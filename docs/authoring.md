@@ -41,7 +41,7 @@ steps:
           properties: { plan: { type: string } }
         # maxAttempts: 2       # optional; overrides the step's maxAttempts (below)
         # maxSchemaFailures: 1 #   just for this produce — see design.md §6
-      # bind: modifier         # accepted value's `modifier` key writes through to run routing
+        # bind: modifier       # accepted value's `modifier` key writes through to run routing
     body: |                    # the prompt; runtime placeholders are filled in when available
       Read the proposal and produce a `plan`.
     bodyFile: path/to.md       # load body from a file, relative to this workflow's dir (must resolve inside it); mutually exclusive with body
