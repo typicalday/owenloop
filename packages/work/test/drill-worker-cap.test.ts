@@ -5,8 +5,8 @@
  * and memory-heavy where a command order is short, so runner dispatch gets its
  * OWN budget: `maxConcurrentAgents` (`--max-agents`). This drill proves the two
  * are genuinely separate — the global cap is set high enough that it cannot be
- * what bites — and that over-cap candidates are LEFT FOR A LATER SWEEP rather
- * than dropped, released, or stamped.
+ * what bites — and that over-cap candidates are returned to the hub rather than
+ * held by a locally saturated daemon.
  *
  * All three orders' harness sessions hang, so the one dispatched runner stays
  * in flight for the whole drill and the cap keeps applying on every later sweep.
@@ -136,7 +136,7 @@ function spawnDaemon(origin: string): ShiftChild {
   );
 }
 
-test('--max-agents caps in-flight runners; over-cap claimed orders queue for local dispatch', async () => {
+test('--max-agents caps in-flight runners; over-cap claims return to the hub', async () => {
   await seedCache();
   let wakes = 0;
   const { origin, reqs, server } = await startMockHub((verb, body) => {
@@ -173,14 +173,24 @@ test('--max-agents caps in-flight runners; over-cap claimed orders queue for loc
       `the first agent-run child record; stderr:\n${daemon.stdout()}`,
     );
     await until(
-      () => /at the agent-run cap \(1\)/.test(daemon.stdout()),
-      `the cap message; stderr:\n${daemon.stdout()}`,
+      () => /at the agent-run cap \(1\)/.test(daemon.stderr()),
+      `the cap message; stderr:\n${daemon.stderr()}`,
     );
 
-    const res = await parked;
-    assert.equal(isShiftError(res), false, `next failed: ${JSON.stringify(res)}`);
-    if (isShiftError(res) || !('events' in res)) throw new Error('unexpected shift response');
-    assert.equal(res.events.some((event) => event.type === 'dispatched'), true, 'next reports the dispatch event');
+    // Capacity releases are also socket events, and classification reports them
+    // before the later dispatch phase. Keep reading until the dispatch record
+    // arrives rather than assuming it is the first FIFO entry.
+    const responses = [await parked];
+    for (let i = 0; i < 2 && !responses.some((res) =>
+      !isShiftError(res) && 'events' in res && res.events.some((event) => event.type === 'dispatched')); i++) {
+      responses.push(await daemon.request({ op: 'next', wait_ms: 3_000 }));
+    }
+    assert.equal(responses.some((res) => isShiftError(res)), false, `next failed: ${JSON.stringify(responses)}`);
+    assert.equal(
+      responses.some((res) => !isShiftError(res) && 'events' in res && res.events.some((event) => event.type === 'dispatched')),
+      true,
+      'next reports the dispatch event',
+    );
 
     // Exactly ONE runner, across every sweep in the park window.
     const recs = readChildRecords(stateDir);
@@ -193,14 +203,24 @@ test('--max-agents caps in-flight runners; over-cap claimed orders queue for loc
     await until(() => starts().length >= 1, `the capped runner to start its harness; stderr:\n${daemon.stdout()}`);
     assert.equal(starts().length, 1, `only one harness session was started; trace:\n${JSON.stringify(traceCalls(), null, 1)}`);
 
-    // The over-cap claims remain owned by this Shift's local queue: nothing was
-    // released and the cap message was logged for each queued candidate.
-    assert.equal(reqs.some((r) => r.verb === 'release'), false, 'a capped order is left offered, never handed back');
-    const capLines = daemon.stdout().split('\n').filter((l) => /at the agent-run cap \(1\)/.test(l));
+    // The over-cap claims return immediately, so an idle sibling shift can be
+    // offered them instead of waiting for this daemon's long-running runner.
+    await until(
+      () => reqs.filter((r) => r.verb === 'release').length >= RUNS.length - 1,
+      `the over-cap claims to be released; stderr:\n${daemon.stdout()}`,
+    );
+    const releasedRuns = new Set(
+      reqs
+	.filter((r) => r.verb === 'release')
+	.map((r) => r.body?.['run'])
+	.filter((run): run is string => typeof run === 'string'),
+    );
+    assert.deepEqual([...releasedRuns].sort(), RUNS.slice(1).sort());
+    const capLines = daemon.stderr().split('\n').filter((l) => /at the agent-run cap \(1\)/.test(l));
     assert.ok(capLines.length >= 2, `expected a cap line per skipped candidate, got:\n${capLines.join('\n')}`);
     assert.ok(
-      capLines.every((l) => /queued for local dispatch/.test(l)),
-      'the message must say the claimed order is locally queued, not dropped',
+      capLines.every((l) => /handing the claim back to the hub/.test(l)),
+      'the message must say the claim was returned, not locally queued',
     );
 
     await daemon.request({ op: 'end' });

@@ -187,9 +187,9 @@ Two properties an uploader can rely on:
 | `reaped` | `workflow`, `run`, `kind`, `pid` | a worker exited and was collected |
 | `failed` | `workflow`, `run`, `step`, `kind`, `message`, and — from the exit path only — `executable`, `exitStatus`, `signal`, optional `harness` | a worker died or could not be spawned; **two producers, two shapes** — see below |
 | `capacity` | `inFlight`, `cap` | no free slot, so the `whats_next` sweep was deferred — explains a shift running nothing new while work is outstanding. **Edge-triggered**, and emitted only on a *changed* wake — see below |
-| `hub-error` | `op` (`wake`\|`whats_next`\|`roster_sync`), `message`, optional `workflow` | a hub call failed. `workflow` present = the targeted `whats_next` for that one workflow; `workflow` absent with `op: 'whats_next'` = the untargeted inbox call, which aborts the whole sweep. `op: 'roster_sync'` records the non-fatal startup or periodic hub-roster refresh failure. **File-only** — see below |
+| `hub-error` | `op` (`wake`\|`whats_next`\|`roster_sync`\|`release`), `message`, optional `workflow` | a hub call failed. `workflow` present = the targeted `whats_next` or release for that one workflow; `workflow` absent with `op: 'whats_next'` = the untargeted inbox call, which aborts the whole sweep. `op: 'roster_sync'` records the non-fatal startup or periodic hub-roster refresh failure. `op: 'release'` means returning an undispatchable claim failed, so it will instead wait for pickup expiry. **File-only** — see below |
 | `bundle-miss` | `workflow`, `def` | a legacy order named a def with no cached bundle |
-| `order-dropped` | `workflow`, `run`, `step`, `reason`, `message` | the shift refused one order and left it for hub pickup |
+| `order-dropped` | `workflow`, `run`, `step`, `reason`, `message` | the shift refused one order; capacity and expiry reasons return the claim to the hub while malformed and unsupported reasons leave it for pickup |
 | `event-queue-overflow` | `dropped` | the socket FIFO evicted events; see below |
 | `ended` | — | an operator ran `owenloop shift end` |
 | `gate` | optional `workflow`, `run`, `name`, `question` | reserved; not emitted today |
@@ -258,11 +258,11 @@ one.
 
 `order-dropped.reason` is the stable machine discriminator and is one of
 `malformed-digest`, `malformed-worker`, `unsupported-worker`,
-`verification-failed`, `metadata-unavailable`, `agent-lane-closed`.
-`agent-lane-closed` means the shift's effective agent ceiling is structurally
-zero, so it leaves the claim for the hub pickup window rather than holding agent
-work it cannot run. `message` is human text — match on `reason`, display
-`message`.
+`verification-failed`, `metadata-unavailable`, `agent-lane-closed`,
+`dispatch-cap-full`, `agent-cap-full`, or `claim-expired`. The capacity,
+expiry, and `agent-lane-closed` reasons return the claim to the hub; malformed
+and unsupported reasons leave it for the pickup window. `message` is human
+text — match on `reason`, display `message`.
 
 ### The first record is self-describing
 

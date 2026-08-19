@@ -144,6 +144,13 @@ export function resolveExecReserve(
   return flagReserve ?? settingsReserve ?? DEFAULT_EXEC_RESERVE;
 }
 
+export function resolveLocalQueueHoldMs(
+  flagHold: number | undefined,
+  settingsHold: number | undefined,
+): number {
+  return flagHold ?? settingsHold ?? 0;
+}
+
 export function resolveShiftName(
   flagName: string | undefined,
   opts: { shiftId?: string; hostname?: string; cwd?: string; pid?: number } = {},
@@ -167,6 +174,7 @@ export interface ParsedArgs {
   once?: boolean;
   maxAgents?: number;
   execReserve?: number;
+  localQueueHoldMs?: number;
   cacheDir?: string;
   stateDir?: string;
   /** `--log-dir` — where `shift.log` and `<run>.log` are written. */
@@ -215,6 +223,7 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--cap':
       case '--max-agents':
       case '--exec-reserve':
+      case '--local-queue-hold':
       case '--workflow':
       case '--poll-interval':
       case '--cache-dir':
@@ -252,6 +261,10 @@ export function parseArgs(args: string[]): ParsedArgs {
 	  const n = intFlag(r.value, '--exec-reserve');
 	  if (typeof n !== 'number') return { error: n.error };
 	  parsed.execReserve = n;
+		} else if (name === '--local-queue-hold') {
+	  const n = intFlag(r.value, '--local-queue-hold');
+	  if (typeof n !== 'number') return { error: n.error };
+	  parsed.localQueueHoldMs = n;
         } else if (name === '--poll-interval') {
           const n = intFlag(r.value, '--poll-interval');
           if (typeof n !== 'number') return { error: n.error };
@@ -276,7 +289,7 @@ function usage(): void {
   process.stderr.write(
     'usage: owenloop work shift [--origin <url>] [--as <account>] [--name <n>] [--serve-crews a,b] [--cap <n>]\n' +
       '                      [--workflow <id>] [--poll-interval <ms>] [--once]\n' +
-      '                      [--max-agents <n>] [--exec-reserve <n>] [--cache-dir <p>] [--state-dir <p>]\n' +
+      '                      [--max-agents <n>] [--exec-reserve <n>] [--local-queue-hold <ms>] [--cache-dir <p>] [--state-dir <p>]\n' +
       '                      [--log-dir <p>] [--log-max-age <ms>] [--work-root <dir>]...\n',
   );
 }
@@ -463,6 +476,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const cap = resolveCap(parsed.cap, settings.dispatchCap);
   const maxConcurrentAgents = resolveMaxConcurrentAgents(parsed.maxAgents, settings.maxConcurrentAgents);
   const execReserve = resolveExecReserve(parsed.execReserve, settings.execReserve);
+  const localQueueHoldMs = resolveLocalQueueHoldMs(parsed.localQueueHoldMs, settings.localQueueHoldMs);
   const workRoot = resolveWorkRoot(env, settings.workRoot, cacheDir);
   const workRepo = resolveWorkRepo(env, settings.workRepo);
   /**
@@ -651,6 +665,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     }),
     maxConcurrentAgents,
     execReserve,
+    localQueueHoldMs,
     workRoot,
     ...(workRepo !== undefined ? { workRepo } : {}),
     shiftId,

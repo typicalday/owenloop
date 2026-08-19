@@ -25,6 +25,7 @@ import { inspectSettings, KNOWN_SETTINGS_KEYS } from '../settings/settings.ts';
 const DEFAULT_NOTE: Partial<Record<(typeof KNOWN_SETTINGS_KEYS)[number], string>> = {
   dispatchCap: '3',
   execReserve: '1',
+  localQueueHoldMs: '0',
   commandRouting: 'shift',
   defPolicy: 'warn',
 };

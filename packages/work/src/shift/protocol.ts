@@ -122,10 +122,10 @@ export interface CapacityEvent {
   cap: number;
 }
 
-/** A hub call failed. `workflow` is present only for per-workflow whats_next calls. */
+/** A hub call failed. `workflow` is present for per-workflow whats_next and release calls. */
 export interface HubErrorEvent {
   type: 'hub-error';
-  op: 'wake' | 'whats_next' | 'roster_sync';
+  op: 'wake' | 'whats_next' | 'roster_sync' | 'release';
   workflow?: string;
   message: string;
 }
@@ -138,8 +138,9 @@ export interface BundleMissEvent {
 }
 
 /**
- * The shift refused one order and left it for the hub pickup window. A dropped
- * unit of work, which is why it is a record and not a debug aside. `reason` is
+ * The shift refused one order. Capacity and expiry reasons hand its claim back
+ * to the hub; malformed and unsupported reasons leave it for the pickup
+ * window. A dropped unit of work is a record, not a debug aside. `reason` is
  * the stable machine discriminator; `message` is the human text.
  */
 export interface OrderDroppedEvent {
@@ -153,7 +154,10 @@ export interface OrderDroppedEvent {
     | 'unsupported-worker'
     | 'verification-failed'
     | 'metadata-unavailable'
-    | 'agent-lane-closed';
+    | 'agent-lane-closed'
+    | 'dispatch-cap-full'
+    | 'agent-cap-full'
+    | 'claim-expired';
   message: string;
 }
 

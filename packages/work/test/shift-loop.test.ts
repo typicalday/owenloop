@@ -88,6 +88,7 @@ interface MockCfg {
   onTargetedWhatsNext?: () => void | Promise<void>;
   presenceThrows?: boolean;
   presence?: Array<{ error?: Error }>;
+  releaseError?: Error;
 }
 
 function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
@@ -141,7 +142,9 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
     async heartbeat() {
       return { text: '' };
     },
-    async release() {
+    async release(req) {
+      calls.push({ verb: 'release', arg: req });
+      if (cfg.releaseError !== undefined) throw cfg.releaseError;
       return { text: '' };
     },
     async submit(req) {
@@ -463,6 +466,7 @@ test('presence Retry-After still dispatches an already-queued local claim', asyn
     workflow: 'wf1',
     cap: 10,
     maxConcurrentAgents: 1,
+    localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
     presenceIntervalMs: 0,
     isAlive: (candidatePid) => alive.has(candidatePid),
   }));
@@ -2157,6 +2161,7 @@ test('maxConcurrentAgents caps agent-run dispatch on top of the global cap', asy
       workflow: 'wf1',
       cap: 10, // plenty of global room — the agent cap is what must bite
       maxConcurrentAgents: 2,
+      localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
       out: (l) => out.push(l),
     }),
   ).iterate();
@@ -2182,6 +2187,7 @@ test('the default exec reserve keeps one cap slot reachable by command work', as
   const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
     maxConcurrentAgents: 3,
+    localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
     out: (line) => out.push(line),
   }));
 
@@ -2273,11 +2279,11 @@ test('a larger reserve remains inside cap while command work fills the held slot
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_agent_1', 'run_command_1', 'run_command_2']);
 });
 
-test('a zero agent ceiling drops agent work instead of holding its claim', async () => {
+test('a zero agent ceiling releases agent work instead of holding its claim', async () => {
   cacheBuilderStep();
   const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
   const errors: string[] = [];
-  const { hub } = mockHub({
+  const { hub, calls } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
     perWf: agentWf([wo('run_agent_1', 'builder')]),
   });
@@ -2293,7 +2299,186 @@ test('a zero agent ceiling drops agent work instead of holding its claim', async
   assert.equal(await loop.iterate(), 0);
   assert.equal(spawns.length, 0);
   assert.deepEqual(events.map((event) => event.type === 'order-dropped' ? event.reason : event.type), ['agent-lane-closed']);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_agent_1' },
+  ]);
   assert.match(errors.join('\n'), /agent ceiling 0/);
+});
+
+// ---- undispatchable claims --------------------------------------------------
+
+test('a cap-1 shift releases an extra agent claim rather than keeping it locally', async () => {
+  cacheBuilderStep();
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: false, cursor: 1 },
+    ],
+    perWf: agentWf([wo('run_first', 'builder'), wo('run_second', 'builder')]),
+  });
+  const alive = new Set<number>();
+  const spawns: SpawnSpec[] = [];
+  let pid = 1000;
+  const spawner: Spawner = (spec) => {
+    spawns.push(spec);
+    alive.add(pid);
+    return { pid: pid++ };
+  };
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 4,
+    isAlive: (candidatePid) => alive.has(candidatePid),
+    onEvent: (event) => events.push(event),
+  }));
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_second' },
+  ]);
+  assert.equal(
+    events.some((event) =>
+      event.type === 'order-dropped' &&
+      event.run === 'run_second' &&
+      event.reason === 'dispatch-cap-full'),
+    true,
+  );
+
+  alive.delete(1000);
+  assert.equal(await loop.iterate(), 0);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.equal(count(calls, 'whats_next'), 1);
+});
+
+test('an agent-lane cap releases an undispatchable agent claim', async () => {
+  cacheBuilderStep();
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_first', 'builder'), wo('run_second', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 10,
+    maxConcurrentAgents: 1,
+    execReserve: 0,
+    onEvent: (event) => events.push(event),
+  })).iterate();
+
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_second' },
+  ]);
+  assert.equal(
+    events.some((event) => event.type === 'order-dropped' && event.reason === 'agent-cap-full'),
+    true,
+  );
+});
+
+test('a command lane at capacity releases its extra claim', async () => {
+  cacheCommandBundle();
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: cmdWf([wo('run_first', 'cmd'), wo('run_second', 'cmd')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+  })).iterate();
+
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_second' },
+  ]);
+});
+
+test('a release failure is observable without interrupting dispatch', async () => {
+  cacheBuilderStep();
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_first', 'builder'), wo('run_second', 'builder')]),
+    releaseError: new Error('hub unavailable'),
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    onEvent: (event) => events.push(event),
+  })).iterate();
+  await Promise.resolve();
+
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.equal(
+    events.some((event) =>
+      event.type === 'hub-error' && event.op === 'release' && event.message === 'hub unavailable'),
+    true,
+  );
+});
+
+test('a rate-limited release backs off later hub polling', async () => {
+  cacheBuilderStep();
+  let monotonic = 0;
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_first', 'builder'), wo('run_second', 'builder')]),
+    releaseError: new HubError(429, 'slow down', 'rate_limited', 23_000),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    monotonicNow: () => monotonic,
+    onEvent: (event) => events.push(event),
+  }));
+
+  await loop.iterate();
+  await Promise.resolve();
+  await Promise.resolve();
+  const callsBeforeBackoff = calls.length;
+
+  monotonic = 1;
+  await loop.iterate();
+
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.equal(calls.length, callsBeforeBackoff, 'a release Retry-After suppresses later hub polling');
+  assert.equal(
+    events.some((event) => event.type === 'hub-error' && event.op === 'release'),
+    true,
+  );
+});
+
+test('a re-offer with a live child is never released', async () => {
+  cacheBuilderStep();
+  writeChildRecord(stateDir, {
+    workflow: 'wf1',
+    run: 'run_live',
+    pid: process.pid,
+    spawnedAt: 0,
+    kind: 'agent-run',
+    step: 'builder',
+  });
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_live', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 10,
+  })).iterate();
+
+  assert.equal(spawns.length, 0);
+  assert.equal(count(calls, 'release'), 0);
 });
 
 test('agentCeiling follows live dispatch-cap changes', () => {
@@ -2334,6 +2519,7 @@ test('a claimed order queued by the agent cap dispatches after a child exits wit
       workflow: 'wf1',
       cap: 10,
       maxConcurrentAgents: 1,
+      localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
       isAlive: (candidatePid) => alive.has(candidatePid),
     }),
   );
@@ -2379,6 +2565,7 @@ test('pending age includes a 40-second whats_next response before 81 seconds in 
     workflow: 'wf1',
     cap: 10,
     maxConcurrentAgents: 1,
+    localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
     isAlive: (candidatePid) => alive.has(candidatePid),
     now: () => wall,
     monotonicNow: () => monotonic,
@@ -2394,12 +2581,16 @@ test('pending age includes a 40-second whats_next response before 81 seconds in 
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
   assert.match(err.join('\n'), /queued claim expired before local dispatch/);
   assert.equal(count(calls, 'whats_next'), 1);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_stale' },
+  ]);
 });
 
 test('a whats_next response older than 90 seconds is not dispatched into immediate capacity', async () => {
   cacheBuilderStep();
   let monotonic = 0;
-  const { hub } = mockHub({
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const { hub, calls } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
     perWf: agentWf([wo('run_stale', 'builder')]),
     onTargetedWhatsNext: () => { monotonic += MAX_PENDING_CANDIDATE_AGE_MS + 1; },
@@ -2411,11 +2602,19 @@ test('a whats_next response older than 90 seconds is not dispatched into immedia
     workflow: 'wf1',
     monotonicNow: () => monotonic,
     err: (line) => err.push(line),
+    onEvent: (event) => events.push(event),
   })).iterate();
 
   assert.equal(dispatched, 0);
   assert.equal(spawns.length, 0);
   assert.match(err.join('\n'), /claim expired before local dispatch/);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_stale' },
+  ]);
+  assert.equal(
+    events.some((event) => event.type === 'order-dropped' && event.reason === 'claim-expired'),
+    true,
+  );
 });
 
 test('a fresh whats_next response still dispatches immediately', async () => {
@@ -2481,9 +2680,9 @@ test('persisted child timestamps use wall time rather than the monotonic clock',
   assert.equal(readChildRecords(stateDir)[0]?.spawnedAt, 123_456_789);
 });
 
-test('a queued claim is discarded before the hub pickup window can expire and re-offer it', async () => {
+test('queued claims release at their hold deadline even while capacity remains saturated', async () => {
   cacheBuilderStep();
-  const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder')];
+  const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder'), wo('run_stale_2', 'builder')];
   const { hub, calls } = mockHub({
     wake: [
       { changed: true, cursor: 1 },
@@ -2496,6 +2695,7 @@ test('a queued claim is discarded before the hub pickup window can expire and re
   let pid = 1000;
   let monotonic = 0;
   const err: string[] = [];
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
   const spawner: Spawner = (spec) => {
     spawns.push(spec);
     alive.add(pid);
@@ -2506,22 +2706,31 @@ test('a queued claim is discarded before the hub pickup window can expire and re
       workflow: 'wf1',
       cap: 10,
       maxConcurrentAgents: 1,
+      localQueueHoldMs: 30_000,
       isAlive: (candidatePid) => alive.has(candidatePid),
       monotonicNow: () => monotonic,
       err: (line) => err.push(line),
+      onEvent: (event) => events.push(event),
     }),
   );
 
   assert.equal(await loop.iterate(), 1);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
 
-  alive.delete(1000);
-  monotonic = MAX_PENDING_CANDIDATE_AGE_MS;
+  monotonic = 30_000;
 
   assert.equal(await loop.iterate(), 0);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
   assert.match(err.join('\n'), /queued claim expired before local dispatch/);
   assert.equal(count(calls, 'whats_next'), 1, 'classifying the stale local candidate does not require another hub sweep');
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_stale' },
+    { workflow: 'wf1', run: 'run_stale_2' },
+  ]);
+  assert.equal(
+    events.filter((event) => event.type === 'order-dropped' && event.reason === 'claim-expired').length,
+    2,
+  );
 });
 
 test('live agent-run records consume the agent cap; the global cap still applies too', async () => {
@@ -2737,12 +2946,14 @@ test('two direct Shift loops sharing one state directory serialize capacity rese
     workflow: 'wf1',
     cap: 1,
     maxConcurrentAgents: 1,
+    localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
     out: (line) => firstOut.push(line),
   }));
   const secondLoop = createShiftLoop(baseOpts(secondHub.hub, spawner, {
     workflow: 'wf1',
     cap: 1,
     maxConcurrentAgents: 1,
+    localQueueHoldMs: MAX_PENDING_CANDIDATE_AGE_MS,
     out: (line) => secondOut.push(line),
   }));
 
@@ -3015,7 +3226,7 @@ test('concurrent runs of one step are never braked — only failures count', asy
 test('a braked candidate is not queued for local dispatch', async () => {
   const monotonic = 0;
   const runs = ['run_q01', 'run_q02'];
-  const { loop, spawns, next } = stormLoop(runs, () => monotonic);
+  const { loop, spawns, calls, next } = stormLoop(runs, () => monotonic);
 
   await loop.iterate();
   loop.noteWorkerFailure({ run: 'run_q01' });
@@ -3026,6 +3237,7 @@ test('a braked candidate is not queued for local dispatch', async () => {
   // next drain, with no window elapsed — which would defeat the brake entirely.
   await loop.iterate();
   assert.deepEqual(spawns.map((s) => s.run), ['run_q01']);
+  assert.equal(count(calls, 'release'), 0, 'the brake deliberately leaves claims to lapse');
 });
 
 test('a brake expiry sweeps again even when wake reports no change', async () => {

@@ -46,6 +46,9 @@ Options:
 		--exec-reserve <n>         slots inside --cap that agent-run children may
 					not occupy, so exec orders always have room
 					(default 1; else settings.execReserve; 0 disables)
+      --local-queue-hold <ms>    retain an undispatchable claim locally before
+					returning it to the hub (default 0; else
+					settings.localQueueHoldMs; capped at 90000)
       --cache-dir/--state-dir <p>   override the resolved dirs
 
   hold options:
@@ -112,7 +115,7 @@ Options:
   settings (no options in v1):
       prints the resolved settings file path, whether it exists, each known
       knob (hubOrigin, cacheDir, stateDir, dispatchCap, commandRouting,
-      maxConcurrentAgents, execReserve, workRoot, workRepo) with its value + provenance,
+      maxConcurrentAgents, execReserve, localQueueHoldMs, workRoot, workRepo) with its value + provenance,
       and any unrecognized keys.
       settings.dispatchCap/stateDir are the lowest-precedence
       fallbacks for shift's --cap/--state-dir. NO secrets ever

@@ -27,11 +27,11 @@
  * liveInFlight counts every live child record, each one pid-probed (see
  * state.ts). When `k <= 0` the loop skips `whats_next` but remembers that the
  * adopted wake still needs a sweep. Orders already returned by `whats_next`
- * are already claimed, so over-cap orders enter an in-memory queue and dispatch
- * as soon as local child capacity frees; waiting for another hub wake would
- * strand those claims until pickup expiry. The agent lane is additionally
- * bounded by `cap − execReserve`, preserving room for an exec order while
- * agents are saturated.
+ * are already claimed. Orders this shift cannot dispatch are released back to
+ * the hub immediately, so another daemon can take them; `localQueueHoldMs`
+ * optionally retains them locally for a bounded window instead. The agent lane
+ * is additionally bounded by `cap − execReserve`, preserving room for an exec
+ * order while agents are saturated.
  *
  * RESILIENCE: presence/wake/whats_next failures are logged and never kill the
  * loop. `stop()` flips a flag checked between awaits; the in-flight sweep
@@ -164,6 +164,11 @@ export interface ShiftLoopOptions {
    * ceiling. Clamped to `cap - 1` so it cannot consume the whole cap.
    */
   execReserve?: number;
+  /**
+   * How long to retain a claim this shift cannot dispatch before returning it
+   * to the hub. Defaults to 0: do not queue locally.
+   */
+  localQueueHoldMs?: number;
   /**
    * PHASE 4 — the root under which per-RUN agent work directories live
    * (`<workRoot>/<workflow>/<run>/`). ABSENT DISABLES THE REAPER entirely: with
@@ -348,6 +353,8 @@ interface Candidate {
 const DEFAULT_MAX_AGENTS = 4;
 /** The `execReserve` fallback when the option is absent. */
 const DEFAULT_EXEC_RESERVE = 1;
+/** The `localQueueHoldMs` fallback when the option is absent. */
+const DEFAULT_LOCAL_QUEUE_HOLD_MS = 0;
 /** The hub reaps a never-contacted claim after this long. Every client-side
  * re-offer latency must stay strictly under it. */
 export const HUB_PICKUP_WINDOW_MS = 120_000;
@@ -462,6 +469,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     };
   }
 
+  /** Effective local hold, capped below the hub pickup window. */
+  function localQueueHoldMs(): number {
+    return Math.min(
+      Math.max(0, opts.localQueueHoldMs ?? DEFAULT_LOCAL_QUEUE_HOLD_MS),
+      MAX_PENDING_CANDIDATE_AGE_MS,
+    );
+  }
+
   const isAlive = opts.isAlive;
   const monotonicNow = opts.monotonicNow ?? performance.now.bind(performance);
   // Live shift identity (MCP `clock_in`, D3-D7 of the plan). Seeded from opts,
@@ -554,6 +569,22 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     } catch (e) {
       opts.err(`shift event sink failed: ${errMsg(e)} (continuing)`);
     }
+  }
+
+  /**
+   * Hand a claim back so another shift can be offered it immediately. This
+   * deliberately stays off the dispatch critical path; a failed release falls
+   * back to the existing pickup-window behavior and is observable.
+   */
+  function releaseClaim(workflow: string, run: string): void {
+    void opts.hub.release({ workflow, run }).catch((e) => {
+      noteServerBackoff(e);
+      const message = errMsg(e);
+      opts.err(
+		`[${workflow}/${run}] release failed: ${message} — leaving the hub pickup window to re-offer it`,
+      );
+      emit({ type: 'hub-error', op: 'release', workflow, message });
+    });
   }
 
   function acquireDispatchLock(waitMs: number, label: string) {
@@ -779,18 +810,27 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   function discardExpiredCandidate(candidate: Candidate, queued: boolean): boolean {
-    if (monotonicNow() - candidate.requestStartedAt < MAX_PENDING_CANDIDATE_AGE_MS) return false;
+    const holdMs = queued ? localQueueHoldMs() : MAX_PENDING_CANDIDATE_AGE_MS;
+    if (monotonicNow() - candidate.requestStartedAt < holdMs) return false;
     const prefix = queued ? 'queued claim' : 'claim';
-    opts.err(
-      `[${candidate.workflow}/${candidate.order.run}] ${prefix} expired before local dispatch — leaving the hub pickup window to re-offer it`,
-    );
+    const message = `${prefix} expired before local dispatch — handing the claim back to the hub`;
+    opts.err(`[${candidate.workflow}/${candidate.order.run}] ${message}`);
+    emit({
+      type: 'order-dropped',
+      workflow: candidate.workflow,
+      run: candidate.order.run,
+      step: candidate.order.step,
+      reason: 'claim-expired',
+      message,
+    });
+    releaseClaim(candidate.workflow, candidate.order.run);
     return true;
   }
 
   /** Dispatch already-claimed orders when local child capacity becomes free. */
   function drainPending(live: ChildRecord[], reserved: ChildReservation[]): number {
     let remaining = cap - live.length - reserved.length;
-    if (remaining <= 0 || pendingCandidates.size === 0) return 0;
+    if (pendingCandidates.size === 0) return 0;
 
     const { ceiling } = agentLane();
     let agentRoom = ceiling -
@@ -800,7 +840,6 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let dispatched = 0;
 
     for (const [run, candidate] of pendingCandidates) {
-      if (remaining <= 0) break;
       if (discardExpiredCandidate(candidate, true)) {
 	pendingCandidates.delete(run);
 	continue;
@@ -809,6 +848,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	pendingCandidates.delete(run);
 	continue;
       }
+      // Even at full capacity, keep scanning so a configured local hold is a
+      // real deadline rather than one deferred until another child exits.
+      if (remaining <= 0) continue;
       // The agent lane's second budget can be full while the dispatch cap still
       // has room. Skip this entry and KEEP it queued (a command entry further
       // down the map is still dispatchable) — `continue`, never `break`, so one
@@ -816,8 +858,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (candidate.kind === 'agent' && agentRoom <= 0) continue;
 
       const result = dispatchCandidate(candidate);
-      if (result === 'total-capacity') break;
-      if (result === 'agent-capacity') continue;
+      if (result === 'total-capacity') {
+	remaining = 0;
+	continue;
+      }
+      if (result === 'agent-capacity') {
+	agentRoom = 0;
+	continue;
+      }
       pendingCandidates.delete(run);
       if (result !== 'dispatched') continue;
 
@@ -929,7 +977,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const candidates: Candidate[] = [];
 
     /**
-     * Refuse one order and leave it for the hub pickup window.
+     * Refuse one order. Some reasons intentionally leave the claim for the hub
+     * pickup window; capacity reasons use `releaseOrder` below instead.
      *
      * Every refusal below is a DROPPED UNIT OF WORK, not a debug aside: the
      * shift declines an order the hub already handed it, and until now the only
@@ -947,6 +996,19 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       opts.err(`[${workflow}/${order.run}] ${message}`);
       emit({ type: 'order-dropped', workflow, run: order.run, step: order.step, reason, message });
       claimed.add(order.run);
+    };
+    /**
+     * Refuse an order because this shift lacks capacity, then hand its claim
+     * back so a sibling daemon may dispatch it immediately.
+     */
+    const releaseOrder = (
+      workflow: string,
+      order: WorkOrder,
+      reason: OrderDroppedEvent['reason'],
+      message: string,
+    ): void => {
+      dropOrder(workflow, order, reason, message);
+      releaseClaim(workflow, order.run);
     };
     for (const wf of instances) {
       let res;
@@ -1093,8 +1155,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    continue;
 	  }
 	  if (remaining <= 0) {
-	    pendingCandidates.set(order.run, candidate);
-	    opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+	    if (localQueueHoldMs() > 0) {
+	      pendingCandidates.set(order.run, candidate);
+	      opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+	    } else {
+	      releaseOrder(
+		wf,
+		order,
+		'dispatch-cap-full',
+		`at the dispatch cap (${cap}) — handing the claim back to the hub`,
+	      );
+	    }
 	  } else {
 	    remaining--;
 	    candidates.push(candidate);
@@ -1105,6 +1176,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
 	// Agent wire routing is authoritative. The detached agent-run resolves its
 	// own exact step and harness from the order digest, never from this cache.
+	// A re-offer already has a live child record; never release it.
         if (workerRuns.has(order.run)) continue;
 	const candidate: Candidate = {
 	  order,
@@ -1122,20 +1194,38 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	}
 
 	if (ceiling === 0) {
-	  dropOrder(
+	  releaseOrder(
 	    wf,
 	    order,
 	    'agent-lane-closed',
-	    'this shift runs no agent-run children (agent ceiling 0) — leaving for the pickup window',
+	    'this shift runs no agent-run children (agent ceiling 0) — handing the claim back to the hub',
 	  );
 	  continue;
 	}
 	if (!reoffer && remaining <= 0) {
-	  pendingCandidates.set(order.run, candidate);
-	  opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+	  if (localQueueHoldMs() > 0) {
+	    pendingCandidates.set(order.run, candidate);
+	    opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+	  } else {
+	    releaseOrder(
+	      wf,
+	      order,
+	      'dispatch-cap-full',
+	      `at the dispatch cap (${cap}) — handing the claim back to the hub`,
+	    );
+	  }
 	} else if (!reoffer && agentRoom <= 0) {
-	  pendingCandidates.set(order.run, candidate);
-	  opts.out(`[${wf}/${order.run}] at the agent-run cap (${agentCapLabel}) — queued for local dispatch`);
+	  if (localQueueHoldMs() > 0) {
+	    pendingCandidates.set(order.run, candidate);
+	    opts.out(`[${wf}/${order.run}] at the agent-run cap (${agentCapLabel}) — queued for local dispatch`);
+	  } else {
+	    releaseOrder(
+	      wf,
+	      order,
+	      'agent-cap-full',
+	      `at the agent-run cap (${agentCapLabel}) — handing the claim back to the hub`,
+	    );
+	  }
 	} else {
 	  if (!reoffer) {
 	    remaining--;
@@ -1159,13 +1249,22 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	continue;
       }
       if (result === 'total-capacity' || result === 'agent-capacity') {
-	pendingCandidates.set(candidate.order.run, candidate);
 	const limit = result === 'total-capacity'
 	  ? `dispatch cap (${cap})`
 	  : `agent-run cap (${agentCapLabel})`;
-	opts.out(
-	  `[${candidate.workflow}/${candidate.order.run}] lost a shared-capacity race at the ${limit} — queued for local dispatch`,
-	);
+	if (localQueueHoldMs() > 0) {
+	  pendingCandidates.set(candidate.order.run, candidate);
+	  opts.out(
+	    `[${candidate.workflow}/${candidate.order.run}] lost a shared-capacity race at the ${limit} — queued for local dispatch`,
+	  );
+	} else {
+	  releaseOrder(
+	    candidate.workflow,
+	    candidate.order,
+	    result === 'total-capacity' ? 'dispatch-cap-full' : 'agent-cap-full',
+	    `lost a shared-capacity race at the ${limit} — handing the claim back to the hub`,
+	  );
+	}
       }
     }
 
