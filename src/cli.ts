@@ -1415,11 +1415,14 @@ Commands:
   push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <origin>] [--as <slot>]
     publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
-  start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--modifier <name>] [--hub <url>]
+  start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--modifier <name>] [--scope <label>] [--priority <low|normal|high>] [--hub <url>]
 ${' '.repeat(41)}start a published workflow on the bound hub (human credential)
 ${' '.repeat(41)}--modifier names one value from the def's declared \`modifiers:\` set; every
 ${' '.repeat(41)}step's capability is then offered as \`<capability>:<modifier>\`. Omit it and
 ${' '.repeat(41)}the run carries no modifier and its steps are offered on BARE capabilities.
+${' '.repeat(41)}--scope is a free routing label recorded on the run — no registry, no fixed set.
+${' '.repeat(41)}Omit it and the run is routed by the org's routes alone.
+${' '.repeat(41)}--priority is one of low, normal, high. Omit it and the hub applies normal.
   cancel <workflow> [--reason <text>] [--hub <url>]
 ${' '.repeat(41)}cancel a running instance on the bound hub (human credential; agents cannot cancel).
 ${' '.repeat(41)}Closes every open lease so the run stops being re-offered, and records the
@@ -1544,7 +1547,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['publish', cmdOpts('unsigned', 'output', 'source', 'hub')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
-  ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier')],
+  ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier', 'scope', 'priority')],
   ['cancel', cmdOpts('hub', 'reason')],
   ['instance', cmdOpts('hub')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
@@ -1679,6 +1682,12 @@ const MAX_ROSTER_CAPABILITY_LENGTH = 64;
 const MAX_ROSTER_CANDIDATES = 32;
 const MAX_HARNESS_MODELS = 256;
 const ROSTER_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+/**
+ * The run's rate-limit priority band. Fixed by the routing plan's §4.8 wire
+ * contract, not by hub discretion, so an out-of-set value is a local usage
+ * error rather than a forwarded request the hub has to refuse.
+ */
+const START_PRIORITIES: ReadonlySet<string> = new Set(['low', 'normal', 'high']);
 
 function isRosterIdentifier(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= MAX_ROSTER_IDENTIFIER_LENGTH && value.trim() === value;
@@ -4936,7 +4945,7 @@ async function hubRequestMessage(res: Response): Promise<string | undefined> {
  */
 async function dispatchStart(io: CliIO, args: Args): Promise<number> {
   const defName = need(args, 1, 'defName');
-  const requiredTextOption = (key: 'crew' | 'title' | 'modifier', label: string): string | undefined => {
+  const requiredTextOption = (key: 'crew' | 'title' | 'modifier' | 'scope' | 'priority', label: string): string | undefined => {
     if (args.missingOptionValues.has(key)) {
       throw new CliError(`missing value for --${key}: expected --${key} <${label}>`);
     }
@@ -4956,6 +4965,14 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
   // than a silent unmodified run. Omitting the flag entirely IS the unmodified
   // run — that is the difference `requiredTextOption` preserves.
   const modifier = requiredTextOption('modifier', 'name');
+  // Free routing label. No registry and no enumeration by design (§4.8), so the
+  // only shape check is the one every text option gets: present-but-valueless and
+  // explicitly-empty are usage errors; omitted is omitted.
+  const scope = requiredTextOption('scope', 'label');
+  const priority = requiredTextOption('priority', 'low|normal|high');
+  if (priority !== undefined && !START_PRIORITIES.has(priority)) {
+    throw new CliError(`invalid --priority '${priority}' — must be one of low, normal, high`);
+  }
   const origin = resolveStartHub(io, args);
   const slot: CredentialSlotSelector = { principal: 'human' };
   const cred = readCredential(io, origin, slot);
@@ -4973,6 +4990,8 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
     // absent as the same thing, but sending an explicit `undefined` would put a
     // `modifier` key in the JSON body with a null value. Omitted means omitted.
     ...(modifier !== undefined ? { modifier } : {}),
+    ...(scope !== undefined ? { scope } : {}),
+    ...(priority !== undefined ? { priority } : {}),
   };
 
   const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/start_run', request);
@@ -5015,6 +5034,11 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
     // accepted exactly this value. Printed only when the flag was passed, so an
     // unmodified run's output is byte-identical to what it was before.
     ...(modifier !== undefined ? { modifier } : {}),
+    // Echoed from the request, like `modifier` above, and only when the flag
+    // was passed. A run started without these flags prints exactly what it did
+    // before, while a hub refusal prevents this success output entirely.
+    ...(scope !== undefined ? { scope } : {}),
+    ...(priority !== undefined ? { priority } : {}),
     ...(Array.isArray(wire.stampedCrews) ? { stampedCrews: wire.stampedCrews } : {}),
     ...(Array.isArray(wire.validatedCrews) ? { validatedCrews: wire.validatedCrews } : {}),
   });

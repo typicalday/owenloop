@@ -82,17 +82,21 @@ test('start: bound-project happy path posts inputs and crew with the human crede
   });
 });
 
-test('start: missing or empty crew/title/modifier values fail before credential and network access', async () => {
+test('start: missing or empty crew/title/modifier/scope/priority values fail before credential and network access', async () => {
   const cases = [
     { argv: ['start', 'newhire-onboarding', '--crew'], error: /missing value for --crew/u },
     { argv: ['start', 'newhire-onboarding', '--title'], error: /missing value for --title/u },
     { argv: ['start', 'newhire-onboarding', '--modifier'], error: /missing value for --modifier/u },
+    { argv: ['start', 'newhire-onboarding', '--scope'], error: /missing value for --scope/u },
+    { argv: ['start', 'newhire-onboarding', '--priority'], error: /missing value for --priority/u },
     { argv: ['start', 'newhire-onboarding', '--crew='], error: /invalid empty value for --crew/u },
     { argv: ['start', 'newhire-onboarding', '--title='], error: /invalid empty value for --title/u },
     // `--modifier=` is a usage error, NOT a silent unmodified run. The REST
     // route reads `''` as omitted, so forwarding a blank value would start a
     // run at bare capabilities while the operator believes they picked a depth.
     { argv: ['start', 'newhire-onboarding', '--modifier='], error: /invalid empty value for --modifier/u },
+    { argv: ['start', 'newhire-onboarding', '--scope='], error: /invalid empty value for --scope/u },
+    { argv: ['start', 'newhire-onboarding', '--priority='], error: /invalid empty value for --priority/u },
   ] as const;
 
   for (const fixture of cases) {
@@ -155,6 +159,52 @@ test('start: --modifier forwards the run modifier and echoes it back', async () 
   // field, and a value outside the def's declared set is a 400 before any
   // instance exists — so a printed modifier can only be one the hub accepted.
   assert.equal(JSON.parse(t.out.join('\n')).modifier, 'deep');
+});
+
+test('start: --scope and --priority forward and echo', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/start_run': () => ({ status: 200, json: STARTED }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['start', 'newhire-onboarding', '--scope', 'proj-a', '--priority', 'high'], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(calls[0]!.body ?? '{}'), {
+    workflow_name: 'newhire-onboarding',
+    scope: 'proj-a',
+    priority: 'high',
+  });
+  const printed = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal(printed.scope, 'proj-a');
+  assert.equal(printed.priority, 'high');
+});
+
+test('start: an out-of-set --priority is refused before network access', async () => {
+  const { fetch, calls } = routedFetch({});
+  let credentialAccesses = 0;
+  const keychain: Keychain = {
+    get() {
+      credentialAccesses += 1;
+      return null;
+    },
+    set() {
+      credentialAccesses += 1;
+    },
+    delete() {
+      credentialAccesses += 1;
+    },
+  };
+  const t = makeIo({ fetch, keychain });
+  bind(t);
+
+  const code = await mainAsync(['start', 'newhire-onboarding', '--priority', 'urgent'], t.io);
+
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /must be one of low, normal, high/u);
+  assert.equal(credentialAccesses, 0);
+  assert.equal(calls.length, 0);
 });
 
 test('start: an explicit literal title "true" remains a valid value', async () => {

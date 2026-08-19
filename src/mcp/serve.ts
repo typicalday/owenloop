@@ -72,9 +72,16 @@ import type { LineStream, ToolRegistration, ToolResult } from './server.ts';
  * command falls back to `process.stdin`).
  */
 export interface McpIo extends CredentialIO {
+  /** The session's working directory — the repo the MCP host was launched in. */
+  cwd: string;
   out: (line: string) => void;
   err: (line: string) => void;
   stdinStream?: LineStream;
+  /**
+   * Local command runner, used only to read the git `origin` remote for the
+   * `start_run` scope default. Without it the default cannot be resolved.
+  */
+  runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
   principalKeys?: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
   /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
   sshProcess?: SshProcessAdapter;
@@ -84,6 +91,8 @@ export interface McpIo extends CredentialIO {
 interface McpDeps {
   io: McpIo;
   origin: string;
+  /** Repo-name scope default for `start_run`, resolved once at startup. */
+  repoScope?: string;
 }
 
 /** The human control plane authenticates as the human slot, always. */
@@ -156,6 +165,29 @@ export function resolveMcpOrigin(io: McpIo, hubFlag: string | undefined): string
     return origins[0]!;
   }
   return DEFAULT_HUB;
+}
+
+/** Repo-name charset — kept local so this module does not depend on the installer. */
+const REPO_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * The default `scope` for a run started from inside a repo session: the repo
+ * name, taken from the `origin` remote's URL (last path segment, trailing
+ * `.git` removed). Worktree-stable by construction — every checkout of one repo
+ * reports the same remote, whereas the directory name differs per worktree.
+ *
+ * Returns `undefined` — meaning "send no scope at all" — for every failure:
+ * no runner seam, not a git repo, no `origin` remote, empty or unparseable URL,
+ * or a segment outside the legal charset. Never guesses a label.
+ */
+export function resolveRepoScope(io: McpIo): string | undefined {
+  if (io.runCommand === undefined) return undefined;
+  const r = io.runCommand('git', ['-C', io.cwd, 'remote', 'get-url', 'origin']);
+  if (r.status !== 0) return undefined;
+  const url = r.stdout.trim().replace(/\/+$/, '');
+  if (url === '') return undefined;
+  const segment = (url.split(/[/:]/).pop() ?? '').replace(/\.git$/, '');
+  return REPO_SEGMENT_RE.test(segment) ? segment : undefined;
 }
 
 // ---- the authenticated hub client -------------------------------------------
@@ -508,14 +540,31 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     },
     {
       name: 'start_run',
-      description: 'Create a new workflow instance from a definition name, optionally seeding provided inputs.',
+      description:
+		'Create a new workflow instance from a definition name, optionally seeding provided inputs. ' +
+		'`scope` is a free routing label recorded on the run; when omitted it defaults to this ' +
+		"session's repository name (the `origin` remote's last path segment) when one can be " +
+		'determined, and is sent as nothing otherwise. `priority` is the rate-limit band; omit it ' +
+		'and the hub applies `normal`.',
       inputSchema: {
         type: 'object',
-        properties: { workflow_name: { type: 'string' }, provide: { type: 'object', additionalProperties: true } },
+		properties: {
+			workflow_name: { type: 'string' },
+			provide: { type: 'object', additionalProperties: true },
+			scope: { type: 'string' },
+			// Unlike crew `kind`/`principalKind`, this is a fixed local wire
+			// contract, so the MCP schema rejects an out-of-set value too.
+			priority: { type: 'string', enum: ['low', 'normal', 'high'] },
+		},
         required: ['workflow_name'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/start_run', body: a })),
+      handler: passthrough(deps, (a) => ({
+		method: 'POST',
+		path: '/api/start_run',
+		// A default, never an override: explicit `scope`, including '', wins.
+		body: deps.repoScope !== undefined && !('scope' in a) ? { ...a, scope: deps.repoScope } : a,
+      })),
     },
     {
       name: 'create_workflow',
@@ -957,7 +1006,7 @@ async function shouldRegisterEnrollment(deps: McpDeps): Promise<boolean> {
  */
 export async function runMcpCommand(io: McpIo, opts: { hubFlag?: string }): Promise<number> {
   const origin = resolveMcpOrigin(io, opts.hubFlag);
-  const deps: McpDeps = { io, origin };
+  const deps: McpDeps = { io, origin, repoScope: resolveRepoScope(io) };
 
   const tools = [...buildBaselineTools(deps), createAgentTool(deps), ...buildCrewTools(deps)];
   if (await shouldRegisterEnrollment(deps)) tools.push(stageEnrollmentTool(deps));
