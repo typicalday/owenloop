@@ -37,8 +37,8 @@ import type { ArtifactMap, CascadeOp, ChildStatusSummary, Firing, TimeFacts, Wor
 import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
-import { applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
-import type { CapabilityRewrites, CrewStamps } from './capabilities.ts';
+import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
+import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
 import type { Store, WorkflowRow } from './store.ts';
@@ -1387,6 +1387,23 @@ export class Engine {
        */
       matchModes?: Record<string, MatchMode>;
       /**
+       * Per-AUTHORED-capability substitution, applied BEFORE the offer composes
+       * with the modifier, so one entry covers every grade a step can be
+       * offered at. Supplied by the same caller that supplies `matchModes` and
+       * for the same reason — deciding what an authored name means in this org
+       * requires reading an install-scoped table the pure engine cannot see.
+       * Substitution is a single hop and the value is never validated; the
+       * caller resolves any chain first. See `applyCapabilityMappings`.
+       *
+       * Absent or empty is exact identity: the offer is composed from the
+       * authored list itself, byte for byte, as before this input existed.
+       *
+       * Distinct from `capabilityRewrites` below, which is keyed by the
+       * COMPOSED string and applied AFTER composition. Both may apply in one
+       * tick, in that order.
+       */
+      capabilityMappings?: CapabilityMappings;
+      /**
        * Per-offered-capability reroute, keyed by the COMPOSED capability the
        * offer would otherwise carry. Supplied by the same caller that supplies
        * `matchModes` and for the same reason — choosing a reroute target means
@@ -1418,6 +1435,7 @@ export class Engine {
       0,
       undefined,
       opts.matchModes ?? {},
+      opts.capabilityMappings ?? {},
       opts.capabilityRewrites ?? {},
       opts.crewStamps ?? {},
     );
@@ -1471,6 +1489,7 @@ export class Engine {
     depth: number,
     parentEdge?: { parentWf: string; step: StepDef; callsStem: string },
     matchModes: Record<string, MatchMode> = {},
+    capabilityMappings: CapabilityMappings = {},
     capabilityRewrites: CapabilityRewrites = {},
     crewStamps: CrewStamps = {},
   ): TickResult {
@@ -1526,12 +1545,12 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts);
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityRewrites);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityMappings, capabilityRewrites);
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
-				const claimed = this.claim(workflow, def, f, arts, now, modifier, capabilityRewrites, crewStamps);
+				const claimed = this.claim(workflow, def, f, arts, now, modifier, capabilityMappings, capabilityRewrites, crewStamps);
         if (claimed === 'in-flight') {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
@@ -1564,7 +1583,7 @@ export class Engine {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
-		}, matchModes, capabilityRewrites, crewStamps);
+		}, matchModes, capabilityMappings, capabilityRewrites, crewStamps);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -1660,6 +1679,7 @@ export class Engine {
     capabilities: string[] | undefined,
     modifier: string | undefined,
     matchModes: Record<string, MatchMode>,
+    capabilityMappings: CapabilityMappings,
     capabilityRewrites: CapabilityRewrites,
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
@@ -1678,13 +1698,17 @@ export class Engine {
 
       // A2: caller capability filter vs. this firing's COMPOSED offer. Composed
       // here, not authored, so a caller bound to `wise:deep` is judged against
-      // what the order will actually carry — including when `deep` came from the
+      // what the order will actually carry — including a mapping onto the org's
+      // own capability vocabulary, including when `deep` came from the
       // escalation rule rather than the run, and including a reroute the caller
-      // decided on. The filter and `buildOrder` apply the same two functions in
-      // the same order, so what is matched is always what gets stamped.
+      // decided on. The filter and `buildOrder` apply the same three functions
+      // in the same order, so what is matched is always what gets stamped.
       const stepFirings: Firing[] = [];
       for (const f of all) {
-        const composed = composeCapabilities(step.capabilities, this.routingFor(step, f, arts, modifier).modifier);
+        const composed = composeCapabilities(
+          applyCapabilityMappings(step.capabilities, capabilityMappings),
+          this.routingFor(step, f, arts, modifier).modifier,
+        );
         const { offered } = applyCapabilityRewrites(composed, capabilityRewrites);
         if (claimMatches(offered, capabilities, matchModes)) stepFirings.push(f);
         else defer(f, 'capability-mismatch');
@@ -1786,6 +1810,7 @@ export class Engine {
     arts: ArtifactMap,
     now: number,
     modifier?: string,
+    capabilityMappings: CapabilityMappings = {},
     capabilityRewrites: CapabilityRewrites = {},
     crewStamps: CrewStamps = {},
   ): Order | 'in-flight' | DeferredClaim | null {
@@ -1817,7 +1842,7 @@ export class Engine {
     // `applySchedule` so the offer and the filter read the same function on the
     // same in-tx `arts` snapshot; nothing between them can move.
     const routing = this.routingFor(this.step(def, f.step), f, arts, modifier);
-    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing, capabilityRewrites, crewStamps);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing, capabilityMappings, capabilityRewrites, crewStamps);
     if (typeof order === 'object' && 'deferred' in order) return order;
     // One history record per rejection episode. Written HERE, not in
     // `buildOrder` (which is store-pure) and not on the deferred path (an offer
@@ -1858,6 +1883,7 @@ export class Engine {
     arts: ArtifactMap,
     consumedFingerprint: Fingerprint,
     routing: { modifier?: string; escalation?: EscalationRecord } = {},
+    capabilityMappings: CapabilityMappings = {},
     capabilityRewrites: CapabilityRewrites = {},
     crewStamps: CrewStamps = {},
   ): Order | DeferredClaim {
@@ -1987,9 +2013,13 @@ export class Engine {
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
-    // The routing snapshot of THIS offer. `capabilities` is the composed list —
-    // absent on a capability-silent step, since there is nothing to compose
-    // onto. `modifier` is stamped whenever the offer carries one, even for a
+    // The routing snapshot of THIS offer. `capabilities` is the mapped-then-
+    // composed list — absent on a capability-silent step, since there is
+    // nothing to map or compose onto. A mapping substitutes the org's own
+    // capability name for the authored one before the modifier is attached, so
+    // one entry covers every grade the step can be offered at; the authored
+    // name stays recoverable through `defDigest`, which pins the def that wrote
+    // it. `modifier` is stamped whenever the offer carries one, even for a
     // capability-silent step, so the brief can surface the grade of service
     // regardless of how the step routes; on an escalated offer it is the
     // escalation target, and `escalated` marks it as such so the hub does not
@@ -1997,7 +2027,10 @@ export class Engine {
     // recomposed: composition happens per offer, and this record is what the
     // shift resolved against.
     const { offered, reroutedFrom } = applyCapabilityRewrites(
-      composeCapabilities(step.capabilities, routing.modifier),
+      composeCapabilities(
+        applyCapabilityMappings(step.capabilities, capabilityMappings),
+        routing.modifier,
+      ),
       capabilityRewrites,
     );
     if (offered.length > 0) order.capabilities = offered;
