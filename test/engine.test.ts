@@ -2014,6 +2014,93 @@ test('requested modifier feedback is validated and retained on bound-artifact re
   );
 });
 
+// All three gates agree for every value and every def; the vocabulary's shape
+// is settled once, in parseModifiers.
+
+/**
+ * A def with ONE modifier-bound produce, built WITHOUT parseDef on purpose:
+ * the third case below declares a whitespace name, which parseModifiers now
+ * refuses. That is not a blessing of whitespace names — the parser is what
+ * stops them. This fixture stands in for a def snapshot pinned before that
+ * rule existed (store.ts deserializes def_snapshot without re-parsing), and
+ * the point of these tests is that all three gates agree about whatever
+ * vocabulary they are handed.
+ */
+function agreementDef(modifiers: string[]): WorkflowDef {
+  const init = step({
+    name: 'init',
+    consumes: ['proposal'],
+    produces: ['modifier'],
+    capabilities: ['utility'],
+  });
+  init.produces[0]!.bind = { to: 'modifier', from: 'modifier' };
+  return def('agreement', [input('proposal')], [init], modifiers);
+}
+
+/** true = that gate ACCEPTED the value; false = it threw ModifierRefusalError. */
+function modifierGates(
+  modifiers: string[],
+  value: string,
+): { start: boolean; bind: boolean; requested: boolean } {
+  const accepted = (fn: () => void): boolean => {
+    try {
+      fn();
+      return true;
+    } catch (e) {
+      if (e instanceof ModifierRefusalError) return false;
+      throw e;
+    }
+  };
+
+  // gate 1 — start_run
+  const startEngine = makeEngine([agreementDef(modifiers)]).engine;
+  const start = accepted(() => {
+    startEngine.createInstance('agreement', { modifier: value });
+  });
+
+  // gate 2 — accepted bind (human green, which throws rather than schema-rejecting)
+  const bindEngine = makeEngine([agreementDef(modifiers)]).engine;
+  const bindWf = bindEngine.createInstance('agreement');
+  fire(bindEngine, bindWf, 'init', 1);
+  const bind = accepted(() => {
+    bindEngine.green(bindWf, 'human', 'modifier', { modifier: value });
+  });
+
+  // gate 3 — reject --requested, on an artifact first greened with the baseline
+  const rejEngine = makeEngine([agreementDef(modifiers)]).engine;
+  const rejWf = rejEngine.createInstance('agreement');
+  const order = fire(rejEngine, rejWf, 'init', 1);
+  rejEngine.green(rejWf, order.run, 'modifier', { modifier: modifiers[0]! });
+  const requested = accepted(() => {
+    rejEngine.reject(rejWf, 'modifier', 'human', 'try another', value);
+  });
+
+  return { start, bind, requested };
+}
+
+test('modifier vocabulary: a declared value is accepted by start, bind and requested alike', () => {
+  assert.deepEqual(
+    modifierGates(['standard', 'deep'], 'deep'),
+    { start: true, bind: true, requested: true },
+  );
+});
+
+test('modifier vocabulary: an undeclared value is refused by start, bind and requested alike', () => {
+  assert.deepEqual(
+    modifierGates(['standard', 'deep'], 'exhaustive'),
+    { start: false, bind: false, requested: false },
+  );
+});
+
+test('modifier vocabulary: membership is the ONLY authority — no gate adds a shape rule of its own', () => {
+  // The regression proper. Before this fix: start accepted 'two words', bind
+  // and requested threw on /\s/ alone. Same declared value, three answers.
+  assert.deepEqual(
+    modifierGates(['standard', 'two words'], 'two words'),
+    { start: true, bind: true, requested: true },
+  );
+});
+
 test('createInstance stores a declared modifier on the run record', () => {
   const { engine, store } = makeEngine([gradedDef(['express', 'deep'])]);
   const wf = engine.createInstance('graded', { modifier: 'deep' });

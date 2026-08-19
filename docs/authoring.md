@@ -352,9 +352,10 @@ accepted object's `customer` key.
 
 The two supported target families are:
 
-- `modifier` — the extracted value must be one whitespace-free member of the
-  workflow's declared `modifiers:` list. A workflow may bind `modifier` only
-  once. An invalid value is refused at submit time.
+- `modifier` — the extracted value must be one member of the workflow's
+  declared `modifiers:` list. A name with whitespace cannot be in that list
+  because `modifiers:` refuses it at definition-parse time. A workflow may bind
+  `modifier` only once. A value outside the list is refused at submit time.
 - `meta.<key>` — writes any JSON value into non-routing instance metadata.
   Metadata never changes capability composition or routing.
 

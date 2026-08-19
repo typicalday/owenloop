@@ -3143,6 +3143,37 @@ test("parseDef rejects ':' in a modifier name — it is the separator the engine
   );
 });
 
+test('parseDef rejects whitespace inside a modifier name — the vocabulary is fixed at publish, not at bind', () => {
+  // This is what let modifiers: ['two words'] be declared, started with, and
+  // then refused at bind.
+  for (const value of ['two words', 'deep\treview', 'trailing ', ' leading']) {
+    assert.throws(
+      () =>
+	parseDef({
+	  name: 'graded',
+	  modifiers: [value],
+	  inputs: [{ name: 'seed' }],
+	  steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build'] }],
+	}),
+      (e: unknown) => e instanceof DefError && /must not contain whitespace/.test((e as Error).message),
+    );
+  }
+});
+
+test('parseDef still reports a whitespace-ONLY modifier as empty rather than as a whitespace name', () => {
+  assert.throws(
+    () =>
+	parseDef({
+	  name: 'graded',
+	  modifiers: ['   '],
+	  inputs: [{ name: 'seed' }],
+	  steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build'] }],
+	}),
+    (e: unknown) =>
+      e instanceof DefError && /modifier names must not be empty or whitespace/.test((e as Error).message),
+  );
+});
+
 test("parseDef rejects ':' in an authored capability name — the suffix position is the engine's", () => {
   assert.throws(
     () =>

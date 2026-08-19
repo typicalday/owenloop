@@ -2066,10 +2066,24 @@ export class Engine {
     return current;
   }
 
-  /** Reuse the start-run modifier refusal shape for accepted bound values. */
+  /**
+   * The bind-time and reject-time modifier gate: membership in the def's
+   * declared `modifiers` set, and nothing else — byte for byte the rule the
+   * start path applies in `createInstanceInTx`. One value cannot be legal to
+   * start a run with and illegal to bind.
+   *
+   * `def` here is the PINNED snapshot, so the vocabulary checked is the one
+   * stamped on this run, not a later republish.
+   *
+   * The SHAPE of a name is constrained where a name is authored:
+   * `parseModifiers` in `src/defs.ts` refuses an empty name, a name containing
+   * whitespace, a name containing `MODIFIER_SEPARATOR`, and a duplicate.
+   * Re-testing shape here is what split the vocabulary in the first place — a
+   * value the parser admitted and `start_run` accepted, refused at bind.
+   */
   private assertBoundModifier(def: WorkflowDef, value: unknown): asserts value is string {
     const declared = def.modifiers ?? [];
-    if (typeof value !== 'string' || /\s/.test(value) || !declared.includes(value)) {
+    if (typeof value !== 'string' || !declared.includes(value)) {
       const rendered = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
       throw new ModifierRefusalError(def.name, rendered, declared);
     }

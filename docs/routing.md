@@ -90,7 +90,9 @@ initial value; after that, a def-declared artifact bind is the only thing that
 can change it (section 8a). The engine attaches *no meaning*
 to it. `deep` is not "more" than `express` as far as any code is concerned;
 they are just two different strings. A definition declares which ones it
-accepts:
+accepts. One word is a rule, not a convention: `modifiers:` refuses a name
+containing whitespace at definition-parse time (`parseModifiers` in
+`src/defs.ts`), so a spaced name fails at publish rather than at bind:
 
 ```yaml
 modifiers: [express, standard, deep]
@@ -499,7 +501,7 @@ Five properties, in the order they matter:
    by a human `green`. All three branches run inside the same `store.tx()` that
    writes the artifact, so acceptance and the routing write commit together or
    neither happens. A submission still waiting on judges has synchronized
-   nothing. An out-of-set or multi-word value is refused before its accepted value
+   nothing. A value outside the declared set is refused before its accepted value
    or green transition is written: a producer commit records the artifact as
    `rejected`, comes back `schema-rejected`, and burns a schema attempt; a human
    `green` throws `ModifierRefusalError` — the same refusal `start_run` uses.
@@ -513,7 +515,7 @@ Five properties, in the order they matter:
    ```
 
    The engine validates `deep` against the definition's declared `modifiers:` at
-   **reject** time, not later: an undeclared or whitespace-bearing value throws
+   **reject** time, not later: an undeclared value throws
    `ModifierRefusalError` and nothing is written at all. A `--requested` on an
    artifact that is not bound to `modifier` is refused outright. The validated
    value is then carried on the rejection's reason entry, and reaches the
