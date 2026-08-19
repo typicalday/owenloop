@@ -174,13 +174,19 @@ consumer passes to `verifyConsumed` as `expectedVersion`. It is never inferred
 from process-local state.
 
 Retry-safety is a property of where the target is computed, not of the client.
-The engine computes it inside the claim transaction and persists it with the
-immutable order, so every read of that claim — a reconnect, a retried submit
-after a lost response, a restarted holder — yields the same number. Engine
-refusal paths that leave the run open (a schema reject) do not bump the
-artifact, so the target survives in-claim retries; a refinement is a new claim
-and receives a newly issued target. A stale target fails the consumer's version
-check, which is a refusal, never an admitted unverified value.
+The engine issues it inside the claim transaction and persists it with the
+order, so a reconnect, a retried submit after a lost response, or a restarted
+holder re-reads the issued number instead of guessing one; a refinement is a new
+claim and receives a newly issued target.
+
+The target is not frozen for the life of the claim. A refusal that leaves the
+run open without bumping the artifact (a schema reject) leaves it correct, but a
+judgment or human reject follows a commit that already bumped the artifact and
+leaves the same claim live to retry — so the engine re-stamps that claim's
+target from the current committed version at the reject site. A client must
+therefore re-read `owes[].version` off the order on every submit and never cache
+it across a reject. A stale target fails the consumer's version check, which is
+a refusal, never an admitted unverified value.
 
 A target is authoritative only when it is a positive integer: the smallest
 commit any producer can land is v1. An absent target, a `0`, or a non-integer

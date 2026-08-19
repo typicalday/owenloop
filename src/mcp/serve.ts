@@ -413,9 +413,11 @@ function submissionFingerprint(order: Order, deps: McpDeps): NonNullable<Order['
  * judge-approve commit does not increment it. Producer claims name
  * `owes[].version`, the target the engine issued for this owed output inside
  * the claim transaction — the version the next successful commit lands, and
- * the version the consumer checks the proof against. See
- * `outputVersionForSubmission` in packages/work/src/submit-proof.ts for the
- * retry-safety argument; this is the same rule on the local MCP path.
+ * the version the consumer checks the proof against. It is re-read off the
+ * order on every submit and never cached, because a reject that re-arms an
+ * open claim re-stamps it. See `outputVersionForSubmission` in
+ * packages/work/src/submit-proof.ts for the retry-safety argument; this is the
+ * same rule on the local MCP path.
  */
 function outputVersion(order: Order, path: string): number | undefined {
   if (order.judge === path) return order.consumedFingerprint?.[path];

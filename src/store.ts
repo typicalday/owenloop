@@ -1112,8 +1112,10 @@ export class Store {
     const cur = this.getRun(id);
     if (!cur) throw new Error(`run not found: ${id}`);
     // order_json is DELIBERATELY excluded from `merged` and the UPDATE below:
-    // the order packet is immutable after claim (§8 / Gap 1). Omitting it makes
-    // that structural — no close/outcome/summary write can ever clobber it.
+    // no close/outcome/summary write can ever clobber the order packet, and
+    // omitting the column makes that structural rather than a convention.
+    // `restampOrderTarget` below is the ONE writer of order_json after claim,
+    // and it rewrites a single `owes[].version` and nothing else.
     const merged: RunData = {
       workflow: cur.workflow,
       step: cur.step,
@@ -1131,6 +1133,38 @@ export class Store {
       .run(merged.key ?? '', merged.outcome ?? null, merged.summary ?? null, merged.sessionId ?? null,
         toJson(merged.fingerprint), merged.cause ?? null, nowMs(), id);
     return this.getRun(id) as RunRow;
+  }
+
+  /**
+   * Re-stamp ONE owed version target on a run's persisted order packet.
+   *
+   * The order is frozen at claim with exactly one exception, and this is it.
+   * When a reject re-arms a still-open claim, the artifact has already been
+   * bumped by the commit that preceded the reject, so the target the claim
+   * froze at issue names a version the next commit will overshoot — and the
+   * producer would sign that stale number into its submission proof while the
+   * hub keys the stored proof row by the version actually committed. Everything
+   * else about the packet stays frozen, and `updateRun` still cannot touch it
+   * at all.
+   *
+   * No-ops when the run has no persisted order (pre-schema-v7 rows), when the
+   * order does not owe `path`, or when the target already is `version` — so
+   * callers can call it unconditionally, and re-stamping is idempotent.
+   */
+  restampOrderTarget(id: string, path: string, version: number): void {
+    const cur = this.getRun(id);
+    if (!cur?.order) return;
+    const owed = cur.order.owes.find((o) => o.path === path);
+    if (owed === undefined || owed.version === version) return;
+    // Rebuilt immutably (map, not in-place mutation) so no caller is left
+    // holding a half-mutated Order read before this write.
+    const next: Order = {
+      ...cur.order,
+      owes: cur.order.owes.map((o) => (o.path === path ? { ...o, version } : o)),
+    };
+    this.db
+      .prepare('UPDATE run SET order_json = ?, updated_at = ? WHERE id = ?')
+      .run(toJson(next), nowMs(), id);
   }
 
   getRun(id: string): RunRow | undefined {

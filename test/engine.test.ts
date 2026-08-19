@@ -9,6 +9,14 @@ import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { StepDef, WorkflowDef } from '../src/types.ts';
 import { normalizeSubmitValue } from '../packages/work/src/submit-value.ts';
+import { outputVersionForSubmission } from '../packages/work/src/submit-proof.ts';
+import type { OrderPacket } from '../packages/work/src/hub/types.ts';
+import { encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT, PAYLOAD_TYPE_SUBMISSION } from '../src/crypto/dsse.ts';
+import { keyidFromBlob, publicKeyDescriptor } from '../src/crypto/keys.ts';
+import { valueDigestHex } from '../src/crypto/canonical.ts';
+import type { EnrollmentGrantRecord } from '../src/crypto/records.ts';
+import { verifyConsumed } from '../src/crypto/verify-consumed.ts';
+import type { VerifyConsumedOptions } from '../src/crypto/verify-consumed.ts';
 import { assertReferenceContract, def, input, step } from './helpers.ts';
 
 // ---- fixtures & harness ------------------------------------------------------
@@ -80,6 +88,72 @@ function fire(engine: Engine, wf: string, stepName: string, now: number): Order 
 function complete(engine: Engine, wf: string, o: Order, value: Record<string, unknown> = {}, opts: { terminal?: boolean } = {}): void {
   for (const out of o.outputs) engine.green(wf, o.run, out, value, opts);
   engine.close(wf, o.run);
+}
+
+/**
+ * A minimal synthetic proof fixture, mirroring test/crypto-verify-consumed.ts.
+ * Nothing here is a real key: `verifyConsumed`'s signature step is stubbed via
+ * `signerForPrincipal`, so these helpers exist only to exercise the version
+ * link between a producer's signed `produced[].version` and a consumer's
+ * claim-time expected version.
+ */
+const PROOF_ROOT = proofKey('engine-root');
+const PROOF_PRODUCER = proofKey('engine-producer');
+
+function proofKey(name: string): { keyid: string; publicKey: string } {
+  const blob = Buffer.from(`synthetic-engine-${name}`);
+  return { keyid: keyidFromBlob(blob), publicKey: `ssh-ed25519 ${blob.toString('base64')} ${name}` };
+}
+
+function proofEnvelope(payloadType: string, payload: unknown): string {
+  return JSON.stringify({
+    payloadType,
+    payload: encodeBase64(Buffer.from(JSON.stringify(payload), 'utf8')),
+    signatures: [{ sig: encodeBase64(Buffer.from('synthetic-signature', 'utf8')) }],
+  });
+}
+
+/** A submission envelope naming exactly the version the producer would sign. */
+function syntheticProof(artifact: string, version: number, value: unknown): string {
+  return proofEnvelope(PAYLOAD_TYPE_SUBMISSION, {
+    run: 'run-synthetic',
+    workflow: 'wf-synthetic',
+    defDigest: 'def-synthetic',
+    step: 'planner',
+    key: '',
+    produced: [{ artifact, version, valueDigest: valueDigestHex(value) }],
+    consumedFingerprint: {},
+    producerKeyId: PROOF_PRODUCER.keyid,
+    timestamp: 10,
+  });
+}
+
+function syntheticGrant(): Uint8Array {
+  const record: EnrollmentGrantRecord = {
+    newKey: {
+      keyid: PROOF_PRODUCER.keyid,
+      keyType: 'ssh-ed25519',
+      openSshPublicKey: PROOF_PRODUCER.publicKey,
+      comment: 'engine-producer',
+    },
+    principal: { kind: 'machine', id: 'engine-producer' },
+    scope: { pools: '*', labels: '*', namespaces: '*', delegation: { allowed: false } },
+    grantedBy: PROOF_ROOT.keyid,
+    validFrom: 0,
+  };
+  return Buffer.from(proofEnvelope(PAYLOAD_TYPE_ENROLLMENT_GRANT, record));
+}
+
+function syntheticSignerOptions(): VerifyConsumedOptions {
+  return {
+    signerForPrincipal: ({ allowedSignersText }) => {
+      const publicKey = allowedSignersText.trim().split(/\s+/).slice(1).join(' ');
+      const selected = publicKeyDescriptor(publicKey);
+      return {
+        verify: async () => ({ keyid: selected.keyid, principal: 'synthetic-signer', format: 'sshsig' as const }),
+      };
+    },
+  };
 }
 
 /**
@@ -155,6 +229,92 @@ test("an owed output's issued version is the target the consumer later checks a 
 
   const runner2 = fire(engine, wf, 'runner', 4000);
   assert.equal(runner2.consumedFingerprint!.plan, target2);
+});
+
+test('a reject that re-arms an OPEN claim re-stamps the owed target, so the signed version is the committed one', async () => {
+  // The sibling test above knocks the producer back through a CLOSED run, so
+  // the retry is a NEW claim and gets a freshly issued target. This one keeps
+  // the SAME claim open across the reject — the shape a judgment/human reject
+  // actually takes — where the artifact was already bumped by the commit that
+  // preceded the reject. Without a re-stamp the producer keeps signing the
+  // pre-reject target while the engine commits one past it, and the proof row
+  // the hub stores is keyed by a version its own envelope does not name.
+  const { engine, store } = makeEngine([orderShapeDef()]);
+  const wf = engine.createInstance('ordershape', { provide: { proposal: { text: 'x' } } });
+
+  const planner = fire(engine, wf, 'planner', 1000);
+  assert.equal(planner.owes.find((w) => w.path === 'plan')!.version, 1);
+
+  // First commit on this claim — deliberately NOT closed.
+  assert.equal(engine.green(wf, planner.run, 'plan', { plan: 'v1' }).outcome, 'green');
+  assert.equal(store.getArtifact(wf, 'plan')!.version, 1);
+
+  assert.equal(engine.reject(wf, 'plan', 'runner', 'needs rework').outcome, 'rejected');
+  const rejected = store.getArtifact(wf, 'plan')!;
+  assert.equal(rejected.acceptance, 'rejected');
+  assert.equal(rejected.version, 1, 'a reject does not bump the version');
+  // The claim is still live, so the producer resumes on the same order rather
+  // than being re-offered a new one. These two are what make this test about
+  // the defect and not about the new-claim path the sibling test covers.
+  assert.equal(store.getTask(wf, 'planner', '')!.status, 'claimed');
+  assert.equal(store.getRun(planner.run)!.outcome, undefined);
+
+  // Re-read the order the way a resumed worker does, and resolve the version it
+  // would sign through the real production lookup rather than a hand-copy.
+  const reread = store.getRun(planner.run)!.order!;
+  const signed = outputVersionForSubmission(reread as unknown as OrderPacket, 'plan');
+
+  assert.equal(engine.green(wf, planner.run, 'plan', { plan: 'v2' }).outcome, 'green');
+  const committed = store.getArtifact(wf, 'plan')!.version;
+
+  assert.equal(
+    signed,
+    committed,
+    'the version the producer signs must be the version the engine committed and the hub keys the proof row by',
+  );
+
+  // And the consumer half: a proof naming `signed` must not trip the version
+  // link when checked against the committed version.
+  const value = { plan: 'v2' };
+  const verdict = await verifyConsumed(
+    {
+      path: 'plan',
+      value,
+      proof: syntheticProof('plan', signed!, value),
+      expectedVersion: committed,
+      orgRootPublicKey: PROOF_ROOT.publicKey,
+      grants: [syntheticGrant()],
+      at: 50,
+      demand: {},
+    },
+    syntheticSignerOptions(),
+  );
+  // `verified`, not merely "not a version refusal": an unverifiable or
+  // otherwise-invalid verdict would satisfy a negative assertion vacuously and
+  // stop testing anything.
+  assert.equal(verdict.kind, 'verified', JSON.stringify(verdict));
+  assert.equal(verdict.kind === 'verified' && verdict.version, committed);
+
+  // And the same fixture DOES refuse the pre-fix pairing, so the assertion
+  // above is load-bearing rather than a check that always passes.
+  const stale = await verifyConsumed(
+    {
+      path: 'plan',
+      value,
+      proof: syntheticProof('plan', committed - 1, value),
+      expectedVersion: committed,
+      orgRootPublicKey: PROOF_ROOT.publicKey,
+      grants: [syntheticGrant()],
+      at: 50,
+      demand: {},
+    },
+    syntheticSignerOptions(),
+  );
+  assert.equal(stale.kind, 'invalid', JSON.stringify(stale));
+  assert.match(
+    stale.kind === 'invalid' ? stale.reason : '',
+    /^version: artifact 'plan' has signed version 1, expected version 2$/,
+  );
 });
 
 test('a missing human input is not fireable, so no claim can emit a negative fingerprint version', () => {

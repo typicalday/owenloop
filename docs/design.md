@@ -1619,7 +1619,11 @@ dynamic feedback, so it stays); the acceptance lifecycle state it used to
 duplicate is read from the artifact row, which is where it lives anyway
 (§5, §24.1). The claim-time invariant is unchanged: the order is built and
 the run row is inserted in the same transaction, and the persisted
-`RunData.order` is byte-identical to the packet `tick` handed out.
+`RunData.order` is byte-identical to the packet `tick` handed out. That is a
+claim-time invariant, not a lifetime one: the single post-claim write to a
+persisted order is `Store.restampOrderTarget`, which rewrites one
+`owes[].version` when a reject re-arms a still-open claim whose artifact the
+preceding commit already bumped.
 
 ### §29.1 `defDigest` — instruction-content identity
 

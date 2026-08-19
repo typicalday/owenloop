@@ -300,11 +300,12 @@ export interface Order {
      * stalls the step. This closes that: the requirement is stated up front,
      * from the same declaration the refusal will be measured against.
      *
-     * It is a COPY, not a reference. The order is immutable once written
-     * (`RunData.order`), so this is the schema as it stood at claim time; a def
-     * edited mid-run leaves the projected schema and the enforced one able to
-     * disagree, exactly as `defDigest` already records for the rest of the
-     * order.
+     * It is a COPY, not a reference. Nothing rewrites the schema on a persisted
+     * order — `Store.restampOrderTarget`, the one post-claim writer, touches
+     * only `owes[].version` — so this is the schema as it stood at claim time;
+     * a def edited mid-run leaves the projected schema and the enforced one
+     * able to disagree, exactly as `defDigest` already records for the rest of
+     * the order.
      */
     schema?: JsonSchema;
     /**
@@ -346,8 +347,10 @@ export interface RunData {
   cause?: FiringTrigger;
   /** The flattened order packet issued at claim time (§8 / Gap 1) — the exact
    *  Order buildOrder emitted, written in the SAME transaction that created
-   *  this run. Immutable after insert: updateRun never touches it. The
-   *  replay/eval/paper-trail record (buildOrder is deterministic modulo run
+   *  this run. `updateRun` never touches it, so no close/outcome write can
+   *  clobber it; `Store.restampOrderTarget` is the single narrow exception,
+   *  rewriting one `owes[].version` when a reject re-arms a still-open claim.
+   *  The replay/eval/paper-trail record (buildOrder is deterministic modulo run
    *  id). Absent on runs created before schema v7. */
   order?: Order;
 }

@@ -1956,12 +1956,17 @@ export class Engine {
         // land, not the currently-committed one: `green()` writes
         // `art.version + 1`, so that is the version a consumer will later see
         // and check a submission proof against. Issued by the engine inside the
-        // claim transaction and persisted with the immutable order, so every
-        // retry of the same claim reads the same target. Refusal paths that
-        // leave the run open (schema-reject) do NOT bump the artifact, so the
-        // target stays correct across in-claim retries; a path that does commit
-        // closes the run, and a stale target then fails the consumer's version
-        // check — a refusal, never an admitted unverified value.
+        // claim transaction and persisted with the order.
+        //
+        // The target stays correct across every in-claim retry that does NOT
+        // move the artifact — the schema reject and the artifact-bind reject in
+        // `green()` leave the run open without bumping `version`. A judgment or
+        // human reject also leaves the claim open, but it FOLLOWS a commit that
+        // already bumped the artifact, so the frozen target is one behind from
+        // that point on. `restampOwedTarget` re-stamps it at the reject site
+        // for exactly that case; see its doc comment. A stale target that
+        // escaped anyway fails the consumer's version check — a refusal, never
+        // an admitted unverified value.
         version: (a?.version ?? 0) + 1,
         judgmentRejects: a?.judgmentRejects ?? 0,
         schemaRejects: a?.schemaRejects ?? 0,
@@ -2621,6 +2626,12 @@ export class Engine {
         approvals: undefined,
 				reasons: [...art.reasons, reason('reject', 'judgment', by, text, art.version, requested)],
       });
+      // The producer's claim survives this reject (settle() writes artifact rows
+      // only), so its frozen target is now one behind the version the next
+      // commit will land. `art` is the pre-write snapshot and a reject does not
+      // bump `version`, so `art.version + 1` is the same expression buildOrder
+      // stamps at issue.
+      this.restampOwedTarget(workflow, art.producer, path, art.version + 1);
       this.settle(workflow, def);
       return { outcome: 'rejected' };
     });
@@ -2689,6 +2700,11 @@ export class Engine {
         approvals: undefined,
 				reasons: [...childArt.reasons, reason('reject', 'judgment', `parent:${by}` as Author, text, childArt.version, requested)],
       });
+      // Same stranding as the plain reject above, one instance down: the child's
+      // producing step can hold an open claim in the CHILD workflow. The parent
+      // `calls` artifact reopened below needs no re-stamp — a `calls:` step never
+      // becomes a worker order (src/model.ts), so no claim owes it.
+      this.restampOwedTarget(child.id, childArt.producer, childOutcomeStem, childArt.version + 1);
       this.settle(child.id, childDef);
 
       // Parent calls artifact → reopened to owed (not left rejected), pinned
@@ -3359,6 +3375,34 @@ export class Engine {
       ...(clearApprovals ? { approvals: undefined } : {}),
       reasons: [...art.reasons, reason(action, rejectKind, 'engine', op.reason, art.version)],
     });
+  }
+
+  /**
+   * Re-stamp the owed version target for `path` on any OPEN claim that owes it.
+   *
+   * The target frozen at claim issue is `committed + 1`. That stays correct for
+   * every refusal that leaves the run open WITHOUT bumping the artifact (the
+   * schema reject and the artifact-bind reject in `green()`). It goes stale for
+   * a judgment/human reject, which is preceded by a commit that already bumped
+   * the artifact and which leaves the SAME claim live to retry: the next commit
+   * lands `committed + 1` from the new committed version, while the producer is
+   * still signing the old number into its proof's `produced[].version`. The
+   * proof row is then stored under a key the envelope does not name, and the
+   * consumer's version check refuses the artifact.
+   *
+   * Matching is by owed path, not by task key, so it is correct for map
+   * elements without re-deriving the binding key. Runs inside the caller's open
+   * tx (plain store writes, no nested tx).
+   */
+  private restampOwedTarget(workflow: string, producer: string, path: string, target: number): void {
+    for (const task of this.store.listTasks(workflow)) {
+      if (task.step !== producer || task.status !== 'claimed' || task.run === undefined) continue;
+      // A closed run's next claim rebuilds the order from scratch and already
+      // gets a fresh target, so only an open one can strand.
+      const run = this.store.getRun(task.run);
+      if (!run || run.outcome !== undefined) continue;
+      this.store.restampOrderTarget(task.run, path, target);
+    }
   }
 
   /**
