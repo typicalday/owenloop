@@ -30,7 +30,7 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
-import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -125,6 +125,8 @@ interface RawStep {
   spec?: unknown;
   /** Per-step escalation rule: `{ after: <n>, modifier: <declared value> }`. */
   escalation?: unknown;
+  /** Cleanup-on-cancel declaration: `{ consumes: [<stem>...] }`. */
+  onCancel?: unknown;
 }
 /** Keys valid on a normal (non-calls:, non-include:) step entry. */
 const RAW_STEP_KEYS = [
@@ -132,7 +134,7 @@ const RAW_STEP_KEYS = [
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'workdirFrom', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
   'calls', 'reapTtl', 'capabilities', 'maxLease', 'x', 'executor', 'command', 'spec',
-  'escalation',
+  'escalation', 'onCancel',
 ] as const;
 
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
@@ -280,6 +282,20 @@ function parseEscalation(v: unknown, ctx: string): EscalationDef {
   const modifier = asString(raw['modifier'], `${ctx}.modifier`);
   if (modifier.trim().length === 0) throw new DefError(`${ctx}.modifier must not be empty`);
   return { after, modifier };
+}
+
+/** Parse a step's `onCancel:` block. Stem-membership cross-checks live in
+ *  validateDef because they need the step's parsed consumes. */
+function parseOnCancel(v: unknown, ctx: string): OnCancelDef {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new DefError(`${ctx} must be a mapping of { consumes }`);
+  }
+  const raw = v as Record<string, unknown>;
+  assertNoUnknownKeys(raw, ['consumes'] as const, ctx);
+  if (raw['consumes'] === undefined) {
+    throw new DefError(`${ctx} must set 'consumes' (the subset of the step's consumes the cancel-path firing requires; use [] for none)`);
+  }
+  return { consumes: asStringArray(raw['consumes'], `${ctx}.consumes`) };
 }
 
 function asNumber(v: unknown, fallback: number, ctx: string): number {
@@ -865,6 +881,12 @@ function prefixStep(step: StepDef, prefix: string, defInputs: readonly string[] 
   // judges: marker names a local stem (unlike calls:, which names an external
   // workflow) — it must be prefixed to keep pointing at the (now-prefixed) produce.
   const newJudges = step.judges !== undefined ? prefixStem(step.judges) : undefined;
+  // onCancel consumes name local stems, so they must follow the same prefixing
+  // rule as ordinary consumes. Build a fresh object to avoid aliasing a child
+  // definition into an expanded parent.
+  const newOnCancel = step.onCancel !== undefined
+    ? { consumes: step.onCancel.consumes.map(prefixStem) }
+    : undefined;
 
   // workdirFrom names a local consumed stem or a declared input of the included
   // definition, followed by a dotted value path. Prefix only the stem; the value
@@ -889,6 +911,7 @@ function prefixStep(step: StepDef, prefix: string, defInputs: readonly string[] 
   if (newGenerates !== undefined) result.generates = newGenerates;
   if (newEffect !== undefined) result.effect = newEffect;
   if (newJudges !== undefined) result.judges = newJudges;
+  if (newOnCancel !== undefined) result.onCancel = newOnCancel;
   if (newWorkdirFrom !== undefined) result.workdirFrom = newWorkdirFrom;
   return result;
 }
@@ -991,7 +1014,19 @@ export function expandIncludes(
           const outer = parsed ? inputRewrites.get(parsed.stem) : undefined;
           if (parsed && outer !== undefined) rewrittenWorkdirFrom = `${outer}.${parsed.path}`;
         }
-        return { ...l, consumes: rewrittenConsumes, workdirFrom: rewrittenWorkdirFrom };
+        // onCancel consume stems follow ordinary consume rewrites for mapped
+        // child inputs; otherwise the expanded step would name a stem it no
+        // longer consumes.
+        const rewrittenOnCancel = l.onCancel === undefined
+          ? undefined
+          : { consumes: l.onCancel.consumes.map((stem) => inputRewrites.get(stem) ?? stem) };
+        const rewrittenStep: StepDef = {
+          ...l,
+          consumes: rewrittenConsumes,
+          workdirFrom: rewrittenWorkdirFrom,
+        };
+        if (rewrittenOnCancel !== undefined) rewrittenStep.onCancel = rewrittenOnCancel;
+        return rewrittenStep;
       });
 
       resultSteps.push(...rewrittenSteps);
@@ -1213,7 +1248,8 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     for (const tok of rawOn) {
       if (tok !== 'inputsGreen' && tok !== 'allGreen' && tok !== 'idle') {
         throw new DefError(
-          `step '${name}': on: token '${tok}' is not supported; supported: 'inputsGreen', 'allGreen', 'idle'`,
+          `step '${name}': on: token '${tok}' is not supported; supported: 'inputsGreen', 'allGreen', 'idle'. ` +
+          'Cleanup that must still run when the run is cancelled is declared with the step-level onCancel: key, not a firing trigger.',
         );
       }
     }
@@ -1237,6 +1273,9 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   }
   if (rl.escalation !== undefined) {
     step.escalation = parseEscalation(rl.escalation, `step '${name}'.escalation`);
+  }
+  if (rl.onCancel !== undefined) {
+    step.onCancel = parseOnCancel(rl.onCancel, `step '${name}'.onCancel`);
   }
   // A3: per-step max total lease lifetime (duration string, same as reapTtl).
   if (rl.maxLease !== undefined) {
@@ -1520,7 +1559,7 @@ export function validateDef(def: WorkflowDef): string[] {
       if (tok !== 'inputsGreen' && tok !== 'allGreen' && tok !== 'idle') {
         errors.push(
           `step '${l.name}': on: token '${tok}' is not supported; ` +
-          `supported: 'inputsGreen', 'allGreen', 'idle'.`,
+          `supported: 'inputsGreen', 'allGreen', 'idle'. Cleanup that must still run when the run is cancelled is declared with the step-level onCancel: key, not a firing trigger.`,
         );
       }
     }
@@ -1546,6 +1585,34 @@ export function validateDef(def: WorkflowDef): string[] {
     const triggers = l.on ?? ['inputsGreen'];
     if (triggers.some((t) => t === 'allGreen' || t === 'idle') && l.consumes.length > 0) {
       errors.push(`evaluator step ${l.name} (on: allGreen/idle) must not declare consumes; its firings carry no input fingerprint`);
+    }
+  }
+
+  // onCancel: cross-checks. A cancel-path firing is keyless and fires once, so
+  // it can require only the step's own plain consumes.
+  for (const l of def.steps) {
+    if (l.onCancel === undefined) continue;
+    const seen = new Set<string>();
+    for (const stem of l.onCancel.consumes) {
+      if (seen.has(stem)) {
+        errors.push(`step '${l.name}': onCancel.consumes lists '${stem}' more than once`);
+        continue;
+      }
+      seen.add(stem);
+      const consume = l.consumes.find((candidate) => candidate.stem === stem);
+      if (consume === undefined) {
+        errors.push(
+          `step '${l.name}': onCancel.consumes names '${stem}', which is not one of the step's consumes ` +
+          `[${l.consumes.map((candidate) => candidate.stem).join(', ')}]`,
+        );
+        continue;
+      }
+      if (consume.mode !== 'plain') {
+        errors.push(
+          `step '${l.name}': onCancel.consumes names '${stem}', which the step consumes in ${consume.mode} mode ` +
+          `('${consume.raw}'); the cancel-path firing is keyless, so only plain consumes may be listed`,
+        );
+      }
     }
   }
 
@@ -2025,6 +2092,14 @@ export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[
     ? [...deadEndWarnings(def), ...danglingReduceSuffixWarnings(def), ...unroutedCapabilityWarnings(def)]
     : [];
   return { errors, warnings };
+}
+
+/**
+ * The steps a def declares as cleanup-on-cancel, in definition order. The
+ * control plane calls this when it cancels a run.
+ */
+export function cancelCleanupSteps(def: WorkflowDef): StepDef[] {
+  return def.steps.filter((step) => step.onCancel !== undefined);
 }
 
 // ---- WS-6: scope-aware calls: target resolution -------------------------------

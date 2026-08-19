@@ -1853,3 +1853,65 @@ path still requires a pre-commit verifier and remains fail-closed when that
 adapter is not provided. The ingestor and verifier are separate concerns:
 ingestion makes the bundle's verified object available, while the verifier
 decides whether the install may commit it.
+
+## §31 Cleanup on cancellation (`onCancel:`)
+
+The engine's step grammar has a declarative cleanup marker:
+
+```yaml
+- name: deprovisioner
+  consumes: [merge, workspace]
+  onCancel:
+    consumes: [workspace]
+```
+
+This is deliberately a new step key rather than another `on:` token.
+
+| Existing key | What it means | Why it is not cleanup-on-cancel |
+|---|---|---|
+| `terminal: true` | A step's green is a destructive completion. | It says nothing about run lifecycle. |
+| `effect.onInvalidate` | Routes an already-green artifact after its inputs move. | Cancellation is not an input move. |
+| `on:` | Pure in-run firing vocabulary. | It has no lifecycle signal or per-trigger consume payload. |
+| `idleAfter:` | Duration sidecar for `on: [idle]`. | It is unrelated to cancellation. |
+| `x:` | Opaque extension map. | It cannot validate this declaration or catch typos. |
+
+Finally, `on:` is evaluated by the clock-free, state-pure
+`eligibleFirings(ArtifactMap, TimeFacts)`; cancellation is neither artifact
+state nor a time fact, and `WorkflowData` has no instance status. It therefore
+cannot be a scheduler trigger in this package.
+
+`onCancel:` is a mapping with exactly one required key, `consumes:`, a list of
+strings that may be empty. Every entry must be a unique stem from the owning
+step's own plain consumes. Map and reduce consumes have no key binding on a
+one-time cancellation firing and are refused. The key is refused on `calls:`
+steps by that grammar's smaller key allowlist. `allGreen` and `idle`
+evaluators may declare `onCancel:` only with an empty list because they cannot
+declare normal consumes. `terminal: true` together with `onCancel:` remains
+legal deliberately: the engine does not infer an author's cleanup policy.
+
+`onCancel:` is inert in the standalone engine. It does not affect
+`eligibleFirings`, `modelCheck`, the forward cascade, or done-ness. A host
+with no cancellation concept loads a definition carrying it with no behavior
+change.
+
+The control plane contract is:
+
+> **`onCancel:` contract.** When the control plane cancels a run of instance `W`:
+>
+> 1. Resolve `W`'s def — `WorkflowData.defSnapshot` when pinned (§28), otherwise by name.
+> 2. Select the cleanup steps: `cancelCleanupSteps(def)` (exported from `owenloop`), i.e. every
+>    step where `step.onCancel !== undefined`, in def order.
+> 3. For each such step `S`: if **every** stem in `S.onCancel.consumes` is green, dispatch an
+>    order for `S` whose inputs are exactly those stems and their values. If any is not green,
+>    `S` is not dispatchable — record that and do not block cancellation on it.
+> 4. `assertServableInstance` (`packages/hub-core/src/serving.ts`) must admit an order on a
+>    `cancelled` instance **only** when that order is for a step selected in step 2. Every other
+>    step stays refused, exactly as today.
+> 5. A step with no `onCancel:` is never dispatched after cancel — today's behaviour, unchanged.
+> 6. **Recommended, and the follow-on run's call to confirm:** hold the cancelled instance out of
+>    its final closed state until each dispatched cleanup step's produces settle (green, or
+>    exhausted per that step's `maxAttempts`). Closing immediately would reproduce the original
+>    defect in a slower form — the order exists but nothing waits for it.
+> 7. `onCancel:` is inert in the standalone engine. `eligibleFirings`, `modelCheck`, the forward
+>    cascade, and done-ness do not read it. A host with no cancellation concept loads and runs a
+>    def carrying it with no behaviour change.

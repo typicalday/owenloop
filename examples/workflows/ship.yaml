@@ -343,6 +343,9 @@ steps:
             branch:       { type: string, minLength: 1 }
             worktreePath: { type: string }
     on: [inputsGreen]       # fires exactly once when merge (terminal) AND workspace are green
+    onCancel:
+      consumes: [workspace] # cancelling must still reclaim the machine. merge is deliberately
+                             # absent: it is terminal and never greens on a cancelled run.
     model: fast             # mechanical git teardown
     reapTtl: 15m
     body: |
@@ -370,3 +373,7 @@ steps:
       time, so the artifact would be born-rejected on every firing. With
       inputsGreen the fingerprint matches and, once green, re-firing is
       suppressed because `merge` is terminal — so this runs exactly once.)
+
+      (Cancellation note: `onCancel:` is inert in the standalone engine. A
+      control plane that supports cancellation reads it to dispatch this
+      cleanup step with only the declared cancel-path inputs.)

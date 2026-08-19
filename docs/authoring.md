@@ -63,6 +63,8 @@ steps:
       onInvalidate: escalate   #   consulted only when idempotent: false (see below)
     on: [inputsGreen]          # optional; firing trigger (see below)
     idleAfter: 30m             # required when 'idle' is in on:
+    onCancel:                  # optional cleanup declaration (see below)
+      consumes: [workspace]    #   plain consume subset needed after cancellation
     invalidates: [plan]        # which input stems this step may invalidate
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
@@ -619,6 +621,38 @@ carry an empty input fingerprint, so a commit can never satisfy it, and
 `engine.setAlarm(workflow, step, at)` with an absolute timestamp — it overrides the
 relative `idleAfter` window and survives a process restart.
 `engine.nextAlarm(workflow)` tells an external scheduler when to wake the instance.
+
+## `onCancel:` — cleanup that survives cancellation
+
+`onCancel:` declares that a step is cleanup a control plane should dispatch when
+it cancels a run. It is **not** an `on:` firing trigger: the standalone engine
+has no run-cancellation state and never schedules it. A host that supports
+cancellation reads this declaration separately.
+
+The declaration names the inputs needed on the cancel path:
+
+```yaml
+- name: deprovisioner
+  consumes: [merge, workspace]  # normal path
+  onCancel:
+    consumes: [workspace]       # cancel path
+```
+
+The subset is explicit because cancellation can leave a normal input permanently
+non-green. In this example, `merge` is terminal and will not green after a
+cancel, so the control plane must not guess whether to wait for it or omit it.
+
+`onCancel:` must be a mapping with a required `consumes:` list; an empty list
+is allowed. Each listed name must be one of the step's own plain consumes, and a
+name may appear only once. Map (`[$i]`) and reduce (`[*]`) consumes are not
+allowed because a cancellation firing is keyless and runs once. The key is not
+valid on a `calls:` step. An `allGreen` or `idle` evaluator may carry
+`onCancel:`, but because evaluators cannot consume inputs, its list must be
+empty.
+
+`terminal: true` and `onCancel:` are deliberately compatible. Whether running
+a destructive step during cleanup is sensible is the workflow author's decision,
+not an engine policy.
 
 ## Consume / produce grammar
 

@@ -502,6 +502,23 @@ export interface EffectDef {
   onInvalidate?: 'pin' | 'escalate' | string;
 }
 
+/**
+ * Declares that a step is cleanup: it must still be dispatched when the run is
+ * cancelled, not only on the normal green path.
+ *
+ * This is not a firing trigger. `on:`/`FiringTrigger` is the in-run scheduler's
+ * vocabulary, evaluated from artifact state and time facts. Run cancellation is
+ * neither of those, so `onCancel:` is inert in this engine: it is a declaration
+ * the control plane reads when it cancels a run.
+ */
+export interface OnCancelDef {
+  /** The subset of the step's own plain consume stems the cancel-path firing
+   *  requires. Required, may be empty. This is explicit because a cleanup
+   *  step's normal consume set may include a terminal artifact that never
+   *  greens after cancellation, and the control plane must not guess inputs. */
+  consumes: string[];
+}
+
 /** A step (step) definition. */
 /**
  * A step's escalation rule (def-authored, engine-applied).
@@ -585,6 +602,8 @@ export interface StepDef {
   idleAfter?: string;
   /** Parsed idleAfter in milliseconds. */
   idleAfterMs?: number;
+  /** Cleanup-on-cancel declaration. Absent = no cancel-path dispatch. See OnCancelDef. */
+  onCancel?: OnCancelDef;
   /** Per-step reap TTL override in milliseconds. Falls back to the engine's DEFAULT_REAP_TTL_MS. */
   reapTtlMs?: number;
   /** A2: opaque routing capabilities for peer-orchestrator claim filtering. A tick

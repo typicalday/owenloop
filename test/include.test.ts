@@ -160,6 +160,47 @@ test('expandIncludes: repeated child aliases deep-clone nested judge x carriers'
   assert.deepEqual(validateDef(expanded), []);
 });
 
+test('expandIncludes: prefixes onCancel consumes without mutating the child definition', () => {
+  const childDef = buildDef({
+    name: 'cleanup-child',
+    inputs: [{ name: 'workspace' }],
+    steps: [{
+      name: 'deprovisioner',
+      consumes: ['workspace'],
+      produces: ['cleanup'],
+      onCancel: { consumes: ['workspace'] },
+      body: 'clean up',
+    }],
+  });
+  const parentDef = buildDef({
+    name: 'cleanup-parent',
+    steps: [{ include: 'cleanup-child', as: 'kid' }],
+  });
+
+  const expanded = expandIncludes(parentDef, makeResolver([childDef]));
+  const expandedStep = expanded.steps.find((step) => step.name === 'kid.deprovisioner')!;
+  const childStep = childDef.steps[0]!;
+
+  assert.deepEqual(expandedStep.onCancel, { consumes: ['kid.workspace'] });
+  assert.deepEqual(expandedStep.consumes.map((consume) => consume.stem), ['kid.workspace']);
+  assert.deepEqual(childStep.onCancel, { consumes: ['workspace'] });
+  assert.notStrictEqual(expandedStep.onCancel, childStep.onCancel);
+  assert.notStrictEqual(expandedStep.onCancel!.consumes, childStep.onCancel!.consumes);
+  assert.deepEqual(validateDef(expanded), []);
+
+  const mappedParent = buildDef({
+    name: 'mapped-cleanup-parent',
+    inputs: [{ name: 'outer-workspace' }],
+    steps: [{ include: 'cleanup-child', as: 'kid', inputs: { workspace: 'outer-workspace' } }],
+  });
+  const mapped = expandIncludes(mappedParent, makeResolver([childDef]));
+  assert.deepEqual(
+    mapped.steps.find((step) => step.name === 'kid.deprovisioner')!.onCancel,
+    { consumes: ['outer-workspace'] },
+  );
+  assert.deepEqual(validateDef(mapped), []);
+});
+
 // ---- (b) Mapped input becomes internal consume edge, NOT a new input --------
 
 test('(b) expandIncludes: mapped input is not hoisted — parent inputs unchanged', () => {
