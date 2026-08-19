@@ -335,14 +335,16 @@ export interface CreateOpts {
   /** Mode 2: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; used only to cascade the child's outcome back up. */
   producedBy?: { parentWf: string; parentPath: string };
   /**
-   * The ONE routing modifier this instance carries for its whole life. Must be
-   * a member of the def's declared `modifiers` set — `createInstance` throws
+   * The ONE routing modifier this instance carries at a time. Must be a member
+   * of the def's declared `modifiers` set — `createInstance` throws
    * {@link ModifierRefusalError} otherwise, rather than starting a run that
-   * would compose capabilities no crew was ever bound to.
+   * would compose capabilities no crew was ever bound to. After creation, the
+   * engine may replace it only through a def-declared artifact bind during
+   * acceptance.
    *
    * Absent = an unmodified run: every step is offered on bare capabilities.
-   * Never mutated after creation; an escalated re-offer carries its own target
-   * modifier per-offer without rewriting this.
+   * An escalated re-offer carries its own target modifier per-offer without
+   * rewriting this stored value.
    */
   modifier?: string;
 }
@@ -551,8 +553,9 @@ export class Engine {
     if (opts.params !== undefined) wfData.params = opts.params;
     // Validated against the SNAPSHOT being pinned on this same row, not
     // against a live re-resolution — the modifier and the vocabulary that
-    // legitimizes it are stamped together and stay consistent for the life of
-    // the instance, even if the def is republished with a different set.
+    // legitimizes it are stamped together. Later bound-artifact writes still
+    // validate against this pinned vocabulary, even if the def is republished
+    // with a different set.
     if (opts.modifier !== undefined) {
       const declared = def.modifiers ?? [];
       if (!declared.includes(opts.modifier)) {

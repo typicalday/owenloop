@@ -358,9 +358,11 @@ export interface WorkflowData {
   params?: Record<string, string>;
   /**
    * The ONE modifier this run carries, validated against the def's declared
-   * `modifiers` set when the run is created and immutable thereafter — no
-   * step, worker or judge can write it (only `start_run` sets it; escalation
-   * overrides it per-offer without changing it here).
+   * `modifiers` set when the run is created. The starter supplies the initial
+   * value; after that, only the engine may replace it while accepting an
+   * artifact whose def-declared bind targets `modifier`. No step, worker, or
+   * judge writes it directly; escalation still overrides it per-offer without
+   * changing the stored value.
    *
    * Absent = an unmodified run: every step is offered on bare capabilities.
    * Deletes with the run, like the rest of the row.

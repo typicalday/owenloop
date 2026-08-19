@@ -1689,7 +1689,7 @@ addressed by digest.
 record or throws the named refusal; `resolveOrder(order)` builds the
 `{defDigest, step, key}` ref from an order and additionally materializes the
 runtime placeholders in the resolved prompt — the same substitution
-`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}` that
+`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MODIFIER}`/`${MAX_ATTEMPTS}` that
 `buildOrder` used to inline, moved whole to resolution time (unknown
 placeholders stay untouched; `MAX_ATTEMPTS` renders the `maxAttempts` metadata
 from the resolved instruction record). Substitution

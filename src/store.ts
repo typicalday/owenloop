@@ -636,10 +636,11 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'def_hash')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
     }
-    // Routing modifier: the ONE modifier this instance carries, set once at
-    // creation and never written again. NULL on every pre-existing row, which
-    // is exactly right — an instance created before modifiers existed is an
-    // unmodified run and every step is offered on bare capabilities. No
+    // Routing modifier: the ONE modifier this instance carries. The starter
+    // supplies its initial value; a def-declared artifact bind may later update
+    // it through the engine's routing writer. NULL on every pre-existing row,
+    // which is exactly right — an instance created before modifiers existed is
+    // an unmodified run and every step is offered on bare capabilities. No
     // backfill: there is no value to invent.
     if (!wfCols.some((c) => c.name === 'modifier')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN modifier TEXT`);

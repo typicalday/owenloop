@@ -41,7 +41,8 @@ steps:
           properties: { plan: { type: string } }
         # maxAttempts: 2       # optional; overrides the step's maxAttempts (below)
         # maxSchemaFailures: 1 #   just for this produce — see design.md §6
-    body: |                    # the prompt; ${WORKFLOW} ${RUN} ${INDEX} are filled in
+        # bind: modifier       # accepted value writes through to run routing
+    body: |                    # the prompt; runtime placeholders are filled in when available
       Read the proposal and produce a `plan`.
     bodyFile: path/to.md       # load body from a file, relative to this workflow's dir (must resolve inside it); mutually exclusive with body
 
@@ -225,7 +226,9 @@ full contract.
 A command step's `consumes:` reach the command through its environment, not its
 working directory: `owenloop work exec` sets `OWENLOOP_CONSUMES` with the JSON
 inline, or `OWENLOOP_CONSUMES_FILE` with a path to it once that JSON exceeds
-64 KiB. See [`docs/bundles.md` § Consumed inputs for command
+64 KiB. The worker also supplies rejection feedback and the order's current
+modifier through `OWENLOOP_FEEDBACK`/`OWENLOOP_FEEDBACK_FILE` and
+`OWENLOOP_MODIFIER`. See [`docs/bundles.md` § Consumed inputs for command
 steps](bundles.md#consumed-inputs-for-command-steps) for the reader snippet and
 the omitted-key rule.
 
@@ -313,6 +316,51 @@ if nothing consumes it. A stem under `generates:` is deliberately consumed by no
 (an audit log, an external artifact, a stub); lint leaves it alone. Generated artifacts
 are otherwise identical: schema-validated, fingerprinted, greenable, and visible in
 `status`/`show`.
+
+## `bind:` — write an accepted artifact into run state
+
+A produce mapping may declare a `bind:` target. When that artifact is accepted,
+the engine writes the selected value into the run instance in the same
+acceptance transaction. The artifact's own version and event history remains the
+record of the value and any later rejection; the bind adds the engine's sync
+event.
+
+The short form binds the whole accepted value:
+
+```yaml
+modifiers: [express, standard, deep]
+steps:
+  - name: choose_modifier
+    produces:
+      - name: modifier
+        bind: modifier
+```
+
+The mapping form selects a dotted object path. It is equivalent to the short
+form when `from` is omitted:
+
+```yaml
+      - name: decision
+        bind: { to: modifier, from: payload.value }
+```
+
+The two supported target families are:
+
+- `modifier` — the extracted value must be one whitespace-free member of the
+  workflow's declared `modifiers:` list. A workflow may bind `modifier` only
+  once. An invalid value is refused at submit time.
+- `meta.<key>` — writes any JSON value into non-routing instance metadata.
+  Metadata never changes capability composition or routing.
+
+`from` is a dot-separated path through object keys; arrays, escaping, and array
+indexes are not part of this grammar. A missing path is a submit-time refusal.
+Bindings are supported on singleton and map produces, not collection produces.
+Only a green acceptance applies the bind: a producer submission that is waiting
+for judges has not synchronized the run yet.
+
+When a capability-bearing step can run before the modifier-bound artifact is
+accepted, lint warns that the step is not downstream of the bound artifact.
+Wire the dependency explicitly if that step must use the synchronized modifier.
 
 ## `judges:` — quality gates before green
 

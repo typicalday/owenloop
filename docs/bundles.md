@@ -255,6 +255,30 @@ consume-side verification under its hard rule and refuses the whole order when
 the consumed evidence is absent, unverifiable, or invalid, so the environment
 block is built only for an order whose inputs already verified.
 
+### Rejection feedback and modifier context
+
+When an order has owed paths with non-empty reason threads, `owenloop work exec`
+also supplies the feedback as a JSON array through one of these variables:
+
+| Variable | Set when | Value |
+| --- | --- | --- |
+| `OWENLOOP_FEEDBACK` | serialized feedback is at or under 65536 bytes | inline array of `{path, reasons}` objects |
+| `OWENLOOP_FEEDBACK_FILE` | serialized feedback is strictly larger | absolute path to a private `0600` UTF-8 file containing that array |
+
+Exactly one feedback variable is present when feedback exists; both are removed
+when there is no feedback, so a nested command cannot inherit a stale thread.
+The overflow file is removed after the command exits. Each `reasons` entry is
+the normal artifact reason shape and may include `requested`, the machine-readable
+replacement requested for a bound modifier artifact.
+
+`OWENLOOP_MODIFIER` is set to the modifier stamped on this order, including an
+escalation target when the order is an escalated re-offer. It is absent when the
+run has no modifier. This is order metadata, not an instruction to mutate the
+run; only an accepted artifact with a declared bind can do that.
+
+An agent prompt can read the same value as `${MODIFIER}`. Unknown placeholders
+remain unchanged; when an order has no modifier, `${MODIFIER}` remains literal.
+
 ## Working directory for command steps
 
 An order carries a `workdir` when its step declared `workdir:` or
