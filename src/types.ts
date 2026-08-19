@@ -346,8 +346,10 @@ export interface RunData {
   cause?: FiringTrigger;
   /** The flattened order packet issued at claim time (§8 / Gap 1) — the exact
    *  Order buildOrder emitted, written in the SAME transaction that created
-   *  this run. Immutable after insert: updateRun never touches it. The
-   *  replay/eval/paper-trail record (buildOrder is deterministic modulo run
+   *  this run. `updateRun` never touches it, so no close/outcome write can
+   *  clobber it; `Store.restampOrderTarget` is the single narrow exception,
+   *  rewriting one `owes[].version` when a reject re-arms a still-open claim.
+   *  The replay/eval/paper-trail record (buildOrder is deterministic modulo run
    *  id). Absent on runs created before schema v7. */
   order?: Order;
 }

@@ -91,13 +91,21 @@ version the next successful commit lands (claim-time committed version + 1), and
 therefore the version the consumer supplies to `verifyConsumed` as
 `expectedVersion`.
 
-The target is retry-safe because the engine computes it inside the claim
-transaction and persists it with the immutable order. Every read of that claim
-returns the same number, so a refinement, a committed submit whose response was
-lost, an unsigned commit, or a client process restart cannot move it. Refusal
-paths that leave the run open do not bump the artifact, and a refinement is a
-new claim with a newly issued target. A stale target fails the consumer's
-version check — a refusal, never an admitted unverified value.
+The target is retry-safe because the engine issues it inside the claim
+transaction and persists it with the order rather than leaving a client to guess
+one: a refinement is a new claim with a newly issued target, and an unsigned
+commit or a client process restart does not move it.
+
+One thing does move it, deliberately. A judgment or human reject leaves the same
+claim live to retry and follows a commit that already bumped the artifact, so
+the engine re-stamps that claim's `owes[].version` from the current committed
+version at the reject site. Refusal paths that leave the run open without
+bumping the artifact (a schema reject) leave it untouched. A client must
+therefore re-read the target off the order on every submit and never cache it.
+A committed submit whose response was lost and is then replayed is a separate,
+still-open residual: it bumps the artifact with no reject in between, so nothing
+re-stamps the target and it strands one behind. A stale target fails the
+consumer's version check — a refusal, never an admitted unverified value.
 
 A target counts as authoritative only when it is a positive integer, since the
 smallest commit a producer can land is v1. Given an absent target, a `0`, or a

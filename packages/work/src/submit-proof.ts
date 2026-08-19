@@ -114,14 +114,17 @@ function submissionFingerprint(
  *     the proof against.
  *
  * Retry-safety comes from the hub, not from this function. The target is
- * computed once inside the claim transaction and persisted with the immutable
- * order, so every retry of the same claim — a reconnect, a lost response, a
- * restarted holder — reads the same number. The engine's refusal paths that
- * leave the run open (schema-reject) do not bump the artifact, so the target
- * survives in-claim retries; a refinement is a NEW claim and therefore a newly
- * issued target. If a target ever did go stale, the consumer's version check
- * refuses the artifact. The failure mode is a refusal, never an admitted
- * unverified value.
+ * issued inside the claim transaction and persisted with the order, so a
+ * reconnect, a lost response, or a restarted holder re-reads the same number
+ * rather than guessing one; a refinement is a NEW claim and therefore a newly
+ * issued target. It is not, however, frozen for the life of the claim. A
+ * refusal that leaves the run open without bumping the artifact (a schema
+ * reject) leaves the target correct, but a judgment/human reject FOLLOWS a
+ * commit that already bumped it, so the engine re-stamps the target on the
+ * still-open claim at the reject site — this function simply re-reads whatever
+ * the current order says, which is why it must never cache one. If a target
+ * does go stale anyway, the consumer's version check refuses the artifact. The
+ * failure mode is a refusal, never an admitted unverified value.
  *
  * A hub that projects no `owes[].version` (pre-version-aware) yields
  * `undefined`, and the caller submits unsigned rather than signing a guess.
