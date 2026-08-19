@@ -27,18 +27,26 @@ Do not collapse these — the rest of this page depends on telling them apart.
    stderr are what `<run>.log` holds.
 3. **The command a worker runs** — the `command:` text of a command step,
    executed by the worker under `/bin/sh -c`. **Its** streams are captured into
-   the receipt the worker submits to the hub, and the worker relays the captured
-   tail (≤4 KiB) into its own output so a copy reaches `<run>.log`.
+   the `CommandReceipt`. On success, the worker submits that receipt to the hub;
+   on failure, it sends the receipt as diagnostic context on an `ask` and
+   submits no artifact. In both cases the worker relays the captured tail (≤4
+   KiB) into its own output so a copy reaches `<run>.log`.
 
 The worker never **inherits** the command's streams. Every relayed line carries
-the literal `  | ` prefix. Both the receipt and `<run>.log` contain the
-captured tail; full streams are represented only by the receipt's output hash
-and stdout/stderr byte counts.
+the literal `  | ` prefix. The receipt and `<run>.log` contain the captured
+tail; for a failed command, the receipt is ask context rather than an artifact.
+Full streams are represented only by the receipt's output hash and stdout/stderr
+byte counts.
 
 | Command outcome | Worker channel | Header |
 | --- | --- | --- |
 | exit 0 and no machinery error | stdout | `… the command for step 'X' succeeded; its output follows` |
 | anything else | stderr | `… the command for step 'X' exited N` / `was killed by …` / `could not be run (…)`; `its last output follows` |
+
+An ordinary command that fails raises an `ask` on its first owed path with the
+receipt and captured output as diagnostics. Nothing is greened, and the owed
+artifact waits for a human retry; additional owed paths remain debts because
+`ask` closes the run.
 
 Under shift dispatch fd 1 and fd 2 both point at the same file, so the header —
 not the channel — is what tells these outcomes apart in `<run>.log`. The two

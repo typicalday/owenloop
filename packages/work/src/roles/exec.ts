@@ -142,6 +142,8 @@ export function exitCodeFor(outcome: ExecOutcome): number {
     case 'hub-unreachable':
     case 'submit-rejected':
     case 'submit-failed':
+    case 'command-failed':
+    case 'ask-failed':
     case 'judge-no-verdict':
     case 'reject-failed':
     case 'stopped':

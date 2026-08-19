@@ -105,7 +105,7 @@ test('parseArgs reads --shift, both value forms', () => {
 
 test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: ExecOutcome[] = ['submitted', 'completed', 'rejected', 'judge-rejected'];
-  const one: ExecOutcome[] = ['misroute', 'unresolved-instructions', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'submit-rejected', 'submit-failed', 'judge-no-verdict', 'reject-failed', 'stopped'];
+  const one: ExecOutcome[] = ['misroute', 'workdir-denied', 'unresolved-instructions', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'submit-rejected', 'submit-failed', 'command-failed', 'ask-failed', 'judge-no-verdict', 'reject-failed', 'stopped'];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
   for (const o of one) assert.equal(exitCodeFor(o), 1);
 });

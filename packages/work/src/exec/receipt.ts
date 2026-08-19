@@ -1,15 +1,15 @@
 /**
- * The command receipt (C5, plan decision 8) — the audit record exec submits for
- * an ordinary command order, and for a judge order that exits 0. The hub `submit`
- * verb has no failure channel, so a non-zero `exitCode` (or `exitCode: null` +
- * `error` for machinery failure) carries the command result. A non-zero judge
- * exit uses `reject` instead of a receipt, and signal-killed work submits neither.
- * Pure construction so it is trivially asserted in tests.
+ * The command receipt (C5, plan decision 8) — the artifact value exec submits
+ * only for a successful ordinary command and for a judge that exits 0. Because
+ * the hub `submit` verb has no failure channel, a failed ordinary command puts
+ * this same receipt in `hub.ask`'s diagnostic context and submits nothing. A
+ * non-zero judge exit uses `reject` instead, and signal-killed work submits
+ * neither. Pure construction so it is trivially asserted in tests.
  */
 import { parsePayloadLine, type ParsedPayload } from './payload.ts';
 import type { CommandResult } from './runner.ts';
 
-/** The submitted artifact value for a command order. */
+/** A command's artifact value on success, or failure diagnostics in `hub.ask` context. */
 export interface CommandReceipt {
   kind: 'command-receipt';
   command: string;

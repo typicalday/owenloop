@@ -384,8 +384,30 @@ out of the `CommandReceipt`; malformed or over-cap JSON produces
 `payloadError` and no `payload`, while leaving the command exit code unchanged.
 When the hub supplies authoritative output-version metadata and the driver can
 sign, the parsed payload is part of the receipt value covered by the DSSE
-submission proof. Current producer command receipts are unsigned because the
-deployed hub does not supply a retry-safe target version.
+submission proof. Current successful producer command receipts are unsigned
+because the deployed hub does not supply a retry-safe target version.
+
+An ordinary command submits its complete `CommandReceipt` only when it exits
+successfully without a machinery error. A non-zero exit or machinery error is
+not submitted as an artifact; the worker escalates it through `ask` on the
+first owed path instead:
+
+```json
+{
+  "workflow": "<workflow>",
+  "run": "<run>",
+  "path": "<owed artifact path>",
+  "question": "<operator-facing failure diagnosis>",
+  "context": "<JSON-encoded CommandReceipt>"
+}
+```
+
+The question identifies the command, exit code or signal, machinery error when
+present, output byte counts, output hash, and captured output tail. The receipt
+in `context` is diagnostic data, not a submitted value. A successful `ask`
+freezes the owed artifact and closes the run; a human answers with the
+artifact's retry path. Only the first owed path is escalated because `ask`
+closes the run, so additional owed paths remain debts.
 
 When a valid payload contains a plain-step `reject`, the command worker sends
 the directive's `text` as the reject reason and, when command output is
