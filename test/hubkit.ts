@@ -15,7 +15,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { credentialSlot, hashDefForHub, keychainServiceFor } from '../src/hub.ts';
-import type { CredentialSlotSelector } from '../src/hub.ts';
+import type { CapabilityPublishReportEntry, CredentialSlotSelector } from '../src/hub.ts';
+import { parse as parseYaml } from 'yaml';
+import { parseDef } from '../src/defs.ts';
+import { capabilityName } from '../src/capabilities.ts';
 import { canonicalKeyRef } from '../src/crypto/keys.ts';
 import type { EnsureKeyResult, InspectKeyResult, PrincipalKeyRef, PublicKeyDescriptor } from '../src/crypto/keys.ts';
 import type { PrincipalKeyManager } from '../src/crypto/keys.ts';
@@ -445,13 +448,102 @@ export function workflowsRoute(
  * would be against the real hub — a genuinely-unchanged push resolves with
  * zero `create_workflow` calls, not merely a server-side no-op.
  */
-export function makeFakeHub(seed: { name: string; yaml: string; version?: number }[] = []): {
+export interface FakeHubOpts {
+  /**
+   * Both capability-mapping routes answer 404 — a hub build that does not have
+   * them at all. This is the DEFAULT SHAPE OF EVERY SHIPPED HUB TODAY (no
+   * `owenloop-service` build implements the mapping write), so it is what the
+   * fail-closed tests drive; the implemented routes below model the contract
+   * `src/capability-mapping-client.ts` proposes.
+   */
+  mappingsUnsupported?: boolean;
+  /** Seed `GET /api/capability_routes` — ONE row per `(capability, crew)` pair. */
+  capabilityRoutes?: { capability: string; crewId: string; crewName: string | null }[];
+  /** Seed already-recorded `authored → org` mappings, keyed by def name. */
+  mappings?: Record<string, Record<string, string>>;
+}
+
+/**
+ * The org capability names one def resolves to, in first-authored order, given
+ * its recorded mappings — the fake's copy of the hub's `orgCapabilitiesOf`.
+ */
+function fakeOrgCapabilities(yaml: string, mappings: Record<string, string>): { authored: string; org: string }[] {
+  let def;
+  try {
+    def = parseDef(parseYaml(yaml));
+  } catch {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: { authored: string; org: string }[] = [];
+  for (const step of def.steps) {
+    for (const authored of step.capabilities ?? []) {
+      const org = mappings[authored] ?? authored;
+      if (seen.has(org)) continue;
+      seen.add(org);
+      out.push({ authored, org });
+    }
+  }
+  return out;
+}
+
+export function makeFakeHub(
+  seed: { name: string; yaml: string; version?: number }[] = [],
+  opts: FakeHubOpts = {},
+): {
   routes: Record<string, RouteHandler>;
   state: Map<string, { yaml: string; version: number }>;
+  /** The in-memory `capability_mappings` table, keyed by def name. */
+  mappings: Map<string, Record<string, string>>;
 } {
   const state = new Map<string, { yaml: string; version: number }>(
     seed.map((w) => [w.name, { yaml: w.yaml, version: w.version ?? 1 }]),
   );
+  const mappings = new Map<string, Record<string, string>>(
+    Object.entries(opts.mappings ?? {}).map(([def, m]) => [def, { ...m }]),
+  );
+  const capabilityRoutes = opts.capabilityRoutes ?? [];
+
+  /**
+   * The hub's `buildCapabilityPublishReport`, reproduced: entries in
+   * first-authored order keyed by ORG name, `authored` present only when a
+   * mapping changed it, `bound` when a LIVE crew route matches the name part,
+   * else `shared` when another live def resolves to the same org name.
+   */
+  const buildReport = (name: string, yaml: string): CapabilityPublishReportEntry[] => {
+    const own = mappings.get(name) ?? {};
+    const entries: CapabilityPublishReportEntry[] = fakeOrgCapabilities(yaml, own).map(({ authored, org }) => ({
+      capability: org,
+      ...(org === authored ? {} : { authored }),
+      status: 'new' as const,
+    }));
+    if (entries.length === 0) return entries;
+    for (const entry of entries) {
+      const crews = [
+        ...new Set(
+          capabilityRoutes
+            .filter((r) => capabilityName(r.capability) === entry.capability && r.crewName !== null)
+            .map((r) => r.crewName!),
+        ),
+      ].sort();
+      const sharedWith = [...state.entries()]
+        .filter(([otherName]) => otherName !== name)
+        .filter(([otherName, other]) =>
+          fakeOrgCapabilities(other.yaml, mappings.get(otherName) ?? {}).some((c) => c.org === entry.capability),
+        )
+        .map(([otherName]) => otherName)
+        .sort();
+      if (crews.length > 0) {
+        entry.status = 'bound';
+        entry.crews = crews;
+      } else if (sharedWith.length > 0) {
+        entry.status = 'shared';
+      }
+      if (sharedWith.length > 0) entry.sharedWith = sharedWith;
+    }
+    return entries;
+  };
+
   const routes: Record<string, RouteHandler> = {
     'GET /api/workflows': () => ({
       status: 200,
@@ -465,6 +557,13 @@ export function makeFakeHub(seed: { name: string; yaml: string; version?: number
         })),
       },
     }),
+    'GET /api/capability_routes': () => ({
+      status: 200,
+      json: {
+        text: '',
+        bindings: capabilityRoutes.map((r) => ({ ...r, createdBy: 'user_abc', createdAt: 1 })),
+      },
+    }),
     'POST /api/create_workflow': (req) => {
       const body = JSON.parse(req.body ?? '{}') as { yaml?: string };
       const yaml = typeof body.yaml === 'string' ? body.yaml : '';
@@ -472,15 +571,51 @@ export function makeFakeHub(seed: { name: string; yaml: string; version?: number
       const nameMatch = /^name:\s*(\S+)/m.exec(yaml);
       const name = nameMatch ? nameMatch[1]! : '';
       const existing = state.get(name);
+      // The report is emitted on BOTH branches — including the idempotent no-op
+      // — and is `[]` for a def that authors no capabilities, so the CLI can
+      // tell "[] " from "field absent" (an older hub).
       if (existing && hashDefForHub(existing.yaml) === hash) {
-        return { status: 200, json: { ok: true, name, version: existing.version, hash, unchanged: true } };
+        return {
+          status: 200,
+          json: {
+            ok: true,
+            name,
+            version: existing.version,
+            hash,
+            unchanged: true,
+            capabilityReport: buildReport(name, yaml),
+          },
+        };
       }
       const version = existing ? existing.version + 1 : 1;
       state.set(name, { yaml, version });
-      return { status: 200, json: { ok: true, name, version, hash } };
+      return { status: 200, json: { ok: true, name, version, hash, capabilityReport: buildReport(name, yaml) } };
     },
   };
-  return { routes, state };
+
+  if (opts.mappingsUnsupported !== true) {
+    routes['GET /api/capability_mappings'] = (req) => ({
+      status: 200,
+      json: { ok: true, mappings: mappings.get(req.url.searchParams.get('def') ?? '') ?? {} },
+    });
+    routes['POST /api/set_capability_mappings'] = (req) => {
+      const body = JSON.parse(req.body ?? '{}') as { def?: string; mappings?: Record<string, string> };
+      const def = typeof body.def === 'string' ? body.def : '';
+      const current = { ...(mappings.get(def) ?? {}) };
+      // Identity rows are dropped, exactly as the hub's resolver drops them.
+      for (const [authored, org] of Object.entries(body.mappings ?? {})) {
+        if (org === authored) delete current[authored];
+        else current[authored] = org;
+      }
+      mappings.set(def, current);
+      return { status: 200, json: { ok: true } };
+    };
+  } else {
+    routes['GET /api/capability_mappings'] = () => ({ status: 404, json: { error: 'not_found' } });
+    routes['POST /api/set_capability_mappings'] = () => ({ status: 404, json: { error: 'not_found' } });
+  }
+
+  return { routes, state, mappings };
 }
 
 // ---- makeIdentityHub: the stateful fake for setup/doctor -------------------

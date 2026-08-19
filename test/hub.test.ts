@@ -13,7 +13,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parse as parseYamlText } from 'yaml';
 import {
+  asCapabilityMappings,
   asCreateWorkflowOk,
+  capabilityPublishReportText,
   asMintAgentTokenOk,
   asWhoami,
   base64url,
@@ -507,6 +509,88 @@ test('asCreateWorkflowOk: a malformed 2xx is an error, not a defaulted success (
     version: 2,
     hash: 'h',
   });
+});
+
+test('asCreateWorkflowOk: a well-formed capabilityReport survives narrowing, extra fields and all', () => {
+  const ok = asCreateWorkflowOk(
+    {
+      ok: true,
+      name: 'x',
+      version: 2,
+      hash: 'h',
+      capabilityReport: [
+        { capability: 'x.review', authored: 'review', status: 'bound', crews: ['reviewers'], unknownFuture: 1 },
+        { capability: 'triage', status: 'shared', sharedWith: ['other'] },
+        { capability: 'solo', status: 'new' },
+      ],
+    },
+    'x',
+  );
+  assert.deepEqual(ok.capabilityReport, [
+    { capability: 'x.review', status: 'bound', authored: 'review', crews: ['reviewers'] },
+    { capability: 'triage', status: 'shared', sharedWith: ['other'] },
+    { capability: 'solo', status: 'new' },
+  ]);
+});
+
+test('asCreateWorkflowOk: an ABSENT report and an EMPTY one are deliberately distinct', () => {
+  // `undefined` = a hub older than the report. `[]` = this def authors no
+  // capabilities. Collapsing them would make "nothing to say" indistinguishable
+  // from "this hub cannot say".
+  assert.equal(asCreateWorkflowOk({ ok: true, name: 'x', version: 2, hash: 'h' }, 'x').capabilityReport, undefined);
+  assert.deepEqual(
+    asCreateWorkflowOk({ ok: true, name: 'x', version: 2, hash: 'h', capabilityReport: [] }, 'x').capabilityReport,
+    [],
+  );
+});
+
+test('asCreateWorkflowOk: a malformed capabilityReport throws naming the field and index, never a value (REL-9)', () => {
+  const base = { ok: true, name: 'x', version: 2, hash: 'h' };
+  assert.throws(
+    () => asCreateWorkflowOk({ ...base, capabilityReport: {} }, 'x'),
+    /create_workflow: malformed success response — capabilityReport is not an array/,
+  );
+  assert.throws(
+    () => asCreateWorkflowOk({ ...base, capabilityReport: [{ capability: 'r', status: 'weird' }] }, 'x'),
+    /capabilityReport\[0\] status must be one of new, shared, bound/,
+  );
+  assert.throws(
+    () => asCreateWorkflowOk({ ...base, capabilityReport: [{ capability: 'r', status: 'bound', crews: 'reviewers' }] }, 'x'),
+    /capabilityReport\[0\] crews must be an array of non-empty strings when present/,
+  );
+  try {
+    asCreateWorkflowOk({ ...base, capabilityReport: [{ capability: 'secret-name', status: 'weird' }] }, 'x');
+    assert.fail('expected a throw');
+  } catch (e) {
+    assert.doesNotMatch((e as Error).message, /secret-name|weird/, 'the guard names the position, never echoes the body');
+  }
+});
+
+test('capabilityPublishReportText: one line per status, silent for an empty report', () => {
+  assert.equal(capabilityPublishReportText([]), '');
+  assert.equal(
+    capabilityPublishReportText([
+      { capability: 'x.review', authored: 'review', status: 'bound', crews: ['reviewers', 'seniors'] },
+      { capability: 'triage', status: 'shared', sharedWith: ['other'] },
+      { capability: 'solo', status: 'new' },
+    ]),
+    'Capabilities — review → x.review: bound (reviewers, seniors); ' +
+      'triage: shared with other; solo: new — nothing serves it yet.',
+  );
+});
+
+test('asCapabilityMappings: narrows a well-formed table and refuses a malformed one without echoing it', () => {
+  assert.deepEqual(asCapabilityMappings({ ok: true, mappings: { review: 'code-review' } }), { review: 'code-review' });
+  assert.deepEqual(asCapabilityMappings({ ok: true, mappings: {} }), {});
+  assert.throws(() => asCapabilityMappings({ ok: true }), /capability_mappings: malformed success response/);
+  assert.throws(() => asCapabilityMappings({ ok: true, mappings: [] }), /expected a `mappings` object/);
+  try {
+    asCapabilityMappings({ ok: true, mappings: { 'secret-authored': 7 } });
+    assert.fail('expected a throw');
+  } catch (e) {
+    assert.match((e as Error).message, /mappings\[0\]/, 'the position is named');
+    assert.doesNotMatch((e as Error).message, /secret-authored/, 'the body value is not echoed');
+  }
 });
 
 // ---- whoami response guard -----------------------------------------------

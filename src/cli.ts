@@ -158,6 +158,7 @@ import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/in
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
+  capabilityPublishReportText,
   asCapabilityRerouteAdded,
   asCapabilityRerouteRemoved,
   asCapabilityReroutes,
@@ -197,6 +198,8 @@ import {
 } from './hub.ts';
 import type {
   AgentIdentitySummary,
+  CapabilityPublishReportEntry,
+  CapabilityRouteWire,
   Credential,
   CredentialSlotSelector,
   DefPushCandidate,
@@ -204,6 +207,9 @@ import type {
   Keychain,
   WhoamiIdentity,
 } from './hub.ts';
+import { fetchCapabilityMappings, recordCapabilityMappings } from './capability-mapping-client.ts';
+import type { CapabilityMappingTransport } from './capability-mapping-client.ts';
+import { MODIFIER_SEPARATOR } from './capabilities.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
 import { discoverCrewRosterFiles, crewRosterPath, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
 import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
@@ -1412,9 +1418,13 @@ Commands:
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
-  push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <origin>] [--as <slot>]
+  push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <origin>] [--as <slot>] [--map <authored>=<org>]
     publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
+                                         --map records one authored=org capability mapping (repeatable); without it push records none
+  install <owner>/<repo>[@ref] [<defName>...] [--map <authored>=<org>] [--accept-defaults] [--dry-run] [--hub <origin>] [--as <slot>]
+                                         publish an OUTSIDE repo's defs to your hub under SCOPED capabilities (<defName>.<capability> by default)
+                                         records the capability mapping BEFORE it publishes; it never writes into local workflows/ (that is \`add\`)
   start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--modifier <name>] [--scope <label>] [--priority <low|normal|high>] [--hub <url>]
 ${' '.repeat(41)}start a published workflow on the bound hub (human credential)
 ${' '.repeat(41)}--modifier names one value from the def's declared \`modifiers:\` set; every
@@ -1546,7 +1556,8 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['connect', cmdOpts('hub', 'as')],
   ['publish', cmdOpts('unsigned', 'output', 'source', 'hub')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
-  ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
+  ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle', 'map')],
+  ['install', cmdOpts('hub', 'as', 'map', 'accept-defaults', 'dry-run')],
   ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier', 'scope', 'priority')],
   ['cancel', cmdOpts('hub', 'reason')],
   ['instance', cmdOpts('hub')],
@@ -4605,6 +4616,133 @@ function orderSelectedDefsByCalls(
   return { ordered, dependencies };
 }
 
+/** What one batch of `POST /api/create_workflow` calls did, per def. */
+interface PublishOutcome {
+  pushed: string[];
+  noop: string[];
+  skipped: string[];
+  failed: { name: string; error: string }[];
+  /** The hub's capability publish report, per def that returned one. */
+  capabilities: Record<string, CapabilityPublishReportEntry[]>;
+}
+
+/**
+ * Publish an already-diffed, already-validated batch of defs — the shared
+ * publish ladder behind BOTH `push` and `install`, so the two can never drift
+ * apart in how they treat a 401, a 413, a 429, a `{ok:false}` 200, or a def
+ * whose selected dependency failed.
+ *
+ * Behavior, unchanged from when this lived inline in `dispatchPush`:
+ *  - A def whose selected `calls:` dependency failed or was skipped is SKIPPED,
+ *    never published against a half-updated hub.
+ *  - A 401 refreshes an oauth credential once and retries once; a 401 that
+ *    survives that (or any 401 on an agent token) aborts the whole run by
+ *    re-throwing — already-published defs stand.
+ *  - A 429 halts the batch immediately (REL-10): this def is `failed`, the
+ *    not-yet-attempted remainder is `skipped`, and nothing else is sent.
+ *  - Any other per-def failure is recorded and the batch continues.
+ *
+ * `holder.cred` is read before every request and written back after a refresh,
+ * so a mid-batch token rotation is not lost by the caller.
+ */
+async function publishCandidates(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  holder: { cred: Credential },
+  toPush: (DefPushCandidate & { status: 'new' | 'changed' })[],
+  dependencies: Map<string, Set<string>>,
+  bundleDigest?: string,
+): Promise<PublishOutcome> {
+  const pushed: string[] = [];
+  const noop: string[] = [];
+  const failed: { name: string; error: string }[] = [];
+  const skipped: string[] = [];
+  const capabilities: Record<string, CapabilityPublishReportEntry[]> = {};
+  const unsuccessful = new Set<string>();
+
+  for (let i = 0; i < toPush.length; i++) {
+    const c = toPush[i]!;
+    const label = c.status === 'new' ? '+' : '~';
+    const blockedBy = [...(dependencies.get(c.name) ?? [])]
+      .filter((dependency) => unsuccessful.has(dependency))
+      .sort();
+    if (blockedBy.length > 0) {
+      skipped.push(c.name);
+      unsuccessful.add(c.name);
+      io.err(`- ${c.name} (skipped: selected dependency ${blockedBy.map((name) => `'${name}'`).join(', ')} failed or was skipped)`);
+      continue;
+    }
+    try {
+      let res = await createWorkflowRequest(io, origin, holder.cred, c.yaml, bundleDigest);
+      if (res.status === 401 && holder.cred.kind === 'oauth') {
+        holder.cred = await refreshOAuth(io, origin, slot, holder.cred as Extract<Credential, { kind: 'oauth' }>);
+        res = await createWorkflowRequest(io, origin, holder.cred, c.yaml, bundleDigest);
+      }
+      if (res.status === 401) {
+        if (holder.cred.kind === 'agent') {
+          throw new CliError('token revoked or invalid — re-mint it in the console or run `owenloop login`');
+        }
+        throw new CliError('credential rejected by the hub — run `owenloop login`');
+      }
+      if (res.status === 413) throw new CliError('workflow yaml exceeds the hub 32MB request cap');
+      if (res.status === 429) {
+        const retryAfter = res.headers.get('retry-after');
+        throw new RateLimitError(`rate limited by the hub${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
+      }
+      if (!res.ok) throw new CliError(`hub returned HTTP ${res.status}`);
+
+      const bodyJson: unknown = await res.json();
+      const errText = createWorkflowError(bodyJson);
+      if (errText !== null) throw new CliError(`hub rejected the def: ${errText}`);
+
+      const okBody = asCreateWorkflowOk(bodyJson, c.name);
+      if (okBody.unchanged) {
+        noop.push(c.name);
+        io.err(`= ${c.name} (server: unchanged, v${okBody.version})`);
+      } else {
+        pushed.push(c.name);
+        io.err(`${label} ${c.name} (→ v${okBody.version})`);
+      }
+      // The hub sends the report on BOTH branches, `unchanged:true` included, so
+      // an idempotent re-push still tells the pusher what the org vocabulary is.
+      if (okBody.capabilityReport !== undefined) {
+        capabilities[c.name] = okBody.capabilityReport;
+        printCapabilityReport(io, c.name, okBody.capabilityReport);
+      }
+    } catch (e) {
+      // A 429 halts the whole batch immediately (REL-10): record this def as
+      // failed, then stop — the not-yet-attempted remainder is reported as
+      // `skipped`, not silently hammered against a rate-limited server.
+      // Handled before the generic path because RateLimitError extends CliError.
+      if (e instanceof RateLimitError) {
+        const msg = e.message;
+        failed.push({ name: c.name, error: msg });
+        unsuccessful.add(c.name);
+        io.err(`! ${c.name} (failed: ${msg})`);
+        const remainder = toPush.slice(i + 1).map((r) => r.name);
+        skipped.push(...remainder);
+        for (const name of remainder) unsuccessful.add(name);
+        if (remainder.length > 0) {
+          io.err(`stopping — rate limited by the hub; ${remainder.length} def(s) not attempted`);
+        }
+        break;
+      }
+      // A hard auth error aborts the whole run (re-throw); a per-def server
+      // failure is recorded and the batch continues (already-pushed defs stand).
+      if (e instanceof CliError && /run `owenloop login`|re-mint it/.test(e.message)) {
+        throw e;
+      }
+      const msg = (e as Error).message;
+      failed.push({ name: c.name, error: msg });
+      unsuccessful.add(c.name);
+      io.err(`! ${c.name} (failed: ${msg})`);
+    }
+  }
+
+  return { pushed, noop, skipped, failed, capabilities };
+}
+
 /**
  * `owenloop push [<defName>...] [--bundle <bundle.wnlp>] [--force]
  * [--dry-run] [--hub <origin>]` — publish local workflow defs, or exact
@@ -4625,6 +4763,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   }
   const dryRun = flag(args, 'dry-run');
   const force = flag(args, 'force');
+  // `push` publishes defs the ORG authored, so their capabilities join the org's
+  // SHARED vocabulary by default and NOTHING is recorded. `--map` is the only
+  // way `push` writes a mapping at all — the deliberate asymmetry with
+  // `install`, which scopes by default. See `dispatchInstall`.
+  const requestedMap = parseCapabilityMapFlag(args);
   const slot = resolveSlot(args);
 
   const resolved = resolvePublishingHub(io, args, slot);
@@ -4682,6 +4825,20 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const selectedOrder = orderSelectedDefsByCalls(selected, bundle?.manifest.package.name);
   selected = selectedOrder.ordered;
   const selectedDependencies = selectedOrder.dependencies;
+  assertMapCoversSelection(requestedMap, selected);
+  // Per def, only the entries that def actually authors, and only the
+  // non-identity ones — the hub's resolver drops an identity row anyway, so
+  // posting one would be a write that changes nothing.
+  const mappingWrites = selected
+    .map((def) => ({
+      name: def.name,
+      entries: Object.fromEntries(
+        authoredCapabilitiesOf(def)
+          .filter((cap) => requestedMap[cap] !== undefined && requestedMap[cap] !== cap)
+          .map((cap) => [cap, requestedMap[cap]!]),
+      ),
+    }))
+    .filter((w) => Object.keys(w.entries).length > 0);
 
   // Client-side validation gate — all-or-nothing, mirroring dispatchAdd exactly.
   // Any failure aborts the entire push; nothing is sent.
@@ -4782,8 +4939,24 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       changed: toPush.filter((c) => c.status === 'changed').map((c) => c.name),
       unchanged: unchanged.map((c) => c.name),
       wouldPush: toPush.map((c) => c.name),
+      wouldRecord: Object.fromEntries(mappingWrites.map((w) => [w.name, w.entries])),
     });
     return 0;
+  }
+
+  // `--map` records BEFORE anything is published, the same ordering `install`
+  // uses and for the same reason: a hub that cannot record the mapping must
+  // fail the command with nothing published, never leave the two halves apart.
+  if (mappingWrites.length > 0) {
+    const holder = { cred };
+    const transport = capabilityMappingTransport(io, origin, slot, holder);
+    for (const write of mappingWrites) {
+      await recordCapabilityMappings(transport, write.name, write.entries, origin);
+      for (const [authored, org] of Object.entries(write.entries)) {
+        io.err(`  recorded ${write.name}: ${authored} → ${org}`);
+      }
+    }
+    cred = holder.cred;
   }
 
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
@@ -4793,98 +4966,633 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     cred = await uploadPushBundle(io, origin, slot, cred, bundle);
   }
 
-  const pushedNames: string[] = [];
-  const noopNames: string[] = [];
-  const failed: { name: string; error: string }[] = [];
-  const skipped: string[] = [];
-  const unsuccessful = new Set<string>();
-
-  for (let i = 0; i < toPush.length; i++) {
-    const c = toPush[i]!;
-    const label = c.status === 'new' ? '+' : '~';
-    const blockedBy = [...(selectedDependencies.get(c.name) ?? [])]
-      .filter((dependency) => unsuccessful.has(dependency))
-      .sort();
-    if (blockedBy.length > 0) {
-      skipped.push(c.name);
-      unsuccessful.add(c.name);
-      io.err(`- ${c.name} (skipped: selected dependency ${blockedBy.map((name) => `'${name}'`).join(', ')} failed or was skipped)`);
-      continue;
-    }
-    try {
-      let res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
-      if (res.status === 401 && cred.kind === 'oauth') {
-        cred = await refreshOAuth(io, origin, slot, cred as Extract<Credential, { kind: 'oauth' }>);
-	res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
-      }
-      if (res.status === 401) {
-        if (cred.kind === 'agent') {
-          throw new CliError('token revoked or invalid — re-mint it in the console or run `owenloop login`');
-        }
-        throw new CliError('credential rejected by the hub — run `owenloop login`');
-      }
-      if (res.status === 413) throw new CliError('workflow yaml exceeds the hub 32MB request cap');
-      if (res.status === 429) {
-        const retryAfter = res.headers.get('retry-after');
-        throw new RateLimitError(`rate limited by the hub${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
-      }
-      if (!res.ok) throw new CliError(`hub returned HTTP ${res.status}`);
-
-      const bodyJson: unknown = await res.json();
-      const errText = createWorkflowError(bodyJson);
-      if (errText !== null) throw new CliError(`hub rejected the def: ${errText}`);
-
-      const okBody = asCreateWorkflowOk(bodyJson, c.name);
-      if (okBody.unchanged) {
-        noopNames.push(c.name);
-        io.err(`= ${c.name} (server: unchanged, v${okBody.version})`);
-      } else {
-        pushedNames.push(c.name);
-        io.err(`${label} ${c.name} (→ v${okBody.version})`);
-      }
-    } catch (e) {
-      // A 429 halts the whole batch immediately (REL-10): record this def as
-      // failed, then stop — the not-yet-attempted remainder is reported as
-      // `skipped`, not silently hammered against a rate-limited server.
-      // Handled before the generic path because RateLimitError extends CliError.
-      if (e instanceof RateLimitError) {
-        const msg = e.message;
-        failed.push({ name: c.name, error: msg });
-	unsuccessful.add(c.name);
-        io.err(`! ${c.name} (failed: ${msg})`);
-        const remainder = toPush.slice(i + 1).map((r) => r.name);
-        skipped.push(...remainder);
-	for (const name of remainder) unsuccessful.add(name);
-        if (remainder.length > 0) {
-          io.err(`stopping — rate limited by the hub; ${remainder.length} def(s) not attempted`);
-        }
-        break;
-      }
-      // A hard auth error aborts the whole run (re-throw); a per-def server
-      // failure is recorded and the batch continues (already-pushed defs stand).
-      if (e instanceof CliError && /run `owenloop login`|re-mint it/.test(e.message)) {
-        throw e;
-      }
-      const msg = (e as Error).message;
-      failed.push({ name: c.name, error: msg });
-      unsuccessful.add(c.name);
-      io.err(`! ${c.name} (failed: ${msg})`);
-    }
-  }
+  const holder = { cred };
+  const published = await publishCandidates(io, origin, slot, holder, toPush, selectedDependencies, bundle?.digest);
 
   print(io, {
-    ok: failed.length === 0,
+    ok: published.failed.length === 0,
     hub: origin,
     ...(bundle === undefined ? {} : { bundleDigest: bundle.digest, publication: bundle.publicationState }),
-    pushed: pushedNames,
-    noop: noopNames,
+    pushed: published.pushed,
+    noop: published.noop,
     unchanged: unchanged.map((c) => c.name),
-    skipped,
-    failed,
+    skipped: published.skipped,
+    failed: published.failed,
+    capabilities: published.capabilities,
   });
-  return failed.length === 0 ? 0 : 1;
+  return published.failed.length === 0 ? 0 : 1;
   } finally {
     if (bundle !== undefined) rmSync(bundle.cleanupRoot, { recursive: true, force: true });
+  }
+}
+
+// ---- capability mapping (shared by `push --map` and `install`) ---------------
+
+/**
+ * Every authored capability one def declares, deduped, in first-authored order.
+ *
+ * Judge steps are synthesized into `def.steps` by the def parser, so iterating
+ * `steps` covers them — there is no second place capabilities can be written.
+ * Order is the order an operator reads the YAML top-down, which is the order
+ * the install prompt asks in.
+ */
+function authoredCapabilitiesOf(def: WorkflowDef): string[] {
+  const names: string[] = [];
+  for (const step of def.steps) {
+    for (const cap of step.capabilities ?? []) {
+      if (!names.includes(cap)) names.push(cap);
+    }
+  }
+  return names;
+}
+
+/**
+ * The org capability name an OUTSIDE def's capability takes by default:
+ * `<defName>.<authored>`.
+ *
+ * This needs no new separator and invents no escaping. A def name matches
+ * `/^[a-z0-9][a-z0-9_-]*$/i`, so it can never contain a dot, while the def
+ * parser's capability rule reserves only `:` — dots are already legal inside a
+ * capability. So the dot splits the two halves unambiguously in one direction
+ * (the first dot ends the def name) and collides with nothing.
+ */
+function scopedCapabilityName(defName: string, authored: string): string {
+  return `${defName}.${authored}`;
+}
+
+/**
+ * The same rule the def parser's `assertAuthoredCapability` applies, restated
+ * for an ORG-side name supplied on the command line or at the prompt:
+ * non-empty, not whitespace, and no `MODIFIER_SEPARATOR`.
+ *
+ * The separator ban is the load-bearing half. `:` is the suffix position the
+ * engine composes the run modifier into at offer time (`wise` + `deep` →
+ * `wise:deep`), so an authored-side value carrying one would be a capability
+ * that can never be composed. The def parser refuses it in YAML; this refuses
+ * it on the mapping's target, which reaches exactly the same position.
+ */
+function assertMappingTarget(target: string, where: string): void {
+  if (target.trim().length === 0) {
+    throw new CliError(`${where}: an org capability name must not be empty or whitespace`);
+  }
+  if (target.includes(MODIFIER_SEPARATOR)) {
+    throw new CliError(
+      `${where}: capability '${target}' must not contain '${MODIFIER_SEPARATOR}' — ` +
+        'the suffix position is reserved for the modifier the engine composes at offer time ' +
+        "(a run carrying 'deep' turns the authored capability 'wise' into 'wise:deep')",
+    );
+  }
+}
+
+/**
+ * Parse the repeatable `--map <authored>=<org>` flag shared by `push` and
+ * `install`. `parsePairs` supplies the `expected name=value, got: …` refusal;
+ * every target is then validated by `assertMappingTarget`.
+ */
+function parseCapabilityMapFlag(args: Args): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [authored, target] of Object.entries(parsePairs(all(args, 'map'), false))) {
+    if (authored.trim().length === 0) {
+      throw new CliError('--map: the authored capability name must not be empty or whitespace');
+    }
+    assertMappingTarget(target as string, `--map ${authored}`);
+    out[authored] = target as string;
+  }
+  return out;
+}
+
+/**
+ * Refuse a `--map` naming a capability none of the selected defs authors — it
+ * would otherwise be a silent no-op, and a typo in an authored name is exactly
+ * the case where silence is worst (the operator believes a link was made).
+ */
+function assertMapCoversSelection(map: Record<string, string>, selected: WorkflowDef[]): void {
+  const authored = new Set(selected.flatMap((def) => authoredCapabilitiesOf(def)));
+  const unknown = Object.keys(map)
+    .filter((name) => !authored.has(name))
+    .sort();
+  if (unknown.length === 0) return;
+  const known = [...authored].sort();
+  throw new CliError(
+    `--map names ${unknown.length} capability(ies) no selected def authors: ${unknown.join(', ')} — ` +
+      (known.length === 0 ? 'the selected defs author no capabilities' : `authored: ${known.join(', ')}`),
+  );
+}
+
+/**
+ * Adapt `authedGet`/`authedPost` into the transport
+ * `src/capability-mapping-client.ts` takes, threading the possibly-refreshed
+ * credential back into `holder` so a mid-command oauth refresh is not lost.
+ *
+ * The client module cannot import these helpers directly — they are private to
+ * `cli.ts`, and `cli.ts` imports the client, so a direct import would be a
+ * cycle. Injecting the transport keeps the 30s deadline, the bounded body,
+ * `redirect: 'error'` and the single 401-refresh-and-retry on the mapping calls
+ * without one.
+ */
+function capabilityMappingTransport(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  holder: { cred: Credential },
+): CapabilityMappingTransport {
+  return {
+    async get(path: string): Promise<Response> {
+      const { res, cred } = await authedGet(io, origin, slot, holder.cred, path);
+      holder.cred = cred;
+      return res;
+    },
+    async post(path: string, body: unknown): Promise<Response> {
+      const { res, cred } = await authedPost(io, origin, slot, holder.cred, path, body);
+      holder.cred = cred;
+      return res;
+    },
+  };
+}
+
+/**
+ * The hub's capability publish report for one def, on STDERR — stdout stays
+ * machine JSON. Silent for a hub that sent no report (older than the report) and
+ * for a def that authors no capabilities, so neither case prints a dangling
+ * header.
+ */
+function printCapabilityReport(io: CliIO, defName: string, report: CapabilityPublishReportEntry[] | undefined): void {
+  if (report === undefined) return;
+  const text = capabilityPublishReportText(report);
+  if (text !== '') io.err(`${defName}: ${text}`);
+}
+
+/**
+ * Render the org's live capability vocabulary from `GET /api/capability_routes`
+ * as one line — `review (reviewers), builder (builders), triage (unbound)`.
+ *
+ * The endpoint returns ONE ROW PER `(capability, crew)` pair, so rows are
+ * grouped by capability here. A row whose `crewName` is `null` is a DANGLING
+ * route (the crew is gone) and shows as `unbound`, because that is what it means
+ * for routing: the capability exists in the vocabulary but nothing serves it.
+ */
+function formatOrgVocabulary(routes: CapabilityRouteWire[]): string {
+  const crewsByCapability = new Map<string, Set<string>>();
+  for (const route of routes) {
+    const crews = crewsByCapability.get(route.capability);
+    const name = route.crewName;
+    if (crews === undefined) crewsByCapability.set(route.capability, new Set(name === null ? [] : [name]));
+    else if (name !== null) crews.add(name);
+  }
+  return [...crewsByCapability.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([capability, crews]) => `${capability} (${crews.size === 0 ? 'unbound' : [...crews].sort().join(', ')})`)
+    .join(', ');
+}
+
+/** One def's decided `authored → org` vocabulary, and the subset that must be written. */
+interface DefMappingPlan {
+  def: WorkflowDef;
+  /** Every authored capability, identity entries included — what the operator decided. */
+  resolved: Record<string, string>;
+  /** The subset the hub does not already hold: non-identity, and not carried forward unchanged. */
+  toRecord: Record<string, string>;
+}
+
+/**
+ * Fetch a public GitHub repo's `workflows/**` at a pinned commit sha, into an
+ * in-memory file map.
+ *
+ * Deliberately its own sequence rather than a refactor of `dispatchAdd`'s: `add`
+ * interleaves this with a project install lock, a crash journal and an atomic
+ * swap that `install` has no business acquiring, and its refusal wording names
+ * `add`'s local install. Only the PRIMITIVES are shared (`parseRepoSpec`,
+ * `githubShaUrl`, `githubTarballUrl`, `readBodyBounded`, `extractTarGz`,
+ * `archivePathViolation`), which is where the security-relevant behavior lives:
+ * the ref is pinned to a 40-char sha before the tarball is fetched, the body is
+ * capped DURING the stream, and every archive path is checked for escape before
+ * it is ever joined (SEC-1).
+ */
+async function fetchGithubWorkflowFiles(
+  io: CliIO,
+  spec: string,
+): Promise<{ source: string; ref: string; sha: string; files: Map<string, Uint8Array> }> {
+  const { owner, repo, ref } = parseRepoSpec(spec);
+  const source = `${owner}/${repo}`;
+  const fetchFn = io.fetch ?? globalThis.fetch;
+
+  let shaRes: Response;
+  try {
+    shaRes = await fetchFn(githubShaUrl(owner, repo, ref), {
+      headers: { Accept: 'application/vnd.github.sha', 'User-Agent': 'owenloop' },
+      signal: AbortSignal.timeout(ADD_SHA_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`timed out after ${ADD_SHA_TIMEOUT_MS / 1000}s resolving ${source}@${ref}`);
+    }
+    throw e;
+  }
+  if (!shaRes.ok) {
+    const notFoundNote = shaRes.status === 404 ? ' (repo or ref not found)' : '';
+    throw new CliError(`could not resolve ${source}@${ref}: GitHub returned ${shaRes.status}${notFoundNote}`);
+  }
+  const shaBytes = await readBodyBounded(shaRes, hubMaxResponseBytes(io), `sha resolution for ${source}@${ref}`);
+  const sha = new TextDecoder().decode(shaBytes).trim();
+  if (!/^[0-9a-f]{40}$/i.test(sha)) {
+    throw new CliError(`unexpected response resolving ${source}@${ref}: expected a 40-char commit sha, got "${sha}"`);
+  }
+
+  let bytes: Uint8Array;
+  try {
+    const tarRes = await fetchFn(githubTarballUrl(owner, repo, sha), {
+      headers: { 'User-Agent': 'owenloop' },
+      signal: AbortSignal.timeout(ADD_TARBALL_TIMEOUT_MS),
+    });
+    if (!tarRes.ok) {
+      throw new CliError(`could not fetch tarball for ${source}@${sha}: GitHub returned ${tarRes.status}`);
+    }
+    bytes = await readBodyBounded(tarRes, tarballMaxBytes(io), `tarball for ${source}@${sha}`);
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`timed out after ${ADD_TARBALL_TIMEOUT_MS / 1000}s downloading tarball for ${source}@${sha}`);
+    }
+    throw e;
+  }
+
+  let rawFiles: Map<string, Uint8Array>;
+  try {
+    rawFiles = extractTarGz(bytes);
+  } catch (e) {
+    throw new CliError(`could not extract tarball for ${source}@${sha}: ${(e as Error).message}`);
+  }
+  const files = new Map<string, Uint8Array>();
+  const pathViolations: string[] = [];
+  for (const [rawPath, data] of rawFiles) {
+    const firstSlash = rawPath.indexOf('/');
+    const rest = firstSlash >= 0 ? rawPath.slice(firstSlash + 1) : '';
+    if (!rest.startsWith('workflows/')) continue;
+    const relPath = rest.slice('workflows/'.length);
+    if (!relPath) continue;
+    const violation = archivePathViolation(relPath);
+    if (violation) {
+      pathViolations.push(`${rawPath}: ${violation}`);
+      continue;
+    }
+    files.set(relPath, data);
+  }
+  if (pathViolations.length > 0) {
+    throw new CliError(
+      `refusing to install ${source}@${sha} — ${pathViolations.length} unsafe archive path(s) found; nothing published:\n  - ${pathViolations.join('\n  - ')}`,
+    );
+  }
+  if (files.size === 0) {
+    throw new CliError(`no workflows/ directory found in ${source}@${ref}`);
+  }
+  return { source, ref, sha, files };
+}
+
+/**
+ * Ask the operator, one authored capability at a time, what the org should call
+ * it. Enter accepts the prefilled SCOPED default; typing a name links the
+ * capability into the org's existing vocabulary instead.
+ *
+ * Prompt style matches `promptAgentName` / `promptSuccession`: prefilled
+ * default, empty answer accepts it, one re-prompt on an invalid answer, then a
+ * `CliError`. All prompt I/O is stderr, so `| jq` on stdout is unaffected.
+ *
+ * `prompt` is passed in ALREADY RESOLVED by `requirePrompt`, which the caller
+ * ran before any hub I/O — a piped run must fail with the flag names, never
+ * block here after half the work is done.
+ */
+async function promptCapabilityMapping(
+  io: CliIO,
+  prompt: (question: string) => Promise<string>,
+  defName: string,
+  authored: string,
+): Promise<string> {
+  const fallback = scopedCapabilityName(defName, authored);
+  const question = `  ${authored}  [${fallback}]: `;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = (await prompt(question)).trim();
+    if (raw === '') return fallback;
+    try {
+      assertMappingTarget(raw, `capability '${authored}'`);
+      return raw;
+    } catch (e) {
+      io.err((e as Error).message);
+    }
+  }
+  throw new CliError(`no valid org capability name provided for '${authored}'`);
+}
+
+/**
+ * `owenloop install <owner>/<repo>[@ref] [<defName>...] [--map <authored>=<org>]
+ * [--accept-defaults] [--dry-run] [--hub <origin>] [--as <slot>]` — publish defs
+ * authored OUTSIDE your org to your hub, under capability names your org
+ * chooses.
+ *
+ * **This is a PUBLISH verb, a sibling of `push` — not of `add`.** It never
+ * writes into the local `workflows/` directory: `add` already owns local
+ * installation, with its install lock, crash journal and atomic swap, and
+ * duplicating that here would be a second implementation of the same
+ * transaction. `install` fetches the outside def, decides the org-side
+ * capability vocabulary for it, records that mapping, and publishes.
+ *
+ * **Why the mapping is scoped by default.** `push` publishes defs YOU authored,
+ * so their capabilities join the org's SHARED vocabulary — two of your own defs
+ * both authoring `review` deliberately mean the same `review`, served by the
+ * same crews. A def from an unrelated author making the same claim is not the
+ * same claim. So every capability an installed def authors becomes
+ * `<defName>.<capability>` unless the installer says otherwise, once, at install
+ * time. The def content itself is never edited: the mapping is org-side data.
+ *
+ * **Order of operations, and it is the point: record, THEN publish.** Publishing
+ * first would put an unscoped third-party def into the org's vocabulary for the
+ * window between the two calls — exactly the trust-boundary breach this verb
+ * exists to prevent. So a hub that cannot record the mapping fails the command
+ * BEFORE anything is published, and nothing is left half-applied.
+ *
+ * **A hub that cannot record mappings.** No shipped `owenloop-service` build
+ * implements the mapping write yet (see `src/capability-mapping-client.ts` for
+ * the full statement and the proposed contract). Until one does, only the
+ * IDENTITY case completes end to end: when every capability keeps its authored
+ * name there is nothing to record — the hub's resolver drops identity rows
+ * anyway — so the write is skipped and the publish proceeds. Every other case
+ * stops at the missing verb with exit 2.
+ *
+ * Exit codes: 0 ok; 1 runtime/hub error (a validation-gate refusal, a per-def
+ * hub rejection, a refused source kind, an invalid `--map`); 2 the hub is
+ * unresolvable, or it does not implement the mapping write; 3 the credential for
+ * the slot is absent or irrecoverable.
+ */
+async function dispatchInstall(io: CliIO, args: Args): Promise<number> {
+  // 0. Argument-only work, before anything is fetched or resolved.
+  const spec = need(args, 1, '<source>');
+  const classified = classifyAddSource(spec);
+  if (classified.kind !== 'github') {
+    const what = classified.kind === 'file' ? 'a local .wnlp bundle' : 'an http(s) URL';
+    throw new CliError(
+      `owenloop install: ${what} is not an install source yet — only owner/repo[@ref] (GitHub) is. ` +
+        `Run \`owenloop add ${spec}\` to install it into the local store, then ` +
+        '`owenloop push --bundle <bundle.wnlp>` to publish it.',
+    );
+  }
+  const dryRun = flag(args, 'dry-run');
+  const acceptDefaults = flag(args, 'accept-defaults');
+  const requestedMap = parseCapabilityMapFlag(args);
+  const slot = resolveSlot(args);
+
+  const resolvedHub = resolvePublishingHub(io, args, slot);
+  const { origin } = resolvedHub;
+  const startingCredential = resolvedHub.credential ?? readCredential(io, origin, slot);
+  if (!startingCredential) {
+    throw new CliError(`${emptySlotMessage(origin, slot)} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+  // Threaded through every hub call so a mid-command oauth refresh is not lost.
+  const holder = { cred: startingCredential };
+
+  // 1. Fetch the outside repo and materialize its workflows/ into a temp dir.
+  //    Nothing under the user's cwd is touched, at any point.
+  const fetched = await fetchGithubWorkflowFiles(io, spec);
+  const sourceRef = `${fetched.source}@${fetched.sha}`;
+  const workRoot = mkdtempSync(join(tmpdir(), 'owenloop-install-'));
+  try {
+    for (const [relPath, data] of fetched.files) {
+      const dest = join(workRoot, relPath);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, data);
+    }
+
+    // 2. Load, narrow to positionals, and order by `calls:` — same machinery push uses.
+    const failures: DefLoadFailure[] = [];
+    const allDefs = loadDefsRaw(workRoot, failures);
+    const requested = args.positionals.slice(2);
+    let selected: WorkflowDef[];
+    if (requested.length > 0) {
+      selected = [];
+      for (const name of requested) {
+        const def = allDefs.get(name);
+        if (!def) {
+          throw new CliError(
+            `unknown workflow definition '${name}' in ${sourceRef} (found: ${[...allDefs.keys()].sort().join(', ') || 'none'})${failureNote(failures)}`,
+          );
+        }
+        selected.push(def);
+      }
+    } else {
+      selected = [...allDefs.values()];
+    }
+    if (selected.length === 0) {
+      throw new CliError(`nothing to install — no workflow definitions found in ${sourceRef}${failureNote(failures)}`);
+    }
+    const selectedOrder = orderSelectedDefsByCalls(selected);
+    selected = selectedOrder.ordered;
+    const selectedDependencies = selectedOrder.dependencies;
+    assertMapCoversSelection(requestedMap, selected);
+
+    // 3. Client-side validation gate — all-or-nothing, byte-for-byte push's.
+    //    Any failure aborts everything: nothing is mapped and nothing is sent.
+    const reasons: string[] = failures.map((f) => `${f.file}: ${f.error}`);
+    for (const def of selected) {
+      reasons.push(...lintDef(def).errors.map((e) => `${def.name}: ${e}`));
+      reasons.push(...validateDef(def).map((e) => `${def.name}: ${e}`));
+      const report = modelCheck(def, { assumeProvided: true });
+      if (hasDefiniteCheckDefect(report)) {
+        reasons.push(
+          `${def.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+            `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
+            `${report.deadlocks.length} true deadlock(s))`,
+        );
+      }
+    }
+
+    // 4. Push candidates: verbatim source yaml + the server-canonical hash.
+    //    include:/bodyFile: defs are not hub-pushable, exactly as in `push`.
+    const candidates: DefPushCandidate[] = [];
+    for (const def of selected) {
+      if (!def.dir) {
+        reasons.push(`${def.name}: has no source file on disk to push`);
+        continue;
+      }
+      const yaml = readFileSync(def.dir, 'utf8');
+      let usesInclude = false;
+      try {
+        usesInclude = (buildDef(parseYaml(yaml), basename(def.dir), dirname(def.dir))._includes?.length ?? 0) > 0;
+      } catch {
+        // A shape error would already have surfaced via the gate above.
+      }
+      if (usesInclude) {
+        reasons.push(`${def.name}: uses include:, not hub-pushable yet`);
+        continue;
+      }
+      try {
+        candidates.push({ name: def.name, hash: hashDefForHub(yaml), yaml });
+      } catch (e) {
+        if (e instanceof DefError && /bodyFile/.test(e.message)) {
+          reasons.push(`${def.name}: uses bodyFile:, not hub-pushable`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (reasons.length > 0) {
+      throw new CliError(
+        `refusing to install ${sourceRef} — ${reasons.length} problem(s) found; nothing mapped, nothing published:\n  - ${reasons.join('\n  - ')}`,
+      );
+    }
+
+    // 5. THE NON-INTERACTIVE GUARD, before a single hub request.
+    //    Resolved here rather than at the first question so a piped run fails
+    //    with the flag names while the request log is still empty — never after
+    //    a mapping read has already happened. If carry-forward later covers
+    //    every capability, this prompt is simply never called.
+    const uncovered = selected.some((def) =>
+      authoredCapabilitiesOf(def).some((cap) => requestedMap[cap] === undefined),
+    );
+    const prompt =
+      !uncovered || acceptDefaults
+        ? undefined
+        : requirePrompt(
+            io,
+            'owenloop install needs to ask what your org should call each capability this def authors, ' +
+              'but stdin is not interactive — pass --map <authored>=<org> for each one, ' +
+              'or --accept-defaults to take the scoped <defName>.<capability> name for all of them',
+          );
+
+    // 6. The org's existing vocabulary, so an operator choosing to LINK is
+    //    choosing informed. Read-only; publishes nothing.
+    const { res: routesRes, cred: routesCred } = await authedGet(
+      io,
+      origin,
+      slot,
+      holder.cred,
+      '/api/capability_routes',
+    );
+    assertAuthOk(routesRes, routesCred, origin);
+    holder.cred = routesCred;
+    let vocabulary: CapabilityRouteWire[];
+    try {
+      vocabulary = asCapabilityRoutes(await routesRes.json());
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+
+    // 7. Decide the vocabulary for each def: --map wins, then carry-forward,
+    //    then --accept-defaults, then the prompt.
+    const transport = capabilityMappingTransport(io, origin, slot, holder);
+    const plans: DefMappingPlan[] = [];
+    for (const def of selected) {
+      const authored = authoredCapabilitiesOf(def);
+      const resolved: Record<string, string> = {};
+      const toRecord: Record<string, string> = {};
+      if (authored.length === 0) {
+        plans.push({ def, resolved, toRecord });
+        continue;
+      }
+      const existingOrUnsupported = await fetchCapabilityMappings(transport, def.name, origin);
+      const existing = existingOrUnsupported === 'unsupported' ? {} : existingOrUnsupported;
+      const unsupported = existingOrUnsupported === 'unsupported';
+      const needsAsking = authored.filter(
+        (cap) => requestedMap[cap] === undefined && (unsupported || existing[cap] === undefined),
+      );
+      if (needsAsking.length > 0 && !acceptDefaults) {
+        if (unsupported) {
+          // The risk the operator must see BEFORE the first question: pressing
+          // Enter through the prompts overwrites a deliberate link this hub
+          // cannot report.
+          io.err(
+            `${origin} cannot report capability mappings already recorded for ${def.name} — ` +
+              'every capability will be asked about again, and the answers overwrite whatever is recorded.',
+          );
+        }
+        io.err(
+          `\n${def.name} authors ${authored.length} capability(ies). Enter = keep the scoped name; ` +
+            'type an org capability to link it into your existing vocabulary.',
+        );
+        const vocab = formatOrgVocabulary(vocabulary);
+        io.err(vocab === '' ? 'Your org routes no capabilities yet.' : `Your org already routes: ${vocab}`);
+        io.err('');
+      }
+      for (const cap of authored) {
+        const chosen =
+          requestedMap[cap] ??
+          (unsupported ? undefined : existing[cap]) ??
+          (acceptDefaults || prompt === undefined
+            ? scopedCapabilityName(def.name, cap)
+            : await promptCapabilityMapping(io, prompt, def.name, cap));
+        resolved[cap] = chosen;
+        // Identity rows are dropped hub-side, and a carried-forward row the hub
+        // already holds needs no rewrite — so neither is worth a write.
+        if (chosen !== cap && existing[cap] !== chosen) toRecord[cap] = chosen;
+      }
+      plans.push({ def, resolved, toRecord });
+    }
+    const mapped = Object.fromEntries(plans.map((p) => [p.def.name, p.resolved]));
+    const wouldRecord = plans.filter((p) => Object.keys(p.toRecord).length > 0);
+
+    // 8. The server diff, the same source of truth `push` uses.
+    const { res: listRes, cred: listCred } = await authedGet(io, origin, slot, holder.cred, '/api/workflows');
+    assertAuthOk(listRes, listCred, origin);
+    holder.cred = listCred;
+    let serverMap: ReturnType<typeof parseWorkflowList>;
+    try {
+      serverMap = parseWorkflowList(await listRes.json());
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    const { toPush, unchanged } = computeServerDiff(candidates, serverMap, false);
+    for (const c of unchanged) io.err(`= ${c.name} (unchanged)`);
+
+    if (dryRun) {
+      for (const c of toPush) io.err(c.status === 'new' ? `+ ${c.name} (new)` : `~ ${c.name} (changed)`);
+      for (const plan of wouldRecord) {
+        for (const [authored, org] of Object.entries(plan.toRecord)) {
+          io.err(`  would record ${plan.def.name}: ${authored} → ${org}`);
+        }
+      }
+      print(io, {
+        ok: true,
+        dryRun: true,
+        hub: origin,
+        source: sourceRef,
+        mapped,
+        wouldRecord: Object.fromEntries(wouldRecord.map((p) => [p.def.name, p.toRecord])),
+        new: toPush.filter((c) => c.status === 'new').map((c) => c.name),
+        changed: toPush.filter((c) => c.status === 'changed').map((c) => c.name),
+        unchanged: unchanged.map((c) => c.name),
+        wouldPush: toPush.map((c) => c.name),
+      });
+      return 0;
+    }
+
+    // 9. RECORD, THEN PUBLISH. A hub with no mapping writer throws here — with
+    //    zero create_workflow calls behind it.
+    const recorded: string[] = [];
+    for (const plan of wouldRecord) {
+      await recordCapabilityMappings(transport, plan.def.name, plan.toRecord, origin);
+      recorded.push(plan.def.name);
+      for (const [authored, org] of Object.entries(plan.toRecord)) {
+        io.err(`  recorded ${plan.def.name}: ${authored} → ${org}`);
+      }
+    }
+
+    // 10. Publish, on push's ladder.
+    holder.cred = await ensureFreshOAuth(io, origin, slot, holder.cred);
+    const published = await publishCandidates(io, origin, slot, holder, toPush, selectedDependencies);
+    print(io, {
+      ok: published.failed.length === 0,
+      hub: origin,
+      source: sourceRef,
+      mapped,
+      recorded,
+      pushed: published.pushed,
+      noop: published.noop,
+      unchanged: unchanged.map((c) => c.name),
+      skipped: published.skipped,
+      failed: published.failed,
+      capabilities: published.capabilities,
+    });
+    return published.failed.length === 0 ? 0 : 1;
+  } finally {
+    rmSync(workRoot, { recursive: true, force: true });
   }
 }
 
@@ -6770,17 +7478,23 @@ async function probeAgentSlots(
 }
 
 /**
- * The interactive prompt for setup, or the non-interactive guard. Returns
- * `io.prompt` when injected; else, when stdin is a real TTY, the default
- * readline prompt; else a `CliError` naming the two bypass flags — thrown BEFORE
- * any mutation so a scripted/piped run never blocks or half-applies.
+ * The interactive prompt for a verb that must ask, or the non-interactive
+ * guard. Returns `io.prompt` when injected; else, when stdin is a real TTY, the
+ * default readline prompt; else a `CliError` naming that verb's bypass flags —
+ * thrown BEFORE any mutation (and, for `install`, before any hub I/O at all) so
+ * a scripted/piped run never blocks and never half-applies.
+ *
+ * `unavailable` is the refusal wording. It defaults to `setup`'s, so `setup`'s
+ * callers keep their message byte-for-byte; `install` passes its own, which
+ * must name `--map` and `--accept-defaults`.
  */
-function requirePrompt(io: CliIO): (question: string) => Promise<string> {
+function requirePrompt(io: CliIO, unavailable?: string): (question: string) => Promise<string> {
   if (io.prompt) return io.prompt;
   if (process.stdin.isTTY) return defaultPrompt;
   throw new CliError(
-    'setup needs to ask which Scoped Identity to use, but stdin is not interactive — pass ' +
-      '--new-agent <name> to create a new Scoped Identity, or --replace-agent <name> to replace an existing one',
+    unavailable ??
+      'setup needs to ask which Scoped Identity to use, but stdin is not interactive — pass ' +
+        '--new-agent <name> to create a new Scoped Identity, or --replace-agent <name> to replace an existing one',
   );
 }
 
@@ -7832,7 +8546,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'cancel', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -7880,6 +8594,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchTrust(io, args);
       case 'push':
         return await dispatchPush(io, args);
+      case 'install':
+        return await dispatchInstall(io, args);
       case 'start':
 	return await dispatchStart(io, args);
       case 'cancel':
