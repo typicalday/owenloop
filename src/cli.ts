@@ -5310,13 +5310,16 @@ async function promptCapabilityMapping(
  * exists to prevent. So a hub that cannot record the mapping fails the command
  * BEFORE anything is published, and nothing is left half-applied.
  *
- * **A hub that cannot record mappings.** No shipped `owenloop-service` build
- * implements the mapping write yet (see `src/capability-mapping-client.ts` for
- * the full statement and the proposed contract). Until one does, only the
- * IDENTITY case completes end to end: when every capability keeps its authored
- * name there is nothing to record — the hub's resolver drops identity rows
- * anyway — so the write is skipped and the publish proceeds. Every other case
- * stops at the missing verb with exit 2.
+ * **A hub that cannot record mappings.** The hub's mapping READ is live, but no
+ * shipped `owenloop-service` build has the BATCH write this command needs — it
+ * ships a singular one-row-per-call verb instead, which cannot give the
+ * record-then-publish order its all-or-nothing guarantee (see
+ * `src/capability-mapping-client.ts` for why the plural is not sugar over N
+ * singular calls). Until the batch verb ships, only the IDENTITY case completes
+ * end to end: when every capability keeps its authored name there is nothing to
+ * record — the hub's resolver drops identity rows anyway — so the write is
+ * skipped and the publish proceeds. Every other case stops at the missing verb
+ * with exit 2.
  *
  * Exit codes: 0 ok; 1 runtime/hub error (a validation-gate refusal, a per-def
  * hub rejection, a refused source kind, an invalid `--map`); 2 the hub is
