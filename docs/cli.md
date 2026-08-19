@@ -53,7 +53,7 @@ for the full breakdown.
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | verify a resolved hub credential and record an optional per-project override in `.owenloop/hub.json` |
 | `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
-| `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
+| `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--modifier <name>] [--scope <label>] [--priority <low\|normal\|high>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
 | `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <url>]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
