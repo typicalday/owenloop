@@ -258,8 +258,11 @@ one.
 
 `order-dropped.reason` is the stable machine discriminator and is one of
 `malformed-digest`, `malformed-worker`, `unsupported-worker`,
-`verification-failed`, `metadata-unavailable`. `message` is human text — match
-on `reason`, display `message`.
+`verification-failed`, `metadata-unavailable`, `agent-lane-closed`.
+`agent-lane-closed` means the shift's effective agent ceiling is structurally
+zero, so it leaves the claim for the hub pickup window rather than holding agent
+work it cannot run. `message` is human text — match on `reason`, display
+`message`.
 
 ### The first record is self-describing
 
