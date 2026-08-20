@@ -1476,6 +1476,100 @@ test('owenloop lint and check attribute overlapping calls cycles to every member
   }
 });
 
+test('owenloop lint and check validate calls against raw child interfaces like strict loading', () => {
+  const inheritedInputDir = mkdtempSync(join(tmpdir(), 'owenloop-lint-raw-child-input-'));
+  writeFileSync(join(inheritedInputDir, 'interface.yaml'), [
+    'name: interface',
+    'inputs:',
+    '  - name: seed',
+    'outputs: [result]',
+    'steps:',
+    '  - name: work',
+    '    consumes: [seed]',
+    '    produces: [result]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+  writeFileSync(join(inheritedInputDir, 'child.yaml'), [
+    'name: child',
+    'steps:',
+    '  - include: interface',
+    '    as: inherited',
+    '',
+  ].join('\n'));
+  writeFileSync(join(inheritedInputDir, 'parent.yaml'), [
+    'name: parent',
+    'inputs:',
+    '  - name: proposal',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: delegate',
+    '    calls: child',
+    '    inputs:',
+    '      inherited.seed: proposal',
+    '    produces: [result]',
+    '  - name: finish',
+    '    consumes: [result]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+
+  const inheritedInputCli = makeCli({ defs: inheritedInputDir });
+  const expectedInputError = /maps input 'inherited\.seed' which workflow 'child' does not declare/;
+  const strictInput = inheritedInputCli.run('defs');
+  assert.equal(strictInput.code, 1);
+  assert.match(strictInput.err, expectedInputError);
+  const inputLint = inheritedInputCli.run('lint', 'parent');
+  assert.equal(inputLint.code, 1);
+  assert.match(inputLint.out, expectedInputError);
+  const inputCheck = inheritedInputCli.run('check', 'parent');
+  assert.equal(inputCheck.code, 1);
+  assert.match(inputCheck.err, expectedInputError);
+
+  const inheritedOutputDir = mkdtempSync(join(tmpdir(), 'owenloop-lint-raw-child-output-'));
+  writeFileSync(join(inheritedOutputDir, 'interface.yaml'), [
+    'name: interface',
+    'outputs: [extra]',
+    'steps:',
+    '  - name: extra',
+    '    produces: [extra]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+  writeFileSync(join(inheritedOutputDir, 'child.yaml'), [
+    'name: child',
+    'outputs: [result]',
+    'steps:',
+    '  - name: work',
+    '    produces: [result]',
+    '    terminal: true',
+    '  - include: interface',
+    '    as: inherited',
+    '',
+  ].join('\n'));
+  writeFileSync(join(inheritedOutputDir, 'parent.yaml'), [
+    'name: parent',
+    'steps:',
+    '  - name: delegate',
+    '    calls: child',
+    '    produces: [result]',
+    '  - name: finish',
+    '    consumes: [result]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+
+  const inheritedOutputCli = makeCli({ defs: inheritedOutputDir });
+  const strictOutput = inheritedOutputCli.run('defs');
+  assert.equal(strictOutput.code, 0, strictOutput.err);
+  const outputLint = inheritedOutputCli.run('lint', 'parent');
+  assert.equal(outputLint.code, 0, `${outputLint.err}\n${outputLint.out}`);
+  const outputCheck = inheritedOutputCli.run('check', 'parent');
+  assert.equal(outputCheck.code, 0, `${outputCheck.err}\n${outputCheck.out}`);
+});
+
 test('owenloop lint exits 0 for clean definitions and prints JSON', () => {
   const { run } = makeCli();
   const r = run('lint');

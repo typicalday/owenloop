@@ -2661,6 +2661,10 @@ test('discovery(g): a malformed installed sibling is reported without hiding a h
   assert.equal(namedLint.code, 0, namedLint.err.join('\n'));
   const checked = await runCli(cwd, ['check', 'parent']);
   assert.equal(checked.code, 0, checked.err.join('\n'));
+  const created = await runCli(cwd, ['create', 'parent']);
+  assert.equal(created.code, 0, created.err.join('\n'));
+  assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
+  assert.match(created.err.join('\n'), /warning: failed to load installed workflow def .*broken\.yaml/);
 });
 
 // ---- offline crash-recovery: `owenloop add --recover` ------------------------

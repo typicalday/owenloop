@@ -2364,21 +2364,20 @@ export function resolveCallsTarget(
 
 // ---- M2-CYCLE: cross-def calls-cycle detection --------------------------------
 
-/** A calls cycle and every resolved definition key that participates in it. */
+/** A calls cycle and the resolved definition keys on its displayed path. */
 export interface CallsCycleFinding {
   message: string;
   members: string[];
 }
 
-/**
- * Report calls cycles in a flat def map. This is the Mode 2 analogue of the
- * Mode 1 include-cycle guard in expandIncludes; the two edge kinds stay
- * deliberately separate. Findings use resolved map identity, not bare call
- * text, so CAS bundle siblings cannot be accidentally fused.
- */
-export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFinding[] {
+interface CallsGraph {
+  keys: string[];
+  order: Map<string, number>;
+  edges: Map<string, string[]>;
+}
+
+function buildCallsGraph(defs: Map<string, WorkflowDef>): CallsGraph {
   const keys = [...defs.keys()];
-  const order = new Map(keys.map((key, index) => [key, index]));
   const edges = new Map<string, string[]>();
   for (const [key, def] of defs) {
     // WS-6: graph nodes are RESOLVED map keys, not bare calls text. Two bundles
@@ -2391,74 +2390,167 @@ export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFin
     }
     edges.set(key, [...children]);
   }
-  const cycleFingerprint = (cycle: readonly string[]): string => {
-    const members = cycle.slice(0, -1);
-    return members
-      .map((_, index) => [...members.slice(index), ...members.slice(0, index)].join('\u0000'))
-      .sort()[0] ?? '';
+  return {
+    keys,
+    order: new Map(keys.map((key, index) => [key, index])),
+    edges,
+  };
+}
+
+/**
+ * Preserve the original tri-color DFS exactly for strict loading. It stops at
+ * the first back edge, so finalizeDefs remains O(V+E) and retains its stable
+ * first-cycle message and traversal precedence.
+ */
+function findFirstCallsCycle(graph: CallsGraph): string[] | undefined {
+  const WHITE = 0, GREY = 1, BLACK = 2;
+  const color = new Map(graph.keys.map((key) => [key, WHITE]));
+  const stack: string[] = [];
+  const visit = (key: string): string[] | undefined => {
+    color.set(key, GREY);
+    stack.push(key);
+    for (const child of graph.edges.get(key) ?? []) {
+      const state = color.get(child) ?? WHITE;
+      if (state === GREY) return [...stack.slice(stack.indexOf(child)), child];
+      if (state === WHITE) {
+		const found = visit(child);
+		if (found !== undefined) return found;
+      }
+    }
+    stack.pop();
+    color.set(key, BLACK);
+    return undefined;
+  };
+  for (const key of graph.keys) {
+    if ((color.get(key) ?? WHITE) !== WHITE) continue;
+    const found = visit(key);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function cycleFingerprint(cycle: readonly string[]): string {
+  const members = cycle.slice(0, -1);
+  return members
+    .map((_, index) => [...members.slice(index), ...members.slice(0, index)].join('\u0000'))
+    .sort()[0] ?? '';
+}
+
+function canonicalizeCycle(cycle: string[], order: Map<string, number>): string[] {
+  const members = cycle.slice(0, -1);
+  let first = 0;
+  for (let index = 1; index < members.length; index++) {
+    if ((order.get(members[index]!) ?? Number.MAX_SAFE_INTEGER) < (order.get(members[first]!) ?? Number.MAX_SAFE_INTEGER)) {
+      first = index;
+    }
+  }
+  const rotated = [...members.slice(first), ...members.slice(0, first)];
+  return [...rotated, rotated[0]!];
+}
+
+/** Return each cyclic SCC, indexed by every member, using deterministic Tarjan traversal. */
+function cyclicComponentsByMember(graph: CallsGraph): Map<string, Set<string>> {
+  let nextIndex = 0;
+  const index = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const byMember = new Map<string, Set<string>>();
+
+  const visit = (key: string): void => {
+    index.set(key, nextIndex);
+    lowlink.set(key, nextIndex);
+    nextIndex++;
+    stack.push(key);
+    onStack.add(key);
+
+    for (const child of graph.edges.get(key) ?? []) {
+      if (!index.has(child)) {
+		visit(child);
+		lowlink.set(key, Math.min(lowlink.get(key)!, lowlink.get(child)!));
+      } else if (onStack.has(child)) {
+		lowlink.set(key, Math.min(lowlink.get(key)!, index.get(child)!));
+      }
+    }
+
+    if (lowlink.get(key) !== index.get(key)) return;
+    const members: string[] = [];
+    while (stack.length > 0) {
+      const member = stack.pop()!;
+      onStack.delete(member);
+      members.push(member);
+      if (member === key) break;
+    }
+    const cyclic = members.length > 1 || (graph.edges.get(key) ?? []).includes(key);
+    if (!cyclic) return;
+    const component = new Set(members);
+    for (const member of members) byMember.set(member, component);
   };
 
-  // Retain the legacy depth-first first cycle as the first finding. Strict
-  // finalizeDefs throws that finding, so this preserves its public error text
-  // and traversal precedence while authoring callers receive every cycle below.
-  const legacyFirstCycle = (): string[] | undefined => {
-    const WHITE = 0, GREY = 1, BLACK = 2;
-    const color = new Map(keys.map((key) => [key, WHITE]));
-    const stack: string[] = [];
-    const visit = (key: string): string[] | undefined => {
-      color.set(key, GREY);
-      stack.push(key);
-      for (const child of edges.get(key) ?? []) {
-	const state = color.get(child) ?? WHITE;
-	if (state === GREY) return [...stack.slice(stack.indexOf(child)), child];
-	if (state === WHITE) {
-	  const found = visit(child);
-	  if (found !== undefined) return found;
-	}
-      }
-      stack.pop();
-      color.set(key, BLACK);
-      return undefined;
-    };
-    for (const key of keys) {
-      if ((color.get(key) ?? WHITE) !== WHITE) continue;
-      const found = visit(key);
+  for (const key of graph.keys) {
+    if (!index.has(key)) visit(key);
+  }
+  return byMember;
+}
+
+/** Find one deterministic simple cycle through member inside its cyclic SCC. */
+function cycleThroughMember(
+  member: string,
+  component: ReadonlySet<string>,
+  graph: CallsGraph,
+): string[] | undefined {
+  const pathBack = (key: string, target: string, path: string[], seen: Set<string>): string[] | undefined => {
+    for (const child of graph.edges.get(key) ?? []) {
+      if (!component.has(child)) continue;
+      if (child === target) return [...path, child];
+      if (seen.has(child)) continue;
+      seen.add(child);
+      const found = pathBack(child, target, [...path, child], seen);
       if (found !== undefined) return found;
     }
     return undefined;
   };
 
-  // Enumerate each simple directed cycle exactly once. A cycle is explored
-  // only from its lowest insertion-order member; restricting descendants to
-  // that order removes rotation duplicates without collapsing overlapping
-  // cycles into one SCC-wide finding.
-  const cycles: string[][] = [];
-  const seenCycles = new Set<string>();
-  for (const start of keys) {
-    const visit = (key: string, path: string[], seen: Set<string>): void => {
-      for (const child of edges.get(key) ?? []) {
-	if (child === start) {
-	  const cycle = [...path, start];
-	  const fingerprint = cycleFingerprint(cycle);
-	  if (!seenCycles.has(fingerprint)) {
-	    seenCycles.add(fingerprint);
-	    cycles.push(cycle);
-	  }
-	  continue;
-	}
-	if (seen.has(child) || order.get(child)! < order.get(start)!) continue;
-	visit(child, [...path, child], new Set([...seen, child]));
-      }
-    };
-    visit(start, [start], new Set([start]));
+  for (const child of graph.edges.get(member) ?? []) {
+    if (!component.has(child)) continue;
+    if (child === member) return [member, member];
+    const found = pathBack(child, member, [child], new Set([member, child]));
+    if (found !== undefined) return [member, ...found];
   }
+  return undefined;
+}
 
-  const first = legacyFirstCycle();
-  if (first !== undefined) {
-    const firstFingerprint = cycleFingerprint(first);
-    const firstCycleIndex = cycles.findIndex((cycle) => cycleFingerprint(cycle) === firstFingerprint);
-    if (firstCycleIndex >= 0) cycles.splice(firstCycleIndex, 1);
-    cycles.unshift(first);
+/**
+ * Report calls cycles in a flat def map. This is the Mode 2 analogue of the
+ * Mode 1 include-cycle guard in expandIncludes; the two edge kinds stay
+ * deliberately separate. Findings use resolved map identity, not bare call
+ * text, so CAS bundle siblings cannot be accidentally fused. The first finding
+ * is strict loading's legacy DFS witness. Further findings add at most one
+ * deterministic witness for each still-unattributed cyclic member, keeping
+ * authoring attribution polynomial and every finding's members consistent with
+ * its displayed path without enumerating exponentially many simple cycles.
+ */
+export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFinding[] {
+  const graph = buildCallsGraph(defs);
+  const first = findFirstCallsCycle(graph);
+  if (first === undefined) return [];
+
+  const cycles: string[][] = [first];
+  const seen = new Set([cycleFingerprint(first)]);
+  const attributed = new Set(first.slice(0, -1));
+  const components = cyclicComponentsByMember(graph);
+  for (const member of graph.keys) {
+    if (attributed.has(member)) continue;
+    const component = components.get(member);
+    if (component === undefined) continue;
+    const witness = cycleThroughMember(member, component, graph);
+    if (witness === undefined) continue; // unreachable for a member of a cyclic SCC
+    const cycle = canonicalizeCycle(witness, graph.order);
+    for (const cycleMember of cycle.slice(0, -1)) attributed.add(cycleMember);
+    const fingerprint = cycleFingerprint(cycle);
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    cycles.push(cycle);
   }
 
   return cycles.map((cycle) => ({
@@ -2553,7 +2645,8 @@ export function loadDefsUnfinalized(dir: string): Map<string, WorkflowDef> {
  * (each def possibly still carrying `_includes`), it: expands each def's
  * includes; runs the cross-def `calls:` checks (target existence, `callsInputs`
  * key validity, exactly-one child output); runs `validateDef` per expanded def;
- * and finally `reportCallsCycles` over the whole expanded map. Returns the
+ * and finally performs the bounded first-cycle DFS over the whole expanded map.
+ * `reportCallsCycles` exposes the wider per-member authoring report. Returns the
  * expanded, validated map. Throws `DefError` on the first problem — the same
  * messages, in the same order, the filesystem loader has always produced (this
  * is a pure extraction of what used to live inline in `loadDefs`).
@@ -2638,9 +2731,10 @@ export function finalizeDefs(
     out.set(name, expanded);
   }
 
-  // Preserve strict loading's first, stable cycle error after all per-def checks.
-  const cycle = reportCallsCycles(out)[0];
-  if (cycle !== undefined) throw new DefError(cycle.message);
+  // Preserve strict loading's first, stable cycle error after all per-def checks
+  // without paying the wider authoring reporter's per-member attribution cost.
+  const cycle = findFirstCallsCycle(buildCallsGraph(out));
+  if (cycle !== undefined) throw new DefError(`calls cycle: ${cycle.join(' -> ')}`);
 
   return out;
 }

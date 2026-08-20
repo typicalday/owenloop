@@ -916,9 +916,12 @@ discovery surface without requiring prior knowledge of a flag.
 - **Fail-open.** The fold-in never breaks base loading. A corrupt or
   structurally-invalid `installed.json`, a missing install folder, or an install
   folder that fails to load each emits a `warning:` on stderr and is skipped;
-  your project defs still load and the command still exits 0. The add-time
-  fail-closed lockfile validation is unchanged — discovery consumes it and simply
-  refuses to act on a bad ledger rather than crashing.
+  your project defs still load and the command still exits 0. Within a readable
+  install folder, one malformed definition is skipped without hiding healthy
+  siblings: directory `lint` reports the bad file, while executable commands
+  warn and use the same healthy definition set. The add-time fail-closed
+  lockfile validation is unchanged — discovery consumes it and simply refuses
+  to act on a bad ledger rather than crashing.
 
 Public repos only — no auth/token support yet; a private repo (or a bad
 ref) surfaces as a 404 from the sha-resolve step.

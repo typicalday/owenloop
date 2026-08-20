@@ -583,7 +583,7 @@ When the engine spawns a child instance, it passes `producedBy: { parentWf, pare
 
 ### §23.4 Cross-def calls-cycle check
 
-At `loadDefs` time, after all defs are expanded and per-def validated, `reportCallsCycles(defs)` reports the distinct `calls:` cycles in the graph; `finalizeDefs` throws its first finding as `DefError: calls cycle: a -> b -> a` for strict loading. The reporter follows the same scope-aware resolution as runtime spawning and keys each edge by the resolved definition, not by the bare text alone; two bundles may therefore each contain a workflow named `build` without being collapsed into one node. Authoring commands use every reportable finding to mark each participating definition invalid.
+At `loadDefs` time, after all defs are expanded and per-def validated, `finalizeDefs` runs the original bounded first-cycle DFS and throws `DefError: calls cycle: a -> b -> a` on its first witness. Authoring commands call `reportCallsCycles(defs)`, which preserves that first witness and adds deterministic per-member witnesses until every cyclic definition is attributed, without enumerating the potentially exponential set of all simple cycles. Each finding names exactly the members on its displayed path. Both paths follow the same scope-aware resolution as runtime spawning and key each edge by the resolved definition, not by the bare text alone; two bundles may therefore each contain a workflow named `build` without being collapsed into one node.
 
 This check is **separate** from the include-cycle guard in `expandIncludes` (§22.5) — they walk different edge kinds (`calls:` vs `include:`). An include cycle and a calls cycle can coexist independently and are reported with different messages (`calls cycle:` vs `include cycle:`).
 

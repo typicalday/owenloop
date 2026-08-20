@@ -2921,6 +2921,44 @@ test('reportCallsCycles reports distinct overlapping cycles with matching member
   );
 });
 
+test('reportCallsCycles bounds dense-graph findings while attributing every cyclic member', () => {
+  const names = Array.from({ length: 7 }, (_, index) => `node-${index}`);
+  const defs = new Map(names.map((name) => {
+    const targets = names.filter((target) => target !== name);
+    return [name, buildDef({
+      name,
+      outputs: ['result'],
+      steps: [
+		...targets.map((target, index) => ({
+		  name: `delegate-${index}`,
+		  calls: target,
+		  produces: [`child-${index}`],
+		})),
+		{
+		  name: 'finish',
+		  consumes: targets.map((_, index) => `child-${index}`),
+		  produces: ['result'],
+		  terminal: true,
+		},
+      ],
+    })] as const;
+  }));
+
+  const findings = reportCallsCycles(defs);
+  assert.ok(findings.length <= names.length, `expected at most one witness per member, got ${findings.length}`);
+  assert.deepEqual(
+    new Set(findings.flatMap((finding) => finding.members)),
+    new Set(names),
+  );
+  for (const finding of findings) {
+    const displayedMembers = finding.message
+      .replace('calls cycle: ', '')
+      .split(' -> ')
+      .slice(0, -1);
+    assert.deepEqual(finding.members, displayedMembers);
+  }
+});
+
 test('loadDefs: calls: inputs key must be a declared child input', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {

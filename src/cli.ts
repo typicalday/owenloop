@@ -642,7 +642,18 @@ function loadDefsWithInstalled(
 ): LoadedDefs {
   const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
 
-  foldInstalledDefs(io, defsDir, merged, loadDefsUnfinalized);
+  // Installed folders use the same per-file tolerant scan as authoring
+  // discovery. A corrupt sibling is warned about but cannot hide a healthy
+  // installed callee from executable discovery; the merged healthy map still
+  // receives one strict finalize below.
+  foldInstalledDefs(io, defsDir, merged, (dir) => {
+    const failures: DefLoadFailure[] = [];
+    const defs = scanDefsRaw(dir, failures);
+    for (const failure of failures) {
+      io.err(`warning: failed to load installed workflow def ${failure.file}: ${failure.error}`);
+    }
+    return defs;
+  });
 
   const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
 
@@ -721,31 +732,40 @@ function foldCasDefs(
  * maps before best-effort expansion so cross-directory includes resolve against
  * the same complete map as strict runtime discovery.
  */
+interface AuthoringDefs {
+  rawDefs: Map<string, WorkflowDef>;
+  defs: Map<string, WorkflowDef>;
+}
+
 function loadDefsRawWithInstalled(
   io: CliIO,
   defsDir: string,
   failures: DefLoadFailure[],
   verbose = false,
-): Map<string, WorkflowDef> {
+): AuthoringDefs {
   const merged = existsSync(defsDir) ? scanDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
   foldInstalledDefs(io, defsDir, merged, (dir) => scanDefsRaw(dir, failures));
   foldCasDefs(io, defsDir, merged, false, verbose);
-  return expandDefsRaw(merged);
+  return { rawDefs: merged, defs: expandDefsRaw(merged) };
 }
 
 function loadDefsForAuthoring(
   io: CliIO,
   args: Args,
   failures: DefLoadFailure[],
-): { defsDir: string; defs: Map<string, WorkflowDef> } {
+): { defsDir: string; rawDefs: Map<string, WorkflowDef>; defs: Map<string, WorkflowDef> } {
   // This deliberately checks override *presence*, rather than whether its path
   // happens to equal cwd/workflows, matching openCtx exactly.
   const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
   const defsDir = defsOverride ?? join(io.cwd, 'workflows');
-  const defs = defsOverride !== undefined
-    ? (existsSync(defsDir) ? loadDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>())
-    : loadDefsRawWithInstalled(io, defsDir, failures, flag(args, 'verbose'));
-  return { defsDir, defs };
+  let loaded: AuthoringDefs;
+  if (defsOverride !== undefined) {
+    const rawDefs = existsSync(defsDir) ? scanDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
+    loaded = { rawDefs, defs: expandDefsRaw(rawDefs) };
+  } else {
+    loaded = loadDefsRawWithInstalled(io, defsDir, failures, flag(args, 'verbose'));
+  }
+  return { defsDir, ...loaded };
 }
 
 function cycleErrorsByDefKey(defs: Map<string, WorkflowDef>): Map<string, string[]> {
@@ -2215,7 +2235,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 
   if (command === 'lint') {
     const failures: DefLoadFailure[] = [];
-    const { defsDir, defs } = loadDefsForAuthoring(io, args, failures);
+    const { defsDir, rawDefs, defs } = loadDefsForAuthoring(io, args, failures);
     const cycleErrors = cycleErrorsByDefKey(defs);
     const defName = args.positionals[1];
     let hasErrors = false;
@@ -2224,14 +2244,14 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       const def = defs.get(defName);
       if (!def) throw new CliError(`unknown workflow definition '${defName}' (looked in ${defsDir})${failureNote(failures)}`);
       const result = lintDef(def);
-      const errors = [...validateCallsEdges(def, defs), ...result.errors, ...(cycleErrors.get(defName) ?? [])];
+      const errors = [...validateCallsEdges(def, rawDefs), ...result.errors, ...(cycleErrors.get(defName) ?? [])];
       if (errors.length) hasErrors = true;
       print(io, { def: def.name, errors, warnings: errors.length ? [] : result.warnings });
     } else {
       const results: { def?: string; file?: string; errors: string[]; warnings: string[] }[] =
 		[...defs].map(([key, def]) => {
 			const result = lintDef(def);
-			const errors = [...validateCallsEdges(def, defs), ...result.errors, ...(cycleErrors.get(key) ?? [])];
+			const errors = [...validateCallsEdges(def, rawDefs), ...result.errors, ...(cycleErrors.get(key) ?? [])];
 			if (errors.length) hasErrors = true;
 			return { def: def.name, errors, warnings: errors.length ? [] : result.warnings };
 		});
@@ -2250,7 +2270,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 
   if (command === 'check') {
     const failures: DefLoadFailure[] = [];
-    const { defsDir, defs } = loadDefsForAuthoring(io, args, failures);
+    const { defsDir, rawDefs, defs } = loadDefsForAuthoring(io, args, failures);
     const cycleErrors = cycleErrorsByDefKey(defs);
     const defName = need(args, 1, 'def');
     const def = defs.get(defName);
@@ -2261,10 +2281,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       );
     }
 
-    // loadDefsRaw uses buildDef (no semantic validation); run validateDef here so
-    // invariant stem-reference / duplicate-name errors surface to the author.
+    // Authoring discovery uses buildDef (no semantic validation); run
+    // validateDef here so invariant stem-reference / duplicate-name errors
+    // surface to the author.
     const defErrors = [
-      ...validateCallsEdges(def, defs),
+      ...validateCallsEdges(def, rawDefs),
       ...validateDef(def),
       ...(cycleErrors.get(defName) ?? []),
     ];
