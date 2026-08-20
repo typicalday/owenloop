@@ -2438,6 +2438,204 @@ test('an agent-lane cap releases an undispatchable agent claim', async () => {
   );
 });
 
+test('an agent-capacity cooldown re-arms on agent room, not a broad total-capacity change', async () => {
+  cacheBuilderStep();
+  let monotonic = 0;
+  writeChildRecord(stateDir, {
+    workflow: 'wf1', run: 'run_agent_blocker', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder',
+  });
+  const perWf = agentWf([wo('run_agent_released', 'builder')]);
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: true, cursor: 2 },
+      { changed: false, cursor: 2 },
+    ],
+    perWf,
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 3,
+    maxConcurrentAgents: 1,
+    execReserve: 0,
+    monotonicNow: () => monotonic,
+  }));
+
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 1);
+  assert.equal(spawns.length, 0, 'the first agent order is released while the lane is full');
+
+  // More total dispatch capacity is irrelevant while the sole agent lane is
+  // still occupied. A changed cursor may sweep, but must not re-claim it.
+  loop.setCap(4);
+  monotonic = 1;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 1, 'a broad capacity-vector change did not clear agent saturation');
+
+  // Freeing the relevant lane before the monotonic deadline is the early
+  // retry signal, even when the hub cursor stays unchanged. A real hub gives
+  // this re-offer a fresh run id.
+  removeChildRecord(stateDir, 'run_agent_blocker');
+  perWf.wf1!.orders = [wo('run_agent_reoffer', 'builder')];
+  monotonic = 2;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 2);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_agent_reoffer']);
+});
+
+test('an agent-capacity cooldown suppresses fresh-run churn until its fixed monotonic deadline', async () => {
+  cacheBuilderStep();
+  let monotonic = 0;
+  writeChildRecord(stateDir, {
+    workflow: 'wf1', run: 'run_agent_blocker', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder',
+  });
+  const perWf = agentWf([]);
+  let offered = 0;
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: true, cursor: 2 },
+      { changed: true, cursor: 3 },
+      { changed: false, cursor: 3 },
+      { changed: true, cursor: 4 },
+    ],
+    perWf,
+    onTargetedWhatsNext: () => {
+      offered++;
+      perWf.wf1!.orders = [wo(`run_agent_reoffer_${offered}`, 'builder')];
+    },
+  });
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 3,
+    maxConcurrentAgents: 1,
+    execReserve: 0,
+    monotonicNow: () => monotonic,
+  }));
+
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 1);
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_agent_reoffer_1' },
+  ]);
+
+  monotonic = 1;
+  await loop.iterate();
+  monotonic = 29_999;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 1, 'busy cursor activity before 30s did not re-claim the stable step');
+
+  monotonic = 30_000;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 2, 'the fixed deadline retries on an unchanged wake');
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run_agent_reoffer_1' },
+    { workflow: 'wf1', run: 'run_agent_reoffer_2' },
+  ]);
+
+  monotonic = 30_001;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 2, 'the fresh release arms a new fixed window instead of sliding it');
+});
+
+test('a workflow cooldown leaves inbox and sibling workflows observable, but deliberately delays its command work', async () => {
+  cacheCommandBundle();
+  let monotonic = 0;
+  writeChildRecord(stateDir, {
+    workflow: 'wfA', run: 'run_agent_blocker', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder',
+  });
+  const perWf = {
+    wfA: { def: 'demo', orders: [modernWo('run_agent_a1', 'builder', 'agent')] },
+    wfB: { def: 'demo', orders: [wo('run_command_b1', 'cmd', 'wfB')] },
+  };
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: true, cursor: 2 },
+      { changed: false, cursor: 2 },
+    ],
+    inbox: ['wfA', 'wfB'],
+    perWf,
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const reapers: SweepOpts[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    cap: 5,
+    maxConcurrentAgents: 1,
+    execReserve: 0,
+    monotonicNow: () => monotonic,
+    workRoot: join(cacheDir, 'work'),
+    sweepWorkDirs: (options) => {
+      reapers.push(options);
+      return [];
+    },
+  }));
+
+  await loop.iterate();
+  perWf.wfA.orders = [
+    modernWo('run_agent_a2', 'builder', 'agent'),
+    wo('run_command_a_delayed', 'cmd', 'wfA'),
+  ];
+  perWf.wfB.orders = [wo('run_command_b2', 'cmd', 'wfB')];
+
+  monotonic = 1;
+  await loop.iterate();
+  const targetedBeforeDeadline = calls
+    .filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow !== undefined)
+    .map((call) => (call.arg as { workflow?: string }).workflow);
+  assert.deepEqual(targetedBeforeDeadline, ['wfA', 'wfB', 'wfB']);
+  assert.equal(
+    calls.filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow === undefined).length,
+    2,
+    'the untargeted inbox request stays outside the targeted cooldown',
+  );
+  assert.deepEqual([...reapers.at(-1)!.workflows], ['wfB'], 'the reaper sees the observed sibling, not skipped wfA');
+  assert.equal(spawns.some((spawn) => spawn.run === 'run_command_a_delayed'), false);
+
+  monotonic = 30_000;
+  await loop.iterate();
+  assert.equal(
+    spawns.some((spawn) => spawn.run === 'run_command_a_delayed'),
+    true,
+    'workflow-wide suppression intentionally delays command work until the bound',
+  );
+});
+
+test('a sweep with only a cooled workflow does not call the work-directory reaper', async () => {
+  cacheBuilderStep();
+  let monotonic = 0;
+  writeChildRecord(stateDir, {
+    workflow: 'wf1', run: 'run_agent_blocker', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder',
+  });
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: true, cursor: 2 }],
+    perWf: agentWf([wo('run_agent_released', 'builder')]),
+  });
+  const { spawner } = fakeSpawner();
+  const reapers: SweepOpts[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 3,
+    maxConcurrentAgents: 1,
+    execReserve: 0,
+    monotonicNow: () => monotonic,
+    workRoot: join(cacheDir, 'work'),
+    sweepWorkDirs: (options) => {
+      reapers.push(options);
+      return [];
+    },
+  }));
+
+  await loop.iterate();
+  assert.equal(reapers.length, 1);
+  monotonic = 1;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 1, 'the targeted call was suppressed');
+  assert.equal(reapers.length, 1, 'no hub observation means no reaper call');
+});
+
 test('a command lane at capacity releases its extra claim', async () => {
   cacheCommandBundle();
   const { hub, calls } = mockHub({
