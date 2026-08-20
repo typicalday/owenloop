@@ -1583,6 +1583,14 @@ stream cancelled) rather than buffered, closing the same memory-exhaustion gap
 on the hub path that the `add` download cap closes on the archive path.
 `OWENLOOP_HUB_MAX_RESPONSE_BYTES` overrides the cap (a test knob).
 
+**Authentication failures.** On the credential-verification and shared
+authenticated-read paths, a `401` keeps its credential-specific message, while
+a `429` is reported as `rate limited by the hub`. When the hub sends a
+`Retry-After` header, the CLI appends ` (retry after VALUE)`; it does not parse
+the value or sleep automatically. Other non-2xx responses keep the generic
+status-bearing hub-rejected message. Login verifies before storing, so a failed
+verification — including a `429` — never writes the credential.
+
 ### `login` — authenticate the CLI against a hub
 
 Two ways to get a credential, both of which **verify before storing** (a token
