@@ -4,6 +4,7 @@ import { Engine, ModifierRefusalError } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { buildDef, hashDef, parseDef } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
+import type { Firing } from '../src/model.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
 import type { OrderInstructionSource } from '../src/order-resolver.ts';
 import { openStore } from '../src/store.ts';
@@ -222,6 +223,13 @@ test('onCancel declarations are inert in standalone Engine eligibility, cascade,
     consumedFingerprint: order.consumedFingerprint,
     outputs: order.outputs,
   });
+  const projectFiring = (firing: Firing) => ({
+    step: firing.step,
+    key: firing.key,
+    inputs: firing.inputs,
+    outputs: firing.outputs,
+    cause: firing.cause,
+  });
   const drive = (definition: WorkflowDef) => {
     const { engine, store } = makeEngine([definition]);
     const workflow = engine.createInstance(definition.name, { provide: { seed: { source: 'shared' } } });
@@ -247,18 +255,18 @@ test('onCancel declarations are inert in standalone Engine eligibility, cascade,
 
     complete(engine, workflow, finish, { result: 'done' }, { terminal: true });
     const status = engine.status(workflow);
-    const finalTick = engine.tick(workflow, { now: 3000 });
     const final = {
       done: status.done,
       debts: status.debts,
-      eligible: finalTick.orders.map(projectOrder),
+      eligible: status.eligible.map(projectFiring),
       artifacts: projectArtifacts(),
-      tick: finalTick.orders.map(projectOrder),
     };
+    const finalTick = engine.tick(workflow, { now: 3000 });
     return {
       initialEligible: initialTick.orders.map(projectOrder),
       afterPrepare,
       final,
+      finalTick: finalTick.orders.map(projectOrder),
     };
   };
 
@@ -270,7 +278,7 @@ test('onCancel declarations are inert in standalone Engine eligibility, cascade,
   assert.equal(unmarkedTrace.final.done, true);
   assert.deepEqual(unmarkedTrace.final.debts, []);
   assert.deepEqual(unmarkedTrace.final.eligible, []);
-  assert.deepEqual(unmarkedTrace.final.tick, []);
+  assert.deepEqual(unmarkedTrace.finalTick, []);
 });
 
 test('a firing carries its consumed input handles, claim-time fingerprint, and owed reason thread', () => {

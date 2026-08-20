@@ -987,9 +987,15 @@ test('calls: deep tick (2) three-level nesting — tick(root) drives the tree to
   engine.close(workerOrder!.workflow, workerOrder!.run);
 
   engine.tick(root);
-  assert.deepEqual(getArt(store, leafRow!.id, 'result')?.value, result, 'leaf keeps its submitted result');
-  assert.deepEqual(getArt(store, midRow!.id, 'leaf_mirror')?.value, result, 'middle mirrors the leaf result');
-  assert.deepEqual(getArt(store, root, 'mid_mirror')?.value, result, 'root mirrors the middle result');
+  const leafResult = getArt(store, leafRow!.id, 'result')!;
+  const middleMirror = getArt(store, midRow!.id, 'leaf_mirror')!;
+  const rootMirror = getArt(store, root, 'mid_mirror')!;
+  assert.equal(leafResult.acceptance, 'green', 'leaf keeps its submitted result green');
+  assert.deepEqual(leafResult.value, result);
+  assert.equal(middleMirror.acceptance, 'green', 'middle mirrors a green leaf result');
+  assert.deepEqual(middleMirror.value, result);
+  assert.equal(rootMirror.acceptance, 'green', 'root mirrors a green middle result');
+  assert.deepEqual(rootMirror.value, result);
 
   const status = engine.status(root);
   assert.equal(status.done, true);
