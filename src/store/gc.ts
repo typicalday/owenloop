@@ -35,6 +35,7 @@ import {
   fsyncWorkflowStoreFileAndParent,
   parkWorkflowStoreGcObject,
   recoverInterruptedWorkflowStoreGc,
+  removeParkedWorkflowStoreGcObject,
   workflowStoreGcJournalPath,
 } from './gc-recovery.ts';
 import {
@@ -635,7 +636,14 @@ export async function collectWorkflowStoreGarbage(
 			? {}
 			: { afterObjectParked: args.hooks.afterObjectParked }),
       });
-      (args.hooks?.removeParkedObject ?? rmRecursiveForce)(parked);
+      removeParkedWorkflowStoreGcObject({
+		root: targetRoot,
+		stateDir: state.stateDir,
+		parked,
+		...(args.hooks?.removeParkedObject === undefined
+			? {}
+			: { remove: args.hooks.removeParkedObject }),
+	  });
     }
     if (
       ownsEveryStagingWriter

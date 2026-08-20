@@ -200,6 +200,47 @@ test('selected winners, explicit pins, runtime pins, and transitive bundle locks
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV2.digest), false);
 });
 
+test('bundle install refuses a locked multi-workflow coordinate with no callable default before mutation', async () => {
+  const child = await installVersion({
+    name: 'child',
+    version: '1.0.0',
+    workflows: { helper: workflowYaml('helper', 'helper') },
+  });
+  const target = 'child/child@1.0.0';
+  const indexPath = storeIndexPath(child.root);
+  const indexBefore = readFileSync(indexPath);
+  const objectsRoot = join(child.root, 'objects', 'sha256');
+  const objectsBefore = readdirSync(objectsRoot).sort(compareStoreText);
+
+  await assert.rejects(
+    installVersion({
+      name: 'caller',
+      version: '1.0.0',
+      root: child.root,
+      workflow: [
+		'name: caller',
+		'inputs:',
+		'  - name: seed',
+		'    seedOwed: true',
+		'steps:',
+		'  - name: invoke',
+		`    calls: ${target}`,
+		'    inputs:',
+		'      seed: seed',
+		'    produces: [done]',
+		'outputs: [done]',
+		'',
+      ].join('\n'),
+      lock: { [target]: child.digest },
+    }),
+    /lock target 'child\/child@1\.0\.0'.*no longer exactly callable/u,
+  );
+
+  assert.deepEqual(readFileSync(indexPath), indexBefore, 'the caller index entry is never committed');
+  assert.deepEqual(readdirSync(objectsRoot).sort(compareStoreText), objectsBefore, 'no caller object is committed');
+  assert.equal(readWorkflowStoreIndex(indexPath).entries['caller/caller@1.0.0'], undefined);
+});
+
 test('project GC follows locks from every retained global caller version', async () => {
 	const projectV1 = await installVersion({ name: 'child', version: '1.0.0' });
 	const projectV2 = await installVersion({ name: 'child', version: '2.0.0', root: projectV1.root });
@@ -930,6 +971,52 @@ test('failure after index commit leaves a loadable index and a rerunnable orphan
   });
   assert.ok(rerun.objects.some((object) => object.digest === installed.digests['1.0.0']));
   assert.equal(existsSync(objectDirForDigest(installed.root, installed.digests['1.0.0'])), false);
+});
+
+test('failed parked-object removal keeps durable evidence for the next project GC run', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+  let parkedObject: string | undefined;
+
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+      hooks: {
+		removeParkedObject: (path) => {
+		  parkedObject = path;
+		  throw new Error('injected parked-object removal failure');
+		},
+      },
+    }),
+    /injected parked-object removal failure/u,
+  );
+
+  assert.ok(parkedObject);
+  assert.equal(existsSync(parkedObject), true);
+  assert.equal(existsSync(gcJournal), true, 'failed cleanup retains its authenticated retry evidence');
+  const unrelated = join(installed.root, '.owenloop-staging', 'unrelated', 'keep.txt');
+  mkdirSync(dirname(unrelated), { recursive: true });
+  writeFileSync(unrelated, 'keep');
+
+  await collectWorkflowStoreGarbage({
+    projectRoot: installed.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => [],
+  });
+
+  assert.equal(existsSync(parkedObject), false, 'the next run retries the journal-owned parked path');
+  assert.equal(existsSync(gcJournal), false, 'evidence clears only after durable removal');
+  assert.equal(readFileSync(unrelated, 'utf8'), 'keep', 'unrelated shared staging remains untouched');
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
 });
 
 test('malformed or symlinked object state fails closed without deletion', async () => {

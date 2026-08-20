@@ -27,6 +27,7 @@ import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
 import {
   DefError,
+  digestScopedCallsTargetKey,
   finalizeDefs,
   lintDef,
   loadDefFile,
@@ -73,8 +74,9 @@ import type {
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
+import { loadCasDefs } from './def-source.ts';
 import { compareStoreText, defDigest, objectDirForDigest } from './types.ts';
-import { probeStoreRoot, projectStoreRoot, storeIndexPath } from './resolve.ts';
+import { projectStoreRoot, storeIndexPath } from './resolve.ts';
 import { recoverInterruptedWorkflowStoreGc } from './gc-recovery.ts';
 
 // ---- A1/A2 ports ---------------------------------------------------------------
@@ -206,35 +208,19 @@ function assertManifestLocksResolvable(args: {
     );
   }
 
-  const readIndex = (storeRoot: string): WorkflowStoreIndex => probeStoreRoot(storeRoot) === 'absent'
-    ? { version: 1, entries: {} }
-    : readWorkflowStoreIndex(storeIndexPath(storeRoot));
-  const projectIndex = readIndex(projectRoot);
-  const globalIndex = projectRoot === globalRoot ? projectIndex : readIndex(globalRoot);
-  const indexNamesDigest = (index: WorkflowStoreIndex, digest: DefDigest): boolean =>
-    Object.values(index.entries).some((entry) => entry.digest === digest);
-  const verifiedObjectPresent = (storeRoot: string, digest: DefDigest): boolean => {
-    const objectDir = objectDirForDigest(storeRoot, digest);
-    const state = probeDirectoryPath(objectDir, 'workflow object', storeRoot);
-    if (state === 'absent') return false;
-    verifyWorkflowObjectSync(objectDir, digest, { coordinateRepair: false });
-    return true;
-  };
+  // Do not approximate execution reachability with index/object presence.
+  // Strict discovery also verifies coordinate identity, runtime compatibility,
+  // the callable default/sole-workflow target, and the exact project/global
+  // fallback semantics used when a running workflow resolves its bundleLock.
+  const callableKeys = new Set(
+    loadCasDefs({ projectRoot, globalRoot, warn: () => {} })
+      .filter((registration) => registration.kind === 'coordinate')
+      .map((registration) => registration.key),
+  );
 
   for (const [coordinate, rawDigest] of entries.sort(([a], [b]) => compareStoreText(a, b))) {
     const digest = defDigest(rawDigest);
-    let callable = false;
-    if (projectIndex.entries[coordinate]?.digest === digest) {
-      const local = verifiedObjectPresent(projectRoot, digest);
-      callable = local || (
-		indexNamesDigest(globalIndex, digest)
-		&& verifiedObjectPresent(globalRoot, digest)
-      );
-    }
-    if (!callable && globalIndex.entries[coordinate]?.digest === digest) {
-      callable = verifiedObjectPresent(globalRoot, digest);
-    }
-    if (!callable) {
+    if (!callableKeys.has(digestScopedCallsTargetKey(digest, coordinate))) {
       throw new Error(
 	`refusing bundle install: lock target '${coordinate}' pinned to ${digest} ` +
 		  'is no longer exactly callable from the combined workflow store',

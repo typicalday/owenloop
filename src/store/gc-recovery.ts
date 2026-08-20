@@ -58,6 +58,11 @@ export interface ParkWorkflowStoreGcObjectArgs extends WorkflowStoreGcRecoveryAr
 	afterObjectParked?: (path: string) => void;
 }
 
+export interface RemoveParkedWorkflowStoreGcObjectArgs extends WorkflowStoreGcRecoveryArgs {
+	parked: string;
+	remove?: (path: string) => void;
+}
+
 export function workflowStoreGcJournalPath(stateDir: string): string {
 	return join(stateDir, WORKFLOW_STORE_GC_JOURNAL_FILENAME);
 }
@@ -198,15 +203,22 @@ export function recoverInterruptedWorkflowStoreGc(args: WorkflowStoreGcRecoveryA
 	const parkedState = stagingState === 'dir'
 		? realDirectoryState(parked, 'workflow-store GC parked object', stagingRoot)
 		: undefined;
+	const index = readWorkflowStoreIndex(storeIndexPath(args.root));
+	const indexed = Object.values(index.entries).some((entry) => entry.digest === journal.digest);
 	if (liveState !== undefined && parkedState !== undefined) {
 		throw corruptGcJournal(journalPath, 'both the live and parked object paths exist');
 	}
 	if (liveState === undefined && parkedState === undefined) {
-		throw corruptGcJournal(journalPath, 'neither the live nor parked object path exists');
+		if (indexed) {
+			throw corruptGcJournal(journalPath, 'neither the live nor parked object path exists for an indexed digest');
+		}
+		// Deletion and its staging-directory fsync completed, but the process
+		// stopped before unlinking the journal. The index corroborates that no
+		// live bytes are owed, so finish the durable cleanup.
+		fsyncWorkflowStoreDirectory(stagingState === 'dir' ? stagingRoot : args.root);
+		removeGcJournal(journalPath, args.stateDir);
+		return true;
 	}
-
-	const index = readWorkflowStoreIndex(storeIndexPath(args.root));
-	const indexed = Object.values(index.entries).some((entry) => entry.digest === journal.digest);
 	if (liveState !== undefined) {
 		// The interruption preceded (or the filesystem rolled back) the rename.
 		// Whether indexed or orphaned, the canonical path must not remain writable.
@@ -226,26 +238,26 @@ export function recoverInterruptedWorkflowStoreGc(args: WorkflowStoreGcRecoveryA
 		fsyncWorkflowStoreDirectory(dirname(live));
 		verifyWorkflowObjectSync(live, journal.digest, { coordinateRepair: false });
 	} else {
-		// Only an index-absent digest is corroborated as doomed. Leave its verified,
-		// hardened parked copy for the caller's ordinary staging cleanup.
+		// Only an index-absent digest is corroborated as doomed.
 		restoreAndVerify(parked, journal);
 		fsyncWorkflowStoreDirectory(stagingRoot);
 		fsyncWorkflowStoreDirectory(dirname(live));
 	}
-	removeGcJournal(journalPath, args.stateDir);
 	if (!indexed) {
-		// Remove only the path authenticated by the GC journal. Offline recovery
-		// must not recursively clear unrelated staging evidence owned by another
-		// interrupted transaction.
+		// Keep the journal until the authenticated parked path and its directory
+		// entry are durably gone. A failed removal therefore remains retryable.
 		rmRecursiveForce(parked);
+		fsyncWorkflowStoreDirectory(stagingRoot);
 	}
+	removeGcJournal(journalPath, args.stateDir);
 	return true;
 }
 
 /**
  * Park one already-unindexed object under durable recovery evidence. The
- * caller holds the root lock and removes the returned staging path only after
- * this function has durably cleared the journal.
+ * caller holds the root lock and must pass the returned path to
+ * removeParkedWorkflowStoreGcObject(). The journal remains durable until that
+ * path and its staging-directory entry have been removed successfully.
  */
 export function parkWorkflowStoreGcObject(args: ParkWorkflowStoreGcObjectArgs): string {
 	if (lockfilePathViolation(args.parkedName) !== undefined) {
@@ -285,6 +297,28 @@ export function parkWorkflowStoreGcObject(args: ParkWorkflowStoreGcObjectArgs): 
 	fsyncWorkflowStoreDirectory(dirname(live));
 	fsyncWorkflowStoreDirectory(stagingRoot);
 	args.afterObjectParked?.(parked);
-	removeGcJournal(journalPath, args.stateDir);
 	return parked;
+}
+
+/** Remove one journal-authenticated parked object and only then clear evidence. */
+export function removeParkedWorkflowStoreGcObject(
+	args: RemoveParkedWorkflowStoreGcObjectArgs,
+): void {
+	const journalPath = workflowStoreGcJournalPath(args.stateDir);
+	const journal = readGcJournal(journalPath);
+	if (journal === undefined) {
+		throw new Error(`refusing workflow-store GC parked cleanup '${args.parked}': journal is missing`);
+	}
+	const { parked, stagingRoot } = transactionPaths(args.root, journal);
+	if (args.parked !== parked) {
+		throw new Error(
+			`refusing workflow-store GC parked cleanup '${args.parked}': journal authenticates '${parked}'`,
+		);
+	}
+	(args.remove ?? rmRecursiveForce)(parked);
+	if (lstatSync(parked, { throwIfNoEntry: false }) !== undefined) {
+		throw new Error(`workflow-store GC parked cleanup '${parked}' returned without removing the path`);
+	}
+	fsyncWorkflowStoreDirectory(stagingRoot);
+	removeGcJournal(journalPath, args.stateDir);
 }
