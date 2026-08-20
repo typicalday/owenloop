@@ -8,11 +8,13 @@ import {
   readFileSync,
   readdirSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { main, mainAsync } from '../src/cli.ts';
+import { finalizeDefs } from '../src/defs.ts';
 import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   collectWorkflowStoreGarbage,
@@ -53,6 +55,7 @@ async function installVersion(args: {
   workflow?: string;
   workflows?: Record<string, string>;
   lock?: Record<string, string>;
+  defaultWorkflow?: string;
 }): Promise<{ root: string; digest: DefDigest }> {
   const name = args.name ?? 'widget';
   const sourceDir = writeBundleSource({
@@ -60,6 +63,7 @@ async function installVersion(args: {
     version: args.version,
     workflow: args.workflow ?? workflowYaml(name, args.marker ?? `${name}-${args.version}`),
     ...(args.workflows === undefined ? {} : { workflows: args.workflows }),
+    ...(args.defaultWorkflow === undefined ? {} : { defaultWorkflow: args.defaultWorkflow }),
     ...(args.lock === undefined ? {} : { lock: args.lock }),
   });
   const installed = await installBundleFixture({
@@ -272,7 +276,36 @@ test('bundle GC --yes removes exactly an unchanged dry run and strict loading st
 });
 
 test('GC excludes a two-connection stale snapshot writer from the scan-to-delete window', async () => {
-  const installed = await installThree();
+  const includedParent = (version: string) => [
+    'name: widget',
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - include: helper',
+    '    as: helper',
+    '    inputs:',
+    '      seed: seed',
+    `# ${version}`,
+    '',
+  ].join('\n');
+  const old = await installVersion({
+    version: '1.0.0',
+    workflow: includedParent('old'),
+    workflows: { helper: workflowYaml('helper', 'old-helper') },
+    defaultWorkflow: 'widget',
+  });
+  const current = await installVersion({
+    version: '2.0.0',
+    root: old.root,
+    workflow: includedParent('current'),
+    workflows: { helper: workflowYaml('helper', 'current-helper') },
+    defaultWorkflow: 'widget',
+  });
+  const installed = {
+    root: old.root,
+    digests: { '1.0.0': old.digest, '2.0.0': current.digest },
+  };
   const globalRoot = emptyRoot();
   const controlDir = tempDir('owenloop-gc-snapshot-barrier-');
   const dbPath = join(controlDir, 'state.db');
@@ -283,6 +316,7 @@ test('GC excludes a two-connection stale snapshot writer from the scan-to-delete
   const childScript = `
     const { writeFileSync } = await import('node:fs');
     const { Engine } = await import(${JSON.stringify(new URL('../src/engine.ts', import.meta.url).href)});
+    const { finalizeDefs } = await import(${JSON.stringify(new URL('../src/defs.ts', import.meta.url).href)});
     const { openStore } = await import(${JSON.stringify(new URL('../src/store.ts', import.meta.url).href)});
     const { loadCasDefs } = await import(${JSON.stringify(new URL('../src/store/index.ts', import.meta.url).href)});
     const registrations = loadCasDefs({
@@ -290,7 +324,14 @@ test('GC excludes a two-connection stale snapshot writer from the scan-to-delete
       globalRoot: process.env.GC_GLOBAL_ROOT,
       warn: () => {},
     });
-    const defs = new Map(registrations.map((registration) => [registration.key, registration.def]));
+    const parent = registrations.find((registration) => registration.key === process.env.GC_TARGET);
+    const helper = registrations.find((registration) =>
+      registration.bundleDigest === parent?.bundleDigest && registration.def.name === 'helper');
+    if (parent === undefined || helper === undefined) throw new Error('missing include-bearing CAS fixture definitions');
+    const defs = finalizeDefs(new Map([
+      [process.env.GC_TARGET, parent.def],
+      ['helper', helper.def],
+    ]));
     const store = openStore(process.env.GC_DB_PATH);
     const engine = new Engine(store, (name) => {
       const def = defs.get(name);
@@ -312,6 +353,27 @@ test('GC excludes a two-connection stale snapshot writer from the scan-to-delete
       store.close();
     }
   `;
+  const registrations = loadCasDefs({
+    projectRoot: installed.root,
+    globalRoot,
+    warn: () => {},
+  });
+  const parent = registrations.find((registration) => registration.key === target);
+  const helper = registrations.find((registration) =>
+    registration.bundleDigest === parent?.bundleDigest && registration.def.name === 'helper');
+  assert.ok(parent && helper, 'the exact parent and its same-bundle include target load');
+  const finalized = finalizeDefs(new Map([
+    [target, parent.def],
+    ['helper', helper.def],
+  ]));
+  const finalizedTarget = finalized.get(target);
+  assert.ok(finalizedTarget, 'the exact include-bearing CAS definition finalizes');
+  assert.deepEqual(finalizedTarget.bundleStoreRoots, [installed.root]);
+  assert.equal(
+    Object.getOwnPropertyDescriptor(finalizedTarget, 'bundleStoreRoots')?.enumerable,
+    false,
+    'runtime provenance remains non-enumerable after include expansion',
+  );
   const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '--eval', childScript], {
     cwd: new URL('..', import.meta.url).pathname,
     env: {
@@ -360,6 +422,82 @@ test('GC excludes a two-connection stale snapshot writer from the scan-to-delete
   assert.equal(result.ok, false, 'the stale snapshot must not commit after GC wins the shared lock');
   assert.match(result.error ?? '', /no longer indexed with verified object bytes/u);
   assert.deepEqual(readRuntimeSnapshotBundlePins(dbPath), [], 'the second SQLite connection landed no snapshot row');
+});
+
+test('GC recovers an interruption after the durable journal but before the live-object rename', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+  let interruptedObject: string | undefined;
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+      hooks: {
+	afterLiveObjectMadeWritable: (path) => {
+	  interruptedObject = path;
+	  assert.equal(existsSync(gcJournal), true, 'durable evidence precedes the live chmod');
+	  assert.notEqual(lstatSync(path).mode & 0o200, 0, 'the interruption lands in the chmod-to-rename window');
+	  throw new Error('injected process interruption after live chmod');
+	},
+      },
+    }),
+    /injected process interruption after live chmod/u,
+  );
+  assert.ok(interruptedObject);
+  assert.equal(existsSync(gcJournal), true);
+
+  const rerun = await collectWorkflowStoreGarbage({
+    projectRoot: installed.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => [],
+  });
+  assert.equal(existsSync(gcJournal), false, 'recovery clears evidence only after restoring the object mode');
+  assert.ok(rerun.objects.some((object) => object.digest === installed.digests['1.0.0']));
+  assert.equal(existsSync(interruptedObject), false, 'the recovered orphan is collectable on the rerun');
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+});
+
+test('GC journal recovery refuses a symlinked parked-object root before chmod', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const outside = tempDir('owenloop-gc-journal-escape-');
+  const digest = 'a'.repeat(64) as DefDigest;
+  const parkedName = `gc-${digest}-park_${'b'.repeat(24)}`;
+  const outsideObject = join(outside, parkedName);
+  mkdirSync(outsideObject);
+  const outsideMode = lstatSync(outsideObject).mode & 0o7777;
+  symlinkSync(outside, join(installed.root, '.owenloop-staging'));
+  const journalPath = join(installed.root, '.owenloop', 'gc.journal');
+  writeFileSync(journalPath, `${JSON.stringify({
+    version: 1,
+    digest,
+    parkedName,
+    originalMode: 0o555,
+  })}\n`);
+  const indexBefore = readFileSync(storeIndexPath(installed.root));
+
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+    }),
+    /workflow store staging directory.*symlink/u,
+  );
+  assert.equal(lstatSync(outsideObject).mode & 0o7777, outsideMode, 'recovery never chmods through the link');
+  assert.deepEqual(readFileSync(storeIndexPath(installed.root)), indexBefore, 'recovery refusal never mutates the index');
+  assert.equal(existsSync(journalPath), true, 'untrusted evidence remains for manual inspection');
 });
 
 test('project and global GC mutate only the selected target root', async () => {

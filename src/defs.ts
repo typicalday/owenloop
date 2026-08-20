@@ -1064,13 +1064,24 @@ export function expandIncludes(
     }
   }
 
-  return {
+  const expanded: WorkflowDef = {
     ...def,
     steps: resultSteps,
     inputs: resultInputs,
     outputs: resultOutputs.length > 0 ? resultOutputs : def.outputs,
     _includes: undefined,
   };
+
+  // CAS store roots are live loader provenance, deliberately non-enumerable so
+  // they never enter hashes or persisted snapshots. The spread above therefore
+  // cannot carry them. Preserve the original descriptor explicitly so an
+  // include-expanded CAS definition still coordinates its snapshot writes with
+  // bundle GC.
+  const storeRoots = Object.getOwnPropertyDescriptor(def, 'bundleStoreRoots');
+  if (storeRoots !== undefined) {
+    Object.defineProperty(expanded, 'bundleStoreRoots', storeRoots);
+  }
+  return expanded;
 }
 
 /** Build a validated `WorkflowDef` from a parsed YAML object (or throw DefError). */
