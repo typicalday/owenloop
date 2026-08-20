@@ -2575,7 +2575,7 @@ test('add --recover --global refuses a journal recorded against a different stor
 
 // ---- bundle commands ---------------------------------------------------------
 
-test('bundle commands are store-free, JSON-only, and round-trip the golden fixture', () => {
+test('bundle format commands are store-free, JSON-only, and round-trip the golden fixture', () => {
   const source = join(import.meta.dirname, 'fixtures', 'bundle', 'golden-source');
   const { run, home } = makeCli({ setDbEnv: false });
   const bundlePath = join(home, 'golden.wnlp');

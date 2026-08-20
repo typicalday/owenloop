@@ -19,7 +19,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -192,7 +192,7 @@ function emptyGlobalRoot(): string {
   return root;
 }
 
-function load(projectRoot: string | undefined, globalRoot: string): {
+function load(projectRoot: string | undefined, globalRoot: string, options: { verbose?: boolean } = {}): {
   registrations: ReturnType<typeof loadCasDefs>;
   warnings: string[];
 } {
@@ -201,6 +201,7 @@ function load(projectRoot: string | undefined, globalRoot: string): {
     ...(projectRoot === undefined ? {} : { projectRoot }),
     globalRoot,
     warn: (line) => warnings.push(line),
+		...(options.verbose === undefined ? {} : { verbose: options.verbose }),
   });
   return { registrations, warnings };
 }
@@ -267,6 +268,12 @@ test('WS-6 loader: every CAS workflow is registered qualified, carries provenanc
     assert.equal(r.bundlePackage, 'parent');
     assert.equal(r.def.bundleDigest, digest, 'the def itself carries the digest the resolver reads');
     assert.equal(r.def.bundlePackage, 'parent');
+		assert.deepEqual(r.def.bundleStoreRoots, [root], 'snapshot writers inherit the canonical store root');
+		assert.equal(
+			Object.prototype.propertyIsEnumerable.call(r.def, 'bundleStoreRoots'),
+			false,
+			'live store provenance does not alter hashes or persisted snapshots',
+		);
     assert.equal(r.key.includes('/'), true, 'every registered key contains "/"');
   }
 
@@ -469,6 +476,44 @@ test('WS-6 missing project bytes fall back only to the exact digest indexed glob
   assert.ok(alias);
   assert.equal(alias.bundleDigest, project.digest);
   assert.equal(alias.level, 'global', 'verified bytes came from the exact-digest global fallback');
+	assert.deepEqual(
+		alias.def.bundleStoreRoots,
+		[global.root, project.root].sort(),
+		'the writer locks both the naming project index and the global object store',
+	);
+});
+
+test('WS-6 a project copy cannot mask missing bytes for the same digest indexed globally', async () => {
+	const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+	const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+	assert.equal(project.digest, global.digest, 'fixture stores must index identical bytes');
+	removeInstalledObject(global.root, global.digest);
+
+	assert.throws(
+		() => load(project.root, global.root),
+		/indexed by global coordinate 'parent\/parent@1\.0\.0'.*no verified object directory exists/u,
+		'a global index row must prove its own physical copy even when project has the digest',
+	);
+
+	const warnings: string[] = [];
+	const inspected = inspectCasDefs({
+		projectRoot: project.root,
+		globalRoot: global.root,
+		warn: (line) => warnings.push(line),
+	});
+	assert.equal(inspected.complete, false);
+	assert.ok(
+		inspected.registrations.some((registration) => (
+			registration.key === 'parent/parent@1.0.0'
+			&& registration.bundleDigest === project.digest
+			&& registration.level === 'project'
+		)),
+		'tolerant inspection retains the independently verified project registration',
+	);
+	assert.match(
+		warnings.join('\n'),
+		/incomplete global workflow coordinate 'parent\/parent@1\.0\.0'.*no verified object directory exists/u,
+	);
 });
 
 test('WS-6 a corrupt project object is never masked by a same-coordinate global decoy', async () => {
@@ -875,34 +920,152 @@ test('an already-running explicit-version parent stays pinned after a newer chil
   }
 });
 
-test('explicit versioned calls enforce the manifest lock before child creation', async () => {
-  const installed = await installVersionedCall({
-    marker: 'LOCK-MISMATCH',
-    lockDigest: 'f'.repeat(64),
+test('explicit versioned calls with a stale manifest lock are rejected before install commit', async () => {
+  const root = tempDir('owenloop-versioned-mismatch-');
+  await assert.rejects(
+    installVersionedCall({
+      marker: 'LOCK-MISMATCH',
+      lockDigest: 'f'.repeat(64),
+      root,
+    }),
+    /lock target 'dep\/child@1\.0\.0'.*no longer exactly callable/u,
+  );
+  const index = readWorkflowStoreIndex(storeIndexPath(root));
+  assert.equal(index.entries['caller/caller@1.0.0'], undefined);
+  assert.ok(index.entries['dep/child@1.0.0'], 'the already-installed dependency remains unchanged');
+});
+
+test('reinstall repairs a locked same-digest bundle after legacy executable-mode loss', async () => {
+  const target = 'dep/child@1.0.0';
+  const childSource = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('LOCKED-REPAIR'),
   });
-  const dir = tempDir('owenloop-versioned-mismatch-');
-  const store = openStore(join(dir, 'state.db'));
-  try {
-    const defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
-    const engine = new Engine(store, (name, from) => {
-      const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
-      if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
-      return def;
-    });
+  const child = await installBundleFixture({ sourceDir: childSource });
+  const childIndex = readWorkflowStoreIndex(storeIndexPath(child.root));
+  addIndexCoordinate(child.root, target, { ...childIndex.entries['child/child@1.0.0']! });
 
-    const parent = engine.createInstance('caller/caller@1.0.0', {
-      provide: { seed: { ready: true } },
-    });
-    engine.tick(parent, { deep: false });
+  const unrelatedSource = writeBundleSource({
+    name: 'unrelated',
+    version: '1.0.0',
+    workflow: childYaml('UNRELATED').replace('name: child\n', 'name: unrelated\n'),
+    files: { 'bin/run.sh': '#!/bin/sh\nprintf "unrelated\\n"\n' },
+  });
+  chmodSync(join(unrelatedSource, 'bin', 'run.sh'), 0o755);
+  const unrelated = await installBundleFixture({ sourceDir: unrelatedSource, root: child.root });
 
-    assert.equal(store.findChildByParent(parent, 'delivered'), undefined, 'no mismatched child is created');
-    assert.match(
-      store.getArtifact(parent, 'delivered')?.reasons.at(-1)?.text ?? '',
-      /parent bundle pins .* but the resolved definition comes from/u,
-    );
-  } finally {
-    store.close();
-  }
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: versionedParentYaml(target, 'LOCKED-REPAIR'),
+    lock: { [target]: child.result.digest },
+    files: { 'bin/run.sh': '#!/bin/sh\nprintf "ok\\n"\n' },
+  });
+  chmodSync(join(callerSource, 'bin', 'run.sh'), 0o755);
+  const caller = await installBundleFixture({ sourceDir: callerSource, root: child.root });
+  const executable = join(caller.result.objectPath, 'bin', 'run.sh');
+  const unrelatedExecutable = join(unrelated.result.objectPath, 'bin', 'run.sh');
+  assert.equal(statSync(executable).mode & 0o7777, 0o555);
+  const indexBefore = readFileSync(storeIndexPath(child.root));
+
+  chmodSync(executable, 0o444);
+  chmodSync(unrelatedExecutable, 0o444);
+  assert.throws(
+    () => loadCasDefs({ projectRoot: child.root, globalRoot: child.root, warn: () => {} }),
+    /canonical bundle digest mismatch|expected hardened store mode/u,
+  );
+
+  await assert.rejects(
+    installBundleFixture({ sourceDir: callerSource, root: child.root }),
+    (error: unknown) => error instanceof Error && error.message.includes(unrelated.result.digest),
+    'repair exclusion must not hide an unrelated corrupt indexed object',
+  );
+  assert.equal(statSync(executable).mode & 0o7777, 0o444, 'failed validation does not start caller repair');
+
+  const unrelatedRepair = await installBundleFixture({ sourceDir: unrelatedSource, root: child.root });
+  assert.equal(unrelatedRepair.result.installed, false);
+  assert.equal(statSync(unrelatedExecutable).mode & 0o7777, 0o555);
+
+  const repaired = await installBundleFixture({ sourceDir: callerSource, root: child.root });
+  assert.equal(repaired.result.installed, false, 'same-digest reinstall takes the repair path');
+  assert.equal(statSync(executable).mode & 0o7777, 0o555, 'repair restores the executable bit');
+  assert.deepEqual(readFileSync(storeIndexPath(child.root)), indexBefore, 'repair preserves index bytes');
+  assert.doesNotThrow(
+    () => loadCasDefs({ projectRoot: child.root, globalRoot: child.root, warn: () => {} }),
+  );
+});
+
+test('locked global same-digest repair preserves project exact-digest fallback', async () => {
+  const projectRoot = tempDir('owenloop-locked-global-repair-project-');
+  const globalRoot = emptyGlobalRoot();
+  const target = 'dep/child@1.0.0';
+  const childSource = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('GLOBAL-REPAIR-DEPENDENCY'),
+  });
+  const child = await installBundleFixture({
+    sourceDir: childSource,
+    root: globalRoot,
+    level: 'global',
+    projectRoot,
+    globalRoot,
+  });
+  const globalChildIndex = readWorkflowStoreIndex(storeIndexPath(globalRoot));
+  addIndexCoordinate(globalRoot, target, { ...globalChildIndex.entries['child/child@1.0.0']! });
+
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: versionedParentYaml(target, 'GLOBAL-REPAIR-CALLER'),
+    lock: { [target]: child.result.digest },
+    files: { 'bin/run.sh': '#!/bin/sh\nprintf "ok\\n"\n' },
+  });
+  chmodSync(join(callerSource, 'bin', 'run.sh'), 0o755);
+  const caller = await installBundleFixture({
+    sourceDir: callerSource,
+    root: globalRoot,
+    level: 'global',
+    projectRoot,
+    globalRoot,
+  });
+  const globalIndex = readWorkflowStoreIndex(storeIndexPath(globalRoot));
+  addIndexCoordinate(projectRoot, 'caller/caller@1.0.0', {
+    ...globalIndex.entries['caller/caller@1.0.0']!,
+  });
+  const projectIndexBefore = readFileSync(storeIndexPath(projectRoot));
+  const globalIndexBefore = readFileSync(storeIndexPath(globalRoot));
+  const executable = join(caller.result.objectPath, 'bin', 'run.sh');
+
+  chmodSync(executable, 0o444);
+  assert.throws(
+    () => loadCasDefs({ projectRoot, globalRoot, warn: () => {} }),
+    /canonical bundle digest mismatch|expected hardened store mode/u,
+  );
+
+  const repaired = await installBundleFixture({
+    sourceDir: callerSource,
+    root: globalRoot,
+    level: 'global',
+    projectRoot,
+    globalRoot,
+  });
+  assert.equal(repaired.result.installed, false, 'same-digest global reinstall takes the repair path');
+  assert.equal(statSync(executable).mode & 0o7777, 0o555, 'repair restores the executable bit');
+  assert.deepEqual(readFileSync(storeIndexPath(projectRoot)), projectIndexBefore, 'project index stays unchanged');
+  assert.deepEqual(readFileSync(storeIndexPath(globalRoot)), globalIndexBefore, 'global index stays unchanged');
+
+  const { registrations } = load(projectRoot, globalRoot);
+  const alias = registrations.find((registration) => registration.key === 'caller/caller@1.0.0');
+  assert.ok(alias, 'the project index row remains callable through global fallback');
+  assert.equal(alias.bundleDigest, caller.result.digest);
+  assert.equal(alias.level, 'global');
+  assert.deepEqual(
+    alias.def.bundleStoreRoots,
+    [globalRoot, projectRoot].sort(),
+    'the repaired fallback still coordinates the naming and supplying roots',
+  );
 });
 
 // ---- acceptance (c): a pin mismatch is a visible debt, not a silent run ------
@@ -1157,7 +1320,7 @@ test('version selection: workflow registration order is sorted by qualified name
   );
 });
 
-test('version selection: install order moves neither the winner nor the warnings', async () => {
+test('version selection: default discovery hides detailed notices behind one stable summary', async () => {
   // Two installs of the same versions differing only in the order they were
   // added must produce byte-identical warnings, in the same order, and pick the
   // same winner.
@@ -1173,8 +1336,26 @@ test('version selection: install order moves neither the winner nor the warnings
     second.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
     'registration order itself is stable, not merely the set of keys',
   );
-  assert.deepEqual(first.warnings, second.warnings, 'warning text and order are identical');
-  assert.equal(first.warnings.length, 2, 'both shadowed workflows of 0.1.0 are reported once each');
+	  assert.deepEqual(first.warnings, second.warnings, 'summary text and order are identical');
+	  assert.deepEqual(first.warnings, [
+	    'note: 1 superseded bundle version hidden; --verbose to list them',
+	  ]);
+	  assert.equal(first.warnings.some((line) => line.startsWith('warning:')), false);
+});
+
+test('version selection: verbose restores every detailed shadowing notice in stable order', async () => {
+	const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
+	const { warnings } = load(root, emptyGlobalRoot(), { verbose: true });
+	const oldDigest = digests.get('0.1.0') as string;
+	const newDigest = digests.get('0.1.7') as string;
+	assert.deepEqual(warnings, [
+		`warning: workflow 'parent/child' from project-indexed bundle ${oldDigest} (version 0.1.0) ` +
+			`does not hold that name — project-indexed bundle ${newDigest} (version 0.1.7) is the selected ` +
+			`version; this copy stays reachable as '${oldDigest}/child'`,
+		`warning: workflow 'parent/parent' from project-indexed bundle ${oldDigest} (version 0.1.0) ` +
+			`does not hold that name — project-indexed bundle ${newDigest} (version 0.1.7) is the selected ` +
+			`version; this copy stays reachable as '${oldDigest}/parent'`,
+	]);
 });
 
 test('version selection: a project pin whose BYTES came from global still outranks a higher global version', async () => {
@@ -1294,11 +1475,12 @@ test('version selection: several non-SemVer versions fail closed instead of gues
   const { root, digests } = await installVersions(['nightly', 'edge']);
   const { registrations, warnings } = load(root, emptyGlobalRoot());
 
-  assert.equal(
+	  assert.equal(
     registrations.find((r) => r.key === 'parent/parent'),
     undefined,
     'no version may claim the unqualified name when none can be ordered',
-  );
+	  );
+	  assert.equal(warnings.some((line) => line.startsWith('note:')), false, 'actionable warnings are never hidden');
   assert.equal(
     warnings.some((line) => line.includes("workflow 'parent/parent' has no selectable version")),
     true,
@@ -1318,11 +1500,12 @@ test('version selection: several non-SemVer versions fail closed instead of gues
 });
 
 test('version selection: a SINGLE non-SemVer version still holds its name', async () => {
-  const { root, digests } = await installVersions(['nightly']);
-  const { registrations } = load(root, emptyGlobalRoot());
+	  const { root, digests } = await installVersions(['nightly']);
+	  const { registrations, warnings } = load(root, emptyGlobalRoot());
 
   const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
-  assert.equal(winner?.bundleDigest, digests.get('nightly'), 'nothing to order, so nothing to refuse');
+	  assert.equal(winner?.bundleDigest, digests.get('nightly'), 'nothing to order, so nothing to refuse');
+	  assert.deepEqual(warnings, [], 'one version has no hidden-history summary');
 });
 
 test('version selection: a SemVer version outranks a non-SemVer one rather than tying', async () => {
@@ -1334,8 +1517,8 @@ test('version selection: a SemVer version outranks a non-SemVer one rather than 
 });
 
 test('version selection: the shadowing warning names both versions, not just the digests', async () => {
-  const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
-  const { warnings } = load(root, emptyGlobalRoot());
+	  const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
+	  const { warnings } = load(root, emptyGlobalRoot(), { verbose: true });
 
   const line = warnings.find((w) => w.includes(digests.get('0.1.0') as string));
   assert.ok(line, 'the shadowed copy is reported');

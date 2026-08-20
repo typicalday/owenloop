@@ -70,6 +70,8 @@ export interface LoadCasDefsArgs {
 	globalRoot: string;
 	/** Warning sink used only by tolerant inspection and collision notices. */
 	warn: (line: string) => void;
+	/** Emit the full per-candidate superseded-version notices. */
+	verbose?: boolean;
 }
 
 /** Explicitly partial result for read-only inspection. */
@@ -101,11 +103,29 @@ interface LoadedObject {
 	manifest: BundleManifest;
 	defs: Map<string, WorkflowDef>;
 	level: ResolutionLevel;
+	objectRoot: string;
 }
 
 interface ReadIndexResult {
 	entries: IndexedCoordinate[];
 	complete: boolean;
+}
+
+interface RepairObjectReplacement {
+	root: string;
+	digest: DefDigest;
+	objectDir: string;
+}
+
+function setBundleStoreRoots(def: WorkflowDef, roots: string[]): void {
+	// This is live loader provenance, not definition content. Keep it available
+	// to snapshot writers without changing hashDef or the persisted snapshot.
+	Object.defineProperty(def, 'bundleStoreRoots', {
+		value: roots,
+		writable: true,
+		configurable: true,
+		enumerable: false,
+	});
 }
 
 function failureMessage(error: unknown): string {
@@ -140,12 +160,14 @@ function readIndexedCoordinates(
 
 /** Load and verify every definition in one immutable object. */
 function loadObjectDefs(
+	root: string,
 	objectDir: string,
 	bundleDigest: DefDigest,
 	level: ResolutionLevel,
+	requireHardenedModes = true,
 ): LoadedObject {
 	try {
-		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
+		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false, requireHardenedModes });
 		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
 		const defs = new Map<string, WorkflowDef>();
 		// Sorted, not YAML key order. `defs` is handed to callers as a Map, whose
@@ -168,7 +190,7 @@ function loadObjectDefs(
 			def.bundleLock = { ...manifest.lock };
 			defs.set(def.name, def);
 		}
-		return { bundleDigest, manifest, defs, level };
+		return { bundleDigest, manifest, defs, level, objectRoot: root };
 	} catch (error) {
 		if (isRuntimeIncompatible(error)) {
 			throw new CasRuntimeIncompatibleError(failureMessage(error));
@@ -189,7 +211,7 @@ function loadObjectIfPresent(
 			if (probeObjectDir(objectDir, digest, level) !== 'dir') {
 				throw new CasObjectAbsentDuringCoordinatedRead();
 			}
-			return loadObjectDefs(objectDir, digest, level);
+			return loadObjectDefs(root, objectDir, digest, level);
 		});
 	} catch (error) {
 		if (error instanceof CasObjectAbsentDuringCoordinatedRead) return undefined;
@@ -202,16 +224,29 @@ function resolveObject(
 	indexed: IndexedCoordinate,
 	globalRoot: string,
 	globalDigests: ReadonlySet<DefDigest>,
+	repairReplacement?: RepairObjectReplacement,
 ): LoadedObject {
 	const digest = defDigest(indexed.entry.digest);
-	const primary = loadObjectIfPresent(indexed.root, digest, indexed.level);
+	const loadAtRoot = (root: string, level: ResolutionLevel): LoadedObject | undefined => {
+		if (
+			repairReplacement !== undefined
+			&& root === repairReplacement.root
+			&& digest === repairReplacement.digest
+		) {
+			// Staging is hardened only after the swap; canonical bytes and
+			// definition semantics are still verified here before revalidation.
+			return loadObjectDefs(root, repairReplacement.objectDir, digest, level, false);
+		}
+		return loadObjectIfPresent(root, digest, level);
+	};
+	const primary = loadAtRoot(indexed.root, indexed.level);
 	if (primary !== undefined) return primary;
 
 	// An indexed project object may fall through only to the exact same digest,
 	// and only when that digest is also indexed globally. A different global
 	// digest for the coordinate is never considered.
 	if (indexed.level === 'project' && globalDigests.has(digest)) {
-		const fallback = loadObjectIfPresent(globalRoot, digest, 'global');
+		const fallback = loadAtRoot(globalRoot, 'global');
 		if (fallback !== undefined) return fallback;
 	}
 
@@ -320,7 +355,8 @@ function shadowedWorkflowKey(candidate: WorkflowCandidate): string {
 function selectWorkflowRegistrations(
 	objects: readonly RegisteredObject[],
 	warn: (line: string) => void,
-): CasDefRegistration[] {
+	verbose: boolean,
+): { registrations: CasDefRegistration[]; suppressedDigests: Set<DefDigest> } {
 	const byQualified = new Map<string, WorkflowCandidate[]>();
 	const ordered = [...objects].sort(
 		(a, b) => compareStoreText(a.loaded.bundleDigest, b.loaded.bundleDigest),
@@ -344,6 +380,7 @@ function selectWorkflowRegistrations(
 	}
 
 	const registrations: CasDefRegistration[] = [];
+	const suppressedDigests = new Set<DefDigest>();
 	for (const qualified of [...byQualified.keys()].sort(compareStoreText)) {
 		const candidates = byQualified.get(qualified) as WorkflowCandidate[];
 		const selection = selectLatestVersion(candidates);
@@ -378,19 +415,24 @@ function selectWorkflowRegistrations(
 			// index that named the object. The registration's own `level` field
 			// reports the different question of which store the bytes came from, and
 			// the two legitimately disagree under exact-digest fallback.
-			warn(
+			const message =
 				`warning: workflow '${qualified}' from ${candidate.level}-indexed bundle ${candidate.digest} ` +
 					`(version ${candidate.version}) does not hold that name — ${selection.winner.level}-indexed ` +
 					`bundle ${selection.winner.digest} (version ${selection.winner.version}) is the selected ` +
-					`version; this copy stays reachable as '${key}'`,
-			);
+					`version; this copy stays reachable as '${key}'`;
+			if (verbose) warn(message);
+			else suppressedDigests.add(candidate.digest as DefDigest);
 			registrations.push(candidateRegistration(candidate, key));
 		}
 	}
-	return registrations;
+	return { registrations, suppressedDigests };
 }
 
-function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspectionResult {
+function discoverCasDefs(
+	args: LoadCasDefsArgs,
+	tolerant: boolean,
+	repairReplacement?: RepairObjectReplacement,
+): CasDefInspectionResult {
 	const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
 	const globalRoot = projectStoreRoot(args.globalRoot);
 	const sameRoot = projectRoot === undefined || projectRoot === globalRoot;
@@ -417,17 +459,27 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 	for (const item of global.entries) globalDigests.add(defDigest(item.entry.digest));
 
 	const registrations: CasDefRegistration[] = [];
-	const loadedByDigest = new Map<DefDigest, LoadedObject>();
+	// Physical validation is scoped to the INDEXING root, not merely to content
+	// identity. A project index may borrow an exact digest from global, but a
+	// global index row must independently prove that the global copy exists. If
+	// this cache were digest-only, the project-first walk could let valid project
+	// bytes mask a missing/corrupt global object with the same digest.
+	const loadedByRootAndDigest = new Map<string, Map<DefDigest, LoadedObject>>();
 	const registeredObjects = new Map<DefDigest, RegisteredObject>();
 	const registeredCoordinateKeys = new Set<string>();
 
 	for (const indexed of selected) {
 		try {
 			const digest = defDigest(indexed.entry.digest);
-			let loaded = loadedByDigest.get(digest);
+			let loadedAtRoot = loadedByRootAndDigest.get(indexed.root);
+			if (loadedAtRoot === undefined) {
+				loadedAtRoot = new Map<DefDigest, LoadedObject>();
+				loadedByRootAndDigest.set(indexed.root, loadedAtRoot);
+			}
+			let loaded = loadedAtRoot.get(digest);
 			if (loaded === undefined) {
-				loaded = resolveObject(indexed, globalRoot, globalDigests);
-				loadedByDigest.set(digest, loaded);
+				loaded = resolveObject(indexed, globalRoot, globalDigests, repairReplacement);
+				loadedAtRoot.set(digest, loaded);
 			}
 			const target = coordinateTarget(indexed, loaded);
 			// `indexed.level`, not `loaded.level`: the index that NAMED the object
@@ -437,6 +489,17 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 			const alreadyRegistered = registeredObjects.get(loaded.bundleDigest);
 			if (alreadyRegistered?.indexedLevel !== 'project') {
 				registeredObjects.set(loaded.bundleDigest, { loaded, indexedLevel: indexed.level });
+			}
+			// Snapshot writers must coordinate with every store root that can affect
+			// this digest's discoverability. This includes the index that named it
+			// and, for project exact-digest fallback, the global root that supplied
+			// its verified bytes.
+			for (const def of loaded.defs.values()) {
+				setBundleStoreRoots(def, [...new Set([
+					...(def.bundleStoreRoots ?? []),
+					indexed.root,
+					loaded.objectRoot,
+				])].sort(compareStoreText));
 			}
 			if (target === undefined) {
 				if (indexed.registerAlias) {
@@ -484,13 +547,45 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 		}
 	}
 
-	registrations.push(...selectWorkflowRegistrations([...registeredObjects.values()], args.warn));
+	const selectedWorkflows = selectWorkflowRegistrations(
+		[...registeredObjects.values()],
+		args.warn,
+		args.verbose === true,
+	);
+	registrations.push(...selectedWorkflows.registrations);
+	if (args.verbose !== true && selectedWorkflows.suppressedDigests.size > 0) {
+		const count = selectedWorkflows.suppressedDigests.size;
+		args.warn(`note: ${count} superseded bundle ${count === 1 ? 'version' : 'versions'} hidden; --verbose to list them`);
+	}
 	return { registrations, complete };
 }
 
 /** Strict executable discovery. Any indexed integrity failure aborts. */
 export function loadCasDefs(args: LoadCasDefsArgs): CasDefRegistration[] {
 	return discoverCasDefs(args, false).registrations;
+}
+
+/**
+ * Strict combined-store discovery for a same-digest repair transaction.
+ *
+ * The installer calls this only after independently verifying the staged
+ * replacement. Substituting those bytes for the repairing root/digest lets its
+ * exact reinstall reach the repair swap without removing the indexed digest
+ * that project fallback legitimately depends on. Every dependency, unrelated
+ * object, and same-digest copy at another root still goes through the ordinary
+ * strict execution-time discovery path.
+ * This transaction-only seam is deliberately not re-exported from the store
+ * barrel: executable discovery must never suppress a corrupt object.
+ */
+export function loadCasDefsWithRepairReplacement(
+	args: LoadCasDefsArgs,
+	replacement: { root: string; digest: DefDigest; objectDir: string },
+): CasDefRegistration[] {
+	return discoverCasDefs(args, false, {
+		root: projectStoreRoot(replacement.root),
+		digest: defDigest(replacement.digest),
+		objectDir: replacement.objectDir,
+	}).registrations;
 }
 
 /** Tolerant read-only inspection. Never use this result for execution. */

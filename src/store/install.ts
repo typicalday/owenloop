@@ -25,7 +25,15 @@
 import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
-import { DefError, finalizeDefs, lintDef, loadDefFile, loadDefsRaw, validateDef } from '../defs.ts';
+import {
+  DefError,
+  digestScopedCallsTargetKey,
+  finalizeDefs,
+  lintDef,
+  loadDefFile,
+  loadDefsRaw,
+  validateDef,
+} from '../defs.ts';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
@@ -66,8 +74,10 @@ import type {
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
-import { defDigest } from './types.ts';
-import { storeIndexPath } from './resolve.ts';
+import { loadCasDefs, loadCasDefsWithRepairReplacement } from './def-source.ts';
+import { compareStoreText, defDigest, objectDirForDigest } from './types.ts';
+import { projectStoreRoot, storeIndexPath } from './resolve.ts';
+import { recoverInterruptedWorkflowStoreGc } from './gc-recovery.ts';
 
 // ---- A1/A2 ports ---------------------------------------------------------------
 
@@ -148,6 +158,10 @@ export interface InstallWorkflowBundleArgs {
   root: string;
   /** Which level `root` is (result metadata only). */
   level: StoreLevel;
+  /** Project root used to revalidate exact manifest locks before commit. */
+  projectRoot?: string;
+  /** Global root used to revalidate exact manifest locks before commit. */
+  globalRoot?: string;
   /** Path of the per-root install lock (project installs share the project add lock). */
   lockPath: string;
   /** Path of the per-root crash-recovery journal. */
@@ -168,6 +182,56 @@ export interface InstallWorkflowBundleArgs {
    * never legal under the global root — there is no ledger there to vouch).
    */
   readLedger?: () => LedgerLookup;
+}
+
+function assertManifestLocksResolvable(args: {
+  root: string;
+  level: StoreLevel;
+  projectRoot: string | undefined;
+  globalRoot: string | undefined;
+  lock: Readonly<Record<string, string>>;
+  repairReplacement?: { root: string; digest: DefDigest; objectDir: string };
+}): void {
+  const entries = Object.entries(args.lock);
+  if (entries.length === 0) return;
+  if (args.projectRoot === undefined || args.globalRoot === undefined) {
+    throw new Error(
+      'refusing bundle with exact lock targets: install requires both projectRoot and globalRoot for pre-commit revalidation',
+    );
+  }
+  const projectRoot = projectStoreRoot(args.projectRoot);
+  const globalRoot = projectStoreRoot(args.globalRoot);
+  const root = projectStoreRoot(args.root);
+  const expectedRoot = args.level === 'project' ? projectRoot : globalRoot;
+  if (root !== expectedRoot) {
+    throw new Error(
+      `refusing bundle lock revalidation: ${args.level} install root '${root}' does not match '${expectedRoot}'`,
+    );
+  }
+
+  // Do not approximate execution reachability with index/object presence.
+  // Strict discovery also verifies coordinate identity, runtime compatibility,
+  // the callable default/sole-workflow target, and the exact project/global
+  // fallback semantics used when a running workflow resolves its bundleLock.
+  const loadArgs = { projectRoot, globalRoot, warn: () => {} };
+  const registrations = args.repairReplacement === undefined
+    ? loadCasDefs(loadArgs)
+    : loadCasDefsWithRepairReplacement(loadArgs, args.repairReplacement);
+  const callableKeys = new Set(
+    registrations
+      .filter((registration) => registration.kind === 'coordinate')
+      .map((registration) => registration.key),
+  );
+
+  for (const [coordinate, rawDigest] of entries.sort(([a], [b]) => compareStoreText(a, b))) {
+    const digest = defDigest(rawDigest);
+    if (!callableKeys.has(digestScopedCallsTargetKey(digest, coordinate))) {
+      throw new Error(
+	`refusing bundle install: lock target '${coordinate}' pinned to ${digest} ` +
+		  'is no longer exactly callable from the combined workflow store',
+      );
+    }
+  }
 }
 
 /**
@@ -244,8 +308,7 @@ export const workflowStoreReplacementRecovery = {
  *
  * Fixed commit order:
  *   1. acquire the root's install lock;
- *   2. recover a prior interrupted install (before stale-stage cleanup — the
- *      backups a rollback needs live under the staging root);
+ *   2. recover prior GC parking and install transactions before stale-stage cleanup;
  *   3. clear stale staging debris;
  *   4. reread + validate the index INSIDE the lock (ownership/conflict
  *      decisions must see the post-lock state — TOCTOU);
@@ -308,14 +371,15 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
   // root (a rollback double-fault) — then the `finally` must NOT clear it.
   let preserveStagingRoot = false;
   try {
-    // Recover a prior interrupted install FIRST — before the stale-staging
-    // clear, since the backups a rollback needs live under the staging root.
+    // Recover prior GC parking and install transactions FIRST — before the
+    // stale-staging clear, since either can own evidence below that shared root.
     // A v1 (GitHub) journal at a shared project journal path needs the
     // project ledger to vouch (supplied via `readLedger` — project bundle
     // installs share the project add lock/recovery ordering); without a
     // ledger a leftover v1 journal is refused. Any refusal preserves the
     // staging root + journal as evidence.
     try {
+      recoverInterruptedWorkflowStoreGc({ root, stateDir: dirname(lockPath) });
       recoverInterruptedInstall({
 	defsDir: root,
 	journalPath,
@@ -362,6 +426,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     const reasons: string[] = [];
     let staged: Map<string, ReturnType<typeof loadDefFile>>;
     let externalVersionedCalls: ReadonlySet<string> = new Set();
+    let stagedBundleLock: Readonly<Record<string, string>> = {};
     const manifestPath = join(stagingDir, 'bundle.yaml');
     if (existsSync(manifestPath)) {
       // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
@@ -369,7 +434,8 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       staged = new Map<string, ReturnType<typeof loadDefFile>>();
       try {
         const manifest = parseManifestBytes(readFileSync(manifestPath));
-	externalVersionedCalls = new Set(Object.keys(manifest.lock));
+		externalVersionedCalls = new Set(Object.keys(manifest.lock));
+		stagedBundleLock = manifest.lock;
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
           try {
@@ -461,6 +527,22 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	repairRequired = true;
       }
     }
+
+    // Re-read both roots while this install still owns its root lock. A
+    // destructive GC owns both root locks, so either this commit becomes visible
+    // to its reachability scan or a GC-first removal makes this stale caller
+    // fail here before any journal/object/index mutation. A verified staged
+    // same-digest repair may substitute its verified staged replacement only
+    // for the broken destination; every lock dependency, unrelated object, and
+    // same-digest physical copy at another root remains strict.
+    assertManifestLocksResolvable({
+      root,
+      level,
+      projectRoot: args.projectRoot,
+      globalRoot: args.globalRoot,
+      lock: stagedBundleLock,
+      ...(repairRequired ? { repairReplacement: { root, digest, objectDir: stagingDir } } : {}),
+    });
 
     // The post-install index, computed BEFORE the commit point so its exact
     // canonical bytes are what the journal's metadataHash commits to. A
@@ -692,11 +774,11 @@ export interface RecoverWorkflowStoreArgs {
 
 /**
  * Offline crash recovery for a workflow-store root — the `add --recover`
- * counterpart for bundle installs. Acquires the root lock, runs the generic
- * two-version recovery (v2 metadata-hash commit point), releases. No network,
+ * counterpart for bundle installs. Acquires the root lock, recovers GC parking
+ * before the generic two-version install recovery, then releases. No network,
  * no store open. A v2 journal recovers forward or back exactly as the inline
  * path would; a v1 journal is refused (the GitHub route owns v1 recovery).
- * Refusals throw and leave the journal, staging, and objects untouched.
+ * Refusals throw and preserve unrelated staging evidence.
  */
 export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Promise<RecoveryOutcome> {
   ensureDirectoryPathNoSymlink(args.root, 'workflow store root');
@@ -706,6 +788,7 @@ export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Prom
   guardStateFile(args.journalPath, 'crash-recovery journal');
   const lock = await acquireInstallLock(args.lockPath);
   try {
+    recoverInterruptedWorkflowStoreGc({ root: args.root, stateDir: dirname(args.lockPath) });
     return recoverInterruptedInstall({
       defsDir: args.root,
       journalPath: args.journalPath,

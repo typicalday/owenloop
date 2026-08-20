@@ -307,6 +307,38 @@ The bundle route derives `<home>` from the first non-blank caller-injected
 recovery-marker directory. A bundle install refuses when neither variable is
 supplied rather than falling back to the process user's ambient home.
 
+Normal definition discovery no longer floods stderr for expected bundle
+history. It emits at most one `note: N superseded bundle versions hidden;
+--verbose to list them`; the global `--verbose` flag restores every detailed
+superseded-version notice. The actionable `has no selectable version` warning
+for competing non-SemVer versions is never hidden.
+
+Store history can be bounded safely with a dry run first:
+
+```sh
+owenloop bundle gc --keep 2             # project store, report only
+owenloop bundle gc --keep 2 --yes       # recompute under lock and apply
+owenloop bundle gc --global             # global store, report only
+```
+
+The default keep count is 2 (current plus one rollback version). GC preserves
+selected versions, explicit pins, retained local instance snapshots, transitive
+bundle locks from every retained coordinate in either root, exact versioned
+calls from retained legacy snapshots and current project/add definitions, and
+project-index fallback into the global store. Reachability is coordinate- and
+root-aware, so
+an intact non-target copy does not keep a redundant target history beyond
+`--keep`. It never contacts the hub; `--yes` is the only destructive switch
+and only the target bundle index/object tree is changed. Applied GC takes both
+roots' writer locks (creating only coordination state at a known missing
+counterpart root when necessary). Project GC also takes the legacy GitHub-add
+lock and recovers its journal before clearing their shared staging tree; global
+GC uses that lock as a read barrier without recovering or otherwise mutating the
+project tree.
+CAS-backed snapshot writers share the store locks, and bundle installs
+revalidate exact manifest locks before commit, so stale definitions or callers
+cannot be pinned during or immediately after collection.
+
 Bundle installs fail closed without their two required adapters (bundle
 ingestion and pre-commit verification). The default CLI binds the real
 bundle ingestor, so a `.wnlp` produced by `packBundle` reaches the normal
@@ -417,8 +449,10 @@ owenloop bundle digest ./report-1.2.0.wnlp
 owenloop bundle unpack ./report-1.2.0.wnlp ./unpacked-report
 ```
 
-Bundle commands are filesystem-only: they do not open or create the local
-`.owenloop/state.db` and do not contact a remote service. Packing never edits
+The bundle format commands (`pack`, `inspect`, `digest`, and `unpack`) are
+filesystem-only: they do not open or create the local `.owenloop/state.db` and
+do not contact a remote service. `bundle gc` is intentionally store- and
+local-snapshot-aware, but likewise never contacts the hub. Packing never edits
 the source manifest. Inspection and unpacking reject unsafe paths, symlinks,
 unsupported archive entry types, malformed canonical headers, duplicate files,
 invalid manifests, workflow/manifest name mismatches, missing lock entries, and

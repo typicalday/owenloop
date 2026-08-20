@@ -30,7 +30,7 @@
  *   owenloop close <wf> <run> [--outcome ok|no_work|released|failed|skipped] [--summary s]
  *   owenloop delete <wf> [--recursive]
  *
- * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
+ * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS), --verbose.
  */
 
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -44,7 +44,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, hasDefiniteCheckDefect, modelCheck } from './model.ts';
-import { openStore } from './store.ts';
+import { openStore, readRuntimeSnapshotBundlePins } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import {
   buildDef,
@@ -141,11 +141,14 @@ import {
 import type { AddJournal, InstalledEntry, InstallCommitHandle, InstallLockHandle, Lockfile } from './add.ts';
 import {
   BundleIngestorUnavailableError,
+  collectWorkflowStoreGarbage,
+  compareStoreText,
   globalStoreRoot,
   installWorkflowBundle,
   inspectCasDefs,
   loadCasDefs,
   PreCommitVerifierUnavailableError,
+  parseWorkflowCoordinate,
   projectStoreRoot,
   createBundleIngestor,
   createPreCommitVerifier,
@@ -155,6 +158,7 @@ import {
   workflowStoreStatePaths,
 } from './store/index.ts';
 import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/index.ts';
+import { recoverInterruptedWorkflowStoreGc } from './store/gc-recovery.ts';
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
@@ -407,6 +411,8 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   // bundle path/URL must stay a positional.
   'global',
   'unsigned',
+  'verbose',
+  'yes',
 ]);
 
 function parseArgs(argv: string[]): Args {
@@ -586,6 +592,7 @@ function loadDefsWithInstalled(
   io: CliIO,
   defsDir: string,
   tolerantCasInspection = false,
+  verbose = false,
 ): LoadedDefs {
   const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
 
@@ -594,7 +601,7 @@ function loadDefsWithInstalled(
     lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
   } catch (e) {
     io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
-    const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
+	const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
     return {
       defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
       definitionDiscoveryComplete,
@@ -628,7 +635,7 @@ function loadDefsWithInstalled(
     }
   }
 
-  const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
+	const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
 
   return {
     defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
@@ -665,6 +672,7 @@ function foldCasDefs(
   defsDir: string,
   merged: Map<string, WorkflowDef>,
   tolerantInspection = false,
+  verbose = false,
 ): boolean {
   // Without HOME/USERPROFILE, retain project discovery and consult a guaranteed
   // absent synthetic global root instead of silently dropping the project store.
@@ -677,7 +685,8 @@ function foldCasDefs(
   const discoveryArgs = {
     projectRoot: projectStoreRoot(defsDir),
     globalRoot,
-    warn: (line: string) => io.err(line),
+	warn: (line: string) => io.err(line),
+	verbose,
   };
   const discovery = tolerantInspection
     ? inspectCasDefs(discoveryArgs)
@@ -715,7 +724,7 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
 	defs: existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>(),
 	definitionDiscoveryComplete: true,
       }
-    : loadDefsWithInstalled(io, defsDir, tolerantCasInspection);
+	: loadDefsWithInstalled(io, defsDir, tolerantCasInspection, flag(args, 'verbose'));
   const { defs, definitionDiscoveryComplete } = loaded;
 
   // Guard the built-in default (`cwd/.owenloop/state.db`) against a symlinked
@@ -806,10 +815,17 @@ function printBundleInspectResult(io: CliIO, result: ReturnType<typeof inspectBu
  * the stderr message so scripts can match on it.
  */
 function dispatchBundle(io: CliIO, args: Args): number {
-  const sub = need(args, 1, 'pack|unpack|inspect|digest');
+	const sub = need(args, 1, 'pack|unpack|inspect|digest|gc');
   if (sub !== 'pack' && args.options.has('output')) {
-    throw new CliError(`owenloop bundle ${sub}: --output is only valid for pack`);
+	throw new CliError(`owenloop bundle ${sub}: --output is only valid for pack`);
   }
+	if (sub !== 'gc') {
+		for (const option of ['keep', 'yes', 'global']) {
+			if (args.options.has(option)) {
+				throw new CliError(`owenloop bundle ${sub}: --${option} is only valid for bundle gc`);
+			}
+		}
+	}
 
   switch (sub) {
     case 'pack': {
@@ -855,10 +871,12 @@ function dispatchBundle(io: CliIO, args: Args): number {
       const bytes = readBundleCommandFile(io, bundlePath);
       const result = runBundle(() => digestBundle(bytes));
       print(io, { digest: result.digest });
-      return 0;
+	return 0;
     }
+    case 'gc':
+	throw new CliError('owenloop bundle gc requires the async entry point');
     default:
-      throw new CliError(`owenloop bundle: unknown subcommand '${sub}' (expected pack, unpack, inspect, or digest)`);
+	throw new CliError(`owenloop bundle: unknown subcommand '${sub}' (expected pack, unpack, inspect, digest, or gc)`);
   }
 }
 
@@ -1395,7 +1413,7 @@ function sleepMs(ms: number): void {
 
 export const USAGE = `owenloop — a dataflow workflow engine
 
-Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
+Usage: owenloop <command> [args] [--db <path>] [--defs <dir>] [--verbose]
 
 Commands:
   defs                                   list available workflow definitions
@@ -1408,6 +1426,8 @@ Commands:
   bundle unpack <bundle.wnlp> <destination-dir>       unpack a .wnlp bundle into a new directory
   bundle inspect <bundle.wnlp>           strictly validate a .wnlp bundle and print its manifest/entries
   bundle digest <bundle.wnlp>            print the bundle's def digest (SHA-256 of the canonical tar)
+  bundle gc [--keep <n>] [--global] [--yes]
+${' '.repeat(41)}dry-run or collect superseded content-addressed store objects
   publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <origin>]
                                          pack a bundle and sign its canonical digest (signed by default)
   trust init [--force]                  create the local Ed25519 enrollment root
@@ -1509,6 +1529,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   close <wf> <run> [--outcome ok|no_work|released|failed|skipped] [--summary s]
   delete <wf> [--recursive]              refuse if children exist unless --recursive (cascades)
 
+Global: --verbose lists detailed superseded bundle-version notices.
 Environment: OWENLOOP_DB, OWENLOOP_DEFS`;
 
 /** Append parse failures to a "definition not found" error — the def the user asked for may be in one of the broken files. */
@@ -1529,7 +1550,7 @@ export { hasDefiniteCheckDefect };
  * even on commands that ignore them — to avoid rejecting a documented
  * invocation.
  */
-const GLOBAL_OPTIONS = ['db', 'defs'] as const;
+const GLOBAL_OPTIONS = ['db', 'defs', 'verbose'] as const;
 
 /** Build a command's option allowlist: the two globals plus its own long-form flags. */
 const cmdOpts = (...extra: string[]): ReadonlySet<string> => new Set<string>([...GLOBAL_OPTIONS, ...extra]);
@@ -1551,7 +1572,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['help', cmdOpts()],
   ['defs', cmdOpts()],
   ['add', cmdOpts('recover', 'global')],
-  ['bundle', cmdOpts('output')],
+  ['bundle', cmdOpts('output', 'keep', 'yes', 'global')],
   ['login', cmdOpts('hub', 'with-token', 'as')],
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
@@ -2307,10 +2328,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     return 0;
   }
 
-  // The bundle namespace is pure filesystem work on the bytes the user
-  // points at — dispatched BEFORE openCtx so pack/inspect/digest neither
-  // open/create `.owenloop/state.db` nor touch a remote (same reasoning as
-  // lint/check above; see docs/cli.md).
+  // Package-format bundle commands are pure filesystem work on bytes the user
+  // points at. GC also dispatches before openCtx, but its async branch performs
+  // its own read-only snapshot scan and targeted store collection.
   if (command === 'bundle') {
     return dispatchBundle(io, args);
   }
@@ -3022,6 +3042,169 @@ function optionalWorkflowRecoveryMarkerDir(io: CliIO): string | undefined {
   return home === undefined ? undefined : defaultRecoveryMarkerDir(home);
 }
 
+const DEFAULT_BUNDLE_GC_KEEP = 2;
+
+function bundleGcKeep(args: Args): number {
+	if (args.missingOptionValues.has('keep')) {
+		throw new CliError('owenloop bundle gc: --keep requires a positive integer value');
+	}
+	const raw = last(args, 'keep');
+	if (raw === undefined) return DEFAULT_BUNDLE_GC_KEEP;
+	if (!/^[1-9][0-9]*$/u.test(raw)) {
+		throw new CliError(`owenloop bundle gc: invalid --keep '${raw}' (expected a positive integer)`);
+	}
+	const keep = Number(raw);
+	if (!Number.isSafeInteger(keep)) {
+		throw new CliError(`owenloop bundle gc: invalid --keep '${raw}' (expected a finite positive integer)`);
+	}
+	return keep;
+}
+
+function bundleGcPathOverride(
+	args: Args,
+	key: 'db' | 'defs',
+	environmentValue: string | undefined,
+): string | undefined {
+	if (args.missingOptionValues.has(key)) {
+		throw new CliError(`owenloop bundle gc: --${key} requires a non-empty path value`);
+	}
+	const optionValue = last(args, key);
+	if (optionValue !== undefined) {
+		if (optionValue.trim() === '') {
+			throw new CliError(`owenloop bundle gc: --${key} requires a non-empty path value`);
+		}
+		return optionValue;
+	}
+	if (environmentValue !== undefined && environmentValue.trim() === '') {
+		throw new CliError(`owenloop bundle gc: OWENLOOP_${key.toUpperCase()} must be a non-empty path`);
+	}
+	return environmentValue;
+}
+
+/** Collect exact CAS coordinates called by the currently executable non-CAS definitions. */
+function bundleGcExactCallsFromCurrentDefs(
+	io: CliIO,
+	defsDir: string,
+	defsOverride: string | undefined,
+	verbose: boolean,
+): string[] {
+	const defs = defsOverride === undefined
+		? loadDefsWithInstalled(io, defsDir, false, verbose).defs
+		: (existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>());
+	const exactCalls = new Set<string>();
+	for (const def of defs.values()) {
+		// CAS definitions already root their own exact edges through bundleLock.
+		// This scan supplies the missing roots for project, GitHub-add, and legacy
+		// definitions whose snapshots intentionally carry no bundle provenance.
+		if (def.bundleDigest !== undefined) continue;
+		for (const step of def.steps) {
+			if (step.calls === undefined || !step.calls.includes('@')) continue;
+			try {
+				parseWorkflowCoordinate(step.calls);
+			} catch (error) {
+				throw new CliError(
+					`owenloop bundle gc: malformed exact calls target ${JSON.stringify(step.calls)} ` +
+						`in workflow '${def.name}': ${(error as Error).message}`,
+				);
+			}
+			exactCalls.add(step.calls);
+		}
+	}
+	return [...exactCalls].sort(compareStoreText);
+}
+
+/** Store-aware async branch of the otherwise filesystem-only bundle namespace. */
+async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
+	assertBundlePositionals(args, 2, 'owenloop bundle gc [--keep <n>] [--global] [--yes]');
+	if (args.options.has('output')) {
+		throw new CliError('owenloop bundle gc: --output is only valid for bundle pack');
+	}
+	const keep = bundleGcKeep(args);
+	// Path selection determines both the destructive target and the snapshot pin
+	// source. Validate every CLI/env override before deriving a root, probing a
+	// DB, or acquiring a writer lock; parseArgs represents a missing value as the
+	// literal string "true", which must never become a filesystem path here.
+	const defsOverride = bundleGcPathOverride(args, 'defs', io.env.OWENLOOP_DEFS);
+	const dbOverride = bundleGcPathOverride(args, 'db', io.env.OWENLOOP_DB);
+	const globalFlag = flag(args, 'global');
+	if (globalFlag && defsOverride !== undefined) throw new CliError(GLOBAL_DEFS_CONFLICT_MSG);
+
+	const projectRoot = projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
+	let globalRoot: string;
+	if (globalFlag) {
+		globalRoot = globalStoreRoot(workflowHome(io));
+	} else {
+		try {
+			globalRoot = globalStoreRoot(workflowHome(io));
+		} catch {
+			// Match normal definition discovery: project-only operation remains
+			// available when HOME is absent. No global install can derive a root
+			// either, so model this as a single-root plan and avoid inventing a
+			// coordination path inside the project store.
+			globalRoot = projectRoot;
+		}
+	}
+
+	const dbPath = dbOverride ?? join(io.cwd, '.owenloop', 'state.db');
+	if (dbOverride === undefined) {
+		const parent = dirname(dbPath);
+		const parentState = lstatSync(parent, { throwIfNoEntry: false });
+		if (parentState?.isSymbolicLink()) {
+			throw new CliError(`refusing runtime database parent '${parent}': it is a symbolic link`);
+		}
+		if (parentState !== undefined && !parentState.isDirectory()) {
+			throw new CliError(`refusing runtime database parent '${parent}': it is not a directory`);
+		}
+		dbPathRefusingSymlink(dbPath);
+	}
+
+	const readLedger = globalFlag
+		? undefined
+		: () => {
+			const lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
+			return (source: string) => {
+				const entry = lf.installed[source];
+				return entry === undefined ? undefined : { sha: entry.sha, path: entry.path };
+			};
+		};
+	const legacyRecovery = globalFlag
+		? undefined
+		: {
+			lockPath: join(io.cwd, '.owenloop', 'add.lock'),
+			journalPath: join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME),
+			lockfilePath: join(io.cwd, '.owenloop', 'installed.json'),
+			readLedger: readLedger!,
+		};
+	const legacyReadBarrier = globalFlag
+		? {
+			lockPath: join(io.cwd, '.owenloop', 'add.lock'),
+			journalPath: join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME),
+		}
+		: undefined;
+	const result = await collectWorkflowStoreGarbage({
+		projectRoot,
+		globalRoot,
+		level: globalFlag ? 'global' : 'project',
+		keep,
+		yes: flag(args, 'yes'),
+		readSnapshotPins: () => readRuntimeSnapshotBundlePins(dbPath),
+		readExactCalls: () => bundleGcExactCallsFromCurrentDefs(
+			io,
+			projectRoot,
+			defsOverride,
+			flag(args, 'verbose'),
+		),
+		...(readLedger === undefined ? {} : { readLedger }),
+		...(legacyRecovery === undefined ? {} : { legacyRecovery }),
+		...(legacyReadBarrier === undefined ? {} : { legacyReadBarrier }),
+		...(optionalWorkflowRecoveryMarkerDir(io) === undefined
+			? {}
+			: { recoveryMarkerDir: optionalWorkflowRecoveryMarkerDir(io) }),
+	});
+	print(io, result);
+	return 0;
+}
+
 /**
  * The `.wnlp` bundle route of `owenloop add` — the content-addressed store
  * counterpart of the GitHub route. `dispatchAdd` classifies the positional
@@ -3050,9 +3233,9 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
   // A fresh bundle install also needs an external marker directory, so derive
   // that path from the same injected home and never from process state.
   const recoveryMarkerDir = workflowRecoveryMarkerDir(io);
-  const root = globalFlag
-    ? globalStoreRoot(workflowHome(io))
-    : projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
+  const projectRoot = projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
+  const globalRoot = globalStoreRoot(workflowHome(io));
+  const root = globalFlag ? globalRoot : projectRoot;
   const statePaths = workflowStoreStatePaths(root);
   const lockPath = statePaths.lockPath;
   const journalPath = statePaths.journalPath;
@@ -3099,6 +3282,8 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
     source: bundleSource,
     root,
     level: globalFlag ? 'global' : 'project',
+    projectRoot,
+    globalRoot,
     lockPath,
     journalPath,
     recoveryMarkerDir,
@@ -3337,7 +3522,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   mkdirRefusingSymlink(canonicalState.stateDir);
   guardStateFile(canonicalState.lockPath, 'canonical install lock');
   guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
-  const lockPaths = [...new Set([installLockPath, canonicalState.lockPath])].sort();
+  const lockPaths = [...new Set([installLockPath, canonicalState.lockPath])].sort(compareStoreText);
   const locks: InstallLockHandle[] = [];
   try {
     for (const path of lockPaths) locks.push(await acquireInstallLock(path));
@@ -3350,13 +3535,10 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   // must NOT delete it (the error message tells the user to recover it).
   let preserveStagingRoot = false;
   try {
-    // Recover a crash-interrupted prior install FIRST — before the stale-staging
-    // clear, since the backups/parked dirs a rollback needs live UNDER the
-    // staging root, so clearing it first would destroy them. Any refusal (bad or
-    // mismatched or contradictory journal) must preserve the staging root and the
-    // journal as evidence: without this, the `finally` below would rmSync the
-    // staging root and take the backups a later recovery needs with it.
+    // Recover crash-interrupted GC parking and installs FIRST — before the
+    // stale-staging clear, since either can own evidence below that shared root.
     try {
+      recoverInterruptedWorkflowStoreGc({ root: defsDir, stateDir: canonicalState.stateDir });
       recoverInterruptedInstall({
 	defsDir,
 	journalPath: canonicalState.journalPath,
@@ -3684,7 +3866,9 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
     guardStateFile(canonicalState.lockPath, 'canonical install lock');
     guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
   }
-  const lockPaths = [...new Set([installLockPath, ...(canonicalStateExists ? [canonicalState.lockPath] : [])])].sort();
+  const lockPaths = [
+    ...new Set([installLockPath, ...(canonicalStateExists ? [canonicalState.lockPath] : [])]),
+  ].sort(compareStoreText);
   const locks: InstallLockHandle[] = [];
   try {
     for (const path of lockPaths) locks.push(await acquireInstallLock(path));
@@ -3694,6 +3878,9 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
   }
   let outcome: RecoveryOutcome = 'no-journal';
   try {
+    if (canonicalStateExists) {
+      recoverInterruptedWorkflowStoreGc({ root: defsDir, stateDir: canonicalState.stateDir });
+    }
     const canonicalOutcome = recoverInterruptedInstall({
       defsDir,
       journalPath: canonicalState.journalPath,
@@ -3707,7 +3894,7 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
 	lockfilePath,
 	recoveryMarkerDir,
 	v2Replacement: workflowStoreReplacementRecovery,
-      });
+    });
     outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
     for (const handle of locks.reverse()) releaseInstallLock(handle);
@@ -8711,13 +8898,15 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
 
   const args = parseArgs(argv);
   const command = args.positionals[0];
-  if (command === undefined || !ASYNC_COMMANDS.has(command)) {
-    return main(argv, io);
-  }
+	const asyncBundleGc = command === 'bundle' && args.positionals[1] === 'gc';
+	if (command === undefined || (!ASYNC_COMMANDS.has(command) && !asyncBundleGc)) {
+		return main(argv, io);
+	}
   try {
-    const short = preflight(command, args, io);
-    if (short !== undefined) return short;
-    switch (command) {
+	const short = preflight(command, args, io);
+	if (short !== undefined) return short;
+	if (asyncBundleGc) return await dispatchBundleGc(io, args);
+	switch (command) {
       case 'add':
         return await dispatchAdd(io, args);
       case 'login':

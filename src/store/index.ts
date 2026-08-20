@@ -98,6 +98,16 @@ export type {
   LoadCasDefsArgs,
 } from './def-source.ts';
 
+// ---- workflow-store reachability GC ----
+export { collectWorkflowStoreGarbage, planWorkflowStoreGc } from './gc.ts';
+export type {
+  CollectWorkflowStoreGcArgs,
+  PlanWorkflowStoreGcArgs,
+  WorkflowStoreGcObject,
+  WorkflowStoreGcPlan,
+  WorkflowStoreGcReport,
+} from './gc.ts';
+
 // ---- WP-E2a origin execution policy ----
 export {
   originEvidencePath,

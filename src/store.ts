@@ -14,7 +14,10 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { lstatSync } from 'node:fs';
 import { detId, nowMs } from './util.ts';
+import { compareStoreText, defDigest, isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
+import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
 import type {
   Acceptance,
   ArtifactData,
@@ -51,6 +54,144 @@ export interface WorkflowRow extends WorkflowData {
   createdAt: number;
   /** Mode 2 foundation: parent workflow coordinate for a child instance spawned by a calls: step. */
   producedBy?: { parentWf: string; parentPath: string };
+}
+
+/** The bundle identities retained by one persisted workflow definition snapshot. */
+export interface RuntimeSnapshotBundlePins {
+  /** The snapshot's own containing bundle, when it came from the CAS store. */
+  bundleDigest?: string;
+  /** Exact cross-bundle dependencies copied from the snapshot's bundle lock. */
+  bundleLock: string[];
+  /** Exact versioned calls not already covered by this snapshot's bundle lock. */
+  exactCalls?: string[];
+}
+
+function exactCallsFromSnapshot(record: Record<string, unknown>, workflow: string): string[] {
+	const rawSteps = record.steps;
+	if (rawSteps === undefined) return [];
+	if (!Array.isArray(rawSteps)) {
+		throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps: expected an array`);
+	}
+	const exactCalls = new Set<string>();
+	for (const [index, rawStep] of rawSteps.entries()) {
+		if (typeof rawStep !== 'object' || rawStep === null || Array.isArray(rawStep)) {
+			throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps[${index}]: expected an object`);
+		}
+		const calls = (rawStep as Record<string, unknown>).calls;
+		if (calls === undefined) continue;
+		if (typeof calls !== 'string') {
+			throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps[${index}].calls: expected a string`);
+		}
+		if (!calls.includes('@')) continue;
+		try {
+			parseWorkflowCoordinate(calls);
+		} catch (error) {
+			throw new Error(
+				`workflow '${workflow}' has malformed exact def_snapshot calls target ${JSON.stringify(calls)}: ` +
+					(error as Error).message,
+			);
+		}
+		const rawLock = record.bundleLock;
+		if (
+			typeof rawLock === 'object'
+			&& rawLock !== null
+			&& !Array.isArray(rawLock)
+			&& Object.prototype.hasOwnProperty.call(rawLock, calls)
+		) continue;
+		exactCalls.add(calls);
+	}
+	return [...exactCalls].sort(compareStoreText);
+}
+
+/**
+ * Read bundle pins from an EXISTING runtime database without migrating or
+ * otherwise writing it. GC deliberately cannot use {@link openStore}: opening
+ * the normal store enables write-oriented pragmas and schema migration, while
+ * a dry run must remain observational. Legacy databases without the workflow
+ * table or def_snapshot column simply predate snapshot pinning and contribute
+ * no pins.
+ */
+export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBundlePins[] {
+	if (lstatSync(path, { throwIfNoEntry: false }) === undefined) return [];
+
+	const db = new DatabaseSync(path, { readOnly: true });
+	try {
+		const hasMeta = db
+			.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`)
+			.get() !== undefined;
+		if (hasMeta) {
+			const row = db.prepare(`SELECT v FROM meta WHERE k = 'schema_version'`).get() as
+				| { v: string }
+				| undefined;
+			const current = row?.v;
+			if (current !== undefined && parseInt(current, 10) > parseInt(SCHEMA_VERSION, 10)) {
+				throw new StoreVersionError(
+					`database schema_version ${current} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
+						'upgrade your owenloop install to open this database',
+				);
+			}
+		}
+
+		const hasWorkflow = db
+			.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workflow'`)
+			.get() !== undefined;
+		if (!hasWorkflow) return [];
+		const columns = db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>;
+		if (!columns.some((column) => column.name === 'def_snapshot')) return [];
+
+		const rows = db
+			.prepare('SELECT id, def_snapshot FROM workflow WHERE def_snapshot IS NOT NULL ORDER BY created_at, id')
+			.all() as unknown as Array<{ id: string; def_snapshot: string }>;
+		return rows.map((row) => {
+			let snapshot: unknown;
+			try {
+				snapshot = JSON.parse(row.def_snapshot);
+			} catch (error) {
+				throw new Error(
+					`workflow '${row.id}' has malformed def_snapshot JSON: ${(error as Error).message}`,
+				);
+			}
+			if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
+				throw new Error(`workflow '${row.id}' has malformed def_snapshot: expected an object`);
+			}
+			const record = snapshot as Record<string, unknown>;
+			const rawDigest = record.bundleDigest;
+			let bundleDigest: string | undefined;
+			if (rawDigest !== undefined && rawDigest !== '') {
+				if (typeof rawDigest !== 'string' || !isDefDigest(rawDigest)) {
+					throw new Error(
+						`workflow '${row.id}' has noncanonical def_snapshot.bundleDigest ${JSON.stringify(rawDigest)}`,
+					);
+				}
+				bundleDigest = rawDigest;
+			}
+
+			const rawLock = record.bundleLock;
+			if (rawLock !== undefined && (
+				typeof rawLock !== 'object' || rawLock === null || Array.isArray(rawLock)
+			)) {
+				throw new Error(`workflow '${row.id}' has malformed def_snapshot.bundleLock: expected an object`);
+			}
+			const bundleLock = Object.entries((rawLock ?? {}) as Record<string, unknown>).map(([target, digest]) => {
+				if (typeof digest !== 'string' || !isDefDigest(digest)) {
+					throw new Error(
+						`workflow '${row.id}' has noncanonical def_snapshot.bundleLock[${JSON.stringify(target)}] ` +
+							`${JSON.stringify(digest)}`,
+					);
+				}
+				return digest;
+			});
+
+			const exactCalls = exactCallsFromSnapshot(record, row.id);
+			return {
+				...(bundleDigest === undefined ? {} : { bundleDigest }),
+				bundleLock: [...new Set(bundleLock)].sort(compareStoreText),
+				...(exactCalls.length === 0 ? {} : { exactCalls }),
+			};
+		});
+	} finally {
+		db.close();
+	}
 }
 
 // ---- deterministic ids -------------------------------------------------------
@@ -480,6 +621,7 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
 
 export class Store {
   readonly db: DatabaseSync;
+  private readonly activeSnapshotDigests = new Set<string>();
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
@@ -691,6 +833,35 @@ export class Store {
     }
   }
 
+  /**
+   * Persist one or more CAS-backed definition snapshots under the same
+   * workflow-store lock used by install and GC. Reachability is revalidated
+   * before `BEGIN IMMEDIATE`; the guarded digest set then authorizes only the
+   * low-level snapshot writes performed by this transaction.
+   */
+  txWithWorkflowSnapshots<T>(snapshots: WorkflowDef | readonly WorkflowDef[], fn: () => T): T {
+    const defs = Array.isArray(snapshots) ? snapshots : [snapshots];
+    return withWorkflowSnapshotStoreGuard(defs, (guardedDigests) => {
+      for (const digest of guardedDigests) this.activeSnapshotDigests.add(digest);
+      try {
+				return this.tx(fn);
+      } finally {
+				for (const digest of guardedDigests) this.activeSnapshotDigests.delete(digest);
+      }
+    });
+  }
+
+  private assertWorkflowSnapshotGuard(snapshot: WorkflowDef | undefined): void {
+    if (snapshot?.bundleDigest === undefined || (snapshot.bundleStoreRoots?.length ?? 0) === 0) return;
+    const digest = defDigest(snapshot.bundleDigest);
+    if (!this.activeSnapshotDigests.has(digest)) {
+      throw new Error(
+				`refusing uncoordinated workflow snapshot write for bundle ${digest}: ` +
+					'use txWithWorkflowSnapshots so bundle GC cannot race the commit',
+      );
+    }
+  }
+
   // -- meta --------------------------------------------------------------------
 
   getMeta(k: string): string | undefined {
@@ -708,6 +879,7 @@ export class Store {
   // -- workflow ----------------------------------------------------------------
 
   insertWorkflow(id: string, data: WorkflowData, producedBy?: { parentWf: string; parentPath: string }): WorkflowRow {
+    this.assertWorkflowSnapshotGuard(data.defSnapshot);
     const at = nowMs();
     this.db
       .prepare(
@@ -737,6 +909,7 @@ export class Store {
    * decide what "drift" means, it just persists what the engine computed.
    */
   repinWorkflowDef(id: string, snapshot: WorkflowDef, hash: string): void {
+    this.assertWorkflowSnapshotGuard(snapshot);
     this.db
       .prepare('UPDATE workflow SET def_snapshot = ?, def_hash = ? WHERE id = ?')
       .run(JSON.stringify(snapshot), hash, id);
