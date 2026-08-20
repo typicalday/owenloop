@@ -203,11 +203,17 @@ interface HubCall {
   body?: unknown;
   /** A pre-built query string beginning with `?`, or omitted. */
   query?: string;
+  /** Extra request headers for an endpoint with a protocol-specific session. */
+  headers?: Record<string, string>;
+  /** Select this JSON-RPC response from a Streamable HTTP SSE reply. */
+  jsonRpcResponseId?: string | number;
 }
 
 interface HubCallResult {
   status: number;
   json: unknown;
+  /** Session id issued by a Streamable HTTP MCP initialization, if any. */
+  mcpSessionId?: string;
   /** True when the call could not authenticate (missing/expired/rejected credential). */
   authFailed?: boolean;
   /** The tool-facing message for an `authFailed` result — always names the fix. */
@@ -225,8 +231,48 @@ interface HubCallResult {
  *   4. on a 401 with an oauth credential, exactly ONE `refreshOAuth` + one
  *      retry; a final 401 → `authFailed`.
  * The response body is parsed leniently (a parse failure yields `{}`, status
- * preserved). The bearer never leaves the `Authorization` header.
+ * preserved), including Streamable HTTP's JSON and SSE response forms. The
+ * bearer never leaves the `Authorization` header.
  */
+function parseSseMessages(body: string): unknown[] {
+  const messages: unknown[] = [];
+  let data: string[] = [];
+  const dispatch = (): void => {
+    if (data.length === 0) return;
+    const payload = data.join('\n');
+    data = [];
+    if (payload === '[DONE]') return;
+    try {
+      messages.push(JSON.parse(payload));
+    } catch {
+      // A malformed event is not a valid MCP response. Keep looking in case a
+      // later event carries the request's response, then fail closed if not.
+    }
+  };
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      dispatch();
+      continue;
+    }
+    if (!line.startsWith('data:')) continue;
+    const value = line.slice('data:'.length);
+    data.push(value.startsWith(' ') ? value.slice(1) : value);
+  }
+  dispatch();
+  return messages;
+}
+
+async function parseHubResponse(res: Response, jsonRpcResponseId?: string | number): Promise<unknown> {
+  const contentType = res.headers.get('content-type')?.toLowerCase() ?? '';
+  if (!contentType.includes('text/event-stream')) return res.json();
+  const messages = parseSseMessages(await res.text());
+  if (jsonRpcResponseId !== undefined) {
+    return messages.find((message) => isObject(message) && message['id'] === jsonRpcResponseId) ?? {};
+  }
+  return messages.at(-1) ?? {};
+}
+
 async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
   const { io, origin } = deps;
 
@@ -253,6 +299,7 @@ async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
       Authorization: authHeader(c),
       Accept: 'application/json',
       ...(req.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(req.headers ?? {}),
     };
     return hubFetch(io, resolveEndpoint(origin, req.path + (req.query ?? '')), {
       method: req.method,
@@ -276,11 +323,11 @@ async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
 
   let json: unknown;
   try {
-    json = await res.json();
+    json = await parseHubResponse(res, req.jsonRpcResponseId);
   } catch {
     json = {};
   }
-  return { status: res.status, json };
+  return { status: res.status, json, mcpSessionId: res.headers.get('mcp-session-id') ?? undefined };
 }
 
 /** Whether an HTTP status is a 2xx success. */
@@ -305,6 +352,113 @@ function toolResultFromRest(r: HubCallResult): ToolResult {
 /** An `isError` result whose single text block is `text` verbatim (not JSON). */
 function errorText(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
+}
+
+/**
+ * Attest the *remote* hub's ephemeral workflow contract before forwarding an
+ * `ephemeral:true` create. The local proxy always advertises its newest schema,
+ * so neither its tools/list response nor a successful inclusive REST listing
+ * can establish that an older selected hub honors these fields. This follows
+ * the Streamable HTTP lifecycle with authenticated, non-mutating requests:
+ * initialize, notifications/initialized, then tools/list. The negotiated
+ * protocol version and any returned session id ride every later request.
+ */
+async function attestRemoteEphemeralWorkflowSupport(deps: McpDeps): Promise<string | undefined> {
+  const noCreate = '; no create request was sent';
+  const jsonRpcError = (stage: string, response: unknown): string | undefined => {
+    const error = isObject(response) ? response['error'] : undefined;
+    if (error === undefined) return undefined;
+    return `ephemeral workflow preflight remote MCP ${stage} returned JSON-RPC error ${JSON.stringify(error)}${noCreate}`;
+  };
+  const initialize = await callHub(deps, {
+    method: 'POST',
+    path: '/mcp',
+    headers: { Accept: 'application/json, text/event-stream' },
+    jsonRpcResponseId: 'owenloop-ephemeral-preflight-initialize',
+    body: {
+      jsonrpc: '2.0',
+      id: 'owenloop-ephemeral-preflight-initialize',
+      method: 'initialize',
+      params: {
+	protocolVersion: '2025-06-18',
+	capabilities: {},
+	clientInfo: { name: 'owenloop-cli-mcp', version: packageVersion() },
+      },
+    },
+  });
+  if (initialize.authFailed) return initialize.authMessage ?? loginHint(deps.origin);
+  const initializeError = jsonRpcError('initialize', initialize.json);
+  if (initializeError !== undefined) return initializeError;
+  if (!isOk(initialize.status)) {
+    return `ephemeral workflow preflight could not initialize remote MCP at ${deps.origin} (HTTP ${initialize.status}); no create request was sent`;
+  }
+  const initializeResult = isObject(initialize.json) ? initialize.json['result'] : undefined;
+  const protocolVersion = isObject(initializeResult) ? initializeResult['protocolVersion'] : undefined;
+  if (typeof protocolVersion !== 'string' || protocolVersion === '') {
+    return `ephemeral workflow preflight received no negotiated remote MCP protocol version from ${deps.origin}${noCreate}`;
+  }
+  const subsequentHeaders = {
+    Accept: 'application/json, text/event-stream',
+    'MCP-Protocol-Version': protocolVersion,
+    ...(initialize.mcpSessionId === undefined ? {} : { 'Mcp-Session-Id': initialize.mcpSessionId }),
+  };
+
+  const initialized = await callHub(deps, {
+    method: 'POST',
+    path: '/mcp',
+    headers: subsequentHeaders,
+    body: { jsonrpc: '2.0', method: 'notifications/initialized' },
+  });
+  if (initialized.authFailed) return initialized.authMessage ?? loginHint(deps.origin);
+  const initializedError = jsonRpcError('initialized notification', initialized.json);
+  if (initializedError !== undefined) return initializedError;
+  if (!isOk(initialized.status)) {
+    return `ephemeral workflow preflight could not send remote MCP initialized notification to ${deps.origin} (HTTP ${initialized.status})${noCreate}`;
+  }
+
+  const listed = await callHub(deps, {
+    method: 'POST',
+    path: '/mcp',
+    headers: subsequentHeaders,
+    jsonRpcResponseId: 'owenloop-ephemeral-preflight-tools-list',
+    body: {
+      jsonrpc: '2.0',
+      id: 'owenloop-ephemeral-preflight-tools-list',
+      method: 'tools/list',
+      params: {},
+    },
+  });
+  if (listed.authFailed) return listed.authMessage ?? loginHint(deps.origin);
+  const listedError = jsonRpcError('tools/list', listed.json);
+  if (listedError !== undefined) return listedError;
+  if (!isOk(listed.status)) {
+    return `ephemeral workflow preflight could not list remote MCP tools at ${deps.origin} (HTTP ${listed.status}); no create request was sent`;
+  }
+
+  const response = isObject(listed.json) ? listed.json['result'] : undefined;
+  const tools = isObject(response) && Array.isArray(response['tools']) ? response['tools'] : undefined;
+  if (tools === undefined) {
+    return `ephemeral workflow preflight received no remote MCP tools/list result from ${deps.origin}; no create request was sent`;
+  }
+
+  const findTool = (name: string): Record<string, unknown> | undefined =>
+    tools.find((tool): tool is Record<string, unknown> => isObject(tool) && tool['name'] === name);
+  const supportsBoolean = (tool: Record<string, unknown> | undefined, field: string): boolean => {
+    const schema = tool?.['inputSchema'];
+    const properties = isObject(schema) ? schema['properties'] : undefined;
+    const property = isObject(properties) ? properties[field] : undefined;
+    return isObject(property) && property['type'] === 'boolean';
+  };
+
+  const missing = [
+    !supportsBoolean(findTool('create_workflow'), 'ephemeral') ? 'create_workflow.ephemeral' : undefined,
+    !supportsBoolean(findTool('list_workflows'), 'include_ephemeral') ? 'list_workflows.include_ephemeral' : undefined,
+    findTool('delete_workflow') === undefined ? 'delete_workflow' : undefined,
+  ].filter((item): item is string => item !== undefined);
+  if (missing.length > 0) {
+    return `ephemeral workflow preflight found that remote MCP at ${deps.origin} lacks ${missing.join(', ')}; no create request was sent`;
+  }
+  return undefined;
 }
 
 // ---- tool table -------------------------------------------------------------
@@ -434,13 +588,13 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 21 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 22 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 21, plus `createAgentTool`, plus the four crew tools from
+ * set: these 22, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
@@ -591,11 +745,19 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'Only when no catalog entry fits and the human chooses ordinary authoring, use this parse-and-load hard gate for a workflow definition YAML. It is stored only if it loads clean; failures return the engine/parser error verbatim. Idempotent: re-pushing identical content is a no-op success (unchanged: true with the existing version); changed content version-forwards.',
       inputSchema: {
         type: 'object',
-		properties: { yaml: { type: 'string' }, bundle_digest: { type: 'string' } },
+		properties: { yaml: { type: 'string' }, bundle_digest: { type: 'string' }, ephemeral: { type: 'boolean' } },
         required: ['yaml'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/create_workflow', body: a })),
+      handler: async (a) => {
+	if (a['ephemeral'] === true) {
+	  const preflightFailure = await attestRemoteEphemeralWorkflowSupport(deps);
+	  if (preflightFailure !== undefined) return errorText(preflightFailure);
+	}
+	const r = await callHub(deps, { method: 'POST', path: '/api/create_workflow', body: a });
+	if (r.authFailed) return errorText(r.authMessage ?? loginHint(deps.origin));
+	return toolResultFromRest(r);
+      },
     },
     {
       name: 'get_workflow',
@@ -615,8 +777,24 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_workflows',
       description: 'Discover published workflow definitions and decide which one fits a task.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/workflows' })),
+      inputSchema: { type: 'object', properties: { include_ephemeral: { type: 'boolean' } }, additionalProperties: false },
+      handler: passthrough(deps, (a) => ({
+		method: 'GET',
+		path: '/api/workflows',
+		...('include_ephemeral' in a ? { query: `?include_ephemeral=${String(a['include_ephemeral'])}` } : {}),
+      })),
+    },
+    {
+      name: 'delete_workflow',
+      description:
+		'Retire an ephemeral workflow live name. Refuses while an active root references its exact pinned definition closure.',
+      inputSchema: {
+		type: 'object',
+		properties: { name: { type: 'string', minLength: 1 } },
+		required: ['name'],
+		additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/delete_workflow', body: a })),
     },
     {
       name: 'get_status',

@@ -78,6 +78,40 @@ const AUTHOR_SKILL_PATHS = [
   'plugins/codex/plugins/owenloop/skills/author/SKILL.md',
 ] as const;
 
+/** ephemeral's governed hub lifecycle surface under both plugin spellings. */
+const EPHEMERAL_ALLOWED_TOOLS = [
+  'mcp__plugin_owenloop_owenloop__list_workflows',
+  'mcp__plugin_owenloop_owenloop__create_workflow',
+  'mcp__plugin_owenloop_owenloop__get_workflow',
+  'mcp__plugin_owenloop_owenloop__start_run',
+  'mcp__plugin_owenloop_owenloop__whats_next',
+  'mcp__plugin_owenloop_owenloop__heartbeat',
+  'mcp__plugin_owenloop_owenloop__get_order',
+  'mcp__plugin_owenloop_owenloop__submit',
+  'mcp__plugin_owenloop_owenloop__reject_artifact',
+  'mcp__plugin_owenloop_owenloop__get_status',
+  'mcp__plugin_owenloop_owenloop__delete_workflow',
+  'mcp__owenloop__list_workflows',
+  'mcp__owenloop__create_workflow',
+  'mcp__owenloop__get_workflow',
+  'mcp__owenloop__start_run',
+  'mcp__owenloop__whats_next',
+  'mcp__owenloop__heartbeat',
+  'mcp__owenloop__get_order',
+  'mcp__owenloop__submit',
+  'mcp__owenloop__reject_artifact',
+  'mcp__owenloop__get_status',
+  'mcp__owenloop__delete_workflow',
+] as const;
+
+/** The hub skill needs its own list: AUTHOR_SKILL_PATHS carries author-only
+ * harness assertions, while SKILL_CASES intentionally rejects all MCP names. */
+const EPHEMERAL_SKILL_PATHS = [
+  'plugins/_skills/ephemeral/SKILL.md',
+  'plugins/claude-code/plugin/skills/ephemeral/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/ephemeral/SKILL.md',
+] as const;
+
 /** shift's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
  *  tightly scoped Bash prefix. */
@@ -417,6 +451,60 @@ test('author/SKILL.md allowed-tools is exactly the governed set — no Edit/Writ
   assert.ok(!((tools)).includes('Edit'));
   assert.ok(!((tools)).includes('Write'));
   assert.ok(!((tools)).includes('Bash'));
+});
+
+test('all shipped ephemeral skills have the governed identity and exact lifecycle tool set', () => {
+  for (const path of EPHEMERAL_SKILL_PATHS) {
+    const { data } = parseFrontmatter(readText(path));
+    assert.equal(data.name, 'ephemeral');
+    assert.match(String(data.description), /collision-safe hub ephemeral workflow/u);
+    assert.deepEqual(new Set(splitToolList(data['allowed-tools'])), new Set(EPHEMERAL_ALLOWED_TOOLS));
+  }
+});
+
+test('all shipped ephemeral skills keep the decision gate, capability preflight, and publication proof', () => {
+  for (const path of EPHEMERAL_SKILL_PATHS) {
+    const body = parseFrontmatter(readText(path)).body;
+    for (const rule of ['R1', 'R2', 'R3', 'R4', 'R5', 'R6']) assert.ok(body.includes(rule), path + ' must retain ' + rule);
+    for (const condition of [
+      'Straight line of at most about five steps',
+      'Steps are smaller than one coherent agent turn',
+      'cannot yet name each step',
+      'Everything fits comfortably',
+    ]) assert.ok(body.includes(condition), path + ' must retain every never-use condition');
+    assert.ok(body.includes('include_ephemeral: true'), path + ' must preflight inclusive discovery');
+    assert.ok(body.includes('remote MCP capability preflight'), path + ' must attest the selected remote hub, not only the local proxy');
+    assert.ok(body.includes('A 200 inclusive listing is **not** a capability\nattestation'), path + ' must not mistake an ignored inclusive query for support');
+    assert.ok(body.includes('ephemeral: true'), path + ' must create an ephemeral definition');
+    assert.ok(body.includes('eph-<short-task-slug>-<unix-ms>-<random-hex>'), path + ' must require collision-safe names');
+    assert.ok(body.includes('version, and hash'), path + ' must record publication identity');
+    assert.ok(body.includes('compare its name,\nversion, and hash'), path + ' must recheck publication identity before retirement');
+  }
+});
+
+test('all shipped ephemeral skills prescribe honest self-execution and safe retirement', () => {
+  for (const path of EPHEMERAL_SKILL_PATHS) {
+    const body = parseFrontmatter(readText(path)).body;
+    assert.match(body, /start_run[\s\S]*whats_next[\s\S]*heartbeat[\s\S]*get_order[\s\S]*submit/u, path + ' must prescribe the self-execution sequence');
+    assert.ok(body.includes('Stop only after terminal\ncompletion'), path + ' must require terminal completion');
+    assert.ok(body.indexOf('After terminal status') < body.indexOf('call \`delete_workflow\` exactly once'), path + ' must check terminal status before deletion');
+    assert.ok(body.includes('live catalog pointer'), path + ' must explain live-pointer-only retirement');
+    assert.ok(body.includes('Historical pinned definition\nversions remain reachable and are never deleted'), path + ' must preserve immortal history semantics');
+    for (const refusal of ['Active root references', 'No live definition', 'not ephemeral']) {
+      assert.ok(body.includes(refusal), path + ' must classify ' + refusal + ' refusal');
+    }
+    assert.ok(body.includes('never its HTTP\nstatus alone'), path + ' must classify 409s by message');
+  }
+});
+
+test('ephemeral skill is hub-native and the legacy local skill is gone', () => {
+  for (const path of EPHEMERAL_SKILL_PATHS) {
+    const content = readText(path);
+    for (const forbidden of ['SQLite', 'OWENLOOP_DB', '.owenloop-eph', 'owenloop create', 'owenloop tick', 'owenloop delete']) {
+      assert.ok(!content.includes(forbidden), path + ' must not teach retired local transport: ' + forbidden);
+    }
+  }
+  assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-ephemeral/SKILL.md')), false);
 });
 
 for (const { path, name } of SKILL_CASES) {

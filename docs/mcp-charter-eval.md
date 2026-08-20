@@ -64,16 +64,17 @@ than inheriting an old baseline.
 
 The committed [baseline](evals/mcp-charter-baseline.json) records a complete
 2026-08-20 run for charter hash
-`d2a19686f3932643362fe3b83c3a870235c33929f345e8107a663a7d6454516d`.
+`dfb67821e8aa35de812aa041716eef044bf2e1fce4e574866ceb9638667c9cca`.
 Claude Code 2.1.236 using `claude-opus-5` passed 4/4 clear tasks. Codex 0.147.0
-using `gpt-5.6-sol` passed 2/4: it found and started both matching workflows,
-but it made no catalog call on either no-match task.
+using `gpt-5.6-sol` passed 1/4: it completed the library match, but missed the
+delivery match and made no catalog call on either no-match task.
 
-The retained no-match responses were reviewed. Claude plainly says that no
-catalog playbook fits in both responses. Codex instead asks for the missing
-task inputs and offers to perform the work directly; because it never called
-`list_workflows`, those two records correctly fail the structured-call rule.
-The prose review does not alter either harness's numeric score.
+The retained no-match responses were reviewed. Claude calls the catalog first
+and plainly says that no catalog playbook fits in both responses. Codex instead
+asks for missing task inputs and offers to perform the work directly; because
+it never called `list_workflows`, those two records correctly fail the
+structured-call rule. The prose review does not alter either harness's numeric
+score.
 
 ## Safety and baseline updates
 

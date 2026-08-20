@@ -388,17 +388,19 @@ looks like:
   as scratch discipline rather than standing infrastructure.
 
 The engine doesn't know or care which of these is ticking it — an order is an
-order. For Claude Code specifically, three shipped skills implement these
-patterns ready-made:
+order. Two standalone CLI skills implement the first two patterns:
 
 - [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md) — drive an existing
   workflow instance to done: tick, dispatch each order to a fresh subagent,
   report honestly.
 - [`owenloop-author`](skills/owenloop-author/SKILL.md) — turn a plain-English
   goal into a validated workflow def, interactively, then drive it.
-- [`owenloop-ephemeral`](skills/owenloop-ephemeral/SKILL.md) — author and
-  drive a throwaway workflow to structure an agent's own mid-task work, then
-  delete it.
+
+The Owenloop Claude Code and Codex plugins also provide the hub-native
+`ephemeral` skill for structuring the caller's own one-off work with an
+ephemeral workflow. `npx skills add` installs the standalone repository
+skills; install the Claude Code or Codex Owenloop plugin to receive the
+materialized hub skill.
 
 ---
 
