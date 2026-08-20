@@ -87,7 +87,7 @@ for the full breakdown.
 | `util modifier-init --default <value>` | choose a modifier from rejection feedback, the order hint, or a default; intended for command steps |
 | `trust init\|grant\|revoke` | create and sign local enrollment trust records offline — see [`trust`](#trust--local-enrollment-trust) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
-| `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
+| `provide <wf> <name> [--value json] [--hub <url>]` | supply a seeded input after the fact; `--hub` targets a hosted workflow |
 | `tick <wf> [--now=<ms>] [--shallow] [--capability <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--capability` claims steps without capabilities plus matching-capability steps — see below |
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
 | `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
@@ -98,13 +98,21 @@ for the full breakdown.
 | `green <wf> <run> <path> [--value json] [--terminal]` | accept an owed output |
 | `emit <wf> <run> --items '[{…},{…}]'` | add collection elements |
 | `seal <wf> <run> [--value json]` | mark a collection complete |
-| `reject <wf> <path> --by <author> --text <msg>` | reject an output (re-arms its producer) |
+| `reject <wf> <path> --by <author> --text <msg> [--requested <modifier>] [--hub <url>]` | reject an output (re-arms its producer); `--hub` targets a hosted workflow |
 | `retract <wf> <path> --by <author> --text <msg>` | drop a collection member |
 | `skip <wf> <path> --by <author> --text <msg>` | a step declines its own output |
 | `retry <wf> <path> [--by a] [--text guidance] [--hub <url>]` | clear a stall and reset the counter, or answer an `ask` — `--hub` targets a hub-hosted run |
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
+
+Without `--hub`, `provide` and `reject` use the local SQLite engine exactly as
+before. With `--hub`, they operate on the project-bound (or explicitly named)
+hosted workflow and use the logged-in human credential; the explicit hub must
+agree with an existing project binding. Hosted `reject` maps `--text` to the
+hub's `reason`, forwards `--requested` when supplied, and does not accept
+caller-controlled `--by` because the hub attributes the rejection to the
+authenticated human. Hosted `provide` sends the input identifier as `name`.
 
 ## Bundles
 
