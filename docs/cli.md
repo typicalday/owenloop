@@ -127,6 +127,15 @@ hub's `reason`, forwards `--requested` when supplied, and does not accept
 caller-controlled `--by` because the hub attributes the rejection to the
 authenticated human. Hosted `provide` sends the input identifier as `name`.
 
+Hosted workflow IDs must be `wf_` followed by exactly 24 lowercase hexadecimal
+characters. The CLI rejects malformed IDs before resolving the hub, reading
+credentials, or making a request for `cancel`, the `--hub` forms of `retry`,
+`reject`, and `provide`, `instance show`, and `routing show`. Local
+`provide`/`reject`/`retry` retain their SQLite behavior. Local `show` first
+checks that the workflow instance exists: an existing instance with no
+artifacts prints `[]`, while an unknown well-formed ID fails with
+`no such workflow instance: <id>`.
+
 ## Bundles
 
 The package-format commands are deliberately dispatched before the CLI opens
