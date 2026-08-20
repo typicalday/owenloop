@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { loadDefFile } from '../src/defs.ts';
 import {
   applyOutcome,
@@ -11,6 +12,8 @@ import {
   settleInMemory,
 } from '../src/model.ts';
 import { arts, def, input, step } from './helpers.ts';
+
+type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
 const memberRetractFixture = def(
   'member-retract-fixture',
@@ -108,7 +111,11 @@ test('memberRetractFirings: every non-retracted member retracts through every au
 });
 
 test('modelCheck: shipped research reports no definite defects before the expected state bound', () => {
-  const shippedResearch = loadDefFile(new URL('../examples/workflows/research.yaml', import.meta.url));
+  const loadDefFileInputIsString: Exactly<Parameters<typeof loadDefFile>[0], string> = true;
+  assert.equal(loadDefFileInputIsString, true, 'loadDefFile remains a filesystem-string API');
+  const shippedResearch = loadDefFile(
+    fileURLToPath(new URL('../examples/workflows/research.yaml', import.meta.url)),
+  );
   const report = modelCheck(shippedResearch, { maxStates: 50_000, assumeProvided: true });
 
   assert.equal(report.bounded, true, 'the complete member-retract model exceeds the shipped search budget');

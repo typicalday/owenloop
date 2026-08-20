@@ -23,7 +23,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce, parseWorkdirFrom } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
@@ -2411,12 +2410,11 @@ function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
 // ---- filesystem loading ------------------------------------------------------
 
 /** Load and validate a single workflow definition from a YAML file. */
-export function loadDefFile(file: string | URL): WorkflowDef {
-  const path = typeof file === 'string' ? file : fileURLToPath(file);
-  const text = readFileSync(path, 'utf8');
+export function loadDefFile(file: string): WorkflowDef {
+  const text = readFileSync(file, 'utf8');
   const raw = parseYaml(text);
-  const def = parseDef(raw, basename(path), dirname(path));
-  def.dir = path;
+  const def = parseDef(raw, basename(file), dirname(file));
+  def.dir = file;
   return def;
 }
 
