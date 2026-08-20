@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { main, mainAsync } from '../src/cli.ts';
-import { finalizeDefs } from '../src/defs.ts';
+import { finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   collectWorkflowStoreGarbage,
@@ -22,8 +22,10 @@ import {
   objectDirForDigest,
   planWorkflowStoreGc,
   readWorkflowStoreIndex,
+  recoverWorkflowStore,
   storeIndexPath,
   workflowCoordinate,
+  workflowStoreStatePaths,
   writeWorkflowStoreIndex,
 } from '../src/store/index.ts';
 import type { DefDigest, RuntimeSnapshotBundlePins } from '../src/index.ts';
@@ -188,6 +190,73 @@ test('selected winners, explicit pins, runtime pins, and transitive bundle locks
   const lockedPlan = plan({ projectRoot: childV1.root, keep: 1 });
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV1.digest), false);
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV2.digest), false);
+});
+
+test('project GC follows locks from every retained global caller version', async () => {
+	const projectV1 = await installVersion({ name: 'child', version: '1.0.0' });
+	const projectV2 = await installVersion({ name: 'child', version: '2.0.0', root: projectV1.root });
+	const globalRoot = emptyRoot();
+	const callerWorkflow = (target: string, marker: string) => [
+		'name: caller',
+		'inputs:',
+		'  - name: seed',
+		'    seedOwed: true',
+		'steps:',
+		'  - name: invoke',
+		`    calls: ${target}`,
+		'    inputs:',
+		'      seed: seed',
+		'    produces: [done]',
+		'outputs: [done]',
+		`# ${marker}`,
+		'',
+	].join('\n');
+	const oldTarget = 'child/child@1.0.0';
+	const currentTarget = 'child/child@2.0.0';
+	await installVersion({
+		name: 'caller',
+		version: '1.0.0',
+		root: globalRoot,
+		workflow: callerWorkflow(oldTarget, 'old-global-caller'),
+		lock: { [oldTarget]: projectV1.digest },
+	});
+	await installVersion({
+		name: 'caller',
+		version: '2.0.0',
+		root: globalRoot,
+		workflow: callerWorkflow(currentTarget, 'current-global-caller'),
+		lock: { [currentTarget]: projectV2.digest },
+	});
+
+	const dry = plan({
+		projectRoot: projectV1.root,
+		globalRoot,
+		level: 'project',
+		keep: 1,
+	}).report;
+	assert.equal(
+		dry.objects.some((object) => object.digest === projectV1.digest),
+		false,
+		'the shadowed but retained global caller keeps its older project-only child',
+	);
+
+	const applied = await collectWorkflowStoreGarbage({
+		projectRoot: projectV1.root,
+		globalRoot,
+		level: 'project',
+		keep: 1,
+		yes: true,
+		readSnapshotPins: () => [],
+	});
+	assert.equal(applied.objects.some((object) => object.digest === projectV1.digest), false);
+	assert.equal(existsSync(objectDirForDigest(projectV1.root, projectV1.digest)), true);
+
+	const registrations = loadCasDefs({ projectRoot: projectV1.root, globalRoot, warn: () => {} });
+	const defs = finalizeDefs(new Map(registrations.map((registration) => [registration.key, registration.def])));
+	const oldCaller = defs.get('caller/caller@1.0.0');
+	assert.ok(oldCaller, 'the shadowed global caller remains exactly resolvable');
+	const resolved = resolveCallsTarget(defs, oldTarget, oldCaller);
+	assert.equal(resolved?.bundleDigest, projectV1.digest);
 });
 
 test('a runtime-pinned orphan and project exact-digest fallback into global are retained', async () => {
@@ -465,6 +534,94 @@ test('GC recovers an interruption after the durable journal but before the live-
   assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
 });
 
+test('offline workflow-store recovery removes only its parked GC object from shared staging', async () => {
+	const installed = await installThree();
+	const globalRoot = emptyRoot();
+	const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+	let parkedObject: string | undefined;
+	await assert.rejects(
+		collectWorkflowStoreGarbage({
+			projectRoot: installed.root,
+			globalRoot,
+			level: 'project',
+			keep: 1,
+			yes: true,
+			readSnapshotPins: () => [],
+			hooks: {
+				afterObjectParked: (path) => {
+					parkedObject = path;
+					assert.equal(existsSync(gcJournal), true);
+					assert.equal(lstatSync(path).mode & 0o777, 0o555);
+					throw new Error('injected process interruption after durable park');
+				},
+			},
+		}),
+		/injected process interruption after durable park/u,
+	);
+	assert.ok(parkedObject);
+	assert.equal(existsSync(parkedObject), true);
+	assert.equal(existsSync(gcJournal), true);
+	const unrelated = join(installed.root, '.owenloop-staging', 'unrelated', 'keep.txt');
+	mkdirSync(join(unrelated, '..'), { recursive: true });
+	writeFileSync(unrelated, 'keep');
+
+	const state = workflowStoreStatePaths(installed.root);
+	const recovery = await recoverWorkflowStore({
+		root: installed.root,
+		lockPath: state.lockPath,
+		journalPath: state.journalPath,
+	});
+	assert.equal(recovery, 'no-journal');
+	assert.equal(existsSync(gcJournal), false, 'offline recovery resolves GC evidence first');
+	assert.equal(existsSync(parkedObject), false, 'the journal-authenticated parked object is removed');
+	assert.equal(readFileSync(unrelated, 'utf8'), 'keep', 'unrelated staging evidence is preserved');
+	assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+});
+
+test('ordinary bundle install restores a parked GC object when the durable index still names its digest', async () => {
+	const installed = await installThree();
+	const globalRoot = emptyRoot();
+	const indexPath = storeIndexPath(installed.root);
+	const indexBefore = readFileSync(indexPath);
+	const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+	let parkedObject: string | undefined;
+	let parkedDigest: DefDigest | undefined;
+	await assert.rejects(
+		collectWorkflowStoreGarbage({
+			projectRoot: installed.root,
+			globalRoot,
+			level: 'project',
+			keep: 1,
+			yes: true,
+			readSnapshotPins: () => [],
+			hooks: {
+				afterObjectParked: (path) => {
+					parkedObject = path;
+					const match = /\/gc-([0-9a-f]{64})-park_[0-9a-f]{24}$/u.exec(path);
+					assert.ok(match);
+					parkedDigest = match[1] as DefDigest;
+					throw new Error('injected parked-object interruption');
+				},
+			},
+		}),
+		/injected parked-object interruption/u,
+	);
+	assert.ok(parkedObject && parkedDigest);
+	assert.equal(existsSync(objectDirForDigest(installed.root, parkedDigest)), false);
+
+	// Model a crash where the index rename was not the state recovered by the
+	// filesystem. Recovery must consult these current durable bytes rather than
+	// assuming every parked digest is doomed.
+	writeFileSync(indexPath, indexBefore);
+	await installVersion({ version: '3.0.0', root: installed.root });
+	const restored = objectDirForDigest(installed.root, parkedDigest);
+	assert.equal(existsSync(restored), true, 'the indexed parked object returns to its canonical path');
+	assert.equal(lstatSync(restored).mode & 0o777, 0o555);
+	assert.equal(existsSync(parkedObject), false);
+	assert.equal(existsSync(gcJournal), false);
+	assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+});
+
 test('GC journal recovery refuses a symlinked parked-object root before chmod', async () => {
   const installed = await installThree();
   const globalRoot = emptyRoot();
@@ -502,7 +659,10 @@ test('GC journal recovery refuses a symlinked parked-object root before chmod', 
 
 test('project and global GC mutate only the selected target root', async () => {
   const project = await installThree();
-  const global = await installThree();
+  const globalOne = await installVersion({ name: 'global-widget', version: '1.0.0' });
+  await installVersion({ name: 'global-widget', version: '1.1.0', root: globalOne.root });
+  await installVersion({ name: 'global-widget', version: '2.0.0', root: globalOne.root });
+  const global = { root: globalOne.root };
   const projectIndexBefore = readFileSync(storeIndexPath(project.root));
   const globalIndexBefore = readFileSync(storeIndexPath(global.root));
 

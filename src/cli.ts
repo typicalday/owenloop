@@ -156,6 +156,7 @@ import {
   workflowStoreStatePaths,
 } from './store/index.ts';
 import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/index.ts';
+import { recoverInterruptedWorkflowStoreGc } from './store/gc-recovery.ts';
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
@@ -3436,13 +3437,11 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   // must NOT delete it (the error message tells the user to recover it).
   let preserveStagingRoot = false;
   try {
-    // Recover a crash-interrupted prior install FIRST — before the stale-staging
-    // clear, since the backups/parked dirs a rollback needs live UNDER the
-    // staging root, so clearing it first would destroy them. Any refusal (bad or
-    // mismatched or contradictory journal) must preserve the staging root and the
-    // journal as evidence: without this, the `finally` below would rmSync the
-    // staging root and take the backups a later recovery needs with it.
+    // Recover crash-interrupted GC parking and installs FIRST — before the
+    // stale-staging clear, since both can own evidence below that shared root.
+    // Any refusal must preserve the staging root and journals as evidence.
     try {
+      recoverInterruptedWorkflowStoreGc({ root: defsDir, stateDir: canonicalState.stateDir });
       recoverInterruptedInstall({
 	defsDir,
 	journalPath: canonicalState.journalPath,
@@ -3780,6 +3779,9 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
   }
   let outcome: RecoveryOutcome = 'no-journal';
   try {
+    if (canonicalStateExists) {
+      recoverInterruptedWorkflowStoreGc({ root: defsDir, stateDir: canonicalState.stateDir });
+    }
     const canonicalOutcome = recoverInterruptedInstall({
       defsDir,
       journalPath: canonicalState.journalPath,
@@ -3793,7 +3795,7 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
 	lockfilePath,
 	recoveryMarkerDir,
 	v2Replacement: workflowStoreReplacementRecovery,
-      });
+    });
     outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
     for (const handle of locks.reverse()) releaseInstallLock(handle);

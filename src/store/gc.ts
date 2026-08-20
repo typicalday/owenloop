@@ -6,15 +6,9 @@
  */
 
 import {
-  chmodSync,
-  closeSync,
-  constants as fsConstants,
-  fsyncSync,
   lstatSync,
-  openSync,
   readFileSync,
   readdirSync,
-  rmSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
@@ -23,15 +17,11 @@ import {
   acquireInstallLock,
   ensureDirectoryPathNoSymlink,
   guardStateFile,
-  lockfilePathViolation,
   probeDirectoryPath,
-  readRegularFileNoFollow,
   recoverInterruptedInstall,
-  renameDirRestoringWrite,
   releaseInstallLock,
   rmRecursiveForce,
   STAGING_DIRNAME,
-  writeJsonAtomic,
 } from '../install.ts';
 import type { LedgerLookup } from '../install.ts';
 import type { RuntimeSnapshotBundlePins } from '../store.ts';
@@ -40,6 +30,12 @@ import { loadCasDefs } from './def-source.ts';
 import { readWorkflowStoreIndex, serializeWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
 import { workflowStoreReplacementRecovery } from './install.ts';
+import {
+  fsyncWorkflowStoreFileAndParent,
+  parkWorkflowStoreGcObject,
+  recoverInterruptedWorkflowStoreGc,
+  workflowStoreGcJournalPath,
+} from './gc-recovery.ts';
 import {
   compareStoreText,
   defDigest,
@@ -110,136 +106,10 @@ export interface CollectWorkflowStoreGcArgs {
     afterIndexWrite?: () => void;
     /** Process-interruption seam after durable evidence and the live chmod. */
     afterLiveObjectMadeWritable?: (path: string) => void;
+    /** Process-interruption seam after the object rename and parent fsyncs. */
+    afterObjectParked?: (path: string) => void;
     removeParkedObject?: (path: string) => void;
   };
-}
-
-const GC_JOURNAL_FILENAME = 'gc.journal';
-
-interface WorkflowStoreGcJournal {
-  version: 1;
-  digest: DefDigest;
-  parkedName: string;
-  originalMode: number;
-}
-
-function gcJournalPath(stateDir: string): string {
-  return join(stateDir, GC_JOURNAL_FILENAME);
-}
-
-function fsyncPath(path: string): void {
-  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function fsyncDirectory(path: string): void {
-  const fd = openSync(path, fsConstants.O_RDONLY);
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function corruptGcJournal(path: string, detail: string): Error {
-  return new Error(
-    `invalid workflow-store GC journal at ${path}: ${detail} — ` +
-      'inspect the target store and remove the journal manually before retrying',
-  );
-}
-
-function readGcJournal(path: string): WorkflowStoreGcJournal | undefined {
-  const bytes = readRegularFileNoFollow(path, 'workflow-store GC journal');
-  if (bytes === undefined) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(bytes).toString('utf8'));
-  } catch (error) {
-    throw corruptGcJournal(path, `invalid JSON: ${(error as Error).message}`);
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw corruptGcJournal(path, 'expected an object');
-  }
-  const raw = parsed as Record<string, unknown>;
-  const keys = Object.keys(raw).sort(compareStoreText);
-  const expectedKeys = ['digest', 'originalMode', 'parkedName', 'version'];
-  if (JSON.stringify(keys) !== JSON.stringify(expectedKeys)) {
-    throw corruptGcJournal(path, `unexpected fields ${JSON.stringify(keys)}`);
-  }
-  if (raw.version !== 1) throw corruptGcJournal(path, `unsupported version ${JSON.stringify(raw.version)}`);
-  if (typeof raw.digest !== 'string') throw corruptGcJournal(path, 'digest must be a string');
-  let digest: DefDigest;
-  try {
-    digest = defDigest(raw.digest);
-  } catch (error) {
-    throw corruptGcJournal(path, (error as Error).message);
-  }
-  if (typeof raw.parkedName !== 'string' || lockfilePathViolation(raw.parkedName) !== undefined) {
-    throw corruptGcJournal(path, 'parkedName is not a safe path segment');
-  }
-  if (!new RegExp(`^gc-${digest}-park_[0-9a-f]{24}$`, 'u').test(raw.parkedName)) {
-    throw corruptGcJournal(path, 'parkedName does not match the recorded digest and GC transaction shape');
-  }
-  if (raw.originalMode !== 0o555) {
-    throw corruptGcJournal(path, `originalMode must be the hardened object mode 0555, got ${String(raw.originalMode)}`);
-  }
-  return { version: 1, digest, parkedName: raw.parkedName, originalMode: raw.originalMode };
-}
-
-function writeGcJournal(path: string, stateDir: string, journal: WorkflowStoreGcJournal): void {
-  guardStateFile(path, 'workflow-store GC journal');
-  writeJsonAtomic(path, journal);
-  // The evidence must reach stable storage before the canonical object is made
-  // writable. Fsync both the renamed file and its directory entry.
-  fsyncPath(path);
-  fsyncDirectory(stateDir);
-}
-
-function removeGcJournal(path: string, stateDir: string): void {
-  guardStateFile(path, 'workflow-store GC journal');
-  rmSync(path, { force: true });
-  // Persist the unlink before parked cleanup. Otherwise a crash could make the
-  // journal reappear after its only corresponding object has been removed.
-  fsyncDirectory(stateDir);
-}
-
-function recoverInterruptedGcPark(
-  targetRoot: string,
-  stateDir: string,
-  stagingRoot: string,
-  journalPath: string,
-): void {
-  const journal = readGcJournal(journalPath);
-  if (journal === undefined) return;
-  const live = objectDirForDigest(targetRoot, journal.digest);
-  const parked = join(stagingRoot, journal.parkedName);
-  const liveState = probeDirectoryPath(live, 'workflow-store GC live object', targetRoot) === 'dir'
-    ? lstatSync(live)
-    : undefined;
-  const stagingState = probeDirectoryPath(stagingRoot, 'workflow store staging directory', targetRoot);
-  const parkedState = stagingState === 'dir'
-    && probeDirectoryPath(parked, 'workflow-store GC parked object', stagingRoot) === 'dir'
-    ? lstatSync(parked)
-    : undefined;
-  if (liveState !== undefined && parkedState !== undefined) {
-    throw corruptGcJournal(journalPath, 'both the live and parked object paths exist');
-  }
-  const candidate = liveState === undefined ? parked : live;
-  const candidateState = liveState === undefined ? parkedState : liveState;
-  if (candidateState === undefined) {
-    throw corruptGcJournal(journalPath, 'neither the live nor parked object path exists');
-  }
-  if (candidateState.isSymbolicLink() || !candidateState.isDirectory()) {
-    throw corruptGcJournal(journalPath, `transaction object '${candidate}' is not a real directory`);
-  }
-  chmodSync(candidate, journal.originalMode);
-  fsyncPath(candidate);
-  verifyWorkflowObjectSync(candidate, journal.digest, { coordinateRepair: false });
-  removeGcJournal(journalPath, stateDir);
 }
 
 interface BundleObjectMetadata {
@@ -460,9 +330,14 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     for (const digest of snapshot.bundleLock) protectedDigests.add(defDigest(digest));
   }
 
-  // A project index can intentionally use exact-digest fallback into global.
-  if (args.level === 'global' && !sameRoot) {
-    for (const entry of Object.values(projectIndex.entries)) {
+  // The other root is read-only for this run, so every coordinate it retains
+  // remains exactly callable. Seed all of those parent objects before walking
+  // bundle locks: a shadowed non-target caller can depend on a target-root
+  // child older than the target's keep window. Global GC also needs this for
+  // project exact-digest fallback into global.
+  if (!sameRoot) {
+    const nonTargetIndex = args.level === 'project' ? globalIndex : projectIndex;
+    for (const entry of Object.values(nonTargetIndex.entries)) {
       protectedDigests.add(defDigest(entry.digest));
     }
   }
@@ -548,15 +423,14 @@ export async function collectWorkflowStoreGarbage(
   }
 
   const state = workflowStoreStatePaths(targetRoot);
-  const gcModeJournalPath = gcJournalPath(state.stateDir);
   ensureDirectoryPathNoSymlink(state.stateDir, 'workflow store state directory');
   guardStateFile(state.lockPath, 'install lock');
   guardStateFile(state.journalPath, 'crash-recovery journal');
-  guardStateFile(gcModeJournalPath, 'workflow-store GC journal');
+  guardStateFile(workflowStoreGcJournalPath(state.stateDir), 'workflow-store GC journal');
   const lock = await acquireInstallLock(state.lockPath);
   try {
     const stagingRoot = join(targetRoot, STAGING_DIRNAME);
-    recoverInterruptedGcPark(targetRoot, state.stateDir, stagingRoot, gcModeJournalPath);
+    recoverInterruptedWorkflowStoreGc({ root: targetRoot, stateDir: state.stateDir });
     recoverInterruptedInstall({
       defsDir: targetRoot,
       journalPath: state.journalPath,
@@ -583,7 +457,11 @@ export async function collectWorkflowStoreGarbage(
     });
     const currentIndex = readWorkflowStoreIndex(storeIndexPath(targetRoot));
     if (serializeWorkflowStoreIndex(currentIndex) !== serializeWorkflowStoreIndex(plan.nextIndex)) {
-      writeWorkflowStoreIndex(storeIndexPath(targetRoot), plan.nextIndex);
+      const indexPath = storeIndexPath(targetRoot);
+      writeWorkflowStoreIndex(indexPath, plan.nextIndex);
+      // The pruned index is the durable commit point. Persist both its bytes and
+      // containing directory entry before any object can leave the CAS path.
+      fsyncWorkflowStoreFileAndParent(indexPath);
     }
     args.hooks?.afterIndexWrite?.();
 
@@ -597,31 +475,19 @@ export async function collectWorkflowStoreGarbage(
       if (liveState === undefined || liveState.isSymbolicLink() || !liveState.isDirectory()) {
 		throw new Error(`refusing to remove workflow-store object '${live}': it is no longer a real directory`);
       }
-      verifyWorkflowObjectSync(live, digest, { coordinateRepair: false });
-      const parked = join(stagingRoot, `gc-${digest}-${randId('park')}`);
-      if (lstatSync(parked, { throwIfNoEntry: false }) !== undefined) {
-		throw new Error(`refusing to park workflow-store object: destination '${parked}' already exists`);
-      }
-      const originalMode = liveState.mode & 0o7777;
-      if (originalMode !== 0o555) {
-		throw new Error(`refusing to park workflow-store object '${live}': expected hardened mode 0555`);
-      }
-      const parkedName = parked.slice(stagingRoot.length + 1);
-      writeGcJournal(gcModeJournalPath, state.stateDir, {
-	version: 1,
-	digest,
-	parkedName,
-	originalMode,
+      const parkedName = `gc-${digest}-${randId('park')}`;
+      const parked = parkWorkflowStoreGcObject({
+		root: targetRoot,
+		stateDir: state.stateDir,
+		digest,
+		parkedName,
+		...(args.hooks?.afterLiveObjectMadeWritable === undefined
+			? {}
+			: { afterLiveObjectMadeWritable: args.hooks.afterLiveObjectMadeWritable }),
+		...(args.hooks?.afterObjectParked === undefined
+			? {}
+			: { afterObjectParked: args.hooks.afterObjectParked }),
       });
-      // macOS requires owner-write on the source directory for rename. Durable
-      // evidence above makes the otherwise-dangerous chmod recoverable: a crash
-      // before rename restores the canonical path, while a crash after rename
-      // restores the parked path before cleanup.
-      chmodSync(live, originalMode | 0o200);
-      args.hooks?.afterLiveObjectMadeWritable?.(live);
-      renameDirRestoringWrite(live, parked, originalMode);
-      fsyncPath(parked);
-      removeGcJournal(gcModeJournalPath, state.stateDir);
       (args.hooks?.removeParkedObject ?? rmRecursiveForce)(parked);
     }
     if (probeDirectoryPath(stagingRoot, 'workflow store staging directory', targetRoot) === 'dir') {

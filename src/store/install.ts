@@ -68,6 +68,7 @@ import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts
 import { verifyWorkflowObjectSync } from './ingestor.ts';
 import { defDigest } from './types.ts';
 import { storeIndexPath } from './resolve.ts';
+import { recoverInterruptedWorkflowStoreGc } from './gc-recovery.ts';
 
 // ---- A1/A2 ports ---------------------------------------------------------------
 
@@ -244,8 +245,8 @@ export const workflowStoreReplacementRecovery = {
  *
  * Fixed commit order:
  *   1. acquire the root's install lock;
- *   2. recover a prior interrupted install (before stale-stage cleanup — the
- *      backups a rollback needs live under the staging root);
+ *   2. recover prior GC parking and install transactions (before stale-stage
+ *      cleanup — both can own evidence below the shared staging root);
  *   3. clear stale staging debris;
  *   4. reread + validate the index INSIDE the lock (ownership/conflict
  *      decisions must see the post-lock state — TOCTOU);
@@ -308,14 +309,15 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
   // root (a rollback double-fault) — then the `finally` must NOT clear it.
   let preserveStagingRoot = false;
   try {
-    // Recover a prior interrupted install FIRST — before the stale-staging
-    // clear, since the backups a rollback needs live under the staging root.
+    // Recover prior GC parking and install transactions FIRST — before the
+    // stale-staging clear, since both can own evidence below that shared root.
     // A v1 (GitHub) journal at a shared project journal path needs the
     // project ledger to vouch (supplied via `readLedger` — project bundle
     // installs share the project add lock/recovery ordering); without a
     // ledger a leftover v1 journal is refused. Any refusal preserves the
     // staging root + journal as evidence.
     try {
+      recoverInterruptedWorkflowStoreGc({ root, stateDir: dirname(lockPath) });
       recoverInterruptedInstall({
 	defsDir: root,
 	journalPath,
@@ -692,11 +694,11 @@ export interface RecoverWorkflowStoreArgs {
 
 /**
  * Offline crash recovery for a workflow-store root — the `add --recover`
- * counterpart for bundle installs. Acquires the root lock, runs the generic
- * two-version recovery (v2 metadata-hash commit point), releases. No network,
+ * counterpart for bundle installs. Acquires the root lock, recovers GC parking
+ * before the generic two-version install recovery, then releases. No network,
  * no store open. A v2 journal recovers forward or back exactly as the inline
  * path would; a v1 journal is refused (the GitHub route owns v1 recovery).
- * Refusals throw and leave the journal, staging, and objects untouched.
+ * Refusals throw and preserve unrelated staging evidence.
  */
 export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Promise<RecoveryOutcome> {
   ensureDirectoryPathNoSymlink(args.root, 'workflow store root');
@@ -706,13 +708,15 @@ export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Prom
   guardStateFile(args.journalPath, 'crash-recovery journal');
   const lock = await acquireInstallLock(args.lockPath);
   try {
-    return recoverInterruptedInstall({
+    recoverInterruptedWorkflowStoreGc({ root: args.root, stateDir: dirname(args.lockPath) });
+    const outcome = recoverInterruptedInstall({
       defsDir: args.root,
       journalPath: args.journalPath,
       lockfilePath: storeIndexPath(args.root),
       recoveryMarkerDir: args.recoveryMarkerDir,
       v2Replacement: workflowStoreReplacementRecovery,
     });
+    return outcome;
   } finally {
     releaseInstallLock(lock);
   }
