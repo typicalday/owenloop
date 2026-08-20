@@ -31,7 +31,7 @@
 #   wf=$(owenloop create compile-dev-playbook \
 #     --provide brief='{"task":"add Stripe subscription billing to a Node/TypeScript app","category":"billing"}' \
 #     | jq -r .workflow)
-#   owenloop tick $wf     # ... conduct to done (e.g. with the owenloop-conduct skill)
+#   owenloop tick $wf     # ... conduct to done (e.g. with the conduct plugin skill)
 #   # `approval` is a human gate before publish. Flying solo? Pre-approve at create:
 #   #   --provide approval='{"approved_by":"alex"}'
 #   # Otherwise the instance parks blocked on it — durably, in SQLite — until:

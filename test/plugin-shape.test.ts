@@ -505,6 +505,8 @@ test('ephemeral skill is hub-native and the legacy local skill is gone', () => {
     }
   }
   assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-ephemeral/SKILL.md')), false);
+  assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-author/SKILL.md')), false);
+  assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-conduct/SKILL.md')), false);
 });
 
 for (const { path, name } of SKILL_CASES) {

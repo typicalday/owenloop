@@ -33,7 +33,7 @@
 #   ...
 #   owenloop reject $wf pr --by reviewer --text "error path untested; add the 429 case"
 #
-# Or hand it to an agent: the owenloop-conduct skill (skills/owenloop-conduct)
+# Or hand it to an agent: the conduct plugin skill
 # drives an instance to done, one fresh subagent per order.
 #
 # Scaffolding hygiene: if the db (.owenloop/) and this defs dir live inside

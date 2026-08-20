@@ -388,44 +388,35 @@ looks like:
   as scratch discipline rather than standing infrastructure.
 
 The engine doesn't know or care which of these is ticking it — an order is an
-order. Two standalone CLI skills implement the first two patterns:
+order. The Owenloop Claude Code and Codex plugins provide three hub-native skills:
 
-- [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md) — drive an existing
-  workflow instance to done: tick, dispatch each order to a fresh subagent,
-  report honestly.
-- [`owenloop-author`](skills/owenloop-author/SKILL.md) — turn a plain-English
-  goal into a validated workflow def, interactively, then drive it.
+- [`conduct`](plugins/_skills/conduct/SKILL.md) — supervise one existing workflow
+  through a scoped Shift, check its status, and relay human gates.
+- [`author`](plugins/_skills/author/SKILL.md) — interview a human, draft a workflow,
+  validate it through `create_workflow`, present it for approval, and offer
+  `start_run`. Use `conduct` or `shift` to supervise the resulting run.
+- [`ephemeral`](plugins/_skills/ephemeral/SKILL.md) — structure the caller's own
+  one-off work with an ephemeral workflow.
 
-The Owenloop Claude Code and Codex plugins also provide the hub-native
-`ephemeral` skill for structuring the caller's own one-off work with an
-ephemeral workflow. `npx skills add` installs the standalone repository
-skills; install the Claude Code or Codex Owenloop plugin to receive the
-materialized hub skill.
+Put the `owenloop` CLI on `PATH` and run `owenloop setup`; the setup flow converges
+the bundled Claude Code and Codex plugins on that same CLI and hub connection.
 
 ---
 
 ## Quick start
 
-Install the owenloop skills for whatever Prime Agent you use — Claude Code, Codex,
-Cursor, and most others:
+Put the `owenloop` CLI (Node ≥ 22.13) on `PATH` and run `owenloop setup` once. Then
+ask your Prime Agent for what you want:
 
-```sh
-npx skills add typicalday/owenloop
-```
-
-Then ask your Prime Agent for what you want:
-
-> Use owenloop-author to build me a workflow that researches a topic, writes
+> Use author to build me a workflow that researches a topic, writes
 > a report, and doesn't accept it until an independent reviewer signs off —
 > then run it on "tidepools".
 
-The skill interviews you for anything missing, writes and validates the YAML
-definition, then conducts the instance to done — dispatching each order to a
-fresh subagent, relaying knock-backs, and escalating stalls to you. Already
-have a def? *"Conduct the report workflow"* hands it to
-[`owenloop-conduct`](skills/owenloop-conduct/SKILL.md). The engine itself is the
-`owenloop` CLI (Node ≥ 22.13 required). Install the package so `owenloop` is on
-`PATH`; the shipped Claude Code and Codex plugins launch that same command as
+The `author` skill interviews you for anything missing, writes and validates the
+YAML definition, and presents the process for approval before offering to start it.
+Already have a def? *"Conduct the report workflow"* hands it to
+[`conduct`](plugins/_skills/conduct/SKILL.md). The shipped Claude Code and Codex
+plugins launch the same `owenloop` command as
 `owenloop mcp`, rather than using a separate npx-pinned server. The plugins
 check the installed CLI/plugin version pair at session start when their hooks
 are enabled, and the MCP server reports a readable mismatch error on tool calls; run `owenloop setup` when the versions differ. For one-off shell
