@@ -182,6 +182,47 @@ test('mcpcore: tools/call without a string name → INVALID_PARAMS', async () =>
   assert.equal(frames[0]!.error!.code, INVALID_PARAMS);
 });
 
+test('mcpcore: tools/call validates registered schemas before a handler can run', async () => {
+  let calls = 0;
+  const strictTool: ToolRegistration = {
+    name: 'strict',
+    description: 'requires one string value',
+    inputSchema: {
+      type: 'object',
+      properties: { value: { type: 'string' } },
+      required: ['value'],
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      calls += 1;
+      return textResult({ value: args['value'] });
+    },
+  };
+  const { server, frames } = makeServer([strictTool]);
+  const invalidArguments: Array<unknown | undefined> = [undefined, null, ['not-an-object'], { value: 1 }, { value: 'ok', extra: true }];
+
+  for (const [index, argumentsValue] of invalidArguments.entries()) {
+    await server.handleLine(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 20 + index,
+      method: 'tools/call',
+      params: { name: 'strict', ...(argumentsValue === undefined ? {} : { arguments: argumentsValue }) },
+    }));
+  }
+
+  assert.equal(calls, 0, 'invalid calls must not invoke the handler');
+  assert.equal(frames.length, invalidArguments.length);
+  for (const frame of frames) {
+    assert.equal(frame.error!.code, INVALID_PARAMS);
+    assert.doesNotMatch(frame.error!.message, /not-an-object|"ok"/u, 'diagnostics must not echo supplied values');
+  }
+
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'strict', arguments: { value: 'ok' } } }));
+  assert.equal(calls, 1);
+  const result = frames[frames.length - 1]!.result as { content: Array<{ text: string }> };
+  assert.deepEqual(JSON.parse(result.content[0]!.text), { value: 'ok' });
+});
+
 test('mcpcore: a notification (no id) is NEVER answered — initialized and a call-shaped notification both stay silent', async () => {
   const { server, frames } = makeServer([echoTool]);
   await server.handleLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
