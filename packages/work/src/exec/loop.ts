@@ -48,7 +48,7 @@ import { join, resolve } from 'node:path';
 import { isWorkdirAllowed } from '../agent/workdir.ts';
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
+import { HubError, type ContactHolder, type GetOrderResponse, type OrderPacket, type SubmitRequest } from '../hub/types.ts';
 import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
 import type { InstructionResolver } from './instructions.ts';
 import { parsePayloadLine } from './payload.ts';
@@ -58,6 +58,12 @@ import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
 const EMPTY_HASH = createHash('sha256').digest('hex');
+
+/** Submit retries are intentionally narrow: 429 is known not to reach the verb. */
+const SUBMIT_MAX_ATTEMPTS = 3;
+const SUBMIT_RETRY_WINDOW_MS = 30_000;
+const SUBMIT_FALLBACK_DELAYS_MS = [5_000, 10_000] as const;
+const SUBMIT_ERROR_DETAIL_MAX_CHARS = 160;
 
 /**
  * The largest serialized `consumes` payload delivered inline in
@@ -145,6 +151,23 @@ export interface ExecLoop {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Keep edge response bodies out of the run log without changing HubError's
+ * transport contract for other callers. In particular, Cloudflare's HTML 1015
+ * page contributes no useful diagnosis beyond the 429 classification.
+ */
+function formatSubmitError(e: unknown): string {
+  if (!(e instanceof HubError)) return errMsg(e);
+  if (e.status === 429) return 'HTTP 429 (rate limited)';
+
+  const detail = e.message.replace(/\s+/g, ' ').trim();
+  const boundedDetail =
+    detail.length <= SUBMIT_ERROR_DETAIL_MAX_CHARS
+      ? detail
+      : `${detail.slice(0, SUBMIT_ERROR_DETAIL_MAX_CHARS - 1)}…`;
+  return `HTTP ${e.status}${e.code === undefined ? '' : ` (${e.code})`}${boundedDetail === '' ? '' : `: ${boundedDetail}`}`;
 }
 
 interface CommandOutcomeFields {
@@ -389,6 +412,26 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (o === 'ownership-error') return 'ownership-error';
     if (o === 'hub-unreachable') return 'hub-unreachable';
     return 'lease-lost';
+  }
+
+  /**
+   * Wait for a server-approved submit retry without continuing after the
+   * concurrent lease loop has made the claim terminal.
+   */
+  async function waitForSubmitRetry(ms: number): Promise<LeaseOutcome | undefined> {
+    const settled = await Promise.race([
+      opts.sleep(ms).then(() => ({ kind: 'slept' as const })),
+      leasePromise!.then((outcome) => ({ kind: 'lease' as const, outcome })),
+    ]);
+    return settled.kind === 'lease' ? settled.outcome : undefined;
+  }
+
+  /** Stop a failed submit exactly as the pre-retry implementation did. */
+  async function failSubmit(path: string, error: unknown): Promise<ExecOutcome> {
+    opts.err(`owenloop work exec: submit to ${path} failed: ${formatSubmitError(error)}`);
+    lease.stop('submit-failed'); // targeted release (idempotent) — best effort
+    await leasePromise;
+    return 'submit-failed';
   }
 
   /** Deliver one reject verb and settle the lease after the response arrives. */
@@ -718,9 +761,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (!commandSucceeded(result)) return escalateCommandFailure(receipt, order, resolvedCommand);
 
     for (const owe of order.owes) {
-      let res;
+      let proof: string | undefined;
       try {
-        let proof: string | undefined;
         if (opts.origin !== undefined) {
 	  // The immutable order can authorize a judge proof only when the owed
 	  // path is the fingerprinted judged artifact. Producer command receipts
@@ -737,20 +779,56 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
             ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
           });
         }
-        res = await hub.submit({
-          workflow,
-          run: runId,
-          path: owe.path,
-          value: receipt,
-          ...(proof !== undefined ? { proof } : {}),
-          holder: opts.holder,
-        });
       } catch (e) {
-        opts.err(`owenloop work exec: submit to ${owe.path} failed: ${errMsg(e)}`);
-        lease.stop('submit-failed'); // targeted release (idempotent) — best effort
-        await leasePromise;
-        return 'submit-failed';
+        return failSubmit(owe.path, e);
       }
+
+      // One logical receipt gets one request object. A retry replays these same
+      // fields (including the proof) rather than producing a fresh signature.
+      const submitRequest: SubmitRequest = Object.freeze({
+        workflow,
+        run: runId,
+        path: owe.path,
+        value: receipt,
+        ...(proof !== undefined ? { proof } : {}),
+        holder: opts.holder,
+      });
+      const retryStartedAt = opts.now();
+      let res: Awaited<ReturnType<HubClient['submit']>> | undefined;
+
+      for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
+        try {
+          res = await hub.submit(submitRequest);
+          break;
+        } catch (e) {
+          const retryable = e instanceof HubError && e.status === 429;
+          if (!retryable || attempt === SUBMIT_MAX_ATTEMPTS) return failSubmit(owe.path, e);
+
+          const delay = e.retryAfterMs ?? SUBMIT_FALLBACK_DELAYS_MS[attempt - 1]!;
+          const remaining = SUBMIT_RETRY_WINDOW_MS - (opts.now() - retryStartedAt);
+          // Never retry ahead of a server delay, nor hold this receipt beyond
+          // the bounded retry window just because a malformed/large header said to.
+          if (delay > remaining) return failSubmit(owe.path, e);
+
+          opts.err(
+            `owenloop work exec: submit to ${owe.path} failed: ${formatSubmitError(e)}; ` +
+              `retrying attempt ${attempt + 1}/${SUBMIT_MAX_ATTEMPTS} after ${delay}ms`,
+          );
+          const leaseOutcome = await waitForSubmitRetry(delay);
+          if (leaseOutcome !== undefined) {
+            if (signalled) {
+              opts.err(`owenloop work exec: signalled while waiting to retry submit to ${owe.path} — no further receipt sent`);
+              return 'killed';
+            }
+            opts.err(`owenloop work exec: lease ${leaseOutcome} while waiting to retry submit to ${owe.path} — no further receipt sent`);
+            return mapLeaseDuringRun(leaseOutcome);
+          }
+        }
+      }
+
+      // Each non-success attempt returns from this function, so this only
+      // satisfies TypeScript's control-flow analysis after the bounded loop.
+      if (res === undefined) return failSubmit(owe.path, new Error('submit retry ended without a response'));
       const outcome = res.outcome;
       if (outcome !== 'green' && outcome !== 'submitted') {
         opts.err(`owenloop work exec: submit to ${owe.path} rejected (${outcome ?? 'unknown'}): ${res.text}`);

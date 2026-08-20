@@ -295,6 +295,38 @@ function baseOpts(hub: HubClient, runner: CommandRunner, extra: Partial<ExecLoop
   };
 }
 
+/** A manually advanced clock so submit-backoff tests never need real timers. */
+function controlledClock(): {
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  release: (ms: number) => void;
+  released: number[];
+} {
+  let current = 0;
+  const pending: Array<{ ms: number; resolve: () => void }> = [];
+  const released: number[] = [];
+  return {
+    sleep: (ms) =>
+      new Promise<void>((resolve) => {
+        pending.push({
+          ms,
+          resolve: () => {
+            current += ms;
+            released.push(ms);
+            resolve();
+          },
+        });
+      }),
+    now: () => current,
+    release: (ms) => {
+      const index = pending.findIndex((sleep) => sleep.ms === ms);
+      assert.notEqual(index, -1, `no pending ${ms}ms sleep`);
+      pending.splice(index, 1)[0]!.resolve();
+    },
+    released,
+  };
+}
+
 const only = (calls: Call[], verb: string): Call[] => calls.filter((c) => c.verb === verb);
 
 // ---- happy path -------------------------------------------------------------
@@ -1318,12 +1350,13 @@ test('an order that owes nothing is a misroute', async () => {
 
 test('a schema-rejected submit ⇒ submit-rejected (releases — the claim may still be ours)', async () => {
   const fr = fakeRunner();
-  const { hub, calls } = mockHub({ getOrder: [commandOrder()], submit: ['schema-rejected'] });
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()], submit: ['schema-rejected'] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(0));
   assert.equal(await p, 'submit-rejected');
+  assert.equal(submits.length, 1); // response-level rejections are never retried
   assert.equal(only(calls, 'release').length, 1);
 });
 
@@ -1347,6 +1380,206 @@ test('a submit that throws ⇒ submit-failed (best-effort release)', async () =>
   fr.resolve(result(0));
   assert.equal(await p, 'submit-failed');
   assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a 429 submit honors Retry-After and replays the exact request', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'rate limited', 'rate_limited', 7_654), 'green'],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+
+  clock.release(7_654);
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(clock.released, [7_654]);
+  assert.equal(submits.length, 2);
+  const requests = only(calls, 'submit');
+  assert.strictEqual(requests[0]!.arg, requests[1]!.arg);
+  assert.deepEqual(submits.map((submit) => submit.path), ['out', 'out']);
+  assert.equal(only(calls, 'release').length, 0);
+});
+
+test('429 submit fallback delays are 5s then 10s and run the command once', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited'), new HubError(429, 'limited'), 'green'],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  clock.release(5_000);
+  await macrotaskSleep();
+  clock.release(10_000);
+
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(clock.released, [5_000, 10_000]);
+  assert.equal(submits.length, 3);
+  assert.equal(fr.starts.length, 1);
+});
+
+test('three 429 submits exhaust the retry bound and release once', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited'), new HubError(429, 'limited'), new HubError(429, 'limited')],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  clock.release(5_000);
+  await macrotaskSleep();
+  clock.release(10_000);
+
+  assert.equal(await p, 'submit-failed');
+  assert.equal(submits.length, 3);
+  assert.deepEqual(clock.released, [5_000, 10_000]);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a Retry-After outside the retry window fails without an early retry', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited', undefined, 30_001)],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+
+  assert.equal(await p, 'submit-failed');
+  assert.equal(submits.length, 1);
+  assert.deepEqual(clock.released, []);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('503 and generic submit failures each make one attempt only', async () => {
+  for (const error of [new HubError(503, 'gateway'), new Error('network down')]) {
+    const fr = fakeRunner();
+    const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()], submit: [error] });
+    const loop = createExecLoop(baseOpts(hub, fr.runner));
+    const p = loop.run();
+    await macrotaskSleep();
+    fr.resolve(result(0));
+
+    assert.equal(await p, 'submit-failed');
+    assert.equal(submits.length, 1);
+    assert.equal(only(calls, 'release').length, 1);
+  }
+});
+
+test('a 429 submit log is classified and never includes a large response body', async () => {
+  const clock = controlledClock();
+  const errs: string[] = [];
+  const fr = fakeRunner();
+  const marker = 'CLOUDFLARE_HTML_BODY_MARKER';
+  const { hub } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, `<html>${marker}${'x'.repeat(20_000)}</html>`), 'green'],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, {
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeatIntervalMs: 1_000_000,
+      err: (line) => errs.push(line),
+    }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  clock.release(5_000);
+
+  assert.equal(await p, 'submitted');
+  const log = errs.join('\n');
+  assert.match(log, /HTTP 429 \(rate limited\)/);
+  assert.doesNotMatch(log, new RegExp(marker));
+  assert.ok(log.length < 500);
+});
+
+test('a terminal lease during submit backoff sends no second submit', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({
+    getOrder: [commandOrder()],
+    heartbeat: () => {
+      throw new HubError(403, 'forbidden');
+    },
+    submit: [new HubError(429, 'limited'), 'green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000 }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  clock.release(1_000); // heartbeat wins the lease race while the 5s retry waits
+
+  assert.equal(await p, 'ownership-error');
+  assert.equal(submits.length, 1);
+});
+
+test('stop during submit backoff sends no second submit', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited'), 'green'],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  loop.stop('signal');
+
+  assert.equal(await p, 'killed');
+  assert.equal(submits.length, 1);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a retried first owed path completes before the next path is submitted', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({
+    getOrder: [commandOrder({ owes: ['a', 'b'] })],
+    submit: [new HubError(429, 'limited'), 'green', 'green'],
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  clock.release(5_000);
+
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(submits.map((submit) => submit.path), ['a', 'a', 'b']);
 });
 
 test('the first rejected submit stops the run — later owed paths are not written', async () => {
