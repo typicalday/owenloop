@@ -329,9 +329,11 @@ an intact non-target copy does not keep a redundant target history beyond
 `--keep`. It never contacts the hub; `--yes` is the only destructive switch
 and only the target bundle index/object tree is changed. Applied GC takes both
 roots' writer locks (creating only coordination state at a known missing
-counterpart root when necessary). CAS-backed snapshot writers share those locks,
-and bundle installs revalidate exact manifest locks before commit, so stale
-definitions or callers cannot be pinned during or immediately after collection.
+counterpart root when necessary). Project GC also takes the legacy GitHub-add
+lock and recovers its journal before clearing their shared staging tree.
+CAS-backed snapshot writers share the store locks, and bundle installs
+revalidate exact manifest locks before commit, so stale definitions or callers
+cannot be pinned during or immediately after collection.
 
 Bundle installs fail closed without their two required adapters (bundle
 ingestion and pre-commit verification). The default CLI binds the real

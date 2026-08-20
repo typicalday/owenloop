@@ -10,10 +10,11 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
 import { main, mainAsync } from '../src/cli.ts';
+import { installFolder, writeAddJournal, writeLockfile } from '../src/add.ts';
 import { finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
@@ -979,6 +980,164 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
   legacy.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, created_at INTEGER)');
   legacy.close();
   assert.deepEqual(readRuntimeSnapshotBundlePins(legacyPath), []);
+});
+
+test('destructive bundle gc rejects missing or blank DB/defs paths before touching store state', async () => {
+  const cwd = tempDir('owenloop-gc-path-validation-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  mkdirSync(home);
+  const v1 = await installVersion({ version: '1.0.0', root: projectRoot });
+  await installVersion({ version: '2.0.0', root: projectRoot });
+  await installVersion({ version: '3.0.0', root: projectRoot });
+
+  const stateDir = join(cwd, '.owenloop');
+  mkdirSync(stateDir);
+  const dbPath = join(stateDir, 'state.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, def_snapshot TEXT, created_at INTEGER)');
+  db.prepare('INSERT INTO workflow (id, def_snapshot, created_at) VALUES (?, ?, ?)').run(
+    'wf_pinned',
+    JSON.stringify({ bundleDigest: v1.digest, bundleLock: {} }),
+    1,
+  );
+  db.close();
+
+  const indexBefore = readFileSync(storeIndexPath(projectRoot));
+  const dbBefore = readFileSync(dbPath);
+  const objectsDir = join(projectRoot, 'objects', 'sha256');
+  const objectsBefore = readdirSync(objectsDir).sort();
+  const globalRoot = join(home, '.owenloop', 'workflows');
+  const legacyLock = join(stateDir, 'add.lock');
+
+  const invoke = async (argv: string[], env: Record<string, string | undefined> = {}) => {
+    const err: string[] = [];
+    const code = await mainAsync(argv, {
+      cwd,
+      env: { HOME: home, ...env },
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+    return { code, err: err.join('\n') };
+  };
+  const cases: Array<{ argv: string[]; env?: Record<string, string | undefined>; pattern: RegExp }> = [
+    { argv: ['bundle', 'gc', '--keep', '1', '--yes', '--db', '--yes'], pattern: /--db requires a non-empty path/u },
+    { argv: ['bundle', 'gc', '--keep', '1', '--yes', '--db='], pattern: /--db requires a non-empty path/u },
+    { argv: ['bundle', 'gc', '--keep', '1', '--yes', '--db=   '], pattern: /--db requires a non-empty path/u },
+    { argv: ['bundle', 'gc', '--keep', '1', '--yes', '--defs', '--yes'], pattern: /--defs requires a non-empty path/u },
+    { argv: ['bundle', 'gc', '--keep', '1', '--yes', '--defs='], pattern: /--defs requires a non-empty path/u },
+    { argv: ['bundle', 'gc', '--keep', '1', '--yes', '--defs=   '], pattern: /--defs requires a non-empty path/u },
+    {
+      argv: ['bundle', 'gc', '--keep', '1', '--yes'],
+      env: { OWENLOOP_DB: '   ' },
+      pattern: /OWENLOOP_DB must be a non-empty path/u,
+    },
+    {
+      argv: ['bundle', 'gc', '--keep', '1', '--yes'],
+      env: { OWENLOOP_DEFS: '' },
+      pattern: /OWENLOOP_DEFS must be a non-empty path/u,
+    },
+  ];
+  for (const input of cases) {
+    const result = await invoke(input.argv, input.env);
+    assert.equal(result.code, 1, `${input.argv.join(' ')} should fail`);
+    assert.match(result.err, input.pattern);
+    assert.deepEqual(readFileSync(storeIndexPath(projectRoot)), indexBefore);
+    assert.deepEqual(readdirSync(objectsDir).sort(), objectsBefore);
+    assert.deepEqual(readFileSync(dbPath), dbBefore);
+    assert.equal(existsSync(objectDirForDigest(projectRoot, v1.digest)), true, 'the real DB pin remains usable');
+    assert.equal(existsSync(globalRoot), false, 'validation precedes cross-root lock creation');
+    assert.equal(existsSync(legacyLock), false, 'validation precedes the legacy writer lock');
+  }
+});
+
+test('project bundle gc recovers a pending GitHub replacement before shared staging cleanup', async () => {
+  const cwd = tempDir('owenloop-gc-github-recovery-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  mkdirSync(home);
+  const v1 = await installVersion({ version: '1.0.0', root: projectRoot });
+  await installVersion({ version: '2.0.0', root: projectRoot });
+  await installVersion({ version: '3.0.0', root: projectRoot });
+
+  const owner = 'acme';
+  const repo = 'widgets';
+  const source = `${owner}/${repo}`;
+  const folder = installFolder(owner, repo);
+  const stagingId = 'stg_pending_github_replacement';
+  const stagingRoot = join(projectRoot, '.owenloop-staging');
+  const backupDir = join(stagingRoot, `${stagingId}-old`);
+  const destination = join(projectRoot, folder);
+  mkdirSync(destination, { recursive: true });
+  mkdirSync(backupDir, { recursive: true });
+  writeFileSync(join(destination, 'github.yaml'), 'NEW');
+  writeFileSync(join(backupDir, 'github.yaml'), 'PREVIOUS');
+
+  const stateDir = join(cwd, '.owenloop');
+  mkdirSync(stateDir);
+  const journalPath = join(stateDir, 'add.journal');
+  const lockfilePath = join(stateDir, 'installed.json');
+  const previousSha = 'a'.repeat(40);
+  const replacementSha = 'b'.repeat(40);
+  writeLockfile(lockfilePath, {
+    version: 1,
+    installed: {
+      [source]: {
+		source,
+		ref: 'HEAD',
+		sha: previousSha,
+		installedAt: 1,
+		path: folder,
+		files: ['github.yaml'],
+      },
+    },
+  });
+  writeAddJournal(journalPath, {
+    version: 1,
+    phase: 'applying',
+    source,
+    sha: replacementSha,
+    folder,
+    stagingId,
+    hadDest: true,
+    defsDir: projectRoot,
+    ref: 'HEAD',
+    startedAt: 1,
+  });
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--keep', '1', '--yes'], {
+    cwd,
+    env: { HOME: home },
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+  });
+  assert.equal(code, 0, err.join('\n'));
+  assert.equal(JSON.parse(out.join('\n')).count, 2);
+  assert.equal(readFileSync(join(destination, 'github.yaml'), 'utf8'), 'PREVIOUS');
+  assert.equal(existsSync(backupDir), false, 'recovery consumes the retained backup instead of GC deleting it');
+  assert.equal(existsSync(journalPath), false, 'the recovered GitHub transaction clears its journal');
+  assert.equal(existsSync(objectDirForDigest(projectRoot, v1.digest)), false, 'GC still removes its own candidate');
+});
+
+test('project GC without legacy coordination preserves unrelated shared-staging evidence', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const retainedBackup = join(installed.root, '.owenloop-staging', 'stg_unknown-owner-old', 'workflow.yaml');
+  mkdirSync(dirname(retainedBackup), { recursive: true });
+  writeFileSync(retainedBackup, 'ONLY SURVIVING COPY');
+
+  const result = await collectWorkflowStoreGarbage({
+    projectRoot: installed.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => [],
+  });
+  assert.equal(result.count, 2);
+  assert.equal(readFileSync(retainedBackup, 'utf8'), 'ONLY SURVIVING COPY');
 });
 
 test('bundle gc CLI validates before mutation, dry-runs without creating state, and sync gc refuses clearly', async () => {

@@ -10,7 +10,7 @@ import {
   readFileSync,
   readdirSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import { loadDefFile } from '../defs.ts';
 import {
@@ -100,6 +100,17 @@ export interface CollectWorkflowStoreGcArgs {
   readSnapshotPins: () => readonly RuntimeSnapshotBundlePins[];
   /** Project mode supplies the same legacy installed-ledger reader as bundle installation. */
   readLedger?: () => LedgerLookup;
+  /**
+   * Project GitHub-add transaction state sharing this root's staging tree.
+   * When supplied, GC takes this lock and recovers this journal before it may
+   * clear staging entries not owned by the current GC transaction.
+   */
+  legacyRecovery?: {
+    lockPath: string;
+    journalPath: string;
+    lockfilePath: string;
+    readLedger: () => LedgerLookup;
+  };
   recoveryMarkerDir?: string;
   /** Narrow failure-injection seams for commit-order regression tests. */
   hooks?: {
@@ -486,12 +497,19 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   };
 }
 
-async function acquireGcLocks(roots: readonly string[]): Promise<InstallLockHandle[]> {
-  const statesByLock = new Map(
-    [...new Set(roots.map((root) => projectStoreRoot(root)))]
-      .map((root) => workflowStoreStatePaths(root))
-      .map((state) => [state.lockPath, state] as const),
-  );
+async function acquireGcLocks(
+  roots: readonly string[],
+  additionalLockPaths: readonly string[] = [],
+): Promise<InstallLockHandle[]> {
+  const statesByLock = new Map<string, { lockPath: string; stateDir: string }>();
+  for (const root of [...new Set(roots.map((candidate) => projectStoreRoot(candidate)))]) {
+    const state = workflowStoreStatePaths(root);
+    statesByLock.set(state.lockPath, state);
+  }
+  for (const candidate of additionalLockPaths) {
+    const lockPath = projectStoreRoot(candidate);
+    statesByLock.set(lockPath, { lockPath, stateDir: dirname(lockPath) });
+  }
   const locks: InstallLockHandle[] = [];
   try {
     for (const lockPath of [...statesByLock.keys()].sort(compareStoreText)) {
@@ -534,7 +552,10 @@ export async function collectWorkflowStoreGarbage(
   // into either side of the scan-to-delete window. This may create coordination
   // state at a known-but-missing counterpart root; dry-run remains side-effect
   // free and only the target index/object tree is changed.
-  const locks = await acquireGcLocks([projectRoot, globalRoot]);
+  const locks = await acquireGcLocks(
+    [projectRoot, globalRoot],
+    args.legacyRecovery === undefined ? [] : [args.legacyRecovery.lockPath],
+  );
   try {
     guardStateFile(state.journalPath, 'crash-recovery journal');
     guardStateFile(workflowStoreGcJournalPath(state.stateDir), 'workflow-store GC journal');
@@ -545,13 +566,35 @@ export async function collectWorkflowStoreGarbage(
       journalPath: state.journalPath,
       lockfilePath: storeIndexPath(targetRoot),
       ...(args.recoveryMarkerDir === undefined ? {} : { recoveryMarkerDir: args.recoveryMarkerDir }),
-      ...(args.readLedger === undefined ? {} : { readLedger: args.readLedger }),
+      ...((args.readLedger ?? args.legacyRecovery?.readLedger) === undefined
+		? {}
+		: { readLedger: args.readLedger ?? args.legacyRecovery?.readLedger }),
       v2Replacement: workflowStoreReplacementRecovery,
     });
+    if (
+      args.legacyRecovery !== undefined
+      && projectStoreRoot(args.legacyRecovery.journalPath) !== projectStoreRoot(state.journalPath)
+    ) {
+      guardStateFile(args.legacyRecovery.journalPath, 'legacy crash-recovery journal');
+      guardStateFile(args.legacyRecovery.lockfilePath, 'installed ledger');
+      recoverInterruptedInstall({
+		defsDir: targetRoot,
+		journalPath: args.legacyRecovery.journalPath,
+		lockfilePath: args.legacyRecovery.lockfilePath,
+		readLedger: args.legacyRecovery.readLedger,
+		...(args.recoveryMarkerDir === undefined ? {} : { recoveryMarkerDir: args.recoveryMarkerDir }),
+		v2Replacement: workflowStoreReplacementRecovery,
+      });
+    }
 
-    // Recovery owns any transaction debris. Once it reports a stable store, an
-    // old GC parked copy is safe to retry before computing fresh reachability.
-    if (probeDirectoryPath(stagingRoot, 'workflow store staging directory', targetRoot) === 'dir') {
+    // Only clear the shared tree when every writer that can own an entry has
+    // been locked and recovered. Global staging has no GitHub-add owner;
+    // project staging is safe only when its legacy lock/journal were supplied.
+    // Otherwise this probe remains a pre-commit symlink/type guard and leaves
+    // unrelated evidence untouched.
+    const stagingState = probeDirectoryPath(stagingRoot, 'workflow store staging directory', targetRoot);
+    const ownsEveryStagingWriter = args.level === 'global' || args.legacyRecovery !== undefined;
+    if (stagingState === 'dir' && ownsEveryStagingWriter) {
       rmRecursiveForce(stagingRoot);
     }
 
@@ -594,7 +637,10 @@ export async function collectWorkflowStoreGarbage(
       });
       (args.hooks?.removeParkedObject ?? rmRecursiveForce)(parked);
     }
-    if (probeDirectoryPath(stagingRoot, 'workflow store staging directory', targetRoot) === 'dir') {
+    if (
+      ownsEveryStagingWriter
+      && probeDirectoryPath(stagingRoot, 'workflow store staging directory', targetRoot) === 'dir'
+    ) {
       rmRecursiveForce(stagingRoot);
     }
     return { ...plan.report, dryRun: false };

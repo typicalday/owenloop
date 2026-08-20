@@ -142,6 +142,7 @@ import type { AddJournal, InstalledEntry, InstallCommitHandle, InstallLockHandle
 import {
   BundleIngestorUnavailableError,
   collectWorkflowStoreGarbage,
+  compareStoreText,
   globalStoreRoot,
   installWorkflowBundle,
   inspectCasDefs,
@@ -3045,6 +3046,27 @@ function bundleGcKeep(args: Args): number {
 	return keep;
 }
 
+function bundleGcPathOverride(
+	args: Args,
+	key: 'db' | 'defs',
+	environmentValue: string | undefined,
+): string | undefined {
+	if (args.missingOptionValues.has(key)) {
+		throw new CliError(`owenloop bundle gc: --${key} requires a non-empty path value`);
+	}
+	const optionValue = last(args, key);
+	if (optionValue !== undefined) {
+		if (optionValue.trim() === '') {
+			throw new CliError(`owenloop bundle gc: --${key} requires a non-empty path value`);
+		}
+		return optionValue;
+	}
+	if (environmentValue !== undefined && environmentValue.trim() === '') {
+		throw new CliError(`owenloop bundle gc: OWENLOOP_${key.toUpperCase()} must be a non-empty path`);
+	}
+	return environmentValue;
+}
+
 /** Store-aware async branch of the otherwise filesystem-only bundle namespace. */
 async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 	assertBundlePositionals(args, 2, 'owenloop bundle gc [--keep <n>] [--global] [--yes]');
@@ -3052,8 +3074,13 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 		throw new CliError('owenloop bundle gc: --output is only valid for bundle pack');
 	}
 	const keep = bundleGcKeep(args);
+	// Path selection determines both the destructive target and the snapshot pin
+	// source. Validate every CLI/env override before deriving a root, probing a
+	// DB, or acquiring a writer lock; parseArgs represents a missing value as the
+	// literal string "true", which must never become a filesystem path here.
+	const defsOverride = bundleGcPathOverride(args, 'defs', io.env.OWENLOOP_DEFS);
+	const dbOverride = bundleGcPathOverride(args, 'db', io.env.OWENLOOP_DB);
 	const globalFlag = flag(args, 'global');
-	const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
 	if (globalFlag && defsOverride !== undefined) throw new CliError(GLOBAL_DEFS_CONFLICT_MSG);
 
 	const projectRoot = projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
@@ -3072,7 +3099,6 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 		}
 	}
 
-	const dbOverride = last(args, 'db') ?? io.env.OWENLOOP_DB;
 	const dbPath = dbOverride ?? join(io.cwd, '.owenloop', 'state.db');
 	if (dbOverride === undefined) {
 		const parent = dirname(dbPath);
@@ -3095,6 +3121,14 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 				return entry === undefined ? undefined : { sha: entry.sha, path: entry.path };
 			};
 		};
+	const legacyRecovery = globalFlag
+		? undefined
+		: {
+			lockPath: join(io.cwd, '.owenloop', 'add.lock'),
+			journalPath: join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME),
+			lockfilePath: join(io.cwd, '.owenloop', 'installed.json'),
+			readLedger: readLedger!,
+		};
 	const result = await collectWorkflowStoreGarbage({
 		projectRoot,
 		globalRoot,
@@ -3103,6 +3137,7 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 		yes: flag(args, 'yes'),
 		readSnapshotPins: () => readRuntimeSnapshotBundlePins(dbPath),
 		...(readLedger === undefined ? {} : { readLedger }),
+		...(legacyRecovery === undefined ? {} : { legacyRecovery }),
 		...(optionalWorkflowRecoveryMarkerDir(io) === undefined
 			? {}
 			: { recoveryMarkerDir: optionalWorkflowRecoveryMarkerDir(io) }),
@@ -3428,7 +3463,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   mkdirRefusingSymlink(canonicalState.stateDir);
   guardStateFile(canonicalState.lockPath, 'canonical install lock');
   guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
-  const lockPaths = [...new Set([installLockPath, canonicalState.lockPath])].sort();
+  const lockPaths = [...new Set([installLockPath, canonicalState.lockPath])].sort(compareStoreText);
   const locks: InstallLockHandle[] = [];
   try {
     for (const path of lockPaths) locks.push(await acquireInstallLock(path));
@@ -3772,7 +3807,9 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
     guardStateFile(canonicalState.lockPath, 'canonical install lock');
     guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
   }
-  const lockPaths = [...new Set([installLockPath, ...(canonicalStateExists ? [canonicalState.lockPath] : [])])].sort();
+  const lockPaths = [
+    ...new Set([installLockPath, ...(canonicalStateExists ? [canonicalState.lockPath] : [])]),
+  ].sort(compareStoreText);
   const locks: InstallLockHandle[] = [];
   try {
     for (const path of lockPaths) locks.push(await acquireInstallLock(path));

@@ -146,8 +146,9 @@ reachability. An applied run acquires both roots' writer locks in canonical
 order, so installs cannot enter either side of the scan-to-delete window. Only
 the selected root's bundle index and object tree are changed; coordinating with
 a known but not-yet-created counterpart root may create its `.owenloop` lock
-state so a concurrent first install uses the same lock. GC never contacts the
-hub.
+state so a concurrent first install uses the same lock. Project GC additionally
+takes the legacy GitHub-add lock and recovers its separate journal before
+clearing the staging tree those install routes share. GC never contacts the hub.
 
 GC is a pure dry run unless `--yes` is present. A dry run does not create a
 missing store root, runtime database, lock, journal, or staging directory.
