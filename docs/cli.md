@@ -2940,9 +2940,11 @@ inference. Contrast this with [`agent new`](#agent-new--mint-an-agent-token-into
 which **mints** a new credential directly and therefore stops rather than
 ever guessing — a wrong guess there is a side effect a retry cannot undo.
 
-For `create_workflow {ephemeral:true}`, the proxy first makes authenticated,
-non-mutating remote MCP `initialize` and `tools/list` calls. It forwards the
-create only when the selected hub itself advertises `create_workflow.ephemeral`,
+For `create_workflow {ephemeral:true}`, the proxy first completes authenticated,
+non-mutating remote MCP initialization (`initialize`,
+`notifications/initialized`, then `tools/list`) using the negotiated protocol
+version and any returned session id. It forwards the create only when the
+selected hub itself advertises `create_workflow.ephemeral`,
 `list_workflows.include_ephemeral`, and `delete_workflow`; a proxy-local schema
 or a 200 inclusive listing is not sufficient evidence.
 

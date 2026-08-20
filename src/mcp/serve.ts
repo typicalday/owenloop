@@ -205,6 +205,8 @@ interface HubCall {
   query?: string;
   /** Extra request headers for an endpoint with a protocol-specific session. */
   headers?: Record<string, string>;
+  /** Select this JSON-RPC response from a Streamable HTTP SSE reply. */
+  jsonRpcResponseId?: string | number;
 }
 
 interface HubCallResult {
@@ -229,8 +231,48 @@ interface HubCallResult {
  *   4. on a 401 with an oauth credential, exactly ONE `refreshOAuth` + one
  *      retry; a final 401 → `authFailed`.
  * The response body is parsed leniently (a parse failure yields `{}`, status
- * preserved). The bearer never leaves the `Authorization` header.
+ * preserved), including Streamable HTTP's JSON and SSE response forms. The
+ * bearer never leaves the `Authorization` header.
  */
+function parseSseMessages(body: string): unknown[] {
+  const messages: unknown[] = [];
+  let data: string[] = [];
+  const dispatch = (): void => {
+    if (data.length === 0) return;
+    const payload = data.join('\n');
+    data = [];
+    if (payload === '[DONE]') return;
+    try {
+      messages.push(JSON.parse(payload));
+    } catch {
+      // A malformed event is not a valid MCP response. Keep looking in case a
+      // later event carries the request's response, then fail closed if not.
+    }
+  };
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      dispatch();
+      continue;
+    }
+    if (!line.startsWith('data:')) continue;
+    const value = line.slice('data:'.length);
+    data.push(value.startsWith(' ') ? value.slice(1) : value);
+  }
+  dispatch();
+  return messages;
+}
+
+async function parseHubResponse(res: Response, jsonRpcResponseId?: string | number): Promise<unknown> {
+  const contentType = res.headers.get('content-type')?.toLowerCase() ?? '';
+  if (!contentType.includes('text/event-stream')) return res.json();
+  const messages = parseSseMessages(await res.text());
+  if (jsonRpcResponseId !== undefined) {
+    return messages.find((message) => isObject(message) && message['id'] === jsonRpcResponseId) ?? {};
+  }
+  return messages.at(-1) ?? {};
+}
+
 async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
   const { io, origin } = deps;
 
@@ -281,7 +323,7 @@ async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
 
   let json: unknown;
   try {
-    json = await res.json();
+    json = await parseHubResponse(res, req.jsonRpcResponseId);
   } catch {
     json = {};
   }
@@ -316,15 +358,23 @@ function errorText(text: string): ToolResult {
  * Attest the *remote* hub's ephemeral workflow contract before forwarding an
  * `ephemeral:true` create. The local proxy always advertises its newest schema,
  * so neither its tools/list response nor a successful inclusive REST listing
- * can establish that an older selected hub honors these fields. This does two
- * authenticated, non-mutating MCP requests instead: initialize, then
- * tools/list (with the returned session header when the remote uses one).
+ * can establish that an older selected hub honors these fields. This follows
+ * the Streamable HTTP lifecycle with authenticated, non-mutating requests:
+ * initialize, notifications/initialized, then tools/list. The negotiated
+ * protocol version and any returned session id ride every later request.
  */
 async function attestRemoteEphemeralWorkflowSupport(deps: McpDeps): Promise<string | undefined> {
+  const noCreate = '; no create request was sent';
+  const jsonRpcError = (stage: string, response: unknown): string | undefined => {
+    const error = isObject(response) ? response['error'] : undefined;
+    if (error === undefined) return undefined;
+    return `ephemeral workflow preflight remote MCP ${stage} returned JSON-RPC error ${JSON.stringify(error)}${noCreate}`;
+  };
   const initialize = await callHub(deps, {
     method: 'POST',
     path: '/mcp',
     headers: { Accept: 'application/json, text/event-stream' },
+    jsonRpcResponseId: 'owenloop-ephemeral-preflight-initialize',
     body: {
       jsonrpc: '2.0',
       id: 'owenloop-ephemeral-preflight-initialize',
@@ -337,17 +387,40 @@ async function attestRemoteEphemeralWorkflowSupport(deps: McpDeps): Promise<stri
     },
   });
   if (initialize.authFailed) return initialize.authMessage ?? loginHint(deps.origin);
+  const initializeError = jsonRpcError('initialize', initialize.json);
+  if (initializeError !== undefined) return initializeError;
   if (!isOk(initialize.status)) {
     return `ephemeral workflow preflight could not initialize remote MCP at ${deps.origin} (HTTP ${initialize.status}); no create request was sent`;
+  }
+  const initializeResult = isObject(initialize.json) ? initialize.json['result'] : undefined;
+  const protocolVersion = isObject(initializeResult) ? initializeResult['protocolVersion'] : undefined;
+  if (typeof protocolVersion !== 'string' || protocolVersion === '') {
+    return `ephemeral workflow preflight received no negotiated remote MCP protocol version from ${deps.origin}${noCreate}`;
+  }
+  const subsequentHeaders = {
+    Accept: 'application/json, text/event-stream',
+    'MCP-Protocol-Version': protocolVersion,
+    ...(initialize.mcpSessionId === undefined ? {} : { 'Mcp-Session-Id': initialize.mcpSessionId }),
+  };
+
+  const initialized = await callHub(deps, {
+    method: 'POST',
+    path: '/mcp',
+    headers: subsequentHeaders,
+    body: { jsonrpc: '2.0', method: 'notifications/initialized' },
+  });
+  if (initialized.authFailed) return initialized.authMessage ?? loginHint(deps.origin);
+  const initializedError = jsonRpcError('initialized notification', initialized.json);
+  if (initializedError !== undefined) return initializedError;
+  if (!isOk(initialized.status)) {
+    return `ephemeral workflow preflight could not send remote MCP initialized notification to ${deps.origin} (HTTP ${initialized.status})${noCreate}`;
   }
 
   const listed = await callHub(deps, {
     method: 'POST',
     path: '/mcp',
-    headers: {
-      Accept: 'application/json, text/event-stream',
-      ...(initialize.mcpSessionId === undefined ? {} : { 'Mcp-Session-Id': initialize.mcpSessionId }),
-    },
+    headers: subsequentHeaders,
+    jsonRpcResponseId: 'owenloop-ephemeral-preflight-tools-list',
     body: {
       jsonrpc: '2.0',
       id: 'owenloop-ephemeral-preflight-tools-list',
@@ -356,6 +429,8 @@ async function attestRemoteEphemeralWorkflowSupport(deps: McpDeps): Promise<stri
     },
   });
   if (listed.authFailed) return listed.authMessage ?? loginHint(deps.origin);
+  const listedError = jsonRpcError('tools/list', listed.json);
+  if (listedError !== undefined) return listedError;
   if (!isOk(listed.status)) {
     return `ephemeral workflow preflight could not list remote MCP tools at ${deps.origin} (HTTP ${listed.status}); no create request was sent`;
   }

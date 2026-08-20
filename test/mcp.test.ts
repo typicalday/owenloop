@@ -46,7 +46,7 @@ import type { Credential } from '../src/hub.ts';
 import { globalConfigPath, writeGlobalConfig } from '../src/global-config.ts';
 import { resolveMcpOrigin, resolveRepoScope } from '../src/mcp/serve.ts';
 import { kcHuman, kcKey, makeIo, OAUTH_METADATA, realHttpServer, routedFetch } from './hubkit.ts';
-import type { HubIo, RouteHandler } from './hubkit.ts';
+import type { HubIo, RouteHandler, RouteResult } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
 const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
@@ -297,11 +297,12 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
   const routes: Record<string, RouteHandler> = {
     'POST /api/reject_artifact': () => ({ status: 200, json: { ok: true } }),
     'POST /api/create_workflow': () => ({ status: 200, json: { ok: true } }),
-	'POST /mcp': ({ body }) => {
+	'POST /mcp': ({ body }): RouteResult => {
 	  const request = JSON.parse(body ?? '{}') as { id?: string; method?: string };
 	  if (request.method === 'initialize') {
-		return { status: 200, headers: { 'Mcp-Session-Id': 'ephemeral-preflight' }, json: { jsonrpc: '2.0', id: request.id, result: {} } };
+		return { status: 200, headers: { 'Mcp-Session-Id': 'ephemeral-preflight' }, json: { jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-06-18' } } };
 	  }
+	  if (request.method === 'notifications/initialized') return { status: 202 };
 	  if (request.method === 'tools/list') {
 		return {
 		  status: 200,
@@ -370,8 +371,8 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
   assert.deepEqual(createBodies.find((body) => body['ephemeral'] === true), { yaml: 'version: 1', bundle_digest: 'sha256:bundle', ephemeral: true });
   assert.deepEqual(createBodies.find((body) => body['ephemeral'] === undefined), { yaml: 'version: 1' });
   const preflight = calls.filter((row) => row.pathname === '/mcp');
-  assert.equal(preflight.length, 2, 'only ephemeral creation attests the remote MCP contract');
-  assert.deepEqual(preflight.map((row) => (JSON.parse(row.body ?? '{}') as { method?: string }).method), ['initialize', 'tools/list']);
+  assert.equal(preflight.length, 3, 'only ephemeral creation attests the remote MCP contract');
+  assert.deepEqual(preflight.map((row) => (JSON.parse(row.body ?? '{}') as { method?: string }).method), ['initialize', 'notifications/initialized', 'tools/list']);
 });
 
 test('mcp: pending_gates preserves optional serve_crews and returns each hub response unchanged', async () => {
@@ -750,8 +751,9 @@ test('mcp: an old hub that ignores inclusive discovery cannot receive an ephemer
 	'POST /mcp': ({ body }) => {
 	  const request = JSON.parse(body ?? '{}') as { id?: string; method?: string };
 	  if (request.method === 'initialize') {
-		return { status: 200, headers: { 'Mcp-Session-Id': 'old-hub' }, json: { jsonrpc: '2.0', id: request.id, result: {} } };
+		return { status: 200, headers: { 'Mcp-Session-Id': 'old-hub' }, json: { jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-06-18' } } };
 	  }
+	  if (request.method === 'notifications/initialized') return { status: 202 };
 	  if (request.method === 'tools/list') {
 		return {
 		  status: 200,
@@ -788,9 +790,85 @@ test('mcp: an old hub that ignores inclusive discovery cannot receive an ephemer
   assert.equal(calls.filter((row) => row.pathname === '/api/create_workflow').length, 0, 'the old hub must never receive a create request');
   assert.deepEqual(
 	calls.filter((row) => row.pathname === '/mcp').map((row) => (JSON.parse(row.body ?? '{}') as { method?: string }).method),
-	['initialize', 'tools/list'],
+	['initialize', 'notifications/initialized', 'tools/list'],
 	'the decision came from the remote hub schema, not the proxy tool surface or inclusive listing response',
   );
+});
+
+test('mcp: ephemeral preflight follows Streamable HTTP negotiation and reads an SSE tools/list reply', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/create_workflow': () => ({ status: 200, json: { created: 'ephemeral' } }),
+	'POST /mcp': ({ body }): RouteResult => {
+	  const request = JSON.parse(body ?? '{}') as { id?: string; method?: string };
+	  if (request.method === 'initialize') {
+		return {
+		  status: 200,
+		  headers: { 'Mcp-Session-Id': 'strict-session' },
+		  json: { jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} } } },
+		};
+	  }
+	  if (request.method === 'notifications/initialized') return { status: 202 };
+	  if (request.method === 'tools/list') {
+		const progress = JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'listing' } });
+		const response = JSON.stringify({
+		  jsonrpc: '2.0',
+		  id: request.id,
+		  result: {
+			tools: [
+			  { name: 'create_workflow', inputSchema: { properties: { ephemeral: { type: 'boolean' } } } },
+			  { name: 'list_workflows', inputSchema: { properties: { include_ephemeral: { type: 'boolean' } } } },
+			  { name: 'delete_workflow', inputSchema: { properties: {} } },
+			],
+		  },
+		});
+		return { status: 200, headers: { 'Content-Type': 'text/event-stream' }, raw: `event: message\r\ndata: ${progress}\r\n\r\nevent: message\r\ndata: ${response}\r\n\r\n` };
+	  }
+	  return { status: 400, json: { error: 'unexpected_mcp_method' } };
+	},
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' } });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'create_workflow', { yaml: 'version: 1', ephemeral: true })]);
+  assert.deepEqual(resultJson(frames.find((frame) => frame.id === 3)!), { created: 'ephemeral' });
+
+  const mcp = calls.filter((row) => row.pathname === '/mcp');
+  assert.deepEqual(mcp.map((row) => (JSON.parse(row.body ?? '{}') as { method?: string }).method), ['initialize', 'notifications/initialized', 'tools/list']);
+  assert.equal(mcp[0]!.headers['accept'], 'application/json, text/event-stream');
+  assert.equal(mcp[0]!.headers['mcp-session-id'], undefined, 'initialize starts without a session id');
+  assert.equal(mcp[0]!.headers['mcp-protocol-version'], undefined, 'the protocol version is negotiated by initialize');
+  for (const request of mcp.slice(1)) {
+	assert.equal(request.headers['mcp-session-id'], 'strict-session');
+	assert.equal(request.headers['mcp-protocol-version'], '2025-06-18');
+	assert.equal(request.headers['accept'], 'application/json, text/event-stream');
+  }
+});
+
+test('mcp: ephemeral preflight preserves a remote JSON-RPC tools/list error and never creates', async () => {
+  const routes: Record<string, RouteHandler> = {
+	'POST /api/create_workflow': () => ({ status: 200, json: { impossible: true } }),
+	'POST /mcp': ({ body }) => {
+	  const request = JSON.parse(body ?? '{}') as { id?: string; method?: string };
+	  if (request.method === 'initialize') {
+		return { status: 200, headers: { 'Mcp-Session-Id': 'error-session' }, json: { jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-06-18' } } };
+	  }
+	  if (request.method === 'notifications/initialized') return { status: 202 };
+	  if (request.method === 'tools/list') {
+		return { status: 400, json: { jsonrpc: '2.0', id: request.id, error: { code: -32001, message: 'catalog temporarily unavailable', data: { retryAfterMs: 500 } } } };
+	  }
+	  return { status: 400, json: { error: 'unexpected_mcp_method' } };
+	},
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' } });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'create_workflow', { yaml: 'version: 1', ephemeral: true })]);
+  const create = frames.find((frame) => frame.id === 3)!;
+  assert.equal(create.result!.isError, true);
+  assert.match(create.result!.content![0]!.text, /"code":-32001,"message":"catalog temporarily unavailable","data":\{"retryAfterMs":500\}/u);
+  assert.equal(calls.filter((row) => row.pathname === '/api/create_workflow').length, 0);
 });
 
 test('mcp: delete_workflow advertises a constrained name and posts it unchanged', async () => {
