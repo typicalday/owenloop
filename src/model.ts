@@ -72,6 +72,15 @@ export interface Firing {
   cause?: FiringTrigger;
 }
 
+/**
+ * A model-only authority action: a non-judge consumer retracts a bare
+ * collection member. This is not an eligible worker run, so it must stay out
+ * of `eligibleFirings()` (which is also the live scheduler).
+ */
+export interface MemberRetractFiring extends Firing {
+  modelTransition: 'member-retract';
+}
+
 /** A structural maintenance op the engine should apply (level-triggered). */
 export type CascadeOp =
   | { kind: 'reject'; path: string; reason: string; held?: true } // green→rejected, value kept; held=true for escalate
@@ -653,6 +662,52 @@ function callsDischargeFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
       inputs: Object.values(step.callsInputs ?? {}),
       outputs: outs,
     });
+  }
+  return firings;
+}
+
+/**
+ * The model-only collection-member retractions available in THIS state.
+ *
+ * `Engine.retract()` is an authority action rather than a scheduler action: a
+ * non-judge step that consumes a member's stem may retract an existing bare
+ * member even after that member is rejected. A rejected member has no ordinary
+ * map firing, so without this transition modelCheck would call that runtime-
+ * valid state a deadlock.
+ *
+ * Kept separate from `eligibleFirings` deliberately: that function is the
+ * live worker scheduler, while these synthetic firings are consumed only by
+ * modelCheck's successor expansion.
+ */
+export function memberRetractFirings(def: WorkflowDef, arts: ArtifactMap): MemberRetractFiring[] {
+  const members = [...arts.values()]
+    .flatMap((art) => {
+      const el = parseElement(art.path);
+      return el && el.suffix === '' && art.acceptance !== 'retracted' ? [{ art, el }] : [];
+    })
+    .sort((a, b) =>
+      a.el.stem.localeCompare(b.el.stem) || a.el.index - b.el.index || a.art.path.localeCompare(b.art.path),
+    );
+
+  const firings: MemberRetractFiring[] = [];
+  for (const step of def.steps) {
+    // Synthesized judges may only invalidate the singleton in their `judges:`
+    // marker; their read-only context consumes grant no member-retract authority.
+    if (step.judges !== undefined) continue;
+
+    for (const { art, el } of members) {
+      // Match Engine.assertAuthority's defensive exact-path comparison as well
+      // as its normal stem comparison. `some` also deduplicates repeated edges.
+      if (!step.consumes.some((consume) => consume.stem === el.stem || consume.stem === art.path)) continue;
+      firings.push({
+		modelTransition: 'member-retract',
+		step: step.name,
+		key: art.path,
+		index: el.index,
+		inputs: [],
+		outputs: [art.path],
+      });
+    }
   }
   return firings;
 }
@@ -2089,6 +2144,10 @@ function eligibleOutcomes(
   arts: Map<string, ArtifactData>,
   firing: Firing,
 ): CheckStep['outcome'][] {
+  if ((firing as Partial<MemberRetractFiring>).modelTransition === 'member-retract') {
+    return ['retract'];
+  }
+
   const step = def.steps.find((l) => l.name === firing.step);
   if (!step) return ['green'];
 
@@ -2244,7 +2303,8 @@ function applyEmitSeal(
  *                       bumping judgmentRejects+1
  *   'schema-reject'   — acceptance rejected, schemaRejects+1 on the output
  *   'skip'            — acceptance skipped + fingerprint of requiredInputs
- *   'retract'         — acceptance retracted (collection member only)
+ *   'retract'         — a non-judge consumer retracts an authorized bare
+ *                       collection member; acceptance becomes retracted
  *   'emit-seal'       — collection producer: emit 1..maxCollectionSize green elements,
  *                       then seal; forks into (maxCollectionSize+1) successor states
  *
@@ -2382,6 +2442,8 @@ export function applyOutcome(
  *   judgmentRejects: BUCKETED to min(count, maxAttempts) so that e.g. 0, 1, 2
  *     are distinct but anything >= cap is the same (frozen state)
  *   schemaRejects: BUCKETED to min(count, maxSchemaFailures) similarly
+ *   retracted: TERMINAL, so its prior version/reject counters cannot affect
+ *     any future transition and are intentionally omitted
  *
  * For 'skipped' artifacts, the fingerprint is encoded as sorted "inputPath:versionRank"
  * pairs to capture rearm eligibility correctly.
@@ -2391,6 +2453,16 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
   const stepMap = new Map(def.steps.map((l) => [l.name, l]));
 
   for (const [path, art] of [...arts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    // settleInMemory treats retracted artifacts as terminal: it neither
+    // maintains them nor lets them fire again. Their version and failure
+    // counters are historical only, so retaining them would split otherwise
+    // equivalent post-retract states and make the model's real transition
+    // unnecessarily exhaust the state budget.
+    if (art.acceptance === 'retracted') {
+      parts.push(`${path}:retracted`);
+      continue;
+    }
+
     const step = stepMap.get(art.producer);
     const producePat = step && produceOwning(step, path);
     const maxAttempts = step ? effectiveMaxAttempts(step, producePat) : 3;
@@ -2563,7 +2635,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // `eligibleFirings` (the LIVE engine scheduler) and `hasDefiniteCheckDefect`
     // (shared by check / add / push / install) are deliberately untouched.
     const callsFirings = callsDischargeFirings(def, node.arts);
-    const firings = [...status.eligible, ...callsFirings];
+    // Member retraction is likewise a runtime-valid authority transition, not
+    // a worker firing. It is separate from eligibleFirings so a rejected map
+    // input still has the later retract move the runtime permits.
+    const retractFirings = memberRetractFirings(def, node.arts);
+    const firings = [...status.eligible, ...callsFirings, ...retractFirings];
 
     // Non-done state with no eligible firings: classify by recomputing eligibility
     // as if every freeze/stall were lifted (unlimited attempts). If a producer
@@ -2596,7 +2672,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
     // Expand successors
     outer: for (const firing of firings) {
-      firedSteps.add(firing.step);
+      // An authority-only member retract does not prove its actor ever
+      // produced an ordinary firing; preserve structural-dead-step accounting.
+      if ((firing as Partial<MemberRetractFiring>).modelTransition !== 'member-retract') {
+		firedSteps.add(firing.step);
+      }
       const outcomes = eligibleOutcomes(def, node.arts, firing);
 
       for (const outcome of outcomes) {
