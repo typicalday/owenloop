@@ -57,9 +57,18 @@ ordered calls, response evidence, classifications, and score. A charter edit
 changes the served-byte hash, so it creates a new attributable score rather
 than inheriting an old baseline.
 
-The current [baseline status](evals/README.md) records the unscorable live
-attempts and the operator-approved exception for this delivery. No score was
-invented and no partial baseline was written.
+The committed [baseline](evals/mcp-charter-baseline.json) records a complete
+2026-08-20 run for charter hash
+`d2a19686f3932643362fe3b83c3a870235c33929f345e8107a663a7d6454516d`.
+Claude Code 2.1.236 using `claude-opus-5` passed 4/4 clear tasks. Codex 0.147.0
+using `gpt-5.6-sol` passed 2/4: it found and started both matching workflows,
+but it made no catalog call on either no-match task.
+
+The retained no-match responses were reviewed. Claude plainly says that no
+catalog playbook fits in both responses. Codex instead asks for the missing
+task inputs and offers to perform the work directly; because it never called
+`list_workflows`, those two records correctly fail the structured-call rule.
+The prose review does not alter either harness's numeric score.
 
 ## Safety and baseline updates
 

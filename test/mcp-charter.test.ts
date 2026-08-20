@@ -27,6 +27,7 @@ import {
   CLAUDE_EVAL_PERMISSIONS,
   CODEX_EVAL_PERMISSIONS,
   finalResponseEvidence,
+  mergeReportedModel,
   reportedMetadata,
   runTask,
 } from './mcp-charter-eval.ts';
@@ -382,7 +383,7 @@ test('mcp charter: report aggregates two harnesses under one hash and excludes o
     fixture,
     [
       makeScoreRecord({ id: 'claude-code', reportedModel: 'fixture' }, hash, records),
-      makeScoreRecord({ id: 'codex', configuredModel: 'fixture' }, hash, records),
+      makeScoreRecord({ id: 'codex', configuredModel: 'fixture', reportedModel: 'fixture' }, hash, records),
     ],
     '2026-08-20T00:00:00.000Z',
   );
@@ -390,6 +391,15 @@ test('mcp charter: report aggregates two harnesses under one hash and excludes o
   assert.ok(report.scores.every((score) => score.charterSha256 === hash));
   assert.ok(report.scores.every((score) => score.denominator === 4 && score.passed === 4 && score.tasks.length === 6));
   assert.deepEqual(validateReport(report), []);
+
+  const unattributed = structuredClone(report);
+  const codex = unattributed.scores.find((score) => score.harness.id === 'codex');
+  assert.ok(codex !== undefined);
+  delete codex.harness.reportedModel;
+  assert.ok(
+    validateReport(unattributed).includes('codex: provider-selected model is missing'),
+    'a configured override alone must not masquerade as the provider-selected model',
+  );
 });
 
 test('mcp charter runner makes adapter exits unscorable and retains only final response evidence', async () => {
@@ -537,13 +547,25 @@ test('mcp charter records model metadata from the real adapter init-line shape',
     ]),
     { reportedModel: 'claude-opus-5', version: '2.1.220' },
   );
+  const codexStarted: AgentEvent = {
+    kind: 'started',
+    ref: { harness: 'codex', token: 'thread-id' },
+    model: 'gpt-5.6-terra',
+  };
   assert.deepEqual(
     reportedMetadata([
+      codexStarted,
       {
         kind: 'progress',
         text: 'app-server ready: userAgent=owenloop-recorder/0.146.0 (Mac OS 26.2.0; arm64)',
       },
     ]),
-    { version: '0.146.0' },
+    { reportedModel: 'gpt-5.6-terra', version: '0.146.0' },
+  );
+  assert.equal(mergeReportedModel('codex', undefined, 'gpt-5.6-terra'), 'gpt-5.6-terra');
+  assert.equal(mergeReportedModel('codex', 'gpt-5.6-terra', 'gpt-5.6-terra'), 'gpt-5.6-terra');
+  assert.throws(
+    () => mergeReportedModel('codex', 'gpt-5.6-terra', 'gpt-5.6-sol'),
+    /codex reported model drift across tasks: gpt-5\.6-terra -> gpt-5\.6-sol/u,
   );
 });

@@ -57,7 +57,12 @@ export interface HarnessSessionRef {
  * adapter that stops emitting says nothing about whether the work was accepted.
  */
 export type AgentEvent =
-  | { kind: 'started'; ref: HarnessSessionRef }
+  | {
+      kind: 'started';
+      ref: HarnessSessionRef;
+      /** Provider-selected model when the session-start response exposes it. */
+      model?: string;
+    }
   /** Optional log line. Adapters may emit none; nothing may depend on it. */
   | { kind: 'progress'; text: string }
   /** The completed top-level assistant reply, assembled by the owning adapter.

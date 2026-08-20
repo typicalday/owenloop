@@ -1333,6 +1333,7 @@ export const codexAdapter: HarnessAdapter = {
     const { client, reportExit } = await openClient(args.cwd, onEvent, gate, args.approvals);
 
     let threadId: string;
+    let reportedModel: string | undefined;
     try {
       const res = await client.request<Record<string, unknown>>(
         'thread/start',
@@ -1342,6 +1343,10 @@ export const codexAdapter: HarnessAdapter = {
       const id = str(asMap(res['thread'])['id']);
       if (id === undefined) throw new Error('thread/start returned no thread id');
       threadId = id;
+      // The app-server resolves an omitted model to the actual session model in
+      // this response. Surface it with the durable session reference so callers
+      // can attribute measurements without scraping persisted Codex state.
+      reportedModel = str(res['model']);
     } catch (err) {
       // No token exists yet, so there is nothing to hand back and nothing to
       // invent. Report, tear down, reject.
@@ -1357,7 +1362,7 @@ export const codexAdapter: HarnessAdapter = {
     SESSIONS.set(threadId, session);
     // BEFORE the turn runs and before resolving: the caller persists the token
     // on this event, so a mid-turn crash still leaves a resumable record.
-    onEvent({ kind: 'started', ref });
+    onEvent({ kind: 'started', ref, ...(reportedModel === undefined ? {} : { model: reportedModel }) });
 
     try {
       await runTurn(

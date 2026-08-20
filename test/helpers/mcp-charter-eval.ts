@@ -268,7 +268,12 @@ const NO_OP_SCHEMAS: Readonly<Record<FixtureNoOpToolName, Record<string, unknown
   },
   reject_artifact: {
     type: 'object',
-    properties: { workflow: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } },
+    properties: {
+      workflow: { type: 'string' },
+      path: { type: 'string' },
+      reason: { type: 'string' },
+      requested: { type: 'string' },
+    },
     required: ['workflow', 'path', 'reason'],
     additionalProperties: false,
   },
@@ -523,6 +528,12 @@ export function validateReport(report: CharterEvalReport): string[] {
     if (score.tasks.length !== 6) errors.push(`${score.harness.id}: expected six task records`);
     if (score.tasks.some((task) => task.classification === 'unscorable')) {
       errors.push(`${score.harness.id}: one or more tasks are unscorable`);
+    }
+    if (
+      (score.harness.id === 'claude-code' || score.harness.id === 'codex') &&
+      score.harness.reportedModel === undefined
+    ) {
+      errors.push(`${score.harness.id}: provider-selected model is missing`);
     }
   }
   return errors;

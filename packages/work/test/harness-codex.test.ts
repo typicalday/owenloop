@@ -1281,7 +1281,7 @@ function handle(m) {
       }
       return;
     case 'thread/start':
-      send({ id: m.id, result: { thread: { id: THREAD, sessionId: THREAD } } });
+      send({ id: m.id, result: { thread: { id: THREAD, sessionId: THREAD }, model: 'stub-selected-model' } });
       return;
     case 'turn/start':
       // The ACK, exactly as recorded: the turn is created, not finished.
@@ -1636,6 +1636,7 @@ test('D6 a MID-TURN stop interrupts the live turn, and start resolves through it
   assert.ok(startedEvent !== undefined && startedEvent.kind === 'started');
   const ref = startedEvent.ref;
   assert.equal(ref.token, STUB_THREAD);
+  assert.equal(startedEvent.model, 'stub-selected-model', 'thread/start must surface the provider-selected model');
 
   await codexAdapter.stop(ref);
 

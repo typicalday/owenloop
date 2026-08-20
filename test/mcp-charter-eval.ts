@@ -110,7 +110,11 @@ export function reportedMetadata(events: readonly AgentEvent[]): { reportedModel
     .map((event) => event.text);
   const claudeInit = progress.find((text) => /^session\s+\S+:\s/u.test(text));
   const codexInit = progress.find((text) => /^app-server ready: userAgent=/u.test(text));
-  const reportedModel = claudeInit === undefined ? undefined : /(?:^|\s)model=([^\s]+)/u.exec(claudeInit)?.[1];
+  const startedModel = events.find(
+    (event): event is Extract<AgentEvent, { kind: 'started' }> => event.kind === 'started' && event.model !== undefined,
+  )?.model;
+  const claudeModel = claudeInit === undefined ? undefined : /(?:^|\s)model=([^\s]+)/u.exec(claudeInit)?.[1];
+  const reportedModel = startedModel ?? claudeModel;
   const claudeVersion = claudeInit === undefined ? undefined : /(?:^|\s)cliVersion=([^\s]+)/u.exec(claudeInit)?.[1];
   const codexVersion =
     codexInit === undefined ? undefined : /^app-server ready: userAgent=[^/\s]+\/([^\s]+)/u.exec(codexInit)?.[1];
@@ -119,6 +123,20 @@ export function reportedMetadata(events: readonly AgentEvent[]): { reportedModel
     ...(reportedModel === undefined ? {} : { reportedModel }),
     ...(version === undefined ? {} : { version }),
   };
+}
+
+/** Keep a harness score attributable to one provider-selected model. */
+export function mergeReportedModel(
+  harnessId: string,
+  current: string | undefined,
+  next: string | undefined,
+): string | undefined {
+  if (next === undefined) return current;
+  if (current === undefined) return next;
+  if (current !== next) {
+    throw new Error(`${harnessId} reported model drift across tasks: ${current} -> ${next}`);
+  }
+  return current;
 }
 
 function unscorable(reason: string, calls: ParsedTrace['calls'] = []): ParsedTrace {
@@ -374,7 +392,7 @@ async function main(): Promise<void> {
       const run = await runTask(harness, task, DEFAULT_CHARTER_FIXTURE_PATH, charterSha256, {
         taskTimeoutMs: options.taskTimeoutMs,
       });
-      reportedModel ??= run.reportedModel;
+      reportedModel = mergeReportedModel(harness.id, reportedModel, run.reportedModel);
       version ??= run.version;
       records.push({ ...scoreTask(task, run.trace), responseEvidence: run.responseEvidence });
     }
