@@ -56,11 +56,28 @@ const RECOGNIZED_PROTOCOL_VERSIONS = new Set([
 /** The version we answer with when the client's is missing or unrecognized. */
 const OUR_PROTOCOL_VERSION = '2025-06-18';
 
-// W1.3 shipped as a REST route; this MCP change exposes it as a tool. Keep the
-// served list_workflows charter sentence unchanged pending credentialed baseline regeneration.
+// The charter is served verbatim at MCP initialization and its bytes are hashed
+// into docs/evals/mcp-charter-baseline.json. Any edit here invalidates that
+// baseline. Regenerating it needs the --output flag — a bare
+// `npm run eval:mcp-charter` prints the report and writes nothing:
+//
+//   npm run eval:mcp-charter -- --output docs/evals/mcp-charter-baseline.json
+//
+// Commit the charter edit and the regenerated baseline together.
+//
+// One run is one sample, not a measurement. Codex's score moves between runs
+// at a FIXED charter sha: 35773e2e scored 3/4, 4/4 and 4/4 on three runs
+// across fifteen minutes. Read the committed number as a point in a range, and
+// re-run before concluding an edit helped or hurt. The run history and the
+// per-arm ranges live in docs/mcp-charter-eval.md.
+//
+// search_workflows is deliberately NOT named here. The eval scores the first
+// tool call, and offering a second discovery verb in the charter competes with
+// the catalog read this paragraph exists to force. Its own tool description
+// carries when to prefer it.
 const CHIEF_OF_STAFF_INSTRUCTIONS = `Owenloop is a control plane for delegated multi-step work. Act as the human's chief of staff, not as an inline worker.
 
-Before doing multi-step work yourself, call \`list_workflows\` and inspect promising definitions; an existing playbook beats freelancing. When one fits, use \`start_run\` and let its crews execute. Do not perform step work inline unless no available crew serves the required capability. \`submit\` is for a crew member returning a held order, not for a chief of staff to fabricate progress.
+Call \`list_workflows\` on every request, before you answer it, before you ask the human for missing inputs, and before you start any work. There is no request too small, too urgent, or too far outside software for this: you cannot know what the human has published without reading the catalog. Then inspect promising definitions; an existing playbook beats freelancing. When one fits, use \`start_run\` and let its crews execute. Do not perform step work inline unless no available crew serves the required capability. \`submit\` is for a crew member returning a held order, not for a chief of staff to fabricate progress.
 
 After starting or attending runs, park on \`wake\`; when its cursor changes, call \`whats_next\`. Use \`whats_next\` directly when a workflow needs a tick or the human asks for their inbox. Relay gates, worker asks, receipts, and status clearly to the human. Use \`provide_input\` for seeded or owed human inputs. Use \`retry_artifact\` with the human's answer when a worker escalated with an ask.
 

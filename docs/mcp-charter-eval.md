@@ -64,17 +64,36 @@ than inheriting an old baseline.
 
 The committed [baseline](evals/mcp-charter-baseline.json) records a complete
 2026-08-20 run for charter hash
-`dfb67821e8aa35de812aa041716eef044bf2e1fce4e574866ceb9638667c9cca`.
-Claude Code 2.1.236 using `claude-opus-5` passed 4/4 clear tasks. Codex 0.147.0
-using `gpt-5.6-sol` passed 1/4: it completed the library match, but missed the
-delivery match and made no catalog call on either no-match task.
+`35773e2e269844fbb81acec0c07774f5674d51aa47304f6e0346458a13f9a2a2`.
+Claude Code 2.1.236 using `claude-opus-5` passed 4/4 clear tasks, and Codex
+0.147.0 using `gpt-5.6-sol` also passed 4/4.
 
-The retained no-match responses were reviewed. Claude calls the catalog first
-and plainly says that no catalog playbook fits in both responses. Codex instead
-asks for missing task inputs and offers to perform the work directly; because
-it never called `list_workflows`, those two records correctly fail the
-structured-call rule. The prose review does not alter either harness's numeric
-score.
+One run is one sample. Codex's score moves between runs at a fixed charter hash,
+so read any single number as a point in a range, and re-run before concluding
+that a charter edit helped or hurt. Six runs on 2026-08-20, all on the same
+harness versions and models:
+
+| charter hash | runs | Claude | Codex |
+| --- | --- | --- | --- |
+| `dfb67821` (previous charter) | 2 | 4/4, 4/4 | 1/4, 2/4 |
+| `bdbd33e3` (discarded wording) | 1 | 4/4 | 2/4 |
+| `35773e2e` (this charter) | 3 | 4/4, 4/4, 4/4 | 3/4, 4/4, 4/4 |
+
+Only the committed run's JSON lives in this repository. The other five were kept
+outside it and are quoted here for the range, not as artifacts you can re-read.
+Codex's range under this charter does not overlap its range under the previous
+one, which is the evidence that moving the catalog rule to the front of the
+charter changed behaviour. Three runs in an arm is a direction, not a
+significance claim.
+
+The retained no-match and ambiguous responses were reviewed. Claude calls the
+catalog first on all four and says plainly that no published playbook fits.
+Codex now calls the catalog first on both no-match tasks, which is what the
+score measures, but its prose is weaker: it names the mismatch on the finance
+task and simply asks for missing inputs on the operations one. On the unscored
+`ambiguous-launch` task Codex still makes no call at all, so the charter's
+every-request rule is not fully carried even in the runs that score 4/4. The
+prose review does not alter either harness's numeric score.
 
 ## Safety and baseline updates
 
