@@ -2980,11 +2980,11 @@ and makes no hub request.
 | `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances; optional `serve_capabilities` accepts raw advertised keys |
 | `pending_gates` | find gates waiting on a human — owed inputs no worker can supply; query after starting or attending runs, or when a human asks what needs attention; optional `serve_crews` narrows the list |
 | `submit` | return an owed work-order output from a crew member or held-order holder; not a way for a chief of staff to fabricate inline progress |
-| `reject_artifact` | send a real upstream defect back to its producer with a concrete reason |
+| `reject_artifact` | send a real upstream defect back to its producer with a concrete reason; optional `requested` carries the replacement modifier requested from the producer |
 | `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask`; it must not bypass unresolved rejection feedback |
 | `provide_input` | relay a human answer into a seeded/owed gate |
 | `start_run` | start a fitting multi-step playbook and let its crews execute; optional `scope` (free routing label, defaults to the session's repo name) and `priority` (`low\|normal\|high`) |
-| `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses ordinary authoring |
+| `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses ordinary authoring; optional `bundle_digest` identifies the content-addressed bundle for reference orders |
 | `get_workflow` | inspect a promising loaded definition before selecting it |
 | `list_workflows` | discover published workflow definitions and decide which one fits a task |
 | `get_status` | `engine.status` verbatim plus a plain-English rendering |
