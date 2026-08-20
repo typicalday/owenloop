@@ -148,7 +148,10 @@ the selected root's bundle index and object tree are changed; coordinating with
 a known but not-yet-created counterpart root may create its `.owenloop` lock
 state so a concurrent first install uses the same lock. Project GC additionally
 takes the legacy GitHub-add lock and recovers its separate journal before
-clearing the staging tree those install routes share. GC never contacts the hub.
+clearing the staging tree those install routes share. Global GC takes that lock
+as a read barrier while discovering project/add definition reachability, but
+refuses a pending project journal rather than mutating the non-target project
+tree. GC never contacts the hub.
 
 GC is a pure dry run unless `--yes` is present. A dry run does not create a
 missing store root, runtime database, lock, journal, or staging directory.
@@ -161,8 +164,10 @@ An unchanged `--yes` run reports the same candidates as its preceding dry run.
 
 The collector protects every cross-root selected winner, the best `--keep`
 versions of each qualified workflow, explicit index pins, every bundle digest
-and lock dependency in retained local workflow snapshots, and the exact
-coordinate+digest dependency closure of every retained bundle in either index.
+and lock dependency in retained local workflow snapshots, exact versioned
+`calls:` edges in retained filesystem/add/legacy snapshots and currently
+loadable non-CAS project/add definitions, and the exact coordinate+digest
+dependency closure of every retained bundle in either index.
 Project-to-global fallback is preserved. Protection is root-scoped: a complete
 non-target coordinate/object copy can satisfy an exact edge without keeping a
 redundant target copy, so `--keep` still bounds identical histories installed
@@ -172,7 +177,9 @@ one digest are retained or collected atomically. Malformed indexes, objects,
 links, special files, or snapshots fail closed before deletion.
 
 Runtime snapshot writers share the relevant store writer locks and revalidate
-CAS reachability before beginning SQLite. Bundle installs revalidate every
+CAS reachability before beginning SQLite. Store roots are guarded before lock
+state is created, so a symlinked global parent cannot redirect coordination
+writes. Bundle installs revalidate every
 manifest lock against the combined store after taking their root lock and before
 commit. GC therefore either observes a committed caller/pin, or a stale writer
 is refused after collection and must reload. On filesystems that require a

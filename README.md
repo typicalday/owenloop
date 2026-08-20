@@ -323,14 +323,18 @@ owenloop bundle gc --global             # global store, report only
 
 The default keep count is 2 (current plus one rollback version). GC preserves
 selected versions, explicit pins, retained local instance snapshots, transitive
-bundle locks from every retained coordinate in either root, and project-index
-fallback into the global store. Reachability is coordinate- and root-aware, so
+bundle locks from every retained coordinate in either root, exact versioned
+calls from retained legacy snapshots and current project/add definitions, and
+project-index fallback into the global store. Reachability is coordinate- and
+root-aware, so
 an intact non-target copy does not keep a redundant target history beyond
 `--keep`. It never contacts the hub; `--yes` is the only destructive switch
 and only the target bundle index/object tree is changed. Applied GC takes both
 roots' writer locks (creating only coordination state at a known missing
 counterpart root when necessary). Project GC also takes the legacy GitHub-add
-lock and recovers its journal before clearing their shared staging tree.
+lock and recovers its journal before clearing their shared staging tree; global
+GC uses that lock as a read barrier without recovering or otherwise mutating the
+project tree.
 CAS-backed snapshot writers share the store locks, and bundle installs
 revalidate exact manifest locks before commit, so stale definitions or callers
 cannot be pinned during or immediately after collection.

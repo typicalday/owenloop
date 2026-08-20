@@ -19,7 +19,7 @@ import { main, mainAsync } from '../src/cli.ts';
 import { installFolder, writeAddJournal, writeLockfile } from '../src/add.ts';
 import { finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { rmRecursiveForce } from '../src/install.ts';
-import { readRuntimeSnapshotBundlePins, StoreVersionError } from '../src/store.ts';
+import { openStore, readRuntimeSnapshotBundlePins, StoreVersionError } from '../src/store.ts';
 import {
   collectWorkflowStoreGarbage,
   compareStoreText,
@@ -119,6 +119,7 @@ function plan(args: {
   level?: 'project' | 'global';
   keep?: number;
   pins?: RuntimeSnapshotBundlePins[];
+  exactCalls?: string[];
 }) {
   return planWorkflowStoreGc({
     projectRoot: args.projectRoot,
@@ -126,6 +127,7 @@ function plan(args: {
     level: args.level ?? 'project',
     keep: args.keep ?? 2,
     snapshotPins: args.pins ?? [],
+    exactCalls: args.exactCalls ?? [],
   });
 }
 
@@ -238,6 +240,155 @@ test('selected winners, explicit pins, runtime pins, and transitive bundle locks
   const lockedPlan = plan({ projectRoot: childV1.root, keep: 1 });
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV1.digest), false);
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV2.digest), false);
+});
+
+test('retained unpinned snapshot exact calls protect coordinates outside the keep window', async () => {
+  const childV1 = await installVersion({ name: 'child', version: '1.0.0' });
+  await installVersion({ name: 'child', version: '2.0.0', root: childV1.root });
+  const target = 'child/child@1.0.0';
+
+  const report = plan({
+    projectRoot: childV1.root,
+    keep: 1,
+    pins: [{ bundleLock: [], exactCalls: [target] }],
+  }).report;
+
+  assert.equal(report.objects.some((object) => object.digest === childV1.digest), false);
+  assert.equal(report.coordinates.includes(target), false);
+});
+
+test('applied CLI GC preserves exact calls from retained unpinned runtime snapshots', async () => {
+  const cwd = tempDir('owenloop-gc-snapshot-exact-call-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  mkdirSync(home);
+  const childV1 = await installVersion({ name: 'child', version: '1.0.0', root: projectRoot });
+  await installVersion({ name: 'child', version: '2.0.0', root: projectRoot });
+
+  const dbPath = join(cwd, 'state.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, def_snapshot TEXT, created_at INTEGER)');
+  db.prepare('INSERT INTO workflow (id, def_snapshot, created_at) VALUES (?, ?, ?)').run(
+    'wf_legacy_parent',
+    JSON.stringify({
+      bundleLock: {},
+      steps: [{ calls: 'child/child@1.0.0' }],
+    }),
+    1,
+  );
+  db.close();
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--keep', '1', '--yes', '--db', dbPath], {
+    cwd,
+    env: { HOME: home },
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 0, err.join('\n'));
+  assert.equal(JSON.parse(out.join('\n')).count, 0);
+  assert.equal(existsSync(objectDirForDigest(projectRoot, childV1.digest)), true);
+});
+
+test('applied CLI GC protects exact calls from current project and add definitions', async () => {
+  const cwd = tempDir('owenloop-gc-non-cas-calls-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  mkdirSync(home);
+  const childV1 = await installVersion({ name: 'child', version: '1.0.0', root: projectRoot });
+  const childV2 = await installVersion({ name: 'child', version: '2.0.0', root: projectRoot });
+  await installVersion({ name: 'child', version: '3.0.0', root: projectRoot });
+
+  const callsWorkflow = (name: string, target: string) => [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: invoke',
+    `    calls: ${target}`,
+    '    inputs:',
+    '      seed: seed',
+    '    produces: [done]',
+    'outputs: [done]',
+    '',
+  ].join('\n');
+  writeFileSync(join(projectRoot, 'project-parent.yaml'), callsWorkflow('project-parent', 'child/child@1.0.0'));
+
+  const source = 'acme/parents';
+  const folder = installFolder('acme', 'parents');
+  const installedDir = join(projectRoot, folder);
+  mkdirSync(installedDir);
+  writeFileSync(join(installedDir, 'workflow.yaml'), callsWorkflow('add-parent', 'child/child@2.0.0'));
+  const stateDir = join(cwd, '.owenloop');
+  mkdirSync(stateDir);
+  writeLockfile(join(stateDir, 'installed.json'), {
+    version: 1,
+    installed: {
+      [source]: {
+			source,
+			ref: 'HEAD',
+			sha: 'a'.repeat(40),
+			installedAt: 1,
+			path: folder,
+			files: ['workflow.yaml'],
+      },
+    },
+  });
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--keep', '1', '--yes', '--db', join(cwd, 'missing.db')], {
+    cwd,
+    env: { HOME: home },
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 0, err.join('\n'));
+  assert.equal(JSON.parse(out.join('\n')).count, 0);
+  assert.equal(existsSync(objectDirForDigest(projectRoot, childV1.digest)), true);
+  assert.equal(existsSync(objectDirForDigest(projectRoot, childV2.digest)), true);
+});
+
+test('global CLI GC protects an exact global call from a current project definition', async () => {
+  const cwd = tempDir('owenloop-gc-global-non-cas-call-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  const globalRoot = join(home, '.owenloop', 'workflows');
+  mkdirSync(home);
+  mkdirSync(projectRoot);
+  const childV1 = await installVersion({ name: 'child', version: '1.0.0', root: globalRoot });
+  await installVersion({ name: 'child', version: '2.0.0', root: globalRoot });
+  writeFileSync(join(projectRoot, 'project-parent.yaml'), [
+    'name: project-parent',
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: invoke',
+    '    calls: child/child@1.0.0',
+    '    inputs:',
+    '      seed: seed',
+    '    produces: [done]',
+    'outputs: [done]',
+    '',
+  ].join('\n'));
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--global', '--keep', '1', '--yes', '--db', join(cwd, 'missing.db')], {
+    cwd,
+    env: { HOME: home },
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 0, err.join('\n'));
+  assert.equal(JSON.parse(out.join('\n')).count, 0);
+  assert.equal(existsSync(objectDirForDigest(globalRoot, childV1.digest)), true);
 });
 
 test('same-root planning and HOME-unavailable CLI preserve fixed-point exact locks', async () => {
@@ -1311,12 +1462,20 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
   db.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, def_snapshot TEXT, created_at INTEGER)');
   db.prepare('INSERT INTO workflow (id, def_snapshot, created_at) VALUES (?, ?, ?)').run(
     'wf_good',
-    JSON.stringify({ bundleDigest: digest, bundleLock: { 'dep/dep@1.0.0': dependency } }),
+    JSON.stringify({
+      bundleDigest: digest,
+      bundleLock: { 'dep/dep@1.0.0': dependency },
+      steps: [{ calls: 'legacy/child@1.0.0' }, { calls: 'dep/dep@1.0.0' }],
+    }),
     1,
   );
   db.close();
   const bytesBefore = readFileSync(dbPath);
-  assert.deepEqual(readRuntimeSnapshotBundlePins(dbPath), [{ bundleDigest: digest, bundleLock: [dependency] }]);
+  assert.deepEqual(readRuntimeSnapshotBundlePins(dbPath), [{
+    bundleDigest: digest,
+    bundleLock: [dependency],
+    exactCalls: ['legacy/child@1.0.0'],
+  }]);
   assert.deepEqual(readFileSync(dbPath), bytesBefore);
   assert.equal(existsSync(`${dbPath}-wal`), false);
 
@@ -1333,6 +1492,56 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
   legacy.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, created_at INTEGER)');
   legacy.close();
   assert.deepEqual(readRuntimeSnapshotBundlePins(legacyPath), []);
+});
+
+test('create and adopt refuse snapshot locks through a symlinked global parent', async () => {
+  const cwd = tempDir('owenloop-snapshot-global-parent-');
+  const realHome = join(cwd, 'real-home');
+  const linkedHome = join(cwd, 'linked-home');
+  const realOwenloop = join(realHome, '.owenloop');
+  const globalRoot = join(realOwenloop, 'workflows');
+  mkdirSync(realHome);
+  mkdirSync(linkedHome);
+  await installVersion({ version: '1.0.0', root: globalRoot });
+  rmRecursiveForce(join(globalRoot, '.owenloop'));
+  symlinkSync(realOwenloop, join(linkedHome, '.owenloop'));
+
+  const dbPath = join(cwd, 'explicit-state.db');
+  const invoke = async (argv: string[]) => {
+    const err: string[] = [];
+    const code = await mainAsync([...argv, '--db', dbPath], {
+      cwd,
+      env: { HOME: linkedHome },
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+    return { code, error: err.join('\n') };
+  };
+
+  const created = await invoke(['create', 'widget/widget']);
+  assert.equal(created.code, 1);
+  assert.match(created.error, /workflow store root.*parent.*symbolic link/u);
+  assert.equal(
+    existsSync(join(globalRoot, '.owenloop')),
+    false,
+    'create writes no snapshot lock state through the symlinked global parent',
+  );
+
+  const store = openStore(dbPath);
+  store.tx(() => store.insertWorkflow('wf_legacy', { def: 'widget/widget' }));
+  store.close();
+
+  const adopted = await invoke(['adopt', 'wf_legacy']);
+  assert.equal(adopted.code, 1);
+  assert.match(adopted.error, /workflow store root.*parent.*symbolic link/u);
+  assert.equal(
+    existsSync(join(globalRoot, '.owenloop')),
+    false,
+    'adopt writes no snapshot lock state through the symlinked global parent',
+  );
+  const reopened = openStore(dbPath);
+  assert.equal(reopened.getWorkflow('wf_legacy')?.defSnapshot, undefined, 'failed adopt leaves the legacy row unpinned');
+  reopened.close();
 });
 
 test('destructive bundle GC refuses a newer runtime DB schema without changing the store', async () => {

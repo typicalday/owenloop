@@ -148,6 +148,7 @@ import {
   inspectCasDefs,
   loadCasDefs,
   PreCommitVerifierUnavailableError,
+  parseWorkflowCoordinate,
   projectStoreRoot,
   createBundleIngestor,
   createPreCommitVerifier,
@@ -3067,6 +3068,38 @@ function bundleGcPathOverride(
 	return environmentValue;
 }
 
+/** Collect exact CAS coordinates called by the currently executable non-CAS definitions. */
+function bundleGcExactCallsFromCurrentDefs(
+	io: CliIO,
+	defsDir: string,
+	defsOverride: string | undefined,
+	verbose: boolean,
+): string[] {
+	const defs = defsOverride === undefined
+		? loadDefsWithInstalled(io, defsDir, false, verbose).defs
+		: (existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>());
+	const exactCalls = new Set<string>();
+	for (const def of defs.values()) {
+		// CAS definitions already root their own exact edges through bundleLock.
+		// This scan supplies the missing roots for project, GitHub-add, and legacy
+		// definitions whose snapshots intentionally carry no bundle provenance.
+		if (def.bundleDigest !== undefined) continue;
+		for (const step of def.steps) {
+			if (step.calls === undefined || !step.calls.includes('@')) continue;
+			try {
+				parseWorkflowCoordinate(step.calls);
+			} catch (error) {
+				throw new CliError(
+					`owenloop bundle gc: malformed exact calls target ${JSON.stringify(step.calls)} ` +
+						`in workflow '${def.name}': ${(error as Error).message}`,
+				);
+			}
+			exactCalls.add(step.calls);
+		}
+	}
+	return [...exactCalls].sort(compareStoreText);
+}
+
 /** Store-aware async branch of the otherwise filesystem-only bundle namespace. */
 async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 	assertBundlePositionals(args, 2, 'owenloop bundle gc [--keep <n>] [--global] [--yes]');
@@ -3129,6 +3162,12 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 			lockfilePath: join(io.cwd, '.owenloop', 'installed.json'),
 			readLedger: readLedger!,
 		};
+	const legacyReadBarrier = globalFlag
+		? {
+			lockPath: join(io.cwd, '.owenloop', 'add.lock'),
+			journalPath: join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME),
+		}
+		: undefined;
 	const result = await collectWorkflowStoreGarbage({
 		projectRoot,
 		globalRoot,
@@ -3136,8 +3175,15 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 		keep,
 		yes: flag(args, 'yes'),
 		readSnapshotPins: () => readRuntimeSnapshotBundlePins(dbPath),
+		readExactCalls: () => bundleGcExactCallsFromCurrentDefs(
+			io,
+			projectRoot,
+			defsOverride,
+			flag(args, 'verbose'),
+		),
 		...(readLedger === undefined ? {} : { readLedger }),
 		...(legacyRecovery === undefined ? {} : { legacyRecovery }),
+		...(legacyReadBarrier === undefined ? {} : { legacyReadBarrier }),
 		...(optionalWorkflowRecoveryMarkerDir(io) === undefined
 			? {}
 			: { recoveryMarkerDir: optionalWorkflowRecoveryMarkerDir(io) }),

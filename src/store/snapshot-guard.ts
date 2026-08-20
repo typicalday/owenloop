@@ -74,16 +74,20 @@ export function withWorkflowSnapshotStoreGuard<T>(
   const bundles = guardedBundles(defs);
   if (bundles.length === 0) return fn(new Set());
 
-  const stateByLockPath = new Map(
+  const rootAndStateByLockPath = new Map(
     bundles.flatMap((bundle) => bundle.roots)
-      .map((root) => workflowStoreStatePaths(root))
-      .map((state) => [state.lockPath, state] as const),
+      .map((root) => ({ root, state: workflowStoreStatePaths(root) }))
+      .map((item) => [item.state.lockPath, item] as const),
   );
-  const lockPaths = [...stateByLockPath.keys()].sort(compareStoreText);
+  const lockPaths = [...rootAndStateByLockPath.keys()].sort(compareStoreText);
   const locks: FileLockHandle[] = [];
   try {
     for (const lockPath of lockPaths) {
-      const state = stateByLockPath.get(lockPath)!;
+      const { root, state } = rootAndStateByLockPath.get(lockPath)!;
+      // Guard the store root before creating `<root>/.owenloop`. In particular,
+      // a global root reached through a symlinked `$HOME/.owenloop` must not
+      // redirect snapshot-lock state outside the intended home.
+      ensureDirectoryPathNoSymlink(root, 'workflow store root');
       ensureDirectoryPathNoSymlink(state.stateDir, 'workflow store state directory');
       guardStateFile(lockPath, 'install lock');
       locks.push(acquireFileLockSync(lockPath, { label: 'workflow-store snapshot writer' }));

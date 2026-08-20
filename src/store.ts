@@ -16,7 +16,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { lstatSync } from 'node:fs';
 import { detId, nowMs } from './util.ts';
-import { compareStoreText, defDigest, isDefDigest } from './store/types.ts';
+import { compareStoreText, defDigest, isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
 import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
 import type {
   Acceptance,
@@ -62,6 +62,45 @@ export interface RuntimeSnapshotBundlePins {
   bundleDigest?: string;
   /** Exact cross-bundle dependencies copied from the snapshot's bundle lock. */
   bundleLock: string[];
+  /** Exact versioned calls not already covered by this snapshot's bundle lock. */
+  exactCalls?: string[];
+}
+
+function exactCallsFromSnapshot(record: Record<string, unknown>, workflow: string): string[] {
+	const rawSteps = record.steps;
+	if (rawSteps === undefined) return [];
+	if (!Array.isArray(rawSteps)) {
+		throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps: expected an array`);
+	}
+	const exactCalls = new Set<string>();
+	for (const [index, rawStep] of rawSteps.entries()) {
+		if (typeof rawStep !== 'object' || rawStep === null || Array.isArray(rawStep)) {
+			throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps[${index}]: expected an object`);
+		}
+		const calls = (rawStep as Record<string, unknown>).calls;
+		if (calls === undefined) continue;
+		if (typeof calls !== 'string') {
+			throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps[${index}].calls: expected a string`);
+		}
+		if (!calls.includes('@')) continue;
+		try {
+			parseWorkflowCoordinate(calls);
+		} catch (error) {
+			throw new Error(
+				`workflow '${workflow}' has malformed exact def_snapshot calls target ${JSON.stringify(calls)}: ` +
+					(error as Error).message,
+			);
+		}
+		const rawLock = record.bundleLock;
+		if (
+			typeof rawLock === 'object'
+			&& rawLock !== null
+			&& !Array.isArray(rawLock)
+			&& Object.prototype.hasOwnProperty.call(rawLock, calls)
+		) continue;
+		exactCalls.add(calls);
+	}
+	return [...exactCalls].sort(compareStoreText);
 }
 
 /**
@@ -143,9 +182,11 @@ export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBund
 				return digest;
 			});
 
+			const exactCalls = exactCallsFromSnapshot(record, row.id);
 			return {
 				...(bundleDigest === undefined ? {} : { bundleDigest }),
 				bundleLock: [...new Set(bundleLock)].sort(compareStoreText),
+				...(exactCalls.length === 0 ? {} : { exactCalls }),
 			};
 		});
 	} finally {

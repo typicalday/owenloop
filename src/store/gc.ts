@@ -83,6 +83,8 @@ export interface PlanWorkflowStoreGcArgs {
   level: StoreLevel;
   keep: number;
   snapshotPins: readonly RuntimeSnapshotBundlePins[];
+  /** Exact versioned calls from currently loadable non-CAS definitions. */
+  exactCalls?: readonly string[];
 }
 
 export interface WorkflowStoreGcPlan {
@@ -99,6 +101,8 @@ export interface CollectWorkflowStoreGcArgs {
   yes: boolean;
   /** Re-run inside the writer lock when `yes` is true. */
   readSnapshotPins: () => readonly RuntimeSnapshotBundlePins[];
+  /** Re-read exact versioned calls from current project/add definitions under the writer locks. */
+  readExactCalls?: () => readonly string[];
   /** Project mode supplies the same legacy installed-ledger reader as bundle installation. */
   readLedger?: () => LedgerLookup;
   /**
@@ -111,6 +115,15 @@ export interface CollectWorkflowStoreGcArgs {
     journalPath: string;
     lockfilePath: string;
     readLedger: () => LedgerLookup;
+  };
+  /**
+   * Read-only coordination for non-CAS project/add definitions when their root
+   * is not the GC target. A pending journal is refused rather than recovered so
+   * global GC never mutates the non-target project tree.
+   */
+  legacyReadBarrier?: {
+    lockPath: string;
+    journalPath: string;
   };
   recoveryMarkerDir?: string;
   /** Narrow failure-injection seams for commit-order regression tests. */
@@ -280,6 +293,16 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     globalRoot,
     warn: () => {},
   });
+  const directCoordinateDigests = new Map<string, DefDigest>();
+  for (const registration of registrations) {
+    if (
+      registration.kind === 'coordinate'
+      && registration.coordinate !== undefined
+      && registration.key === registration.coordinate
+    ) {
+      directCoordinateDigests.set(registration.coordinate, registration.bundleDigest);
+    }
+  }
 
   const projectObjects = scanObjects(projectRoot);
   const globalObjects = sameRoot ? projectObjects : scanObjects(globalRoot);
@@ -395,6 +418,8 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     if (entry.pinned) requireTargetDigest(defDigest(entry.digest), 'an explicit index pin');
   }
 
+  const retainedExactCalls = new Set(args.exactCalls ?? []);
+
   // Every retained workflow row remains replay/adopt/debug state until delete.
   for (const snapshot of args.snapshotPins) {
     const digests = [
@@ -413,6 +438,7 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
 		queueDependencies(digest);
       }
     }
+    for (const coordinate of snapshot.exactCalls ?? []) retainedExactCalls.add(coordinate);
   }
 
   // Every project-indexed digest is an external protection root for global GC,
@@ -431,19 +457,21 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   const entryMatches = (index: WorkflowStoreIndex, coordinate: string, digest: DefDigest): boolean =>
     index.entries[coordinate]?.digest === digest;
 
-  /** Retain target state only when the non-target root cannot satisfy an exact lock edge itself. */
-  const preserveDependency = (parent: DefDigest, coordinate: string, digest: DefDigest): void => {
+  /** Retain target state only when the non-target root cannot satisfy an exact coordinate itself. */
+  const preserveCoordinate = (
+    coordinate: string,
+    digest: DefDigest,
+    reason: string,
+    missingMessage: string,
+  ): void => {
     if (sameRoot) {
       if (!entryMatches(targetIndex, coordinate, digest) || !targetObjects.has(digest)) {
-		throw new Error(
-		  `workflow-store bundle ${parent} locks '${coordinate}' to ${digest}, ` +
-			'but no exact callable coordinate with verified bytes is installed',
-		);
+		throw new Error(missingMessage);
       }
       // There is no independent non-target copy in single-root mode. Queueing
       // only its dependencies would let this exact coordinate/object itself be
       // pruned before the fixed-point walk reaches its children.
-      requireTargetDigest(digest, `bundle ${parent} lock '${coordinate}'`);
+      requireTargetDigest(digest, reason);
       return;
     }
 
@@ -465,13 +493,41 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
 		|| (entryMatches(projectIndex, coordinate, digest) && !projectObjects.has(digest))
       );
     if (!targetCanSatisfy) {
-      throw new Error(
-	`workflow-store bundle ${parent} locks '${coordinate}' to ${digest}, ` +
-		  'but no exact callable coordinate with verified bytes is installed',
-      );
+		throw new Error(missingMessage);
     }
-    requireTargetDigest(digest, `bundle ${parent} lock '${coordinate}'`);
+    requireTargetDigest(digest, reason);
   };
+
+  const preserveDependency = (parent: DefDigest, coordinate: string, digest: DefDigest): void => {
+    preserveCoordinate(
+      coordinate,
+      digest,
+      `bundle ${parent} lock '${coordinate}'`,
+      `workflow-store bundle ${parent} locks '${coordinate}' to ${digest}, ` +
+		'but no exact callable coordinate with verified bytes is installed',
+    );
+  };
+
+  // A retained filesystem/add/legacy parent carries no bundle digest or lock,
+  // but its explicit namespace/name@version call still resolves through the
+  // direct CAS coordinate alias. Root that exact coordinate and the digest it
+  // selects before walking the selected object's own manifest locks.
+  for (const coordinate of [...retainedExactCalls].sort(compareStoreText)) {
+    const digest = directCoordinateDigests.get(coordinate);
+	if (digest === undefined) {
+		throw new Error(
+			`workflow-store GC cannot preserve retained exact calls target '${coordinate}': ` +
+				'no callable exact coordinate is installed',
+		);
+    }
+    preserveCoordinate(
+      coordinate,
+      digest,
+      `retained exact calls target '${coordinate}'`,
+      `workflow-store GC cannot preserve retained exact calls target '${coordinate}' at ${digest}: ` +
+		'no exact callable coordinate with verified bytes is installed',
+    );
+  }
 
   // Follow exact coordinate+digest locks to a fixed point. Digest alone is not
   // enough: runtime resolution needs the digest-scoped alias for that exact
@@ -578,6 +634,7 @@ export async function collectWorkflowStoreGarbage(
       level: args.level,
       keep: args.keep,
       snapshotPins: args.readSnapshotPins(),
+      exactCalls: args.readExactCalls?.() ?? [],
     }).report;
   }
 
@@ -589,7 +646,10 @@ export async function collectWorkflowStoreGarbage(
   // free and only the target index/object tree is changed.
   const locks = await acquireGcLocks(
     [projectRoot, globalRoot],
-    args.legacyRecovery === undefined ? [] : [args.legacyRecovery.lockPath],
+    [
+      ...(args.legacyRecovery === undefined ? [] : [args.legacyRecovery.lockPath]),
+      ...(args.legacyReadBarrier === undefined ? [] : [args.legacyReadBarrier.lockPath]),
+    ],
   );
   try {
     guardStateFile(state.journalPath, 'crash-recovery journal');
@@ -621,6 +681,15 @@ export async function collectWorkflowStoreGarbage(
 		v2Replacement: workflowStoreReplacementRecovery,
       });
     }
+	if (args.legacyReadBarrier !== undefined) {
+		guardStateFile(args.legacyReadBarrier.journalPath, 'legacy crash-recovery journal');
+		if (lstatSync(args.legacyReadBarrier.journalPath, { throwIfNoEntry: false }) !== undefined) {
+			throw new Error(
+				`refusing workflow-store GC while legacy crash-recovery journal ` +
+					`'${args.legacyReadBarrier.journalPath}' is pending`,
+			);
+		}
+    }
 
     // Only clear the shared tree when every writer that can own an entry has
     // been locked and recovered. Global staging has no GitHub-add owner;
@@ -634,6 +703,7 @@ export async function collectWorkflowStoreGarbage(
     }
 
     const snapshotPins = args.readSnapshotPins();
+    const exactCalls = args.readExactCalls?.() ?? [];
     args.hooks?.afterSnapshotPinsRead?.();
     const plan = planWorkflowStoreGc({
       projectRoot,
@@ -641,6 +711,7 @@ export async function collectWorkflowStoreGarbage(
       level: args.level,
       keep: args.keep,
       snapshotPins,
+      exactCalls,
     });
     const currentIndex = readWorkflowStoreIndex(storeIndexPath(targetRoot));
     if (serializeWorkflowStoreIndex(currentIndex) !== serializeWorkflowStoreIndex(plan.nextIndex)) {
