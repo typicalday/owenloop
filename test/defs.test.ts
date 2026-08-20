@@ -1419,6 +1419,42 @@ test('lintDef reports exact fields for malformed x.discovery data', () => {
       ],
     },
     {
+      name: 'interface is diagnosed before later malformed siblings',
+      discovery: {
+        interface: [],
+        description: [],
+        whenToUse: ['Ship an approved change.'],
+        notFor: ['Explore an unapproved idea.'],
+      },
+      expected: [
+        'x.discovery.interface: expected a map',
+        'x.discovery.description: expected a non-empty string',
+      ],
+    },
+    {
+      name: 'interface is diagnosed before absent siblings',
+      discovery: { interface: [] },
+      expected: [
+        'x.discovery.interface: expected a map',
+        'x.discovery.description: expected a non-empty string',
+        'x.discovery.whenToUse: expected a non-empty array of non-empty strings',
+        'x.discovery.notFor: expected a non-empty array of non-empty strings',
+      ],
+    },
+    {
+      name: 'interface subtree is diagnosed before later malformed siblings',
+      discovery: {
+        interface: { inputs: {}, outputs: validDiscovery().interface.outputs },
+        description: [],
+        whenToUse: ['Ship an approved change.'],
+        notFor: ['Explore an unapproved idea.'],
+      },
+      expected: [
+        'x.discovery.interface.inputs: expected an array',
+        'x.discovery.description: expected a non-empty string',
+      ],
+    },
+    {
       name: 'authored interface field order',
       discovery: {
         ...validDiscovery(),

@@ -2149,27 +2149,14 @@ function discoveryIssues(def: WorkflowDef): string[] {
     for (const key of allowed) if (!present.has(key)) visitKnownField(key, undefined);
   };
 
-  let interfaceValue: unknown;
-  visitMapFields(discovery, ['description', 'whenToUse', 'notFor', 'interface'], 'x.discovery', (key, value) => {
-    switch (key) {
-      case 'description':
-        requiredString(value, 'x.discovery.description');
-        break;
-      case 'whenToUse':
-        requiredPhraseList(value, 'x.discovery.whenToUse');
-        break;
-      case 'notFor':
-        requiredPhraseList(value, 'x.discovery.notFor');
-        break;
-      case 'interface':
-        interfaceValue = value;
-        break;
-    }
-  });
-  if (!isDiscoveryMap(interfaceValue)) {
-    issues.push('x.discovery.interface: expected a map');
-    return issues;
-  }
+  const inputs = new Map(def.inputs.map((input) => [input.name, { schema: input.schema }]));
+  const outputs = new Map(
+    (def.outputs ?? []).map((name) => {
+      const artifact = def.steps.flatMap((step) => [...step.produces, ...(step.generates ?? [])])
+        .find((produce) => produce.stem === name);
+      return [name, { schema: artifact?.schema }];
+    }),
+  );
   const validateInterfaceEntries = (
     value: unknown,
     path: 'inputs' | 'outputs',
@@ -2230,17 +2217,32 @@ function discoveryIssues(def: WorkflowDef): string[] {
     }
   };
 
-  const inputs = new Map(def.inputs.map((input) => [input.name, { schema: input.schema }]));
-  const outputs = new Map(
-    (def.outputs ?? []).map((name) => {
-      const artifact = def.steps.flatMap((step) => [...step.produces, ...(step.generates ?? [])])
-        .find((produce) => produce.stem === name);
-      return [name, { schema: artifact?.schema }];
-    }),
-  );
-  visitMapFields(interfaceValue, ['inputs', 'outputs'], 'x.discovery.interface', (key, value) => {
-    if (key === 'inputs') validateInterfaceEntries(value, 'inputs', inputs);
-    else validateInterfaceEntries(value, 'outputs', outputs);
+  const validateInterface = (value: unknown): void => {
+    if (!isDiscoveryMap(value)) {
+      issues.push('x.discovery.interface: expected a map');
+      return;
+    }
+    visitMapFields(value, ['inputs', 'outputs'], 'x.discovery.interface', (key, fieldValue) => {
+      if (key === 'inputs') validateInterfaceEntries(fieldValue, 'inputs', inputs);
+      else validateInterfaceEntries(fieldValue, 'outputs', outputs);
+    });
+  };
+
+  visitMapFields(discovery, ['description', 'whenToUse', 'notFor', 'interface'], 'x.discovery', (key, value) => {
+    switch (key) {
+      case 'description':
+        requiredString(value, 'x.discovery.description');
+        break;
+      case 'whenToUse':
+        requiredPhraseList(value, 'x.discovery.whenToUse');
+        break;
+      case 'notFor':
+        requiredPhraseList(value, 'x.discovery.notFor');
+        break;
+      case 'interface':
+        validateInterface(value);
+        break;
+    }
   });
   return issues;
 }
