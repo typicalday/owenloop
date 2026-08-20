@@ -641,9 +641,10 @@ function callsGateReady(step: StepDef, arts: ArtifactMap): boolean {
  * deadlock/stall branch, which relabelled EVERY zero-firing state in the def —
  * so one unrelated `calls:` step anywhere in a def suppressed every genuine
  * deadlock in it. Modeling the discharge as a successor state instead keeps the
- * classification strictly per-state: the child greens ITS OWN artifact and
- * nothing else, so a deadlock elsewhere in the same def is still reached and
- * still reported.
+ * classification strictly per-state: the synthetic green represents the
+ * opaque completion of the whole child plus exposure of its one declared
+ * output, and nothing else in the parent changes. A deadlock elsewhere in the
+ * same def is therefore still reached and still reported.
  *
  * Kept separate from `eligibleFirings` deliberately: that function is the LIVE
  * engine scheduler and a `calls:` step must never become a worker order. These
@@ -1293,6 +1294,31 @@ export interface WorkflowStatus {
   }>;
 }
 
+/**
+ * Whether one workflow instance has no outstanding artifact state (§17/§26).
+ *
+ * `atLeastOne` is the sole exception to a straight outstanding-state scan:
+ * once any member is green, owed siblings may remain untouched forever without
+ * keeping the workflow open. This predicate is intentionally cheaper than
+ * `workflowStatus` so hot engine paths can share its exact completion rule
+ * without building debts, eligibility, blockers, or pending-judge details.
+ */
+export function workflowDone(def: WorkflowDef, arts: ArtifactMap): boolean {
+  const satisfiedAtLeastOneMembers = new Set<string>();
+  for (const step of def.steps) {
+    if (!step.groups) continue;
+    for (const g of step.groups) {
+      if (g.mode !== 'atLeastOne') continue;
+      if (g.of.some((stem) => arts.get(stem)?.acceptance === 'green')) {
+        for (const stem of g.of) satisfiedAtLeastOneMembers.add(stem);
+      }
+    }
+  }
+  return ![...arts.values()].some(
+    (a) => OUTSTANDING_STATES.has(a.acceptance) && !(a.acceptance === 'owed' && satisfiedAtLeastOneMembers.has(a.path)),
+  );
+}
+
 /** Derive the operator view purely from artifact state (§17) — never stored. */
 export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowStatus {
   const debts: WorkflowStatus['debts'] = [];
@@ -1357,24 +1383,7 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   }
   pending.sort((x, y) => x.path.localeCompare(y.path));
 
-  // §26: an `atLeastOne` group is satisfied once any one member is green — its
-  // other members may legitimately sit `owed` forever (no auto-skip fires for
-  // atLeastOne, unlike exactlyOne/atMostOne) without that being "not done".
-  // Stored acceptance is untouched; this is a done-ness computation only.
-  const satisfiedAtLeastOneMembers = new Set<string>();
-  for (const step of def.steps) {
-    if (!step.groups) continue;
-    for (const g of step.groups) {
-      if (g.mode !== 'atLeastOne') continue;
-      if (g.of.some((stem) => arts.get(stem)?.acceptance === 'green')) {
-        for (const stem of g.of) satisfiedAtLeastOneMembers.add(stem);
-      }
-    }
-  }
-  const done = ![...arts.values()].some(
-    (a) => OUTSTANDING_STATES.has(a.acceptance) && !(a.acceptance === 'owed' && satisfiedAtLeastOneMembers.has(a.path)),
-  );
-  return { done, debts, eligible, blocked, pending, inFlight: [] };
+  return { done: workflowDone(def, arts), debts, eligible, blocked, pending, inFlight: [] };
 }
 
 /** The declared judge names for a produce stem (empty if the stem has no judges). */
@@ -2176,8 +2185,9 @@ function eligibleOutcomes(
 
   // M2: a `calls:` firing is the machine handing off to a child instance, not a
   // worker order. The only outcome the PARENT def can observe is the child's
-  // terminal outcome cascading up as a green on the calls artifact. None of the
-  // worker-verb outcomes apply: there is no worker to schema-reject a value, no
+  // terminal completion cascading up as a green on the calls artifact while
+  // exposing the child's declared output. None of the worker-verb outcomes
+  // apply: there is no worker to schema-reject a value, no
   // consumer to judgment-reject (a calls: step declares `consumes: []`), and a
   // calls: produce may carry neither `judges:` nor `group:` (rejected by
   // `buildStep`). Modeling only the green keeps the successor set faithful to
@@ -2612,8 +2622,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // which is false: the engine does spawn the child and the debt is
     // discharged.
     //
-    // The child is modeled as a single opaque green of the calls artifact — the
-    // only thing the parent def can observe about it. `callsDischargeFirings`
+    // The child is modeled as a single opaque whole-child completion that greens
+    // the calls artifact and exposes its declared output — the only thing the
+    // parent def can observe about it. `callsDischargeFirings`
     // gates per-step on `callsInputs` (the same field `Engine.callsGateReady`
     // reads), so a `calls:` step whose gate is NOT green yields no firing and
     // the state is classified on its own merits. Because the discharge greens
