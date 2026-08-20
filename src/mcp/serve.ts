@@ -517,7 +517,12 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'Surface actionable feedback on a real upstream defect by sending it to its producer with a concrete reason. Rejection must be handled, never bypassed to force progress.',
       inputSchema: {
         type: 'object',
-        properties: { workflow: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } },
+		properties: {
+			workflow: { type: 'string' },
+			path: { type: 'string' },
+			reason: { type: 'string' },
+			requested: { type: 'string' },
+		},
         required: ['workflow', 'path', 'reason'],
         additionalProperties: false,
       },
@@ -586,7 +591,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'Only when no catalog entry fits and the human chooses ordinary authoring, use this parse-and-load hard gate for a workflow definition YAML. It is stored only if it loads clean; failures return the engine/parser error verbatim. Idempotent: re-pushing identical content is a no-op success (unchanged: true with the existing version); changed content version-forwards.',
       inputSchema: {
         type: 'object',
-        properties: { yaml: { type: 'string' } },
+		properties: { yaml: { type: 'string' }, bundle_digest: { type: 'string' } },
         required: ['yaml'],
         additionalProperties: false,
       },
