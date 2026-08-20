@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
-import { dirname, sep } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 
 import { mainAsync } from '../src/cli.ts';
 import { createMcpServer } from '../src/mcp/server.ts';
 import type { ToolRegistration } from '../src/mcp/server.ts';
+import { buildClaudeOptions } from '../packages/work/src/harness/claude.ts';
 import {
   fixtureToolRegistrations,
   loadCharterFixture,
@@ -19,7 +20,7 @@ import {
   validateReport,
 } from './helpers/mcp-charter-eval.ts';
 import type { CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/mcp-charter-eval.ts';
-import { finalResponseEvidence, runTask } from './mcp-charter-eval.ts';
+import { finalResponseEvidence, reportedMetadata, runTask } from './mcp-charter-eval.ts';
 import { makeIo } from './hubkit.ts';
 import type { CliIO } from '../src/cli.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../packages/work/src/harness/contract.ts';
@@ -127,6 +128,31 @@ test('mcp charter: fixed fixture has two tasks in each category with valid workf
   for (const task of fixture.tasks) {
     if (task.expectedWorkflow !== undefined) assert.ok(names.has(task.expectedWorkflow));
   }
+});
+
+test('mcp charter: the Claude treatment isolates ambient settings, skills, and MCP servers', () => {
+  const options = buildClaudeOptions(
+    {
+      cwd: '/tmp/mcp-charter-fixture',
+      owenloopMcp: { command: process.execPath, args: ['test/fixtures/mcp-charter-eval-server.ts'] },
+      permissions: {
+        permissionMode: 'bypassPermissions',
+        filesystem: 'read-only',
+        network: 'owenloop-only',
+        extensions: {
+          skills: 'all',
+          mcpServers: { ambient: { command: 'would-reach-production', args: [] } },
+        },
+      },
+    },
+    { env: {}, abortController: new AbortController(), onEvent: () => {} },
+  );
+
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(options.skills, []);
+  assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
 });
 
 test('mcp charter: local stub advertises and records fixed list/get/start behavior', async () => {
@@ -317,6 +343,35 @@ test('mcp charter runner makes adapter exits unscorable and retains only final r
   assert.equal(evidencePath.startsWith(`${sessionCwd}${sep}`), false, 'trace cannot be a file in the evaluated workspace');
 });
 
+test('mcp charter runner gives Codex a private empty configuration root for each task', async () => {
+  const hash = 'f'.repeat(64);
+  const previousCodexHome = process.env['CODEX_HOME'];
+  const ref: HarnessSessionRef = { harness: 'codex', token: 'isolated-config' };
+  let observedHome: string | undefined;
+  let observedConfig: string | undefined;
+  const adapter = harnessAdapter(async (args, onEvent) => {
+    observedHome = process.env['CODEX_HOME'];
+    assert.notEqual(observedHome, previousCodexHome, 'the task must not inherit the operator config root');
+    assert.ok(observedHome !== undefined);
+    observedConfig = await readFile(join(observedHome, 'config.toml'), 'utf8');
+    onEvent({ kind: 'started', ref });
+    await writeTrace(args, hash);
+    onEvent({ kind: 'turn_ended' });
+    return ref;
+  });
+
+  await runTask(
+    { id: 'codex', adapter, permissions: { extensions: { sandbox: 'read-only' } } },
+    { request: 'please help' },
+    'fixture.json',
+    hash,
+    { taskTimeoutMs: 100 },
+  );
+
+  assert.equal(observedConfig, '');
+  assert.equal(process.env['CODEX_HOME'], previousCodexHome, 'the process config root must be restored after the task');
+});
+
 test('mcp charter runner stops a started session at its deadline and preserves its trace as unscorable', async () => {
   const hash = 'e'.repeat(64);
   const ref: HarnessSessionRef = { harness: 'fixture-harness', token: 'deadline' };
@@ -354,4 +409,16 @@ test('mcp charter response evidence excludes all generic progress telemetry', ()
     { kind: 'progress', text: 'stderr: local details' },
   ];
   assert.deepEqual(finalResponseEvidence(events), ['final answer']);
+});
+
+test('mcp charter records model metadata from the real adapter init-line shape', () => {
+  assert.deepEqual(
+    reportedMetadata([
+      {
+        kind: 'progress',
+        text: 'session abc: cliVersion=2.1.220 model=claude-opus-5 apiKeySource=none permissionMode=bypassPermissions',
+      },
+    ]),
+    { reportedModel: 'claude-opus-5', version: '2.1.220' },
+  );
 });

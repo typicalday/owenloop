@@ -643,7 +643,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         opts.err(`owenloop work agent-run: ${e.text}`);
         return;
       case 'assistant_response':
-        opts.err(`owenloop work agent-run: final response: ${e.text}`);
+        // The eval uses this typed event as report evidence. Regular work must
+        // not persist an unbounded model reply (which can contain local output
+        // or sensitive material) merely because an adapter surfaced it.
+        opts.err('owenloop work agent-run: final response received (redacted)');
         return;
       case 'needs_input':
         opts.err(

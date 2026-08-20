@@ -26,14 +26,18 @@ names an expected workflow or asks the model to use a tool.
 The mounted MCP process writes a JSONL trace in a random harness-owned
 directory outside the model session workspace. The evaluated session receives
 only its workspace path; it cannot reach the trace through its normal workspace
-authority. The trace records the full SHA-256 of the exact UTF-8 instructions
-value returned by the real initialize handler, then each received MCP call as
-ordered sequence, name, and arguments. Scores use only that structured wire
-log. Response evidence retains only the final assembled assistant reply (the
-Claude SDK's final top-level text or Codex's completed final-answer item);
-reasoning, stderr, tool output, MCP metadata, and streamed/intermediate text
-are excluded. Neither response text nor generic telemetry is used for a numeric
-score.
+authority. Claude runs with isolated settings, no skills, no ambient MCP
+servers, and only its read-only local built-ins; Codex receives a fresh private
+`CODEX_HOME` containing no user configuration, credentials, plugins, skills, or
+MCP servers. Both sessions therefore expose the fixture mount and their
+intentionally limited built-ins, rather than an operator's configured Owenloop
+server. The trace records the full SHA-256 of the exact UTF-8 instructions value returned by the
+real initialize handler, then each received MCP call as ordered sequence, name,
+and arguments. Scores use only that structured wire log. Response evidence
+retains only the final assembled assistant reply (the Claude SDK's final
+top-level text or Codex's completed final-answer item); reasoning, stderr, tool
+output, MCP metadata, and streamed/intermediate text are excluded. Neither
+response text nor generic telemetry is used for a numeric score.
 
 For the two clear match tasks, a pass requires list_workflows with an empty
 object as the first call, then a later start_run for the expected workflow, with
@@ -59,9 +63,10 @@ The mounted entry point is test/fixtures/mcp-charter-eval-server.ts, not
 bin/owenloop.mjs. It imports only the local MCP transport core and local fixture
 helpers; every handler is a fixed local response, and start_run only records its
 selected workflow. It has no CLI, hub, REST, credential, or settings fallback
-path. Both harness adapters filter ambient OWENLOOP_HUB, and even an inherited
-value cannot be consulted by this local fixture. The evaluation cannot reach
-the production hub.
+path. Claude ignores ambient settings and MCP configuration, and Codex receives
+an empty private configuration root; both mounts are the fixture entry point.
+The fixture itself has no production-hub code path, so ambient `OWENLOOP_HUB`
+cannot reach production through this evaluation.
 
 An absent or malformed initialization marker, charter-hash mismatch, mount
 startup failure, adapter exit or failure, deadline, or incomplete turn makes

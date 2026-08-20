@@ -104,13 +104,13 @@ export function finalResponseEvidence(events: readonly AgentEvent[]): string[] {
   return [];
 }
 
-function reportedMetadata(events: AgentEvent[]): { reportedModel?: string; version?: string } {
+export function reportedMetadata(events: readonly AgentEvent[]): { reportedModel?: string; version?: string } {
   const text = events
     .filter((event): event is Extract<AgentEvent, { kind: 'progress' }> => event.kind === 'progress')
     .map((event) => event.text)
     .join('\n');
-  const reportedModel = /(?:^|\\s)model=([^\\s]+)/u.exec(text)?.[1];
-  const version = /(?:^|\\s)cliVersion=([^\\s]+)/u.exec(text)?.[1];
+  const reportedModel = /(?:^|\s)model=([^\s]+)/u.exec(text)?.[1];
+  const version = /(?:^|\s)cliVersion=([^\s]+)/u.exec(text)?.[1];
   return {
     ...(reportedModel === undefined ? {} : { reportedModel }),
     ...(version === undefined ? {} : { version }),
@@ -119,6 +119,20 @@ function reportedMetadata(events: AgentEvent[]): { reportedModel?: string; versi
 
 function unscorable(reason: string, calls: ParsedTrace['calls'] = []): ParsedTrace {
   return { status: 'unscorable', reason, calls };
+}
+
+/**
+ * Codex merges an app-server thread's MCP config with the operator's config
+ * root. An empty private root is therefore the isolation boundary for this
+ * eval. It deliberately contains no copied credentials, plugins, skills, MCP
+ * servers, or user configuration; app-server authentication remains in the
+ * provider's credential store rather than the evaluated model's filesystem.
+ */
+async function createIsolatedCodexHome(): Promise<string> {
+  const home = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-eval-codex-home-'));
+  await chmod(home, 0o700);
+  await writeFile(join(home, 'config.toml'), '');
+  return home;
 }
 
 export async function runTask(
@@ -140,6 +154,11 @@ export async function runTask(
   const evidenceRoot = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-eval-evidence-'));
   await chmod(evidenceRoot, 0o700);
   const tracePath = join(evidenceRoot, 'trace.jsonl');
+  const codexHome = harness.id === codexAdapter.id ? await createIsolatedCodexHome() : undefined;
+  const previousCodexHome = process.env['CODEX_HOME'];
+  // Tasks run sequentially. Scope the app-server config root to this one task
+  // and restore the process environment before the next harness starts.
+  if (codexHome !== undefined) process.env['CODEX_HOME'] = codexHome;
   const events: AgentEvent[] = [];
   let ref: HarnessSessionRef | undefined;
   let deadlineExceeded = false;
@@ -250,6 +269,11 @@ export async function runTask(
     }
     return { trace, responseEvidence: finalResponseEvidence(terminalEvents), ...reportedMetadata(terminalEvents) };
   } finally {
+    if (codexHome !== undefined) {
+      if (previousCodexHome === undefined) delete process.env['CODEX_HOME'];
+      else process.env['CODEX_HOME'] = previousCodexHome;
+      await rm(codexHome, { recursive: true, force: true });
+    }
     await rm(sessionRoot, { recursive: true, force: true });
     await rm(evidenceRoot, { recursive: true, force: true });
   }
@@ -272,13 +296,19 @@ async function main(): Promise<void> {
       id: claudeAdapter.id,
       adapter: claudeAdapter,
       model: options.claudeModel,
-      permissions: { permissionMode: 'bypassPermissions', maxTurns: 12, extensions: {} },
+      permissions: {
+        permissionMode: 'bypassPermissions',
+        filesystem: 'read-only',
+        network: 'owenloop-only',
+        maxTurns: 12,
+        extensions: {},
+      },
     },
     {
       id: codexAdapter.id,
       adapter: codexAdapter,
       model: options.codexModel,
-      permissions: { permissionMode: 'never', extensions: { sandbox: 'workspace-write' } },
+      permissions: { permissionMode: 'never', extensions: { sandbox: 'read-only' } },
     },
   ];
 

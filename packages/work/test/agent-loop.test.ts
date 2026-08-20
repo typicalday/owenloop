@@ -324,6 +324,20 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
   );
 });
 
+test('final response evidence is redacted from regular worker logs', async () => {
+  const secret = 'SENSITIVE_FINAL_RESPONSE_MUST_NOT_REACH_THE_WORKER_LOG';
+  const adapter = createFakeAdapter({
+    start: { events: [{ kind: 'assistant_response', text: secret }, { kind: 'turn_ended' }] },
+  });
+  const { hub } = mockHub({ getOrder: [agentOrder(), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter });
+
+  await createAgentRunLoop(h.opts).run();
+
+  assert.ok(h.errs.includes('owenloop work agent-run: final response received (redacted)'));
+  assert.equal(h.errs.join('\n').includes(secret), false);
+});
+
 test('the session record carries the resolved harness, its token, the packet cwd, and the injected attempt', async () => {
   const adapter = createFakeAdapter({ id: 'fake', token: 'tok-77' });
   const { hub } = mockHub({ getOrder: [agentOrder({ workdir: '/repo/wt' }), agentOrder({ claimed: false, outcome: 'green' })] });
