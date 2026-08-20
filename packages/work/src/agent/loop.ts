@@ -642,6 +642,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       case 'progress':
         opts.err(`owenloop work agent-run: ${e.text}`);
         return;
+      case 'assistant_response':
+        opts.err(`owenloop work agent-run: final response: ${e.text}`);
+        return;
       case 'needs_input':
         opts.err(
           `owenloop work agent-run: WARNING the step agent asked for input and this contract has no reply channel — ${e.question}`,

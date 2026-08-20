@@ -27,6 +27,7 @@ import {
   codexAdapter,
   isResumeMiss,
   mapNotification,
+  readFinalAssistantResponse,
   readOwenloopMountFailure,
   readTurnCompleted,
   RESUME_UNAVAILABLE_CODE,
@@ -351,6 +352,14 @@ test('B1 the recorded session replays through mapNotification without throwing',
   assert.match(text, /^RES$/m);
   assert.match(text, /^UM$/m);
   assert.match(text, /^ED$/m);
+
+  const responses = entries
+    .filter((entry) => entry.dir === 'in' && entry.frame['method'] === 'item/completed')
+    .flatMap((entry) => {
+      const response = readFinalAssistantResponse('item/completed', entry.frame['params']);
+      return response === undefined ? [] : [response];
+    });
+  assert.deepEqual(responses, ['RESUMED'], 'only completed final-answer items are response evidence');
 });
 
 test('B9 the recording drove the REAL owenloop mount, tools and all', () => {
@@ -521,6 +530,7 @@ test('B6 mapNotification is total — unknown shapes never throw', () => {
       'never/heard/of/this',
     ]) {
       assert.doesNotThrow(() => mapNotification(method, params));
+      assert.doesNotThrow(() => readFinalAssistantResponse(method, params));
       assert.doesNotThrow(() => readTurnCompleted(method, params));
       assert.doesNotThrow(() => readOwenloopMountFailure(method, params));
     }

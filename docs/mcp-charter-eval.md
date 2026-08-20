@@ -11,7 +11,10 @@ Run the evaluation from a checked-out repository:
 
 To pin a model for one harness, pass --claude-model <model> and/or
 --codex-model <model>. The same choices can be supplied with
-OWENLOOP_MCP_CHARTER_CLAUDE_MODEL and OWENLOOP_MCP_CHARTER_CODEX_MODEL.
+OWENLOOP_MCP_CHARTER_CLAUDE_MODEL and OWENLOOP_MCP_CHARTER_CODEX_MODEL. Each
+task has a five-minute deadline by default; pass --task-timeout-ms <positive
+integer> (or set OWENLOOP_MCP_CHARTER_TASK_TIMEOUT_MS) to set a different
+bounded budget.
 
 ## Method
 
@@ -20,12 +23,17 @@ user requests. Every task runs in a newly created harness session. The runner
 only supplies Handle this request for the user followed by the task; it never
 names an expected workflow or asks the model to use a tool.
 
-The mounted MCP process writes a JSONL trace. It records the full SHA-256 of the
-exact UTF-8 instructions value returned by the real initialize handler, then
-records each received MCP call as ordered sequence, name, and arguments. Scores
-use only that structured wire log. Response evidence is retained in the report
-for review, but transcript text is never grepped or otherwise used for a
-numeric score.
+The mounted MCP process writes a JSONL trace in a random harness-owned
+directory outside the model session workspace. The evaluated session receives
+only its workspace path; it cannot reach the trace through its normal workspace
+authority. The trace records the full SHA-256 of the exact UTF-8 instructions
+value returned by the real initialize handler, then each received MCP call as
+ordered sequence, name, and arguments. Scores use only that structured wire
+log. Response evidence retains only the final assembled assistant reply (the
+Claude SDK's final top-level text or Codex's completed final-answer item);
+reasoning, stderr, tool output, MCP metadata, and streamed/intermediate text
+are excluded. Neither response text nor generic telemetry is used for a numeric
+score.
 
 For the two clear match tasks, a pass requires list_workflows with an empty
 object as the first call, then a later start_run for the expected workflow, with
@@ -56,11 +64,12 @@ value cannot be consulted by this local fixture. The evaluation cannot reach
 the production hub.
 
 An absent or malformed initialization marker, charter-hash mismatch, mount
-startup failure, adapter failure, or incomplete turn makes that task
-unscorable. The command exits nonzero and, when --output is supplied, first
-validates the complete report before atomically replacing the requested
-baseline. It never replaces a baseline with fabricated zeroes or a partial
-result.
+startup failure, adapter exit or failure, deadline, or incomplete turn makes
+that task unscorable. On deadline the runner stops the session from the
+synchronous started reference and preserves any trace already written. The
+command exits nonzero and, when --output is supplied, first validates the
+complete report before atomically replacing the requested baseline. It never
+replaces a baseline with fabricated zeroes or a partial result.
 
 When the charter changes, run the command above with working credentials,
 inspect the no-match response evidence to confirm the refusal is plain, and

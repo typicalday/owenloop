@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
+import { dirname, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 
@@ -17,8 +19,10 @@ import {
   validateReport,
 } from './helpers/mcp-charter-eval.ts';
 import type { CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/mcp-charter-eval.ts';
+import { finalResponseEvidence, runTask } from './mcp-charter-eval.ts';
 import { makeIo } from './hubkit.ts';
 import type { CliIO } from '../src/cli.ts';
+import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../packages/work/src/harness/contract.ts';
 
 type Frame = { result?: Record<string, unknown> };
 
@@ -42,6 +46,28 @@ function initTrace(hash: string, calls: TraceCall[]): ParsedTrace {
 
 function taskRecord(task: CharterTask, trace: ParsedTrace): TaskRecord {
   return { ...scoreTask(task, trace), responseEvidence: [] };
+}
+
+function tracePath(args: StartArgs): string {
+  const traceIndex = args.owenloopMcp?.args.indexOf('--trace') ?? -1;
+  assert.ok(traceIndex >= 0, 'runner must give the local fixture a trace path');
+  const path = args.owenloopMcp?.args[traceIndex + 1];
+  if (typeof path !== 'string') throw new Error('runner supplied no trace path');
+  return path;
+}
+
+async function writeTrace(args: StartArgs, hash: string, calls: TraceCall[] = []): Promise<void> {
+  await writeFile(
+    tracePath(args),
+    [{ kind: 'initialize', charterSha256: hash }, ...calls].map((row) => JSON.stringify(row)).join('\n'),
+  );
+}
+
+function harnessAdapter(
+  start: HarnessAdapter['start'],
+  stop: HarnessAdapter['stop'] = async () => {},
+): HarnessAdapter {
+  return { id: 'fixture-harness', start, stop } as HarnessAdapter;
 }
 
 test('mcp charter: initialize serves the charter and every backticked verb is registered by production MCP', async () => {
@@ -254,4 +280,78 @@ test('mcp charter: report aggregates two harnesses under one hash and excludes o
   assert.ok(report.scores.every((score) => score.charterSha256 === hash));
   assert.ok(report.scores.every((score) => score.denominator === 4 && score.passed === 4 && score.tasks.length === 6));
   assert.deepEqual(validateReport(report), []);
+});
+
+test('mcp charter runner makes adapter exits unscorable and retains only final response evidence', async () => {
+  const hash = 'd'.repeat(64);
+  const ref: HarnessSessionRef = { harness: 'fixture-harness', token: 'provider-failure' };
+  let sessionCwd: string | undefined;
+  let evidencePath: string | undefined;
+  const adapter = harnessAdapter(async (args, onEvent) => {
+    sessionCwd = args.cwd;
+    evidencePath = tracePath(args);
+    onEvent({ kind: 'started', ref });
+    await writeTrace(args, hash, [{ sequence: 1, name: 'list_workflows', arguments: {} }]);
+    onEvent({ kind: 'progress', text: 'thinking: private local telemetry' });
+    onEvent({ kind: 'progress', text: 'stderr: a tool result' });
+    onEvent({ kind: 'assistant_response', text: 'I cannot find a matching workflow.' });
+    onEvent({ kind: 'exited', exitCode: null, error: 'model_not_found' });
+    onEvent({ kind: 'turn_ended' });
+    return ref;
+  });
+
+  const run = await runTask(
+    { id: 'fixture-harness', adapter, permissions: { extensions: {} } },
+    { request: 'please help' },
+    'fixture.json',
+    hash,
+    { taskTimeoutMs: 100 },
+  );
+
+  assert.equal(run.trace.status, 'unscorable');
+  assert.match(run.trace.reason, /adapter reported exit: model_not_found/);
+  assert.deepEqual(run.trace.calls, [{ sequence: 1, name: 'list_workflows', arguments: {} }]);
+  assert.deepEqual(run.responseEvidence, ['I cannot find a matching workflow.']);
+  assert.ok(sessionCwd !== undefined && evidencePath !== undefined);
+  assert.notEqual(dirname(evidencePath), sessionCwd, 'trace must be outside the evaluated session cwd');
+  assert.equal(evidencePath.startsWith(`${sessionCwd}${sep}`), false, 'trace cannot be a file in the evaluated workspace');
+});
+
+test('mcp charter runner stops a started session at its deadline and preserves its trace as unscorable', async () => {
+  const hash = 'e'.repeat(64);
+  const ref: HarnessSessionRef = { harness: 'fixture-harness', token: 'deadline' };
+  let stopCalls = 0;
+  const adapter = harnessAdapter(
+    async (args, onEvent) => {
+      onEvent({ kind: 'started', ref });
+      await writeTrace(args, hash, [{ sequence: 1, name: 'list_workflows', arguments: {} }]);
+      return await new Promise<HarnessSessionRef>(() => {});
+    },
+    async () => {
+      stopCalls += 1;
+    },
+  );
+
+  const run = await runTask(
+    { id: 'fixture-harness', adapter, permissions: { extensions: {} } },
+    { request: 'please help' },
+    'fixture.json',
+    hash,
+    { taskTimeoutMs: 20 },
+  );
+
+  assert.equal(run.trace.status, 'unscorable');
+  assert.match(run.trace.reason, /task deadline exceeded after 20ms/);
+  assert.deepEqual(run.trace.calls, [{ sequence: 1, name: 'list_workflows', arguments: {} }]);
+  assert.equal(stopCalls, 1, 'the synchronous started reference must be stopped after timeout');
+});
+
+test('mcp charter response evidence excludes all generic progress telemetry', () => {
+  const events: AgentEvent[] = [
+    { kind: 'progress', text: 'thinking: private' },
+    { kind: 'progress', text: 'tool_result: secret' },
+    { kind: 'assistant_response', text: 'final answer' },
+    { kind: 'progress', text: 'stderr: local details' },
+  ];
+  assert.deepEqual(finalResponseEvidence(events), ['final answer']);
 });

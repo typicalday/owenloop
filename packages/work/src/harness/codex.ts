@@ -580,6 +580,22 @@ export function readTurnCompleted(method: string, params: unknown): TurnOutcome 
 }
 
 /**
+ * Read the final user-visible assistant reply from an app-server notification.
+ *
+ * Deltas are deliberately not used: they are incomplete transport fragments and
+ * can coexist with reasoning, tool output, and other intermediate telemetry.
+ * The completed `agentMessage` is the app-server's assembled final answer.
+ */
+export function readFinalAssistantResponse(method: string, params: unknown): string | undefined {
+  if (method !== 'item/completed') return undefined;
+  const item = asMap(asMap(params)['item']);
+  if ((str(item['type']) ?? str(item['itemType'])) !== 'agentMessage') return undefined;
+  if (str(item['phase']) !== 'final_answer') return undefined;
+  const text = str(item['text']);
+  return text === undefined || text === '' ? undefined : text;
+}
+
+/**
  * Map one server→client notification to an `AgentEvent`.
  *
  * PURE and TOTAL — this is the function the recorded fixture replays through, so
@@ -780,6 +796,8 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
       const mounted = readOwenloopMountFailure(method, params);
       const event = mapNotification(method, params);
       if (event !== undefined) onEvent(event);
+      const finalResponse = readFinalAssistantResponse(method, params);
+      if (finalResponse !== undefined) onEvent({ kind: 'assistant_response', text: finalResponse });
 
       if (mounted !== undefined) {
         // A silent dead order otherwise: with no `submit` tool the agent can

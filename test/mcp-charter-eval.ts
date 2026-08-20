@@ -5,9 +5,10 @@
  * requires logged-in local harnesses, so the deterministic suite must not run it.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 import { claudeAdapter } from '../packages/work/src/harness/claude.ts';
 import { codexAdapter } from '../packages/work/src/harness/codex.ts';
@@ -28,6 +29,7 @@ interface CliOptions {
   output?: string;
   claudeModel?: string;
   codexModel?: string;
+  taskTimeoutMs: number;
 }
 
 interface HarnessRun {
@@ -44,25 +46,46 @@ interface TaskRun {
   version?: string;
 }
 
+export interface RunTaskOptions {
+  taskTimeoutMs?: number;
+}
+
+/** A live task must eventually yield a report, even if an adapter wedges. */
+export const DEFAULT_TASK_TIMEOUT_MS = 5 * 60_000;
+/** Teardown is best effort, but a stuck stop must not defeat the task deadline. */
+const STOP_TIMEOUT_MS = 10_000;
+
 function usage(): never {
   throw new Error(
-    'usage: npm run eval:mcp-charter -- [--output <path>] [--claude-model <model>] [--codex-model <model>]',
+    'usage: npm run eval:mcp-charter -- [--output <path>] [--claude-model <model>] [--codex-model <model>] [--task-timeout-ms <positive integer>]',
   );
+}
+
+function positiveInteger(value: string, flag: string): number {
+  if (!/^[1-9][0-9]*$/u.test(value)) throw new Error(`${flag} must be a positive integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${flag} must be a safe positive integer`);
+  return parsed;
 }
 
 function readOptions(argv: string[]): CliOptions {
   const options: CliOptions = {
     claudeModel: process.env['OWENLOOP_MCP_CHARTER_CLAUDE_MODEL'],
     codexModel: process.env['OWENLOOP_MCP_CHARTER_CODEX_MODEL'],
+    taskTimeoutMs:
+      process.env['OWENLOOP_MCP_CHARTER_TASK_TIMEOUT_MS'] === undefined
+        ? DEFAULT_TASK_TIMEOUT_MS
+        : positiveInteger(process.env['OWENLOOP_MCP_CHARTER_TASK_TIMEOUT_MS'], 'OWENLOOP_MCP_CHARTER_TASK_TIMEOUT_MS'),
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === '--output' || arg === '--claude-model' || arg === '--codex-model') {
+    if (arg === '--output' || arg === '--claude-model' || arg === '--codex-model' || arg === '--task-timeout-ms') {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith('--')) usage();
       if (arg === '--output') options.output = value;
       if (arg === '--claude-model') options.claudeModel = value;
       if (arg === '--codex-model') options.codexModel = value;
+      if (arg === '--task-timeout-ms') options.taskTimeoutMs = positiveInteger(value, '--task-timeout-ms');
       index += 1;
       continue;
     }
@@ -71,17 +94,21 @@ function readOptions(argv: string[]): CliOptions {
   return options;
 }
 
-function responseEvidence(events: AgentEvent[]): string[] {
-  // Adapter telemetry supplies the final-response evidence for human review.
-  // This collection is deliberately kept out of scoreTask(), which sees only
-  // parsed fixture-server calls.
-  return events
-    .filter((event): event is Extract<AgentEvent, { kind: 'progress' }> => event.kind === 'progress')
-    .map((event) => event.text);
+export function finalResponseEvidence(events: readonly AgentEvent[]): string[] {
+  // Scores see only fixture-server calls. Retain only the typed final response;
+  // generic progress includes reasoning, stderr, tool activity, and transport.
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.kind === 'assistant_response') return [event.text];
+  }
+  return [];
 }
 
 function reportedMetadata(events: AgentEvent[]): { reportedModel?: string; version?: string } {
-  const text = responseEvidence(events).join('\n');
+  const text = events
+    .filter((event): event is Extract<AgentEvent, { kind: 'progress' }> => event.kind === 'progress')
+    .map((event) => event.text)
+    .join('\n');
   const reportedModel = /(?:^|\\s)model=([^\\s]+)/u.exec(text)?.[1];
   const version = /(?:^|\\s)cliVersion=([^\\s]+)/u.exec(text)?.[1];
   return {
@@ -94,49 +121,117 @@ function unscorable(reason: string, calls: ParsedTrace['calls'] = []): ParsedTra
   return { status: 'unscorable', reason, calls };
 }
 
-async function runTask(
+export async function runTask(
   harness: HarnessRun,
   task: { request: string },
   fixturePath: string,
   expectedCharterSha256: string,
+  { taskTimeoutMs = DEFAULT_TASK_TIMEOUT_MS }: RunTaskOptions = {},
 ): Promise<TaskRun> {
-  const cwd = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-eval-'));
-  const tracePath = join(cwd, 'trace.jsonl');
+  if (!Number.isSafeInteger(taskTimeoutMs) || taskTimeoutMs < 1) {
+    throw new Error('taskTimeoutMs must be a safe positive integer');
+  }
+  const sessionRoot = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-eval-session-'));
+  const cwd = join(sessionRoot, 'workspace');
+  await mkdir(cwd, { mode: 0o700 });
+  // The evaluated session receives only `cwd`; the fixture server alone receives
+  // this random, harness-owned evidence path. It is never a file in the model's
+  // workspace, so ordinary workspace access cannot inspect or rewrite a score.
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-eval-evidence-'));
+  await chmod(evidenceRoot, 0o700);
+  const tracePath = join(evidenceRoot, 'trace.jsonl');
   const events: AgentEvent[] = [];
   let ref: HarnessSessionRef | undefined;
-  let adapterFailure: string | undefined;
+  let deadlineExceeded = false;
+  let stopping: Promise<string | undefined> | undefined;
+
+  const stopSession = (): Promise<string | undefined> => {
+    if (ref === undefined) return Promise.resolve(undefined);
+    if (stopping !== undefined) return stopping;
+    const sessionRef = ref;
+    stopping = new Promise<string>((resolveStop) => {
+      const timer = setTimeout(() => resolveStop(`session stop exceeded ${STOP_TIMEOUT_MS}ms`), STOP_TIMEOUT_MS);
+      void Promise.resolve()
+        .then(async () => harness.adapter.stop(sessionRef))
+        .then(
+          () => {
+            clearTimeout(timer);
+            resolveStop('');
+          },
+          (error: unknown) => {
+            clearTimeout(timer);
+            resolveStop(`session stop failed: ${error instanceof Error ? error.message : String(error)}`);
+          },
+        );
+    }).then((reason) => (reason === '' ? undefined : reason));
+    return stopping;
+  };
 
   try {
-    try {
-      ref = await harness.adapter.start(
-        {
-          brief: `Handle this request for the user:\n\n${task.request}`,
-          cwd,
-          ...(harness.model === undefined ? {} : { model: harness.model }),
-          owenloopMcp: {
-            command: process.execPath,
-            args: [
-              resolve('test/fixtures/mcp-charter-eval-server.ts'),
-              '--fixture',
-              fixturePath,
-              '--trace',
-              tracePath,
-            ],
-          },
-          permissions: harness.permissions,
-        },
-        (event) => events.push(event),
-      );
-    } catch (error) {
-      adapterFailure = error instanceof Error ? error.message : String(error);
-    } finally {
-      if (ref !== undefined) {
-        try {
-          await harness.adapter.stop(ref);
-        } catch (error) {
-          adapterFailure ??= `session stop failed: ${error instanceof Error ? error.message : String(error)}`;
-        }
+    const onEvent = (event: AgentEvent): void => {
+      events.push(event);
+      if (event.kind === 'started') {
+        ref = event.ref;
+        if (deadlineExceeded) void stopSession();
       }
+    };
+    type StartOutcome = { kind: 'resolved' } | { kind: 'rejected'; reason: string };
+    let start: Promise<StartOutcome>;
+    try {
+      start = harness.adapter
+        .start(
+          {
+            brief: `Handle this request for the user:\n\n${task.request}`,
+            cwd,
+            ...(harness.model === undefined ? {} : { model: harness.model }),
+            owenloopMcp: {
+              command: process.execPath,
+              args: [
+                resolve('test/fixtures/mcp-charter-eval-server.ts'),
+                '--fixture',
+                fixturePath,
+                '--trace',
+                tracePath,
+              ],
+            },
+            permissions: harness.permissions,
+          },
+          onEvent,
+        )
+        .then(
+          (startedRef) => {
+            ref ??= startedRef;
+            return { kind: 'resolved' };
+          },
+          (error: unknown) => ({
+            kind: 'rejected',
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    } catch (error) {
+      start = Promise.resolve({ kind: 'rejected', reason: error instanceof Error ? error.message : String(error) });
+    }
+
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<{ kind: 'deadline' }>((resolveDeadline) => {
+      deadlineTimer = setTimeout(() => resolveDeadline({ kind: 'deadline' }), taskTimeoutMs);
+    });
+    const outcome = await Promise.race([start, deadline]);
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+
+    // Snapshot before ordinary teardown: a post-completion stop can legitimately
+    // emit `exited`, while an exit emitted during the evaluated turn is fatal.
+    const terminalEvents = events.slice();
+    let adapterFailure: string | undefined;
+    if (outcome.kind === 'deadline') {
+      deadlineExceeded = true;
+      adapterFailure = `task deadline exceeded after ${taskTimeoutMs}ms`;
+      const stopFailure = await stopSession();
+      if (stopFailure !== undefined) adapterFailure = `${adapterFailure}; ${stopFailure}`;
+    } else {
+      if (outcome.kind === 'rejected') adapterFailure = `adapter failure: ${outcome.reason}`;
+      const stopFailure = await stopSession();
+      if (stopFailure !== undefined) adapterFailure ??= stopFailure;
     }
 
     let trace: ParsedTrace;
@@ -145,13 +240,18 @@ async function runTask(
     } catch {
       trace = unscorable('trace file was not created');
     }
-    if (adapterFailure !== undefined) trace = unscorable(`adapter failure: ${adapterFailure}`, trace.calls);
-    if (!events.some((event) => event.kind === 'turn_ended')) {
+    const exit = terminalEvents.find((event): event is Extract<AgentEvent, { kind: 'exited' }> => event.kind === 'exited');
+    if (adapterFailure !== undefined) trace = unscorable(adapterFailure, trace.calls);
+    else if (exit !== undefined) {
+      trace = unscorable(`adapter reported exit: ${exit.error ?? `exit code ${String(exit.exitCode)}`}`, trace.calls);
+    }
+    if (adapterFailure === undefined && exit === undefined && !terminalEvents.some((event) => event.kind === 'turn_ended')) {
       trace = unscorable('incomplete turn: no turn_ended adapter event', trace.calls);
     }
-    return { trace, responseEvidence: responseEvidence(events), ...reportedMetadata(events) };
+    return { trace, responseEvidence: finalResponseEvidence(terminalEvents), ...reportedMetadata(terminalEvents) };
   } finally {
-    await rm(cwd, { recursive: true, force: true });
+    await rm(sessionRoot, { recursive: true, force: true });
+    await rm(evidenceRoot, { recursive: true, force: true });
   }
 }
 
@@ -188,7 +288,9 @@ async function main(): Promise<void> {
     let reportedModel: string | undefined;
     let version: string | undefined;
     for (const task of fixture.tasks) {
-      const run = await runTask(harness, task, DEFAULT_CHARTER_FIXTURE_PATH, charterSha256);
+      const run = await runTask(harness, task, DEFAULT_CHARTER_FIXTURE_PATH, charterSha256, {
+        taskTimeoutMs: options.taskTimeoutMs,
+      });
       reportedModel ??= run.reportedModel;
       version ??= run.version;
       records.push({ ...scoreTask(task, run.trace), responseEvidence: run.responseEvidence });
@@ -220,7 +322,9 @@ async function main(): Promise<void> {
   if (options.output !== undefined) await replaceAtomically(options.output, reportText);
 }
 
-void main().catch((error: unknown) => {
-  process.stderr.write(`mcp charter eval failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  void main().catch((error: unknown) => {
+    process.stderr.write(`mcp charter eval failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
