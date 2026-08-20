@@ -4,9 +4,14 @@ The `owenloop` binary is a thin adapter over the engine: it maps `argv` to
 engine calls and prints JSON to stdout. Everything here has a typed,
 in-process equivalent — see [`docs/embedding.md`](embedding.md).
 
-Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) and
-`--defs <dir>` (env `OWENLOOP_DEFS`, default `./workflows`). Nothing is
-remembered between invocations — pass both on every command. Opening the
+Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`),
+`--defs <dir>` (env `OWENLOOP_DEFS`, default `./workflows`), and `--verbose`.
+Nothing is remembered between invocations — pass them on every command.
+`--verbose` restores the detailed notice for every superseded bundle workflow;
+without it, discovery emits at most one summary note such as
+`note: 3 superseded bundle versions hidden; --verbose to list them`. The
+actionable `has no selectable version` warning for competing non-SemVer bundle
+versions remains unconditional. Opening the
 **default** db path refuses a symlinked `.owenloop` directory — and a symlinked
 `state.db` file (or any of its SQLite `-wal`/`-shm`/`-journal` sidecars) inside
 a real `.owenloop` — rather than following it (filesystem-isolation guard
@@ -22,7 +27,7 @@ prints this usage and exits 0 without doing any work.
 
 Boolean flags (`--force`, `--dry-run`, `--all`, `--open`, `--terminal`,
 `--recursive`, `--with-token`, `--shallow`, `--assume-provided`,
-`--strict-inputs`, `--unsigned`, and the bare `--now` on `reap`) never take a
+`--strict-inputs`, `--unsigned`, `--verbose`, `--yes`, and the bare `--now` on `reap`) never take a
 following value — the next token is always a positional or the next `--flag`,
 never consumed as this flag's argument. Use `--flag=value` (e.g. `--now=<ms>`
 on `tick`) for flags that do take a value.
@@ -50,6 +55,7 @@ for the full breakdown.
 | `bundle unpack <bundle.wnlp> <destination-dir>` | strictly validate and atomically extract a `.wnlp` package — see [Bundles](#bundles) |
 | `bundle inspect <bundle.wnlp>` | strictly validate a `.wnlp` package and print its manifest and file metadata — see [Bundles](#bundles) |
 | `bundle digest <bundle.wnlp>` | print the SHA-256 digest of the uncompressed canonical tar — see [Bundles](#bundles) |
+| `bundle gc [--keep <n>] [--global] [--yes]` | dry-run or collect unreachable bundle-store objects — see [Bundles](#bundles) |
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | verify a resolved hub credential and record an optional per-project override in `.owenloop/hub.json` |
 | `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--map <authored>=<org>] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
@@ -116,8 +122,8 @@ authenticated human. Hosted `provide` sends the input identifier as `name`.
 
 ## Bundles
 
-Bundle commands are deliberately dispatched before the CLI opens the engine
-store. `bundle pack`, `bundle inspect`, `bundle digest`, and `bundle unpack`
+The package-format commands are deliberately dispatched before the CLI opens
+the engine store. `bundle pack`, `bundle inspect`, `bundle digest`, and `bundle unpack`
 read or write only the paths named by the command; they do not create
 `.owenloop/state.db`, contact a remote coordinator, or use workflow definitions
 from `--defs`. Successful commands print one JSON object on stdout. Failures
@@ -128,7 +134,34 @@ owenloop bundle pack <source-dir> [--output <bundle.wnlp>]
 owenloop bundle unpack <bundle.wnlp> <destination-dir>
 owenloop bundle inspect <bundle.wnlp>
 owenloop bundle digest <bundle.wnlp>
+owenloop bundle gc [--keep <n>] [--global] [--yes]
 ```
+
+`bundle gc` is intentionally different from the four format commands: it reads
+the selected content-addressed store plus the local runtime database's retained
+definition snapshots. The project store under `--defs`/`OWENLOOP_DEFS` is the
+default target; `--global` targets only `<home>/.owenloop/workflows` and cannot
+be combined with a defs override. The other store may be read to establish
+reachability, but only the selected root is ever mutated. GC never contacts the
+hub.
+
+GC is a pure dry run unless `--yes` is present. A dry run does not create a
+missing store root, runtime database, lock, journal, or staging directory.
+`--keep` is a positive integer and defaults to `2`: the selected/current version
+plus one immediate rollback version, bounding history without eliminating the
+cheapest fallback. The deterministic JSON report contains `ok`, `dryRun`,
+`level`, `root`, `keep`, `count`, `bytes`, sorted `coordinates`, and sorted
+`objects` with each digest's logical regular-file byte total and coordinates.
+An unchanged `--yes` run reports the same candidates as its preceding dry run.
+
+The collector protects every cross-root selected winner, the best `--keep`
+versions of each qualified workflow, explicit index pins, every bundle digest
+and lock dependency in retained local workflow snapshots, transitive
+`bundleLock` dependencies, and (for global GC) every digest referenced by the
+project index. An all-non-SemVer candidate group is kept in full rather than
+given an invented order. Multi-workflow bundles and multiple coordinates for
+one digest are retained or collected atomically. Malformed indexes, objects,
+links, special files, or snapshots fail closed before deletion.
 
 `pack` requires a source directory containing root `bundle.yaml` and every
 workflow path listed by the manifest's `workflows` map. The source manifest is

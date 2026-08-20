@@ -70,6 +70,8 @@ export interface LoadCasDefsArgs {
 	globalRoot: string;
 	/** Warning sink used only by tolerant inspection and collision notices. */
 	warn: (line: string) => void;
+	/** Emit the full per-candidate superseded-version notices. */
+	verbose?: boolean;
 }
 
 /** Explicitly partial result for read-only inspection. */
@@ -320,7 +322,8 @@ function shadowedWorkflowKey(candidate: WorkflowCandidate): string {
 function selectWorkflowRegistrations(
 	objects: readonly RegisteredObject[],
 	warn: (line: string) => void,
-): CasDefRegistration[] {
+	verbose: boolean,
+): { registrations: CasDefRegistration[]; suppressedDigests: Set<DefDigest> } {
 	const byQualified = new Map<string, WorkflowCandidate[]>();
 	const ordered = [...objects].sort(
 		(a, b) => compareStoreText(a.loaded.bundleDigest, b.loaded.bundleDigest),
@@ -344,6 +347,7 @@ function selectWorkflowRegistrations(
 	}
 
 	const registrations: CasDefRegistration[] = [];
+	const suppressedDigests = new Set<DefDigest>();
 	for (const qualified of [...byQualified.keys()].sort(compareStoreText)) {
 		const candidates = byQualified.get(qualified) as WorkflowCandidate[];
 		const selection = selectLatestVersion(candidates);
@@ -378,16 +382,17 @@ function selectWorkflowRegistrations(
 			// index that named the object. The registration's own `level` field
 			// reports the different question of which store the bytes came from, and
 			// the two legitimately disagree under exact-digest fallback.
-			warn(
+			const message =
 				`warning: workflow '${qualified}' from ${candidate.level}-indexed bundle ${candidate.digest} ` +
 					`(version ${candidate.version}) does not hold that name — ${selection.winner.level}-indexed ` +
 					`bundle ${selection.winner.digest} (version ${selection.winner.version}) is the selected ` +
-					`version; this copy stays reachable as '${key}'`,
-			);
+					`version; this copy stays reachable as '${key}'`;
+			if (verbose) warn(message);
+			else suppressedDigests.add(candidate.digest as DefDigest);
 			registrations.push(candidateRegistration(candidate, key));
 		}
 	}
-	return registrations;
+	return { registrations, suppressedDigests };
 }
 
 function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspectionResult {
@@ -484,7 +489,16 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 		}
 	}
 
-	registrations.push(...selectWorkflowRegistrations([...registeredObjects.values()], args.warn));
+	const selectedWorkflows = selectWorkflowRegistrations(
+		[...registeredObjects.values()],
+		args.warn,
+		args.verbose === true,
+	);
+	registrations.push(...selectedWorkflows.registrations);
+	if (args.verbose !== true && selectedWorkflows.suppressedDigests.size > 0) {
+		const count = selectedWorkflows.suppressedDigests.size;
+		args.warn(`note: ${count} superseded bundle ${count === 1 ? 'version' : 'versions'} hidden; --verbose to list them`);
+	}
 	return { registrations, complete };
 }
 

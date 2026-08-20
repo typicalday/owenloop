@@ -62,14 +62,15 @@ export type {
   ResolvedInstructions,
 } from './order-resolver.ts';
 
-export { Store, openStore, StoreVersionError } from './store.ts';
-export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
+export { Store, openStore, readRuntimeSnapshotBundlePins, StoreVersionError } from './store.ts';
+export type { ArtifactRow, RunRow, RuntimeSnapshotBundlePins, TaskRow, WorkflowRow } from './store.ts';
 
 // The content-addressed WORKFLOW store (distinct from the SQLite runtime
 // store above): two-level digest-addressed workflow objects + coordinate
 // index, `.wnlp` bundle installation, and fail-closed resolution.
 export {
   defDigest,
+  collectWorkflowStoreGarbage,
   emptyWorkflowStoreIndex,
   globalStoreRoot,
   hardenObjectModes,
@@ -77,6 +78,7 @@ export {
   inspectCasDefs,
   isDefDigest,
   loadCasDefs,
+  planWorkflowStoreGc,
   objectDestRelPath,
   objectDirForDigest,
   parseWorkflowCoordinate,
@@ -119,8 +121,10 @@ export type {
   CasDefRegistration,
   DefDigest,
   LoadCasDefsArgs,
+  CollectWorkflowStoreGcArgs,
   InstallWorkflowBundleArgs,
   PreCommitVerifier,
+  PlanWorkflowStoreGcArgs,
   ExecutionOriginVerifierInput,
   RecoverWorkflowStoreArgs,
   ResolvedWorkflowObject,
@@ -131,6 +135,9 @@ export type {
   WorkflowCoordinate,
   WorkflowStoreIndex,
   WorkflowStoreIndexEntry,
+  WorkflowStoreGcObject,
+  WorkflowStoreGcPlan,
+  WorkflowStoreGcReport,
   WorkflowStoreStatePaths,
 } from './store/index.ts';
 

@@ -192,7 +192,7 @@ function emptyGlobalRoot(): string {
   return root;
 }
 
-function load(projectRoot: string | undefined, globalRoot: string): {
+function load(projectRoot: string | undefined, globalRoot: string, options: { verbose?: boolean } = {}): {
   registrations: ReturnType<typeof loadCasDefs>;
   warnings: string[];
 } {
@@ -201,6 +201,7 @@ function load(projectRoot: string | undefined, globalRoot: string): {
     ...(projectRoot === undefined ? {} : { projectRoot }),
     globalRoot,
     warn: (line) => warnings.push(line),
+		...(options.verbose === undefined ? {} : { verbose: options.verbose }),
   });
   return { registrations, warnings };
 }
@@ -1157,7 +1158,7 @@ test('version selection: workflow registration order is sorted by qualified name
   );
 });
 
-test('version selection: install order moves neither the winner nor the warnings', async () => {
+test('version selection: default discovery hides detailed notices behind one stable summary', async () => {
   // Two installs of the same versions differing only in the order they were
   // added must produce byte-identical warnings, in the same order, and pick the
   // same winner.
@@ -1173,8 +1174,26 @@ test('version selection: install order moves neither the winner nor the warnings
     second.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
     'registration order itself is stable, not merely the set of keys',
   );
-  assert.deepEqual(first.warnings, second.warnings, 'warning text and order are identical');
-  assert.equal(first.warnings.length, 2, 'both shadowed workflows of 0.1.0 are reported once each');
+	  assert.deepEqual(first.warnings, second.warnings, 'summary text and order are identical');
+	  assert.deepEqual(first.warnings, [
+	    'note: 1 superseded bundle version hidden; --verbose to list them',
+	  ]);
+	  assert.equal(first.warnings.some((line) => line.startsWith('warning:')), false);
+});
+
+test('version selection: verbose restores every detailed shadowing notice in stable order', async () => {
+	const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
+	const { warnings } = load(root, emptyGlobalRoot(), { verbose: true });
+	const oldDigest = digests.get('0.1.0') as string;
+	const newDigest = digests.get('0.1.7') as string;
+	assert.deepEqual(warnings, [
+		`warning: workflow 'parent/child' from project-indexed bundle ${oldDigest} (version 0.1.0) ` +
+			`does not hold that name — project-indexed bundle ${newDigest} (version 0.1.7) is the selected ` +
+			`version; this copy stays reachable as '${oldDigest}/child'`,
+		`warning: workflow 'parent/parent' from project-indexed bundle ${oldDigest} (version 0.1.0) ` +
+			`does not hold that name — project-indexed bundle ${newDigest} (version 0.1.7) is the selected ` +
+			`version; this copy stays reachable as '${oldDigest}/parent'`,
+	]);
 });
 
 test('version selection: a project pin whose BYTES came from global still outranks a higher global version', async () => {
@@ -1294,11 +1313,12 @@ test('version selection: several non-SemVer versions fail closed instead of gues
   const { root, digests } = await installVersions(['nightly', 'edge']);
   const { registrations, warnings } = load(root, emptyGlobalRoot());
 
-  assert.equal(
+	  assert.equal(
     registrations.find((r) => r.key === 'parent/parent'),
     undefined,
     'no version may claim the unqualified name when none can be ordered',
-  );
+	  );
+	  assert.equal(warnings.some((line) => line.startsWith('note:')), false, 'actionable warnings are never hidden');
   assert.equal(
     warnings.some((line) => line.includes("workflow 'parent/parent' has no selectable version")),
     true,
@@ -1318,11 +1338,12 @@ test('version selection: several non-SemVer versions fail closed instead of gues
 });
 
 test('version selection: a SINGLE non-SemVer version still holds its name', async () => {
-  const { root, digests } = await installVersions(['nightly']);
-  const { registrations } = load(root, emptyGlobalRoot());
+	  const { root, digests } = await installVersions(['nightly']);
+	  const { registrations, warnings } = load(root, emptyGlobalRoot());
 
   const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
-  assert.equal(winner?.bundleDigest, digests.get('nightly'), 'nothing to order, so nothing to refuse');
+	  assert.equal(winner?.bundleDigest, digests.get('nightly'), 'nothing to order, so nothing to refuse');
+	  assert.deepEqual(warnings, [], 'one version has no hidden-history summary');
 });
 
 test('version selection: a SemVer version outranks a non-SemVer one rather than tying', async () => {
@@ -1334,8 +1355,8 @@ test('version selection: a SemVer version outranks a non-SemVer one rather than 
 });
 
 test('version selection: the shadowing warning names both versions, not just the digests', async () => {
-  const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
-  const { warnings } = load(root, emptyGlobalRoot());
+	  const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
+	  const { warnings } = load(root, emptyGlobalRoot(), { verbose: true });
 
   const line = warnings.find((w) => w.includes(digests.get('0.1.0') as string));
   assert.ok(line, 'the shadowed copy is reported');
