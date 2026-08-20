@@ -20,6 +20,7 @@ import {
   parseTraceJsonl,
   scoreTask,
   servedCharterInstructions,
+  servedCharterSha256,
   sha256,
   validateReport,
 } from './helpers/mcp-charter-eval.ts';
@@ -139,6 +140,33 @@ test('mcp charter: hashes exact served instruction bytes with full SHA-256', asy
   const hash = sha256(instructions);
   assert.match(hash, /^[0-9a-f]{64}$/u);
   assert.notEqual(hash, sha256(`${instructions} `));
+});
+
+test('mcp charter: leads with the catalog rule and refuses the excuses that used to skip it', async () => {
+  const instructions = await servedCharterInstructions();
+  const catalogRule = instructions.indexOf('Call `list_workflows` on every request');
+  assert.notEqual(catalogRule, -1, 'the catalog rule must be stated as an unconditional call');
+  assert.match(instructions, /before you answer it, before you ask the human for missing inputs/u);
+  assert.match(instructions, /too small, too urgent, or too far outside software/u);
+  assert.ok(
+    catalogRule < instructions.indexOf('use `start_run`'),
+    'the catalog read must be instructed before the run-starting verb',
+  );
+});
+
+test('mcp charter: the committed baseline scores the charter bytes served today', async () => {
+  const served = await servedCharterSha256();
+  const baseline = JSON.parse(
+    await readFile(new URL('../docs/evals/mcp-charter-baseline.json', import.meta.url), 'utf8'),
+  ) as { scores: { charterSha256: string }[] };
+  assert.ok(baseline.scores.length > 0, 'baseline must record at least one harness score');
+  for (const score of baseline.scores) {
+    assert.equal(
+      score.charterSha256,
+      served,
+      'charter edit without a regenerated baseline: run `npm run eval:mcp-charter -- --output docs/evals/mcp-charter-baseline.json`',
+    );
+  }
 });
 
 test('mcp charter: names the narrow caller-owned ephemeral self-execution exception', async () => {
