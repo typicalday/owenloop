@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Engine, SchemaRefusalError } from '../src/engine.ts';
@@ -258,6 +258,36 @@ test('calls: late cleanup-only input reopens and republishes an unchanged child 
 
   completeCleanupParent(engine, run, 2);
   assert.equal(engine.status(run.parentWf).done, true);
+});
+
+test('calls: docs require a green/value-defined output and whole-child completion', () => {
+  const design = readFileSync(new URL('../docs/design.md', import.meta.url), 'utf8');
+  const authoring = readFileSync(new URL('../docs/authoring.md', import.meta.url), 'utf8');
+  const section = (doc: string, start: string, end: string): string => {
+    const startAt = doc.indexOf(start);
+    const endAt = doc.indexOf(end, startAt + start.length);
+    assert.notEqual(startAt, -1, `missing documentation section: ${start}`);
+    assert.notEqual(endAt, -1, `missing documentation section boundary: ${end}`);
+    return doc.slice(startAt, endAt);
+  };
+
+  const cascadePrompt = section(design, '#### §23.6.2 Cascade-up prompt', '#### §23.6.3');
+  assert.match(cascadePrompt, /green and value-defined/);
+  assert.match(cascadePrompt, /workflowDone\(childDef, childArts\)/);
+  assert.match(cascadePrompt, /not an unconditional outcome propagation/);
+
+  const embeddingInterface = section(design, '#### §23.6.3 `outputs:` as embedding interface', '#### §23.6.4');
+  assert.match(embeddingInterface, /greening that artifact is not by itself the completion signal/);
+  assert.match(embeddingInterface, /workflowDone\(childDef, childArts\)/);
+
+  const failureBranch = section(design, '#### §23.6.4 Failure branch', '#### §23.6.5');
+  assert.match(failureBranch, /green, value-defined declared outcome/);
+  assert.match(failureBranch, /outstanding child cleanup or a manual input keeps the parent mirror `owed`/);
+
+  const authoringCalls = section(authoring, '**`calls:` (Mode 2, runtime)**', '| | `include:` (Mode 1)');
+  assert.match(authoringCalls, /declared output is green\/value-defined/);
+  assert.match(authoringCalls, /workflowDone\(childDef, childArts\).*whole child is done/);
+  assert.match(authoringCalls, /cleanup or a manually\s+supplied input still outstanding keeps the parent output owed/);
 });
 
 // ---- test (a): happy path end-to-end ----------------------------------------
