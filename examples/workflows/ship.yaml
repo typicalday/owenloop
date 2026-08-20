@@ -49,6 +49,31 @@ title: Ship — the software production line
 description: Plan + provision → build → review → document → check → merge → clean up. Lifecycle bracketed as owned artifacts; reviewer knock-backs; terminal merge.
 outputs: [merge]
 
+x:
+  discovery:
+    description: >-
+      Ship an approved repository change through planning, provisioning, building,
+      review, documentation, checks, merge, and cleanup on the production line.
+    whenToUse:
+      - Ship an approved software change through the full repository production line.
+      - Need a branch, review, verification, and a merge for a repository change.
+    notFor:
+      - Unapproved ideation or work that still needs a plan or approval.
+      - Non-software workflows that do not change a repository.
+      - Work that must not be merged.
+    interface:
+      inputs:
+        - name: proposal
+          summary: The approved change brief that seeds planning and provisioning.
+          schemaRef: "#/inputs/0/schema"
+        - name: planSeed
+          summary: Optional existing-plan or branch-adoption information for continuing work.
+          schemaRef: "#/inputs/1/schema"
+      outputs:
+        - name: merge
+          summary: The terminal record that confirms the approved pull request was merged.
+          schemaRef: "#/steps/6/produces/0/schema"
+
 inputs:
   - name: proposal          # the approved brief, seeded at create
     seedOwed: true

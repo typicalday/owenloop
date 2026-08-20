@@ -2093,6 +2093,116 @@ function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
   return warnings;
 }
 
+/** Whether a discovery-convention value is a YAML mapping. */
+function isDiscoveryMap(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Return advisory issues for Owenloop's optional x.discovery convention.
+ *
+ * This deliberately does not assign a severity. W2.1 can promote these same
+ * deterministic issues for library definitions without duplicating validation.
+ * The parser and engine continue to treat all extension contents as opaque.
+ */
+function discoveryIssues(def: WorkflowDef): string[] {
+  const issues: string[] = [];
+  const discovery = def.x?.discovery;
+  if (discovery === undefined) return ['x.discovery: missing required discovery metadata'];
+  if (!isDiscoveryMap(discovery)) return ['x.discovery: expected a map'];
+
+  const requiredString = (value: unknown, path: string): string | undefined => {
+    if (typeof value !== 'string' || value.trim() === '') {
+      issues.push(path + ': expected a non-empty string');
+      return undefined;
+    }
+    return value;
+  };
+  const requiredPhraseList = (value: unknown, path: string): void => {
+    if (!Array.isArray(value) || value.length === 0) {
+      issues.push(path + ': expected a non-empty array of non-empty strings');
+      return;
+    }
+    for (const [index, item] of value.entries()) requiredString(item, path + '[' + index + ']');
+  };
+  const unknownFields = (value: Record<string, unknown>, allowed: readonly string[], path: string): void => {
+    const allowedSet = new Set(allowed);
+    for (const key of Object.keys(value)) {
+      if (!allowedSet.has(key)) issues.push(path + '.' + key + ': unknown field');
+    }
+  };
+
+  unknownFields(discovery, ['description', 'whenToUse', 'notFor', 'interface'], 'x.discovery');
+  requiredString(discovery.description, 'x.discovery.description');
+  requiredPhraseList(discovery.whenToUse, 'x.discovery.whenToUse');
+  requiredPhraseList(discovery.notFor, 'x.discovery.notFor');
+
+  const interfaceValue = discovery.interface;
+  if (!isDiscoveryMap(interfaceValue)) {
+    issues.push('x.discovery.interface: expected a map');
+    return issues;
+  }
+  unknownFields(interfaceValue, ['inputs', 'outputs'], 'x.discovery.interface');
+
+  const validateInterfaceEntries = (
+    value: unknown,
+    path: 'inputs' | 'outputs',
+    declared: ReadonlyMap<string, { schema?: unknown }>,
+  ): void => {
+    const fieldPath = 'x.discovery.interface.' + path;
+    const singular = path === 'inputs' ? 'input' : 'output';
+    if (!Array.isArray(value)) {
+      issues.push(fieldPath + ': expected an array');
+      return;
+    }
+
+    const seen = new Set<string>();
+    for (const [index, entry] of value.entries()) {
+      const entryPath = fieldPath + '[' + index + ']';
+      if (!isDiscoveryMap(entry)) {
+        issues.push(entryPath + ': expected a map');
+        continue;
+      }
+      unknownFields(entry, ['name', 'summary', 'schemaRef'], entryPath);
+      const name = requiredString(entry.name, entryPath + '.name');
+      requiredString(entry.summary, entryPath + '.summary');
+      const schemaRef = requiredString(entry.schemaRef, entryPath + '.schemaRef');
+      if (schemaRef !== undefined && !schemaRef.startsWith('#/')) {
+        issues.push(entryPath + '.schemaRef: expected a local JSON pointer starting with \'#/\'');
+      }
+      if (name === undefined) continue;
+      const artifact = declared.get(name);
+      if (artifact === undefined) {
+        issues.push(entryPath + '.name: unknown workflow ' + singular + " '" + name + "'");
+        continue;
+      }
+      if (seen.has(name)) {
+        issues.push(entryPath + '.name: duplicate workflow ' + singular + " '" + name + "'");
+      } else {
+        seen.add(name);
+      }
+      if (artifact.schema === undefined) {
+        issues.push(entryPath + '.schemaRef: workflow ' + singular + " '" + name + "' has no schema");
+      }
+    }
+    for (const name of declared.keys()) {
+      if (!seen.has(name)) issues.push(fieldPath + ': missing workflow ' + singular + " '" + name + "'");
+    }
+  };
+
+  const inputs = new Map(def.inputs.map((input) => [input.name, { schema: input.schema }]));
+  const outputs = new Map(
+    (def.outputs ?? []).map((name) => {
+      const artifact = def.steps.flatMap((step) => [...step.produces, ...(step.generates ?? [])])
+        .find((produce) => produce.stem === name);
+      return [name, { schema: artifact?.schema }];
+    }),
+  );
+  validateInterfaceEntries(interfaceValue.inputs, 'inputs', inputs);
+  validateInterfaceEntries(interfaceValue.outputs, 'outputs', outputs);
+  return issues;
+}
+
 /**
  * Static lint over a workflow definition. Returns both the hard errors from
  * `validateDef` (which `parseDef` / `loadDefFile` would throw on) and
@@ -2106,7 +2216,7 @@ function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
 export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[] } {
   const errors = validateDef(def);
   const warnings = errors.length === 0
-    ? [...deadEndWarnings(def), ...danglingReduceSuffixWarnings(def), ...unroutedCapabilityWarnings(def)]
+    ? [...deadEndWarnings(def), ...danglingReduceSuffixWarnings(def), ...unroutedCapabilityWarnings(def), ...discoveryIssues(def)]
     : [];
   return { errors, warnings };
 }

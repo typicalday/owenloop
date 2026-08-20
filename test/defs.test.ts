@@ -1130,6 +1130,9 @@ test('bodyFile: a contained nested bodyFile still loads (containment does not br
 
 // ---- lintDef -----------------------------------------------------------------
 
+const withoutDiscoveryWarnings = (warnings: string[]): string[] =>
+  warnings.filter((warning) => !warning.startsWith('x.discovery:'));
+
 test('lintDef has no errors for a fully reachable linear chain', () => {
   const { errors, warnings } = lintDef(buildDef({
     name: 'linear',
@@ -1140,7 +1143,7 @@ test('lintDef has no errors for a fully reachable linear chain', () => {
     ],
   }));
   assert.deepEqual(errors, []);
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(withoutDiscoveryWarnings(warnings), []);
 });
 
 test('lintDef flags an unreachable step (its consumed stem has a producer that is unreachable)', () => {
@@ -1223,7 +1226,7 @@ test('lintDef does not warn about a bare (unsuffixed) reduce', () => {
   });
   const { errors, warnings } = lintDef(def);
   assert.deepEqual(errors, []);
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(withoutDiscoveryWarnings(warnings), []);
 });
 
 test('lintDef does not warn about unconsumed outputs on a terminal step', () => {
@@ -1236,7 +1239,7 @@ test('lintDef does not warn about unconsumed outputs on a terminal step', () => 
     ],
   });
   const { warnings } = lintDef(def);
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(withoutDiscoveryWarnings(warnings), []);
 });
 
 test('lintDef does not double-report: a dangling-consume step is not also reported as unreachable', () => {
@@ -1258,7 +1261,200 @@ test('lintDef does not double-report: a dangling-consume step is not also report
 test('lintDef on the delivery example: no errors, no warnings', () => {
   const { errors, warnings } = lintDef(parseDef(delivery));
   assert.deepEqual(errors, []);
+  assert.deepEqual(withoutDiscoveryWarnings(warnings), []);
+});
+
+function validDiscovery(): Record<string, unknown> {
+  return {
+    description: 'Routes an approved change through a small delivery workflow.',
+    whenToUse: ['Deliver an approved repository change.'],
+    notFor: ['Explore an unapproved idea.'],
+    interface: {
+      inputs: [{ name: 'proposal', summary: 'The approved change.', schemaRef: '#/inputs/0/schema' }],
+      outputs: [{ name: 'merge', summary: 'The merged change.', schemaRef: '#/steps/0/produces/0/schema' }],
+    },
+  };
+}
+
+function lintDiscovery(
+  discovery?: unknown,
+  options: { inputSchema?: boolean; outputSchema?: boolean } = {},
+): { errors: string[]; warnings: string[] } {
+  const raw: Record<string, unknown> = {
+    name: 'discovery-fixture',
+    outputs: ['merge'],
+    inputs: [{
+      name: 'proposal',
+      ...(options.inputSchema === false ? {} : { schema: { type: 'string' } }),
+    }],
+    steps: [{
+      name: 'worker',
+      consumes: ['proposal'],
+      produces: [{
+        name: 'merge',
+        ...(options.outputSchema === false ? {} : { schema: { type: 'string' } }),
+      }],
+      terminal: true,
+    }],
+  };
+  if (discovery !== undefined) raw.x = { discovery };
+  return lintDef(buildDef(raw));
+}
+
+test('lintDef warns once when x.discovery is absent', () => {
+  const { errors, warnings } = lintDiscovery();
+  assert.deepEqual(errors, []);
+  assert.deepEqual(warnings, ['x.discovery: missing required discovery metadata']);
+});
+
+test('lintDef accepts a complete x.discovery bag without warnings', () => {
+  const { errors, warnings } = lintDiscovery(validDiscovery());
+  assert.deepEqual(errors, []);
   assert.deepEqual(warnings, []);
+});
+
+test('lintDef reports exact fields for malformed x.discovery data', () => {
+  const cases: Array<{ name: string; discovery: unknown; expected: string; options?: { inputSchema?: boolean; outputSchema?: boolean } }> = [
+    {
+      name: 'discovery unknown field',
+      discovery: { ...validDiscovery(), label: 'wrong' },
+      expected: 'x.discovery.label: unknown field',
+    },
+    {
+      name: 'interface unknown field',
+      discovery: { ...validDiscovery(), interface: { ...validDiscovery().interface as object, label: 'wrong' } },
+      expected: 'x.discovery.interface.label: unknown field',
+    },
+    {
+      name: 'entry unknown field',
+      discovery: {
+        ...validDiscovery(),
+        interface: {
+          ...validDiscovery().interface as object,
+          inputs: [{ ...(validDiscovery().interface as any).inputs[0], label: 'wrong' }],
+        },
+      },
+      expected: 'x.discovery.interface.inputs[0].label: unknown field',
+    },
+    {
+      name: 'discovery is scalar',
+      discovery: 'wrong',
+      expected: 'x.discovery: expected a map',
+    },
+    {
+      name: 'description is list',
+      discovery: { ...validDiscovery(), description: [] },
+      expected: 'x.discovery.description: expected a non-empty string',
+    },
+    {
+      name: 'trigger list is scalar',
+      discovery: { ...validDiscovery(), whenToUse: 'wrong' },
+      expected: 'x.discovery.whenToUse: expected a non-empty array of non-empty strings',
+    },
+    {
+      name: 'anti-trigger list is scalar',
+      discovery: { ...validDiscovery(), notFor: {} },
+      expected: 'x.discovery.notFor: expected a non-empty array of non-empty strings',
+    },
+    {
+      name: 'interface is list',
+      discovery: { ...validDiscovery(), interface: [] },
+      expected: 'x.discovery.interface: expected a map',
+    },
+    {
+      name: 'interface inputs is map',
+      discovery: { ...validDiscovery(), interface: { ...validDiscovery().interface as object, inputs: {} } },
+      expected: 'x.discovery.interface.inputs: expected an array',
+    },
+    {
+      name: 'interface entry is scalar',
+      discovery: { ...validDiscovery(), interface: { ...validDiscovery().interface as object, inputs: ['wrong'] } },
+      expected: 'x.discovery.interface.inputs[0]: expected a map',
+    },
+    {
+      name: 'missing required fields',
+      discovery: {},
+      expected: 'x.discovery.description: expected a non-empty string',
+    },
+    {
+      name: 'empty trigger list',
+      discovery: { ...validDiscovery(), whenToUse: [] },
+      expected: 'x.discovery.whenToUse: expected a non-empty array of non-empty strings',
+    },
+    {
+      name: 'whitespace fields',
+      discovery: {
+        ...validDiscovery(),
+        description: ' ',
+        whenToUse: [' '],
+        notFor: [' '],
+        interface: {
+          ...validDiscovery().interface as object,
+          inputs: [{ name: ' ', summary: ' ', schemaRef: ' ' }],
+        },
+      },
+      expected: 'x.discovery.interface.inputs[0].schemaRef: expected a non-empty string',
+    },
+    {
+      name: 'duplicate input',
+      discovery: {
+        ...validDiscovery(),
+        interface: {
+          ...validDiscovery().interface as object,
+          inputs: [
+            ...(validDiscovery().interface as any).inputs,
+            ...(validDiscovery().interface as any).inputs,
+          ],
+        },
+      },
+      expected: "x.discovery.interface.inputs[1].name: duplicate workflow input 'proposal'",
+    },
+    {
+      name: 'unknown input',
+      discovery: {
+        ...validDiscovery(),
+        interface: {
+          ...validDiscovery().interface as object,
+          inputs: [{ name: 'unknown', summary: 'Unknown input.', schemaRef: '#/inputs/1/schema' }],
+        },
+      },
+      expected: "x.discovery.interface.inputs[0].name: unknown workflow input 'unknown'",
+    },
+    {
+      name: 'missing public output',
+      discovery: { ...validDiscovery(), interface: { inputs: (validDiscovery().interface as any).inputs, outputs: [] } },
+      expected: "x.discovery.interface.outputs: missing workflow output 'merge'",
+    },
+    {
+      name: 'input without schema',
+      discovery: validDiscovery(),
+      options: { inputSchema: false },
+      expected: "x.discovery.interface.inputs[0].schemaRef: workflow input 'proposal' has no schema",
+    },
+    {
+      name: 'output without schema',
+      discovery: validDiscovery(),
+      options: { outputSchema: false },
+      expected: "x.discovery.interface.outputs[0].schemaRef: workflow output 'merge' has no schema",
+    },
+    {
+      name: 'non-local schema ref',
+      discovery: {
+        ...validDiscovery(),
+        interface: {
+          ...validDiscovery().interface as object,
+          outputs: [{ ...(validDiscovery().interface as any).outputs[0], schemaRef: '/steps/0/produces/0/schema' }],
+        },
+      },
+      expected: "x.discovery.interface.outputs[0].schemaRef: expected a local JSON pointer starting with '#/'",
+    },
+  ];
+
+  for (const entry of cases) {
+    const { errors, warnings } = lintDiscovery(entry.discovery, entry.options);
+    assert.deepEqual(errors, [], entry.name);
+    assert.ok(warnings.includes(entry.expected), entry.name + ': ' + warnings.join('; '));
+  }
 });
 
 // ---- invariant parsing tests (§3.1 of the declared-invariants build plan) ---
@@ -1633,7 +1829,7 @@ test('lintDef: terminal: true suppresses all dead-end warnings even when generat
       },
     ],
   }));
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(withoutDiscoveryWarnings(warnings), []);
 });
 
 // ---- outputs: key tests ------------------------------------------------------
@@ -1710,7 +1906,7 @@ test('lintDef: terminal:, generates:, and outputs: exemptions all active simulta
       { name: 'pub', consumes: ['q'], produces: ['summary'], body: '' },
     ],
   }));
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(withoutDiscoveryWarnings(warnings), []);
 });
 
 // Test (d): outputs: entry naming a stem no step produces → hard validateDef error

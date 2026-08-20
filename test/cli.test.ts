@@ -1266,6 +1266,95 @@ test('owenloop lint exits 0 when a def has warnings but no errors', () => {
   assert.deepEqual(warned.errors, []);
 });
 
+test('owenloop lint reports discovery warnings without changing its success exit code', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-discovery-'));
+  writeFileSync(
+    join(dir, 'missing.yaml'),
+    [
+      'name: missing',
+      'inputs:',
+      '  - name: seed',
+      'steps:',
+      '  - name: worker',
+      '    consumes: [seed]',
+      '    produces: [out]',
+      '    terminal: true',
+      '',
+    ].join('\n'),
+  );
+  writeFileSync(
+    join(dir, 'malformed.yaml'),
+    [
+      'name: malformed',
+      'x:',
+      '  discovery:',
+      '    description: []',
+      '    whenToUse: [ship]',
+      '    notFor: [idea]',
+      '    interface:',
+      '      inputs: []',
+      '      outputs: []',
+      'steps:',
+      '  - name: worker',
+      '    produces: [out]',
+      '    terminal: true',
+      '',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: dir });
+  const result = run('lint');
+  assert.equal(result.code, 0);
+  const defs = result.json();
+  assert.deepEqual(defs.find((entry: any) => entry.def === 'missing').warnings, [
+    'x.discovery: missing required discovery metadata',
+  ]);
+  assert.ok(
+    defs.find((entry: any) => entry.def === 'malformed').warnings.includes(
+      'x.discovery.description: expected a non-empty string',
+    ),
+  );
+});
+
+test('owenloop lint has no discovery warning for a complete discovery bag', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-discovery-valid-'));
+  writeFileSync(
+    join(dir, 'complete.yaml'),
+    [
+      'name: complete',
+      'outputs: [out]',
+      'x:',
+      '  discovery:',
+      '    description: Complete discovery fixture.',
+      '    whenToUse: [ship a change]',
+      '    notFor: [brainstorm an idea]',
+      '    interface:',
+      '      inputs:',
+      '        - name: seed',
+      '          summary: Seed value.',
+      '          schemaRef: "#/inputs/0/schema"',
+      '      outputs:',
+      '        - name: out',
+      '          summary: Completed value.',
+      '          schemaRef: "#/steps/0/produces/0/schema"',
+      'inputs:',
+      '  - name: seed',
+      '    schema: { type: string }',
+      'steps:',
+      '  - name: worker',
+      '    consumes: [seed]',
+      '    produces:',
+      '      - name: out',
+      '        schema: { type: string }',
+      '    terminal: true',
+      '',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: dir });
+  const result = run('lint');
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.json(), [{ def: 'complete', errors: [], warnings: [] }]);
+});
+
 test('owenloop lint reports files that fail to parse instead of silently omitting them', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-unparseable-'));
   writeFileSync(
