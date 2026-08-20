@@ -2391,68 +2391,79 @@ export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFin
     }
     edges.set(key, [...children]);
   }
-
-  // A back-edge walk finds only the first loop through a BLACK node. Tarjan's
-  // SCC algorithm instead reports the complete cyclic component, so every def
-  // in overlapping cycles receives the hard authoring error.
-  let nextIndex = 0;
-  const index = new Map<string, number>();
-  const lowlink = new Map<string, number>();
-  const stack: string[] = [];
-  const onStack = new Set<string>();
-  const components: string[][] = [];
-  const visit = (key: string): void => {
-    index.set(key, nextIndex);
-    lowlink.set(key, nextIndex);
-    nextIndex += 1;
-    stack.push(key);
-    onStack.add(key);
-
-    for (const child of edges.get(key) ?? []) {
-      if (!index.has(child)) {
-	visit(child);
-	lowlink.set(key, Math.min(lowlink.get(key)!, lowlink.get(child)!));
-      } else if (onStack.has(child)) {
-	lowlink.set(key, Math.min(lowlink.get(key)!, index.get(child)!));
-      }
-    }
-
-    if (lowlink.get(key) !== index.get(key)) return;
-    const component: string[] = [];
-    for (;;) {
-      const member = stack.pop()!;
-      onStack.delete(member);
-      component.push(member);
-      if (member === key) break;
-    }
-    const members = component.sort((a, b) => order.get(a)! - order.get(b)!);
-    if (members.length > 1 || (edges.get(members[0]!) ?? []).includes(members[0]!)) {
-      components.push(members);
-    }
+  const cycleFingerprint = (cycle: readonly string[]): string => {
+    const members = cycle.slice(0, -1);
+    return members
+      .map((_, index) => [...members.slice(index), ...members.slice(0, index)].join('\u0000'))
+      .sort()[0] ?? '';
   };
 
-  for (const key of keys) if (!index.has(key)) visit(key);
-  components.sort((a, b) => order.get(a[0]!)! - order.get(b[0]!)!);
-
-  const cyclePath = (members: readonly string[]): string[] => {
-    const allowed = new Set(members);
-    const start = members[0]!;
-    const walk = (key: string, path: string[], seen: Set<string>): string[] | undefined => {
+  // Retain the legacy depth-first first cycle as the first finding. Strict
+  // finalizeDefs throws that finding, so this preserves its public error text
+  // and traversal precedence while authoring callers receive every cycle below.
+  const legacyFirstCycle = (): string[] | undefined => {
+    const WHITE = 0, GREY = 1, BLACK = 2;
+    const color = new Map(keys.map((key) => [key, WHITE]));
+    const stack: string[] = [];
+    const visit = (key: string): string[] | undefined => {
+      color.set(key, GREY);
+      stack.push(key);
       for (const child of edges.get(key) ?? []) {
-	if (!allowed.has(child)) continue;
-	if (child === start) return [...path, start];
-	if (seen.has(child)) continue;
-	const found = walk(child, [...path, child], new Set([...seen, child]));
-	if (found !== undefined) return found;
+	const state = color.get(child) ?? WHITE;
+	if (state === GREY) return [...stack.slice(stack.indexOf(child)), child];
+	if (state === WHITE) {
+	  const found = visit(child);
+	  if (found !== undefined) return found;
+	}
       }
+      stack.pop();
+      color.set(key, BLACK);
       return undefined;
     };
-    return walk(start, [start], new Set([start])) ?? [start, start];
+    for (const key of keys) {
+      if ((color.get(key) ?? WHITE) !== WHITE) continue;
+      const found = visit(key);
+      if (found !== undefined) return found;
+    }
+    return undefined;
   };
 
-  return components.map((members) => ({
-    message: `calls cycle: ${cyclePath(members).join(' -> ')}`,
-    members,
+  // Enumerate each simple directed cycle exactly once. A cycle is explored
+  // only from its lowest insertion-order member; restricting descendants to
+  // that order removes rotation duplicates without collapsing overlapping
+  // cycles into one SCC-wide finding.
+  const cycles: string[][] = [];
+  const seenCycles = new Set<string>();
+  for (const start of keys) {
+    const visit = (key: string, path: string[], seen: Set<string>): void => {
+      for (const child of edges.get(key) ?? []) {
+	if (child === start) {
+	  const cycle = [...path, start];
+	  const fingerprint = cycleFingerprint(cycle);
+	  if (!seenCycles.has(fingerprint)) {
+	    seenCycles.add(fingerprint);
+	    cycles.push(cycle);
+	  }
+	  continue;
+	}
+	if (seen.has(child) || order.get(child)! < order.get(start)!) continue;
+	visit(child, [...path, child], new Set([...seen, child]));
+      }
+    };
+    visit(start, [start], new Set([start]));
+  }
+
+  const first = legacyFirstCycle();
+  if (first !== undefined) {
+    const firstFingerprint = cycleFingerprint(first);
+    const firstCycleIndex = cycles.findIndex((cycle) => cycleFingerprint(cycle) === firstFingerprint);
+    if (firstCycleIndex >= 0) cycles.splice(firstCycleIndex, 1);
+    cycles.unshift(first);
+  }
+
+  return cycles.map((cycle) => ({
+    message: `calls cycle: ${cycle.join(' -> ')}`,
+    members: cycle.slice(0, -1),
   }));
 }
 
@@ -2542,7 +2553,7 @@ export function loadDefsUnfinalized(dir: string): Map<string, WorkflowDef> {
  * (each def possibly still carrying `_includes`), it: expands each def's
  * includes; runs the cross-def `calls:` checks (target existence, `callsInputs`
  * key validity, exactly-one child output); runs `validateDef` per expanded def;
- * and finally `detectCallsCycles` over the whole expanded map. Returns the
+ * and finally `reportCallsCycles` over the whole expanded map. Returns the
  * expanded, validated map. Throws `DefError` on the first problem — the same
  * messages, in the same order, the filesystem loader has always produced (this
  * is a pure extraction of what used to live inline in `loadDefs`).

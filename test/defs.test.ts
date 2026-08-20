@@ -2882,21 +2882,43 @@ test('reportCallsCycles attributes self and two-node cycles to every member', ()
   }]);
 });
 
-test('reportCallsCycles attributes every member of overlapping cycles', () => {
+test('reportCallsCycles reports distinct overlapping cycles with matching members', () => {
   const call = (name: string, targets: string[]) => buildDef({
     name,
     outputs: ['result'],
-    steps: targets.map((target, index) => ({ name: `delegate-${index}`, calls: target, produces: ['result'] })),
+    steps: [
+      ...targets.map((target, index) => ({
+	name: `delegate-${index}`,
+	calls: target,
+	produces: [`child-${index}`],
+      })),
+      {
+	name: 'finish',
+	consumes: targets.map((_, index) => `child-${index}`),
+	produces: ['result'],
+	terminal: true,
+      },
+    ],
   });
   // a -> b -> a and a -> c -> b -> a are distinct cycles in one SCC. A
   // back-edge-only traversal can leave c BLACK and falsely report it clean.
   const a = call('a', ['b', 'c']);
   const b = call('b', ['a']);
   const c = call('c', ['b']);
-  assert.deepEqual(reportCallsCycles(new Map([['a', a], ['b', b], ['c', c]])), [{
-    message: 'calls cycle: a -> b -> a',
-    members: ['a', 'b', 'c'],
-  }]);
+  assert.deepEqual(reportCallsCycles(new Map([['a', a], ['b', b], ['c', c]])), [
+    {
+      message: 'calls cycle: a -> b -> a',
+      members: ['a', 'b'],
+    },
+    {
+      message: 'calls cycle: a -> c -> b -> a',
+      members: ['a', 'c', 'b'],
+    },
+  ]);
+  assert.throws(
+    () => finalizeDefs(new Map([['a', a], ['b', b], ['c', c]])),
+    (error: unknown) => error instanceof DefError && error.message === 'calls cycle: a -> b -> a',
+  );
 });
 
 test('loadDefs: calls: inputs key must be a declared child input', () => {
@@ -2949,7 +2971,7 @@ test('loadDefs: calls: inputs key must be a declared child input', () => {
   }
 });
 
-test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
+test('finalizeDefs: A calls B calls A errors with cycle message', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {
     writeFileSync(
@@ -2990,7 +3012,7 @@ test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
   }
 });
 
-test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
+test('finalizeDefs: A calls B (acyclic) passes without error', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {
     writeFileSync(

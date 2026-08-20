@@ -1440,6 +1440,42 @@ test('owenloop lint and check report CAS calls cycles through every selectable a
   }
 });
 
+test('owenloop lint and check attribute overlapping calls cycles to every member', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-overlapping-cycles-'));
+  const calls = (name: string, targets: string[]) => [
+    `name: ${name}`,
+    'outputs: [result]',
+    'steps:',
+    ...targets.flatMap((target, index) => [
+      `  - name: delegate-${index}`,
+      `    calls: ${target}`,
+      `    produces: [child-${index}]`,
+    ]),
+    '  - name: finish',
+    `    consumes: [${targets.map((_, index) => `child-${index}`).join(', ')}]`,
+    '    produces: [result]',
+    '    terminal: true',
+    '',
+  ].join('\n');
+  writeFileSync(join(dir, 'a.yaml'), calls('a', ['b', 'c']));
+  writeFileSync(join(dir, 'b.yaml'), calls('b', ['a']));
+  writeFileSync(join(dir, 'c.yaml'), calls('c', ['b']));
+  const { run } = makeCli({ defs: dir });
+
+  for (const [name, expected] of [
+    ['a', /calls cycle: a -> b -> a/],
+    ['b', /calls cycle: a -> b -> a/],
+    ['c', /calls cycle: a -> c -> b -> a/],
+  ] as const) {
+    const lint = run('lint', name);
+    assert.equal(lint.code, 1, `${name}: ${lint.err}`);
+    assert.match(lint.out, expected, `${name}: ${lint.out}`);
+    const checked = run('check', name);
+    assert.equal(checked.code, 1, `${name}: ${checked.err}`);
+    assert.match(checked.err, expected, `${name}: ${checked.err}`);
+  }
+});
+
 test('owenloop lint exits 0 for clean definitions and prints JSON', () => {
   const { run } = makeCli();
   const r = run('lint');
