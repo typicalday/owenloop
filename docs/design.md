@@ -1372,6 +1372,11 @@ the dataflow fields, the runner reads `x:` — with no allowlist churn as the
 external tooling grows knobs, and no third-party schema leaking into the
 engine's own.
 
+The authoring linter additionally recognizes Owenloop's optional x.discovery
+convention. That narrow, warning-only convention helps catalog tooling describe
+a workflow's purpose and public interface; it does not change the parser's
+opaque-extension contract or make any x value execution-active.
+
 Scope notes: `x:` is a key on the two *authored, engine-fired* shapes
 (`RAW_DEF_KEYS`, `RAW_STEP_KEYS`). It is **not** in the smaller
 `calls:`/`include:` directive shapes (same shape-routing rule as §27.2 —

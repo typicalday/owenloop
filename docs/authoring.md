@@ -92,6 +92,55 @@ steps:
       anything: goes            #   untouched onto the order (Order.x); see design.md §27.3
 ```
 
+## x.discovery — advisory workflow discovery metadata
+
+x.discovery is an Owenloop-owned convention inside the otherwise opaque
+top-level x: map. It lets a person or catalog tool understand what a workflow
+does, when to choose it, when a close-looking workflow is the wrong choice, and
+how to seed/read its public interface:
+
+~~~yaml
+x:
+  discovery:
+    description: >-
+      One non-empty paragraph explaining the workflow in colleague-facing language.
+    whenToUse:
+      - a non-empty trigger phrase
+    notFor:
+      - a non-empty anti-trigger phrase
+    interface:
+      inputs:
+        - name: proposal
+          summary: A non-empty description of the seed value.
+          schemaRef: "#/inputs/0/schema"
+      outputs:
+        - name: merge
+          summary: A non-empty description of the public result.
+          schemaRef: "#/steps/6/produces/0/schema"
+~~~
+
+The bag itself is optional today, so existing definitions remain compatible.
+Its absence is a lint warning, not a loading or execution failure. Once the bag
+is present, all four top-level fields are required: catalog browsing
+(description), positive routing (whenToUse), false-positive avoidance (notFor),
+and usable seeding/result information (interface) answer separate questions. In
+particular, an anti-trigger is not redundant with a trigger: it rules out the
+nearby cases that would otherwise appear to match.
+
+description must be a non-empty string. whenToUse and notFor must each be
+non-empty arrays of non-empty strings. interface.inputs and interface.outputs
+are required arrays, though either can be empty when the workflow genuinely has
+no declared inputs or no public outputs. Each entry must have a non-empty name,
+summary, and schemaRef. The entries cover every declared input and every public
+outputs: name exactly once; no unknown or duplicate names are allowed. Their
+named artifacts must carry schemas. schemaRef is a local JSON Pointer beginning
+#/ to that existing machine schema, not a second copy of the schema.
+
+owenloop lint reports missing or malformed discovery data as field-specific
+warnings. These warnings do not fail lint, loading, packing, publishing, pushing,
+or execution. Other x vocabularies remain opaque and unrestricted; only this
+authoring-lint convention is recognized.
+
 ## `model:` — quality tiers, not vendor ids
 
 The engine never calls a model; `model:` is an opaque string that rides the
