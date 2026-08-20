@@ -910,6 +910,18 @@ function emitAssistant(message: SDKAssistantMessage, onEvent: (e: AgentEvent) =>
   }
 }
 
+/** The reply a user would see from one top-level assistant message. This is
+ * deliberately separate from `emitAssistant`: that function is operational
+ * telemetry, while this value is emitted once at turn end as response evidence. */
+function assistantResponse(message: SDKAssistantMessage): string | undefined {
+  if (message.parent_tool_use_id !== null) return undefined;
+  const text = message.message.content
+    .filter((block): block is Extract<(typeof message.message.content)[number], { type: 'text' }> => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
+  return text === '' ? undefined : text;
+}
+
 /** One progress line per content block of a user message — which on this path
  * means tool results coming back, plus any synthetic user text.
  *
@@ -969,6 +981,7 @@ export async function consumeTurn(
   expectedSessionId?: string,
 ): Promise<TurnOutcome> {
   let sessionId: string | undefined;
+  let finalResponse: string | undefined;
   for await (const message of q) {
     if (message.type === 'system' && message.subtype === 'init') {
       if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
@@ -990,6 +1003,7 @@ export async function consumeTurn(
       });
       onInit?.(sessionId);
     } else if (message.type === 'result') {
+      if (finalResponse !== undefined) onEvent({ kind: 'assistant_response', text: finalResponse });
       if (message.subtype !== 'success') {
         // The contract's channel for "something went wrong that is not a resume
         // failure". Emitted BEFORE turn_ended so a caller reading events in
@@ -1004,6 +1018,7 @@ export async function consumeTurn(
       return { sessionId, sawResult: true };
     } else if (message.type === 'assistant') {
       emitAssistant(message, onEvent);
+      finalResponse = assistantResponse(message) ?? finalResponse;
     } else if (message.type === 'user') {
       emitUser(message, onEvent);
     }

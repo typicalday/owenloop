@@ -283,6 +283,11 @@ test('the recorded RESUME leg replays through deliver, and never re-emits starte
   assert.match(text, /^RES$/m);
   assert.match(text, /^UM$/m);
   assert.match(text, /^ED$/m);
+  assert.deepEqual(
+    second.filter((event) => event.kind === 'assistant_response').map((event) => event.text),
+    ['RESUMED'],
+    'the real adapter emits the completed final response, not the streamed deltas',
+  );
 
   await codexAdapter.stop(ref);
 });
@@ -370,7 +375,7 @@ test('the recorded SDK stream maps the init line, the assistant turn, and turn_e
   assert.deepEqual(outcome, { sessionId: CLAUDE_SESSION, sawResult: true });
   assert.deepEqual(
     events.map((e) => e.kind),
-    ['progress', 'progress', 'turn_ended'],
+    ['progress', 'progress', 'assistant_response', 'turn_ended'],
   );
   assert.ok(
     claudeMessages().some((m) => m.type === 'assistant'),
@@ -390,6 +395,9 @@ test('the recorded SDK stream maps the init line, the assistant turn, and turn_e
   // `undefined=undefined` here rather than as a silent blank in production.
   assert.match(initText, /mcp=\[owenloop=pending\]/);
   assert.match(events[1]?.kind === 'progress' ? events[1].text : '', /^assistant: /);
+  const response = events.find((event) => event.kind === 'assistant_response');
+  assert.ok(response !== undefined && response.kind === 'assistant_response');
+  assert.ok(response.text.length > 0, 'the final top-level SDK response is retained separately from progress');
 });
 
 test('message types outside the mapped set are ignored, not thrown on', async () => {
@@ -533,7 +541,7 @@ test('a failed result emits exited BEFORE turn_ended, carrying the errors', asyn
   // sequence, so the cause must arrive before the turn closes.
   assert.deepEqual(
     events.map((e) => e.kind),
-    ['progress', 'progress', 'exited', 'turn_ended'],
+    ['progress', 'progress', 'assistant_response', 'exited', 'turn_ended'],
   );
   const exited = events.find((e) => e.kind === 'exited');
   assert.equal(exited?.kind === 'exited' ? exited.exitCode : 'wrong kind', null);

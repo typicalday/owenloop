@@ -27,6 +27,7 @@ import {
   codexAdapter,
   isResumeMiss,
   mapNotification,
+  readFinalAssistantResponse,
   readOwenloopMountFailure,
   readTurnCompleted,
   RESUME_UNAVAILABLE_CODE,
@@ -351,6 +352,14 @@ test('B1 the recorded session replays through mapNotification without throwing',
   assert.match(text, /^RES$/m);
   assert.match(text, /^UM$/m);
   assert.match(text, /^ED$/m);
+
+  const responses = entries
+    .filter((entry) => entry.dir === 'in' && entry.frame['method'] === 'item/completed')
+    .flatMap((entry) => {
+      const response = readFinalAssistantResponse('item/completed', entry.frame['params']);
+      return response === undefined ? [] : [response];
+    });
+  assert.deepEqual(responses, ['RESUMED'], 'only completed final-answer items are response evidence');
 });
 
 test('B9 the recording drove the REAL owenloop mount, tools and all', () => {
@@ -521,6 +530,7 @@ test('B6 mapNotification is total — unknown shapes never throw', () => {
       'never/heard/of/this',
     ]) {
       assert.doesNotThrow(() => mapNotification(method, params));
+      assert.doesNotThrow(() => readFinalAssistantResponse(method, params));
       assert.doesNotThrow(() => readTurnCompleted(method, params));
       assert.doesNotThrow(() => readOwenloopMountFailure(method, params));
     }
@@ -1271,7 +1281,7 @@ function handle(m) {
       }
       return;
     case 'thread/start':
-      send({ id: m.id, result: { thread: { id: THREAD, sessionId: THREAD } } });
+      send({ id: m.id, result: { thread: { id: THREAD, sessionId: THREAD }, model: 'stub-selected-model' } });
       return;
     case 'turn/start':
       // The ACK, exactly as recorded: the turn is created, not finished.
@@ -1626,6 +1636,7 @@ test('D6 a MID-TURN stop interrupts the live turn, and start resolves through it
   assert.ok(startedEvent !== undefined && startedEvent.kind === 'started');
   const ref = startedEvent.ref;
   assert.equal(ref.token, STUB_THREAD);
+  assert.equal(startedEvent.model, 'stub-selected-model', 'thread/start must surface the provider-selected model');
 
   await codexAdapter.stop(ref);
 

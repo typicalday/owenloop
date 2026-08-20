@@ -580,6 +580,22 @@ export function readTurnCompleted(method: string, params: unknown): TurnOutcome 
 }
 
 /**
+ * Read the final user-visible assistant reply from an app-server notification.
+ *
+ * Deltas are deliberately not used: they are incomplete transport fragments and
+ * can coexist with reasoning, tool output, and other intermediate telemetry.
+ * The completed `agentMessage` is the app-server's assembled final answer.
+ */
+export function readFinalAssistantResponse(method: string, params: unknown): string | undefined {
+  if (method !== 'item/completed') return undefined;
+  const item = asMap(asMap(params)['item']);
+  if ((str(item['type']) ?? str(item['itemType'])) !== 'agentMessage') return undefined;
+  if (str(item['phase']) !== 'final_answer') return undefined;
+  const text = str(item['text']);
+  return text === undefined || text === '' ? undefined : text;
+}
+
+/**
  * Map one server→client notification to an `AgentEvent`.
  *
  * PURE and TOTAL — this is the function the recorded fixture replays through, so
@@ -780,6 +796,8 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
       const mounted = readOwenloopMountFailure(method, params);
       const event = mapNotification(method, params);
       if (event !== undefined) onEvent(event);
+      const finalResponse = readFinalAssistantResponse(method, params);
+      if (finalResponse !== undefined) onEvent({ kind: 'assistant_response', text: finalResponse });
 
       if (mounted !== undefined) {
         // A silent dead order otherwise: with no `submit` tool the agent can
@@ -1315,6 +1333,7 @@ export const codexAdapter: HarnessAdapter = {
     const { client, reportExit } = await openClient(args.cwd, onEvent, gate, args.approvals);
 
     let threadId: string;
+    let reportedModel: string | undefined;
     try {
       const res = await client.request<Record<string, unknown>>(
         'thread/start',
@@ -1324,6 +1343,10 @@ export const codexAdapter: HarnessAdapter = {
       const id = str(asMap(res['thread'])['id']);
       if (id === undefined) throw new Error('thread/start returned no thread id');
       threadId = id;
+      // The app-server resolves an omitted model to the actual session model in
+      // this response. Surface it with the durable session reference so callers
+      // can attribute measurements without scraping persisted Codex state.
+      reportedModel = str(res['model']);
     } catch (err) {
       // No token exists yet, so there is nothing to hand back and nothing to
       // invent. Report, tear down, reject.
@@ -1339,7 +1362,7 @@ export const codexAdapter: HarnessAdapter = {
     SESSIONS.set(threadId, session);
     // BEFORE the turn runs and before resolving: the caller persists the token
     // on this event, so a mid-turn crash still leaves a resumable record.
-    onEvent({ kind: 'started', ref });
+    onEvent({ kind: 'started', ref, ...(reportedModel === undefined ? {} : { model: reportedModel }) });
 
     try {
       await runTurn(

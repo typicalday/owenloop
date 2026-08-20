@@ -57,9 +57,18 @@ export interface HarnessSessionRef {
  * adapter that stops emitting says nothing about whether the work was accepted.
  */
 export type AgentEvent =
-  | { kind: 'started'; ref: HarnessSessionRef }
+  | {
+      kind: 'started';
+      ref: HarnessSessionRef;
+      /** Provider-selected model when the session-start response exposes it. */
+      model?: string;
+    }
   /** Optional log line. Adapters may emit none; nothing may depend on it. */
   | { kind: 'progress'; text: string }
+  /** The completed top-level assistant reply, assembled by the owning adapter.
+   * Unlike `progress`, this is suitable for a caller that explicitly needs the
+   * final response rather than transport, tool, reasoning, or stderr telemetry. */
+  | { kind: 'assistant_response'; text: string }
   /** The harness surfaced a blocking question. Phase 1 defines the EVENT only —
    *  this contract has no reply channel, and adding one is Phase 3/4's call. */
   | { kind: 'needs_input'; question: string }

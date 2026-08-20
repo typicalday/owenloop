@@ -642,6 +642,13 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       case 'progress':
         opts.err(`owenloop work agent-run: ${e.text}`);
         return;
+      case 'assistant_response':
+        // The eval uses this typed event as report evidence. Regular work must
+        // not persist this additional unbounded copy merely because an adapter
+        // surfaced it. Existing adapter-owned, capped progress telemetry remains
+        // unchanged and is still logged by the `progress` case above.
+        opts.err('owenloop work agent-run: final response evidence received (redacted)');
+        return;
       case 'needs_input':
         opts.err(
           `owenloop work agent-run: WARNING the step agent asked for input and this contract has no reply channel — ${e.question}`,
