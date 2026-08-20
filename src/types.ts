@@ -969,6 +969,14 @@ export interface CheckReport {
   /** Which bounds were hit, for honest reporting. */
   boundsHit: ('maxDepth' | 'maxStates')[];
   /**
+   * True when the search expanded at least one reachable `emit-seal` outcome.
+   * This describes the search shape, not a BFS stop condition, and does not
+   * contribute to `bounded`.
+   */
+  collectionCapApplied: boolean;
+  /** Effective per-seal member-count cap, including the default when unspecified. */
+  maxCollectionSize: number;
+  /**
    * Reachable non-done states with zero eligible firings that have NO path to
    * completion even at unlimited attempts — i.e. recomputing eligibility with
    * all freezes lifted (a human `retry` = unlimited attempts) STILL yields

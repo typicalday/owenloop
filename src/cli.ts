@@ -2338,6 +2338,12 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out(`SEARCH INCOMPLETE — bounds hit: ${report.boundsHit.join(', ')}`);
         io.out('Verdicts apply only within the explored region.');
       }
+	if (report.collectionCapApplied) {
+	  io.out('');
+	  io.out(
+	    `COLLECTION CAP APPLIED — --max-collection ${report.maxCollectionSize} limited each emit/seal fork to 0..${report.maxCollectionSize} members.`,
+	  );
+	}
       if (report.stallStates.length > 0) {
         io.out('');
         io.out(`Stall states (expected — maxAttempts / human-escalation brakes) (${report.stallStates.length}):`);
