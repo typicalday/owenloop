@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -198,6 +200,81 @@ test('selected winners, explicit pins, runtime pins, and transitive bundle locks
   const lockedPlan = plan({ projectRoot: childV1.root, keep: 1 });
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV1.digest), false);
   assert.equal(lockedPlan.report.objects.some((object) => object.digest === childV2.digest), false);
+});
+
+test('same-root planning and HOME-unavailable CLI preserve fixed-point exact locks', async () => {
+  const cwd = tempDir('owenloop-gc-same-root-');
+  const root = join(cwd, 'workflows');
+  const callsWorkflow = (name: string, target: string) => [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: invoke',
+    `    calls: ${target}`,
+    '    inputs:',
+    '      seed: seed',
+    '    produces: [done]',
+    'outputs: [done]',
+    '',
+  ].join('\n');
+
+  const leafV1 = await installVersion({ name: 'leaf', version: '1.0.0', root });
+  const leafV2 = await installVersion({ name: 'leaf', version: '2.0.0', root });
+  const leafOldTarget = 'leaf/leaf@1.0.0';
+  const leafCurrentTarget = 'leaf/leaf@2.0.0';
+  const middleV1 = await installVersion({
+    name: 'middle',
+    version: '1.0.0',
+    root,
+    workflow: callsWorkflow('middle', leafOldTarget),
+    lock: { [leafOldTarget]: leafV1.digest },
+  });
+  await installVersion({
+    name: 'middle',
+    version: '2.0.0',
+    root,
+    workflow: callsWorkflow('middle', leafCurrentTarget),
+    lock: { [leafCurrentTarget]: leafV2.digest },
+  });
+  const middleOldTarget = 'middle/middle@1.0.0';
+  await installVersion({
+    name: 'parent',
+    version: '1.0.0',
+    root,
+    workflow: callsWorkflow('parent', middleOldTarget),
+    lock: { [middleOldTarget]: middleV1.digest },
+  });
+
+  const dry = plan({ projectRoot: root, globalRoot: root, keep: 1 }).report;
+  assert.equal(dry.objects.some((object) => object.digest === middleV1.digest), false);
+  assert.equal(dry.objects.some((object) => object.digest === leafV1.digest), false);
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--keep', '1', '--yes'], {
+    cwd,
+    env: {
+      HOME: undefined,
+      USERPROFILE: undefined,
+      OWENLOOP_DB: join(cwd, 'missing-state.db'),
+    },
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+  });
+  assert.equal(code, 0, err.join('\n'));
+  const applied = JSON.parse(out.join('\n')) as { objects: Array<{ digest: string }> };
+  assert.equal(applied.objects.some((object) => object.digest === middleV1.digest), false);
+  assert.equal(applied.objects.some((object) => object.digest === leafV1.digest), false);
+
+  const registrations = loadCasDefs({ globalRoot: root, warn: () => {} });
+  const defs = finalizeDefs(new Map(registrations.map((registration) => [registration.key, registration.def])));
+  const parent = defs.get('parent/parent@1.0.0');
+  assert.ok(parent);
+  const middle = resolveCallsTarget(defs, middleOldTarget, parent);
+  assert.equal(middle?.bundleDigest, middleV1.digest);
+  assert.equal(resolveCallsTarget(defs, leafOldTarget, middle!)?.bundleDigest, leafV1.digest);
 });
 
 test('bundle install refuses a locked multi-workflow coordinate with no callable default before mutation', async () => {
@@ -978,6 +1055,7 @@ test('failed parked-object removal keeps durable evidence for the next project G
   const globalRoot = emptyRoot();
   const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
   let parkedObject: string | undefined;
+  let removedEntry: string | undefined;
 
   await assert.rejects(
     collectWorkflowStoreGarbage({
@@ -990,6 +1068,12 @@ test('failed parked-object removal keeps durable evidence for the next project G
       hooks: {
 		removeParkedObject: (path) => {
 		  parkedObject = path;
+		  chmodSync(path, 0o755);
+		  const victim = readdirSync(path)
+			.find((entry) => lstatSync(join(path, entry)).isFile());
+		  assert.ok(victim, 'fixture has a regular file to remove before the injected failure');
+		  removedEntry = join(path, victim);
+		  rmSync(removedEntry, { force: true });
 		  throw new Error('injected parked-object removal failure');
 		},
       },
@@ -999,6 +1083,9 @@ test('failed parked-object removal keeps durable evidence for the next project G
 
   assert.ok(parkedObject);
   assert.equal(existsSync(parkedObject), true);
+  assert.ok(removedEntry);
+  assert.equal(existsSync(removedEntry), false, 'the first cleanup attempt removed part of the bundle');
+  assert.notEqual(lstatSync(parkedObject).mode & 0o200, 0, 'partial cleanup left the doomed tree writable');
   assert.equal(existsSync(gcJournal), true, 'failed cleanup retains its authenticated retry evidence');
   const unrelated = join(installed.root, '.owenloop-staging', 'unrelated', 'keep.txt');
   mkdirSync(dirname(unrelated), { recursive: true });

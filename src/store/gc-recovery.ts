@@ -238,14 +238,10 @@ export function recoverInterruptedWorkflowStoreGc(args: WorkflowStoreGcRecoveryA
 		fsyncWorkflowStoreDirectory(dirname(live));
 		verifyWorkflowObjectSync(live, journal.digest, { coordinateRepair: false });
 	} else {
-		// Only an index-absent digest is corroborated as doomed.
-		restoreAndVerify(parked, journal);
-		fsyncWorkflowStoreDirectory(stagingRoot);
-		fsyncWorkflowStoreDirectory(dirname(live));
-	}
-	if (!indexed) {
-		// Keep the journal until the authenticated parked path and its directory
-		// entry are durably gone. A failed removal therefore remains retryable.
+		// The journal authenticates this contained parked path, and the committed
+		// index proves it is doomed. A prior deletion attempt may already have
+		// removed files or made directories writable, so never require the debris
+		// to remain a complete, hardened bundle before retrying its removal.
 		rmRecursiveForce(parked);
 		fsyncWorkflowStoreDirectory(stagingRoot);
 	}

@@ -418,6 +418,20 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
 
   /** Retain target state only when the non-target root cannot satisfy an exact lock edge itself. */
   const preserveDependency = (parent: DefDigest, coordinate: string, digest: DefDigest): void => {
+    if (sameRoot) {
+      if (!entryMatches(targetIndex, coordinate, digest) || !targetObjects.has(digest)) {
+		throw new Error(
+		  `workflow-store bundle ${parent} locks '${coordinate}' to ${digest}, ` +
+			'but no exact callable coordinate with verified bytes is installed',
+		);
+      }
+      // There is no independent non-target copy in single-root mode. Queueing
+      // only its dependencies would let this exact coordinate/object itself be
+      // pruned before the fixed-point walk reaches its children.
+      requireTargetDigest(digest, `bundle ${parent} lock '${coordinate}'`);
+      return;
+    }
+
     const nonTargetSelfSufficient = args.level === 'project'
       ? entryMatches(globalIndex, coordinate, digest) && globalObjects.has(digest)
       : entryMatches(projectIndex, coordinate, digest) && projectObjects.has(digest);
