@@ -2961,6 +2961,12 @@ toolset. Each baseline tool's result is the hub REST response unchanged as one
 text block; a non-2xx response comes back as an error result. The
 `pending-gates` CLI command likewise prints the hub response unchanged.
 
+Every `tools/call` validates its arguments against the input schema advertised
+by `tools/list` before the tool handler runs. An omitted `arguments` member is
+treated as `{}`; when supplied, `arguments` must be an object and must satisfy
+the registered schema. A mismatch returns JSON-RPC `-32602` (`INVALID_PARAMS`)
+and makes no hub request.
+
 | tool | what it does |
 |---|---|
 | `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances; optional `serve_capabilities` accepts raw advertised keys |
