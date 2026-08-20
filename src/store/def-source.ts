@@ -103,11 +103,23 @@ interface LoadedObject {
 	manifest: BundleManifest;
 	defs: Map<string, WorkflowDef>;
 	level: ResolutionLevel;
+	objectRoot: string;
 }
 
 interface ReadIndexResult {
 	entries: IndexedCoordinate[];
 	complete: boolean;
+}
+
+function setBundleStoreRoots(def: WorkflowDef, roots: string[]): void {
+	// This is live loader provenance, not definition content. Keep it available
+	// to snapshot writers without changing hashDef or the persisted snapshot.
+	Object.defineProperty(def, 'bundleStoreRoots', {
+		value: roots,
+		writable: true,
+		configurable: true,
+		enumerable: false,
+	});
 }
 
 function failureMessage(error: unknown): string {
@@ -142,6 +154,7 @@ function readIndexedCoordinates(
 
 /** Load and verify every definition in one immutable object. */
 function loadObjectDefs(
+	root: string,
 	objectDir: string,
 	bundleDigest: DefDigest,
 	level: ResolutionLevel,
@@ -170,7 +183,7 @@ function loadObjectDefs(
 			def.bundleLock = { ...manifest.lock };
 			defs.set(def.name, def);
 		}
-		return { bundleDigest, manifest, defs, level };
+		return { bundleDigest, manifest, defs, level, objectRoot: root };
 	} catch (error) {
 		if (isRuntimeIncompatible(error)) {
 			throw new CasRuntimeIncompatibleError(failureMessage(error));
@@ -191,7 +204,7 @@ function loadObjectIfPresent(
 			if (probeObjectDir(objectDir, digest, level) !== 'dir') {
 				throw new CasObjectAbsentDuringCoordinatedRead();
 			}
-			return loadObjectDefs(objectDir, digest, level);
+			return loadObjectDefs(root, objectDir, digest, level);
 		});
 	} catch (error) {
 		if (error instanceof CasObjectAbsentDuringCoordinatedRead) return undefined;
@@ -442,6 +455,17 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 			const alreadyRegistered = registeredObjects.get(loaded.bundleDigest);
 			if (alreadyRegistered?.indexedLevel !== 'project') {
 				registeredObjects.set(loaded.bundleDigest, { loaded, indexedLevel: indexed.level });
+			}
+			// Snapshot writers must coordinate with every store root that can affect
+			// this digest's discoverability. This includes the index that named it
+			// and, for project exact-digest fallback, the global root that supplied
+			// its verified bytes.
+			for (const def of loaded.defs.values()) {
+				setBundleStoreRoots(def, [...new Set([
+					...(def.bundleStoreRoots ?? []),
+					indexed.root,
+					loaded.objectRoot,
+				])].sort(compareStoreText));
 			}
 			if (target === undefined) {
 				if (indexed.registerAlias) {

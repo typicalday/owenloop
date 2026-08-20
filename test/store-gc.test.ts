@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import {
   existsSync,
@@ -83,6 +84,16 @@ async function installThree(): Promise<{
 
 function emptyRoot(): string {
   return tempDir('owenloop-gc-empty-');
+}
+
+const barrierWord = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+function waitForPath(path: string, label: string, timeoutMs = 5_000): void {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    Atomics.wait(barrierWord, 0, 0, 10);
+  }
 }
 
 function plan(args: {
@@ -258,6 +269,97 @@ test('bundle GC --yes removes exactly an unchanged dry run and strict loading st
   const remaining = readWorkflowStoreIndex(storeIndexPath(installed.root));
   assert.deepEqual(Object.keys(remaining.entries), ['widget/widget@2.0.0']);
   assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+});
+
+test('GC excludes a two-connection stale snapshot writer from the scan-to-delete window', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const controlDir = tempDir('owenloop-gc-snapshot-barrier-');
+  const dbPath = join(controlDir, 'state.db');
+  const readyPath = join(controlDir, 'ready');
+  const attemptPath = join(controlDir, 'attempt');
+  const resultPath = join(controlDir, 'result.json');
+  const target = 'widget/widget@1.0.0';
+  const childScript = `
+    const { writeFileSync } = await import('node:fs');
+    const { Engine } = await import(${JSON.stringify(new URL('../src/engine.ts', import.meta.url).href)});
+    const { openStore } = await import(${JSON.stringify(new URL('../src/store.ts', import.meta.url).href)});
+    const { loadCasDefs } = await import(${JSON.stringify(new URL('../src/store/index.ts', import.meta.url).href)});
+    const registrations = loadCasDefs({
+      projectRoot: process.env.GC_PROJECT_ROOT,
+      globalRoot: process.env.GC_GLOBAL_ROOT,
+      warn: () => {},
+    });
+    const defs = new Map(registrations.map((registration) => [registration.key, registration.def]));
+    const store = openStore(process.env.GC_DB_PATH);
+    const engine = new Engine(store, (name) => {
+      const def = defs.get(name);
+      if (def === undefined) throw new Error('missing stale test definition ' + name);
+      return def;
+    });
+    writeFileSync(process.env.GC_READY_PATH, 'ready');
+    await new Promise((resolve) => process.stdin.once('data', resolve));
+    writeFileSync(process.env.GC_ATTEMPT_PATH, 'attempt');
+    try {
+      const workflow = engine.createInstance(process.env.GC_TARGET);
+      writeFileSync(process.env.GC_RESULT_PATH, JSON.stringify({ ok: true, workflow }));
+    } catch (error) {
+      writeFileSync(process.env.GC_RESULT_PATH, JSON.stringify({
+		ok: false,
+		error: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      store.close();
+    }
+  `;
+  const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '--eval', childScript], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      GC_PROJECT_ROOT: installed.root,
+      GC_GLOBAL_ROOT: globalRoot,
+      GC_DB_PATH: dbPath,
+      GC_READY_PATH: readyPath,
+      GC_ATTEMPT_PATH: attemptPath,
+      GC_RESULT_PATH: resultPath,
+      GC_TARGET: target,
+    },
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  let childError = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => { childError += chunk; });
+  const childDone = new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`snapshot writer exited ${String(code)}/${String(signal)}: ${childError}`));
+    });
+  });
+
+  waitForPath(readyPath, 'stale snapshot writer to load its definition');
+  const applied = await collectWorkflowStoreGarbage({
+    projectRoot: installed.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => readRuntimeSnapshotBundlePins(dbPath),
+    hooks: {
+      afterSnapshotPinsRead: () => {
+		child.stdin.write('commit\n');
+		waitForPath(attemptPath, 'second connection to attempt its snapshot');
+      },
+    },
+  });
+  child.stdin.end();
+  await childDone;
+
+  assert.ok(applied.objects.some((object) => object.digest === installed.digests['1.0.0']));
+  const result = JSON.parse(readFileSync(resultPath, 'utf8')) as { ok: boolean; error?: string };
+  assert.equal(result.ok, false, 'the stale snapshot must not commit after GC wins the shared lock');
+  assert.match(result.error ?? '', /no longer indexed with verified object bytes/u);
+  assert.deepEqual(readRuntimeSnapshotBundlePins(dbPath), [], 'the second SQLite connection landed no snapshot row');
 });
 
 test('project and global GC mutate only the selected target root', async () => {

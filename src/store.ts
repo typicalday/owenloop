@@ -16,7 +16,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { lstatSync } from 'node:fs';
 import { detId, nowMs } from './util.ts';
-import { compareStoreText, isDefDigest } from './store/types.ts';
+import { compareStoreText, defDigest, isDefDigest } from './store/types.ts';
+import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
 import type {
   Acceptance,
   ArtifactData,
@@ -563,6 +564,7 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
 
 export class Store {
   readonly db: DatabaseSync;
+  private readonly activeSnapshotDigests = new Set<string>();
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
@@ -774,6 +776,35 @@ export class Store {
     }
   }
 
+  /**
+   * Persist one or more CAS-backed definition snapshots under the same
+   * workflow-store lock used by install and GC. Reachability is revalidated
+   * before `BEGIN IMMEDIATE`; the guarded digest set then authorizes only the
+   * low-level snapshot writes performed by this transaction.
+   */
+  txWithWorkflowSnapshots<T>(snapshots: WorkflowDef | readonly WorkflowDef[], fn: () => T): T {
+    const defs = Array.isArray(snapshots) ? snapshots : [snapshots];
+    return withWorkflowSnapshotStoreGuard(defs, (guardedDigests) => {
+      for (const digest of guardedDigests) this.activeSnapshotDigests.add(digest);
+      try {
+				return this.tx(fn);
+      } finally {
+				for (const digest of guardedDigests) this.activeSnapshotDigests.delete(digest);
+      }
+    });
+  }
+
+  private assertWorkflowSnapshotGuard(snapshot: WorkflowDef | undefined): void {
+    if (snapshot?.bundleDigest === undefined || (snapshot.bundleStoreRoots?.length ?? 0) === 0) return;
+    const digest = defDigest(snapshot.bundleDigest);
+    if (!this.activeSnapshotDigests.has(digest)) {
+      throw new Error(
+				`refusing uncoordinated workflow snapshot write for bundle ${digest}: ` +
+					'use txWithWorkflowSnapshots so bundle GC cannot race the commit',
+      );
+    }
+  }
+
   // -- meta --------------------------------------------------------------------
 
   getMeta(k: string): string | undefined {
@@ -791,6 +822,7 @@ export class Store {
   // -- workflow ----------------------------------------------------------------
 
   insertWorkflow(id: string, data: WorkflowData, producedBy?: { parentWf: string; parentPath: string }): WorkflowRow {
+    this.assertWorkflowSnapshotGuard(data.defSnapshot);
     const at = nowMs();
     this.db
       .prepare(
@@ -820,6 +852,7 @@ export class Store {
    * decide what "drift" means, it just persists what the engine computed.
    */
   repinWorkflowDef(id: string, snapshot: WorkflowDef, hash: string): void {
+    this.assertWorkflowSnapshotGuard(snapshot);
     this.db
       .prepare('UPDATE workflow SET def_snapshot = ?, def_hash = ? WHERE id = ?')
       .run(JSON.stringify(snapshot), hash, id);

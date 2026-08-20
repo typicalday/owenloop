@@ -268,6 +268,12 @@ test('WS-6 loader: every CAS workflow is registered qualified, carries provenanc
     assert.equal(r.bundlePackage, 'parent');
     assert.equal(r.def.bundleDigest, digest, 'the def itself carries the digest the resolver reads');
     assert.equal(r.def.bundlePackage, 'parent');
+		assert.deepEqual(r.def.bundleStoreRoots, [root], 'snapshot writers inherit the canonical store root');
+		assert.equal(
+			Object.prototype.propertyIsEnumerable.call(r.def, 'bundleStoreRoots'),
+			false,
+			'live store provenance does not alter hashes or persisted snapshots',
+		);
     assert.equal(r.key.includes('/'), true, 'every registered key contains "/"');
   }
 
@@ -470,6 +476,11 @@ test('WS-6 missing project bytes fall back only to the exact digest indexed glob
   assert.ok(alias);
   assert.equal(alias.bundleDigest, project.digest);
   assert.equal(alias.level, 'global', 'verified bytes came from the exact-digest global fallback');
+	assert.deepEqual(
+		alias.def.bundleStoreRoots,
+		[global.root, project.root].sort(),
+		'the writer locks both the naming project index and the global object store',
+	);
 });
 
 test('WS-6 a corrupt project object is never masked by a same-coordinate global decoy', async () => {

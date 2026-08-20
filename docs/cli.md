@@ -161,7 +161,10 @@ and lock dependency in retained local workflow snapshots, transitive
 project index. An all-non-SemVer candidate group is kept in full rather than
 given an invented order. Multi-workflow bundles and multiple coordinates for
 one digest are retained or collected atomically. Malformed indexes, objects,
-links, special files, or snapshots fail closed before deletion.
+links, special files, or snapshots fail closed before deletion. Runtime
+snapshot writers share the target store's writer lock and revalidate CAS
+reachability before beginning SQLite, so GC either sees the committed pin or a
+writer holding a stale definition is refused and must reload.
 
 `pack` requires a source directory containing root `bundle.yaml` and every
 workflow path listed by the manifest's `workflows` map. The source manifest is

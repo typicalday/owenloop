@@ -748,6 +748,15 @@ export interface WorkflowDef {
    */
   bundleDigest?: string;
   /**
+   * @internal Store roots whose indexes/objects made `bundleDigest`
+   * discoverable. Snapshot writers acquire every root's writer lock and
+   * revalidate reachability before persisting this def, so GC cannot remove a
+   * bundle between the loader read and the runtime snapshot commit. Set only
+   * by `loadCasDefs`; absent on ordinary filesystem or embedded definitions,
+   * and deliberately non-enumerable so it is not hashed or persisted.
+   */
+  bundleStoreRoots?: string[];
+  /**
    * @internal WS-6 CAS provenance: a COPY of the containing bundle manifest's
    * `lock` map (explicit `namespace/name@version` reference text → the canonical
    * bundle digest that reference is pinned to). Carried on the def so the

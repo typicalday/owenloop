@@ -325,7 +325,10 @@ The default keep count is 2 (current plus one rollback version). GC preserves
 selected versions, explicit pins, retained local instance snapshots, transitive
 bundle locks, and project-index references into the global store. It never
 contacts the hub and mutates only the explicitly targeted root; `--yes` is the
-only destructive switch.
+only destructive switch. CAS-backed instance creation, child creation, and
+adoption share the store writer lock with GC and revalidate the digest before
+their SQLite snapshot transaction, so a stale definition cannot be pinned
+during or immediately after collection.
 
 Bundle installs fail closed without their two required adapters (bundle
 ingestion and pre-commit verification). The default CLI binds the real

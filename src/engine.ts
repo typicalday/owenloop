@@ -526,7 +526,7 @@ export class Engine {
   createInstance(defName: string, opts: CreateOpts = {}): string {
     const def = this.resolveDef(defName);
     const id = randId('wf');
-    this.store.tx(() => this.createInstanceInTx(defName, def, id, opts));
+    this.store.txWithWorkflowSnapshots(def, () => this.createInstanceInTx(defName, def, id, opts));
     this.fire({ type: 'instance', workflow: id, def: defName });
     this.fireSettled(id);
     return id;
@@ -638,8 +638,10 @@ export class Engine {
     // gate advance landed" (discard). Pure computation over the already-fetched
     // `parentArts` — no extra in-tx store read (E2 busy_timeout GOTCHA-safe).
     let seenGateFp: Fingerprint | undefined;
-    const run = (): { childId: string; created: boolean; provided: string[] } | null =>
-      this.store.tx(() => {
+    type ProvisionResult = { childId: string; created: boolean; provided: string[] } | null;
+    const needsSnapshot = Symbol('needs-workflow-snapshot');
+    let snapshotDef: WorkflowDef | undefined;
+    const transactionBody = (): ProvisionResult | typeof needsSnapshot => {
         // 1. FRESH parent snapshot — re-read inside the write lock; never trust
         //    the caller's STEP-1 map.
         const parentArts = this.artMap(parentWf);
@@ -668,13 +670,18 @@ export class Engine {
         let created = false;
         let childDef: WorkflowDef;
         if (!child) {
+			// Resolving a new child's CAS def must happen before its coordinated
+			// transaction acquires SQLite. Return a read-only sentinel on the
+			// first pass; `run` resolves, locks/revalidates the bundle store, and
+			// then repeats every gate/child read under the guarded write tx.
+			if (snapshotDef === undefined) return needsSnapshot;
           const childId = randId('wf');
           // WS-6: resolve IN THE PARENT'S SCOPE. `parentDef` is the parent's own
           // §28 pin (defFor prefers `defSnapshot` over the live resolver), so a
           // bare `calls:` from a def installed out of a CAS bundle binds to that
           // same bundle's workflow — the version the parent was pinned against —
           // and not to whatever a later install happened to name the same thing.
-          childDef = this.resolveDef(step.calls!, parentDef);
+			childDef = snapshotDef;
           // WS-6: and the resolved child must still be the PINNED one. See
           // `callsPinViolation`.
           const violation = callsPinViolation(parentDef, childDef, step.calls!);
@@ -732,7 +739,20 @@ export class Engine {
         if (created || provided.length > 0) this.settle(child.id, childDef, now);
 
         return { childId: child.id, created, provided };
-      });
+    };
+    const transact = (): ProvisionResult | typeof needsSnapshot => snapshotDef === undefined
+      ? this.store.tx(transactionBody)
+      : this.store.txWithWorkflowSnapshots(snapshotDef, transactionBody);
+    const run = (): ProvisionResult => {
+      let result = transact();
+      if (result !== needsSnapshot) return result;
+      // Resolve optimistically outside both locks. The snapshot guard then
+      // revalidates this CAS provenance under add.lock before SQLite begins.
+      snapshotDef = this.resolveDef(step.calls!, parentDef);
+      result = transact();
+      if (result === needsSnapshot) throw new Error('internal error: guarded child provision requested no snapshot');
+      return result;
+    };
 
     try {
       return run();
@@ -807,7 +827,7 @@ export class Engine {
     const freshDef = this.resolveDef(wf.def);
     const newHash = hashDef(freshDef);
     const previousHash = wf.defHash;
-    this.store.tx(() => {
+    this.store.txWithWorkflowSnapshots(freshDef, () => {
       this.store.repinWorkflowDef(workflow, freshDef, newHash);
       this.settle(workflow, freshDef);
     });

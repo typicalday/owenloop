@@ -97,6 +97,7 @@ export interface CollectWorkflowStoreGcArgs {
   recoveryMarkerDir?: string;
   /** Narrow failure-injection seams for commit-order regression tests. */
   hooks?: {
+    afterSnapshotPinsRead?: () => void;
     afterIndexWrite?: () => void;
     removeParkedObject?: (path: string) => void;
   };
@@ -429,12 +430,14 @@ export async function collectWorkflowStoreGarbage(
       rmRecursiveForce(stagingRoot);
     }
 
+    const snapshotPins = args.readSnapshotPins();
+    args.hooks?.afterSnapshotPinsRead?.();
     const plan = planWorkflowStoreGc({
       projectRoot,
       globalRoot,
       level: args.level,
       keep: args.keep,
-      snapshotPins: args.readSnapshotPins(),
+      snapshotPins,
     });
     const currentIndex = readWorkflowStoreIndex(storeIndexPath(targetRoot));
     if (serializeWorkflowStoreIndex(currentIndex) !== serializeWorkflowStoreIndex(plan.nextIndex)) {
