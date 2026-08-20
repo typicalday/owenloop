@@ -273,12 +273,24 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     assert.ok(firstResponse.events.some((event) => event.type === 'dispatched'), JSON.stringify(firstResponse));
 
     const secondNext = runCli(['shift', 'next', '--wait', '90', '--state-dir', stateDir]);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    // Also the guard on which records may reach the socket: a shift that is
-    // merely FULL has nothing to report to a parked client, and a `capacity`
-    // record queued here would satisfy this call instantly. That record is
-    // file-only for exactly this reason — see FILE_ONLY_EVENTS in runtime.ts.
-    assert.equal(secondNext.child.exitCode, null, 'the second terminal next must park while no event is available');
+    // The exact overlap result proves secondNext owns the daemon's single
+    // parked slot. A wait-0 probe cannot steal that slot; before secondNext
+    // parks, though, the probe drains its capacity response, so require its
+    // event queue to be empty and preserve the socket-event routing contract.
+    let secondNextParked = false;
+    const secondNextDeadline = Date.now() + 10_000;
+    while (!secondNextParked && Date.now() < secondNextDeadline) {
+      const probe = runCli(['shift', 'next', '--wait', '0', '--state-dir', stateDir]);
+      const probeResult = await probe.result;
+      secondNextParked = probeResult.stderr === `${OVERLAP_ERROR}\n` && probeResult.code === 1 && probeResult.stdout === '';
+      if (secondNextParked) break;
+
+      assert.equal(probeResult.code, 0, probeResult.stderr);
+      const probeResponse = jsonResult<{ events: Array<{ type: string }> }>(probeResult);
+      assert.deepEqual(probeResponse.events, [], JSON.stringify(probeResponse));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondNextParked, true, 'the second terminal next must claim the single parked slot before shutdown');
 
     const presenceBeforeEnd = requests(reqs, 'presence_ping').length;
     const ending = runCli(['shift', 'end', '--state-dir', stateDir]);
