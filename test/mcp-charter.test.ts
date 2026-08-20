@@ -6,12 +6,13 @@ import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 
 import { mainAsync } from '../src/cli.ts';
-import { createMcpServer } from '../src/mcp/server.ts';
+import { INVALID_PARAMS } from '../src/mcp/server.ts';
 import type { ToolRegistration } from '../src/mcp/server.ts';
 import { buildClaudeOptions } from '../packages/work/src/harness/claude.ts';
 import { buildThreadStartParams } from '../packages/work/src/harness/codex.ts';
 import {
   FIXTURE_NO_OP_TOOL_NAMES,
+  createFixtureMcpServer,
   fixtureToolRegistrations,
   loadCharterFixture,
   makeReport,
@@ -26,6 +27,7 @@ import type { CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/
 import {
   CLAUDE_EVAL_PERMISSIONS,
   CODEX_EVAL_PERMISSIONS,
+  claudeFixtureMountFailure,
   finalResponseEvidence,
   mergeReportedModel,
   reportedMetadata,
@@ -35,7 +37,7 @@ import { makeIo } from './hubkit.ts';
 import type { CliIO } from '../src/cli.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../packages/work/src/harness/contract.ts';
 
-type Frame = { result?: Record<string, unknown> };
+type Frame = { result?: Record<string, unknown>; error?: { code: number; message: string } };
 
 const INITIALIZE = JSON.stringify({
   jsonrpc: '2.0',
@@ -117,7 +119,7 @@ test('mcp charter: initialize serves the charter and every backticked verb is re
 
   const fixture = await loadCharterFixture();
   const fixtureTools = new Map(
-    fixtureToolRegistrations(fixture, () => {}).map((tool) => [tool.name, tool]),
+    fixtureToolRegistrations(fixture).map((tool) => [tool.name, tool]),
   );
   for (const name of FIXTURE_NO_OP_TOOL_NAMES) {
     const productionTool = tools.find(
@@ -190,12 +192,12 @@ test('mcp charter: the Claude treatment isolates ambient settings, skills, and M
 
 test('mcp charter: local stub advertises and records fixed list/get/start behavior and production-shaped no-ops', async () => {
   const fixture = await loadCharterFixture();
-  const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+  const calls: Array<{ name: string; arguments: unknown }> = [];
   const frames: Frame[] = [];
-  const server = createMcpServer({
+  const server = createFixtureMcpServer(fixture, {
     name: 'fixture',
     version: '1',
-    tools: fixtureToolRegistrations(fixture, (name, arguments_) => calls.push({ name, arguments: arguments_ })),
+    record: (name, arguments_) => calls.push({ name, arguments: arguments_ }),
     write: (frame) => frames.push(frame as Frame),
   });
 
@@ -279,21 +281,72 @@ test('mcp charter: local stub advertises and records fixed list/get/start behavi
   ]);
 });
 
+test('mcp charter: wire trace retains schema-rejected calls before dispatcher validation', async () => {
+  const fixture = await loadCharterFixture();
+  const calls: TraceCall[] = [];
+  const frames: Frame[] = [];
+  let sequence = 0;
+  const server = createFixtureMcpServer(fixture, {
+    name: 'fixture',
+    version: '1',
+    record: (name, arguments_) => calls.push({ sequence: ++sequence, name, arguments: arguments_ }),
+    write: (frame) => frames.push(frame as Frame),
+  });
+
+  await server.handleLine(INITIALIZE);
+  await server.handleLine(toolsCall(2, 'list_workflows'));
+  await server.handleLine(toolsCall(3, 'start_run', {}));
+  await server.handleLine(
+    JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'start_run', arguments: [] } }),
+  );
+  await server.handleLine(toolsCall(5, 'list_workflows', { unexpected: true }));
+
+  assert.deepEqual(frames.slice(2).map((frame) => frame.error?.code), [
+    INVALID_PARAMS,
+    INVALID_PARAMS,
+    INVALID_PARAMS,
+  ]);
+  assert.deepEqual(calls, [
+    { sequence: 1, name: 'list_workflows', arguments: {} },
+    { sequence: 2, name: 'start_run', arguments: {} },
+    { sequence: 3, name: 'start_run', arguments: [] },
+    { sequence: 4, name: 'list_workflows', arguments: { unexpected: true } },
+  ]);
+
+  const finance = fixture.tasks.find((task) => task.id === 'no-match-finance')!;
+  const hash = '9'.repeat(64);
+  assert.equal(
+    scoreTask(finance, initTrace(hash, calls.slice(0, 2))).classification,
+    'failed',
+    'a schema-invalid start after discovery must fail a no-match task',
+  );
+  assert.equal(
+    scoreTask(finance, initTrace(hash, [calls[0]!, { ...calls[2]!, sequence: 2 }])).classification,
+    'failed',
+    'a malformed start after discovery must remain visible and fail',
+  );
+  assert.equal(
+    scoreTask(finance, initTrace(hash, [{ ...calls[3]!, sequence: 1 }])).classification,
+    'failed',
+    'a schema-rejected discovery call with wrong arguments is not valid discovery',
+  );
+});
+
 test('mcp charter: stub is local with an ambient hub and records exact wire arguments', async () => {
   const fixture = await loadCharterFixture();
   const savedHub = process.env['OWENLOOP_HUB'];
   const savedFetch = globalThis.fetch;
-  const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+  const calls: Array<{ name: string; arguments: unknown }> = [];
   const frames: Frame[] = [];
   process.env['OWENLOOP_HUB'] = 'https://api.owenloop.com';
   globalThis.fetch = async (): Promise<Response> => {
     throw new Error('fixture must never fetch');
   };
   try {
-    const server = createMcpServer({
+    const server = createFixtureMcpServer(fixture, {
       name: 'fixture',
       version: '1',
-      tools: fixtureToolRegistrations(fixture, (name, arguments_) => calls.push({ name, arguments: arguments_ })),
+      record: (name, arguments_) => calls.push({ name, arguments: arguments_ }),
       write: (frame) => frames.push(frame as Frame),
     });
     await server.handleLine(INITIALIZE);
@@ -435,6 +488,47 @@ test('mcp charter runner makes adapter exits unscorable and retains only final r
   assert.ok(sessionCwd !== undefined && evidencePath !== undefined);
   assert.notEqual(dirname(evidencePath), sessionCwd, 'trace must be outside the evaluated session cwd');
   assert.equal(evidencePath.startsWith(`${sessionCwd}${sep}`), false, 'trace cannot be a file in the evaluated workspace');
+});
+
+test('mcp charter runner rejects unhealthy Claude fixture mounts and accepts pending or connected', async () => {
+  const hash = '7'.repeat(64);
+  for (const [status, healthy] of [
+    ['pending', true],
+    ['connected', true],
+    ['failed', false],
+    ['needs-auth', false],
+    ['disabled', false],
+  ] as const) {
+    const ref: HarnessSessionRef = { harness: 'claude-code', token: `mount-${status}` };
+    const init =
+      `session ${ref.token}: cliVersion=2.1.236 model=claude-opus-5 ` +
+      `apiKeySource=none permissionMode=bypassPermissions mcp=[owenloop=${status}]`;
+    const adapter = harnessAdapter(async (args, onEvent) => {
+      onEvent({ kind: 'started', ref });
+      await writeTrace(args, hash);
+      onEvent({ kind: 'progress', text: init });
+      onEvent({ kind: 'turn_ended' });
+      return ref;
+    });
+
+    const run = await runTask(
+      { id: 'claude-code', adapter, permissions: CLAUDE_EVAL_PERMISSIONS },
+      { request: 'please help' },
+      'fixture.json',
+      hash,
+      { taskTimeoutMs: 100 },
+    );
+    assert.equal(run.trace.status, healthy ? 'scorable' : 'unscorable', status);
+    assert.equal(
+      claudeFixtureMountFailure([{ kind: 'progress', text: init }]),
+      healthy ? undefined : `fixture MCP mount reported unhealthy Claude status: ${status}`,
+    );
+  }
+
+  assert.equal(
+    claudeFixtureMountFailure([{ kind: 'progress', text: 'session abc: model=claude-opus-5 mcp=[]' }]),
+    'Claude init metadata did not report fixture MCP mount status',
+  );
 });
 
 test('mcp charter runner isolates Codex config without severing file authentication', async (t) => {

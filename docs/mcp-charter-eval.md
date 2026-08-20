@@ -27,7 +27,10 @@ The mounted MCP process writes a JSONL trace in a random harness-owned
 directory outside the model session workspace. The evaluated session receives
 only its workspace path; it cannot reach the trace through its normal workspace
 authority. Claude runs with isolated settings, no skills, no ambient MCP
-servers, and an explicit empty built-in tool set. Codex receives a fresh private
+servers, and an explicit empty built-in tool set. A Claude SDK init status of
+`failed`, `needs-auth`, `disabled`, or any other non-healthy value for the
+fixture mount makes the task unscorable; the SDK's normal `pending` and
+`connected` states are accepted. Codex receives a fresh private
 `CODEX_HOME` containing no user configuration, plugins, skills, or MCP servers.
 If the operator uses file authentication, the runner stages `auth.json` there
 with owner-only permissions so the app-server remains logged in; it disables
@@ -37,8 +40,10 @@ cannot read that staged credential. The private root is removed after the task.
 Both sessions therefore expose the fixture mount without ambient or built-in
 tools, rather than an operator's configured Owenloop server. The trace
 records the full SHA-256 of the exact UTF-8 instructions value returned by the
-real initialize handler, then each received MCP call as ordered sequence, name,
-and arguments. Scores use only that structured wire log. Response evidence
+real initialize handler, then each received named `tools/call` as ordered
+sequence, name, and exact arguments at the inbound wire boundary before schema
+validation. Schema-rejected calls therefore remain visible and are never
+mistaken for no call. Scores use only that structured wire log. Response evidence
 retains only the final assembled assistant reply (the Claude SDK's final
 top-level text or Codex's completed final-answer item); reasoning, stderr, tool
 output, MCP metadata, and streamed/intermediate text are excluded. Neither

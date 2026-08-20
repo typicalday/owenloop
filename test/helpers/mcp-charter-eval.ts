@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 import { createMcpServer, textResult } from '../../src/mcp/server.ts';
-import type { ToolRegistration } from '../../src/mcp/server.ts';
+import type { McpServer, McpServerOptions, ToolRegistration } from '../../src/mcp/server.ts';
 
 export const DEFAULT_CHARTER_FIXTURE_PATH = fileURLToPath(
   new URL('../fixtures/mcp-charter-eval.json', import.meta.url),
@@ -47,7 +47,7 @@ export interface TraceInitialization {
 export interface TraceCall {
   sequence: number;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: unknown;
 }
 
 export type ParsedTrace =
@@ -218,7 +218,7 @@ export async function servedCharterSha256(): Promise<string> {
   return sha256(await servedCharterInstructions());
 }
 
-export type FixtureCallRecorder = (name: string, arguments_: Record<string, unknown>) => void;
+export type FixtureCallRecorder = (name: string, arguments_: unknown) => void;
 
 const EMPTY_SCHEMA = { type: 'object', properties: {}, additionalProperties: false };
 
@@ -304,7 +304,6 @@ function fixtureTool(
   name: string,
   description: string,
   inputSchema: Record<string, unknown>,
-  record: FixtureCallRecorder,
   result: (arguments_: Record<string, unknown>) => unknown,
 ): ToolRegistration {
   return {
@@ -312,10 +311,6 @@ function fixtureTool(
     description,
     inputSchema,
     handler: (arguments_) => {
-      // The server's JSON-RPC dispatcher produced these arguments directly from
-      // the wire. Record before producing a response, so a trace represents a
-      // received call even if a future local handler returns an error.
-      record(name, arguments_);
       const value = result(arguments_);
       return textResult(value, isRecord(value) && value['error'] !== undefined);
     },
@@ -326,13 +321,10 @@ function fixtureTool(
  * The local-only tool set used by both the fixture process and deterministic
  * tests. It deliberately has no hub, CLI, REST, credential, or settings import.
  */
-export function fixtureToolRegistrations(
-  fixture: CharterFixture,
-  record: FixtureCallRecorder,
-): ToolRegistration[] {
+export function fixtureToolRegistrations(fixture: CharterFixture): ToolRegistration[] {
   const byName = new Map(fixture.catalog.map((definition) => [definition.name, definition]));
   const noOp = (name: FixtureNoOpToolName): ToolRegistration =>
-    fixtureTool(name, `Local fixture implementation of ${name}.`, NO_OP_SCHEMAS[name], record, () => ({
+    fixtureTool(name, `Local fixture implementation of ${name}.`, NO_OP_SCHEMAS[name], () => ({
       recorded: true,
       fixture: true,
       name,
@@ -343,7 +335,6 @@ export function fixtureToolRegistrations(
       'list_workflows',
       'List the fixed local evaluation catalog.',
       EMPTY_SCHEMA,
-      record,
       () => ({ workflows: fixture.catalog }),
     ),
     fixtureTool(
@@ -355,7 +346,6 @@ export function fixtureToolRegistrations(
         required: ['name'],
         additionalProperties: false,
       },
-      record,
       (arguments_) => {
         const name = arguments_['name'];
         const definition = typeof name === 'string' ? byName.get(name) : undefined;
@@ -376,7 +366,6 @@ export function fixtureToolRegistrations(
         required: ['workflow_name'],
         additionalProperties: false,
       },
-      record,
       (arguments_) => {
         const workflowName = arguments_['workflow_name'];
         if (typeof workflowName !== 'string' || !byName.has(workflowName)) {
@@ -394,13 +383,54 @@ export function fixtureToolRegistrations(
   ];
 }
 
+function receivedFixtureCall(line: string): { name: string; arguments: unknown } | undefined {
+  let frame: unknown;
+  try {
+    frame = JSON.parse(line) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(frame) || frame['method'] !== 'tools/call') return undefined;
+  const params = frame['params'];
+  if (!isRecord(params) || typeof params['name'] !== 'string') return undefined;
+  return {
+    name: params['name'],
+    // Match the real dispatcher: omitted arguments mean {}, while a supplied
+    // malformed value is preserved exactly so its rejected call still counts.
+    arguments: Object.hasOwn(params, 'arguments') ? params['arguments'] : {},
+  };
+}
+
+/**
+ * Build the fixture MCP server with tracing at the inbound wire boundary.
+ * Recording before the real dispatcher runs ensures schema-rejected and
+ * unknown named calls remain visible without double-recording valid handlers.
+ */
+export function createFixtureMcpServer(
+  fixture: CharterFixture,
+  opts: Omit<McpServerOptions, 'tools'> & { record: FixtureCallRecorder },
+): McpServer {
+  const { record, ...serverOptions } = opts;
+  const core = createMcpServer({ ...serverOptions, tools: fixtureToolRegistrations(fixture) });
+  return {
+    handleLine(line) {
+      const call = receivedFixtureCall(line);
+      if (call !== undefined) record(call.name, call.arguments);
+      return core.handleLine(line);
+    },
+    close(reason) {
+      core.close(reason);
+    },
+  };
+}
+
 function isTraceCall(value: unknown): value is TraceCall {
   if (!isRecord(value)) return false;
   return (
     Number.isInteger(value['sequence']) &&
     (value['sequence'] as number) > 0 &&
     typeof value['name'] === 'string' &&
-    isRecord(value['arguments'])
+    Object.hasOwn(value, 'arguments')
   );
 }
 
@@ -438,8 +468,8 @@ export function parseTraceJsonl(text: string, expectedCharterSha256: string): Pa
   return { status: 'scorable', charterSha256: initial.charterSha256, calls };
 }
 
-function isEmptyObject(value: Record<string, unknown>): boolean {
-  return Object.keys(value).length === 0;
+function isEmptyObject(value: unknown): boolean {
+  return isRecord(value) && Object.keys(value).length === 0;
 }
 
 function discoveredFirst(calls: TraceCall[]): boolean {
@@ -474,8 +504,12 @@ export function scoreTask(task: CharterTask, trace: ParsedTrace): ScoredTask {
   }
 
   const expected = task.expectedWorkflow!;
-  const selectedExpected = starts.some((call) => call.arguments['workflow_name'] === expected);
-  const selectedOther = starts.some((call) => call.arguments['workflow_name'] !== expected);
+  const selectedExpected = starts.some(
+    (call) => isRecord(call.arguments) && call.arguments['workflow_name'] === expected,
+  );
+  const selectedOther = starts.some(
+    (call) => !isRecord(call.arguments) || call.arguments['workflow_name'] !== expected,
+  );
   if (!selectedExpected) {
     return { ...common, classification: 'failed', passed: false, reason: `did not start ${expected}` };
   }

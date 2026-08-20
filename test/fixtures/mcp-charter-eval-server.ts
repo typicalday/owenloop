@@ -1,8 +1,8 @@
 import { appendFileSync, writeFileSync } from 'node:fs';
 
-import { createMcpServer, pumpStdin } from '../../src/mcp/server.ts';
+import { pumpStdin } from '../../src/mcp/server.ts';
 import type { LineStream } from '../../src/mcp/server.ts';
-import { fixtureToolRegistrations, loadCharterFixture, sha256 } from '../helpers/mcp-charter-eval.ts';
+import { createFixtureMcpServer, loadCharterFixture, sha256 } from '../helpers/mcp-charter-eval.ts';
 
 function usage(): never {
   throw new Error('usage: node test/fixtures/mcp-charter-eval-server.ts --fixture <path> --trace <path>');
@@ -29,13 +29,13 @@ let sequence = 0;
 writeFileSync(tracePath, '');
 const append = (row: unknown): void => appendFileSync(tracePath, `${JSON.stringify(row)}\n`);
 
-const server = createMcpServer({
+const server = createFixtureMcpServer(fixture, {
   name: 'mcp-charter-eval-fixture',
   version: String(fixture.version),
-  tools: fixtureToolRegistrations(fixture, (name, arguments_) => {
+  record: (name, arguments_) => {
     sequence += 1;
     append({ sequence, name, arguments: arguments_ });
-  }),
+  },
   write: (frame) => {
     // The real core generates initialize.instructions. Record the digest at that
     // actual transport boundary, not by importing the charter source constant.

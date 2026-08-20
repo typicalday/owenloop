@@ -125,6 +125,28 @@ export function reportedMetadata(events: readonly AgentEvent[]): { reportedModel
   };
 }
 
+const HEALTHY_CLAUDE_MCP_STATUSES = new Set(['pending', 'connected']);
+
+/** Fail closed when Claude explicitly reports an unusable fixture MCP mount. */
+export function claudeFixtureMountFailure(events: readonly AgentEvent[]): string | undefined {
+  const init = events.find(
+    (event): event is Extract<AgentEvent, { kind: 'progress' }> =>
+      event.kind === 'progress' && /^session\s+\S+:\s/u.test(event.text),
+  );
+  if (init === undefined) return 'Claude init metadata did not report fixture MCP mount status';
+  const encoded = /(?:^|\s)mcp=\[([^\]]*)\]/u.exec(init.text)?.[1];
+  if (encoded === undefined) return 'Claude init metadata did not report fixture MCP mount status';
+  const status = encoded
+    .split(',')
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith('owenloop='))
+    ?.slice('owenloop='.length);
+  if (status === undefined || status === '') return 'Claude init metadata did not report fixture MCP mount status';
+  return HEALTHY_CLAUDE_MCP_STATUSES.has(status)
+    ? undefined
+    : `fixture MCP mount reported unhealthy Claude status: ${status}`;
+}
+
 /** Keep a harness score attributable to one provider-selected model. */
 export function mergeReportedModel(
   harnessId: string,
@@ -337,11 +359,18 @@ export async function runTask(
       trace = unscorable('trace file was not created');
     }
     const exit = terminalEvents.find((event): event is Extract<AgentEvent, { kind: 'exited' }> => event.kind === 'exited');
+    const mountFailure = harness.id === claudeAdapter.id ? claudeFixtureMountFailure(terminalEvents) : undefined;
     if (adapterFailure !== undefined) trace = unscorable(adapterFailure, trace.calls);
     else if (exit !== undefined) {
       trace = unscorable(`adapter reported exit: ${exit.error ?? `exit code ${String(exit.exitCode)}`}`, trace.calls);
     }
-    if (adapterFailure === undefined && exit === undefined && !terminalEvents.some((event) => event.kind === 'turn_ended')) {
+    else if (mountFailure !== undefined) trace = unscorable(mountFailure, trace.calls);
+    if (
+      adapterFailure === undefined &&
+      exit === undefined &&
+      mountFailure === undefined &&
+      !terminalEvents.some((event) => event.kind === 'turn_ended')
+    ) {
       trace = unscorable('incomplete turn: no turn_ended adapter event', trace.calls);
     }
     return { trace, responseEvidence: finalResponseEvidence(terminalEvents), ...reportedMetadata(terminalEvents) };
