@@ -48,6 +48,17 @@ receipt and captured output as diagnostics. Nothing is greened, and the owed
 artifact waits for a human retry; additional owed paths remain debts because
 `ask` closes the run.
 
+After a successful command, the worker submits its receipt once for each owed
+path, in order. HTTP `429` is retried for that path at most twice more (up to
+30 seconds total), honoring `Retry-After` or using 5-second then 10-second
+fallback waits. The worker keeps the same receipt and request for every retry;
+it does not retry other HTTP errors or response-level rejections. A lease that
+becomes terminal during a wait suppresses the next submit. Retry notices are
+written to the worker's stderr, and rate-limit notices are rendered as
+`HTTP 429 (rate limited)` without relaying the response body. Other HubError
+details are collapsed to one line and bounded, so an edge-generated HTML page
+cannot flood `<run>.log`.
+
 Under shift dispatch fd 1 and fd 2 both point at the same file, so the header —
 not the channel — is what tells these outcomes apart in `<run>.log`. The two
 channels still matter: stderr is what a reader treats as trouble, and routine

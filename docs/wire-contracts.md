@@ -417,6 +417,19 @@ freezes the owed artifact and closes the run; a human answers with the
 artifact's retry path. Only the first owed path is escalated because `ask`
 closes the run, so additional owed paths remain debts.
 
+Receipt submission is retried only for `HubError` responses with HTTP `429`.
+The worker makes at most three total attempts for each owed path, with a
+30-second wall-clock retry window. It honors a supplied `Retry-After` delay
+exactly when that delay fits the remaining window; without one, it waits 5
+seconds before the second attempt and 10 seconds before the third. A delay that
+would exceed the window fails the submit rather than being shortened. The
+receipt, proof, and request bytes are built once per path and replayed
+unchanged. Non-429 transport errors, response-level submit rejections, and
+`409 run_closed` remain fail-fast and are not treated as successful replays.
+If the lease becomes terminal during a retry wait, the worker sends no further
+receipt. The worker releases the claim on submit failure; a successful submit
+of every owed path closes normally without a release.
+
 When a valid payload contains a plain-step `reject`, the command worker sends
 the directive's `text` as the reject reason and, when command output is
 available, appends the captured tail in this form:
