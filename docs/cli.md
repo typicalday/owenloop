@@ -2960,9 +2960,10 @@ feedback to surface and resolve, not a route to bypass: use `reject_artifact`
 only for a real upstream defect with a concrete reason.
 
 The opt-in [MCP chief-of-staff charter evaluation](mcp-charter-eval.md)
-measures that guidance from structured MCP calls and records the current
-[two-harness baseline](evals/mcp-charter-baseline.json). It is credentialed and
-quota-spending, so it is not part of required CI.
+measures that guidance from structured MCP calls. A baseline is committed only
+after both credentialed harnesses complete scoreably; it is never fabricated
+from an incomplete run. The evaluation is quota-spending and not part of
+required CI.
 
 ### Tools
 

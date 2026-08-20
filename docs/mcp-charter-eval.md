@@ -40,6 +40,11 @@ ordered calls, response evidence, classifications, and score. A charter edit
 changes the served-byte hash, so it creates a new attributable score rather
 than inheriting an old baseline.
 
+This branch intentionally has no committed baseline yet. The Codex evaluation
+session initialized the local fixture but made no tool calls and never emitted
+`turn_ended` after several minutes, so it was unscorable. No score was
+invented and no partial baseline was written.
+
 ## Safety and baseline updates
 
 The mounted entry point is test/fixtures/mcp-charter-eval-server.ts, not
@@ -59,5 +64,6 @@ result.
 
 When the charter changes, run the command above with working credentials,
 inspect the no-match response evidence to confirm the refusal is plain, and
-commit the generated JSON together with any charter change. Do not hand-author
-scores or substitute transcript matching when a harness cannot be evaluated.
+commit the generated JSON together with any charter change only after both
+harnesses are scoreable. Do not hand-author scores or substitute transcript
+matching when a harness cannot be evaluated.

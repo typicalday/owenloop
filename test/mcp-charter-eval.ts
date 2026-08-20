@@ -5,7 +5,7 @@
  * requires logged-in local harnesses, so the deterministic suite must not run it.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -157,6 +157,7 @@ async function runTask(
 
 async function replaceAtomically(path: string, contents: string): Promise<void> {
   const target = resolve(path);
+  await mkdir(dirname(target), { recursive: true });
   const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
   await writeFile(temporary, contents);
   await rename(temporary, target);
