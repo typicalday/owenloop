@@ -415,14 +415,15 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     }
   }
 
-  // A project index may deliberately borrow its bytes from a globally indexed
-  // copy. Global GC must retain the target coordinate/object pair that makes
-  // each such non-target coordinate loadable.
+  // Every project-indexed digest is an external protection root for global GC,
+  // even when project-local bytes currently exist. Keeping the globally indexed
+  // coordinate/object pair preserves the plan's cross-root fallback contract if
+  // the project replica later disappears or needs repair.
   if (args.level === 'global' && !sameRoot) {
     for (const entry of Object.values(projectIndex.entries)) {
       const digest = defDigest(entry.digest);
-      if (!projectObjects.has(digest)) {
-		requireTargetDigest(digest, 'project exact-digest fallback');
+      if (targetCoordinatesForDigest(digest).length > 0) {
+		requireTargetDigest(digest, 'a digest named by the project index');
       }
     }
   }
@@ -532,6 +533,11 @@ async function acquireGcLocks(
 ): Promise<InstallLockHandle[]> {
   const statesByLock = new Map<string, { lockPath: string; stateDir: string }>();
   for (const root of [...new Set(roots.map((candidate) => projectStoreRoot(candidate)))]) {
+    // Applied GC may need coordination state at an absent counterpart root. Guard
+    // and create the store root itself before recursing into `<root>/.owenloop`;
+    // otherwise mkdir could follow a symlink at the root's immediate parent
+    // (notably `$HOME/.owenloop`) and place a lock outside the intended home.
+    ensureDirectoryPathNoSymlink(root, 'workflow store root');
     const state = workflowStoreStatePaths(root);
     statesByLock.set(state.lockPath, state);
   }

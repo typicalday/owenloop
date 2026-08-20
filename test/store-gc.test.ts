@@ -19,7 +19,7 @@ import { main, mainAsync } from '../src/cli.ts';
 import { installFolder, writeAddJournal, writeLockfile } from '../src/add.ts';
 import { finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { rmRecursiveForce } from '../src/install.ts';
-import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
+import { readRuntimeSnapshotBundlePins, StoreVersionError } from '../src/store.ts';
 import {
   collectWorkflowStoreGarbage,
   compareStoreText,
@@ -578,6 +578,39 @@ test('a runtime-pinned orphan and project exact-digest fallback into global are 
 		false,
 		'project-indexed global fallback remains installed with its global alias',
 	);
+});
+
+test('global GC retains every digest named by the project index even when project bytes exist', async () => {
+  const project = await installThree();
+  const global = await installThree();
+  assert.deepEqual(global.digests, project.digests, 'both roots carry identical immutable history');
+
+  const projectIndexBefore = readFileSync(storeIndexPath(project.root));
+  const globalIndexBefore = readFileSync(storeIndexPath(global.root));
+  const globalObjectsRoot = join(global.root, 'objects', 'sha256');
+  const globalObjectsBefore = readdirSync(globalObjectsRoot).sort(compareStoreText);
+
+  const dry = plan({
+    projectRoot: project.root,
+    globalRoot: global.root,
+    level: 'global',
+    keep: 1,
+  }).report;
+  assert.deepEqual(dry.objects, [], 'project-indexed replicas are external protection roots for global GC');
+
+  const applied = await collectWorkflowStoreGarbage({
+    projectRoot: project.root,
+    globalRoot: global.root,
+    level: 'global',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => [],
+  });
+  assert.deepEqual(applied.objects, []);
+  assert.deepEqual(readFileSync(storeIndexPath(project.root)), projectIndexBefore);
+  assert.deepEqual(readFileSync(storeIndexPath(global.root)), globalIndexBefore);
+  assert.deepEqual(readdirSync(globalObjectsRoot).sort(compareStoreText), globalObjectsBefore);
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: project.root, globalRoot: global.root, warn: () => {} }));
 });
 
 test('multi-workflow objects and multiple coordinates are pruned atomically', async () => {
@@ -1232,6 +1265,40 @@ test('malformed or symlinked object state fails closed without deletion', async 
   assert.deepEqual(readdirSync(join(installed.root, 'objects', 'sha256')).sort(), objectsBefore);
 });
 
+test('applied project GC refuses a symlinked global-store parent before creating coordination state', async () => {
+  const cwd = tempDir('owenloop-gc-symlinked-global-parent-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  const redirected = tempDir('owenloop-gc-symlink-target-');
+  mkdirSync(home);
+  symlinkSync(redirected, join(home, '.owenloop'), 'dir');
+  await installVersion({ version: '1.0.0', root: projectRoot });
+  await installVersion({ version: '2.0.0', root: projectRoot });
+  await installVersion({ version: '3.0.0', root: projectRoot });
+
+  const indexBefore = readFileSync(storeIndexPath(projectRoot));
+  const objectsRoot = join(projectRoot, 'objects', 'sha256');
+  const objectsBefore = readdirSync(objectsRoot).sort(compareStoreText);
+  const redirectedBefore = readdirSync(redirected).sort(compareStoreText);
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--keep', '1', '--yes'], {
+    cwd,
+    env: { HOME: home },
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /workflow store root.*symbolic link/u);
+  assert.deepEqual(readFileSync(storeIndexPath(projectRoot)), indexBefore);
+  assert.deepEqual(readdirSync(objectsRoot).sort(compareStoreText), objectsBefore);
+  assert.deepEqual(
+    readdirSync(redirected).sort(compareStoreText),
+    redirectedBefore,
+    'the symlink target receives no counterpart root or lock state',
+  );
+});
+
 test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed on bad digests', () => {
   const dir = tempDir('owenloop-gc-db-');
   const dbPath = join(dir, 'state.db');
@@ -1266,6 +1333,46 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
   legacy.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, created_at INTEGER)');
   legacy.close();
   assert.deepEqual(readRuntimeSnapshotBundlePins(legacyPath), []);
+});
+
+test('destructive bundle GC refuses a newer runtime DB schema without changing the store', async () => {
+  const cwd = tempDir('owenloop-gc-newer-db-');
+  const home = join(cwd, 'home');
+  const projectRoot = join(cwd, 'workflows');
+  mkdirSync(home);
+  await installVersion({ version: '1.0.0', root: projectRoot });
+  await installVersion({ version: '2.0.0', root: projectRoot });
+  await installVersion({ version: '3.0.0', root: projectRoot });
+
+  const stateDir = join(cwd, '.owenloop');
+  const dbPath = join(stateDir, 'state.db');
+  mkdirSync(stateDir);
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)');
+  db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)').run('schema_version', '99');
+  db.close();
+
+  const indexBefore = readFileSync(storeIndexPath(projectRoot));
+  const objectsRoot = join(projectRoot, 'objects', 'sha256');
+  const objectsBefore = readdirSync(objectsRoot).sort(compareStoreText);
+  const dbBefore = readFileSync(dbPath);
+  assert.throws(
+    () => readRuntimeSnapshotBundlePins(dbPath),
+    (error: unknown) => error instanceof StoreVersionError && /schema_version 99 is newer/u.test(error.message),
+  );
+
+  const err: string[] = [];
+  const code = await mainAsync(['bundle', 'gc', '--keep', '1', '--yes', '--db', dbPath], {
+    cwd,
+    env: { HOME: home },
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /schema_version 99 is newer/u);
+  assert.deepEqual(readFileSync(storeIndexPath(projectRoot)), indexBefore);
+  assert.deepEqual(readdirSync(objectsRoot).sort(compareStoreText), objectsBefore);
+  assert.deepEqual(readFileSync(dbPath), dbBefore);
 });
 
 test('destructive bundle gc rejects missing or blank DB/defs paths before touching store state', async () => {

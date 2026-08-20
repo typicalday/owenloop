@@ -77,6 +77,22 @@ export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBund
 
 	const db = new DatabaseSync(path, { readOnly: true });
 	try {
+		const hasMeta = db
+			.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`)
+			.get() !== undefined;
+		if (hasMeta) {
+			const row = db.prepare(`SELECT v FROM meta WHERE k = 'schema_version'`).get() as
+				| { v: string }
+				| undefined;
+			const current = row?.v;
+			if (current !== undefined && parseInt(current, 10) > parseInt(SCHEMA_VERSION, 10)) {
+				throw new StoreVersionError(
+					`database schema_version ${current} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
+						'upgrade your owenloop install to open this database',
+				);
+			}
+		}
+
 		const hasWorkflow = db
 			.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workflow'`)
 			.get() !== undefined;
