@@ -11,6 +11,7 @@ import type { ToolRegistration } from '../src/mcp/server.ts';
 import { buildClaudeOptions } from '../packages/work/src/harness/claude.ts';
 import { buildThreadStartParams } from '../packages/work/src/harness/codex.ts';
 import {
+  FIXTURE_NO_OP_TOOL_NAMES,
   fixtureToolRegistrations,
   loadCharterFixture,
   makeReport,
@@ -22,7 +23,13 @@ import {
   validateReport,
 } from './helpers/mcp-charter-eval.ts';
 import type { CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/mcp-charter-eval.ts';
-import { CODEX_EVAL_PERMISSIONS, finalResponseEvidence, reportedMetadata, runTask } from './mcp-charter-eval.ts';
+import {
+  CLAUDE_EVAL_PERMISSIONS,
+  CODEX_EVAL_PERMISSIONS,
+  finalResponseEvidence,
+  reportedMetadata,
+  runTask,
+} from './mcp-charter-eval.ts';
 import { makeIo } from './hubkit.ts';
 import type { CliIO } from '../src/cli.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../packages/work/src/harness/contract.ts';
@@ -106,6 +113,22 @@ test('mcp charter: initialize serves the charter and every backticked verb is re
   for (const name of charterNames) {
     assert.ok(registeredNames.has(name), `charter names registered verb ${name}`);
   }
+
+  const fixture = await loadCharterFixture();
+  const fixtureTools = new Map(
+    fixtureToolRegistrations(fixture, () => {}).map((tool) => [tool.name, tool]),
+  );
+  for (const name of FIXTURE_NO_OP_TOOL_NAMES) {
+    const productionTool = tools.find(
+      (tool) => typeof tool === 'object' && tool !== null && (tool as { name?: string }).name === name,
+    ) as { inputSchema?: unknown } | undefined;
+    assert.ok(productionTool, `production MCP registers fixture no-op ${name}`);
+    assert.deepEqual(
+      fixtureTools.get(name)?.inputSchema,
+      productionTool.inputSchema,
+      `${name} fixture schema must match the production MCP contract`,
+    );
+  }
 });
 
 test('mcp charter: hashes exact served instruction bytes with full SHA-256', async () => {
@@ -127,6 +150,15 @@ test('mcp charter: fixed fixture has two tasks in each category with valid workf
   );
   assert.equal(new Set(fixture.tasks.map((task) => task.id)).size, 6);
   const names = new Set(fixture.catalog.map((workflow) => workflow.name));
+  for (const workflow of fixture.catalog) {
+    assert.deepEqual(
+      workflow.inputSchemas.map((entry) => entry.name),
+      workflow.inputs,
+      `${workflow.name} must expose ordered production-shaped input schema entries`,
+    );
+    assert.equal(Object.hasOwn(workflow, 'x.discovery'), false, 'discovery metadata must not be a literal dotted key');
+    assert.equal(typeof workflow.x.discovery['description'], 'string');
+  }
   for (const task of fixture.tasks) {
     if (task.expectedWorkflow !== undefined) assert.ok(names.has(task.expectedWorkflow));
   }
@@ -138,9 +170,7 @@ test('mcp charter: the Claude treatment isolates ambient settings, skills, and M
       cwd: '/tmp/mcp-charter-fixture',
       owenloopMcp: { command: process.execPath, args: ['test/fixtures/mcp-charter-eval-server.ts'] },
       permissions: {
-        permissionMode: 'bypassPermissions',
-        filesystem: 'read-only',
-        network: 'owenloop-only',
+        ...CLAUDE_EVAL_PERMISSIONS,
         extensions: {
           skills: 'all',
           mcpServers: { ambient: { command: 'would-reach-production', args: [] } },
@@ -154,10 +184,10 @@ test('mcp charter: the Claude treatment isolates ambient settings, skills, and M
   assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(options.skills, []);
   assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
-  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
+  assert.deepEqual(options.tools, [], 'the MCP-only evaluation must expose no built-in file readers');
 });
 
-test('mcp charter: local stub advertises and records fixed list/get/start behavior', async () => {
+test('mcp charter: local stub advertises and records fixed list/get/start behavior and production-shaped no-ops', async () => {
   const fixture = await loadCharterFixture();
   const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
   const frames: Frame[] = [];
@@ -174,11 +204,42 @@ test('mcp charter: local stub advertises and records fixed list/get/start behavi
   await server.handleLine(toolsCall(4, 'get_workflow', { name: 'code-delivery' }));
   await server.handleLine(toolsCall(5, 'start_run', { workflow_name: 'code-delivery', priority: 'high' }));
   await server.handleLine(toolsCall(6, 'get_workflow', { name: 'not-real' }));
+  await server.handleLine(toolsCall(7, 'submit', {
+    workflow: 'fixture-run',
+    run: 'run-1',
+    path: 'result',
+    value: { text: 'fixture value' },
+    done: true,
+  }));
+  await server.handleLine(toolsCall(8, 'wake', { cursor: 4 }));
+  await server.handleLine(toolsCall(9, 'whats_next', {
+    workflow: 'fixture-run',
+    serve_crews: ['builder'],
+    serve_capabilities: ['code'],
+  }));
+  await server.handleLine(toolsCall(10, 'provide_input', {
+    workflow: 'fixture-run',
+    name: 'proposal',
+    value: { text: 'fixture proposal' },
+  }));
+  await server.handleLine(toolsCall(11, 'retry_artifact', {
+    workflow: 'fixture-run',
+    path: 'result',
+    text: 'try again',
+  }));
+  await server.handleLine(toolsCall(12, 'reject_artifact', {
+    workflow: 'fixture-run',
+    path: 'result',
+    reason: 'fixture reason',
+  }));
 
   const listedTools = frames[1]?.result?.['tools'];
   assert.ok(Array.isArray(listedTools));
   assert.ok(listedTools.some((tool) => typeof tool === 'object' && tool !== null && (tool as { name?: string }).name === 'start_run'));
-  assert.deepEqual(JSON.parse((frames[2]?.result?.['content'] as Array<{ text: string }>)[0]!.text), fixture.catalog);
+  assert.deepEqual(
+    JSON.parse((frames[2]?.result?.['content'] as Array<{ text: string }>)[0]!.text),
+    { workflows: fixture.catalog },
+  );
   assert.deepEqual(
     JSON.parse((frames[3]?.result?.['content'] as Array<{ text: string }>)[0]!.text),
     fixture.catalog[0],
@@ -193,6 +254,27 @@ test('mcp charter: local stub advertises and records fixed list/get/start behavi
     { name: 'get_workflow', arguments: { name: 'code-delivery' } },
     { name: 'start_run', arguments: { workflow_name: 'code-delivery', priority: 'high' } },
     { name: 'get_workflow', arguments: { name: 'not-real' } },
+    {
+      name: 'submit',
+      arguments: {
+        workflow: 'fixture-run',
+        run: 'run-1',
+        path: 'result',
+        value: { text: 'fixture value' },
+        done: true,
+      },
+    },
+    { name: 'wake', arguments: { cursor: 4 } },
+    {
+      name: 'whats_next',
+      arguments: { workflow: 'fixture-run', serve_crews: ['builder'], serve_capabilities: ['code'] },
+    },
+    {
+      name: 'provide_input',
+      arguments: { workflow: 'fixture-run', name: 'proposal', value: { text: 'fixture proposal' } },
+    },
+    { name: 'retry_artifact', arguments: { workflow: 'fixture-run', path: 'result', text: 'try again' } },
+    { name: 'reject_artifact', arguments: { workflow: 'fixture-run', path: 'result', reason: 'fixture reason' } },
   ]);
 });
 

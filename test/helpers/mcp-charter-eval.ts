@@ -11,13 +11,19 @@ export const DEFAULT_CHARTER_FIXTURE_PATH = fileURLToPath(
 
 export type TaskKind = 'match' | 'no-match' | 'ambiguous';
 
+export interface WorkflowInputSchema {
+  name: string;
+  schema?: unknown;
+  [key: string]: unknown;
+}
+
 export interface WorkflowDefinition {
   name: string;
   title: string;
   description: string;
   inputs: string[];
-  inputSchemas: Record<string, unknown>;
-  'x.discovery': Record<string, unknown>;
+  inputSchemas: WorkflowInputSchema[];
+  x: Record<string, unknown> & { discovery: Record<string, unknown> };
 }
 
 export interface CharterTask {
@@ -113,15 +119,27 @@ function asStringArray(value: unknown, field: string): string[] {
   return value;
 }
 
+function asInputSchemas(value: unknown, field: string): WorkflowInputSchema[] {
+  if (!Array.isArray(value)) throw new Error(`fixture ${field} must be an array`);
+  return value.map((entry, index) => {
+    const record = asRecord(entry, `${field}[${index}]`);
+    return { ...record, name: asString(record['name'], `${field}[${index}].name`) };
+  });
+}
+
 function parseWorkflow(value: unknown, index: number): WorkflowDefinition {
   const record = asRecord(value, `catalog[${index}]`);
+  const extension = asRecord(record['x'], `catalog[${index}].x`);
   return {
     name: asString(record['name'], `catalog[${index}].name`),
     title: asString(record['title'], `catalog[${index}].title`),
     description: asString(record['description'], `catalog[${index}].description`),
     inputs: asStringArray(record['inputs'], `catalog[${index}].inputs`),
-    inputSchemas: asRecord(record['inputSchemas'], `catalog[${index}].inputSchemas`),
-    'x.discovery': asRecord(record['x.discovery'], `catalog[${index}].x.discovery`),
+    inputSchemas: asInputSchemas(record['inputSchemas'], `catalog[${index}].inputSchemas`),
+    x: {
+      ...extension,
+      discovery: asRecord(extension['discovery'], `catalog[${index}].x.discovery`),
+    },
   };
 }
 
@@ -204,6 +222,79 @@ export type FixtureCallRecorder = (name: string, arguments_: Record<string, unkn
 
 const EMPTY_SCHEMA = { type: 'object', properties: {}, additionalProperties: false };
 
+export const FIXTURE_NO_OP_TOOL_NAMES = [
+  'submit',
+  'wake',
+  'whats_next',
+  'provide_input',
+  'retry_artifact',
+  'reject_artifact',
+] as const;
+
+type FixtureNoOpToolName = (typeof FIXTURE_NO_OP_TOOL_NAMES)[number];
+
+/**
+ * These schemas deliberately mirror the production MCP surface. The handlers
+ * remain local no-ops, but a model must see and be able to send the same
+ * arguments it would use against Owenloop rather than an empty eval-only shape.
+ */
+const NO_OP_SCHEMAS: Readonly<Record<FixtureNoOpToolName, Record<string, unknown>>> = {
+  whats_next: {
+    type: 'object',
+    properties: {
+      workflow: { type: 'string' },
+      serve_crews: { type: 'array', items: { type: 'string' } },
+      serve_capabilities: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Raw capability keys this caller serves (bare names and exact compounds). ' +
+          'Shifts derive them from their effective rosters; other callers normally omit them.',
+      },
+    },
+    additionalProperties: false,
+  },
+  submit: {
+    type: 'object',
+    properties: {
+      workflow: { type: 'string' },
+      run: { type: 'string' },
+      path: { type: 'string' },
+      value: { type: 'object', additionalProperties: true },
+      done: { type: 'boolean' },
+    },
+    required: ['workflow', 'run', 'path', 'value'],
+    additionalProperties: false,
+  },
+  reject_artifact: {
+    type: 'object',
+    properties: { workflow: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } },
+    required: ['workflow', 'path', 'reason'],
+    additionalProperties: false,
+  },
+  retry_artifact: {
+    type: 'object',
+    properties: { workflow: { type: 'string' }, path: { type: 'string' }, text: { type: 'string' } },
+    required: ['workflow', 'path'],
+    additionalProperties: false,
+  },
+  provide_input: {
+    type: 'object',
+    properties: {
+      workflow: { type: 'string' },
+      name: { type: 'string' },
+      value: { type: 'object', additionalProperties: true },
+    },
+    required: ['workflow', 'name', 'value'],
+    additionalProperties: false,
+  },
+  wake: {
+    type: 'object',
+    properties: { cursor: { type: 'integer', minimum: 0 } },
+    additionalProperties: false,
+  },
+};
+
 function fixtureTool(
   name: string,
   description: string,
@@ -235,8 +326,8 @@ export function fixtureToolRegistrations(
   record: FixtureCallRecorder,
 ): ToolRegistration[] {
   const byName = new Map(fixture.catalog.map((definition) => [definition.name, definition]));
-  const noOp = (name: string): ToolRegistration =>
-    fixtureTool(name, `Local fixture implementation of ${name}.`, EMPTY_SCHEMA, record, () => ({
+  const noOp = (name: FixtureNoOpToolName): ToolRegistration =>
+    fixtureTool(name, `Local fixture implementation of ${name}.`, NO_OP_SCHEMAS[name], record, () => ({
       recorded: true,
       fixture: true,
       name,
@@ -248,7 +339,7 @@ export function fixtureToolRegistrations(
       'List the fixed local evaluation catalog.',
       EMPTY_SCHEMA,
       record,
-      () => fixture.catalog,
+      () => ({ workflows: fixture.catalog }),
     ),
     fixtureTool(
       'get_workflow',

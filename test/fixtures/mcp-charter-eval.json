@@ -6,21 +6,37 @@
       "title": "Code delivery",
       "description": "Plan, implement, test, and review an approved change in an existing software repository.",
       "inputs": ["proposal"],
-      "inputSchemas": {
-        "proposal": {
-          "type": "object",
-          "required": ["text"],
-          "properties": {
-            "text": {
-              "type": "string"
-            }
-          },
-          "additionalProperties": false
+      "inputSchemas": [
+        {
+          "name": "proposal",
+          "schema": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
         }
-      },
-      "x.discovery": {
-        "capabilities": ["software-delivery", "code-review"],
-        "audience": "engineering"
+      ],
+      "x": {
+        "discovery": {
+          "description": "Plan, implement, test, and review an approved change in an existing software repository.",
+          "whenToUse": ["Deliver an approved change in an existing software repository."],
+          "notFor": ["Research and curate a topical media or knowledge library."],
+          "interface": {
+            "inputs": [
+              {
+                "name": "proposal",
+                "summary": "The approved repository change to deliver.",
+                "schemaRef": "#/inputs/0/schema"
+              }
+            ],
+            "outputs": []
+          }
+        }
       }
     },
     {
@@ -28,21 +44,37 @@
       "title": "Library build",
       "description": "Research a topic across subtopics, acquire source and media artifacts, and synthesize a linked knowledge library.",
       "inputs": ["topic"],
-      "inputSchemas": {
-        "topic": {
-          "type": "object",
-          "required": ["text"],
-          "properties": {
-            "text": {
-              "type": "string"
-            }
-          },
-          "additionalProperties": false
+      "inputSchemas": [
+        {
+          "name": "topic",
+          "schema": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
         }
-      },
-      "x.discovery": {
-        "capabilities": ["research", "media-acquisition", "knowledge-synthesis"],
-        "audience": "research"
+      ],
+      "x": {
+        "discovery": {
+          "description": "Research a topic across subtopics, acquire source and media artifacts, and synthesize a linked knowledge library.",
+          "whenToUse": ["Build a sourced media and knowledge library on a defined topic."],
+          "notFor": ["Implement and review an approved software repository change."],
+          "interface": {
+            "inputs": [
+              {
+                "name": "topic",
+                "summary": "The topic and scope for the library.",
+                "schemaRef": "#/inputs/0/schema"
+              }
+            ],
+            "outputs": []
+          }
+        }
       }
     }
   ],

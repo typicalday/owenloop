@@ -184,6 +184,16 @@ export const CODEX_EVAL_PERMISSIONS: StartArgs['permissions'] = {
   },
 };
 
+/** Claude treatment: the fixture MCP is the only model-visible tool surface. */
+export const CLAUDE_EVAL_PERMISSIONS: StartArgs['permissions'] = {
+  permissionMode: 'bypassPermissions',
+  tools: [],
+  filesystem: 'read-only',
+  network: 'owenloop-only',
+  maxTurns: 12,
+  extensions: {},
+};
+
 export async function runTask(
   harness: HarnessRun,
   task: { request: string },
@@ -345,13 +355,7 @@ async function main(): Promise<void> {
       id: claudeAdapter.id,
       adapter: claudeAdapter,
       model: options.claudeModel,
-      permissions: {
-        permissionMode: 'bypassPermissions',
-        filesystem: 'read-only',
-        network: 'owenloop-only',
-        maxTurns: 12,
-        extensions: {},
-      },
+      permissions: CLAUDE_EVAL_PERMISSIONS,
     },
     {
       id: codexAdapter.id,
