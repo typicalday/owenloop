@@ -1562,6 +1562,36 @@ test('stop during submit backoff sends no second submit', async () => {
   assert.equal(only(calls, 'release').length, 1);
 });
 
+test('stop blocks a resolved retry delay while its targeted release is still pending', async () => {
+  const clock = controlledClock();
+  let resolveRelease!: (value: { text: string }) => void;
+  const pendingRelease = new Promise<{ text: string }>((resolve) => {
+    resolveRelease = resolve;
+  });
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited', undefined, 0), 'green'],
+    release: () => pendingRelease,
+  });
+  const loop = createExecLoop(
+    baseOpts(hub, fr.runner, { sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }),
+  );
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+
+  loop.stop('signal');
+  await macrotaskSleep(); // stop has started finalBreath, but release never resolves
+  assert.equal(only(calls, 'release').length, 1);
+  clock.release(0); // the retry wait wins before the pending targeted release
+
+  assert.equal(await p, 'killed');
+  assert.equal(submits.length, 1);
+  resolveRelease({ text: '' });
+});
+
 test('a retried first owed path completes before the next path is submitted', async () => {
   const clock = controlledClock();
   const fr = fakeRunner();

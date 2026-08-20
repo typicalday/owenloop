@@ -815,11 +815,14 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
               `retrying attempt ${attempt + 1}/${SUBMIT_MAX_ATTEMPTS} after ${delay}ms`,
           );
           const leaseOutcome = await waitForSubmitRetry(delay);
+          // stop() marks this worker as signalled before its best-effort release
+          // finishes. The retry sleep can therefore win this race while the
+          // release is still in flight; do not issue a new submit in that gap.
+          if (signalled) {
+            opts.err(`owenloop work exec: signalled while waiting to retry submit to ${owe.path} — no further receipt sent`);
+            return 'killed';
+          }
           if (leaseOutcome !== undefined) {
-            if (signalled) {
-              opts.err(`owenloop work exec: signalled while waiting to retry submit to ${owe.path} — no further receipt sent`);
-              return 'killed';
-            }
             opts.err(`owenloop work exec: lease ${leaseOutcome} while waiting to retry submit to ${owe.path} — no further receipt sent`);
             return mapLeaseDuringRun(leaseOutcome);
           }
