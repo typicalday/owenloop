@@ -1482,7 +1482,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
                                          bounded reachability check (stall states, true deadlocks, stuck, dead steps, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
-  provide <wf> <name> [--value json]     supply an owed (seedOwed) input
+  provide <wf> <name> [--value json] [--hub <url>]  supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
   tick <wf> [--now <ms>] [--shallow] [--capability <c>]...  pull eligible orders (deep: also from calls: children; --shallow for this instance only; --capability filters to matching-capability steps)
   reap <wf> [--now]                      run the reaper; --now forces every claim stale (TTL 0)
@@ -1498,7 +1498,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   green <wf> <run> <path> [--value json] [--terminal]
   emit <wf> <run> --items '[{...}]'      accrete collection elements
   seal <wf> <run> [--value json]         signal a collection is complete
-  reject <wf> <path> --by <author> --text <msg>
+  reject <wf> <path> --by <author> --text <msg> [--requested <modifier>] [--hub <url>]
   retract <wf> <path> --by <author> --text <msg>
   skip <wf> <path> --by <author> --text <msg>
   retry <wf> <path> [--by <author>] [--text <guidance>] [--hub <url>]   clear a §6 stall, or ANSWER an ask
@@ -1579,7 +1579,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided', 'strict-inputs')],
   ['create', cmdOpts('title', 'provide', 'param')],
-  ['provide', cmdOpts('value')],
+  ['provide', cmdOpts('value', 'hub')],
   ['adopt', cmdOpts()],
   ['tick', cmdOpts('now', 'shallow', 'capability')],
   ['reap', cmdOpts('now')],
@@ -1593,7 +1593,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['green', cmdOpts('value', 'terminal')],
   ['emit', cmdOpts('items')],
   ['seal', cmdOpts('value')],
-  ['reject', cmdOpts('by', 'text', 'requested')],
+  ['reject', cmdOpts('by', 'text', 'requested', 'hub')],
   ['retract', cmdOpts('by', 'text')],
   ['skip', cmdOpts('by', 'text')],
   ['retry', cmdOpts('by', 'text', 'hub')],
@@ -5884,6 +5884,89 @@ async function dispatchRetry(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * `owenloop reject --hub` — the human control-plane counterpart to local
+ * `engine.reject()`. The hub owns attribution, so a remote request cannot
+ * carry the local-only `--by` authority input.
+ */
+async function dispatchReject(io: CliIO, args: Args): Promise<number> {
+  const workflow = need(args, 1, 'workflow');
+  const path = need(args, 2, 'path');
+  if (args.options.has('by')) {
+    throw new CliError('owenloop reject: --by cannot be combined with --hub — the hub attributes the rejection to the authenticated human principal');
+  }
+  const text = last(args, 'text');
+  if (args.missingOptionValues.has('text') || text === undefined) {
+    throw new CliError('missing value for --text: expected --text <reason>');
+  }
+  if (text.trim() === '') {
+    throw new CliError('invalid empty value for --text: expected --text <reason>');
+  }
+  if (args.missingOptionValues.has('requested')) {
+    throw new CliError('missing value for --requested: expected --requested <modifier>');
+  }
+  const requested = last(args, 'requested');
+
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const request = {
+    workflow,
+    path,
+    reason: text,
+    ...(requested !== undefined ? { requested } : {}),
+  };
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/reject_artifact', request);
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  print(io, {
+    ok: true,
+    action: 'reject',
+    path,
+    workflow,
+    hub: origin,
+    ...(requested !== undefined ? { requested } : {}),
+  });
+  return 0;
+}
+
+/**
+ * `owenloop provide --hub` — supply a hosted workflow input using the human
+ * control plane. Local input provisioning remains in `main()`.
+ */
+async function dispatchProvide(io: CliIO, args: Args): Promise<number> {
+  const workflow = need(args, 1, 'workflow');
+  const name = need(args, 2, 'name');
+  // Keep this ahead of binding, credentials, and fetch: malformed input has no
+  // external effects, matching the local provide command's JSON contract.
+  const value = parseJson(last(args, 'value'));
+
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/provide_input', { workflow, name, value });
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  print(io, { ok: true, provided: name, workflow, hub: origin });
+  return 0;
+}
+
+/**
  * `owenloop instance` — read a HUB instance's live state from the terminal.
  *
  * The read counterpart to `start` and `cancel`. Two naming constraints forced
@@ -8549,7 +8632,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'cancel', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -8603,6 +8686,10 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
 	return await dispatchStart(io, args);
       case 'cancel':
         return await dispatchCancel(io, args);
+      case 'provide':
+	return args.options.has('hub') ? await dispatchProvide(io, args) : main(argv, io);
+      case 'reject':
+	return args.options.has('hub') ? await dispatchReject(io, args) : main(argv, io);
       case 'retry':
 	// Local engine store unless --hub; only the hub half is async, and
 	// main()'s own `case 'retry'` stays the local implementation so the
