@@ -51,5 +51,20 @@ if (gatePath !== undefined && gatePath !== '') {
   delete process.env.OWENLOOP_START_GATE;
 }
 
+function handleStreamError(error) {
+  if (error?.code === 'EPIPE') return;
+  throw error;
+}
+
+function drain(stream) {
+  return new Promise((resolve) => stream.write('', resolve));
+}
+
+process.stdout.on('error', handleStreamError);
+process.stderr.on('error', handleStreamError);
+
 const { mainAsync } = await import('../dist/src/cli.js');
-mainAsync(process.argv.slice(2)).then((code) => process.exit(code));
+mainAsync(process.argv.slice(2)).then(async (code) => {
+  await Promise.all([drain(process.stdout), drain(process.stderr)]);
+  process.exit(code);
+});
