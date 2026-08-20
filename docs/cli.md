@@ -916,7 +916,8 @@ discovery surface without requiring prior knowledge of a flag.
 - **Fail-open.** The fold-in never breaks base loading. A corrupt or
   structurally-invalid `installed.json`, a missing install folder, or an install
   folder that fails to load each emits a `warning:` on stderr and is skipped;
-  your project defs still load and the command still exits 0. A malformed or
+  your project defs still load and commands still exit 0, except that directory
+  `lint` exits 1 when it reports a failed installed-folder load. A malformed or
   duplicate definition skips its entire installed folder for both authoring and
   executable discovery; directory `lint` also reports that folder as a failed
   load. The add-time fail-closed lockfile validation is unchanged — discovery
