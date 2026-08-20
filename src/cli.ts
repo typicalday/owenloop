@@ -1433,6 +1433,7 @@ ${' '.repeat(41)}the run carries no modifier and its steps are offered on BARE c
 ${' '.repeat(41)}--scope is a free routing label recorded on the run — no registry, no fixed set.
 ${' '.repeat(41)}Omit it and the run is routed by the org's routes alone.
 ${' '.repeat(41)}--priority is one of low, normal, high. Omit it and the hub applies normal.
+  pending-gates --hub <url>               list human-input gates currently blocking hub-hosted workflows (no local-engine form)
   cancel <workflow> [--reason <text>] [--hub <url>]
 ${' '.repeat(41)}cancel a running instance on the bound hub (human credential; agents cannot cancel).
 ${' '.repeat(41)}Closes every open lease so the run stops being re-offered, and records the
@@ -1559,6 +1560,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle', 'map')],
   ['install', cmdOpts('hub', 'as', 'map', 'accept-defaults', 'dry-run')],
   ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier', 'scope', 'priority')],
+  ['pending-gates', cmdOpts('hub')],
   ['cancel', cmdOpts('hub', 'reason')],
   ['instance', cmdOpts('hub')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
@@ -2311,6 +2313,12 @@ function dispatch(command: string, io: CliIO, args: Args): number {
   // lint/check above; see docs/cli.md).
   if (command === 'bundle') {
     return dispatchBundle(io, args);
+  }
+
+  // Pending gates exist only on the hub. Reject the local spelling before
+  // openCtx() so this cannot create or inspect a local SQLite state database.
+  if (command === 'pending-gates') {
+    throw new CliError('owenloop pending-gates has no local-engine equivalent; pass --hub <url>');
   }
 
   const ctx = openCtx(io, args, command === 'status');
@@ -5888,6 +5896,39 @@ async function dispatchRetry(io: CliIO, args: Args): Promise<number> {
   return 0;
 }
 
+/** List the hub's human-input gates without reshaping its response contract. */
+async function dispatchPendingGates(io: CliIO, args: Args): Promise<number> {
+  if (args.positionals.length !== 1) {
+    throw new CliError('invalid pending-gates arguments; usage: owenloop pending-gates --hub <url>');
+  }
+  if (args.missingOptionValues.has('hub') || last(args, 'hub') === undefined) {
+    throw new CliError('missing value for --hub: expected --hub <url>');
+  }
+
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/pending_gates', {});
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('pending_gates: malformed success response — body is not valid JSON');
+  }
+  print(io, body);
+  return 0;
+}
+
 /**
  * `owenloop reject --hub` — the human control-plane counterpart to local
  * `engine.reject()`. The hub owns attribution, so a remote request cannot
@@ -8637,7 +8678,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'pending-gates', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -8689,6 +8730,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchInstall(io, args);
       case 'start':
 	return await dispatchStart(io, args);
+      case 'pending-gates':
+	return args.options.has('hub') ? await dispatchPendingGates(io, args) : main(argv, io);
       case 'cancel':
         return await dispatchCancel(io, args);
       case 'provide':

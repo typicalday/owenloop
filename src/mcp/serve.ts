@@ -434,13 +434,13 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 20 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 21 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 20, plus `createAgentTool`, plus the four crew tools from
+ * set: these 21, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
@@ -467,6 +467,17 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         additionalProperties: false,
       },
       handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/whats_next', body: a })),
+    },
+    {
+      name: 'pending_gates',
+      description:
+		'Find workflow gates currently waiting on a person. A gate is an owed workflow input that no worker can supply; call this after starting or attending runs, or whenever the human asks what decisions or values need attention. Pass serve_crews to narrow the result to those crews.',
+      inputSchema: {
+		type: 'object',
+		properties: { serve_crews: { type: 'array', items: { type: 'string' } } },
+		additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/pending_gates', body: a })),
     },
     {
       name: 'submit',
@@ -506,7 +517,12 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'Surface actionable feedback on a real upstream defect by sending it to its producer with a concrete reason. Rejection must be handled, never bypassed to force progress.',
       inputSchema: {
         type: 'object',
-        properties: { workflow: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } },
+		properties: {
+			workflow: { type: 'string' },
+			path: { type: 'string' },
+			reason: { type: 'string' },
+			requested: { type: 'string' },
+		},
         required: ['workflow', 'path', 'reason'],
         additionalProperties: false,
       },
@@ -575,7 +591,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'Only when no catalog entry fits and the human chooses ordinary authoring, use this parse-and-load hard gate for a workflow definition YAML. It is stored only if it loads clean; failures return the engine/parser error verbatim. Idempotent: re-pushing identical content is a no-op success (unchanged: true with the existing version); changed content version-forwards.',
       inputSchema: {
         type: 'object',
-        properties: { yaml: { type: 'string' } },
+		properties: { yaml: { type: 'string' }, bundle_digest: { type: 'string' } },
         required: ['yaml'],
         additionalProperties: false,
       },
