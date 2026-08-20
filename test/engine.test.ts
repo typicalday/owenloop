@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Engine, ModifierRefusalError } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { buildDef, hashDef, parseDef } from '../src/defs.ts';
+import { modelCheck } from '../src/model.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
 import type { OrderInstructionSource } from '../src/order-resolver.ts';
 import { openStore } from '../src/store.ts';
@@ -188,6 +189,88 @@ test('happy path: planner → builder → reviewer → merger to done', () => {
 
   // nothing left to do
   assert.equal(engine.tick(wf, { now: 5000 }).orders.length, 0);
+});
+
+test('onCancel declarations are inert in standalone Engine eligibility, cascade, modelCheck, and done-ness', () => {
+  const unmarked = parseDef({
+    name: 'on-cancel-inert',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'prepare', consumes: ['seed'], produces: ['prepared'] },
+      { name: 'finish', consumes: ['prepared'], produces: ['result'], terminal: true },
+    ],
+  });
+  const marked = parseDef({
+    name: 'on-cancel-inert',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'prepare', consumes: ['seed'], produces: ['prepared'], onCancel: { consumes: [] } },
+      { name: 'finish', consumes: ['prepared'], produces: ['result'], terminal: true, onCancel: { consumes: ['prepared'] } },
+    ],
+  });
+
+  const unmarkedCheck = modelCheck(unmarked);
+  const markedCheck = modelCheck(marked);
+  assert.deepEqual(markedCheck, unmarkedCheck);
+  assert.equal(unmarkedCheck.completable, true);
+  assert.equal(markedCheck.completable, true);
+
+  const projectOrder = (order: Order) => ({
+    step: order.step,
+    key: order.key,
+    consumes: order.consumes,
+    consumedFingerprint: order.consumedFingerprint,
+    outputs: order.outputs,
+  });
+  const drive = (definition: WorkflowDef) => {
+    const { engine, store } = makeEngine([definition]);
+    const workflow = engine.createInstance(definition.name, { provide: { seed: { source: 'shared' } } });
+    const projectArtifacts = () => store.listArtifacts(workflow).map((artifact) => ({
+      path: artifact.path,
+      acceptance: artifact.acceptance,
+      version: artifact.version,
+      fingerprint: artifact.fingerprint ?? null,
+    }));
+
+    const initialTick = engine.tick(workflow, { now: 1000 });
+    assert.deepEqual(initialTick.orders.map((order) => order.step), ['prepare']);
+    const prepare = initialTick.orders[0]!;
+    complete(engine, workflow, prepare, { prepared: 'ready' });
+
+    const finishTick = engine.tick(workflow, { now: 2000 });
+    assert.deepEqual(finishTick.orders.map((order) => order.step), ['finish']);
+    const finish = finishTick.orders[0]!;
+    const afterPrepare = {
+      artifacts: projectArtifacts(),
+      eligible: finishTick.orders.map(projectOrder),
+    };
+
+    complete(engine, workflow, finish, { result: 'done' }, { terminal: true });
+    const status = engine.status(workflow);
+    const finalTick = engine.tick(workflow, { now: 3000 });
+    const final = {
+      done: status.done,
+      debts: status.debts,
+      eligible: finalTick.orders.map(projectOrder),
+      artifacts: projectArtifacts(),
+      tick: finalTick.orders.map(projectOrder),
+    };
+    return {
+      initialEligible: initialTick.orders.map(projectOrder),
+      afterPrepare,
+      final,
+    };
+  };
+
+  const unmarkedTrace = drive(unmarked);
+  const markedTrace = drive(marked);
+  assert.deepEqual(markedTrace, unmarkedTrace);
+  assert.deepEqual(unmarkedTrace.initialEligible.map((order) => order.step), ['prepare']);
+  assert.deepEqual(unmarkedTrace.afterPrepare.eligible.map((order) => order.step), ['finish']);
+  assert.equal(unmarkedTrace.final.done, true);
+  assert.deepEqual(unmarkedTrace.final.debts, []);
+  assert.deepEqual(unmarkedTrace.final.eligible, []);
+  assert.deepEqual(unmarkedTrace.final.tick, []);
 });
 
 test('a firing carries its consumed input handles, claim-time fingerprint, and owed reason thread', () => {
