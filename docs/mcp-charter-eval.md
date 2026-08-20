@@ -57,9 +57,8 @@ ordered calls, response evidence, classifications, and score. A charter edit
 changes the served-byte hash, so it creates a new attributable score rather
 than inheriting an old baseline.
 
-This branch intentionally has no committed baseline yet. The Codex evaluation
-session initialized the local fixture but made no tool calls and never emitted
-`turn_ended` after several minutes, so it was unscorable. No score was
+The current [baseline status](evals/README.md) records the unscorable live
+attempts and the operator-approved exception for this delivery. No score was
 invented and no partial baseline was written.
 
 ## Safety and baseline updates
