@@ -2364,47 +2364,199 @@ export function resolveCallsTarget(
 
 // ---- M2-CYCLE: cross-def calls-cycle detection --------------------------------
 
-/**
- * Walk the calls: edges in a flat def map and throw a DefError if any cycle exists.
- * This is the Mode 2 analogue of the Mode 1 include-cycle guard in expandIncludes.
- * Note: include: and calls: are DIFFERENT edge kinds — they are checked separately.
- *
- * Called from loadDefs Phase 2 after all defs are expanded and per-def validated.
- */
-function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
-  const WHITE = 0, GREY = 1, BLACK = 2;
-  const color = new Map<string, number>([...defs.keys()].map((k) => [k, WHITE]));
-  const stack: string[] = [];
+/** A calls cycle and the resolved definition keys on its displayed path. */
+export interface CallsCycleFinding {
+  message: string;
+  members: string[];
+}
 
-  // WS-6: the walk must key on RESOLVED identity, not on the bare `calls:` text.
-  // Two installed bundles may each export a workflow named `build`; keying the
-  // walk by that bare text would fuse them into one node and report a cycle that
-  // does not exist. `resolveCallsTarget` maps (edge text, calling def) to the
-  // exact map key the engine will spawn, so each bundle's `build` stays its own
-  // node under its own qualified key.
-  const visit = (name: string): void => {
-    color.set(name, GREY);
-    stack.push(name);
-    const def = defs.get(name);
-    // Unique calls: edges from this def (multiple steps might call the same child)
-    const callsEdges = new Set((def?.steps ?? []).filter((l) => l.calls).map((l) => l.calls!));
-    for (const edge of callsEdges) {
-      const child = def === undefined ? undefined : resolveCallsTargetKey(defs, edge, def);
-      if (child === undefined) continue; // missing-def error is reported separately in loadDefs
-      const c = color.get(child) ?? WHITE;
-      if (c === GREY) {
-        const from = stack.indexOf(child);
-        throw new DefError(`calls cycle: ${[...stack.slice(from), child].join(' -> ')}`);
+interface CallsGraph {
+  keys: string[];
+  order: Map<string, number>;
+  edges: Map<string, string[]>;
+}
+
+function buildCallsGraph(defs: Map<string, WorkflowDef>): CallsGraph {
+  const keys = [...defs.keys()];
+  const edges = new Map<string, string[]>();
+  for (const [key, def] of defs) {
+    // WS-6: graph nodes are RESOLVED map keys, not bare calls text. Two bundles
+    // may both export `build` without being fused into one graph node.
+    const children = new Set<string>();
+    for (const step of def.steps) {
+      if (step.calls === undefined) continue;
+      const child = resolveCallsTargetKey(defs, step.calls, def);
+      if (child !== undefined) children.add(child);
+    }
+    edges.set(key, [...children]);
+  }
+  return {
+    keys,
+    order: new Map(keys.map((key, index) => [key, index])),
+    edges,
+  };
+}
+
+/**
+ * Preserve the original tri-color DFS exactly for strict loading. It stops at
+ * the first back edge, so finalizeDefs remains O(V+E) and retains its stable
+ * first-cycle message and traversal precedence.
+ */
+function findFirstCallsCycle(graph: CallsGraph): string[] | undefined {
+  const WHITE = 0, GREY = 1, BLACK = 2;
+  const color = new Map(graph.keys.map((key) => [key, WHITE]));
+  const stack: string[] = [];
+  const visit = (key: string): string[] | undefined => {
+    color.set(key, GREY);
+    stack.push(key);
+    for (const child of graph.edges.get(key) ?? []) {
+      const state = color.get(child) ?? WHITE;
+      if (state === GREY) return [...stack.slice(stack.indexOf(child)), child];
+      if (state === WHITE) {
+		const found = visit(child);
+		if (found !== undefined) return found;
       }
-      if (c === WHITE) visit(child);
     }
     stack.pop();
-    color.set(name, BLACK);
+    color.set(key, BLACK);
+    return undefined;
+  };
+  for (const key of graph.keys) {
+    if ((color.get(key) ?? WHITE) !== WHITE) continue;
+    const found = visit(key);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function cycleFingerprint(cycle: readonly string[]): string {
+  const members = cycle.slice(0, -1);
+  return members
+    .map((_, index) => [...members.slice(index), ...members.slice(0, index)].join('\u0000'))
+    .sort()[0] ?? '';
+}
+
+function canonicalizeCycle(cycle: string[], order: Map<string, number>): string[] {
+  const members = cycle.slice(0, -1);
+  let first = 0;
+  for (let index = 1; index < members.length; index++) {
+    if ((order.get(members[index]!) ?? Number.MAX_SAFE_INTEGER) < (order.get(members[first]!) ?? Number.MAX_SAFE_INTEGER)) {
+      first = index;
+    }
+  }
+  const rotated = [...members.slice(first), ...members.slice(0, first)];
+  return [...rotated, rotated[0]!];
+}
+
+/** Return each cyclic SCC, indexed by every member, using deterministic Tarjan traversal. */
+function cyclicComponentsByMember(graph: CallsGraph): Map<string, Set<string>> {
+  let nextIndex = 0;
+  const index = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const byMember = new Map<string, Set<string>>();
+
+  const visit = (key: string): void => {
+    index.set(key, nextIndex);
+    lowlink.set(key, nextIndex);
+    nextIndex++;
+    stack.push(key);
+    onStack.add(key);
+
+    for (const child of graph.edges.get(key) ?? []) {
+      if (!index.has(child)) {
+		visit(child);
+		lowlink.set(key, Math.min(lowlink.get(key)!, lowlink.get(child)!));
+      } else if (onStack.has(child)) {
+		lowlink.set(key, Math.min(lowlink.get(key)!, index.get(child)!));
+      }
+    }
+
+    if (lowlink.get(key) !== index.get(key)) return;
+    const members: string[] = [];
+    while (stack.length > 0) {
+      const member = stack.pop()!;
+      onStack.delete(member);
+      members.push(member);
+      if (member === key) break;
+    }
+    const cyclic = members.length > 1 || (graph.edges.get(key) ?? []).includes(key);
+    if (!cyclic) return;
+    const component = new Set(members);
+    for (const member of members) byMember.set(member, component);
   };
 
-  for (const name of defs.keys()) {
-    if ((color.get(name) ?? WHITE) === WHITE) visit(name);
+  for (const key of graph.keys) {
+    if (!index.has(key)) visit(key);
   }
+  return byMember;
+}
+
+/** Find one deterministic simple cycle through member inside its cyclic SCC. */
+function cycleThroughMember(
+  member: string,
+  component: ReadonlySet<string>,
+  graph: CallsGraph,
+): string[] | undefined {
+  const pathBack = (key: string, target: string, path: string[], seen: Set<string>): string[] | undefined => {
+    for (const child of graph.edges.get(key) ?? []) {
+      if (!component.has(child)) continue;
+      if (child === target) return [...path, child];
+      if (seen.has(child)) continue;
+      seen.add(child);
+      const found = pathBack(child, target, [...path, child], seen);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+
+  for (const child of graph.edges.get(member) ?? []) {
+    if (!component.has(child)) continue;
+    if (child === member) return [member, member];
+    const found = pathBack(child, member, [child], new Set([member, child]));
+    if (found !== undefined) return [member, ...found];
+  }
+  return undefined;
+}
+
+/**
+ * Report calls cycles in a flat def map. This is the Mode 2 analogue of the
+ * Mode 1 include-cycle guard in expandIncludes; the two edge kinds stay
+ * deliberately separate. Findings use resolved map identity, not bare call
+ * text, so CAS bundle siblings cannot be accidentally fused. The first finding
+ * is strict loading's legacy DFS witness. Further findings add at most one
+ * deterministic witness for each still-unattributed cyclic member, keeping
+ * authoring attribution polynomial and every finding's members consistent with
+ * its displayed path without enumerating exponentially many simple cycles.
+ */
+export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFinding[] {
+  const graph = buildCallsGraph(defs);
+  const first = findFirstCallsCycle(graph);
+  if (first === undefined) return [];
+
+  const cycles: string[][] = [first];
+  const seen = new Set([cycleFingerprint(first)]);
+  const attributed = new Set(first.slice(0, -1));
+  const components = cyclicComponentsByMember(graph);
+  for (const member of graph.keys) {
+    if (attributed.has(member)) continue;
+    const component = components.get(member);
+    if (component === undefined) continue;
+    const witness = cycleThroughMember(member, component, graph);
+    if (witness === undefined) continue; // unreachable for a member of a cyclic SCC
+    const cycle = canonicalizeCycle(witness, graph.order);
+    for (const cycleMember of cycle.slice(0, -1)) attributed.add(cycleMember);
+    const fingerprint = cycleFingerprint(cycle);
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    cycles.push(cycle);
+  }
+
+  return cycles.map((cycle) => ({
+    message: `calls cycle: ${cycle.join(' -> ')}`,
+    members: cycle.slice(0, -1),
+  }));
 }
 
 // ---- filesystem loading ------------------------------------------------------
@@ -2493,7 +2645,8 @@ export function loadDefsUnfinalized(dir: string): Map<string, WorkflowDef> {
  * (each def possibly still carrying `_includes`), it: expands each def's
  * includes; runs the cross-def `calls:` checks (target existence, `callsInputs`
  * key validity, exactly-one child output); runs `validateDef` per expanded def;
- * and finally `detectCallsCycles` over the whole expanded map. Returns the
+ * and finally performs the bounded first-cycle DFS over the whole expanded map.
+ * `reportCallsCycles` exposes the wider per-member authoring report. Returns the
  * expanded, validated map. Throws `DefError` on the first problem — the same
  * messages, in the same order, the filesystem loader has always produced (this
  * is a pure extraction of what used to live inline in `loadDefs`).
@@ -2517,6 +2670,46 @@ export interface FinalizeDefsOptions {
   allowUnresolvedCalls?: boolean;
 }
 
+/**
+ * Return every direct cross-definition `calls:` error for one expanded
+ * definition. Strict loading uses the first result to retain its historical
+ * throw behavior; tolerant authoring commands can present the complete list.
+ */
+export function validateCallsEdges(
+  def: WorkflowDef,
+  defs: Map<string, WorkflowDef>,
+  options: FinalizeDefsOptions = {},
+): string[] {
+  const errors: string[] = [];
+  for (const step of def.steps) {
+    if (!step.calls) continue;
+    const childDef = resolveCallsTarget(defs, step.calls, def);
+    if (!childDef) {
+      if (
+		options.allowUnresolvedCalls !== true
+		&& options.allowUnresolvedVersionedCalls?.has(step.calls) !== true
+      ) {
+		errors.push(`calls names workflow '${step.calls}' which does not exist`);
+      }
+      continue;
+    }
+    const childInputNames = new Set(childDef.inputs.map((input) => input.name));
+    for (const key of Object.keys(step.callsInputs ?? {})) {
+      if (!childInputNames.has(key)) {
+		errors.push(`calls '${step.name}' maps input '${key}' which workflow '${step.calls}' does not declare`);
+      }
+    }
+    const childOutputs = childDef.outputs ?? [];
+    if (childOutputs.length === 0) {
+      errors.push(`calls names workflow '${step.calls}' which declares no outputs:`);
+    }
+    if (childOutputs.length > 1) {
+      errors.push(`calls names workflow '${step.calls}' which declares ${childOutputs.length} outputs:, calls: v1 requires exactly one`);
+    }
+  }
+  return errors;
+}
+
 export function finalizeDefs(
   raw: Map<string, WorkflowDef>,
   options: FinalizeDefsOptions = {},
@@ -2526,38 +2719,8 @@ export function finalizeDefs(
   for (const [name, def] of raw) {
     const expanded = expandIncludes(def, resolver);
 
-    // M2-VALIDATE cross-def: target-def existence + child input-key validity.
-    // These cannot live in validateDef (pure per-def, no resolver) — same split as expandIncludes.
-    //
-    // WS-6: `calls:` targets resolve through `resolveCallsTarget` (scope-aware),
-    // NOT through the plain `resolver` used for `include:` expansion above.
-    // `include:` is a DIFFERENT edge kind and is deliberately left on the flat
-    // lookup — this workstream is `calls:`-only.
-    for (const l of expanded.steps) {
-      if (!l.calls) continue;
-      const childDef = resolveCallsTarget(raw, l.calls, expanded);
-      if (!childDef) {
-	if (
-	  options.allowUnresolvedCalls === true
-	  || options.allowUnresolvedVersionedCalls?.has(l.calls) === true
-	) continue;
-        throw new DefError(`calls names workflow '${l.calls}' which does not exist`);
-      }
-      const childInputNames = new Set(childDef.inputs.map((i) => i.name));
-      for (const k of Object.keys(l.callsInputs ?? {})) {
-        if (!childInputNames.has(k)) {
-          throw new DefError(`calls '${l.name}' maps input '${k}' which workflow '${l.calls}' does not declare`);
-        }
-      }
-      // M2B-OUTCOME v1: the called workflow must declare exactly one output.
-      const childOutputs = childDef.outputs ?? [];
-      if (childOutputs.length === 0) {
-        throw new DefError(`calls names workflow '${l.calls}' which declares no outputs:`);
-      }
-      if (childOutputs.length > 1) {
-        throw new DefError(`calls names workflow '${l.calls}' which declares ${childOutputs.length} outputs:, calls: v1 requires exactly one`);
-      }
-    }
+    const callsErrors = validateCallsEdges(expanded, raw, options);
+    if (callsErrors.length > 0) throw new DefError(callsErrors[0]);
 
     const errors = validateDef(expanded);
     if (errors.length) {
@@ -2568,8 +2731,10 @@ export function finalizeDefs(
     out.set(name, expanded);
   }
 
-  // M2-CYCLE: detect calls: cycles over the full expanded def map (after all per-def checks pass).
-  detectCallsCycles(out);
+  // Preserve strict loading's first, stable cycle error after all per-def checks
+  // without paying the wider authoring reporter's per-member attribution cost.
+  const cycle = findFirstCallsCycle(buildCallsGraph(out));
+  if (cycle !== undefined) throw new DefError(`calls cycle: ${cycle.join(' -> ')}`);
 
   return out;
 }
@@ -2589,7 +2754,7 @@ export interface DefLoadFailure {
  * Two-phase: Phase 1 collects all defs. Phase 2 expands includes best-effort
  * (silently skips expansion failures so the lint caller sees un-expanded defs).
  */
-export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
+export function scanDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
   // Phase 1: build all defs, skipping (and recording) malformed files.
   const raw = new Map<string, WorkflowDef>();
   const tryAdd = (file: string): void => {
@@ -2617,7 +2782,11 @@ export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<strin
     }
   }
 
-  // Phase 2: expand includes best-effort; on failure keep the un-expanded def.
+  return raw;
+}
+
+/** Best-effort include expansion for a complete, already-merged raw map. */
+export function expandDefsRaw(raw: Map<string, WorkflowDef>): Map<string, WorkflowDef> {
   const out = new Map<string, WorkflowDef>();
   const resolver = (name: string): WorkflowDef | undefined => raw.get(name);
   for (const [name, def] of raw) {
@@ -2630,12 +2799,14 @@ export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<strin
     }
   }
 
-  // M2-CYCLE: best-effort calls-cycle check so lint can surface cycle errors.
-  try {
-    detectCallsCycles(out);
-  } catch {
-    // Cycle errors are surfaced via validateDef in the lint caller; swallow here.
-  }
-
   return out;
+}
+
+/**
+ * Compatibility wrapper for tolerant single-directory loading. Raw loading
+ * builds and expands includes best-effort; callers explicitly invoke shared
+ * calls validation and cycle reporting against the complete definition map.
+ */
+export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
+  return expandDefsRaw(scanDefsRaw(dir, failures));
 }

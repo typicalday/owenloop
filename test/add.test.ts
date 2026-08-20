@@ -2596,9 +2596,112 @@ test('discovery(g): a top-level def that calls: an installed def resolves and cr
   ].join('\n');
   writeFileSync(join(cwd, 'workflows', 'parent.yaml'), parentYaml);
 
+  // Authoring commands use the same no-override discovery universe as runtime,
+  // so the ledger-installed child is valid here as well as for `create`.
+  const defaultLint = await runCli(cwd, ['lint']);
+  assert.equal(defaultLint.code, 0, defaultLint.err.join('\n'));
+  const defaultCheck = await runCli(cwd, ['check', 'parent']);
+  assert.equal(defaultCheck.code, 0, defaultCheck.err.join('\n'));
+  assert.equal(existsSync(join(cwd, '.owenloop', 'state.db')), false, 'authoring discovery does not open the runtime database');
+
+  // An explicit override remains a literal scan, even when it names the default
+  // directory. The installed folder's top-level child.yaml is consequently not
+  // visible through the outer scan.
+  const literalDefs = join(cwd, 'workflows');
+  const literalLint = await runCli(cwd, ['lint', '--defs', literalDefs]);
+  assert.equal(literalLint.code, 1);
+  assert.match(literalLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  const literalCheck = await runCli(cwd, ['check', 'parent', '--defs', literalDefs]);
+  assert.equal(literalCheck.code, 1);
+  assert.match(literalCheck.err.join('\n'), /calls names workflow 'child' which does not exist/);
+  const envLiteralCheck = await runCli(cwd, ['check', 'parent'], { OWENLOOP_DEFS: literalDefs });
+  assert.equal(envLiteralCheck.code, 1);
+  assert.match(envLiteralCheck.err.join('\n'), /calls names workflow 'child' which does not exist/);
+
   const created = await runCli(cwd, ['create', 'parent']);
   assert.equal(created.code, 0, created.err.join('\n'));
   assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
+});
+
+test('discovery(g): a malformed installed sibling skips its folder for authoring and runtime discovery', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-g-whole-folder-'));
+  const childYaml = [
+    'name: child',
+    'outputs: [result]',
+    'steps:',
+    '  - name: worker',
+    '    produces: [result]',
+    '    terminal: true',
+    '',
+  ].join('\n');
+  stageInstall(cwd, 'acme', 'widgets', {
+    'broken.yaml': 'name: [not valid YAML',
+    'child.yaml': childYaml,
+  });
+  writeFileSync(join(cwd, 'workflows', 'parent.yaml'), [
+    'name: parent',
+    'steps:',
+    '  - name: delegate',
+    '    calls: child',
+    '    produces: [result]',
+    '  - name: finish',
+    '    consumes: [result]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+
+  // The malformed sibling invalidates the whole installed folder. The same
+  // missing child is therefore visible to lint/check and to create.
+  const directoryLint = await runCli(cwd, ['lint']);
+  assert.equal(directoryLint.code, 1);
+  assert.match(directoryLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  assert.match(directoryLint.out.join('\n'), /broken\.yaml/);
+  const namedLint = await runCli(cwd, ['lint', 'parent']);
+  assert.equal(namedLint.code, 1);
+  assert.match(namedLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  const checked = await runCli(cwd, ['check', 'parent']);
+  assert.equal(checked.code, 1);
+  assert.match(checked.err.join('\n'), /calls names workflow 'child' which does not exist/);
+  const created = await runCli(cwd, ['create', 'parent']);
+  assert.equal(created.code, 1);
+  assert.match(created.err.join('\n'), /warning: failed to load installed defs for acme\/widgets/);
+  assert.match(created.err.join('\n'), /calls names workflow 'child' which does not exist/);
+});
+
+test('discovery(h): duplicate names skip an installed folder instead of executing its first definition', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-h-duplicate-'));
+  stageInstall(cwd, 'acme', 'widgets', {
+    'child.yaml': validDefYaml('child'),
+    'duplicate.yaml': validDefYaml('child'),
+  });
+  writeFileSync(join(cwd, 'workflows', 'parent.yaml'), [
+    'name: parent',
+    'steps:',
+    '  - name: delegate',
+    '    calls: child',
+    '    produces: [result]',
+    '  - name: finish',
+    '    consumes: [result]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+
+  const linted = await runCli(cwd, ['lint']);
+  assert.equal(linted.code, 1);
+  assert.match(linted.out.join('\n'), /duplicate workflow name 'child'/);
+  assert.match(linted.out.join('\n'), /calls names workflow 'child' which does not exist/);
+
+  const checked = await runCli(cwd, ['check', 'parent']);
+  assert.equal(checked.code, 1);
+  assert.match(checked.err.join('\n'), /calls names workflow 'child' which does not exist/);
+
+  const created = await runCli(cwd, ['create', 'parent']);
+  assert.equal(created.code, 1);
+  assert.match(created.err.join('\n'), /warning: failed to load installed defs for acme\/widgets/);
+  assert.match(created.err.join('\n'), /duplicate workflow name 'child'/);
+  assert.match(created.err.join('\n'), /calls names workflow 'child' which does not exist/);
 });
 
 // ---- offline crash-recovery: `owenloop add --recover` ------------------------

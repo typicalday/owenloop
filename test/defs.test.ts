@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, reportCallsCycles, validateCallsEdges, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -2821,6 +2821,144 @@ test('loadDefs: calls target must exist in resolver namespace', () => {
   }
 });
 
+test('validateCallsEdges reports exact calls errors and preserves unresolved exemptions', () => {
+  const parent = (target: string, callsInputs?: Record<string, string>) => buildDef({
+    name: 'parent',
+    steps: [{ name: 'delegate', calls: target, ...(callsInputs === undefined ? {} : { inputs: callsInputs }), produces: ['result'] }],
+  });
+  const missing = parent('missing');
+  assert.deepEqual(validateCallsEdges(missing, new Map([['parent', missing]])), [
+    "calls names workflow 'missing' which does not exist",
+  ]);
+  assert.deepEqual(validateCallsEdges(missing, new Map([['parent', missing]]), { allowUnresolvedCalls: true }), []);
+  assert.deepEqual(
+    validateCallsEdges(missing, new Map([['parent', missing]]), { allowUnresolvedVersionedCalls: new Set(['missing']) }),
+    [],
+  );
+
+  const noOutputs = buildDef({ name: 'no-outputs', steps: [{ name: 'worker', produces: ['done'] }] });
+  const twoOutputs = buildDef({ name: 'two-outputs', outputs: ['one', 'two'], steps: [{ name: 'worker', produces: ['one'] }] });
+  const noInput = buildDef({ name: 'no-input', outputs: ['done'], steps: [{ name: 'worker', produces: ['done'] }] });
+  const noOutputsParent = parent('no-outputs');
+  const twoOutputsParent = parent('two-outputs');
+  const badInputParent = parent('no-input', { proposal: 'proposal' });
+  const defs = new Map([
+    ['no-outputs', noOutputs],
+    ['two-outputs', twoOutputs],
+    ['no-input', noInput],
+  ]);
+  assert.deepEqual(validateCallsEdges(noOutputsParent, defs, { allowUnresolvedCalls: true }), [
+    "calls names workflow 'no-outputs' which declares no outputs:",
+  ]);
+  assert.deepEqual(validateCallsEdges(twoOutputsParent, defs), [
+    "calls names workflow 'two-outputs' which declares 2 outputs:, calls: v1 requires exactly one",
+  ]);
+  assert.deepEqual(validateCallsEdges(badInputParent, defs), [
+    "calls 'delegate' maps input 'proposal' which workflow 'no-input' does not declare",
+  ]);
+  assert.throws(
+    () => finalizeDefs(new Map([['parent', missing]])),
+    (error: unknown) => error instanceof DefError && error.message === "calls names workflow 'missing' which does not exist",
+  );
+});
+
+test('reportCallsCycles attributes self and two-node cycles to every member', () => {
+  const call = (name: string, target: string) => buildDef({
+    name,
+    outputs: ['result'],
+    steps: [{ name: 'delegate', calls: target, produces: ['result'] }],
+  });
+  const self = call('self', 'self');
+  assert.deepEqual(reportCallsCycles(new Map([['self', self]])), [{
+    message: 'calls cycle: self -> self',
+    members: ['self'],
+  }]);
+
+  const a = call('a', 'b');
+  const b = call('b', 'a');
+  assert.deepEqual(reportCallsCycles(new Map([['a', a], ['b', b]])), [{
+    message: 'calls cycle: a -> b -> a',
+    members: ['a', 'b'],
+  }]);
+});
+
+test('reportCallsCycles reports distinct overlapping cycles with matching members', () => {
+  const call = (name: string, targets: string[]) => buildDef({
+    name,
+    outputs: ['result'],
+    steps: [
+      ...targets.map((target, index) => ({
+	name: `delegate-${index}`,
+	calls: target,
+	produces: [`child-${index}`],
+      })),
+      {
+	name: 'finish',
+	consumes: targets.map((_, index) => `child-${index}`),
+	produces: ['result'],
+	terminal: true,
+      },
+    ],
+  });
+  // a -> b -> a and a -> c -> b -> a are distinct cycles in one SCC. A
+  // back-edge-only traversal can leave c BLACK and falsely report it clean.
+  const a = call('a', ['b', 'c']);
+  const b = call('b', ['a']);
+  const c = call('c', ['b']);
+  assert.deepEqual(reportCallsCycles(new Map([['a', a], ['b', b], ['c', c]])), [
+    {
+      message: 'calls cycle: a -> b -> a',
+      members: ['a', 'b'],
+    },
+    {
+      message: 'calls cycle: a -> c -> b -> a',
+      members: ['a', 'c', 'b'],
+    },
+  ]);
+  assert.throws(
+    () => finalizeDefs(new Map([['a', a], ['b', b], ['c', c]])),
+    (error: unknown) => error instanceof DefError && error.message === 'calls cycle: a -> b -> a',
+  );
+});
+
+test('reportCallsCycles bounds dense-graph findings while attributing every cyclic member', () => {
+  const names = Array.from({ length: 7 }, (_, index) => `node-${index}`);
+  const defs = new Map(names.map((name) => {
+    const targets = names.filter((target) => target !== name);
+    return [name, buildDef({
+      name,
+      outputs: ['result'],
+      steps: [
+		...targets.map((target, index) => ({
+		  name: `delegate-${index}`,
+		  calls: target,
+		  produces: [`child-${index}`],
+		})),
+		{
+		  name: 'finish',
+		  consumes: targets.map((_, index) => `child-${index}`),
+		  produces: ['result'],
+		  terminal: true,
+		},
+      ],
+    })] as const;
+  }));
+
+  const findings = reportCallsCycles(defs);
+  assert.ok(findings.length <= names.length, `expected at most one witness per member, got ${findings.length}`);
+  assert.deepEqual(
+    new Set(findings.flatMap((finding) => finding.members)),
+    new Set(names),
+  );
+  for (const finding of findings) {
+    const displayedMembers = finding.message
+      .replace('calls cycle: ', '')
+      .split(' -> ')
+      .slice(0, -1);
+    assert.deepEqual(finding.members, displayedMembers);
+  }
+});
+
 test('loadDefs: calls: inputs key must be a declared child input', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {
@@ -2871,7 +3009,7 @@ test('loadDefs: calls: inputs key must be a declared child input', () => {
   }
 });
 
-test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
+test('finalizeDefs: A calls B calls A errors with cycle message', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {
     writeFileSync(
@@ -2912,7 +3050,7 @@ test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
   }
 });
 
-test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
+test('finalizeDefs: A calls B (acyclic) passes without error', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {
     writeFileSync(

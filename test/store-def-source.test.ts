@@ -672,7 +672,7 @@ test('WS-6 (a): the two same-named children stay DISTINCT nodes — cycle detect
   assert.notEqual(a.digest, b.digest, 'the two installs are different bundle digests');
 
   const { registrations } = load(a.root, emptyGlobalRoot());
-  // finalizeDefs runs detectCallsCycles; a false cycle would throw DefError here.
+  // finalizeDefs runs the bounded calls-cycle DFS; a false cycle would throw DefError here.
   const defs = defMap(registrations);
   assert.equal(
     new Set([...defs.values()].map((def) => `${def.bundleDigest}/${def.name}`)).size,
