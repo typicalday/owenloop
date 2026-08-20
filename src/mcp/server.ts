@@ -66,6 +66,8 @@ After starting or attending runs, park on \`wake\`; when its cursor changes, cal
 
 Treat rejection as feedback that must be surfaced and resolved. Never bypass a rejected artifact to force progress; use \`reject_artifact\` only to send an actual upstream defect back with a concrete reason.
 
+For your own complex one-off work that needs a workflow, use the ephemeral skill. Its explicitly ephemeral, caller-owned run is the exception: the caller may execute its served orders and return their real outputs with \`submit\` before retiring the name. Ordinary durable runs remain crew-first and never justify fabricated progress.
+
 If no listed playbook fits, say so plainly and ask the human how they want to proceed.`;
 
 // ---- JSON-RPC error codes ---------------------------------------------------

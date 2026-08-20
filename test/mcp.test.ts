@@ -7,7 +7,7 @@
  * `realHttpServer` — no ambient network, no real keychain.
  *
  * The load-bearing assertions:
- *   - the handshake advertises the 26 baseline+create_agent+crew tools;
+ *   - the handshake advertises the 27 baseline+create_agent+crew tools;
  *     `stage_enrollment` is gated (Decision 7);
  *   - a `tools/call` becomes ONE authenticated `/api/*` request and the REST
  *     reply maps to a tool result (2xx → body, non-2xx → isError);
@@ -131,7 +131,7 @@ function resultJson(frame: Frame): unknown {
 
 // ---- handshake + tool advertising -------------------------------------------
 
-test('mcp: handshake advertises 26 tools (21 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
+test('mcp: handshake advertises 27 tools (22 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
   // Probe hits POST /api/stage_enrollment → 404 (route unregistered) → hidden.
   const routes: Record<string, RouteHandler> = { 'POST /api/stage_enrollment': () => ({ status: 404, json: { error: 'not_found' } }) };
   const { fetch } = routedFetch(routes);
@@ -144,11 +144,11 @@ test('mcp: handshake advertises 26 tools (21 baseline + create_agent + 4 crew to
   assert.notEqual(serverInfo.version, '0.0.1');
   assert.equal(serverInfo.version, PACKAGE_VERSION);
   const names = frames[1]!.result!.tools!.map((x) => x.name);
-  assert.equal(names.length, 26, names.join(','));
+  assert.equal(names.length, 27, names.join(','));
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
-  // Sanity: the 21 baseline names are all present.
-  for (const n of ['whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
+  // Sanity: the 22 baseline names are all present.
+  for (const n of ['whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'delete_workflow', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
   // The four crew tools are all present.
@@ -307,7 +307,7 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
     LIST,
     call(3, 'reject_artifact', { workflow: 'wf', path: 'plan', reason: 'needs more depth', requested: 'deep' }),
     call(4, 'reject_artifact', { workflow: 'wf', path: 'plan', reason: 'needs more depth' }),
-    call(5, 'create_workflow', { yaml: 'version: 1', bundle_digest: 'sha256:bundle' }),
+    call(5, 'create_workflow', { yaml: 'version: 1', bundle_digest: 'sha256:bundle', ephemeral: true }),
     call(6, 'create_workflow', { yaml: 'version: 1' }),
   ]);
 
@@ -324,6 +324,7 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
   assert.deepEqual(reject.inputSchema.required, ['workflow', 'path', 'reason']);
   assert.equal(reject.inputSchema.additionalProperties, false);
   assert.deepEqual(create.inputSchema.properties.bundle_digest, { type: 'string' });
+  assert.deepEqual(create.inputSchema.properties.ephemeral, { type: 'boolean' });
   assert.deepEqual(create.inputSchema.required, ['yaml']);
   assert.equal(create.inputSchema.additionalProperties, false);
 
@@ -342,7 +343,7 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
   const creations = calls.filter((row) => row.pathname === '/api/create_workflow');
   assert.equal(creations.length, 2, 'one POST per create_workflow call');
   assert.ok(creations.every((row) => row.method === 'POST'));
-  assert.deepEqual(JSON.parse(creations[0]!.body!), { yaml: 'version: 1', bundle_digest: 'sha256:bundle' });
+  assert.deepEqual(JSON.parse(creations[0]!.body!), { yaml: 'version: 1', bundle_digest: 'sha256:bundle', ephemeral: true });
   assert.deepEqual(JSON.parse(creations[1]!.body!), { yaml: 'version: 1' });
 });
 
@@ -660,7 +661,7 @@ test('mcp: get_workflow encodes the name into the GET path', async () => {
   assert.ok(!calls.some((c) => c.pathname === '/api/workflows/a/b'), 'the name must not split into two path segments');
 });
 
-test('mcp: list_workflows is an authenticated GET passthrough for widened discovery metadata', async () => {
+test('mcp: list_workflows is an authenticated GET passthrough and preserves explicit ephemeral-discovery flags', async () => {
   const body = {
     workflows: [{
       name: 'metadata-rich',
@@ -690,13 +691,73 @@ test('mcp: list_workflows is an authenticated GET passthrough for widened discov
   const t = makeIo({ fetch });
   seedHuman(t);
 
-  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'list_workflows')]);
-  assert.deepEqual(resultJson(frames[1]!), body, 'the client must return the full hub body without a local response schema');
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    call(3, 'list_workflows'),
+    call(4, 'list_workflows', { include_ephemeral: true }),
+    call(5, 'list_workflows', { include_ephemeral: false }),
+  ]);
+  for (const id of [3, 4, 5]) {
+    assert.deepEqual(resultJson(frames.find((frame) => frame.id === id)!), body, 'the client must return the full hub body without a local response schema');
+  }
 
   const workflows = calls.filter((row) => row.pathname === '/api/workflows');
-  assert.equal(workflows.length, 1, 'exactly one hub call for list_workflows');
-  assert.equal(workflows[0]!.method, 'GET');
-  assert.equal(workflows[0]!.authorization, 'Bearer mcpat_human');
+  assert.equal(workflows.length, 3, 'exactly one hub call per list_workflows invocation');
+  assert.ok(workflows.every((row) => row.method === 'GET'));
+  assert.ok(workflows.every((row) => row.authorization === 'Bearer mcpat_human'));
+  assert.deepEqual(workflows.map((row) => new URL(row.url).search), ['', '?include_ephemeral=true', '?include_ephemeral=false']);
+});
+
+test('mcp: delete_workflow advertises a constrained name and posts it unchanged', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/delete_workflow': () => ({ status: 200, json: { retired: true } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    LIST,
+    call(3, 'delete_workflow', { name: 'eph-report-123-abc' }),
+    call(4, 'delete_workflow', { name: '' }),
+  ]);
+  const tools = (frames[1]!.result as {
+    tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } }>;
+  }).tools;
+  const remove = tools.find((tool) => tool.name === 'delete_workflow')!;
+  assert.deepEqual(remove.inputSchema.properties.name, { type: 'string', minLength: 1 });
+  assert.deepEqual(remove.inputSchema.required, ['name']);
+  assert.equal(remove.inputSchema.additionalProperties, false);
+  assert.deepEqual(resultJson(frames.find((frame) => frame.id === 3)!), { retired: true });
+  assert.equal(frames.find((frame) => frame.id === 4)!.error!.code, -32602, 'an empty name must fail locally');
+
+  const deletions = calls.filter((row) => row.pathname === '/api/delete_workflow');
+  assert.equal(deletions.length, 1, 'schema-invalid names must never reach the hub');
+  assert.equal(deletions[0]!.method, 'POST');
+  assert.equal(deletions[0]!.authorization, 'Bearer mcpat_human');
+  assert.deepEqual(JSON.parse(deletions[0]!.body!), { name: 'eph-report-123-abc' });
+});
+
+test('mcp: delete_workflow preserves an active-root refusal message', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/delete_workflow': () => ({
+      status: 409,
+      json: { error: 'workflow_delete_refused', message: "cannot be deleted while active root 'run_123' references it" },
+    }),
+  };
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'delete_workflow', { name: 'eph-report-123-abc' })]);
+  assert.equal(frames[1]!.result!.isError, true);
+  assert.deepEqual(resultJson(frames[1]!), {
+    error: 'workflow_delete_refused',
+    message: "cannot be deleted while active root 'run_123' references it",
+  });
 });
 
 test('mcp: serving-capability schema fields are optional and passthrough preserves them unchanged', async () => {

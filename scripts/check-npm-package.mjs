@@ -16,6 +16,7 @@ export const PLUGIN_FILES = Object.freeze([
   'plugins/claude-code/plugin/hooks/session-start.sh',
   'plugins/claude-code/plugin/skills/author/SKILL.md',
   'plugins/claude-code/plugin/skills/conduct/SKILL.md',
+  'plugins/claude-code/plugin/skills/ephemeral/SKILL.md',
   'plugins/claude-code/plugin/skills/shift/SKILL.md',
   'plugins/codex/.agents/plugins/marketplace.json',
   'plugins/codex/plugins/owenloop/.codex-plugin/plugin.json',
@@ -25,6 +26,7 @@ export const PLUGIN_FILES = Object.freeze([
   'plugins/codex/plugins/owenloop/hooks/session-start.sh',
   'plugins/codex/plugins/owenloop/skills/author/SKILL.md',
   'plugins/codex/plugins/owenloop/skills/conduct/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/ephemeral/SKILL.md',
   'plugins/codex/plugins/owenloop/skills/shift/SKILL.md',
 ]);
 

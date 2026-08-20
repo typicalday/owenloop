@@ -434,13 +434,13 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 21 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 22 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 21, plus `createAgentTool`, plus the four crew tools from
+ * set: these 22, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
@@ -591,7 +591,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'Only when no catalog entry fits and the human chooses ordinary authoring, use this parse-and-load hard gate for a workflow definition YAML. It is stored only if it loads clean; failures return the engine/parser error verbatim. Idempotent: re-pushing identical content is a no-op success (unchanged: true with the existing version); changed content version-forwards.',
       inputSchema: {
         type: 'object',
-		properties: { yaml: { type: 'string' }, bundle_digest: { type: 'string' } },
+		properties: { yaml: { type: 'string' }, bundle_digest: { type: 'string' }, ephemeral: { type: 'boolean' } },
         required: ['yaml'],
         additionalProperties: false,
       },
@@ -615,8 +615,24 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_workflows',
       description: 'Discover published workflow definitions and decide which one fits a task.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/workflows' })),
+      inputSchema: { type: 'object', properties: { include_ephemeral: { type: 'boolean' } }, additionalProperties: false },
+      handler: passthrough(deps, (a) => ({
+		method: 'GET',
+		path: '/api/workflows',
+		...('include_ephemeral' in a ? { query: `?include_ephemeral=${String(a['include_ephemeral'])}` } : {}),
+      })),
+    },
+    {
+      name: 'delete_workflow',
+      description:
+		'Retire an ephemeral workflow live name. Refuses while an active root references its exact pinned definition closure.',
+      inputSchema: {
+		type: 'object',
+		properties: { name: { type: 'string', minLength: 1 } },
+		required: ['name'],
+		additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/delete_workflow', body: a })),
     },
     {
       name: 'get_status',

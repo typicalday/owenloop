@@ -141,6 +141,15 @@ test('mcp charter: hashes exact served instruction bytes with full SHA-256', asy
   assert.notEqual(hash, sha256(`${instructions} `));
 });
 
+test('mcp charter: names the narrow caller-owned ephemeral self-execution exception', async () => {
+  const instructions = await servedCharterInstructions();
+  assert.match(instructions, /use the ephemeral skill/u);
+  assert.match(instructions, /explicitly ephemeral, caller-owned run is the exception/u);
+  assert.match(instructions, /caller may execute its served orders and return their real outputs/u);
+  assert.match(instructions, /let its crews execute/u, 'ordinary runs remain crew-first');
+  assert.match(instructions, /not for a chief of staff to fabricate progress/u, 'ordinary submits remain non-fabricating');
+});
+
 test('mcp charter: fixed fixture has two tasks in each category with valid workflow references', async () => {
   const fixture = await loadCharterFixture();
   assert.equal(fixture.catalog.length, 2);
