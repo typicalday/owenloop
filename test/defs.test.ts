@@ -2882,6 +2882,23 @@ test('reportCallsCycles attributes self and two-node cycles to every member', ()
   }]);
 });
 
+test('reportCallsCycles attributes every member of overlapping cycles', () => {
+  const call = (name: string, targets: string[]) => buildDef({
+    name,
+    outputs: ['result'],
+    steps: targets.map((target, index) => ({ name: `delegate-${index}`, calls: target, produces: ['result'] })),
+  });
+  // a -> b -> a and a -> c -> b -> a are distinct cycles in one SCC. A
+  // back-edge-only traversal can leave c BLACK and falsely report it clean.
+  const a = call('a', ['b', 'c']);
+  const b = call('b', ['a']);
+  const c = call('c', ['b']);
+  assert.deepEqual(reportCallsCycles(new Map([['a', a], ['b', b], ['c', c]])), [{
+    message: 'calls cycle: a -> b -> a',
+    members: ['a', 'b', 'c'],
+  }]);
+});
+
 test('loadDefs: calls: inputs key must be a declared child input', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-test-'));
   try {

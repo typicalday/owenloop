@@ -616,7 +616,7 @@ function foldInstalledDefs(
     }
     let entryRaw: Map<string, WorkflowDef>;
     try {
-      entryRaw = loadDefsUnfinalized(entryDir);
+      entryRaw = scan(entryDir);
     } catch (e) {
       io.err(`warning: failed to load installed defs for ${source} (${entry.path}): ${(e as Error).message}`);
       continue;
@@ -750,11 +750,27 @@ function loadDefsForAuthoring(
 
 function cycleErrorsByDefKey(defs: Map<string, WorkflowDef>): Map<string, string[]> {
   const errors = new Map<string, string[]>();
+  const aliases = new Map<string, string[]>();
+  for (const [key, def] of defs) {
+    // The CAS loader registers one physical def under coordinate, digest-scoped,
+    // and package/workflow aliases. Treat those aliases as one logical def so a
+    // cycle discovered through the resolver's first key is visible through every
+    // name an operator can select.
+    const identity = def.bundleDigest === undefined ? key : `${def.bundleDigest}\u0000${def.name}`;
+    const keys = aliases.get(identity) ?? [];
+    keys.push(key);
+    aliases.set(identity, keys);
+  }
   for (const finding of reportCallsCycles(defs)) {
     for (const key of finding.members) {
-      const messages = errors.get(key) ?? [];
-      messages.push(finding.message);
-      errors.set(key, messages);
+      const def = defs.get(key);
+      if (def === undefined) continue;
+      const identity = def.bundleDigest === undefined ? key : `${def.bundleDigest}\u0000${def.name}`;
+      for (const alias of aliases.get(identity) ?? []) {
+	const messages = errors.get(alias) ?? [];
+	if (!messages.includes(finding.message)) messages.push(finding.message);
+	errors.set(alias, messages);
+      }
     }
   }
   return errors;

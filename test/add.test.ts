@@ -2623,6 +2623,46 @@ test('discovery(g): a top-level def that calls: an installed def resolves and cr
   assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
 });
 
+test('discovery(g): a malformed installed sibling is reported without hiding a healthy called child from lint or check', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-g-tolerant-'));
+  const childYaml = [
+    'name: child',
+    'outputs: [result]',
+    'steps:',
+    '  - name: worker',
+    '    produces: [result]',
+    '    terminal: true',
+    '',
+  ].join('\n');
+  stageInstall(cwd, 'acme', 'widgets', {
+    'broken.yaml': 'name: [not valid YAML',
+    'child.yaml': childYaml,
+  });
+  writeFileSync(join(cwd, 'workflows', 'parent.yaml'), [
+    'name: parent',
+    'steps:',
+    '  - name: delegate',
+    '    calls: child',
+    '    produces: [result]',
+    '  - name: finish',
+    '    consumes: [result]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+
+  // The malformed sibling remains a directory-lint finding, but it cannot
+  // discard the whole installed folder and turn parent -> child into a false
+  // missing-child error.
+  const directoryLint = await runCli(cwd, ['lint']);
+  assert.equal(directoryLint.code, 1);
+  assert.doesNotMatch(directoryLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  const namedLint = await runCli(cwd, ['lint', 'parent']);
+  assert.equal(namedLint.code, 0, namedLint.err.join('\n'));
+  const checked = await runCli(cwd, ['check', 'parent']);
+  assert.equal(checked.code, 0, checked.err.join('\n'));
+});
+
 // ---- offline crash-recovery: `owenloop add --recover` ------------------------
 //
 // `add --recover` is a NETWORK-FREE entry point to the same

@@ -28,11 +28,16 @@ import { DatabaseSync } from 'node:sqlite';
 import { ASYNC_COMMANDS, classifyAddSource, COMMAND_OPTIONS, defaultIO, main, mainAsync, USAGE } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { ADD_JOURNAL_FILENAME } from '../src/add.ts';
+import { packBundle, unpackBundle } from '../src/bundle/index.ts';
 import { writeHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import {
   defDigest,
   globalStoreRoot,
+  hardenObjectModes,
+  objectDirForDigest,
+  projectStoreRoot,
   storeIndexPath,
+  writeWorkflowStoreIndex,
   workflowCoordinate,
   WORKFLOW_STORE_INDEX_FILENAME,
 } from '../src/store/index.ts';
@@ -1380,6 +1385,59 @@ test('owenloop lint and check keep immediate workflow.yaml children in a literal
   assert.equal(directoryLint.code, 0, `${directoryLint.err}\n${directoryLint.out}`);
   assert.equal(namedLint.code, 0, `${namedLint.err}\n${namedLint.out}`);
   assert.equal(checked.code, 0, `${checked.err}\n${checked.out}`);
+});
+
+test('owenloop lint and check report CAS calls cycles through every selectable alias', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-lint-cas-cycle-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-lint-cas-home-'));
+  const defsDir = join(cwd, 'workflows');
+  mkdirSync(defsDir, { recursive: true });
+  const callsDef = (name: string, target: string) => [
+    `name: ${name}`,
+    'outputs: [result]',
+    'steps:',
+    '  - name: delegate',
+    `    calls: ${target}`,
+    '    produces: [result]',
+    '',
+  ].join('\n');
+  const root = projectStoreRoot(defsDir);
+  // A normal install correctly refuses a cycle, so seed a canonical, hardened
+  // store object directly. This exercises authoring inspection of an existing
+  // CAS object, including every alias the loader registers for its default.
+  const packed = packBundle(writeBundleSource({
+    name: 'cycle',
+    workflow: callsDef('cycle', 'other'),
+    workflows: { other: callsDef('other', 'cycle') },
+    defaultWorkflow: 'cycle',
+  }));
+  mkdirSync(join(root, 'objects', 'sha256'), { recursive: true });
+  const digest = defDigest(packed.digest);
+  const objectDir = objectDirForDigest(root, digest);
+  unpackBundle(packed.bytes, objectDir);
+  hardenObjectModes(objectDir);
+  const coordinate = 'cycle/cycle@1.0.0';
+  writeWorkflowStoreIndex(storeIndexPath(root), {
+    version: 1,
+    entries: { [coordinate]: { digest, pinned: false, workflows: ['cycle', 'other'] } },
+  });
+  const run = (...argv: string[]) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = main(argv, { cwd, env: { HOME: home }, out: (line) => out.push(line), err: (line) => err.push(line) });
+    return { code, out: out.join('\n'), err: err.join('\n') };
+  };
+
+  // Bare sibling resolution records the cycle through the coordinate alias
+  // first. The package/workflow alias must still receive the same finding.
+  for (const alias of ['cycle/cycle', coordinate]) {
+    const lint = run('lint', alias);
+    assert.equal(lint.code, 1, `${alias}: ${lint.err}`);
+    assert.match(lint.out, /calls cycle:/, `${alias}: ${lint.out}`);
+    const checked = run('check', alias);
+    assert.equal(checked.code, 1, `${alias}: ${checked.err}`);
+    assert.match(checked.err, /calls cycle:/, `${alias}: ${checked.err}`);
+  }
 });
 
 test('owenloop lint exits 0 for clean definitions and prints JSON', () => {

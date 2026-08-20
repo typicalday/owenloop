@@ -2377,52 +2377,83 @@ export interface CallsCycleFinding {
  * text, so CAS bundle siblings cannot be accidentally fused.
  */
 export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFinding[] {
-  const WHITE = 0, GREY = 1, BLACK = 2;
-  const color = new Map<string, number>([...defs.keys()].map((k) => [k, WHITE]));
-  const stack: string[] = [];
-  const findings: CallsCycleFinding[] = [];
-  const reported = new Set<string>();
-
-  // WS-6: the walk must key on RESOLVED identity, not on the bare `calls:` text.
-  // Two installed bundles may each export a workflow named `build`; keying the
-  // walk by that bare text would fuse them into one node and report a cycle that
-  // does not exist. `resolveCallsTarget` maps (edge text, calling def) to the
-  // exact map key the engine will spawn, so each bundle's `build` stays its own
-  // node under its own qualified key.
-  const visit = (name: string): void => {
-    color.set(name, GREY);
-    stack.push(name);
-    const def = defs.get(name);
-    // Unique calls: edges from this def (multiple steps might call the same child)
-    const callsEdges = new Set((def?.steps ?? []).filter((l) => l.calls).map((l) => l.calls!));
-    for (const edge of callsEdges) {
-      const child = def === undefined ? undefined : resolveCallsTargetKey(defs, edge, def);
-      if (child === undefined) continue; // missing-def error is reported separately in loadDefs
-      const c = color.get(child) ?? WHITE;
-      if (c === GREY) {
-        const from = stack.indexOf(child);
-		const members = stack.slice(from);
-		// Rotation-normalize the resolved member keys so one cycle is reported once.
-		const cycleKey = members.map((_, index) => [...members.slice(index), ...members.slice(0, index)].join('\u0000')).sort()[0]!;
-		if (!reported.has(cycleKey)) {
-			reported.add(cycleKey);
-			findings.push({
-				message: `calls cycle: ${[...members, child].join(' -> ')}`,
-				members,
-			});
-		}
-		continue;
-      }
-      if (c === WHITE) visit(child);
+  const keys = [...defs.keys()];
+  const order = new Map(keys.map((key, index) => [key, index]));
+  const edges = new Map<string, string[]>();
+  for (const [key, def] of defs) {
+    // WS-6: graph nodes are RESOLVED map keys, not bare calls text. Two bundles
+    // may both export `build` without being fused into one graph node.
+    const children = new Set<string>();
+    for (const step of def.steps) {
+      if (step.calls === undefined) continue;
+      const child = resolveCallsTargetKey(defs, step.calls, def);
+      if (child !== undefined) children.add(child);
     }
-    stack.pop();
-    color.set(name, BLACK);
+    edges.set(key, [...children]);
+  }
+
+  // A back-edge walk finds only the first loop through a BLACK node. Tarjan's
+  // SCC algorithm instead reports the complete cyclic component, so every def
+  // in overlapping cycles receives the hard authoring error.
+  let nextIndex = 0;
+  const index = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const components: string[][] = [];
+  const visit = (key: string): void => {
+    index.set(key, nextIndex);
+    lowlink.set(key, nextIndex);
+    nextIndex += 1;
+    stack.push(key);
+    onStack.add(key);
+
+    for (const child of edges.get(key) ?? []) {
+      if (!index.has(child)) {
+	visit(child);
+	lowlink.set(key, Math.min(lowlink.get(key)!, lowlink.get(child)!));
+      } else if (onStack.has(child)) {
+	lowlink.set(key, Math.min(lowlink.get(key)!, index.get(child)!));
+      }
+    }
+
+    if (lowlink.get(key) !== index.get(key)) return;
+    const component: string[] = [];
+    for (;;) {
+      const member = stack.pop()!;
+      onStack.delete(member);
+      component.push(member);
+      if (member === key) break;
+    }
+    const members = component.sort((a, b) => order.get(a)! - order.get(b)!);
+    if (members.length > 1 || (edges.get(members[0]!) ?? []).includes(members[0]!)) {
+      components.push(members);
+    }
   };
 
-  for (const name of defs.keys()) {
-    if ((color.get(name) ?? WHITE) === WHITE) visit(name);
-  }
-  return findings;
+  for (const key of keys) if (!index.has(key)) visit(key);
+  components.sort((a, b) => order.get(a[0]!)! - order.get(b[0]!)!);
+
+  const cyclePath = (members: readonly string[]): string[] => {
+    const allowed = new Set(members);
+    const start = members[0]!;
+    const walk = (key: string, path: string[], seen: Set<string>): string[] | undefined => {
+      for (const child of edges.get(key) ?? []) {
+	if (!allowed.has(child)) continue;
+	if (child === start) return [...path, start];
+	if (seen.has(child)) continue;
+	const found = walk(child, [...path, child], new Set([...seen, child]));
+	if (found !== undefined) return found;
+      }
+      return undefined;
+    };
+    return walk(start, [start], new Set([start])) ?? [start, start];
+  };
+
+  return components.map((members) => ({
+    message: `calls cycle: ${cyclePath(members).join(' -> ')}`,
+    members,
+  }));
 }
 
 // ---- filesystem loading ------------------------------------------------------
