@@ -505,6 +505,25 @@ test('ephemeral skill is hub-native and the legacy local skill is gone', () => {
     }
   }
   assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-ephemeral/SKILL.md')), false);
+  assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-author/SKILL.md')), false);
+  assert.equal(existsSync(resolve(ROOT, 'skills/owenloop-conduct/SKILL.md')), false);
+});
+
+test('retirement docs list every plugin skill and describe conduct as Shift supervision', () => {
+  const readme = readText('README.md');
+  for (const [name, path] of [
+    ['author', 'plugins/_skills/author/SKILL.md'],
+    ['conduct', 'plugins/_skills/conduct/SKILL.md'],
+    ['ephemeral', 'plugins/_skills/ephemeral/SKILL.md'],
+    ['shift', 'plugins/_skills/shift/SKILL.md'],
+  ]) {
+    assert.ok(readme.includes(`[\`${name}\`](${path})`), `README must link the ${name} plugin skill`);
+  }
+
+  const shipExample = readText('examples/workflows/ship.yaml');
+  assert.ok(shipExample.includes('scoped Shift'), 'ship example must describe conduct as scoped Shift supervision');
+  assert.ok(shipExample.includes('`agent-run`'), 'ship example must name Shift-dispatched agent workers');
+  assert.ok(!shipExample.includes('one fresh subagent per order'), 'ship example must not teach the retired dispatch model');
 });
 
 for (const { path, name } of SKILL_CASES) {

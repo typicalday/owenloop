@@ -33,8 +33,9 @@
 #   ...
 #   owenloop reject $wf pr --by reviewer --text "error path untested; add the 429 case"
 #
-# Or hand it to an agent: the owenloop-conduct skill (skills/owenloop-conduct)
-# drives an instance to done, one fresh subagent per order.
+# Or hand it to the `conduct` plugin skill, which supervises this workflow through a
+# scoped Shift, checks status, and relays human gates. The Shift starts `agent-run`
+# workers for agent orders.
 #
 # Scaffolding hygiene: if the db (.owenloop/) and this defs dir live inside
 # the repo the workflow ships changes to, gitignore them first — a builder

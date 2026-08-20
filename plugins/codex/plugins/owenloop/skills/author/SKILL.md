@@ -41,6 +41,28 @@ run `claude mcp list` to confirm the real names before proceeding.
 7. **Offer `start_run`** once approved and free of lint errors, with any inputs
    the human already knows they want to seed.
 
+## Interview, compile, and approve the process
+
+Keep the interview conversational and just detailed enough to name the graph. Ask
+for the end result, starting input, the work and artifact each step creates,
+quality or rejection gates, work repeated per item, possible forks, and each human
+decision. Do not over-interview: once the graph is nameable, draft it and let the
+human correct the draft.
+
+Compile answers into one coherent job per step. Name steps as roles or verbs and
+artifacts as nouns; wire steps through the data they actually produce and consume,
+not a hand-sequenced list. Each produced artifact should be consumed, declared as a
+workflow output, or intentionally recorded as a generated sink. A straight process
+with a quality loop is linear plus rejection; repeated item work is collection
+map/reduce; an either/or decision is route/skip; reusable process pieces are
+`include:` or `calls:`.
+
+For approval, present a numbered process in the human's domain language rather than
+YAML. Explicitly confirm the start, end, gates, forks, and human touchpoints. Revise
+the draft, call `create_workflow` again, and re-present until it is approved. Probe
+concrete failure cases (for example, a bad input or repeated rejection) so approval
+is informed rather than polite.
+
 ## Step Agent dispatch and `x.harness`
 
 `owenloop work agent-run` is the only supported dispatcher for workflow Step
