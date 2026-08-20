@@ -308,9 +308,13 @@ test('mcp: pending_gates preserves optional serve_crews and returns each hub res
     LIST,
     call(3, 'pending_gates', {}),
     call(4, 'pending_gates', { serve_crews: ['alpha', 'beta'] }),
+    call(5, 'pending_gates', { serve_crews: 'alpha' }),
+    call(6, 'pending_gates', { serve_crews: ['alpha', 1] }),
+    call(7, 'pending_gates', { unexpected: true }),
   ]);
 
-  const pending = frames[1]!.result!.tools!.find((tool) => tool.name === 'pending_gates') as unknown as {
+  const frameFor = (id: number): Frame => frames.find((frame) => frame.id === id)!;
+  const pending = frameFor(2).result!.tools!.find((tool) => tool.name === 'pending_gates') as unknown as {
     description: string;
     inputSchema: unknown;
   };
@@ -321,11 +325,14 @@ test('mcp: pending_gates preserves optional serve_crews and returns each hub res
   });
   assert.match(pending.description, /waiting on a person/u);
   assert.match(pending.description, /after starting or attending runs/u);
-  assert.deepEqual(resultJson(frames[2]!), { gates: ['all-visible'] });
-  assert.deepEqual(resultJson(frames[3]!), { gates: ['crew-scoped'] });
+  assert.deepEqual(resultJson(frameFor(3)), { gates: ['all-visible'] });
+  assert.deepEqual(resultJson(frameFor(4)), { gates: ['crew-scoped'] });
+  for (const id of [5, 6, 7]) {
+    assert.equal(frameFor(id).error!.code, -32602, 'invalid tool arguments must use the JSON-RPC INVALID_PARAMS envelope');
+  }
 
   const gates = calls.filter((row) => row.pathname === '/api/pending_gates');
-  assert.equal(gates.length, 2, 'one authenticated POST per pending_gates call');
+  assert.equal(gates.length, 2, 'invalid arguments must not reach the hub');
   assert.equal(gates[0]!.authorization, 'Bearer mcpat_human');
   assert.equal(gates[0]!.method, 'POST');
   assert.deepEqual(JSON.parse(gates[0]!.body!), {});
@@ -918,8 +925,8 @@ test('mcp: create_agent rejects an invalid name BEFORE any network call', async 
   // No human credential seeded and no routes: if the handler reached the network it would throw.
 
   const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'create_agent', { name: 'bad name!' })]);
-  assert.equal(frames[1]!.result!.isError, true);
-  assert.match(frames[1]!.result!.content![0]!.text, /invalid agent name/);
+  assert.equal(frames[1]!.error!.code, -32602);
+  assert.match(frames[1]!.error!.message, /invalid arguments for tool 'create_agent'/u);
   assert.equal(calls.length, 0, 'no hub call was made for an invalid name');
 });
 

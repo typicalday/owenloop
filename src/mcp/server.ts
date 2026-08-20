@@ -29,17 +29,21 @@
  *   - `notifications/initialized` → no-op (no response; it is a notification).
  *   - `ping`                  → `{}`.
  *   - `tools/list`            → the registered tool defs.
- *   - `tools/call`            → dispatch to the tool handler; the result is
- *                               `{content:[{type:'text',text:<JSON>}], isError?}`.
+ *   - `tools/call`            → validate arguments against the registered
+ *                               input schema, then dispatch to the handler;
+ *                               the result is `{content:[{type:'text',text:<JSON>}], isError?}`.
  *   - `notifications/cancelled` → abort a tracked in-flight `tools/call`; the
  *                               aborted call sends NO response frame.
  *   - outbound `notifications/progress` when a call carried
  *     `params._meta.progressToken` (via `ctx.sendProgress`).
  *
  * Errors: unknown method → -32601; malformed JSON / bad envelope → -32700;
- * invalid params → -32602. A notification (no `id`) never gets a response, even
- * on error. The process must never crash on a bad line.
+ * invalid params (including a tool-schema mismatch) → -32602. A notification
+ * (no `id`) never gets a response, even on error. The process must never crash
+ * on a bad line.
  */
+
+import { summarizeIssues, validateValue } from '../schema.ts';
 
 /** The MCP revisions this server will agree to echo back on `initialize`. */
 const RECOGNIZED_PROTOCOL_VERSIONS = new Set([
@@ -201,8 +205,18 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
       replyError(id, METHOD_NOT_FOUND, `unknown tool '${name}'`);
       return;
     }
+    const hasArguments = 'arguments' in params;
     const rawArgs = params['arguments'];
-    const args: Record<string, unknown> = isObject(rawArgs) ? rawArgs : {};
+    if (hasArguments && !isObject(rawArgs)) {
+      replyError(id, INVALID_PARAMS, 'tools/call "arguments" must be an object when supplied');
+      return;
+    }
+    const args: Record<string, unknown> = hasArguments ? rawArgs as Record<string, unknown> : {};
+    const shape = validateValue(reg.inputSchema, args);
+    if (!shape.valid) {
+      replyError(id, INVALID_PARAMS, `invalid arguments for tool '${name}': ${summarizeIssues(shape.issues)}`);
+      return;
+    }
 
     const progressToken = readProgressToken(params);
     const tracked: InFlight = { cancelled: false, byClose: false, cancelCbs: [] };
