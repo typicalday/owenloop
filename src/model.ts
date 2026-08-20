@@ -2588,11 +2588,12 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // Checked BEFORE the `done` continue so terminal properties ("when done,
     // merge must be green") are verified.
     //
-    // Soundness under bounds: a reported counterexample path was produced by real
-    // applyOutcome/settleInMemory transitions (the same transitions the conformance
-    // test pins to the live Engine). Bounds only cause MISSES, never fabrications —
-    // which is why invariant violations exit non-zero even when bounded (unlike
-    // deadlocks/stuck, which the maxCollectionSize cap can spuriously manufacture).
+    // Soundness under bounds: reported invariant counterexamples and true
+    // deadlocks are real witnesses. Counterexample paths are produced by real
+    // applyOutcome/settleInMemory transitions (the same transitions the
+    // conformance test pins to the live Engine), and true deadlocks are classified
+    // by a cap-free freeze-lifted eligibility recomputation. Bounds can cause
+    // MISSES, never fabricate either witness. `stuck` remains informational.
     if (def.invariants) {
       for (const inv of def.invariants) {
         if (reportedInvariants.has(inv.name)) continue;
@@ -2734,16 +2735,18 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
  * (install/push seed `assumeProvided: true`; check seeds
  * `assumeProvided: !strictInputs`).
  *
- * invariant violations and structurally-dead steps are ALWAYS definite (sound
- * regardless of bounds); a true deadlock counts ONLY when the search was
- * exhaustive (`!bounded`) because a tight maxCollectionSize cap can manufacture
- * a spurious one. `unreachedSteps` is deliberately EXCLUDED — it is a bounds
- * artifact ("raise --max-states/--max-depth"), never a definite defect.
+ * Invariant violations, structurally-dead steps, and reported true deadlocks are
+ * ALWAYS definite (sound regardless of bounds). A reported deadlock is a
+ * reachable state whose cap-free freeze-lifted eligibility recomputation has no
+ * moves. max-depth, max-states, and collection caps can cause missed findings,
+ * but cannot fabricate that witness. `unreachedSteps` is deliberately EXCLUDED
+ * — it is a bounds artifact ("raise --max-states/--max-depth"), never a definite
+ * defect.
  */
 export function hasDefiniteCheckDefect(report: CheckReport): boolean {
   return (
     report.invariantViolations.length > 0 ||
     report.structurallyDeadSteps.length > 0 ||
-    (!report.bounded && report.deadlocks.length > 0)
+    report.deadlocks.length > 0
   );
 }

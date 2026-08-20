@@ -1047,10 +1047,11 @@ attempts," i.e. what a human `retry` grants):
 - **true deadlock** (`report.deadlocks`) — the recompute STILL yields zero
   firings: no producer would re-arm even at unlimited attempts. A genuine
   structural dead-end (e.g. a `group:`-blocked or ungreen-input state, or an
-  owed input with no producer). This is folded into `hasDefiniteDefect` and
-  makes `check` exit nonzero — but only when the search was exhaustive
-  (`!report.bounded`), since a tight `--max-collection`/`--max-states` cap
-  can otherwise manufacture a spurious no-moves state.
+  owed input with no producer). This is folded into `hasDefiniteCheckDefect` and
+  always makes `check` exit nonzero. `boundsHit` limits completeness, not the
+  validity of an already-reached deadlock witness: max-depth, max-states, and
+  `--max-collection` may omit findings but cannot fabricate this cap-free
+  freeze-lifted classification.
 
 The freeze-lift recompute ONLY lifts the `frozen()` guard — it does not
 bypass group-exclusivity (`groupBlockingWinner`), input-green gates, or

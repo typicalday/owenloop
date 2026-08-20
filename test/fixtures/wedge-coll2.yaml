@@ -1,0 +1,20 @@
+name: wedge-coll2
+title: leaner idle wedge with collection
+description: collection variant, no reduce
+
+inputs:
+  - name: brief
+    seedOwed: true
+
+steps:
+  - name: gather
+    consumes: [brief]
+    produces: ["gather.item[]"]
+    body: |
+      emit then seal
+  - name: monitor
+    on: [idle]
+    idleAfter: 1h
+    produces: [outcome]
+    body: |
+      never fires

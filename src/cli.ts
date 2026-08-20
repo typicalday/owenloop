@@ -2408,29 +2408,20 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     }
 
     // Exit codes:
-    // - invariant violations → ALWAYS nonzero, regardless of bounded. A reported
-    //   counterexample path was produced by real applyOutcome/settleInMemory
-    //   transitions (pinned to the live Engine by the conformance test). The path
-    //   is a genuine executable witness; bounds only cause MISSES, never
-    //   fabrications. Contrast true deadlocks, where the maxCollectionSize cap can
-    //   manufacture a spurious "no moves" state — hence that requires !bounded.
-    //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
-    // - structurally-dead steps → ALWAYS nonzero, regardless of bounded. Unlike
-    //   true deadlocks (found by the bounded BFS, so a tighter maxCollectionSize
-    //   can manufacture a spurious one), structurally-dead is a STATIC canEverFire
-    //   finding that needs no search bounds at all — it is sound and bounds-
-    //   independent by construction (model.ts's canEverFire only ever returns
-    //   false when certain), so it belongs with invariant violations, not with
-    //   true deadlocks. unreachedSteps (the other dead-step bucket) must NEVER
-    //   affect the exit code — it is purely a bounds artifact.
-    // - definite (true) deadlock only when EXHAUSTIVE (!bounded) → nonzero
+    // - invariant violations, structurally-dead steps, and true deadlocks are
+    //   ALWAYS nonzero, regardless of bounded. Invariant paths use real
+    //   applyOutcome/settleInMemory transitions; structurally-dead is a STATIC
+    //   canEverFire finding; a true deadlock is a reached state with no moves in a
+    //   cap-free freeze-lifted eligibility recomputation. Search bounds may omit
+    //   findings, but they cannot invalidate an already-reached witness.
+    // - unreachedSteps must NEVER affect the exit code: it is purely a bounds
+    //   artifact.
     // - stall states and stuck states are by-design brakes and NEVER affect the
     //   exit code — a stall state (report.stallStates) is EXPECTED (a human-
     //   escalation brake whose freeze, once lifted, re-arms a producer), and a
     //   stuck state (report.stuck) is purely informational (a brake tripped on
     //   one branch while the line still moves on another). Neither is a defect.
-    // - truncated with no invariant violations / structurally-dead steps / true
-    //   deadlocks → 0
+    // - truncated with none of those three definite finding classes → 0
     const hasDefiniteDefect = hasDefiniteCheckDefect(report);
     if (hasDefiniteDefect) {
       throw new CliError(

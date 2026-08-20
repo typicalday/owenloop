@@ -657,13 +657,19 @@ test('hasDefiniteCheckDefect: unit predicate agrees for all three commands', () 
     'an invariant violation alone is a definite defect',
   );
 
-  // deadlock while bounded (search truncated) → false: a tight maxCollectionSize
-  // cap can manufacture a spurious no-moves state, so a deadlock only counts
-  // when the search was exhaustive.
+  // deadlock while bounded (search truncated) → true: unrelated truncation
+  // cannot invalidate an already-reached deadlock witness.
   assert.equal(
     hasDefiniteCheckDefect(baseReport({ deadlocks: [{ path: [] }], bounded: true })),
-    false,
-    'a deadlock found only under bounded search is not yet definite',
+    true,
+    'a reached deadlock remains a definite defect when another bound was hit',
+  );
+  // The plain, uncapped baseline is definite too; collection-cap metadata is
+  // neither necessary nor relevant to the predicate.
+  assert.equal(
+    hasDefiniteCheckDefect(baseReport({ deadlocks: [{ path: [] }], bounded: false })),
+    true,
+    'an exhaustive uncapped deadlock is a definite defect',
   );
   // Collection-cap metadata is a reporting caveat, not a bound: the same
   // deadlock remains definite while the BFS itself is exhaustive.
