@@ -2364,17 +2364,24 @@ export function resolveCallsTarget(
 
 // ---- M2-CYCLE: cross-def calls-cycle detection --------------------------------
 
+/** A calls cycle and every resolved definition key that participates in it. */
+export interface CallsCycleFinding {
+  message: string;
+  members: string[];
+}
+
 /**
- * Walk the calls: edges in a flat def map and throw a DefError if any cycle exists.
- * This is the Mode 2 analogue of the Mode 1 include-cycle guard in expandIncludes.
- * Note: include: and calls: are DIFFERENT edge kinds — they are checked separately.
- *
- * Called from loadDefs Phase 2 after all defs are expanded and per-def validated.
+ * Report calls cycles in a flat def map. This is the Mode 2 analogue of the
+ * Mode 1 include-cycle guard in expandIncludes; the two edge kinds stay
+ * deliberately separate. Findings use resolved map identity, not bare call
+ * text, so CAS bundle siblings cannot be accidentally fused.
  */
-function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
+export function reportCallsCycles(defs: Map<string, WorkflowDef>): CallsCycleFinding[] {
   const WHITE = 0, GREY = 1, BLACK = 2;
   const color = new Map<string, number>([...defs.keys()].map((k) => [k, WHITE]));
   const stack: string[] = [];
+  const findings: CallsCycleFinding[] = [];
+  const reported = new Set<string>();
 
   // WS-6: the walk must key on RESOLVED identity, not on the bare `calls:` text.
   // Two installed bundles may each export a workflow named `build`; keying the
@@ -2394,7 +2401,17 @@ function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
       const c = color.get(child) ?? WHITE;
       if (c === GREY) {
         const from = stack.indexOf(child);
-        throw new DefError(`calls cycle: ${[...stack.slice(from), child].join(' -> ')}`);
+		const members = stack.slice(from);
+		// Rotation-normalize the resolved member keys so one cycle is reported once.
+		const cycleKey = members.map((_, index) => [...members.slice(index), ...members.slice(0, index)].join('\u0000')).sort()[0]!;
+		if (!reported.has(cycleKey)) {
+			reported.add(cycleKey);
+			findings.push({
+				message: `calls cycle: ${[...members, child].join(' -> ')}`,
+				members,
+			});
+		}
+		continue;
       }
       if (c === WHITE) visit(child);
     }
@@ -2405,6 +2422,7 @@ function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
   for (const name of defs.keys()) {
     if ((color.get(name) ?? WHITE) === WHITE) visit(name);
   }
+  return findings;
 }
 
 // ---- filesystem loading ------------------------------------------------------
@@ -2517,6 +2535,46 @@ export interface FinalizeDefsOptions {
   allowUnresolvedCalls?: boolean;
 }
 
+/**
+ * Return every direct cross-definition `calls:` error for one expanded
+ * definition. Strict loading uses the first result to retain its historical
+ * throw behavior; tolerant authoring commands can present the complete list.
+ */
+export function validateCallsEdges(
+  def: WorkflowDef,
+  defs: Map<string, WorkflowDef>,
+  options: FinalizeDefsOptions = {},
+): string[] {
+  const errors: string[] = [];
+  for (const step of def.steps) {
+    if (!step.calls) continue;
+    const childDef = resolveCallsTarget(defs, step.calls, def);
+    if (!childDef) {
+      if (
+		options.allowUnresolvedCalls !== true
+		&& options.allowUnresolvedVersionedCalls?.has(step.calls) !== true
+      ) {
+		errors.push(`calls names workflow '${step.calls}' which does not exist`);
+      }
+      continue;
+    }
+    const childInputNames = new Set(childDef.inputs.map((input) => input.name));
+    for (const key of Object.keys(step.callsInputs ?? {})) {
+      if (!childInputNames.has(key)) {
+		errors.push(`calls '${step.name}' maps input '${key}' which workflow '${step.calls}' does not declare`);
+      }
+    }
+    const childOutputs = childDef.outputs ?? [];
+    if (childOutputs.length === 0) {
+      errors.push(`calls names workflow '${step.calls}' which declares no outputs:`);
+    }
+    if (childOutputs.length > 1) {
+      errors.push(`calls names workflow '${step.calls}' which declares ${childOutputs.length} outputs:, calls: v1 requires exactly one`);
+    }
+  }
+  return errors;
+}
+
 export function finalizeDefs(
   raw: Map<string, WorkflowDef>,
   options: FinalizeDefsOptions = {},
@@ -2526,38 +2584,8 @@ export function finalizeDefs(
   for (const [name, def] of raw) {
     const expanded = expandIncludes(def, resolver);
 
-    // M2-VALIDATE cross-def: target-def existence + child input-key validity.
-    // These cannot live in validateDef (pure per-def, no resolver) — same split as expandIncludes.
-    //
-    // WS-6: `calls:` targets resolve through `resolveCallsTarget` (scope-aware),
-    // NOT through the plain `resolver` used for `include:` expansion above.
-    // `include:` is a DIFFERENT edge kind and is deliberately left on the flat
-    // lookup — this workstream is `calls:`-only.
-    for (const l of expanded.steps) {
-      if (!l.calls) continue;
-      const childDef = resolveCallsTarget(raw, l.calls, expanded);
-      if (!childDef) {
-	if (
-	  options.allowUnresolvedCalls === true
-	  || options.allowUnresolvedVersionedCalls?.has(l.calls) === true
-	) continue;
-        throw new DefError(`calls names workflow '${l.calls}' which does not exist`);
-      }
-      const childInputNames = new Set(childDef.inputs.map((i) => i.name));
-      for (const k of Object.keys(l.callsInputs ?? {})) {
-        if (!childInputNames.has(k)) {
-          throw new DefError(`calls '${l.name}' maps input '${k}' which workflow '${l.calls}' does not declare`);
-        }
-      }
-      // M2B-OUTCOME v1: the called workflow must declare exactly one output.
-      const childOutputs = childDef.outputs ?? [];
-      if (childOutputs.length === 0) {
-        throw new DefError(`calls names workflow '${l.calls}' which declares no outputs:`);
-      }
-      if (childOutputs.length > 1) {
-        throw new DefError(`calls names workflow '${l.calls}' which declares ${childOutputs.length} outputs:, calls: v1 requires exactly one`);
-      }
-    }
+    const callsErrors = validateCallsEdges(expanded, raw, options);
+    if (callsErrors.length > 0) throw new DefError(callsErrors[0]);
 
     const errors = validateDef(expanded);
     if (errors.length) {
@@ -2568,8 +2596,9 @@ export function finalizeDefs(
     out.set(name, expanded);
   }
 
-  // M2-CYCLE: detect calls: cycles over the full expanded def map (after all per-def checks pass).
-  detectCallsCycles(out);
+  // Preserve strict loading's first, stable cycle error after all per-def checks.
+  const cycle = reportCallsCycles(out)[0];
+  if (cycle !== undefined) throw new DefError(cycle.message);
 
   return out;
 }
@@ -2589,7 +2618,7 @@ export interface DefLoadFailure {
  * Two-phase: Phase 1 collects all defs. Phase 2 expands includes best-effort
  * (silently skips expansion failures so the lint caller sees un-expanded defs).
  */
-export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
+export function scanDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
   // Phase 1: build all defs, skipping (and recording) malformed files.
   const raw = new Map<string, WorkflowDef>();
   const tryAdd = (file: string): void => {
@@ -2617,7 +2646,11 @@ export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<strin
     }
   }
 
-  // Phase 2: expand includes best-effort; on failure keep the un-expanded def.
+  return raw;
+}
+
+/** Best-effort include expansion for a complete, already-merged raw map. */
+export function expandDefsRaw(raw: Map<string, WorkflowDef>): Map<string, WorkflowDef> {
   const out = new Map<string, WorkflowDef>();
   const resolver = (name: string): WorkflowDef | undefined => raw.get(name);
   for (const [name, def] of raw) {
@@ -2630,12 +2663,14 @@ export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<strin
     }
   }
 
-  // M2-CYCLE: best-effort calls-cycle check so lint can surface cycle errors.
-  try {
-    detectCallsCycles(out);
-  } catch {
-    // Cycle errors are surfaced via validateDef in the lint caller; swallow here.
-  }
-
   return out;
+}
+
+/**
+ * Compatibility wrapper for tolerant single-directory loading. Raw loading
+ * builds and expands includes best-effort; callers explicitly invoke shared
+ * calls validation and cycle reporting against the complete definition map.
+ */
+export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
+  return expandDefsRaw(scanDefsRaw(dir, failures));
 }

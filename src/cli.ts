@@ -55,7 +55,11 @@ import {
   loadDefs,
   loadDefsRaw,
   loadDefsUnfinalized,
+  expandDefsRaw,
+  reportCallsCycles,
   resolveCallsTarget,
+  scanDefsRaw,
+  validateCallsEdges,
   validateDef,
 } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
@@ -588,24 +592,18 @@ function finalizeDiscoveredDefs(
  * fail-closed validation in add.ts is untouched — we consume `readLockfile`,
  * discovery merely refuses to act on a bad ledger rather than crashing.)
  */
-function loadDefsWithInstalled(
+function foldInstalledDefs(
   io: CliIO,
   defsDir: string,
-  tolerantCasInspection = false,
-  verbose = false,
-): LoadedDefs {
-  const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
-
+  merged: Map<string, WorkflowDef>,
+  scan: (dir: string) => Map<string, WorkflowDef>,
+): void {
   let lf: Lockfile;
   try {
     lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
   } catch (e) {
     io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
-	const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
-    return {
-      defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
-      definitionDiscoveryComplete,
-    };
+    return;
   }
 
   for (const source of Object.keys(lf.installed).sort()) {
@@ -634,8 +632,19 @@ function loadDefsWithInstalled(
       merged.set(name, def);
     }
   }
+}
 
-	const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
+function loadDefsWithInstalled(
+  io: CliIO,
+  defsDir: string,
+  tolerantCasInspection = false,
+  verbose = false,
+): LoadedDefs {
+  const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
+
+  foldInstalledDefs(io, defsDir, merged, loadDefsUnfinalized);
+
+  const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
 
   return {
     defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
@@ -704,6 +713,51 @@ function foldCasDefs(
     merged.set(registration.key, registration.def);
   }
   return discovery.complete;
+}
+
+/**
+ * Authoring-safe default discovery mirrors openCtx's definition universe while
+ * deliberately avoiding finalization and runtime-store access. It merges raw
+ * maps before best-effort expansion so cross-directory includes resolve against
+ * the same complete map as strict runtime discovery.
+ */
+function loadDefsRawWithInstalled(
+  io: CliIO,
+  defsDir: string,
+  failures: DefLoadFailure[],
+  verbose = false,
+): Map<string, WorkflowDef> {
+  const merged = existsSync(defsDir) ? scanDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
+  foldInstalledDefs(io, defsDir, merged, (dir) => scanDefsRaw(dir, failures));
+  foldCasDefs(io, defsDir, merged, false, verbose);
+  return expandDefsRaw(merged);
+}
+
+function loadDefsForAuthoring(
+  io: CliIO,
+  args: Args,
+  failures: DefLoadFailure[],
+): { defsDir: string; defs: Map<string, WorkflowDef> } {
+  // This deliberately checks override *presence*, rather than whether its path
+  // happens to equal cwd/workflows, matching openCtx exactly.
+  const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
+  const defsDir = defsOverride ?? join(io.cwd, 'workflows');
+  const defs = defsOverride !== undefined
+    ? (existsSync(defsDir) ? loadDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>())
+    : loadDefsRawWithInstalled(io, defsDir, failures, flag(args, 'verbose'));
+  return { defsDir, defs };
+}
+
+function cycleErrorsByDefKey(defs: Map<string, WorkflowDef>): Map<string, string[]> {
+  const errors = new Map<string, string[]>();
+  for (const finding of reportCallsCycles(defs)) {
+    for (const key of finding.members) {
+      const messages = errors.get(key) ?? [];
+      messages.push(finding.message);
+      errors.set(key, messages);
+    }
+  }
+  return errors;
 }
 
 function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
@@ -2144,9 +2198,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
   }
 
   if (command === 'lint') {
-    const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
     const failures: DefLoadFailure[] = [];
-    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
+    const { defsDir, defs } = loadDefsForAuthoring(io, args, failures);
+    const cycleErrors = cycleErrorsByDefKey(defs);
     const defName = args.positionals[1];
     let hasErrors = false;
 
@@ -2154,15 +2208,17 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       const def = defs.get(defName);
       if (!def) throw new CliError(`unknown workflow definition '${defName}' (looked in ${defsDir})${failureNote(failures)}`);
       const result = lintDef(def);
-      if (result.errors.length) hasErrors = true;
-      print(io, { def: def.name, errors: result.errors, warnings: result.warnings });
+      const errors = [...validateCallsEdges(def, defs), ...result.errors, ...(cycleErrors.get(defName) ?? [])];
+      if (errors.length) hasErrors = true;
+      print(io, { def: def.name, errors, warnings: errors.length ? [] : result.warnings });
     } else {
       const results: { def?: string; file?: string; errors: string[]; warnings: string[] }[] =
-        [...defs.values()].map((def) => {
-          const result = lintDef(def);
-          if (result.errors.length) hasErrors = true;
-          return { def: def.name, errors: result.errors, warnings: result.warnings };
-        });
+		[...defs].map(([key, def]) => {
+			const result = lintDef(def);
+			const errors = [...validateCallsEdges(def, defs), ...result.errors, ...(cycleErrors.get(key) ?? [])];
+			if (errors.length) hasErrors = true;
+			return { def: def.name, errors, warnings: errors.length ? [] : result.warnings };
+		});
       // Files that never became defs (malformed YAML / bad shape) are lint errors
       // too — omitting them makes `lint` claim a dir is clean when `create` would die.
       for (const f of failures) {
@@ -2177,9 +2233,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
   }
 
   if (command === 'check') {
-    const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
     const failures: DefLoadFailure[] = [];
-    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
+    const { defsDir, defs } = loadDefsForAuthoring(io, args, failures);
+    const cycleErrors = cycleErrorsByDefKey(defs);
     const defName = need(args, 1, 'def');
     const def = defs.get(defName);
     if (!def) {
@@ -2191,7 +2247,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 
     // loadDefsRaw uses buildDef (no semantic validation); run validateDef here so
     // invariant stem-reference / duplicate-name errors surface to the author.
-    const defErrors = validateDef(def);
+    const defErrors = [
+      ...validateCallsEdges(def, defs),
+      ...validateDef(def),
+      ...(cycleErrors.get(defName) ?? []),
+    ];
     if (defErrors.length > 0) {
       throw new CliError(`workflow '${def.name}' has validation errors:\n  - ${defErrors.join('\n  - ')}`);
     }

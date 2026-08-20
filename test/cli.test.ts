@@ -1293,6 +1293,95 @@ test('with no --db or OWENLOOP_DB, the store defaults under cwd/.owenloop', () =
 
 // ---- owenloop lint ------------------------------------------------------------
 
+test('owenloop lint and check report every invalid calls edge', () => {
+  const child = (outputs: string[], inputs = ['proposal']) => [
+    'name: child',
+    'inputs:',
+    ...inputs.map((name) => `  - name: ${name}`),
+    ...(outputs.length === 0 ? [] : [`outputs: [${outputs.join(', ')}]`]),
+    'steps:',
+    '  - name: worker',
+    ...(inputs.length === 0 ? [] : [`    consumes: [${inputs[0]}]`]),
+    `    produces: [${outputs[0] ?? 'done'}]`,
+    '    terminal: true',
+    '',
+  ].join('\n');
+  const parent = (target: string, callsInputs = true) => [
+    'name: parent',
+    'inputs:',
+    '  - name: proposal',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: delegate',
+    `    calls: ${target}`,
+    ...(callsInputs ? ['    inputs:', '      proposal: proposal'] : []),
+    '    produces: [delivered]',
+    '  - name: finish',
+    '    consumes: [delivered]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n');
+  const cases: Array<{
+    name: string;
+    files: Record<string, string>;
+    checkDef?: string;
+    expected?: RegExp;
+  }> = [
+    { name: 'C1 valid child', files: { 'parent.yaml': parent('child'), 'child.yaml': child(['result']) } },
+    { name: 'C2 missing child', files: { 'parent.yaml': parent('missing') }, expected: /calls names workflow 'missing' which does not exist/ },
+    { name: 'C3 no child outputs', files: { 'parent.yaml': parent('child'), 'child.yaml': child([]) }, expected: /calls names workflow 'child' which declares no outputs:/ },
+    { name: 'C4 multiple child outputs', files: { 'parent.yaml': parent('child'), 'child.yaml': child(['one', 'two']) }, expected: /calls names workflow 'child' which declares 2 outputs/ },
+    { name: 'C5 undeclared child input', files: { 'parent.yaml': parent('child'), 'child.yaml': child(['result'], []) }, expected: /calls 'delegate' maps input 'proposal' which workflow 'child' does not declare/ },
+    {
+      name: 'C6 cycle',
+      checkDef: 'a',
+      files: {
+		'a.yaml': ['name: a', 'outputs: [result]', 'steps:', '  - name: delegate', '    calls: b', '    produces: [result]', ''].join('\n'),
+		'b.yaml': ['name: b', 'outputs: [result]', 'steps:', '  - name: delegate', '    calls: a', '    produces: [result]', ''].join('\n'),
+      },
+      expected: /calls cycle: a -> b -> a/,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-calls-'));
+    for (const [file, body] of Object.entries(fixture.files)) writeFileSync(join(dir, file), body);
+    const { run } = makeCli({ defs: dir });
+    const target = fixture.checkDef ?? 'parent';
+    const expectedCode = fixture.expected === undefined ? 0 : 1;
+    const directoryLint = run('lint');
+    const namedLint = run('lint', target);
+    const checked = run('check', target);
+    assert.equal(directoryLint.code, expectedCode, `${fixture.name}: directory lint: ${directoryLint.err}`);
+    assert.equal(namedLint.code, expectedCode, `${fixture.name}: named lint: ${namedLint.err}`);
+    assert.equal(checked.code, expectedCode, `${fixture.name}: check: ${checked.err}`);
+    if (fixture.expected !== undefined) {
+      const result = namedLint.json() as { errors: string[] };
+      assert.ok(result.errors.some((error) => fixture.expected!.test(error)), `${fixture.name}: lint errors ${result.errors.join('; ')}`);
+      assert.match(checked.err, fixture.expected, `${fixture.name}: check stderr`);
+    }
+  }
+});
+
+test('owenloop lint and check keep immediate workflow.yaml children in a literal scan', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-calls-subdir-'));
+  mkdirSync(join(dir, 'child'), { recursive: true });
+  writeFileSync(join(dir, 'child', 'workflow.yaml'), [
+    'name: child', 'outputs: [result]', 'steps:', '  - name: worker', '    produces: [result]', '    terminal: true', '',
+  ].join('\n'));
+  writeFileSync(join(dir, 'parent.yaml'), [
+    'name: parent', 'steps:', '  - name: delegate', '    calls: child', '    produces: [result]', '  - name: finish', '    consumes: [result]', '    produces: [done]', '    terminal: true', '',
+  ].join('\n'));
+  const { run } = makeCli({ defs: dir });
+  const directoryLint = run('lint');
+  const namedLint = run('lint', 'parent');
+  const checked = run('check', 'parent');
+  assert.equal(directoryLint.code, 0, `${directoryLint.err}\n${directoryLint.out}`);
+  assert.equal(namedLint.code, 0, `${namedLint.err}\n${namedLint.out}`);
+  assert.equal(checked.code, 0, `${checked.err}\n${checked.out}`);
+});
+
 test('owenloop lint exits 0 for clean definitions and prints JSON', () => {
   const { run } = makeCli();
   const r = run('lint');

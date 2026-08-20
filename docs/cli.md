@@ -43,6 +43,12 @@ both flags are passed, `--strict-inputs` wins. See
 [`docs/design.md` §25](design.md#25-the-model-checker-owenloop-check--scope)
 for the full breakdown.
 
+Before `check` runs the model, it and `lint` validate cross-definition
+`calls:` edges: a missing child, an undeclared mapped child input, a child with
+zero or multiple outputs, and every member of a calls cycle are hard errors.
+The lint JSON keeps those errors on the calling definition (and on every cycle
+member); `check` presents them in its existing validation-error message.
+
 ## Commands
 
 | command | what it does |
@@ -733,11 +739,11 @@ separate concern.
 `owenloop add <owner>/<repo>[@ref]` fetches a public GitHub repo's
 `workflows/**` folder (via GitHub's REST API and Node's built-in `fetch` — no
 new dependency), validates every def with the same lint/validate/`check`
-machinery `owenloop lint`/`owenloop check` use — plus a strict cross-def
-backstop (include expansion, `calls:` target/inputs/output-count checks,
-cycle detection) on the staged tree, so an error `loadDefsRaw` would
-otherwise swallow still refuses the install — and only then installs them
-under `<defsDir>/<owner>-<repo>-<hash>/`, where `<hash>` is the first 8 hex
+machinery `owenloop lint`/`owenloop check` use. Those authoring commands now
+also report invalid cross-definition `calls:` edges. `add` retains a strict
+whole-staged-tree backstop for include expansion and final load validation, so
+any remaining tolerant raw-loader failure still refuses the install — and only
+then installs them under `<defsDir>/<owner>-<repo>-<hash>/`, where `<hash>` is the first 8 hex
 characters of `sha256(owner/repo)`. The hash keeps distinct sources that used
 to collide on the same `<owner>-<repo>` folder (e.g. `a-b/c` and `a/b-c`)
 from clobbering each other. `owner` and `repo` are restricted to the
@@ -881,7 +887,7 @@ defs dir is guarded only on the default `cwd/workflows` fallback — an explicit
 matching the `--db`/`OWENLOOP_DB` rule above.
 
 **Installed-def discovery.** Defs installed by `add` are discovered by default:
-a plain `owenloop defs`/`create`/`tick` against the DEFAULT defs dir
+a plain `owenloop defs`/`lint`/`check`/`create`/`tick` against the DEFAULT defs dir
 (`cwd/workflows`) sees them by name, no `--defs` flag needed. `loadDefs` itself
 stays a pure dir-scanner (top-level `*.yaml` plus immediate-subdir
 `workflow.yaml`); the CLI folds installed subfolders in on top, ledger-driven and
@@ -898,7 +904,8 @@ discovery surface without requiring prior knowledge of a flag.
 
 - **Only under the default defs dir.** An explicit `--defs`/`OWENLOOP_DEFS` is
   operator intent to target a literal dir and keeps the pure-scan behavior with
-  no installed-def or CAS-store fold-in — the rule is "was an override given",
+  no installed-def or CAS-store fold-in for `defs`, `lint`, `check`, and runtime
+  commands — the rule is "was an override given",
   so even `OWENLOOP_DEFS=$PWD/workflows` counts as an override and stays literal.
   Pointing `--defs` straight at an install folder
   (`--defs workflows/<owner>-<repo>-<hash>`) still works exactly as before.

@@ -2596,6 +2596,28 @@ test('discovery(g): a top-level def that calls: an installed def resolves and cr
   ].join('\n');
   writeFileSync(join(cwd, 'workflows', 'parent.yaml'), parentYaml);
 
+  // Authoring commands use the same no-override discovery universe as runtime,
+  // so the ledger-installed child is valid here as well as for `create`.
+  const defaultLint = await runCli(cwd, ['lint']);
+  assert.equal(defaultLint.code, 0, defaultLint.err.join('\n'));
+  const defaultCheck = await runCli(cwd, ['check', 'parent']);
+  assert.equal(defaultCheck.code, 0, defaultCheck.err.join('\n'));
+  assert.equal(existsSync(join(cwd, '.owenloop', 'state.db')), false, 'authoring discovery does not open the runtime database');
+
+  // An explicit override remains a literal scan, even when it names the default
+  // directory. The installed folder's top-level child.yaml is consequently not
+  // visible through the outer scan.
+  const literalDefs = join(cwd, 'workflows');
+  const literalLint = await runCli(cwd, ['lint', '--defs', literalDefs]);
+  assert.equal(literalLint.code, 1);
+  assert.match(literalLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  const literalCheck = await runCli(cwd, ['check', 'parent', '--defs', literalDefs]);
+  assert.equal(literalCheck.code, 1);
+  assert.match(literalCheck.err.join('\n'), /calls names workflow 'child' which does not exist/);
+  const envLiteralCheck = await runCli(cwd, ['check', 'parent'], { OWENLOOP_DEFS: literalDefs });
+  assert.equal(envLiteralCheck.code, 1);
+  assert.match(envLiteralCheck.err.join('\n'), /calls names workflow 'child' which does not exist/);
+
   const created = await runCli(cwd, ['create', 'parent']);
   assert.equal(created.code, 0, created.err.join('\n'));
   assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);

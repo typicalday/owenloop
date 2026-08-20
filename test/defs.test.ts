@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, reportCallsCycles, validateCallsEdges, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -2819,6 +2819,67 @@ test('loadDefs: calls target must exist in resolver namespace', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('validateCallsEdges reports exact calls errors and preserves unresolved exemptions', () => {
+  const parent = (target: string, callsInputs?: Record<string, string>) => buildDef({
+    name: 'parent',
+    steps: [{ name: 'delegate', calls: target, ...(callsInputs === undefined ? {} : { inputs: callsInputs }), produces: ['result'] }],
+  });
+  const missing = parent('missing');
+  assert.deepEqual(validateCallsEdges(missing, new Map([['parent', missing]])), [
+    "calls names workflow 'missing' which does not exist",
+  ]);
+  assert.deepEqual(validateCallsEdges(missing, new Map([['parent', missing]]), { allowUnresolvedCalls: true }), []);
+  assert.deepEqual(
+    validateCallsEdges(missing, new Map([['parent', missing]]), { allowUnresolvedVersionedCalls: new Set(['missing']) }),
+    [],
+  );
+
+  const noOutputs = buildDef({ name: 'no-outputs', steps: [{ name: 'worker', produces: ['done'] }] });
+  const twoOutputs = buildDef({ name: 'two-outputs', outputs: ['one', 'two'], steps: [{ name: 'worker', produces: ['one'] }] });
+  const noInput = buildDef({ name: 'no-input', outputs: ['done'], steps: [{ name: 'worker', produces: ['done'] }] });
+  const noOutputsParent = parent('no-outputs');
+  const twoOutputsParent = parent('two-outputs');
+  const badInputParent = parent('no-input', { proposal: 'proposal' });
+  const defs = new Map([
+    ['no-outputs', noOutputs],
+    ['two-outputs', twoOutputs],
+    ['no-input', noInput],
+  ]);
+  assert.deepEqual(validateCallsEdges(noOutputsParent, defs, { allowUnresolvedCalls: true }), [
+    "calls names workflow 'no-outputs' which declares no outputs:",
+  ]);
+  assert.deepEqual(validateCallsEdges(twoOutputsParent, defs), [
+    "calls names workflow 'two-outputs' which declares 2 outputs:, calls: v1 requires exactly one",
+  ]);
+  assert.deepEqual(validateCallsEdges(badInputParent, defs), [
+    "calls 'delegate' maps input 'proposal' which workflow 'no-input' does not declare",
+  ]);
+  assert.throws(
+    () => finalizeDefs(new Map([['parent', missing]])),
+    (error: unknown) => error instanceof DefError && error.message === "calls names workflow 'missing' which does not exist",
+  );
+});
+
+test('reportCallsCycles attributes self and two-node cycles to every member', () => {
+  const call = (name: string, target: string) => buildDef({
+    name,
+    outputs: ['result'],
+    steps: [{ name: 'delegate', calls: target, produces: ['result'] }],
+  });
+  const self = call('self', 'self');
+  assert.deepEqual(reportCallsCycles(new Map([['self', self]])), [{
+    message: 'calls cycle: self -> self',
+    members: ['self'],
+  }]);
+
+  const a = call('a', 'b');
+  const b = call('b', 'a');
+  assert.deepEqual(reportCallsCycles(new Map([['a', a], ['b', b]])), [{
+    message: 'calls cycle: a -> b -> a',
+    members: ['a', 'b'],
+  }]);
 });
 
 test('loadDefs: calls: inputs key must be a declared child input', () => {
