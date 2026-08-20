@@ -3985,7 +3985,8 @@ async function authedPost(
 /**
  * A 401 on an agent token is a hard "revoked/invalid" error; a 401 on any
  * other credential kind (after `authedGet`'s one refresh-and-retry) is a hard
- * "credential rejected" error; any other non-2xx is a generic hub-rejected
+ * "credential rejected" error; a 429 is a rate-limit error (including
+ * `Retry-After` when present); any other non-2xx is a generic hub-rejected
  * error naming the status. Shared by `verifyCredential` and `dispatchPush`'s
  * server-list fetch so both surfaces the same wording for the same failure.
  */
@@ -3995,6 +3996,10 @@ function assertAuthOk(res: Response, cred: Credential, origin: string): void {
       throw new CliError('token revoked or invalid — re-mint it in the console or run `owenloop login`');
     }
     throw new CliError('credential rejected by the hub — run `owenloop login`');
+  }
+  if (res.status === 429) {
+    const retryAfter = res.headers.get('retry-after');
+    throw new CliError(`rate limited by the hub${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
   }
   if (!res.ok) {
     throw new CliError(`hub ${origin} rejected the credential (HTTP ${res.status})`);
@@ -6539,8 +6544,8 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
     if (sub === 'list') {
       const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/capability_routes');
       // The GET deliberately uses `assertAuthOk` unchanged (frozen contract), so
-      // a non-401 non-2xx surfaces its generic wording rather than the hub's
-      // `message`. Message passthrough is a POST-path behavior below.
+      // a non-401/non-429 non-2xx surfaces its generic wording while a 429 uses
+      // the helper's rate-limit wording. Message passthrough is a POST-path behavior below.
       assertAuthOk(res, used, origin);
       let body: unknown;
       try {
@@ -7162,8 +7167,9 @@ async function dispatchCrew(io: CliIO, args: Args): Promise<number> {
   try {
     if (sub === 'list') {
       const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/crews');
-      // `assertAuthOk`'s generic wording (frozen contract, mirrors `binding
-      // list`); message passthrough is a POST-path behavior below.
+      // `assertAuthOk`'s generic wording for non-401/non-429 errors (frozen
+      // contract, mirrors `binding list`); a 429 uses its rate-limit wording.
+      // Message passthrough is a POST-path behavior below.
       assertAuthOk(res, used, origin);
       let body: unknown;
       try {
