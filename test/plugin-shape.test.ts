@@ -473,6 +473,8 @@ test('all shipped ephemeral skills keep the decision gate, capability preflight,
       'Everything fits comfortably',
     ]) assert.ok(body.includes(condition), path + ' must retain every never-use condition');
     assert.ok(body.includes('include_ephemeral: true'), path + ' must preflight inclusive discovery');
+    assert.ok(body.includes('remote MCP capability preflight'), path + ' must attest the selected remote hub, not only the local proxy');
+    assert.ok(body.includes('A 200 inclusive listing is **not** a capability\nattestation'), path + ' must not mistake an ignored inclusive query for support');
     assert.ok(body.includes('ephemeral: true'), path + ' must create an ephemeral definition');
     assert.ok(body.includes('eph-<short-task-slug>-<unix-ms>-<random-hex>'), path + ' must require collision-safe names');
     assert.ok(body.includes('version, and hash'), path + ' must record publication identity');

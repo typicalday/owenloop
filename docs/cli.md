@@ -2940,6 +2940,12 @@ inference. Contrast this with [`agent new`](#agent-new--mint-an-agent-token-into
 which **mints** a new credential directly and therefore stops rather than
 ever guessing — a wrong guess there is a side effect a retry cannot undo.
 
+For `create_workflow {ephemeral:true}`, the proxy first makes authenticated,
+non-mutating remote MCP `initialize` and `tools/list` calls. It forwards the
+create only when the selected hub itself advertises `create_workflow.ephemeral`,
+`list_workflows.include_ephemeral`, and `delete_workflow`; a proxy-local schema
+or a 200 inclusive listing is not sufficient evidence.
+
 **`~/.owenloop/config.json`** is written by
 [`login`](#login--authenticate-the-cli-against-a-hub): a small, non-secret
 JSON file (`{"version": 1, "hub": "<origin>"}`) recording the hub `login` most
@@ -2977,7 +2983,7 @@ incomplete run. The evaluation is quota-spending and not part of required CI.
 
 ### Tools
 
-The server exposes 21 baseline tools mirroring the hub's own MCP toolset, plus
+The server exposes 22 baseline tools mirroring the hub's own MCP toolset, plus
 `create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
 `add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
 toolset. Each baseline tool's result is the hub REST response unchanged as one
@@ -2999,9 +3005,10 @@ and makes no hub request.
 | `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask`; it must not bypass unresolved rejection feedback |
 | `provide_input` | relay a human answer into a seeded/owed gate |
 | `start_run` | start a fitting multi-step playbook and let its crews execute; optional `scope` (free routing label, defaults to the session's repo name) and `priority` (`low\|normal\|high`) |
-| `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses ordinary authoring; optional `bundle_digest` identifies the content-addressed bundle for reference orders |
+| `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses authoring; optional `bundle_digest` identifies the content-addressed bundle for reference orders; optional `ephemeral` publishes a retireable one-off only after remote-hub capability attestation |
 | `get_workflow` | inspect a promising loaded definition before selecting it |
-| `list_workflows` | discover published workflow definitions and decide which one fits a task |
+| `list_workflows` | discover published workflow definitions and decide which one fits a task; optional `include_ephemeral` includes definitions hidden from the default catalog |
+| `delete_workflow` | retire an ephemeral workflow's live name; the hub refuses while an active root references its exact pinned definition closure |
 | `get_status` | `engine.status` verbatim plus a plain-English rendering |
 | `heartbeat` | touch the liveness timestamp on an open run so it is not reaped mid-step |
 | `get_order` | re-fetch the persisted order packet and lease state for a run you hold |

@@ -203,11 +203,15 @@ interface HubCall {
   body?: unknown;
   /** A pre-built query string beginning with `?`, or omitted. */
   query?: string;
+  /** Extra request headers for an endpoint with a protocol-specific session. */
+  headers?: Record<string, string>;
 }
 
 interface HubCallResult {
   status: number;
   json: unknown;
+  /** Session id issued by a Streamable HTTP MCP initialization, if any. */
+  mcpSessionId?: string;
   /** True when the call could not authenticate (missing/expired/rejected credential). */
   authFailed?: boolean;
   /** The tool-facing message for an `authFailed` result — always names the fix. */
@@ -253,6 +257,7 @@ async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
       Authorization: authHeader(c),
       Accept: 'application/json',
       ...(req.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(req.headers ?? {}),
     };
     return hubFetch(io, resolveEndpoint(origin, req.path + (req.query ?? '')), {
       method: req.method,
@@ -280,7 +285,7 @@ async function callHub(deps: McpDeps, req: HubCall): Promise<HubCallResult> {
   } catch {
     json = {};
   }
-  return { status: res.status, json };
+  return { status: res.status, json, mcpSessionId: res.headers.get('mcp-session-id') ?? undefined };
 }
 
 /** Whether an HTTP status is a 2xx success. */
@@ -305,6 +310,80 @@ function toolResultFromRest(r: HubCallResult): ToolResult {
 /** An `isError` result whose single text block is `text` verbatim (not JSON). */
 function errorText(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
+}
+
+/**
+ * Attest the *remote* hub's ephemeral workflow contract before forwarding an
+ * `ephemeral:true` create. The local proxy always advertises its newest schema,
+ * so neither its tools/list response nor a successful inclusive REST listing
+ * can establish that an older selected hub honors these fields. This does two
+ * authenticated, non-mutating MCP requests instead: initialize, then
+ * tools/list (with the returned session header when the remote uses one).
+ */
+async function attestRemoteEphemeralWorkflowSupport(deps: McpDeps): Promise<string | undefined> {
+  const initialize = await callHub(deps, {
+    method: 'POST',
+    path: '/mcp',
+    headers: { Accept: 'application/json, text/event-stream' },
+    body: {
+      jsonrpc: '2.0',
+      id: 'owenloop-ephemeral-preflight-initialize',
+      method: 'initialize',
+      params: {
+	protocolVersion: '2025-06-18',
+	capabilities: {},
+	clientInfo: { name: 'owenloop-cli-mcp', version: packageVersion() },
+      },
+    },
+  });
+  if (initialize.authFailed) return initialize.authMessage ?? loginHint(deps.origin);
+  if (!isOk(initialize.status)) {
+    return `ephemeral workflow preflight could not initialize remote MCP at ${deps.origin} (HTTP ${initialize.status}); no create request was sent`;
+  }
+
+  const listed = await callHub(deps, {
+    method: 'POST',
+    path: '/mcp',
+    headers: {
+      Accept: 'application/json, text/event-stream',
+      ...(initialize.mcpSessionId === undefined ? {} : { 'Mcp-Session-Id': initialize.mcpSessionId }),
+    },
+    body: {
+      jsonrpc: '2.0',
+      id: 'owenloop-ephemeral-preflight-tools-list',
+      method: 'tools/list',
+      params: {},
+    },
+  });
+  if (listed.authFailed) return listed.authMessage ?? loginHint(deps.origin);
+  if (!isOk(listed.status)) {
+    return `ephemeral workflow preflight could not list remote MCP tools at ${deps.origin} (HTTP ${listed.status}); no create request was sent`;
+  }
+
+  const response = isObject(listed.json) ? listed.json['result'] : undefined;
+  const tools = isObject(response) && Array.isArray(response['tools']) ? response['tools'] : undefined;
+  if (tools === undefined) {
+    return `ephemeral workflow preflight received no remote MCP tools/list result from ${deps.origin}; no create request was sent`;
+  }
+
+  const findTool = (name: string): Record<string, unknown> | undefined =>
+    tools.find((tool): tool is Record<string, unknown> => isObject(tool) && tool['name'] === name);
+  const supportsBoolean = (tool: Record<string, unknown> | undefined, field: string): boolean => {
+    const schema = tool?.['inputSchema'];
+    const properties = isObject(schema) ? schema['properties'] : undefined;
+    const property = isObject(properties) ? properties[field] : undefined;
+    return isObject(property) && property['type'] === 'boolean';
+  };
+
+  const missing = [
+    !supportsBoolean(findTool('create_workflow'), 'ephemeral') ? 'create_workflow.ephemeral' : undefined,
+    !supportsBoolean(findTool('list_workflows'), 'include_ephemeral') ? 'list_workflows.include_ephemeral' : undefined,
+    findTool('delete_workflow') === undefined ? 'delete_workflow' : undefined,
+  ].filter((item): item is string => item !== undefined);
+  if (missing.length > 0) {
+    return `ephemeral workflow preflight found that remote MCP at ${deps.origin} lacks ${missing.join(', ')}; no create request was sent`;
+  }
+  return undefined;
 }
 
 // ---- tool table -------------------------------------------------------------
@@ -595,7 +674,15 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         required: ['yaml'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/create_workflow', body: a })),
+      handler: async (a) => {
+	if (a['ephemeral'] === true) {
+	  const preflightFailure = await attestRemoteEphemeralWorkflowSupport(deps);
+	  if (preflightFailure !== undefined) return errorText(preflightFailure);
+	}
+	const r = await callHub(deps, { method: 'POST', path: '/api/create_workflow', body: a });
+	if (r.authFailed) return errorText(r.authMessage ?? loginHint(deps.origin));
+	return toolResultFromRest(r);
+      },
     },
     {
       name: 'get_workflow',

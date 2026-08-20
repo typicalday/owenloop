@@ -34,14 +34,18 @@ Never use it when any of these hold:
 
 ## Capability preflight
 
-Before drafting YAML, inspect the mounted Owenloop tool surface. It must expose
-`create_workflow` with an `ephemeral` boolean, `list_workflows` with an
-`include_ephemeral` boolean, and `delete_workflow`. Then call
-`list_workflows` with `include_ephemeral: true`.
+Before drafting YAML, call `list_workflows` with `include_ephemeral: true` for
+the later collision check. A 200 inclusive listing is **not** a capability
+attestation: the mounted CLI proxy can advertise new fields while an older
+selected hub silently ignores them.
 
-If a tool or field is absent, or the inclusive listing cannot honor the
-argument, stop and report that the selected hub has not deployed ephemeral
-retirement. Never fall back to a durable definition.
+The `create_workflow` call with `ephemeral: true` must first perform the
+remote MCP capability preflight, before it sends any create request. It must
+attest that the selected hub's own `tools/list` exposes
+`create_workflow.ephemeral`, `list_workflows.include_ephemeral`, and
+`delete_workflow`. If that preflight returns an error, stop and report its
+exact response. Never fall back to a durable definition or infer support from
+the proxy's local tool surface.
 
 ## Publish a unique ephemeral definition
 

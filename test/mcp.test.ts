@@ -297,6 +297,29 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
   const routes: Record<string, RouteHandler> = {
     'POST /api/reject_artifact': () => ({ status: 200, json: { ok: true } }),
     'POST /api/create_workflow': () => ({ status: 200, json: { ok: true } }),
+	'POST /mcp': ({ body }) => {
+	  const request = JSON.parse(body ?? '{}') as { id?: string; method?: string };
+	  if (request.method === 'initialize') {
+		return { status: 200, headers: { 'Mcp-Session-Id': 'ephemeral-preflight' }, json: { jsonrpc: '2.0', id: request.id, result: {} } };
+	  }
+	  if (request.method === 'tools/list') {
+		return {
+		  status: 200,
+		  json: {
+			jsonrpc: '2.0',
+			id: request.id,
+			result: {
+			  tools: [
+				{ name: 'create_workflow', inputSchema: { properties: { ephemeral: { type: 'boolean' } } } },
+				{ name: 'list_workflows', inputSchema: { properties: { include_ephemeral: { type: 'boolean' } } } },
+				{ name: 'delete_workflow', inputSchema: { properties: {} } },
+			  ],
+			},
+		  },
+		};
+	  }
+	  return { status: 400, json: { error: 'unexpected_mcp_method' } };
+	},
   };
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' } });
@@ -343,8 +366,12 @@ test('mcp: hub passthrough fields are advertised, optional, and forwarded unchan
   const creations = calls.filter((row) => row.pathname === '/api/create_workflow');
   assert.equal(creations.length, 2, 'one POST per create_workflow call');
   assert.ok(creations.every((row) => row.method === 'POST'));
-  assert.deepEqual(JSON.parse(creations[0]!.body!), { yaml: 'version: 1', bundle_digest: 'sha256:bundle', ephemeral: true });
-  assert.deepEqual(JSON.parse(creations[1]!.body!), { yaml: 'version: 1' });
+  const createBodies = creations.map((row) => JSON.parse(row.body!) as Record<string, unknown>);
+  assert.deepEqual(createBodies.find((body) => body['ephemeral'] === true), { yaml: 'version: 1', bundle_digest: 'sha256:bundle', ephemeral: true });
+  assert.deepEqual(createBodies.find((body) => body['ephemeral'] === undefined), { yaml: 'version: 1' });
+  const preflight = calls.filter((row) => row.pathname === '/mcp');
+  assert.equal(preflight.length, 2, 'only ephemeral creation attests the remote MCP contract');
+  assert.deepEqual(preflight.map((row) => (JSON.parse(row.body ?? '{}') as { method?: string }).method), ['initialize', 'tools/list']);
 });
 
 test('mcp: pending_gates preserves optional serve_crews and returns each hub response unchanged', async () => {
@@ -706,6 +733,64 @@ test('mcp: list_workflows is an authenticated GET passthrough and preserves expl
   assert.ok(workflows.every((row) => row.method === 'GET'));
   assert.ok(workflows.every((row) => row.authorization === 'Bearer mcpat_human'));
   assert.deepEqual(workflows.map((row) => new URL(row.url).search), ['', '?include_ephemeral=true', '?include_ephemeral=false']);
+});
+
+test('mcp: an old hub that ignores inclusive discovery cannot receive an ephemeral create', async () => {
+  const durableCatalog = { workflows: [{ name: 'durable-only' }] };
+  // This old hub accepts `include_ephemeral=true` but ignores it, and would
+  // silently discard `ephemeral` from a create body if the proxy forwarded one.
+  // The create route must remain untouched: remote MCP schema attestation is
+  // the fail-closed boundary before that irreversible request.
+  const routes: Record<string, RouteHandler> = {
+    'GET /api/workflows': () => ({ status: 200, json: durableCatalog }),
+	'POST /api/create_workflow': ({ body }) => {
+	  const { yaml } = JSON.parse(body ?? '{}') as { yaml?: unknown };
+	  return { status: 200, json: { ok: true, yaml } };
+	},
+	'POST /mcp': ({ body }) => {
+	  const request = JSON.parse(body ?? '{}') as { id?: string; method?: string };
+	  if (request.method === 'initialize') {
+		return { status: 200, headers: { 'Mcp-Session-Id': 'old-hub' }, json: { jsonrpc: '2.0', id: request.id, result: {} } };
+	  }
+	  if (request.method === 'tools/list') {
+		return {
+		  status: 200,
+		  json: {
+			jsonrpc: '2.0',
+			id: request.id,
+			result: {
+			  tools: [
+				{ name: 'create_workflow', inputSchema: { properties: { yaml: { type: 'string' } } } },
+				{ name: 'list_workflows', inputSchema: { properties: {} } },
+			  ],
+			},
+		  },
+		};
+	  }
+	  return { status: 400, json: { error: 'unexpected_mcp_method' } };
+	},
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' } });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+	INIT,
+	call(3, 'list_workflows', { include_ephemeral: true }),
+	call(4, 'create_workflow', { yaml: 'version: 1', ephemeral: true }),
+  ]);
+
+  assert.deepEqual(resultJson(frames.find((frame) => frame.id === 3)!), durableCatalog, 'an old hub still returns a 200 durable catalog');
+  assert.equal(new URL(calls.find((row) => row.pathname === '/api/workflows')!.url).search, '?include_ephemeral=true');
+  const create = frames.find((frame) => frame.id === 4)!;
+  assert.equal(create.result!.isError, true);
+  assert.match(create.result!.content![0]!.text, /lacks create_workflow\.ephemeral, list_workflows\.include_ephemeral, delete_workflow/u);
+  assert.equal(calls.filter((row) => row.pathname === '/api/create_workflow').length, 0, 'the old hub must never receive a create request');
+  assert.deepEqual(
+	calls.filter((row) => row.pathname === '/mcp').map((row) => (JSON.parse(row.body ?? '{}') as { method?: string }).method),
+	['initialize', 'tools/list'],
+	'the decision came from the remote hub schema, not the proxy tool surface or inclusive listing response',
+  );
 });
 
 test('mcp: delete_workflow advertises a constrained name and posts it unchanged', async () => {
