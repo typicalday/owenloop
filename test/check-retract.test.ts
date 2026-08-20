@@ -5,7 +5,6 @@ import { test } from 'node:test';
 import { loadDefFile } from '../src/defs.ts';
 import {
   applyOutcome,
-  canonicalKey,
   eligibleFirings,
   memberRetractFirings,
   modelCheck,
@@ -30,98 +29,6 @@ const memberRetractFixture = def(
     },
   ],
 );
-
-const canonicalFixture = def(
-  'member-retract-canonical',
-  [input('seed', { seedOwed: false })],
-  [
-    step({ name: 'fanout', consumes: ['seed'], produces: ['items[]'] }),
-    step({ name: 'mapper', consumes: ['items[$i]'], produces: ['items[$i].checked'] }),
-    step({ name: 'reviewer', consumes: ['items[$i].checked'], produces: ['items[$i].checked.review'] }),
-  ],
-);
-
-function replaceArtifact(
-  state: Map<string, ReturnType<typeof arts> extends ReadonlyMap<string, infer Art> ? Art : never>,
-  path: string,
-  changes: Record<string, unknown>,
-) {
-  const next = new Map(state);
-  next.set(path, { ...next.get(path)!, ...changes });
-  return next;
-}
-
-test('canonicalKey: quotients only terminal retracted collection-member families', () => {
-  const first = new Map(
-    arts([
-      { path: 'seed', acceptance: 'green', version: 1 },
-      { path: 'items.sealed', producer: 'fanout', acceptance: 'green', version: 1 },
-      { path: 'items[0]', producer: 'fanout', acceptance: 'retracted', version: 9, judgmentRejects: 2 },
-      { path: 'items[0].checked', producer: 'mapper', acceptance: 'retracted', version: 8, schemaRejects: 4 },
-      { path: 'items[0].checked.review', producer: 'reviewer', acceptance: 'retracted', version: 7 },
-      { path: 'draft', acceptance: 'skipped', version: 0, fingerprint: { 'items[0].checked': 1 } },
-      { path: 'items[1]', producer: 'fanout', acceptance: 'green', version: 1 },
-      {
-	path: 'items[1].checked',
-	producer: 'mapper',
-	acceptance: 'skipped',
-	version: 1,
-	fingerprint: { 'items[1]': 1 },
-      },
-    ]),
-  );
-  const isomorphic = new Map(
-    arts([
-      { path: 'seed', acceptance: 'green', version: 1 },
-      { path: 'items.sealed', producer: 'fanout', acceptance: 'green', version: 1 },
-      { path: 'items[3]', producer: 'fanout', acceptance: 'retracted', version: 2, judgmentRejects: 0 },
-      { path: 'items[3].checked', producer: 'mapper', acceptance: 'retracted', version: 1, schemaRejects: 0 },
-      { path: 'items[3].checked.review', producer: 'reviewer', acceptance: 'retracted', version: 1 },
-      { path: 'draft', acceptance: 'skipped', version: 0, fingerprint: { 'items[3].checked': 1 } },
-      { path: 'items[4]', producer: 'fanout', acceptance: 'green', version: 1 },
-      {
-	path: 'items[4].checked',
-	producer: 'mapper',
-	acceptance: 'skipped',
-	version: 1,
-	fingerprint: { 'items[4]': 1 },
-      },
-    ]),
-  );
-
-  const firstKey = canonicalKey(canonicalFixture, first);
-  assert.equal(
-    firstKey,
-    canonicalKey(canonicalFixture, isomorphic),
-    'terminal bare/member/map/review families and their historical indices are quotient-equivalent',
-  );
-  assert.notEqual(
-    firstKey,
-    canonicalKey(canonicalFixture, replaceArtifact(first, 'items[1]', { acceptance: 'rejected' })),
-    'a rejected surviving member remains distinct',
-  );
-  assert.notEqual(
-    firstKey,
-    canonicalKey(
-      canonicalFixture,
-      replaceArtifact(first, 'items[1]', { acceptance: 'skipped', fingerprint: { seed: 1 } }),
-    ),
-    'a skipped surviving member remains distinct',
-  );
-  assert.notEqual(
-    firstKey,
-    canonicalKey(canonicalFixture, replaceArtifact(first, 'items[0].checked', { acceptance: 'green', version: 1 })),
-    'a nonterminal descendant of a retracted member stays visible',
-  );
-  assert.notEqual(
-    firstKey,
-    canonicalKey(
-      canonicalFixture,
-      replaceArtifact(first, 'items[1].checked', { fingerprint: { 'items[1]': 0 } }),
-    ),
-    'fingerprint references are remapped but their version rank remains distinct',
-  );
-});
 
 test('memberRetractFirings: every non-retracted member retracts through every authorized non-judge consumer', () => {
   let state = settleInMemory(
@@ -164,12 +71,12 @@ test('memberRetractFirings: every non-retracted member retracts through every au
   assert.ok(
     offered.every(
       (f) =>
-        f.modelTransition === 'member-retract' &&
-        f.key === 'gather.source[0]' &&
-        f.index === 0 &&
-        f.inputs.length === 0 &&
-        f.outputs.length === 1 &&
-        f.outputs[0] === 'gather.source[0]',
+	f.modelTransition === 'member-retract' &&
+	f.key === 'gather.source[0]' &&
+	f.index === 0 &&
+	f.inputs.length === 0 &&
+	f.outputs.length === 1 &&
+	f.outputs[0] === 'gather.source[0]',
     ),
     'each transition is tagged, has no claim-fingerprint inputs, and targets only the bare member',
   );

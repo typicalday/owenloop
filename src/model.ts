@@ -2442,99 +2442,15 @@ export function applyOutcome(
  *   judgmentRejects: BUCKETED to min(count, maxAttempts) so that e.g. 0, 1, 2
  *     are distinct but anything >= cap is the same (frozen state)
  *   schemaRejects: BUCKETED to min(count, maxSchemaFailures) similarly
- *   retracted collection families: a retracted bare member and its retracted
- *     indexed descendants are omitted, and surviving member indices are
- *     densely projected. A member's old index and terminal history are
- *     unobservable after retraction, but unrelated retracted artifacts keep
- *     their ordinary encoding.
  *
  * For 'skipped' artifacts, the fingerprint is encoded as sorted "inputPath:versionRank"
  * pairs to capture rearm eligibility correctly.
  */
-interface RetractedMemberProjection {
-  omittedPaths: ReadonlySet<string>;
-  denseIndices: ReadonlyMap<string, number>;
-}
-
-function memberIdentity(stem: string, index: number): string {
-  return `${stem}\u0000${index}`;
-}
-
-/**
- * Project terminal collection-member families out of a model state.
- *
- * A bare member retracted by the model-only transition, plus its already
- * retracted indexed descendants, cannot affect a later firing: literal indexed
- * consumes are rejected by parseConsume, and settleInMemory makes retracted
- * descendants terminal. The projection deliberately leaves any nonterminal
- * child visible — a parent tombstone alone is not enough to elide it.
- */
-function retractedMemberProjection(arts: Map<string, ArtifactData>): RetractedMemberProjection {
-  const bareMembers = [...arts.values()].flatMap((art) => {
-    const element = parseElement(art.path);
-    return element && element.suffix === '' ? [{ art, element }] : [];
-  });
-  const retractedMembers = bareMembers.filter(({ art }) => art.acceptance === 'retracted');
-  const omittedPaths = new Set<string>();
-
-  for (const { art: member, element } of retractedMembers) {
-    omittedPaths.add(member.path);
-    for (const child of arts.values()) {
-      const childElement = parseElement(child.path);
-      if (
-	childElement &&
-	childElement.stem === element.stem &&
-	childElement.index === element.index &&
-	child.acceptance === 'retracted'
-      ) {
-	omittedPaths.add(child.path);
-      }
-    }
-  }
-
-  const denseIndices = new Map<string, number>();
-  const nextIndex = new Map<string, number>();
-  for (const { art, element } of bareMembers
-    .filter(({ art }) => art.acceptance !== 'retracted')
-    .sort(
-      (a, b) =>
-	a.element.stem.localeCompare(b.element.stem) ||
-	a.element.index - b.element.index ||
-	a.art.path.localeCompare(b.art.path),
-    )) {
-    const denseIndex = nextIndex.get(element.stem) ?? 0;
-    denseIndices.set(memberIdentity(element.stem, element.index), denseIndex);
-    nextIndex.set(element.stem, denseIndex + 1);
-  }
-
-  return { omittedPaths, denseIndices };
-}
-
-function projectedIndexedPath(path: string, projection: RetractedMemberProjection): string {
-  const element = parseElement(path);
-  if (!element) return path;
-  const denseIndex = projection.denseIndices.get(memberIdentity(element.stem, element.index));
-  if (denseIndex !== undefined) return `${element.stem}[${denseIndex}]${element.suffix}`;
-  // A skipped fingerprint can point at a terminal family that was projected
-  // away. Its former numeric index is equally unobservable, while the stem and
-  // suffix still distinguish the dependency shape.
-  if (projection.omittedPaths.has(path)) return `${element.stem}[retracted]${element.suffix}`;
-  return path;
-}
-
-/** Exported direct-module test seam for model state equivalence. */
-export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
+function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
   const parts: string[] = [];
   const stepMap = new Map(def.steps.map((l) => [l.name, l]));
-  const projection = retractedMemberProjection(arts);
 
-  const projectedArtifacts = [...arts.entries()]
-    .filter(([path]) => !projection.omittedPaths.has(path))
-    .map(([path, art]) => ({ path, art, projectedPath: projectedIndexedPath(path, projection) }))
-    .sort((a, b) => a.projectedPath.localeCompare(b.projectedPath) || a.path.localeCompare(b.path));
-
-  for (const { path, art, projectedPath } of projectedArtifacts) {
-
+  for (const [path, art] of [...arts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     const step = stepMap.get(art.producer);
     const producePat = step && produceOwning(step, path);
     const maxAttempts = step ? effectiveMaxAttempts(step, producePat) : 3;
@@ -2549,7 +2465,7 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
     const jBucket = Math.min(art.judgmentRejects, maxAttempts);
     const sBucket = Math.min(art.schemaRejects, maxSchema);
 
-    let entry = `${projectedPath}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
+    let entry = `${path}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
 
     // §24: encode the sign-off ledger so two states differing only in which
     // judges have approved (same acceptance/version) are not canonicalized
@@ -2565,13 +2481,12 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
     // For skipped: encode fingerprint as sorted "fPath:fRank" pairs
     if (art.acceptance === 'skipped' && art.fingerprint) {
       const fpParts = Object.entries(art.fingerprint)
+        .sort((a, b) => a[0].localeCompare(b[0]))
         .map(([k, v]) => {
           const dep = arts.get(k);
           const depRank = v === 0 ? 0 : dep?.acceptance === 'green' ? 1 : dep?.acceptance === 'submitted' ? 3 : 2;
-	  return { key: projectedIndexedPath(k, projection), value: `${projectedIndexedPath(k, projection)}@${depRank}` };
+          return `${k}@${depRank}`;
         })
-	.sort((a, b) => a.key.localeCompare(b.key))
-	.map(({ value }) => value)
         .join(',');
       entry += `|fp:${fpParts}`;
     }
