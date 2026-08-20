@@ -284,14 +284,30 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   const projectObjects = scanObjects(projectRoot);
   const globalObjects = sameRoot ? projectObjects : scanObjects(globalRoot);
   const installed = combineMetadata(projectObjects, globalObjects);
-  for (const [coordinate, entry] of [
-    ...Object.entries(projectIndex.entries),
-    ...Object.entries(globalIndex.entries),
-  ]) {
-    if (!installed.has(defDigest(entry.digest))) {
+  const indexNamesDigest = (index: WorkflowStoreIndex, digest: DefDigest): boolean =>
+    Object.values(index.entries).some((entry) => entry.digest === digest);
+
+  // The combined metadata map is useful for dependency traversal, but it is not
+  // evidence that bytes exist at the root whose index named them. Preserve the
+  // loader's intentionally asymmetric contract: project rows may use a globally
+  // indexed exact-digest copy, while global rows must have global bytes.
+  for (const [coordinate, entry] of Object.entries(projectIndex.entries)) {
+    const digest = defDigest(entry.digest);
+    const projectResolvable = projectObjects.has(digest)
+      || (indexNamesDigest(globalIndex, digest) && globalObjects.has(digest));
+    if (!projectResolvable) {
       throw new Error(
-		`workflow-store coordinate '${coordinate}' references digest ${entry.digest}, ` +
-		  `but no verified object is installed at either store root`,
+		`project workflow-store coordinate '${coordinate}' references digest ${entry.digest}, ` +
+			  'but neither project bytes nor a globally indexed exact-digest fallback is installed',
+      );
+    }
+  }
+  for (const [coordinate, entry] of Object.entries(globalIndex.entries)) {
+    const digest = defDigest(entry.digest);
+    if (!globalObjects.has(digest)) {
+      throw new Error(
+		`global workflow-store coordinate '${coordinate}' references digest ${entry.digest}, ` +
+			  'but no verified object is installed at the global store root',
       );
     }
   }
@@ -413,8 +429,6 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
 
   const entryMatches = (index: WorkflowStoreIndex, coordinate: string, digest: DefDigest): boolean =>
     index.entries[coordinate]?.digest === digest;
-  const indexNamesDigest = (index: WorkflowStoreIndex, digest: DefDigest): boolean =>
-    Object.values(index.entries).some((entry) => entry.digest === digest);
 
   /** Retain target state only when the non-target root cannot satisfy an exact lock edge itself. */
   const preserveDependency = (parent: DefDigest, coordinate: string, digest: DefDigest): void => {

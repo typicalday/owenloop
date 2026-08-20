@@ -18,6 +18,7 @@ import { test } from 'node:test';
 import { main, mainAsync } from '../src/cli.ts';
 import { installFolder, writeAddJournal, writeLockfile } from '../src/add.ts';
 import { finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
+import { rmRecursiveForce } from '../src/install.ts';
 import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   collectWorkflowStoreGarbage,
@@ -316,6 +317,80 @@ test('bundle install refuses a locked multi-workflow coordinate with no callable
   assert.deepEqual(readFileSync(indexPath), indexBefore, 'the caller index entry is never committed');
   assert.deepEqual(readdirSync(objectsRoot).sort(compareStoreText), objectsBefore, 'no caller object is committed');
   assert.equal(readWorkflowStoreIndex(indexPath).entries['caller/caller@1.0.0'], undefined);
+});
+
+test('bundle GC refuses both target modes when a global index row has bytes only in project', async () => {
+	const project = await installVersion({ name: 'shared', version: '1.0.0', marker: 'identical' });
+	const global = await installVersion({ name: 'shared', version: '1.0.0', marker: 'identical' });
+	assert.equal(project.digest, global.digest, 'fixture stores must contain the same immutable bundle');
+	rmRecursiveForce(objectDirForDigest(global.root, global.digest));
+
+	const projectIndexBefore = readFileSync(storeIndexPath(project.root));
+	const globalIndexBefore = readFileSync(storeIndexPath(global.root));
+	const projectObjectsRoot = join(project.root, 'objects', 'sha256');
+	const globalObjectsRoot = join(global.root, 'objects', 'sha256');
+	const projectObjectsBefore = readdirSync(projectObjectsRoot).sort(compareStoreText);
+	const globalObjectsBefore = readdirSync(globalObjectsRoot).sort(compareStoreText);
+
+	for (const level of ['project', 'global'] as const) {
+		assert.throws(
+			() => plan({ projectRoot: project.root, globalRoot: global.root, level, keep: 1 }),
+			/indexed by global coordinate 'shared\/shared@1\.0\.0'.*no verified object directory exists/u,
+			`${level} planning must reject the broken global store instead of borrowing project bytes`,
+		);
+		assert.deepEqual(readFileSync(storeIndexPath(project.root)), projectIndexBefore);
+		assert.deepEqual(readFileSync(storeIndexPath(global.root)), globalIndexBefore);
+		assert.deepEqual(readdirSync(projectObjectsRoot).sort(compareStoreText), projectObjectsBefore);
+		assert.deepEqual(readdirSync(globalObjectsRoot).sort(compareStoreText), globalObjectsBefore);
+	}
+});
+
+test('locked bundle install refuses a broken global replica before committing caller state', async () => {
+	const project = await installVersion({ name: 'shared', version: '1.0.0', marker: 'identical' });
+	const global = await installVersion({ name: 'shared', version: '1.0.0', marker: 'identical' });
+	assert.equal(project.digest, global.digest, 'fixture stores must contain the same immutable bundle');
+	rmRecursiveForce(objectDirForDigest(global.root, global.digest));
+
+	const projectIndexBefore = readFileSync(storeIndexPath(project.root));
+	const globalIndexBefore = readFileSync(storeIndexPath(global.root));
+	const projectObjectsRoot = join(project.root, 'objects', 'sha256');
+	const globalObjectsRoot = join(global.root, 'objects', 'sha256');
+	const projectObjectsBefore = readdirSync(projectObjectsRoot).sort(compareStoreText);
+	const globalObjectsBefore = readdirSync(globalObjectsRoot).sort(compareStoreText);
+	const target = 'shared/shared@1.0.0';
+
+	await assert.rejects(
+		installVersion({
+			name: 'caller',
+			version: '1.0.0',
+			root: project.root,
+			level: 'project',
+			projectRoot: project.root,
+			globalRoot: global.root,
+			workflow: [
+				'name: caller',
+				'inputs:',
+				'  - name: seed',
+				'    seedOwed: true',
+				'steps:',
+				'  - name: invoke',
+				`    calls: ${target}`,
+				'    inputs:',
+				'      seed: seed',
+				'    produces: [done]',
+				'outputs: [done]',
+				'',
+			].join('\n'),
+			lock: { [target]: project.digest },
+		}),
+		/indexed by global coordinate 'shared\/shared@1\.0\.0'.*no verified object directory exists/u,
+	);
+
+	assert.deepEqual(readFileSync(storeIndexPath(project.root)), projectIndexBefore);
+	assert.deepEqual(readFileSync(storeIndexPath(global.root)), globalIndexBefore);
+	assert.deepEqual(readdirSync(projectObjectsRoot).sort(compareStoreText), projectObjectsBefore);
+	assert.deepEqual(readdirSync(globalObjectsRoot).sort(compareStoreText), globalObjectsBefore);
+	assert.equal(readWorkflowStoreIndex(storeIndexPath(project.root)).entries['caller/caller@1.0.0'], undefined);
 });
 
 test('project GC follows locks from every retained global caller version', async () => {

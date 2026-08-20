@@ -483,6 +483,39 @@ test('WS-6 missing project bytes fall back only to the exact digest indexed glob
 	);
 });
 
+test('WS-6 a project copy cannot mask missing bytes for the same digest indexed globally', async () => {
+	const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+	const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+	assert.equal(project.digest, global.digest, 'fixture stores must index identical bytes');
+	removeInstalledObject(global.root, global.digest);
+
+	assert.throws(
+		() => load(project.root, global.root),
+		/indexed by global coordinate 'parent\/parent@1\.0\.0'.*no verified object directory exists/u,
+		'a global index row must prove its own physical copy even when project has the digest',
+	);
+
+	const warnings: string[] = [];
+	const inspected = inspectCasDefs({
+		projectRoot: project.root,
+		globalRoot: global.root,
+		warn: (line) => warnings.push(line),
+	});
+	assert.equal(inspected.complete, false);
+	assert.ok(
+		inspected.registrations.some((registration) => (
+			registration.key === 'parent/parent@1.0.0'
+			&& registration.bundleDigest === project.digest
+			&& registration.level === 'project'
+		)),
+		'tolerant inspection retains the independently verified project registration',
+	);
+	assert.match(
+		warnings.join('\n'),
+		/incomplete global workflow coordinate 'parent\/parent@1\.0\.0'.*no verified object directory exists/u,
+	);
+});
+
 test('WS-6 a corrupt project object is never masked by a same-coordinate global decoy', async () => {
   const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'PROJECT' });
   const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL-DECOY' });

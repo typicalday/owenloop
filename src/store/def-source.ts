@@ -450,17 +450,27 @@ function discoverCasDefs(
 	for (const item of global.entries) globalDigests.add(defDigest(item.entry.digest));
 
 	const registrations: CasDefRegistration[] = [];
-	const loadedByDigest = new Map<DefDigest, LoadedObject>();
+	// Physical validation is scoped to the INDEXING root, not merely to content
+	// identity. A project index may borrow an exact digest from global, but a
+	// global index row must independently prove that the global copy exists. If
+	// this cache were digest-only, the project-first walk could let valid project
+	// bytes mask a missing/corrupt global object with the same digest.
+	const loadedByRootAndDigest = new Map<string, Map<DefDigest, LoadedObject>>();
 	const registeredObjects = new Map<DefDigest, RegisteredObject>();
 	const registeredCoordinateKeys = new Set<string>();
 
 	for (const indexed of selected) {
 		try {
 			const digest = defDigest(indexed.entry.digest);
-			let loaded = loadedByDigest.get(digest);
+			let loadedAtRoot = loadedByRootAndDigest.get(indexed.root);
+			if (loadedAtRoot === undefined) {
+				loadedAtRoot = new Map<DefDigest, LoadedObject>();
+				loadedByRootAndDigest.set(indexed.root, loadedAtRoot);
+			}
+			let loaded = loadedAtRoot.get(digest);
 			if (loaded === undefined) {
 				loaded = resolveObject(indexed, globalRoot, globalDigests);
-				loadedByDigest.set(digest, loaded);
+				loadedAtRoot.set(digest, loaded);
 			}
 			const target = coordinateTarget(indexed, loaded);
 			// `indexed.level`, not `loaded.level`: the index that NAMED the object
