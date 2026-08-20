@@ -55,6 +55,7 @@ for the full breakdown.
 | `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--map <authored>=<org>] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
 | `install <owner>/<repo>[@ref] [<defName>...] [--map <authored>=<org>] [--accept-defaults] [--dry-run] [--hub <url>] [--as <slot>]` | publish an OUTSIDE repo's defs to your hub under SCOPED capabilities (`<defName>.<capability>` by default) — records the mapping BEFORE it publishes, and never writes into local `workflows/` — see below |
 | `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--modifier <name>] [--scope <label>] [--priority <low\|normal\|high>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
+| `pending-gates --hub <url>` | list human-input gates currently blocking hub-hosted workflows; there is no local-engine form |
 | `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <url>]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
@@ -2953,15 +2954,17 @@ only for a real upstream defect with a concrete reason.
 
 ### Tools
 
-The server exposes 20 baseline tools mirroring the hub's own MCP toolset, plus
+The server exposes 21 baseline tools mirroring the hub's own MCP toolset, plus
 `create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
 `add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
-toolset. Each baseline tool's result is the hub REST response as one text
-block; a non-2xx response comes back as an error result.
+toolset. Each baseline tool's result is the hub REST response unchanged as one
+text block; a non-2xx response comes back as an error result. The
+`pending-gates` CLI command likewise prints the hub response unchanged.
 
 | tool | what it does |
 |---|---|
 | `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances; optional `serve_capabilities` accepts raw advertised keys |
+| `pending_gates` | find gates waiting on a human — owed inputs no worker can supply; query after starting or attending runs, or when a human asks what needs attention; optional `serve_crews` narrows the list |
 | `submit` | return an owed work-order output from a crew member or held-order holder; not a way for a chief of staff to fabricate inline progress |
 | `reject_artifact` | send a real upstream defect back to its producer with a concrete reason |
 | `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask`; it must not bypass unresolved rejection feedback |

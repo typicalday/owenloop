@@ -7,7 +7,7 @@
  * `realHttpServer` — no ambient network, no real keychain.
  *
  * The load-bearing assertions:
- *   - the handshake advertises the 25 baseline+create_agent+crew tools;
+ *   - the handshake advertises the 26 baseline+create_agent+crew tools;
  *     `stage_enrollment` is gated (Decision 7);
  *   - a `tools/call` becomes ONE authenticated `/api/*` request and the REST
  *     reply maps to a tool result (2xx → body, non-2xx → isError);
@@ -131,7 +131,7 @@ function resultJson(frame: Frame): unknown {
 
 // ---- handshake + tool advertising -------------------------------------------
 
-test('mcp: handshake advertises 25 tools (20 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
+test('mcp: handshake advertises 26 tools (21 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
   // Probe hits POST /api/stage_enrollment → 404 (route unregistered) → hidden.
   const routes: Record<string, RouteHandler> = { 'POST /api/stage_enrollment': () => ({ status: 404, json: { error: 'not_found' } }) };
   const { fetch } = routedFetch(routes);
@@ -144,11 +144,11 @@ test('mcp: handshake advertises 25 tools (20 baseline + create_agent + 4 crew to
   assert.notEqual(serverInfo.version, '0.0.1');
   assert.equal(serverInfo.version, PACKAGE_VERSION);
   const names = frames[1]!.result!.tools!.map((x) => x.name);
-  assert.equal(names.length, 25, names.join(','));
+  assert.equal(names.length, 26, names.join(','));
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
-  // Sanity: the 20 baseline names are all present.
-  for (const n of ['whats_next', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
+  // Sanity: the 21 baseline names are all present.
+  for (const n of ['whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
   // The four crew tools are all present.
@@ -289,6 +289,48 @@ test('mcp: a baseline tool call becomes ONE authenticated POST and maps the 2xx 
   assert.equal(whats.length, 1, 'exactly one hub call for the tool');
   assert.equal(whats[0]!.authorization, 'Bearer mcpat_human', 'the human bearer rode the Authorization header');
   assert.deepEqual(JSON.parse(whats[0]!.body!), { workflow: 'wf' });
+});
+
+test('mcp: pending_gates preserves optional serve_crews and returns each hub response unchanged', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/pending_gates': ({ body }) => {
+      const request = JSON.parse(body ?? '{}') as Record<string, unknown>;
+      return { status: 200, json: 'serve_crews' in request ? { gates: ['crew-scoped'] } : { gates: ['all-visible'] } };
+    },
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    LIST,
+    call(3, 'pending_gates', {}),
+    call(4, 'pending_gates', { serve_crews: ['alpha', 'beta'] }),
+  ]);
+
+  const pending = frames[1]!.result!.tools!.find((tool) => tool.name === 'pending_gates') as unknown as {
+    description: string;
+    inputSchema: unknown;
+  };
+  assert.deepEqual(pending.inputSchema, {
+    type: 'object',
+    properties: { serve_crews: { type: 'array', items: { type: 'string' } } },
+    additionalProperties: false,
+  });
+  assert.match(pending.description, /waiting on a person/u);
+  assert.match(pending.description, /after starting or attending runs/u);
+  assert.deepEqual(resultJson(frames[2]!), { gates: ['all-visible'] });
+  assert.deepEqual(resultJson(frames[3]!), { gates: ['crew-scoped'] });
+
+  const gates = calls.filter((row) => row.pathname === '/api/pending_gates');
+  assert.equal(gates.length, 2, 'one authenticated POST per pending_gates call');
+  assert.equal(gates[0]!.authorization, 'Bearer mcpat_human');
+  assert.equal(gates[0]!.method, 'POST');
+  assert.deepEqual(JSON.parse(gates[0]!.body!), {});
+  assert.equal(gates[1]!.method, 'POST');
+  assert.deepEqual(JSON.parse(gates[1]!.body!), { serve_crews: ['alpha', 'beta'] });
 });
 
 test('mcp: retry_artifact is an authenticated POST and leaves omitted text absent', async () => {
