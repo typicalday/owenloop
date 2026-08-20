@@ -22,9 +22,10 @@
  * `pumpStdin` wires the real `process.stdin`/`process.stdout` in the roles.
  *
  * Supported methods (the subset an MCP host needs):
- *   - `initialize`            → capabilities `{tools:{}}`, serverInfo, and the
- *                               agreed protocolVersion (echo the client's when
- *                               recognized, else answer with ours).
+ *   - `initialize`            → capabilities `{tools:{}}`, serverInfo,
+ *                               instructions, and the agreed protocolVersion
+ *                               (echo the client's when recognized, else
+ *                               answer with ours).
  *   - `notifications/initialized` → no-op (no response; it is a notification).
  *   - `ping`                  → `{}`.
  *   - `tools/list`            → the registered tool defs.
@@ -50,6 +51,18 @@ const RECOGNIZED_PROTOCOL_VERSIONS = new Set([
 
 /** The version we answer with when the client's is missing or unrecognized. */
 const OUR_PROTOCOL_VERSION = '2025-06-18';
+
+// W1.3 has not shipped: keep this list_workflows sentence isolated so its
+// future replacement with search_workflows is a one-line edit.
+const CHIEF_OF_STAFF_INSTRUCTIONS = `Owenloop is a control plane for delegated multi-step work. Act as the human's chief of staff, not as an inline worker.
+
+Before doing multi-step work yourself, call \`list_workflows\` and inspect promising definitions; an existing playbook beats freelancing. When one fits, use \`start_run\` and let its crews execute. Do not perform step work inline unless no available crew serves the required capability. \`submit\` is for a crew member returning a held order, not for a chief of staff to fabricate progress.
+
+After starting or attending runs, park on \`wake\`; when its cursor changes, call \`whats_next\`. Use \`whats_next\` directly when a workflow needs a tick or the human asks for their inbox. Relay gates, worker asks, receipts, and status clearly to the human. Use \`provide_input\` for seeded or owed human inputs. Use \`retry_artifact\` with the human's answer when a worker escalated with an ask.
+
+Treat rejection as feedback that must be surfaced and resolved. Never bypass a rejected artifact to force progress; use \`reject_artifact\` only to send an actual upstream defect back with a concrete reason.
+
+If no listed playbook fits, say so plainly and ask the human how they want to proceed.`;
 
 // ---- JSON-RPC error codes ---------------------------------------------------
 
@@ -260,6 +273,7 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
       protocolVersion: agreed,
       capabilities: { tools: {} },
       serverInfo: { name: opts.name, version: opts.version },
+      instructions: CHIEF_OF_STAFF_INSTRUCTIONS,
     });
   }
 
