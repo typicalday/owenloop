@@ -1003,13 +1003,26 @@ instance.
 ## §25 The model checker (`owenloop check`) — scope
 
 `owenloop check <def>` (see `cli.ts` usage) runs a bounded reachability
-search over `applyOutcome` transitions in `model.ts`, looking for stall
-states, true deadlocks, stuck artifacts, dead steps, and violations of any
-declared invariants. It is a static analysis of a workflow definition's
-shape, not a simulation of a running instance.
+search over the `applyOutcome` transitions in `model.ts`, including the
+model-only authority transitions described below, looking for stall states,
+true deadlocks, stuck artifacts, dead steps, and violations of any declared
+invariants. It is a static analysis of a workflow definition's shape, not a
+simulation of a running instance.
+
+**Collection-member retract transitions.** A bare collection member may be
+retracted by any authorized non-judge consumer, even when that member is
+rejected and therefore has no ordinary eligible map firing. The live scheduler
+(`eligibleFirings`) remains worker-only and keeps its green-input gate; the
+checker adds one synthetic successor transition for each authorized
+`(consumer, member)` pair so a runtime-valid retract is not reported as a
+deadlock. The synthetic transition offers only `retract`. It is not counted as
+an ordinary worker firing for dead-step accounting, and a synthesized judge's
+read-only context never grants member-retract authority. Applying it terminally
+retracts the member and lets the normal cascade retract its indexed map
+children, removing them from a reduce's surviving-member set.
 
 **Stall states vs true deadlocks.** A reachable, non-done state with zero
-eligible firings is classified into exactly ONE of two mutually exclusive
+available transitions is classified into exactly ONE of two mutually exclusive
 buckets, by recomputing eligibility as if every freeze were lifted
 (`eligibleFirings(def, arts, undefined, { ignoreFreeze: true })` — "unlimited
 attempts," i.e. what a human `retry` grants):

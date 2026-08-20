@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,8 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const BIN = fileURLToPath(new URL('../bin/owenloop.mjs', import.meta.url));
 const DEFS = join(ROOT, 'examples', 'workflows');
 const CHECK_ARGS = ['check', 'improve', '--defs', DEFS, '--format', 'json'];
+const LARGE_GRAPH_NAME = 'stdio-drain';
+const LARGE_GRAPH_INPUTS = 800;
 
 interface ExitResult {
   code: number | null;
@@ -19,6 +21,25 @@ interface ExitResult {
 
 function spawnBin(args: string[], stdio: Parameters<typeof spawn>[2]['stdio']): ChildProcess {
   return spawn(process.execPath, [BIN, ...args], { cwd: ROOT, stdio });
+}
+
+function writeLargeGraphFixture(dir: string): string[] {
+  const inputs = Array.from({ length: LARGE_GRAPH_INPUTS }, (_, index) => `input_${index}`);
+  writeFileSync(
+    join(dir, `${LARGE_GRAPH_NAME}.yaml`),
+    [
+      `name: ${LARGE_GRAPH_NAME}`,
+      'outputs: [result]',
+      'inputs:',
+      ...inputs.map((input) => `  - name: ${input}`),
+      'steps:',
+      '  - name: emit',
+      `    consumes: [${inputs.join(', ')}]`,
+      '    produces: [result]',
+      '',
+    ].join('\n'),
+  );
+  return ['graph', LARGE_GRAPH_NAME, '--defs', dir, '--format', 'json'];
 }
 
 function waitForClose(child: ChildProcess, stderr: Buffer[], timeoutMs = 10_000): Promise<ExitResult> {
@@ -66,8 +87,9 @@ test('the executable drains complete JSON output to a pipe before exit', async (
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-stdio-drain-'));
   try {
     const filePath = join(dir, 'report.json');
-    const fileResult = await runToFile(CHECK_ARGS, filePath);
-    const pipeResult = await runPiped(CHECK_ARGS);
+    const largeGraphArgs = writeLargeGraphFixture(dir);
+    const fileResult = await runToFile(largeGraphArgs, filePath);
+    const pipeResult = await runPiped(largeGraphArgs);
 
     assert.deepEqual(
       { code: fileResult.code, signal: fileResult.signal },
