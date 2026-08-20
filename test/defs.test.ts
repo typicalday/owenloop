@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, cancelCleanupSteps, DefError, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -2574,13 +2574,47 @@ test('cancelCleanupSteps selects marked steps in definition order', () => {
     name: 'cleanup-selector',
     inputs: [{ name: 'seed' }],
     steps: [
-      { name: 'first', consumes: ['seed'], produces: ['a'], onCancel: { consumes: ['seed'] } },
+      { name: 'first', consumes: ['seed'], produces: ['a'], onCancel: { consumes: [] } },
       { name: 'middle', consumes: ['a'], produces: ['b'] },
       { name: 'last', consumes: ['b'], produces: ['out'], onCancel: { consumes: ['b'] } },
     ],
   });
-  assert.deepEqual(cancelCleanupSteps(marked).map((stepDef) => stepDef.name), ['first', 'last']);
+  const selected = cancelCleanupSteps(marked);
+  assert.deepEqual(selected.map((stepDef) => stepDef.name), ['first', 'last']);
+  assert.deepEqual(selected[0]!.onCancel, { consumes: [] });
   assert.deepEqual(cancelCleanupSteps(parseDef(delivery)), []);
+});
+
+test('cancelCleanupSteps preserves definition order across expanded includes', () => {
+  const child = buildDef({
+    name: 'cleanup-child',
+    inputs: [{ name: 'workspace' }],
+    steps: [
+      { name: 'child-first', consumes: ['workspace'], produces: ['prepared'], onCancel: { consumes: [] } },
+      { name: 'child-middle', consumes: ['prepared'], produces: ['checked'] },
+      { name: 'child-last', consumes: ['workspace', 'checked'], produces: ['cleaned'], onCancel: { consumes: ['workspace', 'checked'] } },
+    ],
+  });
+  const parent = buildDef({
+    name: 'cleanup-parent',
+    inputs: [{ name: 'workspace' }],
+    steps: [
+      { name: 'parent-before', consumes: ['workspace'], produces: ['staging'], onCancel: { consumes: [] } },
+      { include: 'cleanup-child', as: 'kid', inputs: { workspace: 'staging' } },
+      { name: 'parent-after', consumes: ['kid.cleaned'], produces: ['done'], onCancel: { consumes: ['kid.cleaned'] } },
+    ],
+  });
+
+  const expanded = expandIncludes(parent, (name) => (name === child.name ? child : undefined));
+  const selected = cancelCleanupSteps(expanded);
+  assert.deepEqual(
+    selected.map((stepDef) => stepDef.name),
+    ['parent-before', 'kid.child-first', 'kid.child-last', 'parent-after'],
+  );
+  assert.equal(selected.some((stepDef) => stepDef.name === 'kid.child-middle'), false);
+  assert.deepEqual(selected[1]!.onCancel, { consumes: [] });
+  assert.deepEqual(selected[2]!.onCancel, { consumes: ['staging', 'kid.checked'] });
+  assert.deepEqual(selected[3]!.onCancel, { consumes: ['kid.cleaned'] });
 });
 
 test('hashDef: onCancel changes only defs that declare it', () => {

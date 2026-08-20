@@ -963,7 +963,7 @@ function stallResult(engine: Engine, childWf: string): void {
 
 // ---- (2) three-level nesting ------------------------------------------------
 
-test('calls: deep tick (2) three-level nesting — tick(root) surfaces the grandchild order', () => {
+test('calls: deep tick (2) three-level nesting — tick(root) drives the tree to done', () => {
   const { engine, store } = makeEngine([childDef, midDef, topDef]);
   const root = engine.createInstance('topDef', { provide: { top_in: { env: 'g' } } });
 
@@ -979,6 +979,28 @@ test('calls: deep tick (2) three-level nesting — tick(root) surfaces the grand
   const workerOrder = t.orders.find((o) => o.step === 'worker');
   assert.ok(workerOrder !== undefined, 'root tick surfaces the grandchild worker order');
   assert.equal(workerOrder!.workflow, leafRow!.id, 'grandchild order carries the grandchild workflow id');
+
+  // Commit against the surfaced descendant coordinates, then drive only the
+  // root. Deep reconciliation mirrors leaf → middle → root durably.
+  const result = { value: 'complete' };
+  engine.green(workerOrder!.workflow, workerOrder!.run, 'result', result);
+  engine.close(workerOrder!.workflow, workerOrder!.run);
+
+  engine.tick(root);
+  const leafResult = getArt(store, leafRow!.id, 'result')!;
+  const middleMirror = getArt(store, midRow!.id, 'leaf_mirror')!;
+  const rootMirror = getArt(store, root, 'mid_mirror')!;
+  assert.equal(leafResult.acceptance, 'green', 'leaf keeps its submitted result green');
+  assert.deepEqual(leafResult.value, result);
+  assert.equal(middleMirror.acceptance, 'green', 'middle mirrors a green leaf result');
+  assert.deepEqual(middleMirror.value, result);
+  assert.equal(rootMirror.acceptance, 'green', 'root mirrors a green middle result');
+  assert.deepEqual(rootMirror.value, result);
+
+  const status = engine.status(root);
+  assert.equal(status.done, true);
+  assert.equal(status.debts.length, 0);
+  assert.deepEqual(engine.tick(root).orders, [], 'a completed root tick emits no replacement orders');
 });
 
 // ---- (3) gate not green → no descend ----------------------------------------
