@@ -200,10 +200,12 @@ test('memberRetractFirings: every non-retracted member retracts through every au
   );
 });
 
-test('modelCheck: shipped research has no collection-member deadlocks within the reported bound', () => {
+test('modelCheck: shipped research reports no definite defects before the expected state bound', () => {
   const shippedResearch = loadDefFile(new URL('../examples/workflows/research.yaml', import.meta.url));
   const report = modelCheck(shippedResearch, { maxStates: 50_000, assumeProvided: true });
 
+  assert.equal(report.bounded, true, 'the complete member-retract model exceeds the shipped search budget');
+  assert.deepEqual(report.boundsHit, ['maxStates']);
   assert.deepEqual(report.deadlocks, []);
   assert.deepEqual(report.structurallyDeadSteps, []);
   assert.deepEqual(report.invariantViolations, []);

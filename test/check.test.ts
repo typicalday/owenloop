@@ -605,8 +605,9 @@ test('modelCheck: judge and allGreen evaluator steps are never false-flagged as 
 test('modelCheck: a structurally-dead step in an otherwise-completable def is still flagged', () => {
   // The workflow completes fine without 'reducer' ever contributing anything —
   // completable=true does NOT excuse a genuine wiring defect elsewhere in the def.
-  const report = modelCheck(precisionMap, { maxStates: 500, maxDepth: 50 });
+  const report = modelCheck(precisionMap, { maxStates: 5_000, maxDepth: 50 });
   assert.equal(report.completable, true, 'precision-map should still be completable (fanout/mapper complete the workflow)');
+  assert.equal(report.bounded, false, 'precision-map should be exhaustively checked at the restored sufficient bound');
   assert.ok(report.structurallyDeadSteps.includes('reducer'), 'the structural defect is reported regardless of overall completability');
 });
 
