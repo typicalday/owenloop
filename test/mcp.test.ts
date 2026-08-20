@@ -7,7 +7,7 @@
  * `realHttpServer` — no ambient network, no real keychain.
  *
  * The load-bearing assertions:
- *   - the handshake advertises the 27 baseline+create_agent+crew tools;
+ *   - the handshake advertises the 28 baseline+create_agent+crew tools;
  *     `stage_enrollment` is gated (Decision 7);
  *   - a `tools/call` becomes ONE authenticated `/api/*` request and the REST
  *     reply maps to a tool result (2xx → body, non-2xx → isError);
@@ -131,7 +131,7 @@ function resultJson(frame: Frame): unknown {
 
 // ---- handshake + tool advertising -------------------------------------------
 
-test('mcp: handshake advertises 27 tools (22 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
+test('mcp: handshake advertises 28 tools (23 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
   // Probe hits POST /api/stage_enrollment → 404 (route unregistered) → hidden.
   const routes: Record<string, RouteHandler> = { 'POST /api/stage_enrollment': () => ({ status: 404, json: { error: 'not_found' } }) };
   const { fetch } = routedFetch(routes);
@@ -144,11 +144,11 @@ test('mcp: handshake advertises 27 tools (22 baseline + create_agent + 4 crew to
   assert.notEqual(serverInfo.version, '0.0.1');
   assert.equal(serverInfo.version, PACKAGE_VERSION);
   const names = frames[1]!.result!.tools!.map((x) => x.name);
-  assert.equal(names.length, 27, names.join(','));
+  assert.equal(names.length, 28, names.join(','));
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
-  // Sanity: the 22 baseline names are all present.
-  for (const n of ['whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'delete_workflow', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
+  // Sanity: the 23 baseline names are all present.
+  for (const n of ['whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'search_workflows', 'delete_workflow', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
   // The four crew tools are all present.
@@ -734,6 +734,72 @@ test('mcp: list_workflows is an authenticated GET passthrough and preserves expl
   assert.ok(workflows.every((row) => row.method === 'GET'));
   assert.ok(workflows.every((row) => row.authorization === 'Bearer mcpat_human'));
   assert.deepEqual(workflows.map((row) => new URL(row.url).search), ['', '?include_ephemeral=true', '?include_ephemeral=false']);
+});
+
+test('mcp: search_workflows advertises its constrained ranked-catalog schema and posts caller bodies unchanged', async () => {
+  const body = {
+    text: 'Workflow search results:\n  - plan-release: workflow name, when-to-use guidance',
+    results: [{
+      name: 'plan-release',
+      title: null,
+      description: null,
+      whenToUse: ['Plan and ship a staged release.'],
+      notFor: ['One-line documentation changes.'],
+      score: 17.25,
+      why: 'Matched the workflow name and when-to-use guidance.',
+    }],
+  };
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/search_workflows': () => ({ status: 200, json: body }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    LIST,
+    call(3, 'search_workflows', { query: 'plan release' }),
+    call(4, 'search_workflows', { query: 'plan release', limit: 3, include_ephemeral: false }),
+    call(5, 'search_workflows'),
+    call(6, 'search_workflows', { query: 7 }),
+    call(7, 'search_workflows', { query: 'plan release', limit: 0 }),
+    call(8, 'search_workflows', { query: 'plan release', limit: -1 }),
+    call(9, 'search_workflows', { query: 'plan release', limit: 1.5 }),
+    call(10, 'search_workflows', { query: 'plan release', include_ephemeral: 'false' }),
+    call(11, 'search_workflows', { query: 'plan release', unexpected: true }),
+  ]);
+
+  const tools = (frames[1]!.result as {
+    tools: Array<{ name: string; description: string; inputSchema: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } }>;
+  }).tools;
+  const search = tools.find((tool) => tool.name === 'search_workflows')!;
+  assert.deepEqual(search.inputSchema.properties, {
+    query: { type: 'string' },
+    limit: { type: 'integer', minimum: 1 },
+    include_ephemeral: { type: 'boolean' },
+  });
+  assert.deepEqual(search.inputSchema.required, ['query']);
+  assert.equal(search.inputSchema.additionalProperties, false);
+  assert.match(search.description, /context-smaller ranked read/u);
+  assert.match(search.description, /smaller catalogs \(roughly below 75 definitions\).*full listing can support better selection/u);
+
+  for (const id of [3, 4]) {
+    assert.deepEqual(resultJson(frames.find((frame) => frame.id === id)!), body, 'the client must return the flattened hub body unchanged');
+  }
+  for (const id of [5, 6, 7, 8, 9, 10, 11]) {
+    assert.equal(frames.find((frame) => frame.id === id)!.error!.code, -32602, 'invalid search arguments must fail locally');
+  }
+
+  const searches = calls.filter((row) => row.pathname === '/api/search_workflows');
+  assert.equal(searches.length, 2, 'exactly one hub call per valid search_workflows invocation');
+  assert.ok(searches.every((row) => row.method === 'POST'));
+  assert.ok(searches.every((row) => row.authorization === 'Bearer mcpat_human'));
+  assert.deepEqual(searches.map((row) => JSON.parse(row.body!)), [
+    { query: 'plan release' },
+    { query: 'plan release', limit: 3, include_ephemeral: false },
+  ]);
 });
 
 test('mcp: an old hub that ignores inclusive discovery cannot receive an ephemeral create', async () => {

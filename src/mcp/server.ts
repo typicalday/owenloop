@@ -56,8 +56,8 @@ const RECOGNIZED_PROTOCOL_VERSIONS = new Set([
 /** The version we answer with when the client's is missing or unrecognized. */
 const OUR_PROTOCOL_VERSION = '2025-06-18';
 
-// W1.3 has not shipped: keep this list_workflows sentence isolated so its
-// future replacement with search_workflows is a one-line edit.
+// W1.3 shipped as a REST route; this MCP change exposes it as a tool. Keep the
+// served list_workflows charter sentence unchanged pending credentialed baseline regeneration.
 const CHIEF_OF_STAFF_INSTRUCTIONS = `Owenloop is a control plane for delegated multi-step work. Act as the human's chief of staff, not as an inline worker.
 
 Before doing multi-step work yourself, call \`list_workflows\` and inspect promising definitions; an existing playbook beats freelancing. When one fits, use \`start_run\` and let its crews execute. Do not perform step work inline unless no available crew serves the required capability. \`submit\` is for a crew member returning a held order, not for a chief of staff to fabricate progress.

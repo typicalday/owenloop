@@ -3043,7 +3043,7 @@ incomplete run. The evaluation is quota-spending and not part of required CI.
 
 ### Tools
 
-The server exposes 22 baseline tools mirroring the hub's own MCP toolset, plus
+The server exposes 23 baseline tools mirroring the hub's own MCP toolset, plus
 `create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
 `add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
 toolset. Each baseline tool's result is the hub REST response unchanged as one
@@ -3068,6 +3068,7 @@ and makes no hub request.
 | `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses authoring; optional `bundle_digest` identifies the content-addressed bundle for reference orders; optional `ephemeral` publishes a retireable one-off only after remote-hub capability attestation |
 | `get_workflow` | inspect a promising loaded definition before selecting it |
 | `list_workflows` | discover published workflow definitions and decide which one fits a task; optional `include_ephemeral` includes definitions hidden from the default catalog |
+| `search_workflows` | context-smaller ranked read of the same published catalog when it is too large to read whole or the host cannot spend the full-list context; requires string `query`, accepts optional positive-integer `limit` and boolean `include_ephemeral`, and returns flattened ranked `{ text, results }`; for smaller catalogs (roughly below 75 definitions), the full listing can support better selection |
 | `delete_workflow` | retire an ephemeral workflow's live name; the hub refuses while an active root references its exact pinned definition closure |
 | `get_status` | `engine.status` verbatim plus a plain-English rendering |
 | `heartbeat` | touch the liveness timestamp on an open run so it is not reaped mid-step |

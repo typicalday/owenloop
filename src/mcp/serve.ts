@@ -588,13 +588,13 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 22 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 23 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 22, plus `createAgentTool`, plus the four crew tools from
+ * set: these 23, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
@@ -783,6 +783,23 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		path: '/api/workflows',
 		...('include_ephemeral' in a ? { query: `?include_ephemeral=${String(a['include_ephemeral'])}` } : {}),
       })),
+    },
+    {
+      name: 'search_workflows',
+      description:
+		'Search the same published catalog as a context-smaller ranked read when it is too large to read whole or the host cannot spend the full-list context. For smaller catalogs (roughly below 75 definitions), reading the full listing can support better selection.',
+      // Deliberately stricter than the REST route, which ignores unknown fields: MCP callers fail locally without a hub round-trip.
+      inputSchema: {
+		type: 'object',
+		properties: {
+		  query: { type: 'string' },
+		  limit: { type: 'integer', minimum: 1 },
+		  include_ephemeral: { type: 'boolean' },
+		},
+		required: ['query'],
+		additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/search_workflows', body: a })),
     },
     {
       name: 'delete_workflow',
