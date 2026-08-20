@@ -2557,6 +2557,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     def: def.name,
     bounded: false,
     boundsHit: [],
+    collectionCapApplied: false,
+    maxCollectionSize,
     deadlocks: [],
     stallStates: [],
     stuck: [],
@@ -2686,6 +2688,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
         }
 
         const step: CheckStep = { step: firing.step, key: firing.key, outcome };
+	if (outcome === 'emit-seal') report.collectionCapApplied = true;
         const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize });
 
         for (const suc of successors) {

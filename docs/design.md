@@ -1013,6 +1013,14 @@ true deadlocks, stuck artifacts, dead steps, and violations of any declared
 invariants. It is a static analysis of a workflow definition's shape, not a
 simulation of a running instance.
 
+**Collection-cap reporting.** The finite member-count cap used when expanding
+an `emit`/`seal` outcome defaults to 2 and can be set with `--max-collection`.
+The structured `CheckReport` records the effective value in
+`maxCollectionSize` and sets `collectionCapApplied` when the search expands at
+least one reachable collection fork. This metadata describes the explored
+search shape; it is not a `boundsHit` value and does not make `bounded` true.
+The CLI reports the same caveat in text mode and includes both fields in JSON.
+
 **Collection-member retract transitions.** A bare collection member may be
 retracted by any authorized non-judge consumer, even when that member is
 rejected and therefore has no ordinary eligible map firing. The live scheduler

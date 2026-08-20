@@ -619,6 +619,8 @@ function baseReport(overrides: Partial<CheckReport>): CheckReport {
     def: 'x',
     bounded: false,
     boundsHit: [],
+    collectionCapApplied: false,
+    maxCollectionSize: 2,
     deadlocks: [],
     stallStates: [],
     stuck: [],
@@ -663,11 +665,17 @@ test('hasDefiniteCheckDefect: unit predicate agrees for all three commands', () 
     false,
     'a deadlock found only under bounded search is not yet definite',
   );
-  // same deadlock while NOT bounded (exhaustive search) → true
+  // Collection-cap metadata is a reporting caveat, not a bound: the same
+  // deadlock remains definite while the BFS itself is exhaustive.
   assert.equal(
-    hasDefiniteCheckDefect(baseReport({ deadlocks: [{ path: [] }], bounded: false })),
+    hasDefiniteCheckDefect(baseReport({
+      deadlocks: [{ path: [] }],
+      bounded: false,
+      collectionCapApplied: true,
+      maxCollectionSize: 0,
+    })),
     true,
-    'a deadlock found under an exhaustive search is a definite defect',
+    'a deadlock found under an exhaustive capped collection search is a definite defect',
   );
 
   // all-empty clean report → false
