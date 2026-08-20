@@ -2125,25 +2125,51 @@ function discoveryIssues(def: WorkflowDef): string[] {
     }
     for (const [index, item] of value.entries()) requiredString(item, path + '[' + index + ']');
   };
-  const unknownFields = (value: Record<string, unknown>, allowed: readonly string[], path: string): void => {
+  /**
+   * Validate a mapping in the order its fields were authored.  Required
+   * fields absent from the mapping follow in the convention's fixed order,
+   * making both kinds of diagnostic deterministic.
+   */
+  const visitMapFields = (
+    value: Record<string, unknown>,
+    allowed: readonly string[],
+    path: string,
+    visitKnownField: (key: string, fieldValue: unknown) => void,
+  ): void => {
     const allowedSet = new Set(allowed);
+    const present = new Set<string>();
     for (const key of Object.keys(value)) {
-      if (!allowedSet.has(key)) issues.push(path + '.' + key + ': unknown field');
+      if (!allowedSet.has(key)) {
+        issues.push(path + '.' + key + ': unknown field');
+        continue;
+      }
+      present.add(key);
+      visitKnownField(key, value[key]);
     }
+    for (const key of allowed) if (!present.has(key)) visitKnownField(key, undefined);
   };
 
-  unknownFields(discovery, ['description', 'whenToUse', 'notFor', 'interface'], 'x.discovery');
-  requiredString(discovery.description, 'x.discovery.description');
-  requiredPhraseList(discovery.whenToUse, 'x.discovery.whenToUse');
-  requiredPhraseList(discovery.notFor, 'x.discovery.notFor');
-
-  const interfaceValue = discovery.interface;
+  let interfaceValue: unknown;
+  visitMapFields(discovery, ['description', 'whenToUse', 'notFor', 'interface'], 'x.discovery', (key, value) => {
+    switch (key) {
+      case 'description':
+        requiredString(value, 'x.discovery.description');
+        break;
+      case 'whenToUse':
+        requiredPhraseList(value, 'x.discovery.whenToUse');
+        break;
+      case 'notFor':
+        requiredPhraseList(value, 'x.discovery.notFor');
+        break;
+      case 'interface':
+        interfaceValue = value;
+        break;
+    }
+  });
   if (!isDiscoveryMap(interfaceValue)) {
     issues.push('x.discovery.interface: expected a map');
     return issues;
   }
-  unknownFields(interfaceValue, ['inputs', 'outputs'], 'x.discovery.interface');
-
   const validateInterfaceEntries = (
     value: unknown,
     path: 'inputs' | 'outputs',
@@ -2163,27 +2189,41 @@ function discoveryIssues(def: WorkflowDef): string[] {
         issues.push(entryPath + ': expected a map');
         continue;
       }
-      unknownFields(entry, ['name', 'summary', 'schemaRef'], entryPath);
-      const name = requiredString(entry.name, entryPath + '.name');
-      requiredString(entry.summary, entryPath + '.summary');
-      const schemaRef = requiredString(entry.schemaRef, entryPath + '.schemaRef');
-      if (schemaRef !== undefined && !schemaRef.startsWith('#/')) {
-        issues.push(entryPath + '.schemaRef: expected a local JSON pointer starting with \'#/\'');
-      }
-      if (name === undefined) continue;
-      const artifact = declared.get(name);
-      if (artifact === undefined) {
-        issues.push(entryPath + '.name: unknown workflow ' + singular + " '" + name + "'");
-        continue;
-      }
-      if (seen.has(name)) {
-        issues.push(entryPath + '.name: duplicate workflow ' + singular + " '" + name + "'");
-      } else {
-        seen.add(name);
-      }
-      if (artifact.schema === undefined) {
-        issues.push(entryPath + '.schemaRef: workflow ' + singular + " '" + name + "' has no schema");
-      }
+
+      visitMapFields(entry, ['name', 'summary', 'schemaRef'], entryPath, (key, fieldValue) => {
+        switch (key) {
+          case 'name': {
+            const name = requiredString(fieldValue, entryPath + '.name');
+            if (name === undefined) break;
+
+            // Record every non-blank name before declaration lookup. This
+            // preserves both useful findings for repeated unknown names.
+            if (seen.has(name)) {
+              issues.push(entryPath + '.name: duplicate workflow ' + singular + " '" + name + "'");
+            } else {
+              seen.add(name);
+            }
+
+            const artifact = declared.get(name);
+            if (artifact === undefined) {
+              issues.push(entryPath + '.name: unknown workflow ' + singular + " '" + name + "'");
+            } else if (artifact.schema === undefined) {
+              issues.push(entryPath + '.schemaRef: workflow ' + singular + " '" + name + "' has no schema");
+            }
+            break;
+          }
+          case 'summary':
+            requiredString(fieldValue, entryPath + '.summary');
+            break;
+          case 'schemaRef': {
+            const schemaRef = requiredString(fieldValue, entryPath + '.schemaRef');
+            if (schemaRef !== undefined && !schemaRef.startsWith('#/')) {
+              issues.push(entryPath + '.schemaRef: expected a local JSON pointer starting with \'#/\'');
+            }
+            break;
+          }
+        }
+      });
     }
     for (const name of declared.keys()) {
       if (!seen.has(name)) issues.push(fieldPath + ': missing workflow ' + singular + " '" + name + "'");
@@ -2198,8 +2238,10 @@ function discoveryIssues(def: WorkflowDef): string[] {
       return [name, { schema: artifact?.schema }];
     }),
   );
-  validateInterfaceEntries(interfaceValue.inputs, 'inputs', inputs);
-  validateInterfaceEntries(interfaceValue.outputs, 'outputs', outputs);
+  visitMapFields(interfaceValue, ['inputs', 'outputs'], 'x.discovery.interface', (key, value) => {
+    if (key === 'inputs') validateInterfaceEntries(value, 'inputs', inputs);
+    else validateInterfaceEntries(value, 'outputs', outputs);
+  });
   return issues;
 }
 
