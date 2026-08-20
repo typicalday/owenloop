@@ -27,11 +27,16 @@ The mounted MCP process writes a JSONL trace in a random harness-owned
 directory outside the model session workspace. The evaluated session receives
 only its workspace path; it cannot reach the trace through its normal workspace
 authority. Claude runs with isolated settings, no skills, no ambient MCP
-servers, and only its read-only local built-ins; Codex receives a fresh private
-`CODEX_HOME` containing no user configuration, credentials, plugins, skills, or
-MCP servers. Both sessions therefore expose the fixture mount and their
-intentionally limited built-ins, rather than an operator's configured Owenloop
-server. The trace records the full SHA-256 of the exact UTF-8 instructions value returned by the
+servers, and only its read-only local built-ins. Codex receives a fresh private
+`CODEX_HOME` containing no user configuration, plugins, skills, or MCP servers.
+If the operator uses file authentication, the runner stages `auth.json` there
+with owner-only permissions so the app-server remains logged in; it disables
+Codex's shell, exec, file/image, web, app, and subagent surfaces and subprocess
+environment inheritance, so the evaluated model can reach the fixture MCP but
+cannot read that staged credential. The private root is removed after the task.
+Both sessions therefore expose the fixture mount and only the intended
+built-ins, rather than an operator's configured Owenloop server. The trace
+records the full SHA-256 of the exact UTF-8 instructions value returned by the
 real initialize handler, then each received MCP call as ordered sequence, name,
 and arguments. Scores use only that structured wire log. Response evidence
 retains only the final assembled assistant reply (the Claude SDK's final
@@ -64,7 +69,10 @@ bin/owenloop.mjs. It imports only the local MCP transport core and local fixture
 helpers; every handler is a fixed local response, and start_run only records its
 selected workflow. It has no CLI, hub, REST, credential, or settings fallback
 path. Claude ignores ambient settings and MCP configuration, and Codex receives
-an empty private configuration root; both mounts are the fixture entry point.
+a private minimal configuration root with only its supported login cache; both
+mounts are the fixture entry point. Codex's model-visible tools and subprocess
+environment are disabled apart from that mount, so the login cache is not model
+evidence.
 The fixture itself has no production-hub code path, so ambient `OWENLOOP_HUB`
 cannot reach production through this evaluation.
 

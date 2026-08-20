@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
@@ -8,6 +9,7 @@ import { mainAsync } from '../src/cli.ts';
 import { createMcpServer } from '../src/mcp/server.ts';
 import type { ToolRegistration } from '../src/mcp/server.ts';
 import { buildClaudeOptions } from '../packages/work/src/harness/claude.ts';
+import { buildThreadStartParams } from '../packages/work/src/harness/codex.ts';
 import {
   fixtureToolRegistrations,
   loadCharterFixture,
@@ -20,7 +22,7 @@ import {
   validateReport,
 } from './helpers/mcp-charter-eval.ts';
 import type { CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/mcp-charter-eval.ts';
-import { finalResponseEvidence, reportedMetadata, runTask } from './mcp-charter-eval.ts';
+import { CODEX_EVAL_PERMISSIONS, finalResponseEvidence, reportedMetadata, runTask } from './mcp-charter-eval.ts';
 import { makeIo } from './hubkit.ts';
 import type { CliIO } from '../src/cli.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../packages/work/src/harness/contract.ts';
@@ -343,17 +345,45 @@ test('mcp charter runner makes adapter exits unscorable and retains only final r
   assert.equal(evidencePath.startsWith(`${sessionCwd}${sep}`), false, 'trace cannot be a file in the evaluated workspace');
 });
 
-test('mcp charter runner gives Codex a private empty configuration root for each task', async () => {
+test('mcp charter runner isolates Codex config without severing file authentication', async (t) => {
   const hash = 'f'.repeat(64);
   const previousCodexHome = process.env['CODEX_HOME'];
+  const operatorHome = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-operator-codex-home-'));
+  const fakeAuth = '{"auth_mode":"chatgpt","tokens":{"access_token":"test-only"}}\n';
+  await writeFile(
+    join(operatorHome, 'config.toml'),
+    '[mcp_servers.ambient]\ncommand = "would-reach-production"\n',
+  );
+  await writeFile(join(operatorHome, 'auth.json'), fakeAuth, { mode: 0o600 });
+  process.env['CODEX_HOME'] = operatorHome;
+  t.after(async () => {
+    if (previousCodexHome === undefined) delete process.env['CODEX_HOME'];
+    else process.env['CODEX_HOME'] = previousCodexHome;
+    await rm(operatorHome, { recursive: true, force: true });
+  });
+
   const ref: HarnessSessionRef = { harness: 'codex', token: 'isolated-config' };
   let observedHome: string | undefined;
   let observedConfig: string | undefined;
+  let observedAuth: string | undefined;
   const adapter = harnessAdapter(async (args, onEvent) => {
     observedHome = process.env['CODEX_HOME'];
-    assert.notEqual(observedHome, previousCodexHome, 'the task must not inherit the operator config root');
+    assert.notEqual(observedHome, operatorHome, 'the task must not inherit the operator config root');
     assert.ok(observedHome !== undefined);
     observedConfig = await readFile(join(observedHome, 'config.toml'), 'utf8');
+    observedAuth = await readFile(join(observedHome, 'auth.json'), 'utf8');
+
+    const params = buildThreadStartParams(args);
+    const config = params['config'] as Record<string, unknown>;
+    assert.deepEqual(Object.keys(config['mcp_servers'] as Record<string, unknown>), ['owenloop']);
+    assert.deepEqual(config['agents'], { enabled: false });
+    assert.deepEqual(config['apps'], { _default: { enabled: false } });
+    assert.deepEqual(config['tools'], { view_image: false, web_search: false });
+    assert.deepEqual(config['shell_environment_policy'], { inherit: 'none', ignore_default_excludes: false });
+    assert.equal((config['features'] as Record<string, unknown>)['shell_tool'], false);
+    assert.equal((config['features'] as Record<string, unknown>)['unified_exec'], false);
+    assert.equal(config['web_search'], 'disabled');
+
     onEvent({ kind: 'started', ref });
     await writeTrace(args, hash);
     onEvent({ kind: 'turn_ended' });
@@ -361,15 +391,19 @@ test('mcp charter runner gives Codex a private empty configuration root for each
   });
 
   await runTask(
-    { id: 'codex', adapter, permissions: { extensions: { sandbox: 'read-only' } } },
+    { id: 'codex', adapter, permissions: CODEX_EVAL_PERMISSIONS },
     { request: 'please help' },
     'fixture.json',
     hash,
     { taskTimeoutMs: 100 },
   );
 
-  assert.equal(observedConfig, '');
-  assert.equal(process.env['CODEX_HOME'], previousCodexHome, 'the process config root must be restored after the task');
+  assert.equal(observedConfig, 'cli_auth_credentials_store = "file"\n');
+  assert.equal(observedAuth, fakeAuth, 'file-backed auth must reach the app-server in its private root');
+  assert.equal(process.env['CODEX_HOME'], operatorHome, 'the operator config root must be restored after the task');
+  assert.equal(await readFile(join(operatorHome, 'auth.json'), 'utf8'), fakeAuth, 'the source login remains intact');
+  assert.ok(observedHome !== undefined);
+  await assert.rejects(readFile(join(observedHome, 'auth.json'), 'utf8'), /ENOENT/);
 });
 
 test('mcp charter runner stops a started session at its deadline and preserves its trace as unscorable', async () => {
@@ -420,5 +454,14 @@ test('mcp charter records model metadata from the real adapter init-line shape',
       },
     ]),
     { reportedModel: 'claude-opus-5', version: '2.1.220' },
+  );
+  assert.deepEqual(
+    reportedMetadata([
+      {
+        kind: 'progress',
+        text: 'app-server ready: userAgent=owenloop-recorder/0.146.0 (Mac OS 26.2.0; arm64)',
+      },
+    ]),
+    { version: '0.146.0' },
   );
 });

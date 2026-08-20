@@ -5,9 +5,9 @@
  * requires logged-in local harnesses, so the deterministic suite must not run it.
  */
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 import { claudeAdapter } from '../packages/work/src/harness/claude.ts';
@@ -105,12 +105,16 @@ export function finalResponseEvidence(events: readonly AgentEvent[]): string[] {
 }
 
 export function reportedMetadata(events: readonly AgentEvent[]): { reportedModel?: string; version?: string } {
-  const text = events
+  const progress = events
     .filter((event): event is Extract<AgentEvent, { kind: 'progress' }> => event.kind === 'progress')
-    .map((event) => event.text)
-    .join('\n');
-  const reportedModel = /(?:^|\s)model=([^\s]+)/u.exec(text)?.[1];
-  const version = /(?:^|\s)cliVersion=([^\s]+)/u.exec(text)?.[1];
+    .map((event) => event.text);
+  const claudeInit = progress.find((text) => /^session\s+\S+:\s/u.test(text));
+  const codexInit = progress.find((text) => /^app-server ready: userAgent=/u.test(text));
+  const reportedModel = claudeInit === undefined ? undefined : /(?:^|\s)model=([^\s]+)/u.exec(claudeInit)?.[1];
+  const claudeVersion = claudeInit === undefined ? undefined : /(?:^|\s)cliVersion=([^\s]+)/u.exec(claudeInit)?.[1];
+  const codexVersion =
+    codexInit === undefined ? undefined : /^app-server ready: userAgent=[^/\s]+\/([^\s]+)/u.exec(codexInit)?.[1];
+  const version = claudeVersion ?? codexVersion;
   return {
     ...(reportedModel === undefined ? {} : { reportedModel }),
     ...(version === undefined ? {} : { version }),
@@ -122,18 +126,63 @@ function unscorable(reason: string, calls: ParsedTrace['calls'] = []): ParsedTra
 }
 
 /**
- * Codex merges an app-server thread's MCP config with the operator's config
- * root. An empty private root is therefore the isolation boundary for this
- * eval. It deliberately contains no copied credentials, plugins, skills, MCP
- * servers, or user configuration; app-server authentication remains in the
- * provider's credential store rather than the evaluated model's filesystem.
+ * Codex stores file-backed login state and user configuration under the same
+ * root. Give the app-server a private configuration root, but stage auth.json
+ * when the operator uses file authentication so isolation does not silently
+ * sign a healthy harness out. The evaluated turn has no file/shell tools and
+ * receives no subprocess environment, so the staged credential is app-server
+ * input rather than model-readable evidence. Keyring-only installs need no file.
  */
-async function createIsolatedCodexHome(): Promise<string> {
+async function createIsolatedCodexHome(sourceHome = process.env['CODEX_HOME'] ?? join(homedir(), '.codex')): Promise<string> {
   const home = await mkdtemp(join(tmpdir(), 'owenloop-mcp-charter-eval-codex-home-'));
   await chmod(home, 0o700);
-  await writeFile(join(home, 'config.toml'), '');
+  let copiedFileAuth = false;
+  try {
+    await copyFile(join(sourceHome, 'auth.json'), join(home, 'auth.json'));
+    await chmod(join(home, 'auth.json'), 0o600);
+    copiedFileAuth = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      await rm(home, { recursive: true, force: true });
+      throw error;
+    }
+  }
+  await writeFile(join(home, 'config.toml'), `cli_auth_credentials_store = "${copiedFileAuth ? 'file' : 'auto'}"\n`, {
+    mode: 0o600,
+  });
   return home;
 }
+
+/** Codex treatment: fixture MCP only, with no model-visible path to staged auth. */
+export const CODEX_EVAL_PERMISSIONS: StartArgs['permissions'] = {
+  permissionMode: 'never',
+  extensions: {
+    sandbox: 'read-only',
+    codexConfig: {
+      agents: { enabled: false },
+      apps: { _default: { enabled: false } },
+      features: {
+        apps: false,
+        browser_use: false,
+        browser_use_external: false,
+        browser_use_full_cdp_access: false,
+        computer_use: false,
+        goals: false,
+        image_generation: false,
+        in_app_browser: false,
+        multi_agent: false,
+        plugins: false,
+        remote_plugin: false,
+        shell_tool: false,
+        unified_exec: false,
+      },
+      history: { persistence: 'none' },
+      shell_environment_policy: { inherit: 'none', ignore_default_excludes: false },
+      tools: { view_image: false, web_search: false },
+      web_search: 'disabled',
+    },
+  },
+};
 
 export async function runTask(
   harness: HarnessRun,
@@ -308,7 +357,7 @@ async function main(): Promise<void> {
       id: codexAdapter.id,
       adapter: codexAdapter,
       model: options.codexModel,
-      permissions: { permissionMode: 'never', extensions: { sandbox: 'read-only' } },
+      permissions: CODEX_EVAL_PERMISSIONS,
     },
   ];
 
