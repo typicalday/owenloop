@@ -685,11 +685,11 @@ test('push: a completable def with a maxAttempts brake on one branch and a movin
  * (a reduce step whose `produces: []` discharges nothing, so it can NEVER
  * fire under any bounds — see test/check.test.ts's `precision-map` fixture)
  * was never reported as a structurally-dead defect by `push`'s message, even
- * when `push` happened to reject the def anyway (this exact fixture also
- * trips an unrelated true-deadlock elsewhere in its reachable state graph, so
- * the OLD predicate's `deadlocks` term coincidentally still exits 1 — see
- * modelCheck's report on this def: bounded=false, deadlocks.length=130,
- * structurallyDeadSteps=['reducer']). What this test actually proves: the
+ * when `push` happened to reject the def anyway (historically, this fixture
+ * also tripped unrelated true deadlocks). The model-only rejected-member
+ * retract transition now releases those states, so modelCheck reports
+ * bounded=false, deadlocks.length=0, structurallyDeadSteps=['reducer'].
+ * What this test actually proves: the
  * error message/classification now correctly names the real defect
  * (`1 structurally dead step`) instead of only the incidental deadlock count
  * — pre-fix, `/structurally dead step/` never appears in `push`'s output for
@@ -736,9 +736,9 @@ test('push: a def with a validateDef-missed structurally-dead step is REJECTED (
 
 /**
  * A SECOND, minimal structurally-dead fixture with no incidental true
- * deadlocks anywhere else in its reachable state graph (unlike precision-map
- * above, whose extra `mapper` step happens to also produce 130 unrelated true
- * deadlocks) — `fanout` produces `items[]` and `reducer` is the sole consumer,
+ * deadlocks anywhere else in its reachable state graph (like precision-map
+ * above, whose rejected-member states now retract rather than deadlock) —
+ * `fanout` produces `items[]` and `reducer` is the sole consumer,
  * discharging nothing (`produces: []`). modelCheck on this def reports
  * bounded=false, deadlocks=[], invariantViolations=[], structurallyDeadSteps=
  * ['reducer']. This isolates the EXACT #77 residual gap: pre-fix, `push`'s

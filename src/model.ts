@@ -669,11 +669,17 @@ function callsDischargeFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
 /**
  * The model-only collection-member retractions available in THIS state.
  *
- * `Engine.retract()` is an authority action rather than a scheduler action: a
- * non-judge step that consumes a member's stem may retract an existing bare
- * member even after that member is rejected. A rejected member has no ordinary
- * map firing, so without this transition modelCheck would call that runtime-
- * valid state a deadlock.
+ * `Engine.retract()` is an authority action rather than a scheduler action.
+ * The checker models its graph-reached rejected-member case only: a rejected
+ * member has no ordinary map firing, so without this transition modelCheck
+ * would call that runtime-valid state a deadlock.
+ *
+ * Retracting a green, owed, or skipped member later is an operator lever, like
+ * retry, and is deliberately outside this bounded model. Definitions with a
+ * bare member as an ordinary firing output continue to model retraction at
+ * production through `eligibleOutcomes()`' existing member outcome branch.
+ * Keeping that distinction prevents an unbounded operator-action cross-product
+ * while still modeling the rejection deadlock this transition releases.
  *
  * Kept separate from `eligibleFirings` deliberately: that function is the
  * live worker scheduler, while these synthetic firings are consumed only by
@@ -683,7 +689,7 @@ export function memberRetractFirings(def: WorkflowDef, arts: ArtifactMap): Membe
   const members = [...arts.values()]
     .flatMap((art) => {
       const el = parseElement(art.path);
-      return el && el.suffix === '' && art.acceptance !== 'retracted' ? [{ art, el }] : [];
+      return el && el.suffix === '' && art.acceptance === 'rejected' ? [{ art, el }] : [];
     })
     .sort((a, b) =>
       a.el.stem.localeCompare(b.el.stem) || a.el.index - b.el.index || a.art.path.localeCompare(b.art.path),
@@ -2442,26 +2448,93 @@ export function applyOutcome(
  *   judgmentRejects: BUCKETED to min(count, maxAttempts) so that e.g. 0, 1, 2
  *     are distinct but anything >= cap is the same (frozen state)
  *   schemaRejects: BUCKETED to min(count, maxSchemaFailures) similarly
- *   retracted: TERMINAL, so its prior version/reject counters cannot affect
- *     any future transition and are intentionally omitted
+ *   retracted collection families: a retracted bare member and its retracted
+ *     indexed descendants are omitted, and surviving member indices are
+ *     densely projected. A member's old index and terminal history are
+ *     unobservable after retraction, but unrelated retracted artifacts keep
+ *     their ordinary encoding.
  *
  * For 'skipped' artifacts, the fingerprint is encoded as sorted "inputPath:versionRank"
  * pairs to capture rearm eligibility correctly.
  */
-function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
+interface RetractedMemberProjection {
+  omittedPaths: ReadonlySet<string>;
+  denseIndices: ReadonlyMap<string, number>;
+}
+
+function memberIdentity(stem: string, index: number): string {
+  return `${stem}\u0000${index}`;
+}
+
+/**
+ * Project terminal collection-member families out of a model state.
+ *
+ * A bare member retracted by the model-only transition, plus its already
+ * retracted indexed descendants, cannot affect a later firing: literal indexed
+ * consumes are rejected by parseConsume, and settleInMemory makes retracted
+ * descendants terminal. The projection deliberately leaves any nonterminal
+ * child visible — a parent tombstone alone is not enough to elide it.
+ */
+function retractedMemberProjection(arts: Map<string, ArtifactData>): RetractedMemberProjection {
+  const bareMembers = [...arts.values()].flatMap((art) => {
+    const element = parseElement(art.path);
+    return element && element.suffix === '' ? [{ art, element }] : [];
+  });
+  const retractedMembers = bareMembers.filter(({ art }) => art.acceptance === 'retracted');
+  const omittedPaths = new Set<string>();
+
+  for (const { art: member, element } of retractedMembers) {
+    omittedPaths.add(member.path);
+    for (const child of arts.values()) {
+      const childElement = parseElement(child.path);
+      if (
+	childElement &&
+	childElement.stem === element.stem &&
+	childElement.index === element.index &&
+	child.acceptance === 'retracted'
+      ) {
+	omittedPaths.add(child.path);
+      }
+    }
+  }
+
+  const denseIndices = new Map<string, number>();
+  const nextIndex = new Map<string, number>();
+  for (const { art, element } of bareMembers
+    .filter(({ art }) => art.acceptance !== 'retracted')
+    .sort(
+      (a, b) =>
+	a.element.stem.localeCompare(b.element.stem) ||
+	a.element.index - b.element.index ||
+	a.art.path.localeCompare(b.art.path),
+    )) {
+    const denseIndex = nextIndex.get(element.stem) ?? 0;
+    denseIndices.set(memberIdentity(element.stem, element.index), denseIndex);
+    nextIndex.set(element.stem, denseIndex + 1);
+  }
+
+  return { omittedPaths, denseIndices };
+}
+
+function projectedIndexedPath(path: string, projection: RetractedMemberProjection): string {
+  const element = parseElement(path);
+  if (!element) return path;
+  const denseIndex = projection.denseIndices.get(memberIdentity(element.stem, element.index));
+  return denseIndex === undefined ? path : `${element.stem}[${denseIndex}]${element.suffix}`;
+}
+
+/** Exported direct-module test seam for model state equivalence. */
+export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
   const parts: string[] = [];
   const stepMap = new Map(def.steps.map((l) => [l.name, l]));
+  const projection = retractedMemberProjection(arts);
 
-  for (const [path, art] of [...arts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    // settleInMemory treats retracted artifacts as terminal: it neither
-    // maintains them nor lets them fire again. Their version and failure
-    // counters are historical only, so retaining them would split otherwise
-    // equivalent post-retract states and make the model's real transition
-    // unnecessarily exhaust the state budget.
-    if (art.acceptance === 'retracted') {
-      parts.push(`${path}:retracted`);
-      continue;
-    }
+  const projectedArtifacts = [...arts.entries()]
+    .filter(([path]) => !projection.omittedPaths.has(path))
+    .map(([path, art]) => ({ path, art, projectedPath: projectedIndexedPath(path, projection) }))
+    .sort((a, b) => a.projectedPath.localeCompare(b.projectedPath) || a.path.localeCompare(b.path));
+
+  for (const { path, art, projectedPath } of projectedArtifacts) {
 
     const step = stepMap.get(art.producer);
     const producePat = step && produceOwning(step, path);
@@ -2477,7 +2550,7 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
     const jBucket = Math.min(art.judgmentRejects, maxAttempts);
     const sBucket = Math.min(art.schemaRejects, maxSchema);
 
-    let entry = `${path}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
+    let entry = `${projectedPath}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
 
     // §24: encode the sign-off ledger so two states differing only in which
     // judges have approved (same acceptance/version) are not canonicalized
@@ -2493,12 +2566,13 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
     // For skipped: encode fingerprint as sorted "fPath:fRank" pairs
     if (art.acceptance === 'skipped' && art.fingerprint) {
       const fpParts = Object.entries(art.fingerprint)
-        .sort((a, b) => a[0].localeCompare(b[0]))
         .map(([k, v]) => {
           const dep = arts.get(k);
           const depRank = v === 0 ? 0 : dep?.acceptance === 'green' ? 1 : dep?.acceptance === 'submitted' ? 3 : 2;
-          return `${k}@${depRank}`;
+	  return { key: projectedIndexedPath(k, projection), value: `${projectedIndexedPath(k, projection)}@${depRank}` };
         })
+	.sort((a, b) => a.key.localeCompare(b.key))
+	.map(({ value }) => value)
         .join(',');
       entry += `|fp:${fpParts}`;
     }
