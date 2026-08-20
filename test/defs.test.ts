@@ -2592,7 +2592,7 @@ test('cancelCleanupSteps preserves definition order across expanded includes', (
     steps: [
       { name: 'child-first', consumes: ['workspace'], produces: ['prepared'], onCancel: { consumes: [] } },
       { name: 'child-middle', consumes: ['prepared'], produces: ['checked'] },
-      { name: 'child-last', consumes: ['checked'], produces: ['cleaned'], onCancel: { consumes: ['checked'] } },
+      { name: 'child-last', consumes: ['workspace', 'checked'], produces: ['cleaned'], onCancel: { consumes: ['workspace', 'checked'] } },
     ],
   });
   const parent = buildDef({
@@ -2613,7 +2613,7 @@ test('cancelCleanupSteps preserves definition order across expanded includes', (
   );
   assert.equal(selected.some((stepDef) => stepDef.name === 'kid.child-middle'), false);
   assert.deepEqual(selected[1]!.onCancel, { consumes: [] });
-  assert.deepEqual(selected[2]!.onCancel, { consumes: ['kid.checked'] });
+  assert.deepEqual(selected[2]!.onCancel, { consumes: ['staging', 'kid.checked'] });
   assert.deepEqual(selected[3]!.onCancel, { consumes: ['kid.cleaned'] });
 });
 

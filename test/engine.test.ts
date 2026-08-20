@@ -240,18 +240,19 @@ test('onCancel declarations are inert in standalone Engine eligibility, cascade,
       fingerprint: artifact.fingerprint ?? null,
     }));
 
+    const initialEligible = engine.status(workflow).eligible.map(projectFiring);
     const initialTick = engine.tick(workflow, { now: 1000 });
     assert.deepEqual(initialTick.orders.map((order) => order.step), ['prepare']);
     const prepare = initialTick.orders[0]!;
     complete(engine, workflow, prepare, { prepared: 'ready' });
 
+    const afterPrepare = {
+      artifacts: projectArtifacts(),
+      eligible: engine.status(workflow).eligible.map(projectFiring),
+    };
     const finishTick = engine.tick(workflow, { now: 2000 });
     assert.deepEqual(finishTick.orders.map((order) => order.step), ['finish']);
     const finish = finishTick.orders[0]!;
-    const afterPrepare = {
-      artifacts: projectArtifacts(),
-      eligible: finishTick.orders.map(projectOrder),
-    };
 
     complete(engine, workflow, finish, { result: 'done' }, { terminal: true });
     const status = engine.status(workflow);
@@ -263,8 +264,10 @@ test('onCancel declarations are inert in standalone Engine eligibility, cascade,
     };
     const finalTick = engine.tick(workflow, { now: 3000 });
     return {
-      initialEligible: initialTick.orders.map(projectOrder),
+      initialEligible,
+      initialTick: initialTick.orders.map(projectOrder),
       afterPrepare,
+      finishTick: finishTick.orders.map(projectOrder),
       final,
       finalTick: finalTick.orders.map(projectOrder),
     };
@@ -273,8 +276,10 @@ test('onCancel declarations are inert in standalone Engine eligibility, cascade,
   const unmarkedTrace = drive(unmarked);
   const markedTrace = drive(marked);
   assert.deepEqual(markedTrace, unmarkedTrace);
-  assert.deepEqual(unmarkedTrace.initialEligible.map((order) => order.step), ['prepare']);
-  assert.deepEqual(unmarkedTrace.afterPrepare.eligible.map((order) => order.step), ['finish']);
+  assert.deepEqual(unmarkedTrace.initialEligible.map((firing) => firing.step), ['prepare']);
+  assert.deepEqual(unmarkedTrace.initialTick.map((order) => order.step), ['prepare']);
+  assert.deepEqual(unmarkedTrace.afterPrepare.eligible.map((firing) => firing.step), ['finish']);
+  assert.deepEqual(unmarkedTrace.finishTick.map((order) => order.step), ['finish']);
   assert.equal(unmarkedTrace.final.done, true);
   assert.deepEqual(unmarkedTrace.final.debts, []);
   assert.deepEqual(unmarkedTrace.final.eligible, []);
