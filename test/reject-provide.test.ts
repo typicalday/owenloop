@@ -11,7 +11,7 @@ import { hubBindingPath, writeHubBinding } from '../src/hub.ts';
 import { kcHuman, makeIo, routedFetch } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
-const WORKFLOW = 'wf_hosted';
+const WORKFLOW = 'wf_cccccccccccccccccccccccc';
 const OAUTH_CRED: Credential = {
   kind: 'oauth',
   accessToken: 'mcpat_reject_provide_fixture',
@@ -105,6 +105,25 @@ test('reject --hub validates its remote-only arguments before credentials or fet
   assert.equal(networkCalls, 0);
 });
 
+test('reject --hub rejects a malformed workflow id before credentials or fetch', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/reject_artifact': () => ({ status: 200, json: {} }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const workflow = 'wf_bad';
+  const code = await mainAsync(['reject', workflow, 'pr', '--hub', ORIGIN, '--text', 'no'], t.io);
+
+  assert.equal(code, 1);
+  assert.equal(
+    t.err.join('\n'),
+    `error: invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+  );
+  assert.deepEqual(t.out, []);
+  assert.equal(calls.length, 0);
+});
+
 test('provide --hub posts name rather than input and prints a stable receipt', async () => {
   const { fetch, calls } = routedFetch({
     'POST /api/provide_input': () => ({ status: 201, json: { unexpected: 'ignored' } }),
@@ -150,6 +169,25 @@ test('provide --hub defaults value and rejects non-object JSON before fetch', as
     assert.match(invalid.err.join('\n'), /invalid JSON|expected a JSON object/u);
   }
   assert.equal(networkCalls, 0);
+});
+
+test('provide --hub rejects a malformed workflow id before JSON parsing or fetch', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/provide_input': () => ({ status: 200, json: {} }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const workflow = 'wf_bad';
+  const code = await mainAsync(['provide', workflow, 'proposal', '--hub', ORIGIN, '--value', '{'], t.io);
+
+  assert.equal(code, 1);
+  assert.equal(
+    t.err.join('\n'),
+    `error: invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+  );
+  assert.deepEqual(t.out, []);
+  assert.equal(calls.length, 0);
 });
 
 test('hosted reject and provide surface credential and hub failures consistently', async () => {

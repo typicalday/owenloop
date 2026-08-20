@@ -17,7 +17,7 @@ import type { Credential } from '../src/hub.ts';
 import { kcHuman, makeIo, routedFetch } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
-const WORKFLOW = 'wf_stuck';
+const WORKFLOW = 'wf_aaaaaaaaaaaaaaaaaaaaaaaa';
 const OAUTH_CRED: Credential = {
   kind: 'oauth',
   accessToken: 'mcpat_cancel_fixture',
@@ -111,6 +111,41 @@ test('cancel: an already-terminal instance is a no-op that still exits 0', async
   // 'cancelled' we would have set.
   assert.equal(printed.status, 'done');
   assert.equal('closedRuns' in printed, false, 'nothing was closed, so no closedRuns key');
+});
+
+test('cancel: validates the full workflow-id shape before hub resolution or fetch', async () => {
+  const cases = [
+    { workflow: WORKFLOW, valid: true },
+    { workflow: 'not-a-workflow-id', valid: false },
+    { workflow: `wf_${'a'.repeat(23)}`, valid: false },
+    { workflow: `wf_${'a'.repeat(25)}`, valid: false },
+    { workflow: `wf_${'A'.repeat(24)}`, valid: false },
+    { workflow: `wf_${'a'.repeat(23)}g`, valid: false },
+    { workflow: `wf_${'a'.repeat(23)}/`, valid: false },
+  ];
+
+  for (const { workflow, valid } of cases) {
+    const { fetch, calls } = routedFetch({
+      'POST /api/cancel_run': () => ({ status: 200, json: { cancelled: true } }),
+    });
+    const t = makeIo({ fetch });
+    bind(t);
+
+    const code = await mainAsync(['cancel', workflow], t.io);
+
+    if (valid) {
+      assert.equal(code, 0, t.err.join('\n'));
+      assert.equal(calls.length, 1, 'the well-formed control reaches the canned hub route');
+      continue;
+    }
+    assert.equal(code, 1, workflow);
+    assert.equal(
+      t.err.join('\n'),
+      `error: invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+    );
+    assert.deepEqual(t.out, []);
+    assert.equal(calls.length, 0, `${workflow} must not reach fetch`);
+  }
 });
 
 test('cancel: missing or empty --reason fails before credential and network access', async () => {

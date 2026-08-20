@@ -48,6 +48,10 @@ import type { HubIo, RouteHandler } from './hubkit.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
+const WORKFLOW_A = 'wf_aaaaaaaaaaaaaaaaaaaaaaaa';
+const WORKFLOW_B = 'wf_bbbbbbbbbbbbbbbbbbbbbbbb';
+const WORKFLOW_C = 'wf_cccccccccccccccccccccccc';
+const MISSING_WORKFLOW = 'wf_ffffffffffffffffffffffff';
 
 /** Seed a fresh (non-expiring) human oauth credential into the fake keychain. */
 function seedHumanOauth(t: HubIo, over: Partial<Extract<Credential, { kind: 'oauth' }>> = {}): void {
@@ -74,7 +78,7 @@ function seedHumanOauth(t: HubIo, over: Partial<Extract<Credential, { kind: 'oau
 const ALERT_GAP = {
   id: 'ral_1',
   at: 1786139457984,
-  workflow: 'wf_a',
+  workflow: WORKFLOW_A,
   kind: 'binding-gap',
   capability: 'build:express',
   modifier: 'express',
@@ -85,7 +89,7 @@ const ALERT_GAP = {
 const ALERT_REROUTE = {
   id: 'ral_2',
   at: 1786139999999,
-  workflow: 'wf_b',
+  workflow: WORKFLOW_B,
   kind: 'reroute',
   capability: 'build:express',
   modifier: 'express',
@@ -99,7 +103,7 @@ const ALERT_REROUTE = {
 const ALERT_NULLS = {
   id: 'ral_3',
   at: 1786140000000,
-  workflow: 'wf_c',
+  workflow: WORKFLOW_C,
   kind: 'wait-start',
   capability: 'build',
   modifier: null,
@@ -121,8 +125,8 @@ function showOk(over: Record<string, unknown> = {}): RouteHandler {
   return () => ({
     status: 200,
     json: {
-      text: 'Routing for wf_a.',
-      workflow: 'wf_a',
+      text: `Routing for ${WORKFLOW_A}.`,
+      workflow: WORKFLOW_A,
       defName: 'delivery',
       waitPolicy: { wait: 'forever' },
       alerts: [ALERT_GAP],
@@ -215,16 +219,16 @@ test('routing alerts: --workflow and --limit ride on the query string and the fi
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'alerts', '--workflow', 'wf_a', '--limit', '50', '--hub', HUB], t.io);
+  const code = await mainAsync(['routing', 'alerts', '--workflow', WORKFLOW_A, '--limit', '50', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
   // `routedFetch` keys routes on METHOD + pathname only, so the query string is
   // asserted off the recorded url.
-  assert.equal(new URL(calls[0]!.url).search, '?workflow=wf_a&limit=50');
+  assert.equal(new URL(calls[0]!.url).search, `?workflow=${WORKFLOW_A}&limit=50`);
 
   // Echoing the filter back is what lets a script tell a scoped OLDEST-FIRST
   // timeline from the unscoped newest-first inbox without re-reading argv.
-  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, workflow: 'wf_a', alerts: [ALERT_GAP] });
+  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, workflow: WORKFLOW_A, alerts: [ALERT_GAP] });
 });
 
 test('routing alerts: an alert whose modifier/step/detail are NULL is printed, not dropped and not an error', async () => {
@@ -345,21 +349,21 @@ test('routing alerts: a VALUELESS --workflow is a usage error, not a filter on t
 // ---- routing show -----------------------------------------------------------
 
 test('routing show: GETs run_routing/<wf> and prints the whitelisted routing document', async () => {
-  const { fetch, calls } = routedFetch({ 'GET /api/run_routing/wf_a': showOk({ modifier: 'express' }) });
+  const { fetch, calls } = routedFetch({ [`GET /api/run_routing/${WORKFLOW_A}`]: showOk({ modifier: 'express' }) });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'show', 'wf_a', '--hub', HUB], t.io);
+  const code = await mainAsync(['routing', 'show', WORKFLOW_A, '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0]!.pathname, '/api/run_routing/wf_a');
+  assert.equal(calls[0]!.pathname, `/api/run_routing/${WORKFLOW_A}`);
   assert.equal(calls[0]!.method, 'GET');
 
   assert.deepEqual(stdoutJson(t), {
     ok: true,
     hub: ORIGIN,
-    workflow: 'wf_a',
+    workflow: WORKFLOW_A,
     defName: 'delivery',
     modifier: 'express',
     waitPolicy: { wait: 'forever' },
@@ -371,11 +375,11 @@ test('routing show: GETs run_routing/<wf> and prints the whitelisted routing doc
 });
 
 test('routing show: an UNMODIFIED run omits the modifier key entirely — never null, never empty string', async () => {
-  const { fetch } = routedFetch({ 'GET /api/run_routing/wf_a': showOk() });
+  const { fetch } = routedFetch({ [`GET /api/run_routing/${WORKFLOW_A}`]: showOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'show', 'wf_a', '--hub', HUB], t.io);
+  const code = await mainAsync(['routing', 'show', WORKFLOW_A, '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
   const out = stdoutJson(t);
   assert.equal('modifier' in out, false, 'the ABSENCE of the key is how stdout says "no modifier"');
@@ -387,7 +391,7 @@ test('routing show: waitPolicy.then and unknown joined-row fields are forwarded 
   // object-checked, then passed through — an additive field there must widen what
   // this command prints rather than break it.
   const { fetch } = routedFetch({
-    'GET /api/run_routing/wf_a': showOk({
+    [`GET /api/run_routing/${WORKFLOW_A}`]: showOk({
       waitPolicy: { wait: '30m', then: 'fallback' },
       resolutionReports: [{ step: 'builder', match: 'reroute', somethingNew: { nested: true } }],
       escalations: [{ step: 'builder', at: 5, from: 'build:express', to: 'build' }],
@@ -396,7 +400,7 @@ test('routing show: waitPolicy.then and unknown joined-row fields are forwarded 
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'show', 'wf_a', '--hub', HUB], t.io);
+  const code = await mainAsync(['routing', 'show', WORKFLOW_A, '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
   const out = stdoutJson(t);
   assert.deepEqual(out.waitPolicy, { wait: '30m', then: 'fallback' });
@@ -404,16 +408,20 @@ test('routing show: waitPolicy.then and unknown joined-row fields are forwarded 
   assert.deepEqual(out.escalations, [{ step: 'builder', at: 5, from: 'build:express', to: 'build' }]);
 });
 
-test('routing show: a workflow id containing a slash is percent-encoded into the path segment', async () => {
-  // Without encoding, `a/b` would silently address a different route.
-  const { fetch, calls } = routedFetch({ 'GET /api/run_routing/a%2Fb': showOk({ workflow: 'a/b' }) });
+test('routing show: rejects a malformed workflow id before fetch', async () => {
+  const { fetch, calls } = routedFetch({});
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'show', 'a/b', '--hub', HUB], t.io);
-  assert.equal(code, 0, t.err.join('\n'));
-  assert.equal(calls[0]!.pathname, '/api/run_routing/a%2Fb');
-  assert.equal(stdoutJson(t).workflow, 'a/b', 'the SERVER-echoed id is printed, not argv');
+  const workflow = 'a/b';
+  const code = await mainAsync(['routing', 'show', workflow, '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.equal(
+    t.err.join('\n'),
+    `error: invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+  );
+  assert.deepEqual(t.out, []);
+  assert.equal(calls.length, 0);
 });
 
 test('routing show: an unknown workflow surfaces the hub message verbatim, exit 1, empty stdout', async () => {
@@ -422,7 +430,7 @@ test('routing show: an unknown workflow surfaces the hub message verbatim, exit 
   // WHATEVER `message` the hub sends, so a future typed 404 needs no change here
   // — but today the honest expectation is the generic text below.
   const { fetch } = routedFetch({
-    'GET /api/run_routing/wf_missing': () => ({
+    [`GET /api/run_routing/${MISSING_WORKFLOW}`]: () => ({
       status: 500,
       json: { error: 'internal_error', message: 'internal server error' },
     }),
@@ -430,7 +438,7 @@ test('routing show: an unknown workflow surfaces the hub message verbatim, exit 
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'show', 'wf_missing', '--hub', HUB], t.io);
+  const code = await mainAsync(['routing', 'show', MISSING_WORKFLOW, '--hub', HUB], t.io);
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /internal server error/);
   assert.deepEqual(t.out, [], 'nothing on stdout for a hub refusal');
@@ -438,12 +446,12 @@ test('routing show: an unknown workflow surfaces the hub message verbatim, exit 
 
 test('routing show: a 403 (a run in another org) surfaces the hub message, exit 1', async () => {
   const { fetch } = routedFetch({
-    'GET /api/run_routing/wf_a': () => ({ status: 403, json: { error: 'forbidden', message: 'not your org' } }),
+    [`GET /api/run_routing/${WORKFLOW_A}`]: () => ({ status: 403, json: { error: 'forbidden', message: 'not your org' } }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['routing', 'show', 'wf_a', '--hub', HUB], t.io);
+  const code = await mainAsync(['routing', 'show', WORKFLOW_A, '--hub', HUB], t.io);
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /not your org/);
 });
@@ -460,7 +468,7 @@ test('routing show: each malformed 2xx is exit 1, naming the field or index only
   ] as [Record<string, unknown>, RegExp][]) {
     // `undefined` in the patch object deletes the key from the canned body.
     const { fetch } = routedFetch({
-      'GET /api/run_routing/wf_a': () => {
+      [`GET /api/run_routing/${WORKFLOW_A}`]: () => {
         const result = showOk(patch)({ url: new URL(HUB), body: undefined, method: 'GET', authorization: null });
         const json = { ...(result.json as Record<string, unknown>) };
         for (const [k, v] of Object.entries(patch)) if (v === undefined) delete json[k];
@@ -470,7 +478,7 @@ test('routing show: each malformed 2xx is exit 1, naming the field or index only
     const t = makeIo({ fetch });
     seedHumanOauth(t);
 
-    const code = await mainAsync(['routing', 'show', 'wf_a', '--hub', HUB], t.io);
+    const code = await mainAsync(['routing', 'show', WORKFLOW_A, '--hub', HUB], t.io);
     assert.equal(code, 1, `patch ${JSON.stringify(patch)}`);
     assert.match(t.err.join('\n'), pattern);
     assert.deepEqual(t.out, [], `nothing on stdout for ${JSON.stringify(patch)}`);
@@ -911,14 +919,14 @@ test('routing alerts: an unknown option is rejected by preflight before any side
 test('routing: exit 3 with the login remedy when no human credential exists (all five subcommands, zero network)', async () => {
   for (const argv of [
     ['routing', 'alerts', '--hub', HUB],
-    ['routing', 'show', 'wf_a', '--hub', HUB],
+    ['routing', 'show', WORKFLOW_A, '--hub', HUB],
     ['routing', 'rule', 'list', '--hub', HUB],
     ['routing', 'rule', 'add', 'build:express', 'build', '--hub', HUB],
     ['routing', 'rule', 'rm', 'build:express', 'build', '--hub', HUB],
   ]) {
     const { fetch, calls } = routedFetch({
       'GET /api/routing_alerts': alertsOk(),
-      'GET /api/run_routing/wf_a': showOk(),
+      [`GET /api/run_routing/${WORKFLOW_A}`]: showOk(),
       'GET /api/capability_reroutes': rulesOk(),
       'POST /api/add_capability_reroute': addRuleOk(),
       'POST /api/remove_capability_reroute': rmRuleOk(),
@@ -997,14 +1005,14 @@ test('routing alerts: a hub TIMEOUT is a plain exit 1 (a flaky network is not an
 test('routing: every request sets redirect: error — proof it went through hubFetch, not raw fetch', async () => {
   for (const [argv, pathname] of [
     [['routing', 'alerts'], '/api/routing_alerts'],
-    [['routing', 'show', 'wf_a'], '/api/run_routing/wf_a'],
+    [['routing', 'show', WORKFLOW_A], `/api/run_routing/${WORKFLOW_A}`],
     [['routing', 'rule', 'list'], '/api/capability_reroutes'],
     [['routing', 'rule', 'add', 'build:express', 'build:standard'], '/api/add_capability_reroute'],
     [['routing', 'rule', 'rm', 'build:express', 'build:standard'], '/api/remove_capability_reroute'],
   ] as [string[], string][]) {
     const { fetch, calls } = routedFetch({
       'GET /api/routing_alerts': alertsOk(),
-      'GET /api/run_routing/wf_a': showOk(),
+      [`GET /api/run_routing/${WORKFLOW_A}`]: showOk(),
       'GET /api/capability_reroutes': rulesOk(),
       'POST /api/add_capability_reroute': addRuleOk(),
       'POST /api/remove_capability_reroute': rmRuleOk(),
@@ -1046,7 +1054,7 @@ test('asRoutingAlerts: a kind the CLI has never heard of is forwarded, not rejec
 
 test('asRunRouting: an ABSENT modifier omits the key; an EMPTY-STRING modifier is malformed', async () => {
   const base = {
-    workflow: 'wf_a',
+    workflow: WORKFLOW_A,
     defName: 'delivery',
     waitPolicy: { wait: 'forever' },
     alerts: [],
@@ -1063,7 +1071,7 @@ test('asRunRouting: an ABSENT modifier omits the key; an EMPTY-STRING modifier i
 });
 
 test('asRunRouting: waitPolicy.then is forwarded verbatim when present and omitted when absent', async () => {
-  const base = { workflow: 'wf_a', defName: 'delivery', alerts: [], resolutionReports: [], escalations: [] };
+  const base = { workflow: WORKFLOW_A, defName: 'delivery', alerts: [], resolutionReports: [], escalations: [] };
   assert.equal('then' in asRunRouting({ ...base, waitPolicy: { wait: 'forever' } }).waitPolicy, false);
   assert.equal(asRunRouting({ ...base, waitPolicy: { wait: '30m', then: 'fallback' } }).waitPolicy.then, 'fallback');
 });

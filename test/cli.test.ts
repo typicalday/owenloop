@@ -561,6 +561,33 @@ test('a full delivery happy path runs end to end through main()', () => {
   assert.deepEqual(run('list').json(), []);
 });
 
+test('show distinguishes an existing workflow with no artifacts from an unknown workflow', () => {
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-show-empty-'));
+  try {
+    writeFileSync(join(defsDir, 'artifactless.yaml'), [
+      'name: artifactless',
+      'steps:',
+      '  - name: idle',
+      '    produces: []',
+      '',
+    ].join('\n'));
+    const { run } = makeCli({ defs: defsDir });
+    const workflow = run('create', 'artifactless').json().workflow as string;
+
+    const existing = run('show', workflow);
+    assert.equal(existing.code, 0, existing.err);
+    assert.equal(existing.out, '[]');
+
+    const unknown = 'wf_ffffffffffffffffffffffff';
+    const absent = run('show', unknown);
+    assert.equal(absent.code, 1);
+    assert.equal(absent.out, '');
+    assert.equal(absent.err, `error: no such workflow instance: ${unknown}`);
+  } finally {
+    rmSync(defsDir, { recursive: true, force: true });
+  }
+});
+
 test('defs preserves legacy fields while carrying full input schemas and opaque extensions', () => {
   const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-defs-discovery-'));
   const requestSchema = {

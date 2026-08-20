@@ -12,7 +12,7 @@ import type { Credential } from '../src/hub.ts';
 import { kcHuman, makeIo, routedFetch } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
-const WORKFLOW = 'wf_stuck';
+const WORKFLOW = 'wf_bbbbbbbbbbbbbbbbbbbbbbbb';
 const OAUTH_CRED: Credential = {
   kind: 'oauth',
   accessToken: 'mcpat_retry_fixture',
@@ -81,6 +81,25 @@ test('retry --hub refuses --by before using credentials or the network', async (
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /--by cannot be combined with --hub/u);
   assert.equal(networkCalls, 0);
+});
+
+test('retry --hub rejects a malformed workflow id before credentials or fetch', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/retry_artifact': () => ({ status: 200, json: {} }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const workflow = 'wf_bad';
+  const code = await mainAsync(['retry', workflow, 'pr', '--hub', ORIGIN, '--text', 'retry this'], t.io);
+
+  assert.equal(code, 1);
+  assert.equal(
+    t.err.join('\n'),
+    `error: invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+  );
+  assert.deepEqual(t.out, []);
+  assert.equal(calls.length, 0);
 });
 
 test('local retry answers ask on the reason thread without fetching', async () => {
