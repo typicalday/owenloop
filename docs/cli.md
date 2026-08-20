@@ -291,6 +291,16 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--work-root <dir>` | **repeatable.** restrict this machine to orders whose working directory is inside one of these roots; precedence is the flags, then `OWENLOOP_ALLOWED_WORKDIR_ROOTS` (a `:`-separated list), then `settings.allowedWorkdirRoots`. Each rung REPLACES the one below it rather than extending it. No rung set anywhere ⇒ **no restriction**, which is the default |
 | `--log-max-age <ms>` | worker-log retention, swept once at startup; precedence is flag, then `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`, then `settings.shiftLogMaxAgeMs`, then `1209600000` (14 days). `0` reaps every completed run's log at the next startup; there is no value that disables the sweep, and `shift.log` is never reaped |
 
+**Capacity re-offer damping.** When a `dispatch-cap-full` or `agent-cap-full`
+claim is returned immediately, the shift suppresses targeted `whats_next` for
+that workflow and stable step (workflow, step, and fan-out key) for a fixed
+30-second monotonic cooldown. A fresh hub run id does not bypass the cooldown.
+The shift retries sooner when the relevant capacity returns: any total slot
+for `dispatch-cap-full`, or room in the agent lane for `agent-cap-full`.
+Untargeted inbox polling and sibling workflows continue, but command work in a
+cooled workflow can wait until its cooldown expires. This shift-local damper
+is separate from `--local-queue-hold` and from server `Retry-After` backoff.
+
 **On-disk logs.** A running shift appends its dispatch record to
 `<log-dir>/shift.log` as JSON Lines, and gives each dispatched worker's stdout
 and stderr their own `<log-dir>/<run>.log`. Both files outlive the shift
