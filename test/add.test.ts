@@ -2623,8 +2623,8 @@ test('discovery(g): a top-level def that calls: an installed def resolves and cr
   assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
 });
 
-test('discovery(g): a malformed installed sibling is reported without hiding a healthy called child from lint or check', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-g-tolerant-'));
+test('discovery(g): a malformed installed sibling skips its folder for authoring and runtime discovery', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-g-whole-folder-'));
   const childYaml = [
     'name: child',
     'outputs: [result]',
@@ -2651,20 +2651,57 @@ test('discovery(g): a malformed installed sibling is reported without hiding a h
     '',
   ].join('\n'));
 
-  // The malformed sibling remains a directory-lint finding, but it cannot
-  // discard the whole installed folder and turn parent -> child into a false
-  // missing-child error.
+  // The malformed sibling invalidates the whole installed folder. The same
+  // missing child is therefore visible to lint/check and to create.
   const directoryLint = await runCli(cwd, ['lint']);
   assert.equal(directoryLint.code, 1);
-  assert.doesNotMatch(directoryLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  assert.match(directoryLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
+  assert.match(directoryLint.out.join('\n'), /broken\.yaml/);
   const namedLint = await runCli(cwd, ['lint', 'parent']);
-  assert.equal(namedLint.code, 0, namedLint.err.join('\n'));
+  assert.equal(namedLint.code, 1);
+  assert.match(namedLint.out.join('\n'), /calls names workflow 'child' which does not exist/);
   const checked = await runCli(cwd, ['check', 'parent']);
-  assert.equal(checked.code, 0, checked.err.join('\n'));
+  assert.equal(checked.code, 1);
+  assert.match(checked.err.join('\n'), /calls names workflow 'child' which does not exist/);
   const created = await runCli(cwd, ['create', 'parent']);
-  assert.equal(created.code, 0, created.err.join('\n'));
-  assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
-  assert.match(created.err.join('\n'), /warning: failed to load installed workflow def .*broken\.yaml/);
+  assert.equal(created.code, 1);
+  assert.match(created.err.join('\n'), /warning: failed to load installed defs for acme\/widgets/);
+  assert.match(created.err.join('\n'), /calls names workflow 'child' which does not exist/);
+});
+
+test('discovery(h): duplicate names skip an installed folder instead of executing its first definition', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-h-duplicate-'));
+  stageInstall(cwd, 'acme', 'widgets', {
+    'child.yaml': validDefYaml('child'),
+    'duplicate.yaml': validDefYaml('child'),
+  });
+  writeFileSync(join(cwd, 'workflows', 'parent.yaml'), [
+    'name: parent',
+    'steps:',
+    '  - name: delegate',
+    '    calls: child',
+    '    produces: [result]',
+    '  - name: finish',
+    '    consumes: [result]',
+    '    produces: [done]',
+    '    terminal: true',
+    '',
+  ].join('\n'));
+
+  const linted = await runCli(cwd, ['lint']);
+  assert.equal(linted.code, 1);
+  assert.match(linted.out.join('\n'), /duplicate workflow name 'child'/);
+  assert.match(linted.out.join('\n'), /calls names workflow 'child' which does not exist/);
+
+  const checked = await runCli(cwd, ['check', 'parent']);
+  assert.equal(checked.code, 1);
+  assert.match(checked.err.join('\n'), /calls names workflow 'child' which does not exist/);
+
+  const created = await runCli(cwd, ['create', 'parent']);
+  assert.equal(created.code, 1);
+  assert.match(created.err.join('\n'), /warning: failed to load installed defs for acme\/widgets/);
+  assert.match(created.err.join('\n'), /duplicate workflow name 'child'/);
+  assert.match(created.err.join('\n'), /calls names workflow 'child' which does not exist/);
 });
 
 // ---- offline crash-recovery: `owenloop add --recover` ------------------------

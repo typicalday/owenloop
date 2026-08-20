@@ -642,18 +642,9 @@ function loadDefsWithInstalled(
 ): LoadedDefs {
   const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
 
-  // Installed folders use the same per-file tolerant scan as authoring
-  // discovery. A corrupt sibling is warned about but cannot hide a healthy
-  // installed callee from executable discovery; the merged healthy map still
-  // receives one strict finalize below.
-  foldInstalledDefs(io, defsDir, merged, (dir) => {
-    const failures: DefLoadFailure[] = [];
-    const defs = scanDefsRaw(dir, failures);
-    for (const failure of failures) {
-      io.err(`warning: failed to load installed workflow def ${failure.file}: ${failure.error}`);
-    }
-    return defs;
-  });
+  // Preserve executable discovery's long-standing whole-folder policy: a bad
+  // installed folder is warned about and skipped rather than partially loaded.
+  foldInstalledDefs(io, defsDir, merged, loadDefsUnfinalized);
 
   const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection, verbose);
 
@@ -744,7 +735,17 @@ function loadDefsRawWithInstalled(
   verbose = false,
 ): AuthoringDefs {
   const merged = existsSync(defsDir) ? scanDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
-  foldInstalledDefs(io, defsDir, merged, (dir) => scanDefsRaw(dir, failures));
+  foldInstalledDefs(io, defsDir, merged, (dir) => {
+    try {
+      // Match executable discovery exactly: one malformed or duplicate member
+      // invalidates the installed folder. Retain the failed folder as a lint
+      // result while foldInstalledDefs emits the shared warning.
+      return loadDefsUnfinalized(dir);
+    } catch (e) {
+      failures.push({ file: dir, error: (e as Error).message });
+      throw e;
+    }
+  });
   foldCasDefs(io, defsDir, merged, false, verbose);
   return { rawDefs: merged, defs: expandDefsRaw(merged) };
 }
