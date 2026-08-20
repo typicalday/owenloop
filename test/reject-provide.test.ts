@@ -95,6 +95,10 @@ test('reject --hub validates its remote-only arguments before credentials or fet
   assert.equal(await mainAsync(['reject', WORKFLOW, 'pr', '--hub', ORIGIN, '--text', ''], empty.io), 1);
   assert.match(empty.err.join('\n'), /invalid empty value for --text/u);
 
+  const valuelessRequested = makeIo({ fetch });
+  assert.equal(await mainAsync(['reject', WORKFLOW, 'pr', '--hub', ORIGIN, '--text', 'no', '--requested'], valuelessRequested.io), 1);
+  assert.match(valuelessRequested.err.join('\n'), /missing value for --requested/u);
+
   const attributed = makeIo({ fetch });
   assert.equal(await mainAsync(['reject', WORKFLOW, 'pr', '--hub', ORIGIN, '--by', 'reviewer', '--text', 'no'], attributed.io), 1);
   assert.match(attributed.err.join('\n'), /--by cannot be combined with --hub/u);

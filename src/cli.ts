@@ -5901,6 +5901,9 @@ async function dispatchReject(io: CliIO, args: Args): Promise<number> {
   if (text.trim() === '') {
     throw new CliError('invalid empty value for --text: expected --text <reason>');
   }
+  if (args.missingOptionValues.has('requested')) {
+    throw new CliError('missing value for --requested: expected --requested <modifier>');
+  }
   const requested = last(args, 'requested');
 
   const origin = resolveStartHub(io, args);
