@@ -385,6 +385,15 @@ const CHILD_FIRST_CONTACT_MARGIN_MS = 30_000;
 export const MAX_PENDING_CANDIDATE_AGE_MS = HUB_PICKUP_WINDOW_MS - CHILD_FIRST_CONTACT_MARGIN_MS;
 
 /**
+ * A capacity-refused claim is returned to the hub immediately, so sibling
+ * shifts can take it. This short, fixed monotonic window stops this shift from
+ * claiming that same stable step again on every busy wake while its relevant
+ * capacity is still unavailable.
+ */
+const CAPACITY_RELEASE_COOLDOWN_MS = 30_000;
+type CapacityReleaseReason = 'dispatch-cap-full' | 'agent-cap-full';
+
+/**
  * THE PER-STEP FAILURE BRAKE.
  *
  * Every in-flight guard in this file keys on the RUN id — `liveRuns`,
@@ -545,6 +554,19 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * Drives a sweep without a hub cursor move, so a brake never waits forever. */
   let brakeSweepDueAt: number | undefined;
   /**
+   * Recently capacity-released stable orders. This is deliberately separate
+   * from `stepBrake`: a worker failure leaves its claim to lapse, while a
+   * capacity refusal hands the claim back to the hub and needs a reason-aware
+   * targeted-poll damper.
+   */
+  const capacityCooldown = new Map<string, {
+    workflow: string;
+    reason: CapacityReleaseReason;
+    retryAt: number;
+  }>();
+  /** Earliest fixed cooldown deadline, used to re-admit an unchanged wake. */
+  let capacityCooldownDueAt: number | undefined;
+  /**
    * Has the current at-capacity EPISODE already produced a `capacity` event?
    *
    * Set when the event fires, cleared the moment a slot is free again, so one
@@ -558,6 +580,79 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   /** Bumped whenever a ping starts or is forced due, so a ping that completes
    *  after a force does not stamp the cadence over that force. */
   let presenceGeneration = 0;
+
+  function refreshCapacityCooldownDueAt(): void {
+    let earliest: number | undefined;
+    for (const entry of capacityCooldown.values()) {
+      earliest = earliest === undefined ? entry.retryAt : Math.min(earliest, entry.retryAt);
+    }
+    capacityCooldownDueAt = earliest;
+  }
+
+  /** Remove all expired entries; a real post-expiry retry can arm a new window. */
+  function pruneExpiredCapacityCooldown(now = monotonicNow()): void {
+    let changed = false;
+    for (const [key, entry] of capacityCooldown) {
+      if (entry.retryAt <= now) {
+	capacityCooldown.delete(key);
+	changed = true;
+      }
+    }
+    if (changed) refreshCapacityCooldownDueAt();
+  }
+
+  function armCapacityCooldown(
+    workflow: string,
+    order: WorkOrder,
+    reason: CapacityReleaseReason,
+  ): void {
+    const now = monotonicNow();
+    pruneExpiredCapacityCooldown(now);
+    const key = stepBrakeKey(workflow, order.step, order.key);
+    // Do not let cursor activity or duplicate observations slide an active
+    // deadline. Only a genuine retry after expiry creates a fresh window.
+    if (capacityCooldown.has(key)) return;
+    capacityCooldown.set(key, { workflow, reason, retryAt: now + CAPACITY_RELEASE_COOLDOWN_MS });
+    refreshCapacityCooldownDueAt();
+  }
+
+  /** Read-only admission signal from the freshly reconciled capacity snapshot. */
+  function capacityCooldownReady(remaining: number, agentRoom: number, now = monotonicNow()): boolean {
+    for (const entry of capacityCooldown.values()) {
+      if (entry.retryAt <= now) continue;
+      if (entry.reason === 'dispatch-cap-full' ? remaining > 0 : agentRoom > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Remove entries for `workflow` whose own capacity class is now eligible and
+   * report whether any active entry still suppresses its targeted request.
+   * Expiry is global housekeeping so workflows which disappear from the inbox
+   * cannot pin this private map forever.
+   */
+  function workflowCapacityCooldownActive(
+    workflow: string,
+    remaining: number,
+    agentRoom: number,
+  ): boolean {
+    const now = monotonicNow();
+    pruneExpiredCapacityCooldown(now);
+    let changed = false;
+    let active = false;
+    for (const [key, entry] of capacityCooldown) {
+      if (entry.workflow !== workflow) continue;
+      const ready = entry.reason === 'dispatch-cap-full' ? remaining > 0 : agentRoom > 0;
+      if (ready) {
+	capacityCooldown.delete(key);
+	changed = true;
+      } else {
+	active = true;
+      }
+    }
+    if (changed) refreshCapacityCooldownDueAt();
+    return active;
+  }
 
   function noteServerBackoff(error: unknown): boolean {
     if (!(error instanceof HubError) || error.status !== 429) return false;
@@ -929,6 +1024,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     for (const run of runBrakeKey.keys()) {
       if (!liveOrReserved.has(run)) runBrakeKey.delete(run);
     }
+    pruneExpiredCapacityCooldown();
     /**
      * PHASE 4, for the work-dir reaper only. `polled` is the set of workflows
      * whose `whats_next` SUCCEEDED this sweep — a workflow whose call threw is
@@ -1030,10 +1126,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       releaseClaim(workflow, order.run);
       // Re-arm the next sweep, but only for the two TRANSIENT reasons — see
       // `SweepResult.releasedForCapacity` for why `agent-lane-closed` is not
-      // one of them.
-      if (reason === 'dispatch-cap-full' || reason === 'agent-cap-full') releasedForCapacity = true;
+      // one of them. The independent cooldown prevents a busy cursor from
+      // immediately re-claiming this stable step while the same capacity class
+      // remains unavailable; it neither replaces server Retry-After backoff
+      // nor the worker-failure brake.
+      if (reason === 'dispatch-cap-full' || reason === 'agent-cap-full') {
+	armCapacityCooldown(workflow, order, reason);
+	releasedForCapacity = true;
+      }
     };
     for (const wf of instances) {
+      // Skipping means no targeted hub observation happened: leave this
+      // workflow out of `polled`/`openRuns` so the work-directory reaper never
+      // mistakes damping for an empty response. The inbox call and other
+      // workflows remain eligible.
+      if (workflowCapacityCooldownActive(wf, remaining, agentRoom)) continue;
       let res;
       const requestStartedAt = monotonicNow();
       try {
@@ -1410,6 +1517,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const reserved = inFlight.reserved;
     const occupied = live.length + reserved.length;
     const k = cap - occupied;
+    const agentRoom = agentLane().ceiling -
+      live.filter((record) => record.kind === 'agent-run').length -
+      reserved.filter((record) => record.childKind === 'agent-run').length;
     // Re-arm the at-capacity report the instant a slot frees, independently of
     // whether this tick goes on to wake or sweep. The next stretch at capacity
     // is a NEW episode and gets its own record.
@@ -1446,7 +1556,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // unchanged next time. `sweepOwed` preserves that unconsumed work signal.
     let swept: SweepResult | undefined;
     const brakeDue = brakeSweepDueAt !== undefined && monotonicNow() >= brakeSweepDueAt;
-    if (wakeSucceeded && (changed || sweepOwed || brakeDue) && k > 0) {
+    // Keep a due cooldown armed while total capacity is zero: the outer gate
+    // must still defer hub work, but an unchanged wake needs to retry as soon
+    // as a total slot exists. `sweep()` removes expired entries only when it
+    // can actually make the targeted decision.
+    const capacityCooldownDue = capacityCooldownDueAt !== undefined && monotonicNow() >= capacityCooldownDueAt;
+    const capacityBecameReady = capacityCooldownReady(k, agentRoom);
+    if (wakeSucceeded && (changed || sweepOwed || brakeDue || capacityCooldownDue || capacityBecameReady) && k > 0) {
       // Clear before awaiting: a new brake armed during sweep must survive.
       if (brakeDue) brakeSweepDueAt = undefined;
       swept = await sweep(k, live, reserved);
