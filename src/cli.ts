@@ -2326,6 +2326,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           title: d.title ?? null,
           inputs: d.inputs.map((i) => i.name),
           steps: d.steps.map((l) => l.name),
+	  inputSchemas: d.inputs.map((i) => ({
+	    name: i.name,
+	    ...(i.schema === undefined ? {} : { schema: i.schema }),
+	  })),
+	  ...(d.x === undefined ? {} : { x: d.x }),
         })));
         return 0;
       }

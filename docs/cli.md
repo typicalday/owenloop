@@ -829,6 +829,14 @@ stays a pure dir-scanner (top-level `*.yaml` plus immediate-subdir
 bounded — it only loads folders named by the fail-closed-validated
 `.owenloop/installed.json` entries, never a raw recurse of the tree.
 
+**Definition listing.** The default JSON from `owenloop defs` retains each
+definition's `name`, nullable `title`, ordered input-name `inputs`, and ordered
+`steps`. It additively includes ordered `inputSchemas` entries (always `name`,
+with complete `schema` when declared) and a present-only opaque `x` extension
+bag. Schemas and extension bags are returned in full, never truncated; the
+larger default terminal payload is the intentional tradeoff for making this the
+discovery surface without requiring prior knowledge of a flag.
+
 - **Only under the default defs dir.** An explicit `--defs`/`OWENLOOP_DEFS` is
   operator intent to target a literal dir and keeps the pure-scan behavior with
   no installed-def or CAS-store fold-in — the rule is "was an override given",
@@ -2969,7 +2977,7 @@ block; a non-2xx response comes back as an error result.
 | `start_run` | start a fitting multi-step playbook and let its crews execute; optional `scope` (free routing label, defaults to the session's repo name) and `priority` (`low\|normal\|high`) |
 | `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses ordinary authoring |
 | `get_workflow` | inspect a promising loaded definition before selecting it |
-| `list_workflows` | first-check discovery: names, titles, step counts, and def hash/version of every loaded def |
+| `list_workflows` | discover published workflow definitions and decide which one fits a task |
 | `get_status` | `engine.status` verbatim plus a plain-English rendering |
 | `heartbeat` | touch the liveness timestamp on an open run so it is not reaped mid-step |
 | `get_order` | re-fetch the persisted order packet and lease state for a run you hold |

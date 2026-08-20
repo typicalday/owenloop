@@ -89,7 +89,7 @@ interface Frame {
   result?: {
     content?: Array<{ type: string; text: string }>;
     isError?: boolean;
-    tools?: Array<{ name: string }>;
+    tools?: Array<{ name: string; description?: string }>;
     serverInfo?: { version: string };
   };
   error?: { code: number; message: string };
@@ -155,6 +155,8 @@ test('mcp: handshake advertises 25 tools (20 baseline + create_agent + 4 crew to
   for (const n of ['list_crews', 'create_crew', 'add_crew_member', 'remove_crew_member']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
+  const listWorkflows = frames[1]!.result!.tools!.find((tool) => tool.name === 'list_workflows');
+  assert.equal(listWorkflows?.description, 'Discover published workflow definitions and decide which one fits a task.');
   // Regression guard for the human's deliberate exclusion decision (see buildCrewTools).
   assert.ok(!names.includes('delete_crew'), 'delete_crew must never be advertised on this server');
 });
@@ -554,6 +556,45 @@ test('mcp: get_workflow encodes the name into the GET path', async () => {
   // The slash in the name is percent-encoded into a single path segment (never a bare `/`).
   assert.ok(calls.some((c) => c.pathname === '/api/workflows/a%2Fb' && c.method === 'GET'));
   assert.ok(!calls.some((c) => c.pathname === '/api/workflows/a/b'), 'the name must not split into two path segments');
+});
+
+test('mcp: list_workflows is an authenticated GET passthrough for widened discovery metadata', async () => {
+  const body = {
+    workflows: [{
+      name: 'metadata-rich',
+      title: 'Metadata-rich',
+      inputs: ['request', 'notes'],
+      inputSchemas: [
+	{
+	  name: 'request',
+	  schema: {
+	    type: 'object',
+	    properties: { items: { type: 'array', items: { type: 'string' } } },
+	  },
+	},
+	{ name: 'notes' },
+      ],
+      x: {
+	discovery: { tags: ['planning'] },
+	vendor: { nested: { enabled: true } },
+      },
+    }],
+  };
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'GET /api/workflows': () => ({ status: 200, json: body }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'list_workflows')]);
+  assert.deepEqual(resultJson(frames[1]!), body, 'the client must return the full hub body without a local response schema');
+
+  const workflows = calls.filter((row) => row.pathname === '/api/workflows');
+  assert.equal(workflows.length, 1, 'exactly one hub call for list_workflows');
+  assert.equal(workflows[0]!.method, 'GET');
+  assert.equal(workflows[0]!.authorization, 'Bearer mcpat_human');
 });
 
 test('mcp: serving-capability schema fields are optional and passthrough preserves them unchanged', async () => {

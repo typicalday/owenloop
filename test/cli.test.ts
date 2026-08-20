@@ -556,6 +556,82 @@ test('a full delivery happy path runs end to end through main()', () => {
   assert.deepEqual(run('list').json(), []);
 });
 
+test('defs preserves legacy fields while carrying full input schemas and opaque extensions', () => {
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-defs-discovery-'));
+  const requestSchema = {
+    type: 'object',
+    required: ['items'],
+    properties: {
+      items: {
+	type: 'array',
+	items: {
+	  type: 'object',
+	  required: ['id'],
+	  properties: { id: { type: 'string', minLength: 1 } },
+	},
+      },
+      note: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+    },
+    additionalProperties: false,
+  };
+  const extension = {
+    discovery: { tags: ['planning', 'metadata'], score: 3 },
+    vendor: { nested: { enabled: true, regions: ['us-east-1'] } },
+  };
+
+  try {
+    writeFileSync(join(defsDir, 'metadata-rich.yaml'), JSON.stringify({
+      name: 'metadata-rich',
+      title: 'Metadata-rich',
+      inputs: [
+	{ name: 'request', seedOwed: true, schema: requestSchema },
+	{ name: 'notes', seedOwed: true },
+      ],
+      steps: [{ name: 'analyze', consumes: ['request', 'notes'], produces: ['report'], terminal: true }],
+      x: extension,
+    }));
+    writeFileSync(join(defsDir, 'without-extension.yaml'), JSON.stringify({
+      name: 'without-extension',
+      inputs: [{ name: 'seed', seedOwed: true }],
+      steps: [{ name: 'work', consumes: ['seed'], produces: ['result'], terminal: true }],
+    }));
+    writeFileSync(join(defsDir, 'empty-extension.yaml'), JSON.stringify({
+      name: 'empty-extension',
+      inputs: [],
+      steps: [{ name: 'finish', produces: ['result'], terminal: true }],
+      x: {},
+    }));
+
+    const { run } = makeCli({ defs: defsDir });
+    const result = run('defs');
+    assert.equal(result.code, 0, result.err);
+    const defs = result.json() as Array<Record<string, unknown>>;
+    const rich = defs.find((d) => d.name === 'metadata-rich')!;
+    const withoutExtension = defs.find((d) => d.name === 'without-extension')!;
+    const emptyExtension = defs.find((d) => d.name === 'empty-extension')!;
+
+    assert.equal(rich.name, 'metadata-rich');
+    assert.equal(rich.title, 'Metadata-rich');
+    assert.deepEqual(rich.inputs, ['request', 'notes']);
+    assert.deepEqual(rich.steps, ['analyze']);
+    assert.deepEqual(rich.inputSchemas, [
+      { name: 'request', schema: requestSchema },
+      { name: 'notes' },
+    ]);
+    assert.deepEqual(rich.x, extension, 'the whole extension bag is transported, not just discovery metadata');
+
+    assert.equal(withoutExtension.title, null, 'the legacy nullable title contract remains intact');
+    assert.deepEqual(withoutExtension.inputs, ['seed']);
+    assert.deepEqual(withoutExtension.inputSchemas, [{ name: 'seed' }]);
+    assert.equal(Object.hasOwn(withoutExtension, 'x'), false, 'an absent extension bag stays absent');
+
+    assert.deepEqual(emptyExtension.inputSchemas, [], 'zero-input definitions still carry an ordered schema list');
+    assert.deepEqual(emptyExtension.x, {}, 'a declared empty extension bag remains distinct from absence');
+  } finally {
+    rmSync(defsDir, { recursive: true, force: true });
+  }
+});
+
 // ---- WP-B1: tick/order are reference packets ---------------------------------
 
 test('CLI tick and order read-back are identical reference packets — no authored prompt/command text', () => {

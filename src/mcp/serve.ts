@@ -598,8 +598,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     },
     {
       name: 'list_workflows',
-      description:
-		'First check the complete catalog before doing multi-step work inline; this lists, rather than searches, every loaded workflow definition with its name, title, step count, and def content hash/version.',
+      description: 'Discover published workflow definitions and decide which one fits a task.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/workflows' })),
     },
