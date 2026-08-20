@@ -450,7 +450,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'whats_next',
       description:
-        'THE verb. With workflow: ticks it and returns the next work order(s), or a status summary if none. Without workflow: the inbox of started instances. Serves only YOUR OWN runs by default. Pass serve_crews to partition your own runs further (intersects with each step\'s capabilities; absent or [] = no capability filter). serve_crews is ignored in inbox mode (no workflow).',
+		'The chief-of-staff follow-up, tick, and inbox operation: relay returned work or status to the human and let crews execute it rather than treating orders as inline scratchpad work. With workflow: ticks it and returns the next work order(s), or a status summary if none. Without workflow: the inbox of started instances. Serves only YOUR OWN runs by default. Pass serve_crews to partition your own runs further (intersects with each step\'s capabilities; absent or [] = no capability filter). serve_crews is ignored in inbox mode (no workflow).',
       inputSchema: {
         type: 'object',
 	properties: {
@@ -460,8 +460,8 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 	    type: 'array',
 	    items: { type: 'string' },
 	    description:
-	      'Capability keys this caller serves, raw (bare names and exact compounds). ' +
-	      'Shifts compute this from their effective rosters; other callers normally omit it.',
+	      'Raw capability keys this caller serves (bare names and exact compounds). ' +
+	      'Shifts derive them from their effective rosters; other callers normally omit them.',
 	  },
 	},
         additionalProperties: false,
@@ -471,7 +471,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'submit',
       description:
-        'Submit a work order output. On schema-rejected the run stays open — fix the value and submit again with the same run.',
+		'A crew member or held-order holder returns an owed output here; a chief of staff must not use it to fabricate inline step progress. On schema rejection the run stays open — fix the value and submit again with the same run.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -502,7 +502,8 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     },
     {
       name: 'reject_artifact',
-      description: 'Reject an upstream artifact, sending it back to its producer with a reason.',
+      description:
+		'Surface actionable feedback on a real upstream defect by sending it to its producer with a concrete reason. Rejection must be handled, never bypassed to force progress.',
       inputSchema: {
         type: 'object',
         properties: { workflow: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } },
@@ -514,9 +515,9 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'retry_artifact',
       description:
-	"The human stall-clearing lever: re-arm a stalled or rejected artifact to 'owed', resetting its " +
-	'reject counters. This is also the answer path for a worker that escalated with `ask` — `text` ' +
-	"rides to the next producer on the artifact's reason thread. Omit `text` for a bare stall-clear.",
+	"The deliberate human stall-clear and worker-`ask` answer path: re-arm a stalled or rejected artifact to 'owed', resetting its " +
+	'reject counters, but never use it to bypass unresolved rejection feedback. `text` rides to the next producer on ' +
+	"the artifact's reason thread; omit it only for a bare stall-clear.",
       inputSchema: {
 	type: 'object',
 	properties: { workflow: { type: 'string' }, path: { type: 'string' }, text: { type: 'string' } },
@@ -527,7 +528,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     },
     {
       name: 'provide_input',
-      description: 'The human-gate answer path: provide a value for a seeded/owed input.',
+      description: 'Relay a human answer into a seeded or owed gate by providing its input value.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -543,7 +544,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'start_run',
       description:
-		'Create a new workflow instance from a definition name, optionally seeding provided inputs. ' +
+		'For a fitting multi-step playbook, start a run from its selected definition name and let its crews execute; optionally seed provided inputs. ' +
 		'`scope` is a free routing label recorded on the run; when omitted it defaults to this ' +
 		"session's repository name (the `origin` remote's last path segment) when one can be " +
 		'determined, and is sent as nothing otherwise. `priority` is the rate-limit band; omit it ' +
@@ -571,7 +572,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'create_workflow',
       description:
-        'The authoring hard gate: parse + load a workflow def YAML through the engine. Only stored if it loads clean. On failure returns the engine/parser error verbatim. Idempotent: re-pushing identical content is a no-op success (unchanged: true with the existing version); changed content version-forwards.',
+		'Only when no catalog entry fits and the human chooses ordinary authoring, use this parse-and-load hard gate for a workflow definition YAML. It is stored only if it loads clean; failures return the engine/parser error verbatim. Idempotent: re-pushing identical content is a no-op success (unchanged: true with the existing version); changed content version-forwards.',
       inputSchema: {
         type: 'object',
         properties: { yaml: { type: 'string' } },
@@ -583,7 +584,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'get_workflow',
       description:
-        'Def summary and full workflow bundle: steps with consumes/produces, schemas, judges, each step\'s prompt body, model/executor/command, and x extension bags, plus mermaid source and the def content hash/version.',
+		'Inspect a promising catalog entry in full before selecting it: def summary and bundle with steps, consumes/produces, schemas, judges, each step\'s prompt body, model/executor/command, and x extension bags, plus mermaid source and the def content hash/version.',
       inputSchema: {
         type: 'object',
         properties: { name: { type: 'string' } },
@@ -597,13 +598,14 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     },
     {
       name: 'list_workflows',
-      description: 'Names, titles, step counts, and def content hash/version of every loaded workflow definition.',
+      description:
+		'First check the complete catalog before doing multi-step work inline; this lists, rather than searches, every loaded workflow definition with its name, title, step count, and def content hash/version.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/workflows' })),
     },
     {
       name: 'get_status',
-      description: 'engine.status verbatim plus a plain-English one-paragraph rendering.',
+      description: 'Inspect and relay a run\'s current state rather than performing its work: engine.status verbatim plus a plain-English one-paragraph rendering.',
       inputSchema: {
         type: 'object',
         properties: { workflow: { type: 'string' } },
@@ -618,7 +620,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'heartbeat',
       description:
-        'Touch the liveness timestamp on an open run so it is not reaped mid-step (the design-doc "renew"). The first heartbeat on a freshly served claim is "first contact" — it closes the ~2-minute pickup window. Optionally tag who holds the claim (session or exec).',
+		'A held-run liveness and first-contact signal, distinct from Shift presence: touch an open run so it is not reaped mid-step (the design-doc "renew"). The first heartbeat on a freshly served claim closes the ~2-minute pickup window. Optionally tag who holds the claim (session or exec).',
       inputSchema: {
         type: 'object',
         properties: { workflow: { type: 'string' }, run: { type: 'string' }, holder: HOLDER_SCHEMA },
@@ -630,7 +632,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'get_order',
       description:
-        'Re-fetch the persisted order packet for a run you hold, plus its live lease state (claimed/claimedAt/heartbeatAt/outcome) — for a holder rebinding to work it already had served. Optionally tag who holds the claim.',
+		'For a holder rebinding to a persisted order already served to it, re-fetch that packet and its live lease state (claimed/claimedAt/heartbeatAt/outcome); this is not workflow discovery. Optionally tag who holds the claim.',
       inputSchema: {
         type: 'object',
         properties: { workflow: { type: 'string' }, run: { type: 'string' }, holder: HOLDER_SCHEMA },
@@ -642,7 +644,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'release',
       description:
-        'Voluntarily give back a claim so its order is re-offered without waiting out the reap TTL. Either target one run (`workflow`+`run`) or drain a session (`session`). Idempotent: releasing an unheld/closed run is a no-op, never an error.',
+		'Give a held claim back so its order can be re-offered without waiting for the reap TTL. Either target one run (`workflow`+`run`) or drain a session (`session`). Idempotent: releasing an unheld/closed run is a no-op, never an error.',
       inputSchema: {
         type: 'object',
         properties: { workflow: { type: 'string' }, run: { type: 'string' }, session: { type: 'string' } },
@@ -663,7 +665,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'publish_event',
       description:
-        'Publish an event against a contract: validate the payload against the pinned contract version schema, then start one run per matched active subscription (best-effort, per-target isolation). Returns the per-match outcome. Requires agent scope `run`.',
+		'Delegate event-driven work through matching subscriptions: validate the payload against the pinned contract version schema, then start one run per matched active subscription (best-effort, per-target isolation). Returns the per-match outcome. Requires agent scope `run`.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -679,14 +681,14 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_subscriptions',
       description:
-        "The org's contract subscriptions — what a publish will cascade into. Creating/revoking a subscription is admin-only and deliberately not exposed here.",
+		"Preview which playbooks a publish may start through the org's contract subscriptions. Creating or revoking a subscription is admin-only and deliberately not exposed here.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/subscriptions' })),
     },
     {
       name: 'presence_ping',
       description:
-        'Register or refresh this Shift in the presence registry: its name, the crews it serves, and optionally which process incarnation is reporting. Call it on a ~60s cadence; the entry reads as offline once ~3 min have passed since its last ping — derived when the registry is read, nothing sweeps it. Observability only: it never affects serving and never wakes anyone. This is NOT the lease heartbeat — that is the separate `heartbeat` tool, one per claimed run, whose lapse gets the claim reaped. Every field is overwrite, NOT keep-previous: omitting serve_crews stores an empty set, which means "every crew this principal belongs to" (the same reading whats_next gives an empty serve_crews) and NOT "no crews"; omitting shift_id/started_at clears them.',
+		'Report Shift availability only by registering or refreshing its presence: name, crews served, and optionally process incarnation. Call it on a ~60s cadence; the entry reads as offline once ~3 min have passed since its last ping — derived when the registry is read, nothing sweeps it. Observability only: it never affects serving and never wakes anyone. This is NOT the lease `heartbeat`, which is per claimed run and whose lapse reaps that claim. Every field overwrites, not keeps-previous: omitting serve_crews stores an empty set, meaning every crew this principal belongs to (the same reading whats_next gives an empty serve_crews), not no crews; omitting shift_id/started_at clears them.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -696,8 +698,8 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 	    type: 'array',
 	    items: { type: 'string' },
 	    description:
-	      'Capability keys this caller serves, raw (bare names and exact compounds). ' +
-	      'Shifts compute this from their effective rosters; other callers normally omit it.',
+	      'Raw capability keys this caller serves (bare names and exact compounds). ' +
+	      'Shifts derive them from their effective rosters; other callers normally omit them.',
 	  },
           shift_id: { type: 'string' },
           started_at: { type: 'number' },
@@ -710,28 +712,28 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_shifts',
       description:
-        "Your principal's registered Shifts, each with an online/offline flag (derived at read time from its last ping, ~3 min), how long since it was last seen, the crews it serves (returned as `crews`; an empty list means every crew this principal belongs to, not none), and the reporting process incarnation (`shiftId`/`startedAt`) when the hub recorded one.",
+		"Show available or offline execution coverage for this principal so gaps can be relayed: registered Shifts with an online/offline flag (derived at read time from its last ping, ~3 min), last-seen age, crews served (returned as `crews`; an empty list means every crew this principal belongs to, not none), and recorded process incarnation (`shiftId`/`startedAt`).",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/shifts' })),
     },
     {
       name: 'get_rosters',
       description:
-	"The org's roster cascade: one org-global capability table plus optional per-crew tables. These rows select harness/model/effort after the hub has already routed work to a crew.",
+	"Inspect post-crew routing choices rather than execute work: the org's roster cascade has one org-global capability table plus optional per-crew tables, whose rows select harness/model/effort after the hub has already routed work to a crew.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/rosters' })),
     },
     {
       name: 'list_harness_models',
       description:
-	"The hub's known harnesses and model snapshots, including each model's supported effort values. Read-only; roster writes stay in the terminal CLI.",
+	"Read-only roster-planning data: the hub's known harnesses and model snapshots, including each model's supported effort values. Roster writes stay in the terminal CLI.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/harness_models' })),
     },
     {
       name: 'wake',
       description:
-        'A cheap "has anything relevant to you changed since cursor X" pre-check for a polling loop — returns { cursor, changed }. Keep the returned cursor and pass it next time; call whats_next ONLY when changed is true. Omit cursor to bootstrap. NOT a substitute for whats_next — it never returns work orders, only whether to ask.',
+		'The cheap place to park between changes: a polling pre-check returning only { cursor, changed }. Keep the returned cursor and pass it next time; call whats_next ONLY when changed is true. Omit cursor to bootstrap. It is not a substitute for whats_next — it never returns work orders, only whether to ask.',
       inputSchema: {
         type: 'object',
         properties: { cursor: { type: 'integer', minimum: 0 } },
@@ -761,7 +763,7 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
   return {
     name: 'create_agent',
     description:
-      'Create a NEW Scoped Identity on the hub and store its credential locally. NEVER returns the token — it is written to this machine\'s credential store only. Refuses a name that is already taken. Mints with `work` scope by default; pass `scopes` (e.g. ["work","run"]) to choose.',
+      'Administrative setup that enables crews to execute runs, not the normal task path: create a NEW Scoped Identity on the hub and store its credential locally. NEVER returns the token — it is written to this machine\'s credential store only. Refuses a name that is already taken. Mints with `work` scope by default; pass `scopes` (e.g. ["work","run"]) to choose.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -829,7 +831,7 @@ function stageEnrollmentTool(deps: McpDeps): ToolRegistration {
   return {
     name: 'stage_enrollment',
     description:
-      'Stage a Scoped Identity enrollment on the hub, returning a join code the enrolling machine redeems. A join code is transferred authority, not a credential — it is safe to surface.',
+      'Administrative setup that enables crews to execute runs, not the normal task path: stage a Scoped Identity enrollment on the hub, returning a join code the enrolling machine redeems. A join code is transferred authority, not a credential — it is safe to surface.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -878,7 +880,7 @@ function buildCrewTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_crews',
       description:
-        "The org's crews, each with its membership rows inline (principalKind/principalId/addedBy/addedAt) — " +
+		"Inspect execution capacity and membership before a run or membership change: the org's crews, each with its membership rows inline (principalKind/principalId/addedBy/addedAt) — " +
         'one call, no per-crew fan-out. An org with no crews at all is a normal empty result, not an error. ' +
         "The org's reserved ORPHAN crew (kind: \"orphan\", or a name starting \"orphan:\") IS returned when it " +
         'exists and is deliberately NOT filtered out — it is where the hub re-homes work whose crew was ' +
@@ -891,7 +893,7 @@ function buildCrewTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'create_crew',
       description:
-        "Create a crew on the hub org. `kind` is 'personal' or 'shared', forwarded verbatim — the hub is the " +
+		"Configure who can execute by creating a crew on the hub org. `kind` is 'personal' or 'shared', forwarded verbatim — the hub is the " +
         "enforcement of record for legal values ('orphan' is reserved for the hub's own crew and is refused). " +
         "`ownerMemberId` is required for a 'personal' crew and is simply omitted from the request when not " +
         'passed. NOT admin-only: an org admin may create any crew, AND a non-admin may create a personal crew ' +
@@ -914,7 +916,7 @@ function buildCrewTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'add_crew_member',
       description:
-        "Add one principal to a crew. `principalKind` is 'member' (a human) or 'agent' (a Scoped Identity), " +
+		"Configure who can execute by adding one principal to a crew. `principalKind` is 'member' (a human) or 'agent' (a Scoped Identity), " +
         'forwarded verbatim; the hub validates it. NOT admin-only: an org admin may act on any crew, AND the ' +
         'OWNER of a personal crew may add members to that crew without being an admin. HTTP 400 (not a ' +
         'permissions error, and NOT tolerant): an unknown crewId, an unknown principalId, or a principal that ' +
@@ -937,7 +939,7 @@ function buildCrewTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'remove_crew_member',
       description:
-        'Remove one principal from a crew. TOLERANT: removing a principal that was never a member is a normal ' +
+		'Configure who can execute by removing one principal from a crew. TOLERANT: removing a principal that was never a member is a normal ' +
         'success — HTTP 200 with removed:false, NOT a 404. Read the `removed` boolean rather than treating a ' +
         'false as a failure. An unknown crewId is DIFFERENT and is an HTTP 400 error. NOT admin-only: same ' +
         'self-service carve-out as add_crew_member — an org admin, or the owner of the personal crew being ' +
