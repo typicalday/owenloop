@@ -25,7 +25,14 @@
 import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
-import { DefError, finalizeDefs, lintDef, loadDefFile, loadDefsRaw, validateDef } from '../defs.ts';
+import {
+  DefError,
+  finalizeDefs,
+  lintDef,
+  loadDefFile,
+  loadDefsRaw,
+  validateDef,
+} from '../defs.ts';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
@@ -66,8 +73,8 @@ import type {
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
-import { defDigest } from './types.ts';
-import { storeIndexPath } from './resolve.ts';
+import { compareStoreText, defDigest, objectDirForDigest } from './types.ts';
+import { probeStoreRoot, projectStoreRoot, storeIndexPath } from './resolve.ts';
 import { recoverInterruptedWorkflowStoreGc } from './gc-recovery.ts';
 
 // ---- A1/A2 ports ---------------------------------------------------------------
@@ -149,6 +156,10 @@ export interface InstallWorkflowBundleArgs {
   root: string;
   /** Which level `root` is (result metadata only). */
   level: StoreLevel;
+  /** Project root used to revalidate exact manifest locks before commit. */
+  projectRoot?: string;
+  /** Global root used to revalidate exact manifest locks before commit. */
+  globalRoot?: string;
   /** Path of the per-root install lock (project installs share the project add lock). */
   lockPath: string;
   /** Path of the per-root crash-recovery journal. */
@@ -169,6 +180,67 @@ export interface InstallWorkflowBundleArgs {
    * never legal under the global root — there is no ledger there to vouch).
    */
   readLedger?: () => LedgerLookup;
+}
+
+function assertManifestLocksResolvable(args: {
+  root: string;
+  level: StoreLevel;
+  projectRoot: string | undefined;
+  globalRoot: string | undefined;
+  lock: Readonly<Record<string, string>>;
+}): void {
+  const entries = Object.entries(args.lock);
+  if (entries.length === 0) return;
+  if (args.projectRoot === undefined || args.globalRoot === undefined) {
+    throw new Error(
+      'refusing bundle with exact lock targets: install requires both projectRoot and globalRoot for pre-commit revalidation',
+    );
+  }
+  const projectRoot = projectStoreRoot(args.projectRoot);
+  const globalRoot = projectStoreRoot(args.globalRoot);
+  const root = projectStoreRoot(args.root);
+  const expectedRoot = args.level === 'project' ? projectRoot : globalRoot;
+  if (root !== expectedRoot) {
+    throw new Error(
+      `refusing bundle lock revalidation: ${args.level} install root '${root}' does not match '${expectedRoot}'`,
+    );
+  }
+
+  const readIndex = (storeRoot: string): WorkflowStoreIndex => probeStoreRoot(storeRoot) === 'absent'
+    ? { version: 1, entries: {} }
+    : readWorkflowStoreIndex(storeIndexPath(storeRoot));
+  const projectIndex = readIndex(projectRoot);
+  const globalIndex = projectRoot === globalRoot ? projectIndex : readIndex(globalRoot);
+  const indexNamesDigest = (index: WorkflowStoreIndex, digest: DefDigest): boolean =>
+    Object.values(index.entries).some((entry) => entry.digest === digest);
+  const verifiedObjectPresent = (storeRoot: string, digest: DefDigest): boolean => {
+    const objectDir = objectDirForDigest(storeRoot, digest);
+    const state = probeDirectoryPath(objectDir, 'workflow object', storeRoot);
+    if (state === 'absent') return false;
+    verifyWorkflowObjectSync(objectDir, digest, { coordinateRepair: false });
+    return true;
+  };
+
+  for (const [coordinate, rawDigest] of entries.sort(([a], [b]) => compareStoreText(a, b))) {
+    const digest = defDigest(rawDigest);
+    let callable = false;
+    if (projectIndex.entries[coordinate]?.digest === digest) {
+      const local = verifiedObjectPresent(projectRoot, digest);
+      callable = local || (
+		indexNamesDigest(globalIndex, digest)
+		&& verifiedObjectPresent(globalRoot, digest)
+      );
+    }
+    if (!callable && globalIndex.entries[coordinate]?.digest === digest) {
+      callable = verifiedObjectPresent(globalRoot, digest);
+    }
+    if (!callable) {
+      throw new Error(
+	`refusing bundle install: lock target '${coordinate}' pinned to ${digest} ` +
+		  'is no longer exactly callable from the combined workflow store',
+      );
+    }
+  }
 }
 
 /**
@@ -245,8 +317,7 @@ export const workflowStoreReplacementRecovery = {
  *
  * Fixed commit order:
  *   1. acquire the root's install lock;
- *   2. recover prior GC parking and install transactions (before stale-stage
- *      cleanup — both can own evidence below the shared staging root);
+ *   2. recover prior GC parking and install transactions before stale-stage cleanup;
  *   3. clear stale staging debris;
  *   4. reread + validate the index INSIDE the lock (ownership/conflict
  *      decisions must see the post-lock state — TOCTOU);
@@ -310,7 +381,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
   let preserveStagingRoot = false;
   try {
     // Recover prior GC parking and install transactions FIRST — before the
-    // stale-staging clear, since both can own evidence below that shared root.
+    // stale-staging clear, since either can own evidence below that shared root.
     // A v1 (GitHub) journal at a shared project journal path needs the
     // project ledger to vouch (supplied via `readLedger` — project bundle
     // installs share the project add lock/recovery ordering); without a
@@ -364,6 +435,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     const reasons: string[] = [];
     let staged: Map<string, ReturnType<typeof loadDefFile>>;
     let externalVersionedCalls: ReadonlySet<string> = new Set();
+    let stagedBundleLock: Readonly<Record<string, string>> = {};
     const manifestPath = join(stagingDir, 'bundle.yaml');
     if (existsSync(manifestPath)) {
       // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
@@ -371,7 +443,8 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       staged = new Map<string, ReturnType<typeof loadDefFile>>();
       try {
         const manifest = parseManifestBytes(readFileSync(manifestPath));
-	externalVersionedCalls = new Set(Object.keys(manifest.lock));
+		externalVersionedCalls = new Set(Object.keys(manifest.lock));
+		stagedBundleLock = manifest.lock;
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
           try {
@@ -437,6 +510,18 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // A2 pre-commit verification: after content/engine validation, before ANY
     // destination swap or index write. A rejection commits nothing.
     await verifier.verify({ source, coordinate, digest, objectDir: stagingDir });
+
+    // Re-read both roots while this install still owns its root lock. A
+    // destructive GC owns both root locks, so either this commit becomes visible
+    // to its reachability scan or a GC-first removal makes this stale caller
+    // fail here before any journal/object/index mutation.
+    assertManifestLocksResolvable({
+      root,
+      level,
+      projectRoot: args.projectRoot,
+      globalRoot: args.globalRoot,
+      lock: stagedBundleLock,
+    });
 
     // Existing same-digest objects have two paths. A verified object keeps the
     // normal idempotent dedupe. A broken object is repaired only from the
@@ -709,14 +794,13 @@ export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Prom
   const lock = await acquireInstallLock(args.lockPath);
   try {
     recoverInterruptedWorkflowStoreGc({ root: args.root, stateDir: dirname(args.lockPath) });
-    const outcome = recoverInterruptedInstall({
+    return recoverInterruptedInstall({
       defsDir: args.root,
       journalPath: args.journalPath,
       lockfilePath: storeIndexPath(args.root),
       recoveryMarkerDir: args.recoveryMarkerDir,
       v2Replacement: workflowStoreReplacementRecovery,
     });
-    return outcome;
   } finally {
     releaseInstallLock(lock);
   }

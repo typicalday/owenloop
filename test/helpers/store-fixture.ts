@@ -78,6 +78,9 @@ export function writeBundleSource(args: {
 export async function installBundleFixture(args: {
   sourceDir: string;
   root?: string;
+  level?: 'project' | 'global';
+  projectRoot?: string;
+  globalRoot?: string;
   sourcePath?: string;
   verifier?: PreCommitVerifier;
 }): Promise<{
@@ -99,7 +102,9 @@ export async function installBundleFixture(args: {
     bytes: packed.bytes,
     source,
     root,
-    level: 'project',
+    level: args.level ?? 'project',
+    projectRoot: args.projectRoot ?? root,
+    globalRoot: args.globalRoot ?? root,
     lockPath: state.lockPath,
     journalPath: state.journalPath,
     recoveryMarkerDir: markerDir,

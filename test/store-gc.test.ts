@@ -18,6 +18,7 @@ import { finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   collectWorkflowStoreGarbage,
+  compareStoreText,
   loadCasDefs,
   objectDirForDigest,
   planWorkflowStoreGc,
@@ -54,6 +55,9 @@ async function installVersion(args: {
   version: string;
   marker?: string;
   root?: string;
+  level?: 'project' | 'global';
+  projectRoot?: string;
+  globalRoot?: string;
   workflow?: string;
   workflows?: Record<string, string>;
   lock?: Record<string, string>;
@@ -71,6 +75,9 @@ async function installVersion(args: {
   const installed = await installBundleFixture({
     sourceDir,
     ...(args.root === undefined ? {} : { root: args.root }),
+    ...(args.level === undefined ? {} : { level: args.level }),
+    ...(args.projectRoot === undefined ? {} : { projectRoot: args.projectRoot }),
+    ...(args.globalRoot === undefined ? {} : { globalRoot: args.globalRoot }),
   });
   return { root: installed.root, digest: installed.result.digest };
 }
@@ -217,6 +224,9 @@ test('project GC follows locks from every retained global caller version', async
 		name: 'caller',
 		version: '1.0.0',
 		root: globalRoot,
+		level: 'global',
+		projectRoot: projectV1.root,
+		globalRoot,
 		workflow: callerWorkflow(oldTarget, 'old-global-caller'),
 		lock: { [oldTarget]: projectV1.digest },
 	});
@@ -224,6 +234,9 @@ test('project GC follows locks from every retained global caller version', async
 		name: 'caller',
 		version: '2.0.0',
 		root: globalRoot,
+		level: 'global',
+		projectRoot: projectV1.root,
+		globalRoot,
 		workflow: callerWorkflow(currentTarget, 'current-global-caller'),
 		lock: { [currentTarget]: projectV2.digest },
 	});
@@ -257,6 +270,48 @@ test('project GC follows locks from every retained global caller version', async
 	assert.ok(oldCaller, 'the shadowed global caller remains exactly resolvable');
 	const resolved = resolveCallsTarget(defs, oldTarget, oldCaller);
 	assert.equal(resolved?.bundleDigest, projectV1.digest);
+});
+
+test('identical non-target history does not prevent target keep pruning', async () => {
+  const projectV1 = await installVersion({ version: '1.0.0' });
+  const projectV2 = await installVersion({ version: '2.0.0', root: projectV1.root });
+  const projectV3 = await installVersion({ version: '3.0.0', root: projectV1.root });
+  const globalRoot = emptyRoot();
+  const globalV1 = await installVersion({ version: '1.0.0', root: globalRoot });
+  const globalV2 = await installVersion({ version: '2.0.0', root: globalRoot });
+  const globalV3 = await installVersion({ version: '3.0.0', root: globalRoot });
+  assert.deepEqual(
+    [globalV1.digest, globalV2.digest, globalV3.digest],
+    [projectV1.digest, projectV2.digest, projectV3.digest],
+    'the roots carry identical immutable history',
+  );
+
+  const dry = plan({
+    projectRoot: projectV1.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+  }).report;
+  assert.deepEqual(dry.coordinates, ['widget/widget@1.0.0', 'widget/widget@2.0.0']);
+  assert.deepEqual(
+    dry.objects.map((object) => object.digest).sort(compareStoreText),
+    [projectV1.digest, projectV2.digest].sort(compareStoreText),
+  );
+
+  const applied = await collectWorkflowStoreGarbage({
+    projectRoot: projectV1.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => [],
+  });
+  assert.deepEqual({ ...applied, dryRun: true }, dry);
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: projectV1.root, globalRoot, warn: () => {} }));
+  const registrations = loadCasDefs({ projectRoot: projectV1.root, globalRoot, warn: () => {} });
+  for (const coordinate of ['widget/widget@1.0.0', 'widget/widget@2.0.0']) {
+    assert.ok(registrations.some((registration) => registration.key === coordinate));
+  }
 });
 
 test('a runtime-pinned orphan and project exact-digest fallback into global are retained', async () => {
@@ -493,7 +548,106 @@ test('GC excludes a two-connection stale snapshot writer from the scan-to-delete
   assert.deepEqual(readRuntimeSnapshotBundlePins(dbPath), [], 'the second SQLite connection landed no snapshot row');
 });
 
-test('GC recovers an interruption after the durable journal but before the live-object rename', async () => {
+test('GC-first cross-root race makes a stale non-target caller install fail before commit', async () => {
+  const projectV1 = await installVersion({ name: 'child', version: '1.0.0' });
+  await installVersion({ name: 'child', version: '2.0.0', root: projectV1.root });
+  const globalRoot = emptyRoot();
+  const target = 'child/child@1.0.0';
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: [
+      'name: caller',
+      'inputs:',
+      '  - name: seed',
+      '    seedOwed: true',
+      'steps:',
+      '  - name: invoke',
+      `    calls: ${target}`,
+      '    inputs:',
+      '      seed: seed',
+      '    produces: [done]',
+      'outputs: [done]',
+      '',
+    ].join('\n'),
+    lock: { [target]: projectV1.digest },
+  });
+  const controlDir = tempDir('owenloop-gc-install-barrier-');
+  const readyPath = join(controlDir, 'ready');
+  const attemptPath = join(controlDir, 'attempt');
+  const resultPath = join(controlDir, 'result.json');
+  const childScript = `
+    const { writeFileSync } = await import('node:fs');
+    const { installBundleFixture } = await import(${JSON.stringify(new URL('./helpers/store-fixture.ts', import.meta.url).href)});
+    writeFileSync(process.env.GC_READY_PATH, 'ready');
+    await new Promise((resolve) => process.stdin.once('data', resolve));
+    writeFileSync(process.env.GC_ATTEMPT_PATH, 'attempt');
+    try {
+      await installBundleFixture({
+		sourceDir: process.env.GC_CALLER_SOURCE,
+		root: process.env.GC_GLOBAL_ROOT,
+		level: 'global',
+		projectRoot: process.env.GC_PROJECT_ROOT,
+		globalRoot: process.env.GC_GLOBAL_ROOT,
+      });
+      writeFileSync(process.env.GC_RESULT_PATH, JSON.stringify({ ok: true }));
+    } catch (error) {
+      writeFileSync(process.env.GC_RESULT_PATH, JSON.stringify({
+		ok: false,
+		error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  `;
+  const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '--eval', childScript], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: {
+      ...process.env,
+      GC_PROJECT_ROOT: projectV1.root,
+      GC_GLOBAL_ROOT: globalRoot,
+      GC_CALLER_SOURCE: callerSource,
+      GC_READY_PATH: readyPath,
+      GC_ATTEMPT_PATH: attemptPath,
+      GC_RESULT_PATH: resultPath,
+    },
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  let childError = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => { childError += chunk; });
+  const childDone = new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`caller installer exited ${String(code)}/${String(signal)}: ${childError}`));
+    });
+  });
+
+  waitForPath(readyPath, 'stale non-target installer');
+  const applied = await collectWorkflowStoreGarbage({
+    projectRoot: projectV1.root,
+    globalRoot,
+    level: 'project',
+    keep: 1,
+    yes: true,
+    readSnapshotPins: () => [],
+    hooks: {
+      afterSnapshotPinsRead: () => {
+		child.stdin.write('commit\n');
+		waitForPath(attemptPath, 'non-target install lock attempt');
+      },
+    },
+  });
+  child.stdin.end();
+  await childDone;
+
+  assert.ok(applied.objects.some((object) => object.digest === projectV1.digest));
+  const result = JSON.parse(readFileSync(resultPath, 'utf8')) as { ok: boolean; error?: string };
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? '', /no longer exactly callable/u);
+  assert.equal(readWorkflowStoreIndex(storeIndexPath(globalRoot)).entries['caller/caller@1.0.0'], undefined);
+});
+
+test('GC journal restores a live object interrupted in the temporary chmod window', async () => {
   const installed = await installThree();
   const globalRoot = emptyRoot();
   const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
@@ -507,12 +661,12 @@ test('GC recovers an interruption after the durable journal but before the live-
       yes: true,
       readSnapshotPins: () => [],
       hooks: {
-	afterLiveObjectMadeWritable: (path) => {
-	  interruptedObject = path;
-	  assert.equal(existsSync(gcJournal), true, 'durable evidence precedes the live chmod');
-	  assert.notEqual(lstatSync(path).mode & 0o200, 0, 'the interruption lands in the chmod-to-rename window');
-	  throw new Error('injected process interruption after live chmod');
-	},
+		afterLiveObjectMadeWritable: (path) => {
+		  interruptedObject = path;
+		  assert.equal(existsSync(gcJournal), true);
+		  assert.notEqual(lstatSync(path).mode & 0o200, 0);
+		  throw new Error('injected process interruption after live chmod');
+		},
       },
     }),
     /injected process interruption after live chmod/u,
@@ -520,7 +674,7 @@ test('GC recovers an interruption after the durable journal but before the live-
   assert.ok(interruptedObject);
   assert.equal(existsSync(gcJournal), true);
 
-  const rerun = await collectWorkflowStoreGarbage({
+  await collectWorkflowStoreGarbage({
     projectRoot: installed.root,
     globalRoot,
     level: 'project',
@@ -528,98 +682,132 @@ test('GC recovers an interruption after the durable journal but before the live-
     yes: true,
     readSnapshotPins: () => [],
   });
-  assert.equal(existsSync(gcJournal), false, 'recovery clears evidence only after restoring the object mode');
-  assert.ok(rerun.objects.some((object) => object.digest === installed.digests['1.0.0']));
-  assert.equal(existsSync(interruptedObject), false, 'the recovered orphan is collectable on the rerun');
+  assert.equal(existsSync(gcJournal), false);
+  assert.equal(existsSync(interruptedObject), false);
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+});
+
+test('ordinary install resolves a durable parked-object journal before shared staging cleanup', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+  let parkedObject: string | undefined;
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+      hooks: {
+		afterObjectParked: (path) => {
+		  parkedObject = path;
+		  assert.equal(lstatSync(path).mode & 0o777, 0o555, 'the parked object is re-hardened');
+		  assert.equal(existsSync(gcJournal), true, 'durable evidence remains through parent fsyncs');
+		  throw new Error('injected process interruption after durable park');
+		},
+      },
+    }),
+    /injected process interruption after durable park/u,
+  );
+  assert.ok(parkedObject);
+  assert.equal(existsSync(parkedObject), true);
+  assert.equal(existsSync(gcJournal), true);
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+
+  await installVersion({ version: '3.0.0', root: installed.root });
+  assert.equal(existsSync(parkedObject), false, 'the install recovers GC evidence before clearing staging');
+  assert.equal(existsSync(gcJournal), false);
   assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
 });
 
 test('offline workflow-store recovery removes only its parked GC object from shared staging', async () => {
-	const installed = await installThree();
-	const globalRoot = emptyRoot();
-	const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
-	let parkedObject: string | undefined;
-	await assert.rejects(
-		collectWorkflowStoreGarbage({
-			projectRoot: installed.root,
-			globalRoot,
-			level: 'project',
-			keep: 1,
-			yes: true,
-			readSnapshotPins: () => [],
-			hooks: {
-				afterObjectParked: (path) => {
-					parkedObject = path;
-					assert.equal(existsSync(gcJournal), true);
-					assert.equal(lstatSync(path).mode & 0o777, 0o555);
-					throw new Error('injected process interruption after durable park');
-				},
-			},
-		}),
-		/injected process interruption after durable park/u,
-	);
-	assert.ok(parkedObject);
-	assert.equal(existsSync(parkedObject), true);
-	assert.equal(existsSync(gcJournal), true);
-	const unrelated = join(installed.root, '.owenloop-staging', 'unrelated', 'keep.txt');
-	mkdirSync(join(unrelated, '..'), { recursive: true });
-	writeFileSync(unrelated, 'keep');
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+  let parkedObject: string | undefined;
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+      hooks: {
+		afterObjectParked: (path) => {
+		  parkedObject = path;
+		  assert.equal(existsSync(gcJournal), true);
+		  assert.equal(lstatSync(path).mode & 0o777, 0o555);
+		  throw new Error('injected process interruption after durable park');
+		},
+      },
+    }),
+    /injected process interruption after durable park/u,
+  );
+  assert.ok(parkedObject);
+  assert.equal(existsSync(parkedObject), true);
+  assert.equal(existsSync(gcJournal), true);
+  const unrelated = join(installed.root, '.owenloop-staging', 'unrelated', 'keep.txt');
+  mkdirSync(join(unrelated, '..'), { recursive: true });
+  writeFileSync(unrelated, 'keep');
 
-	const state = workflowStoreStatePaths(installed.root);
-	const recovery = await recoverWorkflowStore({
-		root: installed.root,
-		lockPath: state.lockPath,
-		journalPath: state.journalPath,
-	});
-	assert.equal(recovery, 'no-journal');
-	assert.equal(existsSync(gcJournal), false, 'offline recovery resolves GC evidence first');
-	assert.equal(existsSync(parkedObject), false, 'the journal-authenticated parked object is removed');
-	assert.equal(readFileSync(unrelated, 'utf8'), 'keep', 'unrelated staging evidence is preserved');
-	assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+  const state = workflowStoreStatePaths(installed.root);
+  const recovery = await recoverWorkflowStore({
+    root: installed.root,
+    lockPath: state.lockPath,
+    journalPath: state.journalPath,
+  });
+  assert.equal(recovery, 'no-journal');
+  assert.equal(existsSync(gcJournal), false, 'offline recovery resolves GC evidence first');
+  assert.equal(existsSync(parkedObject), false, 'the journal-authenticated parked object is removed');
+  assert.equal(readFileSync(unrelated, 'utf8'), 'keep', 'unrelated staging evidence is preserved');
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
 });
 
 test('ordinary bundle install restores a parked GC object when the durable index still names its digest', async () => {
-	const installed = await installThree();
-	const globalRoot = emptyRoot();
-	const indexPath = storeIndexPath(installed.root);
-	const indexBefore = readFileSync(indexPath);
-	const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
-	let parkedObject: string | undefined;
-	let parkedDigest: DefDigest | undefined;
-	await assert.rejects(
-		collectWorkflowStoreGarbage({
-			projectRoot: installed.root,
-			globalRoot,
-			level: 'project',
-			keep: 1,
-			yes: true,
-			readSnapshotPins: () => [],
-			hooks: {
-				afterObjectParked: (path) => {
-					parkedObject = path;
-					const match = /\/gc-([0-9a-f]{64})-park_[0-9a-f]{24}$/u.exec(path);
-					assert.ok(match);
-					parkedDigest = match[1] as DefDigest;
-					throw new Error('injected parked-object interruption');
-				},
-			},
-		}),
-		/injected parked-object interruption/u,
-	);
-	assert.ok(parkedObject && parkedDigest);
-	assert.equal(existsSync(objectDirForDigest(installed.root, parkedDigest)), false);
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const indexPath = storeIndexPath(installed.root);
+  const indexBefore = readFileSync(indexPath);
+  const gcJournal = join(installed.root, '.owenloop', 'gc.journal');
+  let parkedObject: string | undefined;
+  let parkedDigest: DefDigest | undefined;
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+      hooks: {
+		afterObjectParked: (path) => {
+		  parkedObject = path;
+		  const match = /\/gc-([0-9a-f]{64})-park_[0-9a-f]{24}$/u.exec(path);
+		  assert.ok(match);
+		  parkedDigest = match[1] as DefDigest;
+		  throw new Error('injected parked-object interruption');
+		},
+      },
+    }),
+    /injected parked-object interruption/u,
+  );
+  assert.ok(parkedObject && parkedDigest);
+  assert.equal(existsSync(objectDirForDigest(installed.root, parkedDigest)), false);
 
-	// Model a crash where the index rename was not the state recovered by the
-	// filesystem. Recovery must consult these current durable bytes rather than
-	// assuming every parked digest is doomed.
-	writeFileSync(indexPath, indexBefore);
-	await installVersion({ version: '3.0.0', root: installed.root });
-	const restored = objectDirForDigest(installed.root, parkedDigest);
-	assert.equal(existsSync(restored), true, 'the indexed parked object returns to its canonical path');
-	assert.equal(lstatSync(restored).mode & 0o777, 0o555);
-	assert.equal(existsSync(parkedObject), false);
-	assert.equal(existsSync(gcJournal), false);
-	assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
+  // Model a crash where the index rename was not the state recovered by the
+  // filesystem. Recovery must consult these current durable bytes rather than
+  // assuming every parked digest is doomed.
+  writeFileSync(indexPath, indexBefore);
+  await installVersion({ version: '3.0.0', root: installed.root });
+  const restored = objectDirForDigest(installed.root, parkedDigest);
+  assert.equal(existsSync(restored), true, 'the indexed parked object returns to its canonical path');
+  assert.equal(lstatSync(restored).mode & 0o777, 0o555);
+  assert.equal(existsSync(parkedObject), false);
+  assert.equal(existsSync(gcJournal), false);
+  assert.doesNotThrow(() => loadCasDefs({ projectRoot: installed.root, globalRoot, warn: () => {} }));
 });
 
 test('GC journal recovery refuses a symlinked parked-object root before chmod', async () => {
@@ -655,6 +843,30 @@ test('GC journal recovery refuses a symlinked parked-object root before chmod', 
   assert.equal(lstatSync(outsideObject).mode & 0o7777, outsideMode, 'recovery never chmods through the link');
   assert.deepEqual(readFileSync(storeIndexPath(installed.root)), indexBefore, 'recovery refusal never mutates the index');
   assert.equal(existsSync(journalPath), true, 'untrusted evidence remains for manual inspection');
+});
+
+test('GC refuses a symlinked shared staging root before index mutation', async () => {
+  const installed = await installThree();
+  const globalRoot = emptyRoot();
+  const outside = tempDir('owenloop-gc-journal-escape-');
+  const outsideSentinel = join(outside, 'keep.txt');
+  writeFileSync(outsideSentinel, 'keep');
+  symlinkSync(outside, join(installed.root, '.owenloop-staging'));
+  const indexBefore = readFileSync(storeIndexPath(installed.root));
+
+  await assert.rejects(
+    collectWorkflowStoreGarbage({
+      projectRoot: installed.root,
+      globalRoot,
+      level: 'project',
+      keep: 1,
+      yes: true,
+      readSnapshotPins: () => [],
+    }),
+    /workflow store staging directory.*symlink/u,
+  );
+  assert.equal(readFileSync(outsideSentinel, 'utf8'), 'keep');
+  assert.deepEqual(readFileSync(storeIndexPath(installed.root)), indexBefore);
 });
 
 test('project and global GC mutate only the selected target root', async () => {

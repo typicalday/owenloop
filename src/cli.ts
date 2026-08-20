@@ -3065,8 +3065,10 @@ async function dispatchBundleGc(io: CliIO, args: Args): Promise<number> {
 			globalRoot = globalStoreRoot(workflowHome(io));
 		} catch {
 			// Match normal definition discovery: project-only operation remains
-			// available when HOME is absent, using a guaranteed-absent fallback.
-			globalRoot = join(projectRoot, '.owenloop-global-store-unavailable');
+			// available when HOME is absent. No global install can derive a root
+			// either, so model this as a single-root plan and avoid inventing a
+			// coordination path inside the project store.
+			globalRoot = projectRoot;
 		}
 	}
 
@@ -3137,9 +3139,9 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
   // A fresh bundle install also needs an external marker directory, so derive
   // that path from the same injected home and never from process state.
   const recoveryMarkerDir = workflowRecoveryMarkerDir(io);
-  const root = globalFlag
-    ? globalStoreRoot(workflowHome(io))
-    : projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
+  const projectRoot = projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
+  const globalRoot = globalStoreRoot(workflowHome(io));
+  const root = globalFlag ? globalRoot : projectRoot;
   const statePaths = workflowStoreStatePaths(root);
   const lockPath = statePaths.lockPath;
   const journalPath = statePaths.journalPath;
@@ -3186,6 +3188,8 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
     source: bundleSource,
     root,
     level: globalFlag ? 'global' : 'project',
+    projectRoot,
+    globalRoot,
     lockPath,
     journalPath,
     recoveryMarkerDir,
@@ -3438,8 +3442,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   let preserveStagingRoot = false;
   try {
     // Recover crash-interrupted GC parking and installs FIRST — before the
-    // stale-staging clear, since both can own evidence below that shared root.
-    // Any refusal must preserve the staging root and journals as evidence.
+    // stale-staging clear, since either can own evidence below that shared root.
     try {
       recoverInterruptedWorkflowStoreGc({ root: defsDir, stateDir: canonicalState.stateDir });
       recoverInterruptedInstall({

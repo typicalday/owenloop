@@ -24,6 +24,7 @@ import {
   STAGING_DIRNAME,
 } from '../install.ts';
 import type { LedgerLookup } from '../install.ts';
+import type { InstallLockHandle } from '../install.ts';
 import type { RuntimeSnapshotBundlePins } from '../store.ts';
 import { randId } from '../util.ts';
 import { loadCasDefs } from './def-source.ts';
@@ -104,7 +105,7 @@ export interface CollectWorkflowStoreGcArgs {
   hooks?: {
     afterSnapshotPinsRead?: () => void;
     afterIndexWrite?: () => void;
-    /** Process-interruption seam after durable evidence and the live chmod. */
+    /** Process-interruption seam after durable evidence and the temporary live chmod. */
     afterLiveObjectMadeWritable?: (path: string) => void;
     /** Process-interruption seam after the object rename and parent fsyncs. */
     afterObjectParked?: (path: string) => void;
@@ -118,7 +119,7 @@ interface BundleObjectMetadata {
   packageName: string;
   version: string;
   qualifiedWorkflows: string[];
-  dependencies: DefDigest[];
+  dependencies: Array<{ coordinate: string; digest: DefDigest }>;
   bytes: number;
 }
 
@@ -175,8 +176,9 @@ function readObjectMetadata(root: string, digest: DefDigest): BundleObjectMetada
     packageName: manifest.package.name,
     version: manifest.package.version,
     qualifiedWorkflows,
-    dependencies: [...new Set(Object.values(manifest.lock).map((value) => defDigest(value)))]
-      .sort(compareStoreText),
+    dependencies: Object.entries(manifest.lock)
+      .map(([coordinate, value]) => ({ coordinate, digest: defDigest(value) }))
+      .sort((a, b) => compareStoreText(a.coordinate, b.coordinate) || compareStoreText(a.digest, b.digest)),
     bytes: regularTreeBytes(objectDir),
   };
 }
@@ -282,12 +284,51 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     }
   }
 
-  const protectedDigests = new Set<DefDigest>();
+  const targetObjects = args.level === 'project' ? projectObjects : globalObjects;
+  const nonTargetIndex = args.level === 'project' ? globalIndex : projectIndex;
+  const requiredTargetDigests = new Set<DefDigest>();
+  const protectedTargetObjects = new Set<DefDigest>();
+  const dependencyQueue: DefDigest[] = [];
+  const queuedDependencies = new Set<DefDigest>();
 
-  // Cross-root selected winners hold their ordinary qualified names.
+  const queueDependencies = (digest: DefDigest): void => {
+    if (queuedDependencies.has(digest)) return;
+    queuedDependencies.add(digest);
+    dependencyQueue.push(digest);
+  };
+  const targetCoordinatesForDigest = (digest: DefDigest): string[] => Object.entries(targetIndex.entries)
+    .filter(([, entry]) => entry.digest === digest)
+    .map(([coordinate]) => coordinate)
+    .sort(compareStoreText);
+  const requireTargetDigest = (digest: DefDigest, reason: string): void => {
+    if (requiredTargetDigests.has(digest)) return;
+    if (targetCoordinatesForDigest(digest).length === 0) {
+      throw new Error(
+	`workflow-store GC cannot preserve ${reason}: target ${args.level} index has no coordinate for digest ${digest}`,
+      );
+    }
+    requiredTargetDigests.add(digest);
+    queueDependencies(digest);
+  };
+
+  // Every retained non-target coordinate remains exactly callable after this
+  // target-only mutation. Its own copy can satisfy that requirement without
+  // retaining a redundant target copy, but all of its lock edges are roots.
+  if (!sameRoot) {
+    for (const entry of Object.values(nonTargetIndex.entries)) {
+      queueDependencies(defDigest(entry.digest));
+    }
+  }
+
+  // Cross-root selected winners hold their ordinary qualified names. A target
+  // winner is also covered by keep>=1; this explicit root documents and guards
+  // that invariant if selection policy changes independently.
   for (const registration of registrations) {
-    if (registration.kind === 'workflow' && registration.key === registration.qualified) {
-      protectedDigests.add(registration.bundleDigest);
+    if (registration.kind !== 'workflow' || registration.key !== registration.qualified) continue;
+    if (targetCoordinatesForDigest(registration.bundleDigest).length > 0) {
+      requireTargetDigest(registration.bundleDigest, `selected workflow '${registration.qualified}'`);
+    } else {
+      queueDependencies(registration.bundleDigest);
     }
   }
 
@@ -311,50 +352,95 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
       level: StoreLevel;
     }>);
     if (selection.kind === 'unorderable') {
-      for (const candidate of selection.shadowed) protectedDigests.add(candidate.digest);
+      for (const candidate of selection.shadowed) {
+		requireTargetDigest(candidate.digest, `unorderable workflow '${qualified}'`);
+      }
       continue;
     }
     for (const candidate of [selection.winner, ...selection.shadowed].slice(0, args.keep)) {
-      protectedDigests.add(candidate.digest);
+      requireTargetDigest(candidate.digest, `keep window for workflow '${qualified}'`);
     }
   }
 
   // Explicit index pins are stronger than retention policy.
   for (const entry of Object.values(targetIndex.entries)) {
-    if (entry.pinned) protectedDigests.add(defDigest(entry.digest));
+    if (entry.pinned) requireTargetDigest(defDigest(entry.digest), 'an explicit index pin');
   }
 
   // Every retained workflow row remains replay/adopt/debug state until delete.
   for (const snapshot of args.snapshotPins) {
-    if (snapshot.bundleDigest !== undefined) protectedDigests.add(defDigest(snapshot.bundleDigest));
-    for (const digest of snapshot.bundleLock) protectedDigests.add(defDigest(digest));
-  }
-
-  // The other root is read-only for this run, so every coordinate it retains
-  // remains exactly callable. Seed all of those parent objects before walking
-  // bundle locks: a shadowed non-target caller can depend on a target-root
-  // child older than the target's keep window. Global GC also needs this for
-  // project exact-digest fallback into global.
-  if (!sameRoot) {
-    const nonTargetIndex = args.level === 'project' ? globalIndex : projectIndex;
-    for (const entry of Object.values(nonTargetIndex.entries)) {
-      protectedDigests.add(defDigest(entry.digest));
+    const digests = [
+      ...(snapshot.bundleDigest === undefined ? [] : [defDigest(snapshot.bundleDigest)]),
+      ...snapshot.bundleLock.map((digest) => defDigest(digest)),
+    ];
+    for (const digest of digests) {
+      if (targetCoordinatesForDigest(digest).length > 0) {
+		requireTargetDigest(digest, 'a retained runtime snapshot');
+      } else if (targetObjects.has(digest)) {
+		// A pin can name an orphan object. Preserve the bytes even though there
+		// is no coordinate to retain or print.
+		protectedTargetObjects.add(digest);
+		queueDependencies(digest);
+      } else {
+		queueDependencies(digest);
+      }
     }
   }
 
-  // Follow exact bundle locks to a fixed point. A retained parent can depend on
-  // an older child than the ordinary keep window would preserve.
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const digest of [...protectedDigests]) {
-      const metadata = installed.get(digest);
-      if (metadata === undefined) continue;
-      for (const dependency of metadata.dependencies) {
-		if (protectedDigests.has(dependency)) continue;
-		protectedDigests.add(dependency);
-		changed = true;
+  // A project index may deliberately borrow its bytes from a globally indexed
+  // copy. Global GC must retain the target coordinate/object pair that makes
+  // each such non-target coordinate loadable.
+  if (args.level === 'global' && !sameRoot) {
+    for (const entry of Object.values(projectIndex.entries)) {
+      const digest = defDigest(entry.digest);
+      if (!projectObjects.has(digest)) {
+		requireTargetDigest(digest, 'project exact-digest fallback');
       }
+    }
+  }
+
+  const entryMatches = (index: WorkflowStoreIndex, coordinate: string, digest: DefDigest): boolean =>
+    index.entries[coordinate]?.digest === digest;
+  const indexNamesDigest = (index: WorkflowStoreIndex, digest: DefDigest): boolean =>
+    Object.values(index.entries).some((entry) => entry.digest === digest);
+
+  /** Retain target state only when the non-target root cannot satisfy an exact lock edge itself. */
+  const preserveDependency = (parent: DefDigest, coordinate: string, digest: DefDigest): void => {
+    const nonTargetSelfSufficient = args.level === 'project'
+      ? entryMatches(globalIndex, coordinate, digest) && globalObjects.has(digest)
+      : entryMatches(projectIndex, coordinate, digest) && projectObjects.has(digest);
+    if (nonTargetSelfSufficient) {
+      queueDependencies(digest);
+      return;
+    }
+
+    const targetCanSatisfy = args.level === 'project'
+      ? entryMatches(projectIndex, coordinate, digest) && (
+		projectObjects.has(digest)
+		|| (indexNamesDigest(globalIndex, digest) && globalObjects.has(digest))
+      )
+      : globalObjects.has(digest) && (
+		entryMatches(globalIndex, coordinate, digest)
+		|| (entryMatches(projectIndex, coordinate, digest) && !projectObjects.has(digest))
+      );
+    if (!targetCanSatisfy) {
+      throw new Error(
+	`workflow-store bundle ${parent} locks '${coordinate}' to ${digest}, ` +
+		  'but no exact callable coordinate with verified bytes is installed',
+      );
+    }
+    requireTargetDigest(digest, `bundle ${parent} lock '${coordinate}'`);
+  };
+
+  // Follow exact coordinate+digest locks to a fixed point. Digest alone is not
+  // enough: runtime resolution needs the digest-scoped alias for that exact
+  // coordinate, and project-to-global fallback is intentionally asymmetric.
+  for (let cursor = 0; cursor < dependencyQueue.length; cursor += 1) {
+    const digest = dependencyQueue[cursor] as DefDigest;
+    const metadata = installed.get(digest);
+    if (metadata === undefined) continue;
+    for (const dependency of metadata.dependencies) {
+      preserveDependency(digest, dependency.coordinate, dependency.digest);
     }
   }
 
@@ -363,7 +449,7 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   for (const coordinate of Object.keys(targetIndex.entries).sort(compareStoreText)) {
     const entry = targetIndex.entries[coordinate] as WorkflowStoreIndex['entries'][string];
     const digest = defDigest(entry.digest);
-    if (protectedDigests.has(digest)) {
+    if (requiredTargetDigests.has(digest)) {
       nextEntries[coordinate] = entry;
       continue;
     }
@@ -373,10 +459,9 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   }
   const nextIndex: WorkflowStoreIndex = { version: 1, entries: nextEntries };
   const nextDigests = new Set(Object.values(nextEntries).map((entry) => defDigest(entry.digest)));
-  const targetObjects = args.level === 'project' ? projectObjects : globalObjects;
   const objects: WorkflowStoreGcObject[] = [];
   for (const digest of [...targetObjects.keys()].sort(compareStoreText)) {
-    if (protectedDigests.has(digest) || nextDigests.has(digest)) continue;
+    if (protectedTargetObjects.has(digest) || nextDigests.has(digest)) continue;
     const metadata = targetObjects.get(digest) as BundleObjectMetadata;
     objects.push({
       digest,
@@ -401,7 +486,28 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   };
 }
 
-/** Plan, or recompute under the writer lock and apply, one target-root GC. */
+async function acquireGcLocks(roots: readonly string[]): Promise<InstallLockHandle[]> {
+  const statesByLock = new Map(
+    [...new Set(roots.map((root) => projectStoreRoot(root)))]
+      .map((root) => workflowStoreStatePaths(root))
+      .map((state) => [state.lockPath, state] as const),
+  );
+  const locks: InstallLockHandle[] = [];
+  try {
+    for (const lockPath of [...statesByLock.keys()].sort(compareStoreText)) {
+      const state = statesByLock.get(lockPath)!;
+      ensureDirectoryPathNoSymlink(state.stateDir, 'workflow store state directory');
+      guardStateFile(state.lockPath, 'install lock');
+      locks.push(await acquireInstallLock(state.lockPath));
+    }
+    return locks;
+  } catch (error) {
+    for (const lock of locks.reverse()) releaseInstallLock(lock);
+    throw error;
+  }
+}
+
+/** Plan, or recompute under both store writer locks and apply, one target-root GC. */
 export async function collectWorkflowStoreGarbage(
   args: CollectWorkflowStoreGcArgs,
 ): Promise<WorkflowStoreGcReport> {
@@ -423,12 +529,15 @@ export async function collectWorkflowStoreGarbage(
   }
 
   const state = workflowStoreStatePaths(targetRoot);
-  ensureDirectoryPathNoSymlink(state.stateDir, 'workflow store state directory');
-  guardStateFile(state.lockPath, 'install lock');
-  guardStateFile(state.journalPath, 'crash-recovery journal');
-  guardStateFile(workflowStoreGcJournalPath(state.stateDir), 'workflow-store GC journal');
-  const lock = await acquireInstallLock(state.lockPath);
+  // A destructive plan observes both independently written indexes. Acquire
+  // both roots in canonical order so no install or snapshot writer can commit
+  // into either side of the scan-to-delete window. This may create coordination
+  // state at a known-but-missing counterpart root; dry-run remains side-effect
+  // free and only the target index/object tree is changed.
+  const locks = await acquireGcLocks([projectRoot, globalRoot]);
   try {
+    guardStateFile(state.journalPath, 'crash-recovery journal');
+    guardStateFile(workflowStoreGcJournalPath(state.stateDir), 'workflow-store GC journal');
     const stagingRoot = join(targetRoot, STAGING_DIRNAME);
     recoverInterruptedWorkflowStoreGc({ root: targetRoot, stateDir: state.stateDir });
     recoverInterruptedInstall({
@@ -470,11 +579,6 @@ export async function collectWorkflowStoreGarbage(
     }
     for (const object of plan.report.objects) {
       const digest = defDigest(object.digest);
-      const live = objectDirForDigest(targetRoot, digest);
-      const liveState = lstatSync(live, { throwIfNoEntry: false });
-      if (liveState === undefined || liveState.isSymbolicLink() || !liveState.isDirectory()) {
-		throw new Error(`refusing to remove workflow-store object '${live}': it is no longer a real directory`);
-      }
       const parkedName = `gc-${digest}-${randId('park')}`;
       const parked = parkWorkflowStoreGcObject({
 		root: targetRoot,
@@ -495,6 +599,6 @@ export async function collectWorkflowStoreGarbage(
     }
     return { ...plan.report, dryRun: false };
   } finally {
-    releaseInstallLock(lock);
+    for (const lock of locks.reverse()) releaseInstallLock(lock);
   }
 }

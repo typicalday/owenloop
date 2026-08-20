@@ -142,7 +142,11 @@ the selected content-addressed store plus the local runtime database's retained
 definition snapshots. The project store under `--defs`/`OWENLOOP_DEFS` is the
 default target; `--global` targets only `<home>/.owenloop/workflows` and cannot
 be combined with a defs override. The other store may be read to establish
-reachability, but only the selected root is ever mutated. GC never contacts the
+reachability. An applied run acquires both roots' writer locks in canonical
+order, so installs cannot enter either side of the scan-to-delete window. Only
+the selected root's bundle index and object tree are changed; coordinating with
+a known but not-yet-created counterpart root may create its `.owenloop` lock
+state so a concurrent first install uses the same lock. GC never contacts the
 hub.
 
 GC is a pure dry run unless `--yes` is present. A dry run does not create a
@@ -156,15 +160,25 @@ An unchanged `--yes` run reports the same candidates as its preceding dry run.
 
 The collector protects every cross-root selected winner, the best `--keep`
 versions of each qualified workflow, explicit index pins, every bundle digest
-and lock dependency in retained local workflow snapshots, transitive
-`bundleLock` dependencies, and (for global GC) every digest referenced by the
-project index. An all-non-SemVer candidate group is kept in full rather than
+and lock dependency in retained local workflow snapshots, and the exact
+coordinate+digest dependency closure of every retained bundle in either index.
+Project-to-global fallback is preserved. Protection is root-scoped: a complete
+non-target coordinate/object copy can satisfy an exact edge without keeping a
+redundant target copy, so `--keep` still bounds identical histories installed
+in both roots. An all-non-SemVer candidate group is kept in full rather than
 given an invented order. Multi-workflow bundles and multiple coordinates for
 one digest are retained or collected atomically. Malformed indexes, objects,
-links, special files, or snapshots fail closed before deletion. Runtime
-snapshot writers share the target store's writer lock and revalidate CAS
-reachability before beginning SQLite, so GC either sees the committed pin or a
-writer holding a stale definition is refused and must reload.
+links, special files, or snapshots fail closed before deletion.
+
+Runtime snapshot writers share the relevant store writer locks and revalidate
+CAS reachability before beginning SQLite. Bundle installs revalidate every
+manifest lock against the combined store after taking their root lock and before
+commit. GC therefore either observes a committed caller/pin, or a stale writer
+is refused after collection and must reload. On filesystems that require a
+temporary owner-write bit to move a hardened object, GC persists an
+index-correlated journal first; all writers recover that journal before shared
+staging cleanup, and the rename's source and destination parents are fsynced
+before the evidence is cleared.
 
 `pack` requires a source directory containing root `bundle.yaml` and every
 workflow path listed by the manifest's `workflows` map. The source manifest is

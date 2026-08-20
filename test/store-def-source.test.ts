@@ -887,34 +887,19 @@ test('an already-running explicit-version parent stays pinned after a newer chil
   }
 });
 
-test('explicit versioned calls enforce the manifest lock before child creation', async () => {
-  const installed = await installVersionedCall({
-    marker: 'LOCK-MISMATCH',
-    lockDigest: 'f'.repeat(64),
-  });
-  const dir = tempDir('owenloop-versioned-mismatch-');
-  const store = openStore(join(dir, 'state.db'));
-  try {
-    const defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
-    const engine = new Engine(store, (name, from) => {
-      const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
-      if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
-      return def;
-    });
-
-    const parent = engine.createInstance('caller/caller@1.0.0', {
-      provide: { seed: { ready: true } },
-    });
-    engine.tick(parent, { deep: false });
-
-    assert.equal(store.findChildByParent(parent, 'delivered'), undefined, 'no mismatched child is created');
-    assert.match(
-      store.getArtifact(parent, 'delivered')?.reasons.at(-1)?.text ?? '',
-      /parent bundle pins .* but the resolved definition comes from/u,
-    );
-  } finally {
-    store.close();
-  }
+test('explicit versioned calls with a stale manifest lock are rejected before install commit', async () => {
+  const root = tempDir('owenloop-versioned-mismatch-');
+  await assert.rejects(
+    installVersionedCall({
+      marker: 'LOCK-MISMATCH',
+      lockDigest: 'f'.repeat(64),
+      root,
+    }),
+    /lock target 'dep\/child@1\.0\.0'.*no longer exactly callable/u,
+  );
+  const index = readWorkflowStoreIndex(storeIndexPath(root));
+  assert.equal(index.entries['caller/caller@1.0.0'], undefined);
+  assert.ok(index.entries['dep/child@1.0.0'], 'the already-installed dependency remains unchanged');
 });
 
 // ---- acceptance (c): a pin mismatch is a visible debt, not a silent run ------

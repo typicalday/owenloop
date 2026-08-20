@@ -323,12 +323,15 @@ owenloop bundle gc --global             # global store, report only
 
 The default keep count is 2 (current plus one rollback version). GC preserves
 selected versions, explicit pins, retained local instance snapshots, transitive
-bundle locks, and project-index references into the global store. It never
-contacts the hub and mutates only the explicitly targeted root; `--yes` is the
-only destructive switch. CAS-backed instance creation, child creation, and
-adoption share the store writer lock with GC and revalidate the digest before
-their SQLite snapshot transaction, so a stale definition cannot be pinned
-during or immediately after collection.
+bundle locks from every retained coordinate in either root, and project-index
+fallback into the global store. Reachability is coordinate- and root-aware, so
+an intact non-target copy does not keep a redundant target history beyond
+`--keep`. It never contacts the hub; `--yes` is the only destructive switch
+and only the target bundle index/object tree is changed. Applied GC takes both
+roots' writer locks (creating only coordination state at a known missing
+counterpart root when necessary). CAS-backed snapshot writers share those locks,
+and bundle installs revalidate exact manifest locks before commit, so stale
+definitions or callers cannot be pinned during or immediately after collection.
 
 Bundle installs fail closed without their two required adapters (bundle
 ingestion and pre-commit verification). The default CLI binds the real
