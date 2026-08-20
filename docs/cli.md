@@ -2927,6 +2927,22 @@ like every other command — an explicit bad value is reported, never silently
 skipped, precisely because rungs 1–2 come from something the operator typed
 or set, not from inference.
 
+### Chief-of-staff guidance
+
+The `initialize` result includes an `instructions` string for MCP hosts. It
+sets the expected operating posture for the control plane: act as the human's
+chief of staff, inspect the complete workflow catalog before doing multi-step
+work, and start a fitting playbook so its crews can execute. Inline step work is
+appropriate only when no available crew serves the required capability.
+
+After a run starts or is attended, an MCP client should park on `wake` and call
+`whats_next` when the returned cursor changes (or when a workflow needs a tick
+or the human asks for an inbox). The client relays gates, worker asks, receipts,
+and status to the human; `provide_input` carries human gate answers and
+`retry_artifact` carries answers to worker `ask` escalations. Rejection is
+feedback to surface and resolve, not a route to bypass: use `reject_artifact`
+only for a real upstream defect with a concrete reason.
+
 ### Tools
 
 The server exposes 20 baseline tools mirroring the hub's own MCP toolset, plus
@@ -2938,14 +2954,14 @@ block; a non-2xx response comes back as an error result.
 | tool | what it does |
 |---|---|
 | `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances; optional `serve_capabilities` accepts raw advertised keys |
-| `submit` | submit a work order output |
-| `reject_artifact` | send an upstream artifact back to its producer with a reason |
-| `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask` |
-| `provide_input` | answer a human gate — provide a value for a seeded/owed input |
-| `start_run` | create a new instance from a definition name; optional `scope` (free routing label, defaults to the session's repo name) and `priority` (`low\|normal\|high`) |
-| `create_workflow` | parse + load a workflow def YAML (the authoring hard gate) |
-| `get_workflow` | fetch one loaded definition |
-| `list_workflows` | names, titles, step counts, and def hash/version of every loaded def |
+| `submit` | return an owed work-order output from a crew member or held-order holder; not a way for a chief of staff to fabricate inline progress |
+| `reject_artifact` | send a real upstream defect back to its producer with a concrete reason |
+| `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask`; it must not bypass unresolved rejection feedback |
+| `provide_input` | relay a human answer into a seeded/owed gate |
+| `start_run` | start a fitting multi-step playbook and let its crews execute; optional `scope` (free routing label, defaults to the session's repo name) and `priority` (`low\|normal\|high`) |
+| `create_workflow` | parse + load a workflow def YAML when no catalog entry fits and the human chooses ordinary authoring |
+| `get_workflow` | inspect a promising loaded definition before selecting it |
+| `list_workflows` | first-check discovery: names, titles, step counts, and def hash/version of every loaded def |
 | `get_status` | `engine.status` verbatim plus a plain-English rendering |
 | `heartbeat` | touch the liveness timestamp on an open run so it is not reaped mid-step |
 | `get_order` | re-fetch the persisted order packet and lease state for a run you hold |
