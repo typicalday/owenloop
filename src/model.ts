@@ -669,17 +669,11 @@ function callsDischargeFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
 /**
  * The model-only collection-member retractions available in THIS state.
  *
- * `Engine.retract()` is an authority action rather than a scheduler action.
- * The checker models its graph-reached rejected-member case only: a rejected
- * member has no ordinary map firing, so without this transition modelCheck
- * would call that runtime-valid state a deadlock.
- *
- * Retracting a green, owed, or skipped member later is an operator lever, like
- * retry, and is deliberately outside this bounded model. Definitions with a
- * bare member as an ordinary firing output continue to model retraction at
- * production through `eligibleOutcomes()`' existing member outcome branch.
- * Keeping that distinction prevents an unbounded operator-action cross-product
- * while still modeling the rejection deadlock this transition releases.
+ * `Engine.retract()` is an authority action rather than a scheduler action:
+ * every existing bare member that is not already retracted remains available
+ * to each authorized non-judge consumer. In particular, the transition must
+ * remain available after rejection, when a member has no ordinary map firing;
+ * otherwise modelCheck would call that runtime-valid state a deadlock.
  *
  * Kept separate from `eligibleFirings` deliberately: that function is the
  * live worker scheduler, while these synthetic firings are consumed only by
@@ -689,7 +683,7 @@ export function memberRetractFirings(def: WorkflowDef, arts: ArtifactMap): Membe
   const members = [...arts.values()]
     .flatMap((art) => {
       const el = parseElement(art.path);
-      return el && el.suffix === '' && art.acceptance === 'rejected' ? [{ art, el }] : [];
+      return el && el.suffix === '' && art.acceptance !== 'retracted' ? [{ art, el }] : [];
     })
     .sort((a, b) =>
       a.el.stem.localeCompare(b.el.stem) || a.el.index - b.el.index || a.art.path.localeCompare(b.art.path),
@@ -2520,7 +2514,12 @@ function projectedIndexedPath(path: string, projection: RetractedMemberProjectio
   const element = parseElement(path);
   if (!element) return path;
   const denseIndex = projection.denseIndices.get(memberIdentity(element.stem, element.index));
-  return denseIndex === undefined ? path : `${element.stem}[${denseIndex}]${element.suffix}`;
+  if (denseIndex !== undefined) return `${element.stem}[${denseIndex}]${element.suffix}`;
+  // A skipped fingerprint can point at a terminal family that was projected
+  // away. Its former numeric index is equally unobservable, while the stem and
+  // suffix still distinguish the dependency shape.
+  if (projection.omittedPaths.has(path)) return `${element.stem}[retracted]${element.suffix}`;
+  return path;
 }
 
 /** Exported direct-module test seam for model state equivalence. */

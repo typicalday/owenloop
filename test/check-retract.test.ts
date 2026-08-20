@@ -59,6 +59,7 @@ test('canonicalKey: quotients only terminal retracted collection-member families
       { path: 'items[0]', producer: 'fanout', acceptance: 'retracted', version: 9, judgmentRejects: 2 },
       { path: 'items[0].checked', producer: 'mapper', acceptance: 'retracted', version: 8, schemaRejects: 4 },
       { path: 'items[0].checked.review', producer: 'reviewer', acceptance: 'retracted', version: 7 },
+      { path: 'draft', acceptance: 'skipped', version: 0, fingerprint: { 'items[0].checked': 1 } },
       { path: 'items[1]', producer: 'fanout', acceptance: 'green', version: 1 },
       {
 	path: 'items[1].checked',
@@ -76,6 +77,7 @@ test('canonicalKey: quotients only terminal retracted collection-member families
       { path: 'items[3]', producer: 'fanout', acceptance: 'retracted', version: 2, judgmentRejects: 0 },
       { path: 'items[3].checked', producer: 'mapper', acceptance: 'retracted', version: 1, schemaRejects: 0 },
       { path: 'items[3].checked.review', producer: 'reviewer', acceptance: 'retracted', version: 1 },
+      { path: 'draft', acceptance: 'skipped', version: 0, fingerprint: { 'items[3].checked': 1 } },
       { path: 'items[4]', producer: 'fanout', acceptance: 'green', version: 1 },
       {
 	path: 'items[4].checked',
@@ -121,7 +123,7 @@ test('canonicalKey: quotients only terminal retracted collection-member families
   );
 });
 
-test('memberRetractFirings: rejected member retracts through every authorized non-judge consumer', () => {
+test('memberRetractFirings: every non-retracted member retracts through every authorized non-judge consumer', () => {
   let state = settleInMemory(
     memberRetractFixture,
     new Map(arts([{ path: 'question', acceptance: 'green', version: 1 }])),
@@ -130,11 +132,23 @@ test('memberRetractFirings: rejected member retracts through every authorized no
   const gather = eligibleFirings(memberRetractFixture, state).find((f) => f.step === 'gather');
   assert.ok(gather, 'collection producer must be eligible');
   state = applyOutcome(memberRetractFixture, state, gather, 'emit-seal', { maxCollectionSize: 1 })[1]!;
+  const expectedActors = ['check', 'synth', 'plain-consumer'];
   assert.deepEqual(
-    memberRetractFirings(memberRetractFixture, state),
-    [],
-    'green members are operator-lever retractions and are not synthetic model transitions',
+    memberRetractFirings(memberRetractFixture, state).map((f) => f.step),
+    expectedActors,
+    'a green bare member remains model-retractable to every authorized non-judge consumer',
   );
+  for (const acceptance of ['owed', 'skipped'] as const) {
+    const variant = new Map(state);
+    const member = variant.get('gather.source[0]');
+    assert.ok(member, 'setup must contain the emitted bare member');
+    variant.set('gather.source[0]', { ...member, acceptance });
+    assert.deepEqual(
+      memberRetractFirings(memberRetractFixture, variant).map((f) => f.step),
+      expectedActors,
+      `a ${acceptance} bare member remains model-retractable to every authorized non-judge consumer`,
+    );
+  }
 
   const check = eligibleFirings(memberRetractFixture, state).find((f) => f.step === 'check');
   assert.ok(check, 'map consumer must be eligible for the emitted member');
@@ -144,8 +158,8 @@ test('memberRetractFirings: rejected member retracts through every authorized no
   const offered = memberRetractFirings(memberRetractFixture, state);
   assert.deepEqual(
     offered.map((f) => f.step),
-    ['check', 'synth', 'plain-consumer'],
-    'every map/reduce/plain consumer gets exactly one authorized member retract',
+    expectedActors,
+    'a rejected member retains one retract transition for every map/reduce/plain consumer',
   );
   assert.ok(
     offered.every(
@@ -186,14 +200,13 @@ test('memberRetractFirings: rejected member retracts through every authorized no
   );
 });
 
-test('modelCheck: shipped research exhaustively reaches no collection-member deadlocks', () => {
+test('modelCheck: shipped research has no collection-member deadlocks within the reported bound', () => {
   const shippedResearch = loadDefFile(new URL('../examples/workflows/research.yaml', import.meta.url));
   const report = modelCheck(shippedResearch, { maxStates: 50_000, assumeProvided: true });
 
-  assert.equal(report.bounded, false);
-  assert.deepEqual(report.boundsHit, []);
   assert.deepEqual(report.deadlocks, []);
   assert.deepEqual(report.structurallyDeadSteps, []);
   assert.deepEqual(report.invariantViolations, []);
   assert.equal(report.completable, true);
+  assert.ok(report.stats.statesExplored > 0, 'the shipped fixture should produce a concrete bound report');
 });

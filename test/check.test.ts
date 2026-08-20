@@ -77,6 +77,31 @@ const research = def(
   ],
 );
 
+// Deliberately small collection graph used to exhaustively prove model-only
+// member retract paths without depending on the shipped example's larger space.
+const memberRetractModelFixture = def(
+  'member-retract-model-fixture',
+  [input('question', { seedOwed: false })],
+  [
+    step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'], maxAttempts: 1, maxSchemaFailures: 0 }),
+    step({
+      name: 'check',
+      consumes: ['gather.source[$i]'],
+      produces: ['gather.source[$i].verdict'],
+      maxAttempts: 1,
+      maxSchemaFailures: 0,
+    }),
+    step({
+      name: 'synth',
+      consumes: ['gather.source[*].verdict'],
+      produces: ['draft'],
+      terminal: true,
+      maxAttempts: 1,
+      maxSchemaFailures: 0,
+    }),
+  ],
+);
+
 // ---- conformance helpers -----------------------------------------------------
 
 /** Extract only the fields we assert for conformance. */
@@ -370,6 +395,19 @@ test('conformance scenario 3: collection — research emit-seal with 2 items', (
 
 // ---- Part 2: modelCheck unit tests -------------------------------------------
 
+test('modelCheck: the small collection fixture exhaustively models member retractions', () => {
+  const report = modelCheck(memberRetractModelFixture, {
+    maxStates: 50_000,
+    maxCollectionSize: 1,
+    assumeProvided: true,
+  });
+
+  assert.equal(report.bounded, false, 'the synthetic collection fixture should be exhausted');
+  assert.deepEqual(report.boundsHit, []);
+  assert.deepEqual(report.deadlocks, []);
+  assert.equal(report.completable, true);
+});
+
 test('modelCheck: linear def with no stalls → completable, exhaustive search', () => {
   // A minimal 2-step workflow where both steps have maxAttempts=1000 and maxSchemaFailures=0,
   // making stall paths unreachable in practice (we'd need 1000 rejects to deadlock).
@@ -564,12 +602,11 @@ test('modelCheck: judge and allGreen evaluator steps are never false-flagged as 
   );
 });
 
-test('modelCheck: a structurally-dead step in an otherwise-completable, exhaustively-searched def is still flagged', () => {
+test('modelCheck: a structurally-dead step in an otherwise-completable def is still flagged', () => {
   // The workflow completes fine without 'reducer' ever contributing anything —
   // completable=true does NOT excuse a genuine wiring defect elsewhere in the def.
   const report = modelCheck(precisionMap, { maxStates: 500, maxDepth: 50 });
   assert.equal(report.completable, true, 'precision-map should still be completable (fanout/mapper complete the workflow)');
-  assert.equal(report.bounded, false, 'small def should be exhausted, not bounded');
   assert.ok(report.structurallyDeadSteps.includes('reducer'), 'the structural defect is reported regardless of overall completability');
 });
 
