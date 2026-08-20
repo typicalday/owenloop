@@ -477,6 +477,16 @@ function need(args: Args, idx: number, label: string): string {
   return v;
 }
 
+const WORKFLOW_ID_RE = /^wf_[0-9a-f]{24}$/u;
+
+function assertWorkflowIdShape(workflow: string): void {
+  if (!WORKFLOW_ID_RE.test(workflow)) {
+    throw new CliError(
+      `invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+    );
+  }
+}
+
 function needOpt(args: Args, key: string): string {
   const v = last(args, key);
   if (v === undefined) throw new CliError(`missing required option: --${key}`);
@@ -1564,7 +1574,7 @@ ${' '.repeat(41)}one run and flips to oldest first. A \`binding-gap\` alert mean
 ${' '.repeat(41)}offer because its compound capability had no live crew binding.
   routing show <workflow> [--hub <url>]
 ${' '.repeat(41)}print one HUB run's routing: modifier, wait policy, alerts, resolution reports
-${' '.repeat(41)}and escalations. Unrelated to the local \`show\`, which reads a def from sqlite.
+${' '.repeat(41)}and escalations. Unrelated to the local \`show\`, which reads raw artifacts from sqlite.
   routing rule list [--hub <url>]           list the org's capability reroute rules in the order the hub tries them
   routing rule add <capability> <target> [--position <n>] [--hub <url>]   add one reroute rule — offer <capability> as <target> when it has no live crew binding (admin; idempotent per pair; no --position appends)
   routing rule rm <capability> <target> [--hub <url>]   remove one reroute rule (admin; a rule that was never there is a no-op)
@@ -2592,6 +2602,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       }
       case 'show': {
         const wf = need(args, 1, 'workflow');
+	if (store.getWorkflow(wf) === undefined) {
+	  throw new CliError(`no such workflow instance: ${wf}`);
+	}
         print(io, store.listArtifacts(wf));
         return 0;
       }
@@ -6087,6 +6100,7 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
  */
 async function dispatchCancel(io: CliIO, args: Args): Promise<number> {
   const workflow = need(args, 1, 'workflow');
+  assertWorkflowIdShape(workflow);
   if (args.missingOptionValues.has('reason')) {
     throw new CliError('missing value for --reason: expected --reason <text>');
   }
@@ -6153,6 +6167,7 @@ async function dispatchCancel(io: CliIO, args: Args): Promise<number> {
 async function dispatchRetry(io: CliIO, args: Args): Promise<number> {
   const workflow = need(args, 1, 'workflow');
   const path = need(args, 2, 'path');
+  assertWorkflowIdShape(workflow);
   if (args.options.has('by')) {
     throw new CliError('owenloop retry: --by cannot be combined with --hub — the hub attributes the retry to the authenticated human principal');
   }
@@ -6227,6 +6242,7 @@ async function dispatchPendingGates(io: CliIO, args: Args): Promise<number> {
 async function dispatchReject(io: CliIO, args: Args): Promise<number> {
   const workflow = need(args, 1, 'workflow');
   const path = need(args, 2, 'path');
+  assertWorkflowIdShape(workflow);
   if (args.options.has('by')) {
     throw new CliError('owenloop reject: --by cannot be combined with --hub — the hub attributes the rejection to the authenticated human principal');
   }
@@ -6280,6 +6296,7 @@ async function dispatchReject(io: CliIO, args: Args): Promise<number> {
 async function dispatchProvide(io: CliIO, args: Args): Promise<number> {
   const workflow = need(args, 1, 'workflow');
   const name = need(args, 2, 'name');
+  assertWorkflowIdShape(workflow);
   // Keep this ahead of binding, credentials, and fetch: malformed input has no
   // external effects, matching the local provide command's JSON contract.
   const value = parseJson(last(args, 'value'));
@@ -6346,6 +6363,7 @@ async function dispatchInstance(io: CliIO, args: Args): Promise<number> {
   if (workflow === undefined || workflow === '') {
     throw new CliError(`missing required argument: workflow (${USAGE_FORMS})`);
   }
+  assertWorkflowIdShape(workflow);
 
   const origin = resolveStartHub(io, args);
   const slot: CredentialSlotSelector = { principal: 'human' };
@@ -6354,8 +6372,8 @@ async function dispatchInstance(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
   }
 
-  // The workflow id is a path segment, so it must be encoded — an id carrying a
-  // slash would otherwise silently address a different route.
+  // Retain path-segment encoding as defense in depth: the validator currently
+  // excludes slashes, but the hub remains a separate service boundary.
   const path = `/api/status/${encodeURIComponent(workflow)}`;
   const { res, cred: used } = await authedGet(io, origin, slot, cred, path);
   if (res.status === 401) assertAuthOk(res, used, origin);
@@ -6989,7 +7007,7 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
  *    finds out it happened.
  *
  * **`routing show <workflow>` is NOT the local `show` command.** `owenloop show`
- * reads a workflow DEFINITION out of the local sqlite store and takes no `--hub`;
+ * reads raw workflow artifacts out of the local sqlite store and takes no `--hub`;
  * `routing show` reads one STARTED RUN's routing state off the hub. They share no
  * code path, and this deliberately did not arrive as a `--hub` flag on the local
  * command — the same separation `instance show` keeps.
@@ -7051,6 +7069,7 @@ async function dispatchRouting(io: CliIO, args: Args): Promise<number> {
     if (rawWorkflow === undefined || rawWorkflow === '') {
       throw new CliError(`missing required argument: <workflow> (${USAGE_FORMS})`);
     }
+    assertWorkflowIdShape(rawWorkflow);
     workflow = rawWorkflow;
   } else if (sub === 'alerts') {
     // `--workflow` with no value, or with an empty one, is a usage error rather
@@ -7169,9 +7188,8 @@ async function dispatchRouting(io: CliIO, args: Args): Promise<number> {
     }
 
     if (sub === 'show') {
-      // The workflow id is a path segment, so it must be encoded — an id carrying
-      // a slash would otherwise silently address a different route
-      // (`dispatchInstance`'s precedent).
+      // Retain path-segment encoding as defense in depth: the validator currently
+      // excludes slashes, but the hub remains a separate service boundary.
       const body = await readJson(
         `/api/run_routing/${encodeURIComponent(workflow)}`,
         'run_routing: malformed success response',

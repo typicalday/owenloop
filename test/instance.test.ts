@@ -19,7 +19,7 @@ import type { Credential } from '../src/hub.ts';
 import { kcHuman, makeIo, routedFetch } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
-const WORKFLOW = 'wf_stuck';
+const WORKFLOW = 'wf_dddddddddddddddddddddddd';
 const OAUTH_CRED: Credential = {
   kind: 'oauth',
   accessToken: 'mcpat_instance_fixture',
@@ -135,7 +135,7 @@ test('instance show: surfaces a terminal instance status without corrupting JSON
   const printed = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
   assert.equal(printed.instanceStatus, 'failed');
   assert.equal(printed.terminal, true);
-  assert.match(t.err.join('\n'), /wf_stuck/u);
+  assert.match(t.err.join('\n'), /wf_dddddddddddddddddddddddd/u);
   assert.match(t.err.join('\n'), /failed/u);
   assert.match(t.err.join('\n'), /TERMINAL/u);
 });
@@ -214,25 +214,21 @@ test('instance show: a done instance reports done true', async () => {
   assert.equal(JSON.parse(t.out.join('\n')).done, true);
 });
 
-/**
- * A workflow id is interpolated into the URL path. If it were not encoded, an id
- * containing a slash would address a different route entirely and the command
- * would report another instance's state as if it were this one.
- */
-test('instance show: the workflow id is percent-encoded into the path', async () => {
-  const { fetch, calls } = routedFetch({
-    'GET /api/status/wf%2Fodd': () => ({
-      status: 200,
-      json: { text: 'x', done: false, debts: [], eligible: [], blocked: [], inFlight: [], defDrift: false },
-    }),
-  });
+test('instance show: rejects a malformed workflow id before fetch', async () => {
+  const { fetch, calls } = routedFetch({});
   const t = makeIo({ fetch });
   bind(t);
 
-  const code = await mainAsync(['instance', 'show', 'wf/odd'], t.io);
+  const workflow = 'wf/odd';
+  const code = await mainAsync(['instance', 'show', workflow], t.io);
 
-  assert.equal(code, 0, t.err.join('\n'));
-  assert.equal(calls[0]!.url, `${ORIGIN}/api/status/wf%2Fodd`);
+  assert.equal(code, 1);
+  assert.equal(
+    t.err.join('\n'),
+    `error: invalid workflow id '${workflow}': expected wf_ followed by 24 lowercase hexadecimal characters`,
+  );
+  assert.deepEqual(t.out, []);
+  assert.equal(calls.length, 0);
 });
 
 test('instance show: an unknown or missing subcommand is a usage error', async () => {
