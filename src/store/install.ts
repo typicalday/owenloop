@@ -74,7 +74,7 @@ import type {
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
-import { loadCasDefs, loadCasDefsExcludingRepairObject } from './def-source.ts';
+import { loadCasDefs, loadCasDefsWithRepairReplacement } from './def-source.ts';
 import { compareStoreText, defDigest, objectDirForDigest } from './types.ts';
 import { projectStoreRoot, storeIndexPath } from './resolve.ts';
 import { recoverInterruptedWorkflowStoreGc } from './gc-recovery.ts';
@@ -190,7 +190,7 @@ function assertManifestLocksResolvable(args: {
   projectRoot: string | undefined;
   globalRoot: string | undefined;
   lock: Readonly<Record<string, string>>;
-  excludedRepairObject?: { root: string; digest: DefDigest };
+  repairReplacement?: { root: string; digest: DefDigest; objectDir: string };
 }): void {
   const entries = Object.entries(args.lock);
   if (entries.length === 0) return;
@@ -214,9 +214,9 @@ function assertManifestLocksResolvable(args: {
   // the callable default/sole-workflow target, and the exact project/global
   // fallback semantics used when a running workflow resolves its bundleLock.
   const loadArgs = { projectRoot, globalRoot, warn: () => {} };
-  const registrations = args.excludedRepairObject === undefined
+  const registrations = args.repairReplacement === undefined
     ? loadCasDefs(loadArgs)
-    : loadCasDefsExcludingRepairObject(loadArgs, args.excludedRepairObject);
+    : loadCasDefsWithRepairReplacement(loadArgs, args.repairReplacement);
   const callableKeys = new Set(
     registrations
       .filter((registration) => registration.kind === 'coordinate')
@@ -532,15 +532,16 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // destructive GC owns both root locks, so either this commit becomes visible
     // to its reachability scan or a GC-first removal makes this stale caller
     // fail here before any journal/object/index mutation. A verified staged
-    // same-digest repair may exclude only its broken physical destination from
-    // discovery; every lock dependency and unrelated object remains strict.
+    // same-digest repair may substitute its verified staged replacement only
+    // for the broken destination; every lock dependency, unrelated object, and
+    // same-digest physical copy at another root remains strict.
     assertManifestLocksResolvable({
       root,
       level,
       projectRoot: args.projectRoot,
       globalRoot: args.globalRoot,
       lock: stagedBundleLock,
-      ...(repairRequired ? { excludedRepairObject: { root, digest } } : {}),
+      ...(repairRequired ? { repairReplacement: { root, digest, objectDir: stagingDir } } : {}),
     });
 
     // The post-install index, computed BEFORE the commit point so its exact

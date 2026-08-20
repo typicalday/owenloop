@@ -111,9 +111,10 @@ interface ReadIndexResult {
 	complete: boolean;
 }
 
-interface ExcludedRepairObject {
+interface RepairObjectReplacement {
 	root: string;
 	digest: DefDigest;
+	objectDir: string;
 }
 
 function setBundleStoreRoots(def: WorkflowDef, roots: string[]): void {
@@ -137,18 +138,12 @@ function readIndexedCoordinates(
 	level: ResolutionLevel,
 	tolerant: boolean,
 	warn: (line: string) => void,
-	excludedRepairObject?: ExcludedRepairObject,
 ): ReadIndexResult {
 	try {
 		if (probeStoreRoot(root) !== 'dir') return { entries: [], complete: true };
 		const index = readWorkflowStoreIndex(storeIndexPath(root));
 		const entries = Object.entries(index.entries)
 			.sort(([a], [b]) => compareStoreText(a, b))
-			.filter(([, entry]) => (
-				excludedRepairObject === undefined
-				|| root !== excludedRepairObject.root
-				|| defDigest(entry.digest) !== excludedRepairObject.digest
-			))
 			.map(([coordinate, entry]) => ({
 				coordinate: coordinate as WorkflowCoordinate,
 				entry,
@@ -169,9 +164,10 @@ function loadObjectDefs(
 	objectDir: string,
 	bundleDigest: DefDigest,
 	level: ResolutionLevel,
+	requireHardenedModes = true,
 ): LoadedObject {
 	try {
-		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
+		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false, requireHardenedModes });
 		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
 		const defs = new Map<string, WorkflowDef>();
 		// Sorted, not YAML key order. `defs` is handed to callers as a Map, whose
@@ -228,16 +224,29 @@ function resolveObject(
 	indexed: IndexedCoordinate,
 	globalRoot: string,
 	globalDigests: ReadonlySet<DefDigest>,
+	repairReplacement?: RepairObjectReplacement,
 ): LoadedObject {
 	const digest = defDigest(indexed.entry.digest);
-	const primary = loadObjectIfPresent(indexed.root, digest, indexed.level);
+	const loadAtRoot = (root: string, level: ResolutionLevel): LoadedObject | undefined => {
+		if (
+			repairReplacement !== undefined
+			&& root === repairReplacement.root
+			&& digest === repairReplacement.digest
+		) {
+			// Staging is hardened only after the swap; canonical bytes and
+			// definition semantics are still verified here before revalidation.
+			return loadObjectDefs(root, repairReplacement.objectDir, digest, level, false);
+		}
+		return loadObjectIfPresent(root, digest, level);
+	};
+	const primary = loadAtRoot(indexed.root, indexed.level);
 	if (primary !== undefined) return primary;
 
 	// An indexed project object may fall through only to the exact same digest,
 	// and only when that digest is also indexed globally. A different global
 	// digest for the coordinate is never considered.
 	if (indexed.level === 'project' && globalDigests.has(digest)) {
-		const fallback = loadObjectIfPresent(globalRoot, digest, 'global');
+		const fallback = loadAtRoot(globalRoot, 'global');
 		if (fallback !== undefined) return fallback;
 	}
 
@@ -422,7 +431,7 @@ function selectWorkflowRegistrations(
 function discoverCasDefs(
 	args: LoadCasDefsArgs,
 	tolerant: boolean,
-	excludedRepairObject?: ExcludedRepairObject,
+	repairReplacement?: RepairObjectReplacement,
 ): CasDefInspectionResult {
 	const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
 	const globalRoot = projectStoreRoot(args.globalRoot);
@@ -430,8 +439,8 @@ function discoverCasDefs(
 
 	const project = sameRoot
 		? { entries: [] as IndexedCoordinate[], complete: true }
-		: readIndexedCoordinates(projectRoot, 'project', tolerant, args.warn, excludedRepairObject);
-	const global = readIndexedCoordinates(globalRoot, 'global', tolerant, args.warn, excludedRepairObject);
+		: readIndexedCoordinates(projectRoot, 'project', tolerant, args.warn);
+	const global = readIndexedCoordinates(globalRoot, 'global', tolerant, args.warn);
 	let complete = project.complete && global.complete;
 
 	const projectCoordinates = new Set(project.entries.map((item) => item.coordinate));
@@ -469,7 +478,7 @@ function discoverCasDefs(
 			}
 			let loaded = loadedAtRoot.get(digest);
 			if (loaded === undefined) {
-				loaded = resolveObject(indexed, globalRoot, globalDigests);
+				loaded = resolveObject(indexed, globalRoot, globalDigests, repairReplacement);
 				loadedAtRoot.set(digest, loaded);
 			}
 			const target = coordinateTarget(indexed, loaded);
@@ -560,19 +569,22 @@ export function loadCasDefs(args: LoadCasDefsArgs): CasDefRegistration[] {
  * Strict combined-store discovery for a same-digest repair transaction.
  *
  * The installer calls this only after independently verifying the staged
- * replacement. Ignoring the broken physical copy lets its exact reinstall
- * reach the repair swap while every dependency and unrelated indexed object
- * still goes through the ordinary strict execution-time discovery path.
+ * replacement. Substituting those bytes for the repairing root/digest lets its
+ * exact reinstall reach the repair swap without removing the indexed digest
+ * that project fallback legitimately depends on. Every dependency, unrelated
+ * object, and same-digest copy at another root still goes through the ordinary
+ * strict execution-time discovery path.
  * This transaction-only seam is deliberately not re-exported from the store
  * barrel: executable discovery must never suppress a corrupt object.
  */
-export function loadCasDefsExcludingRepairObject(
+export function loadCasDefsWithRepairReplacement(
 	args: LoadCasDefsArgs,
-	excluded: { root: string; digest: DefDigest },
+	replacement: { root: string; digest: DefDigest; objectDir: string },
 ): CasDefRegistration[] {
 	return discoverCasDefs(args, false, {
-		root: projectStoreRoot(excluded.root),
-		digest: defDigest(excluded.digest),
+		root: projectStoreRoot(replacement.root),
+		digest: defDigest(replacement.digest),
+		objectDir: replacement.objectDir,
 	}).registrations;
 }
 

@@ -996,6 +996,78 @@ test('reinstall repairs a locked same-digest bundle after legacy executable-mode
   );
 });
 
+test('locked global same-digest repair preserves project exact-digest fallback', async () => {
+  const projectRoot = tempDir('owenloop-locked-global-repair-project-');
+  const globalRoot = emptyGlobalRoot();
+  const target = 'dep/child@1.0.0';
+  const childSource = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('GLOBAL-REPAIR-DEPENDENCY'),
+  });
+  const child = await installBundleFixture({
+    sourceDir: childSource,
+    root: globalRoot,
+    level: 'global',
+    projectRoot,
+    globalRoot,
+  });
+  const globalChildIndex = readWorkflowStoreIndex(storeIndexPath(globalRoot));
+  addIndexCoordinate(globalRoot, target, { ...globalChildIndex.entries['child/child@1.0.0']! });
+
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: versionedParentYaml(target, 'GLOBAL-REPAIR-CALLER'),
+    lock: { [target]: child.result.digest },
+    files: { 'bin/run.sh': '#!/bin/sh\nprintf "ok\\n"\n' },
+  });
+  chmodSync(join(callerSource, 'bin', 'run.sh'), 0o755);
+  const caller = await installBundleFixture({
+    sourceDir: callerSource,
+    root: globalRoot,
+    level: 'global',
+    projectRoot,
+    globalRoot,
+  });
+  const globalIndex = readWorkflowStoreIndex(storeIndexPath(globalRoot));
+  addIndexCoordinate(projectRoot, 'caller/caller@1.0.0', {
+    ...globalIndex.entries['caller/caller@1.0.0']!,
+  });
+  const projectIndexBefore = readFileSync(storeIndexPath(projectRoot));
+  const globalIndexBefore = readFileSync(storeIndexPath(globalRoot));
+  const executable = join(caller.result.objectPath, 'bin', 'run.sh');
+
+  chmodSync(executable, 0o444);
+  assert.throws(
+    () => loadCasDefs({ projectRoot, globalRoot, warn: () => {} }),
+    /canonical bundle digest mismatch|expected hardened store mode/u,
+  );
+
+  const repaired = await installBundleFixture({
+    sourceDir: callerSource,
+    root: globalRoot,
+    level: 'global',
+    projectRoot,
+    globalRoot,
+  });
+  assert.equal(repaired.result.installed, false, 'same-digest global reinstall takes the repair path');
+  assert.equal(statSync(executable).mode & 0o7777, 0o555, 'repair restores the executable bit');
+  assert.deepEqual(readFileSync(storeIndexPath(projectRoot)), projectIndexBefore, 'project index stays unchanged');
+  assert.deepEqual(readFileSync(storeIndexPath(globalRoot)), globalIndexBefore, 'global index stays unchanged');
+
+  const { registrations } = load(projectRoot, globalRoot);
+  const alias = registrations.find((registration) => registration.key === 'caller/caller@1.0.0');
+  assert.ok(alias, 'the project index row remains callable through global fallback');
+  assert.equal(alias.bundleDigest, caller.result.digest);
+  assert.equal(alias.level, 'global');
+  assert.deepEqual(
+    alias.def.bundleStoreRoots,
+    [globalRoot, projectRoot].sort(),
+    'the repaired fallback still coordinates the naming and supplying roots',
+  );
+});
+
 // ---- acceptance (c): a pin mismatch is a visible debt, not a silent run ------
 
 test('WS-6 (c): a bare calls: that resolves OUTSIDE the parent bundle is refused as a visible debt, not run', async () => {
