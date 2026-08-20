@@ -293,6 +293,59 @@ test('mcp: a baseline tool call becomes ONE authenticated POST and maps the 2xx 
   assert.deepEqual(JSON.parse(whats[0]!.body!), { workflow: 'wf' });
 });
 
+test('mcp: hub passthrough fields are advertised, optional, and forwarded unchanged', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/reject_artifact': () => ({ status: 200, json: { ok: true } }),
+    'POST /api/create_workflow': () => ({ status: 200, json: { ok: true } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' } });
+  seedHuman(t);
+
+  const { code, frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    LIST,
+    call(3, 'reject_artifact', { workflow: 'wf', path: 'plan', reason: 'needs more depth', requested: 'deep' }),
+    call(4, 'reject_artifact', { workflow: 'wf', path: 'plan', reason: 'needs more depth' }),
+    call(5, 'create_workflow', { yaml: 'version: 1', bundle_digest: 'sha256:bundle' }),
+    call(6, 'create_workflow', { yaml: 'version: 1' }),
+  ]);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  const tools = (frames[1]!.result as {
+    tools: Array<{
+      name: string;
+      inputSchema: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+    }>;
+  }).tools;
+  const reject = tools.find((tool) => tool.name === 'reject_artifact')!;
+  const create = tools.find((tool) => tool.name === 'create_workflow')!;
+  assert.deepEqual(reject.inputSchema.properties.requested, { type: 'string' });
+  assert.deepEqual(reject.inputSchema.required, ['workflow', 'path', 'reason']);
+  assert.equal(reject.inputSchema.additionalProperties, false);
+  assert.deepEqual(create.inputSchema.properties.bundle_digest, { type: 'string' });
+  assert.deepEqual(create.inputSchema.required, ['yaml']);
+  assert.equal(create.inputSchema.additionalProperties, false);
+
+  for (const id of [3, 4, 5, 6]) {
+    const frame = frames.find((candidate) => candidate.id === id)!;
+    assert.equal(frame.error, undefined, `tool call ${id} must pass local schema validation`);
+    assert.deepEqual(resultJson(frame), { ok: true });
+  }
+
+  const rejections = calls.filter((row) => row.pathname === '/api/reject_artifact');
+  assert.equal(rejections.length, 2, 'one POST per reject_artifact call');
+  assert.ok(rejections.every((row) => row.method === 'POST'));
+  assert.deepEqual(JSON.parse(rejections[0]!.body!), { workflow: 'wf', path: 'plan', reason: 'needs more depth', requested: 'deep' });
+  assert.deepEqual(JSON.parse(rejections[1]!.body!), { workflow: 'wf', path: 'plan', reason: 'needs more depth' });
+
+  const creations = calls.filter((row) => row.pathname === '/api/create_workflow');
+  assert.equal(creations.length, 2, 'one POST per create_workflow call');
+  assert.ok(creations.every((row) => row.method === 'POST'));
+  assert.deepEqual(JSON.parse(creations[0]!.body!), { yaml: 'version: 1', bundle_digest: 'sha256:bundle' });
+  assert.deepEqual(JSON.parse(creations[1]!.body!), { yaml: 'version: 1' });
+});
+
 test('mcp: pending_gates preserves optional serve_crews and returns each hub response unchanged', async () => {
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
