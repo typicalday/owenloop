@@ -148,6 +148,43 @@ test('bundle GC dry-run is deterministic and default keep=2 preserves current pl
   assert.equal(existsSync(oldObject), true);
 });
 
+test('applied no-candidate GC preserves additive index and retained-entry metadata', async () => {
+  const installed = await installVersion({ version: '1.0.0' });
+  const indexPath = storeIndexPath(installed.root);
+  const coordinate = 'widget/widget@1.0.0';
+  const index = readWorkflowStoreIndex(indexPath);
+  const retainedEntry = {
+    ...index.entries[coordinate]!,
+    signature: { algorithm: 'future', value: 'retain-entry-metadata' },
+  };
+  const forwardCompatibleIndex = {
+    ...index,
+    entries: { [coordinate]: retainedEntry },
+    formatNote: { generation: 2, value: 'retain-top-level-metadata' },
+  };
+  writeFileSync(indexPath, `${JSON.stringify(forwardCompatibleIndex, null, 3)}\n`);
+  const indexBefore = readFileSync(indexPath);
+
+  const applied = await collectWorkflowStoreGarbage({
+    projectRoot: installed.root,
+    globalRoot: emptyRoot(),
+    level: 'project',
+    keep: 2,
+    yes: true,
+    readSnapshotPins: () => [],
+  });
+
+  assert.deepEqual(applied.coordinates, []);
+  assert.deepEqual(applied.objects, []);
+  assert.deepEqual(readFileSync(indexPath), indexBefore, 'a no-op apply does not narrow or rewrite the index');
+  const retained = JSON.parse(readFileSync(indexPath, 'utf8')) as {
+    entries: Record<string, { signature?: unknown }>;
+    formatNote?: unknown;
+  };
+  assert.deepEqual(retained.formatNote, forwardCompatibleIndex.formatNote);
+  assert.deepEqual(retained.entries[coordinate]?.signature, forwardCompatibleIndex.entries[coordinate]?.signature);
+});
+
 test('bundle GC keep=1 ranks canonical SemVer; all-non-SemVer groups remain protected', async () => {
   const installed = await installThree();
   const one = plan({ projectRoot: installed.root, keep: 1 }).report;

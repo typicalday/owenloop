@@ -497,7 +497,7 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     coordinates.push(coordinate);
     removedCoordinatesByDigest.set(digest, coordinates);
   }
-  const nextIndex: WorkflowStoreIndex = { version: 1, entries: nextEntries };
+  const nextIndex: WorkflowStoreIndex = { ...targetIndex, entries: nextEntries };
   const nextDigests = new Set(Object.values(nextEntries).map((entry) => defDigest(entry.digest)));
   const objects: WorkflowStoreGcObject[] = [];
   for (const digest of [...targetObjects.keys()].sort(compareStoreText)) {
