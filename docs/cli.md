@@ -2959,6 +2959,11 @@ and status to the human; `provide_input` carries human gate answers and
 feedback to surface and resolve, not a route to bypass: use `reject_artifact`
 only for a real upstream defect with a concrete reason.
 
+The opt-in [MCP chief-of-staff charter evaluation](mcp-charter-eval.md)
+measures that guidance from structured MCP calls and records the current
+[two-harness baseline](evals/mcp-charter-baseline.json). It is credentialed and
+quota-spending, so it is not part of required CI.
+
 ### Tools
 
 The server exposes 20 baseline tools mirroring the hub's own MCP toolset, plus

@@ -55,6 +55,7 @@
     "owenloop": "node bin/owenloop.mjs",
     "test": "node --test --test-reporter=spec test/*.test.ts packages/work/test/*.test.ts",
     "test:quiet": "node --test test/*.test.ts packages/work/test/*.test.ts",
+    "eval:mcp-charter": "node test/mcp-charter-eval.ts",
     "test:crypto": "node --test test/crypto-dsse.test.ts test/crypto-allowed-signers.test.ts test/crypto-ssh.test.ts test/crypto-keys.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src packages/work/src",

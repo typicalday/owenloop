@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "catalog": [
+    {
+      "name": "code-delivery",
+      "title": "Code delivery",
+      "description": "Plan, implement, test, and review an approved change in an existing software repository.",
+      "inputs": ["proposal"],
+      "inputSchemas": {
+        "proposal": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "x.discovery": {
+        "capabilities": ["software-delivery", "code-review"],
+        "audience": "engineering"
+      }
+    },
+    {
+      "name": "library-build",
+      "title": "Library build",
+      "description": "Research a topic across subtopics, acquire source and media artifacts, and synthesize a linked knowledge library.",
+      "inputs": ["topic"],
+      "inputSchemas": {
+        "topic": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "x.discovery": {
+        "capabilities": ["research", "media-acquisition", "knowledge-synthesis"],
+        "audience": "research"
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "id": "match-delivery",
+      "kind": "match",
+      "request": "Implement an approved pagination change in an existing TypeScript repository, run its checks, and prepare the change for review.",
+      "expectedWorkflow": "code-delivery"
+    },
+    {
+      "id": "match-library",
+      "kind": "match",
+      "request": "Research Orlando tourism across attractions, neighborhoods, transport, dining, lodging, and events; collect source media and build a linked knowledge library.",
+      "expectedWorkflow": "library-build"
+    },
+    {
+      "id": "no-match-finance",
+      "kind": "no-match",
+      "request": "Reconcile six months of bank statements, categorize expenses, and prepare a business tax filing package."
+    },
+    {
+      "id": "no-match-operations",
+      "kind": "no-match",
+      "request": "Compare medical providers, verify insurance coverage, schedule an appointment, and arrange transportation."
+    },
+    {
+      "id": "ambiguous-migration",
+      "kind": "ambiguous",
+      "request": "Investigate a legacy service and produce a migration brief with evidence and recommended next steps."
+    },
+    {
+      "id": "ambiguous-launch",
+      "kind": "ambiguous",
+      "request": "Collect competitor material and turn it into a launch-readiness brief for a software product."
+    }
+  ]
+}
