@@ -111,6 +111,11 @@ interface ReadIndexResult {
 	complete: boolean;
 }
 
+interface ExcludedRepairObject {
+	root: string;
+	digest: DefDigest;
+}
+
 function setBundleStoreRoots(def: WorkflowDef, roots: string[]): void {
 	// This is live loader provenance, not definition content. Keep it available
 	// to snapshot writers without changing hashDef or the persisted snapshot.
@@ -132,12 +137,18 @@ function readIndexedCoordinates(
 	level: ResolutionLevel,
 	tolerant: boolean,
 	warn: (line: string) => void,
+	excludedRepairObject?: ExcludedRepairObject,
 ): ReadIndexResult {
 	try {
 		if (probeStoreRoot(root) !== 'dir') return { entries: [], complete: true };
 		const index = readWorkflowStoreIndex(storeIndexPath(root));
 		const entries = Object.entries(index.entries)
 			.sort(([a], [b]) => compareStoreText(a, b))
+			.filter(([, entry]) => (
+				excludedRepairObject === undefined
+				|| root !== excludedRepairObject.root
+				|| defDigest(entry.digest) !== excludedRepairObject.digest
+			))
 			.map(([coordinate, entry]) => ({
 				coordinate: coordinate as WorkflowCoordinate,
 				entry,
@@ -408,15 +419,19 @@ function selectWorkflowRegistrations(
 	return { registrations, suppressedDigests };
 }
 
-function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspectionResult {
+function discoverCasDefs(
+	args: LoadCasDefsArgs,
+	tolerant: boolean,
+	excludedRepairObject?: ExcludedRepairObject,
+): CasDefInspectionResult {
 	const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
 	const globalRoot = projectStoreRoot(args.globalRoot);
 	const sameRoot = projectRoot === undefined || projectRoot === globalRoot;
 
 	const project = sameRoot
 		? { entries: [] as IndexedCoordinate[], complete: true }
-		: readIndexedCoordinates(projectRoot, 'project', tolerant, args.warn);
-	const global = readIndexedCoordinates(globalRoot, 'global', tolerant, args.warn);
+		: readIndexedCoordinates(projectRoot, 'project', tolerant, args.warn, excludedRepairObject);
+	const global = readIndexedCoordinates(globalRoot, 'global', tolerant, args.warn, excludedRepairObject);
 	let complete = project.complete && global.complete;
 
 	const projectCoordinates = new Set(project.entries.map((item) => item.coordinate));
@@ -529,6 +544,26 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 /** Strict executable discovery. Any indexed integrity failure aborts. */
 export function loadCasDefs(args: LoadCasDefsArgs): CasDefRegistration[] {
 	return discoverCasDefs(args, false).registrations;
+}
+
+/**
+ * Strict combined-store discovery for a same-digest repair transaction.
+ *
+ * The installer calls this only after independently verifying the staged
+ * replacement. Ignoring the broken physical copy lets its exact reinstall
+ * reach the repair swap while every dependency and unrelated indexed object
+ * still goes through the ordinary strict execution-time discovery path.
+ * This transaction-only seam is deliberately not re-exported from the store
+ * barrel: executable discovery must never suppress a corrupt object.
+ */
+export function loadCasDefsExcludingRepairObject(
+	args: LoadCasDefsArgs,
+	excluded: { root: string; digest: DefDigest },
+): CasDefRegistration[] {
+	return discoverCasDefs(args, false, {
+		root: projectStoreRoot(excluded.root),
+		digest: defDigest(excluded.digest),
+	}).registrations;
 }
 
 /** Tolerant read-only inspection. Never use this result for execution. */

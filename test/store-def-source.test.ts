@@ -19,7 +19,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -900,6 +900,67 @@ test('explicit versioned calls with a stale manifest lock are rejected before in
   const index = readWorkflowStoreIndex(storeIndexPath(root));
   assert.equal(index.entries['caller/caller@1.0.0'], undefined);
   assert.ok(index.entries['dep/child@1.0.0'], 'the already-installed dependency remains unchanged');
+});
+
+test('reinstall repairs a locked same-digest bundle after legacy executable-mode loss', async () => {
+  const target = 'dep/child@1.0.0';
+  const childSource = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('LOCKED-REPAIR'),
+  });
+  const child = await installBundleFixture({ sourceDir: childSource });
+  const childIndex = readWorkflowStoreIndex(storeIndexPath(child.root));
+  addIndexCoordinate(child.root, target, { ...childIndex.entries['child/child@1.0.0']! });
+
+  const unrelatedSource = writeBundleSource({
+    name: 'unrelated',
+    version: '1.0.0',
+    workflow: childYaml('UNRELATED').replace('name: child\n', 'name: unrelated\n'),
+    files: { 'bin/run.sh': '#!/bin/sh\nprintf "unrelated\\n"\n' },
+  });
+  chmodSync(join(unrelatedSource, 'bin', 'run.sh'), 0o755);
+  const unrelated = await installBundleFixture({ sourceDir: unrelatedSource, root: child.root });
+
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: versionedParentYaml(target, 'LOCKED-REPAIR'),
+    lock: { [target]: child.result.digest },
+    files: { 'bin/run.sh': '#!/bin/sh\nprintf "ok\\n"\n' },
+  });
+  chmodSync(join(callerSource, 'bin', 'run.sh'), 0o755);
+  const caller = await installBundleFixture({ sourceDir: callerSource, root: child.root });
+  const executable = join(caller.result.objectPath, 'bin', 'run.sh');
+  const unrelatedExecutable = join(unrelated.result.objectPath, 'bin', 'run.sh');
+  assert.equal(statSync(executable).mode & 0o7777, 0o555);
+  const indexBefore = readFileSync(storeIndexPath(child.root));
+
+  chmodSync(executable, 0o444);
+  chmodSync(unrelatedExecutable, 0o444);
+  assert.throws(
+    () => loadCasDefs({ projectRoot: child.root, globalRoot: child.root, warn: () => {} }),
+    /canonical bundle digest mismatch|expected hardened store mode/u,
+  );
+
+  await assert.rejects(
+    installBundleFixture({ sourceDir: callerSource, root: child.root }),
+    (error: unknown) => error instanceof Error && error.message.includes(unrelated.result.digest),
+    'repair exclusion must not hide an unrelated corrupt indexed object',
+  );
+  assert.equal(statSync(executable).mode & 0o7777, 0o444, 'failed validation does not start caller repair');
+
+  const unrelatedRepair = await installBundleFixture({ sourceDir: unrelatedSource, root: child.root });
+  assert.equal(unrelatedRepair.result.installed, false);
+  assert.equal(statSync(unrelatedExecutable).mode & 0o7777, 0o555);
+
+  const repaired = await installBundleFixture({ sourceDir: callerSource, root: child.root });
+  assert.equal(repaired.result.installed, false, 'same-digest reinstall takes the repair path');
+  assert.equal(statSync(executable).mode & 0o7777, 0o555, 'repair restores the executable bit');
+  assert.deepEqual(readFileSync(storeIndexPath(child.root)), indexBefore, 'repair preserves index bytes');
+  assert.doesNotThrow(
+    () => loadCasDefs({ projectRoot: child.root, globalRoot: child.root, warn: () => {} }),
+  );
 });
 
 // ---- acceptance (c): a pin mismatch is a visible debt, not a silent run ------

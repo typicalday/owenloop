@@ -74,7 +74,7 @@ import type {
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
-import { loadCasDefs } from './def-source.ts';
+import { loadCasDefs, loadCasDefsExcludingRepairObject } from './def-source.ts';
 import { compareStoreText, defDigest, objectDirForDigest } from './types.ts';
 import { projectStoreRoot, storeIndexPath } from './resolve.ts';
 import { recoverInterruptedWorkflowStoreGc } from './gc-recovery.ts';
@@ -190,6 +190,7 @@ function assertManifestLocksResolvable(args: {
   projectRoot: string | undefined;
   globalRoot: string | undefined;
   lock: Readonly<Record<string, string>>;
+  excludedRepairObject?: { root: string; digest: DefDigest };
 }): void {
   const entries = Object.entries(args.lock);
   if (entries.length === 0) return;
@@ -212,8 +213,12 @@ function assertManifestLocksResolvable(args: {
   // Strict discovery also verifies coordinate identity, runtime compatibility,
   // the callable default/sole-workflow target, and the exact project/global
   // fallback semantics used when a running workflow resolves its bundleLock.
+  const loadArgs = { projectRoot, globalRoot, warn: () => {} };
+  const registrations = args.excludedRepairObject === undefined
+    ? loadCasDefs(loadArgs)
+    : loadCasDefsExcludingRepairObject(loadArgs, args.excludedRepairObject);
   const callableKeys = new Set(
-    loadCasDefs({ projectRoot, globalRoot, warn: () => {} })
+    registrations
       .filter((registration) => registration.kind === 'coordinate')
       .map((registration) => registration.key),
   );
@@ -497,18 +502,6 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // destination swap or index write. A rejection commits nothing.
     await verifier.verify({ source, coordinate, digest, objectDir: stagingDir });
 
-    // Re-read both roots while this install still owns its root lock. A
-    // destructive GC owns both root locks, so either this commit becomes visible
-    // to its reachability scan or a GC-first removal makes this stale caller
-    // fail here before any journal/object/index mutation.
-    assertManifestLocksResolvable({
-      root,
-      level,
-      projectRoot: args.projectRoot,
-      globalRoot: args.globalRoot,
-      lock: stagedBundleLock,
-    });
-
     // Existing same-digest objects have two paths. A verified object keeps the
     // normal idempotent dedupe. A broken object is repaired only from the
     // supplied archive that already passed strict ingest, engine validation,
@@ -534,6 +527,21 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	repairRequired = true;
       }
     }
+
+    // Re-read both roots while this install still owns its root lock. A
+    // destructive GC owns both root locks, so either this commit becomes visible
+    // to its reachability scan or a GC-first removal makes this stale caller
+    // fail here before any journal/object/index mutation. A verified staged
+    // same-digest repair may exclude only its broken physical destination from
+    // discovery; every lock dependency and unrelated object remains strict.
+    assertManifestLocksResolvable({
+      root,
+      level,
+      projectRoot: args.projectRoot,
+      globalRoot: args.globalRoot,
+      lock: stagedBundleLock,
+      ...(repairRequired ? { excludedRepairObject: { root, digest } } : {}),
+    });
 
     // The post-install index, computed BEFORE the commit point so its exact
     // canonical bytes are what the journal's metadataHash commits to. A
