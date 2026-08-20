@@ -655,7 +655,7 @@ steps:
     calls: delivery          # bare local name; use <package>/<workflow> for a CAS target
     inputs:                  # child input → parent artifact (gate: sandbox green)
       proposal: proposal
-    produces: [delivered]    # one parent artifact; greens when delivery's output greens
+    produces: [delivered]    # mirrors a green/value-defined output only after delivery is done
   - name: teardown
     consumes: [delivered]
     produces: [torn_down]
@@ -663,9 +663,12 @@ steps:
     body: Tear down and green `torn_down`.
 ```
 
-The engine spawns the child when the gate inputs are green, greens the parent's
-`calls:` output when the child's declared output greens (no Worker run), and re-provides
-inputs to the existing child if a gate input changes — it never spawns a duplicate.
+The engine spawns the child when the gate inputs are green and keeps the parent's
+`calls:` output owed until the child's declared output is green/value-defined **and**
+`workflowDone(childDef, childArts)` says the whole child is done. Only then does it
+mirror that value into the parent (no Worker run). A child with cleanup or a manually
+supplied input still outstanding keeps the parent output owed. If a gate input changes,
+the engine re-provides it to the existing child — it never spawns a duplicate.
 
 | | `include:` (Mode 1) | `calls:` (Mode 2) |
 |---|---|---|

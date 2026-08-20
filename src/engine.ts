@@ -31,6 +31,7 @@ import {
   plainConsumes,
   rejectionEpisode,
   requiredInputs,
+  workflowDone,
   workflowStatus,
 } from './model.ts';
 import type { ArtifactMap, CascadeOp, ChildStatusSummary, Firing, TimeFacts, WorkflowStatus } from './model.ts';
@@ -851,11 +852,11 @@ export class Engine {
   private static readonly CHILD_OUTCOME_PIN_KEY = '__child_outcome_version__';
 
   /**
-   * F4: the single place that computes "what child-outcome version is this
-   * calls: artifact currently resting on" — used both when machine-greening
-   * (STEP 6) and when stamping the pin at verdict time (reject propagation,
-   * human skip). Returns undefined if no child has ever been spawned (nothing
-   * to pin to).
+   * F4: the single verdict-time helper that computes "what child-outcome
+   * version is this calls: artifact currently resting on" for reject
+   * propagation and human skip. STEP 6 publication reads and stamps the version
+   * from its authoritative in-transaction snapshot instead. Returns undefined
+   * if no child has ever been spawned (nothing to pin to).
    */
   private childOutcomePin(parentWf: string, callsPath: string): number | undefined {
     const child = this.store.findChildByParent(parentWf, callsPath);
@@ -1045,7 +1046,8 @@ export class Engine {
    * Called at the top of tick (outside any tx) and as cascade-up prompt.
    * For each calls: step: spawn the child if gate is ready and no child exists;
    * re-attach if it exists; re-provide if parent inputs moved; machine-green
-   * the parent artifact when the child's declared output is green.
+   * the parent artifact when the child's declared output is green and the
+   * whole child workflow is done.
    */
   private maintainCalls(parentWf: string, def: WorkflowDef, now?: number): void {
     if (this._inMaintainCalls.has(parentWf)) return;
@@ -1171,16 +1173,18 @@ export class Engine {
         // rearmCallsGreen). Under WAL + BEGIN IMMEDIATE no other connection can
         // commit between that in-tx re-read and the write, so a cross-connection
         // interleave — the parent gate advanced to a newer version, or the child
-        // outcome re-armed, between this stale pre-read and the write — is caught
-        // in-tx and the pass aborts (helper returns false, nothing written),
-        // deferring to the next tick. The published value, the gate fingerprint
-        // it claims, and the child-outcome pin therefore always come from ONE
-        // atomic snapshot. commit/settled events fire only when the helper wrote,
-        // so an aborted pass is silent to listeners.
+        // outcome re-armed, or the child's completion state changed, between
+        // this stale pre-read and the write — is caught in-tx and the pass aborts
+        // (helper returns false, nothing written), deferring to the next tick.
+        // The published value, whole-child done result, gate fingerprint, and
+        // child-outcome pin therefore always come from ONE atomic snapshot.
+        // commit/settled events fire only when the helper wrote, so an aborted
+        // pass is silent to listeners.
         //
         // Re-read after potential re-provide.
         childArts = this.artMap(existingChild.id);
         childOutcomeArt = childArts.get(childOutcomeStem);
+        const childIsDone = workflowDone(childDef, childArts);
         const parentCallsArt = this.store.getArtifact(parentWf, callsStem);
 
         // F2: don't machine-green over a schema-rejected debt — it needs a
@@ -1188,7 +1192,7 @@ export class Engine {
         // this step revisits it.
         if (parentCallsArt?.acceptance === 'rejected') continue;
 
-        if (isGreen(childOutcomeArt) && childOutcomeArt?.value !== undefined) {
+        if (isGreen(childOutcomeArt) && childOutcomeArt?.value !== undefined && childIsDone) {
           const alreadyGreen = isGreen(parentCallsArt);
           const sameValue = alreadyGreen && deepEqual(childOutcomeArt.value, parentCallsArt?.value);
           // F4: version-pinning. Only machine-green when the child outcome's
@@ -1210,11 +1214,13 @@ export class Engine {
               this.fireSettled(parentWf);
             }
           }
-        } else if (!isGreen(childOutcomeArt) && isGreen(parentCallsArt) && parentCallsArt) {
-          // M2B-REARM: child's outcome is no longer green (e.g. re-provide re-armed it)
-          // but the parent calls: artifact is still green. Re-arm it to owed so downstream
-          // re-runs when the child completes again. This handles gate re-arm (test f):
-          // the cascade can't detect this because deliver step has consumes: [].
+        } else if ((!isGreen(childOutcomeArt) || !childIsDone) && isGreen(parentCallsArt) && parentCallsArt) {
+          // M2B-REARM: the child outcome is no longer green (e.g. re-provide
+          // re-armed it), OR the outcome is green while the child still has
+          // outstanding work. Re-arm the parent mirror to owed so deep descent
+          // can keep driving the child and downstream re-runs only after the
+          // whole child completes. The cascade cannot detect either condition
+          // because a calls: step declares consumes: [].
           if (this.rearmCallsGreen(parentWf, def, callsStem, existingChild.id, childOutcomeStem, now)) {
             this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'retry' });
             this.fireSettled(parentWf);
@@ -1278,10 +1284,15 @@ export class Engine {
       const child = this.store.findChildByParent(parentWf, callsStem);
       if (!child || child.id !== expectedChildId) return false;
 
+      const childDef = this.defFor(child.id);
+      const currentChildOutcomeStem = childDef.outputs?.[0];
+      if (currentChildOutcomeStem !== childOutcomeStem) return false;
       const childArts = this.artMap(child.id);
-      const childOutcomeArt = childArts.get(childOutcomeStem);
-      // Child re-armed between the pre-read and here → defer.
+      const childOutcomeArt = childArts.get(currentChildOutcomeStem);
+      // Child re-armed, or still has outstanding work, between the pre-read and
+      // here → defer. Only this in-tx snapshot authorizes publication.
       if (!childOutcomeArt || !isGreen(childOutcomeArt) || childOutcomeArt.value === undefined) return false;
+      if (!workflowDone(childDef, childArts)) return false;
 
       // Gate still ready, and the child still consistent with the gate values
       // the fingerprint is about to claim (the heart of the fix).
@@ -1314,11 +1325,12 @@ export class Engine {
   /**
    * STEP 6 re-arm as the mirror-image atomic guard. maintainCalls' optimistic
    * pre-read decides only WHETHER to call this; the parent artifact AND the
-   * child outcome are re-read inside the write lock, and the re-arm happens only
-   * if the parent is still green AND the child outcome is still NOT green in-tx.
-   * If the child went green between the optimistic read and the tx, this does
-   * nothing (returns false) and the next maintainCalls pass publishes normally.
-   * Returns true only when it wrote.
+   * child definition/artifacts are re-read inside the write lock, and the
+   * re-arm happens only if the parent is still green AND either the child
+   * outcome is non-green or the whole child is unfinished in-tx. If the outcome
+   * is green and the child is done by then, this does nothing (returns false)
+   * and the next maintainCalls pass publishes normally. Returns true only when
+   * it wrote.
    */
   private rearmCallsGreen(
     parentWf: string,
@@ -1333,18 +1345,33 @@ export class Engine {
       if (!artNow || !isGreen(artNow)) return false; // already re-armed or gone
       const child = this.store.findChildByParent(parentWf, callsStem);
       if (!child || child.id !== expectedChildId) return false;
-      const childOutcomeArt = this.artMap(child.id).get(childOutcomeStem);
-      // Child went green in-tx → don't re-arm; let the green branch publish next pass.
-      if (isGreen(childOutcomeArt)) return false;
+      const childDef = this.defFor(child.id);
+      const currentChildOutcomeStem = childDef.outputs?.[0];
+      if (currentChildOutcomeStem !== childOutcomeStem) return false;
+      const childArts = this.artMap(child.id);
+      const childOutcomeArt = childArts.get(currentChildOutcomeStem);
+      const childIsDone = workflowDone(childDef, childArts);
+      // Green outcome plus whole-child completion means the mirror is valid.
+      if (isGreen(childOutcomeArt) && childIsDone) return false;
+
+      const childOutcomeGreenButUnfinished = isGreen(childOutcomeArt) && !childIsDone;
+      let fingerprint = artNow.fingerprint;
+      let reasonText = 'gate input moved: child re-running';
+      if (childOutcomeGreenButUnfinished) {
+        fingerprint = { ...(artNow.fingerprint ?? {}) };
+        delete fingerprint[Engine.CHILD_OUTCOME_PIN_KEY];
+        reasonText = 'called workflow is not done';
+      }
       this.store.putArtifact({
         ...artNow,
         acceptance: 'owed',
+        fingerprint,
         reasons: [...artNow.reasons, {
           at: nowMs(),
           action: 'reopen' as const,
           kind: 'structural' as const,
           by: 'engine' as const,
-          text: 'gate input moved: child re-running',
+          text: reasonText,
           fromVersion: artNow.version,
         }],
       });

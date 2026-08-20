@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Engine, SchemaRefusalError } from '../src/engine.ts';
@@ -89,6 +89,46 @@ const parentFailDef: WorkflowDef = def(
   ],
 );
 
+/**
+ * A callable child whose public `result` is available before its final
+ * cleanup debt. `cleanup_input` is deliberately independent of `work_input` so
+ * moving it re-arms only `tidied`, leaving the declared output green at the
+ * same version.
+ */
+const cleanupChildDef: WorkflowDef = {
+  ...def(
+    'cleanupChildDef',
+    [
+      input('work_input', { seedOwed: true }),
+      input('cleanup_input', { seedOwed: true }),
+    ],
+    [
+      step({ name: 'work', consumes: ['work_input'], produces: ['result'] }),
+      step({ name: 'cleanup', consumes: ['result', 'cleanup_input'], produces: ['tidied'] }),
+    ],
+  ),
+  outputs: ['result'],
+};
+
+const cleanupDeliverStep: StepDef = {
+  ...step({ name: 'deliver', produces: ['delivered'] }),
+  calls: 'cleanupChildDef',
+  callsInputs: { work_input: 'work_gate', cleanup_input: 'cleanup_gate' },
+  consumes: [],
+};
+
+const cleanupParentDef: WorkflowDef = def(
+  'cleanupParentDef',
+  [
+    input('work_gate', { seedOwed: true }),
+    input('cleanup_gate', { seedOwed: true }),
+  ],
+  [
+    cleanupDeliverStep,
+    step({ name: 'finish', consumes: ['delivered'], produces: ['finished'] }),
+  ],
+);
+
 // ---- harness ----------------------------------------------------------------
 
 function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
@@ -105,6 +145,150 @@ function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
 function getArt(store: Store, wf: string, path: string): ArtifactData | undefined {
   return store.getArtifact(wf, path);
 }
+
+interface CleanupCallRun {
+  parentWf: string;
+  childWf: string;
+  workRun: string;
+}
+
+/** Start the shared cleanup workflow shape and claim its child `work` order through a deep root tick. */
+function startCleanupCall(engine: Engine, store: Store): CleanupCallRun {
+  const parentWf = engine.createInstance('cleanupParentDef', {
+    provide: {
+      work_gate: { revision: 1 },
+      cleanup_gate: { revision: 1 },
+    },
+  });
+  const tick = engine.tick(parentWf);
+  const child = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(child !== undefined, 'cleanup child should be spawned');
+  const workOrder = tick.orders.find((o) => o.workflow === child!.id && o.step === 'work');
+  assert.ok(workOrder !== undefined, 'deep root tick should offer child work');
+  return { parentWf, childWf: child!.id, workRun: workOrder!.run };
+}
+
+/** Green the child's stable declared output without touching its later cleanup debt. */
+function greenCleanupResult(engine: Engine, run: CleanupCallRun): void {
+  engine.green(run.childWf, run.workRun, 'result', { value: 'complete' });
+  engine.close(run.childWf, run.workRun);
+}
+
+/** Claim the child cleanup through the root and green its final debt. */
+function completeCleanupFromRoot(engine: Engine, run: CleanupCallRun, revision: number): void {
+  const tick = engine.tick(run.parentWf);
+  const cleanupOrder = tick.orders.find((o) => o.workflow === run.childWf && o.step === 'cleanup');
+  assert.ok(cleanupOrder !== undefined, 'deep root tick should offer child cleanup');
+  engine.green(run.childWf, cleanupOrder!.run, 'tidied', { revision });
+  engine.close(run.childWf, cleanupOrder!.run);
+}
+
+/** Claim and complete the parent's downstream finish after the call mirror republishes. */
+function completeCleanupParent(engine: Engine, run: CleanupCallRun, revision: number): void {
+  const tick = engine.tick(run.parentWf);
+  const finishOrder = tick.orders.find((o) => o.workflow === run.parentWf && o.step === 'finish');
+  assert.ok(finishOrder !== undefined, 'parent finish should wait for the whole child');
+  engine.green(run.parentWf, finishOrder!.run, 'finished', { revision });
+  engine.close(run.parentWf, finishOrder!.run);
+}
+
+test('calls: whole-child join keeps the parent owed until cleanup finishes', () => {
+  const { engine, store } = makeEngine([cleanupChildDef, cleanupParentDef]);
+  const run = startCleanupCall(engine, store);
+
+  greenCleanupResult(engine, run);
+
+  assert.equal(getArt(store, run.childWf, 'result')?.acceptance, 'green');
+  assert.equal(engine.status(run.childWf).done, false, 'final cleanup is still outstanding');
+  assert.equal(getArt(store, run.parentWf, 'delivered')?.acceptance, 'owed');
+  assert.equal(engine.status(run.parentWf).done, false, 'parent remains outstanding with its child');
+
+  completeCleanupFromRoot(engine, run, 1);
+
+  assert.equal(engine.status(run.childWf).done, true);
+  assert.equal(getArt(store, run.parentWf, 'delivered')?.acceptance, 'green');
+  assert.deepEqual(getArt(store, run.parentWf, 'delivered')?.value, { value: 'complete' });
+  assert.equal(engine.status(run.parentWf).done, false, 'downstream finish has only now become available');
+
+  completeCleanupParent(engine, run, 1);
+  assert.equal(engine.status(run.parentWf).done, true);
+});
+
+test('calls: late cleanup-only input reopens and republishes an unchanged child result', () => {
+  const { engine, store } = makeEngine([cleanupChildDef, cleanupParentDef]);
+  const run = startCleanupCall(engine, store);
+  greenCleanupResult(engine, run);
+  completeCleanupFromRoot(engine, run, 1);
+  completeCleanupParent(engine, run, 1);
+
+  const resultBefore = getArt(store, run.childWf, 'result')!;
+  const deliveredBefore = getArt(store, run.parentWf, 'delivered')!;
+  const resultVersion = resultBefore.version;
+  const parentFingerprint = { ...(deliveredBefore.fingerprint ?? {}) };
+  assert.equal(deliveredBefore.acceptance, 'green');
+  assert.equal(parentFingerprint.__child_outcome_version__, resultVersion);
+  assert.equal(engine.status(run.parentWf).done, true);
+
+  engine.provideInput(run.parentWf, 'cleanup_gate', { revision: 2 });
+
+  const resultReopened = getArt(store, run.childWf, 'result')!;
+  const tidiedReopened = getArt(store, run.childWf, 'tidied')!;
+  const deliveredReopened = getArt(store, run.parentWf, 'delivered')!;
+  assert.equal(resultReopened.acceptance, 'green');
+  assert.equal(resultReopened.version, resultVersion, 'cleanup-only input must not invalidate result');
+  assert.equal(tidiedReopened.acceptance, 'rejected', 'cleanup-only input invalidates the completed cleanup');
+  assert.equal(deliveredReopened.acceptance, 'owed', 'unfinished child immediately reopens parent mirror');
+  assert.equal(deliveredReopened.reasons.at(-1)?.text, 'called workflow is not done');
+  const reopenedOutcomePin = deliveredReopened.fingerprint?.__child_outcome_version__;
+  assert.equal(deliveredReopened.fingerprint?.work_gate, parentFingerprint.work_gate);
+  assert.equal(deliveredReopened.fingerprint?.cleanup_gate, parentFingerprint.cleanup_gate);
+  assert.equal(engine.status(run.parentWf).done, false);
+
+  completeCleanupFromRoot(engine, run, 2);
+
+  const resultAfter = getArt(store, run.childWf, 'result')!;
+  const deliveredAfter = getArt(store, run.parentWf, 'delivered')!;
+  assert.equal(resultAfter.version, resultVersion, 'cleanup completion must not fabricate a new result version');
+  assert.equal(engine.status(run.childWf).done, true);
+  assert.equal(engine.status(run.parentWf).done, false, 'downstream finish remains after child completion');
+  assert.equal(deliveredAfter.acceptance, 'green', 'unchanged result republishes after whole-child completion');
+  assert.deepEqual(deliveredAfter.value, resultBefore.value);
+  assert.equal(reopenedOutcomePin, undefined, 'structural reopen must clear only the reserved outcome pin');
+  assert.equal(deliveredAfter.fingerprint?.__child_outcome_version__, resultVersion);
+
+  completeCleanupParent(engine, run, 2);
+  assert.equal(engine.status(run.parentWf).done, true);
+});
+
+test('calls: docs require a green/value-defined output and whole-child completion', () => {
+  const design = readFileSync(new URL('../docs/design.md', import.meta.url), 'utf8');
+  const authoring = readFileSync(new URL('../docs/authoring.md', import.meta.url), 'utf8');
+  const section = (doc: string, start: string, end: string): string => {
+    const startAt = doc.indexOf(start);
+    const endAt = doc.indexOf(end, startAt + start.length);
+    assert.notEqual(startAt, -1, `missing documentation section: ${start}`);
+    assert.notEqual(endAt, -1, `missing documentation section boundary: ${end}`);
+    return doc.slice(startAt, endAt);
+  };
+
+  const cascadePrompt = section(design, '#### §23.6.2 Cascade-up prompt', '#### §23.6.3');
+  assert.match(cascadePrompt, /green and value-defined/);
+  assert.match(cascadePrompt, /workflowDone\(childDef, childArts\)/);
+  assert.match(cascadePrompt, /not an unconditional outcome propagation/);
+
+  const embeddingInterface = section(design, '#### §23.6.3 `outputs:` as embedding interface', '#### §23.6.4');
+  assert.match(embeddingInterface, /greening that artifact is not by itself the completion signal/);
+  assert.match(embeddingInterface, /workflowDone\(childDef, childArts\)/);
+
+  const failureBranch = section(design, '#### §23.6.4 Failure branch', '#### §23.6.5');
+  assert.match(failureBranch, /green, value-defined declared outcome/);
+  assert.match(failureBranch, /outstanding child cleanup or a manual input keeps the parent mirror `owed`/);
+
+  const authoringCalls = section(authoring, '**`calls:` (Mode 2, runtime)**', '| | `include:` (Mode 1)');
+  assert.match(authoringCalls, /declared output is green\/value-defined/);
+  assert.match(authoringCalls, /workflowDone\(childDef, childArts\).*whole child is done/);
+  assert.match(authoringCalls, /cleanup or a manually\s+supplied input still outstanding keeps the parent output owed/);
+});
 
 // ---- test (a): happy path end-to-end ----------------------------------------
 
