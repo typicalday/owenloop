@@ -1587,9 +1587,15 @@ test('stop blocks a resolved retry delay while its targeted release is still pen
   assert.equal(only(calls, 'release').length, 1);
   clock.release(0); // the retry wait wins before the pending targeted release
 
-  assert.equal(await p, 'killed');
+  let settled = false;
+  void p.then(() => {
+    settled = true;
+  });
+  await macrotaskSleep();
+  assert.equal(settled, false); // exec must wait for the final targeted release
   assert.equal(submits.length, 1);
   resolveRelease({ text: '' });
+  assert.equal(await p, 'killed');
 });
 
 test('a retried first owed path completes before the next path is submitted', async () => {

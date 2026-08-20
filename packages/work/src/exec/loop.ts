@@ -820,6 +820,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
           // release is still in flight; do not issue a new submit in that gap.
           if (signalled) {
             opts.err(`owenloop work exec: signalled while waiting to retry submit to ${owe.path} — no further receipt sent`);
+            // The role exits the process as soon as this loop resolves. Wait for
+            // lease finalBreath so that exit cannot abandon its targeted release.
+            await leasePromise;
             return 'killed';
           }
           if (leaseOutcome !== undefined) {
