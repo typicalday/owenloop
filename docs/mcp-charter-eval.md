@@ -63,47 +63,45 @@ changes the served-byte hash, so it creates a new attributable score rather
 than inheriting an old baseline.
 
 The committed [baseline](evals/mcp-charter-baseline.json) records a complete
-2026-08-21T05:07:19.675Z run for charter hash
+2026-08-21T05:40:09.335Z run for charter hash
 `03ac02a08d1df19033c793c4b9bad3ca0bce894ec13530638c4c8e1635629096`,
-generated with Node v22.22.3. Claude Code 2.1.236 using `claude-opus-5`
-passed 4/4 clear tasks; Codex 0.147.0 using `gpt-5.6-sol` passed 2/4. Both
-harnesses were complete and scoreable.
+generated with Node v22.22.3. Claude Code 2.1.236 using `claude-opus-5` and
+Codex 0.147.0 using `gpt-5.6-sol` each passed 4/4 clear tasks. Both harnesses
+were complete and scoreable.
 
 One run is one sample. Codex's score moves between runs at a fixed charter hash,
 so read any single number as a point in a range, and re-run before concluding
-that a charter edit helped or hurt. The four 2026-08-21 control reports used
-the unedited `35773e2e` charter, and the four treatment reports used the new
-`03ac02a0` charter; each report identifies the same harness versions and models
-named above:
+that a charter edit helped or hurt. Eight 2026-08-21 controls used the unedited
+`35773e2e` charter, and six treatment reports used the new `03ac02a0` charter;
+each report identifies the same harness versions and models named above:
 
 | charter hash | runs | Claude | Codex |
 | --- | --- | --- | --- |
 | `dfb67821` (previous charter) | 2 | 4/4, 4/4 | 1/4, 2/4 |
 | `bdbd33e3` (discarded wording) | 1 | 4/4 | 2/4 |
-| `35773e2e` (pre-compose charter, including four new controls) | 7 | 4/4, 4/4, 4/4, 4/4, 4/4, 4/4, 4/4 | 3/4, 4/4, 4/4, 2/4, 3/4, 2/4, 2/4 |
-| `03ac02a0` (compose clause) | 4 | 4/4, 4/4, 4/4, 4/4 | 2/4, 2/4, 2/4, 2/4 |
+| `35773e2e` (pre-compose charter, including five new controls) | 8 | 4/4, 4/4, 4/4, 4/4, 4/4, 4/4, 4/4, 4/4 | 3/4, 4/4, 4/4, 2/4, 3/4, 2/4, 2/4, 3/4 |
+| `03ac02a0` (compose clause) | 6 | 4/4, 4/4, 4/4, 4/4, 4/4, 4/4 | 2/4, 2/4, 2/4, 2/4, 3/4, 4/4 |
 
-Only the committed run's JSON lives in this repository. The other twelve reports
-were kept outside it and are quoted here for the range, not as artifacts you can
-re-read. The controls expand the pre-compose Codex range to 2/4–4/4, so the
-2/4 treatment reports cannot be attributed to the compose clause; their shared
-failure is the first-call guard, not a tax- or medical-workflow start. Three
-runs in an arm is a direction, not a significance claim.
+Only the committed run's JSON lives in this repository; this table is the durable
+record of the other samples. The human-directed three-report fixed-charter
+control was 2/4, 3/4, 2/4 for Codex, and the fresh fixed-charter control was
+3/4. The controls therefore show the same first-call variance independently of
+the compose clause. The final generated treatment happened to be 4/4 for Codex,
+but it does not erase the observed 2/4–3/4 fixed-charter regression or establish
+that a charter edit caused any score movement. Three runs in an arm is a
+direction, not a significance claim.
 
-The retained no-match and ambiguous responses were reviewed. Claude calls the
-catalog first, starts only the expected clear-match workflow, and plainly
-refuses both no-match tasks without starting a run. In the final treatment,
-its migration response describes a composite of `library-build` evidence
-gathering plus a bespoke migration-brief step and a checked, approval-gated
-plan; its launch response likewise identifies the collection-plus-bespoke-brief
-shape. Codex starts no no-match run, but its no-match replies still request
-inputs before calling the catalog, the same fixed-charter regression shown by
-the controls; this causes the scored first-call failures. Its ambiguous replies
-also remain refusal/input-oriented rather than describing a composite. The
-fixture exposes neither the plan skill nor `create_workflow`, and neither
-harness actually compiled, surfaced, or released an approval gate; the observed
-prose is not proof of composite execution. Ambiguous observations do not change
-the numeric 4-task denominator.
+The retained no-match and ambiguous responses were reviewed. In the final
+treatment, both harnesses call the catalog first, start only the expected
+clear-match workflow, and make zero starts for the no-match tasks. Claude's
+migration response identifies `library-build` evidence gathering plus a bespoke
+synthesis step as an approval-gated composite, while its launch response names
+the same collection-plus-bespoke-brief composition. Codex's current ambiguous
+responses remain input/tooling-oriented rather than evidence that a composite
+was compiled. The fixture exposes neither the plan skill nor `create_workflow`,
+so neither harness actually compiled, surfaced, or released an approval gate;
+the observed prose is not proof of composite execution. Ambiguous observations
+do not change the numeric 4-task denominator.
 
 ## Safety and baseline updates
 
