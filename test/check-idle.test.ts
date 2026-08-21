@@ -26,9 +26,9 @@ test('parseDef: rejects an overflowing authored idle duration', () => {
       name: 'overflowing-idle-duration',
       inputs: [{ name: 'start', seedOwed: false }],
       steps: [
-		{ name: 'fanout', consumes: ['start'], produces: ['items[]'] },
-		{ name: 'monitor', on: ['idle'], idleAfter, produces: ['wake'] },
-		{ name: 'finish', consumes: ['wake'], produces: ['result'], terminal: true },
+        { name: 'fanout', consumes: ['start'], produces: ['items[]'] },
+        { name: 'monitor', on: ['idle'], idleAfter, produces: ['wake'] },
+        { name: 'finish', consumes: ['wake'], produces: ['result'], terminal: true },
       ],
     }),
     /duration is too large/,
