@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.10](https://github.com/typicalday/owenloop/compare/v0.5.9...v0.5.10) (2026-08-21)
+
+
+### Features
+
+* add graduate skill for ephemeral plan promotion ([#254](https://github.com/typicalday/owenloop/issues/254)) ([3dd4e81](https://github.com/typicalday/owenloop/commit/3dd4e81c7e2a557fd3e61ab29ec71f154cff8590))
+* add hub ephemeral workflow skill ([#230](https://github.com/typicalday/owenloop/issues/230)) ([64b069b](https://github.com/typicalday/owenloop/commit/64b069bc1868f121c302a1f4380446bdd9c683c9))
+* add plan compiler skill ([#251](https://github.com/typicalday/owenloop/issues/251)) ([8a1fb9a](https://github.com/typicalday/owenloop/commit/8a1fb9ac5c658f25eac28647c5f8b7d8ea282575))
+* add safe workflow bundle garbage collection ([#221](https://github.com/typicalday/owenloop/issues/221)) ([2c2ca81](https://github.com/typicalday/owenloop/commit/2c2ca8149fa07c8ca0b6ad647903d43e62af6f12))
+* add x.discovery lint convention ([#218](https://github.com/typicalday/owenloop/issues/218)) ([06ee581](https://github.com/typicalday/owenloop/commit/06ee5810c0ca4bed4c8bb9e61bb367300d071d76))
+* declare and check workflow interface claims ([#252](https://github.com/typicalday/owenloop/issues/252)) ([fae1d83](https://github.com/typicalday/owenloop/commit/fae1d83b527ea41581cb5c6edad98c77929dd79e))
+* **engine:** map authored capabilities to org names before composition ([#213](https://github.com/typicalday/owenloop/issues/213)) ([775813e](https://github.com/typicalday/owenloop/commit/775813e6a8caa874f48dd78beb2311d26bd0239a))
+* expose pending gates to MCP and CLI clients ([#223](https://github.com/typicalday/owenloop/issues/223)) ([38ba485](https://github.com/typicalday/owenloop/commit/38ba4851ba29f1afcb0b02064a47725d63ae1eea))
+* expose search_workflows over MCP ([#231](https://github.com/typicalday/owenloop/issues/231)) ([7223021](https://github.com/typicalday/owenloop/commit/7223021746cc2e7702319d5e3206972556ae5555))
+* expose workflow discovery metadata in defs ([#222](https://github.com/typicalday/owenloop/issues/222)) ([ad8ca3b](https://github.com/typicalday/owenloop/commit/ad8ca3b15cfd2d21a2233a2d2bf4dcb4bae3e786))
+* install outside defs under scoped capabilities ([#214](https://github.com/typicalday/owenloop/issues/214)) ([ae375cd](https://github.com/typicalday/owenloop/commit/ae375cd2d442336ddd254bff5899fc50216a55dc))
+* **mcp:** add chief-of-staff charter ([#219](https://github.com/typicalday/owenloop/issues/219)) ([cc3f02f](https://github.com/typicalday/owenloop/commit/cc3f02f6747ed08cc0a36d9dcd32d503574d2f15))
+* support oneOf, anyOf, and uniqueItems in interface compatibility ([#256](https://github.com/typicalday/owenloop/issues/256)) ([fb6710b](https://github.com/typicalday/owenloop/commit/fb6710bc2f65e0ca8078716247a3c58d48386d8b))
+
+
+### Bug Fixes
+
+* a claim released for capacity re-arms the next sweep ([#217](https://github.com/typicalday/owenloop/issues/217)) ([f09e93b](https://github.com/typicalday/owenloop/commit/f09e93b57eab64bbbc93fa4e9be4714fede86552))
+* a returned lease is not a run for budget or cadence ([#215](https://github.com/typicalday/owenloop/issues/215)) ([e79fcc5](https://github.com/typicalday/owenloop/commit/e79fcc5ca325ce62a18f0558125dc0cf8edf5083))
+* calls joins wait for whole-child completion ([#239](https://github.com/typicalday/owenloop/issues/239)) ([934215d](https://github.com/typicalday/owenloop/commit/934215d69381bb1fc189be1c424fb73d09070b3d))
+* classify future idle waits as stalls, not deadlocks ([#250](https://github.com/typicalday/owenloop/issues/250)) ([1efec61](https://github.com/typicalday/owenloop/commit/1efec617ca27d24e8ceaab45c879f8677480e3cd))
+* **cli:** report auth rate limits accurately ([#228](https://github.com/typicalday/owenloop/issues/228)) ([44da220](https://github.com/typicalday/owenloop/commit/44da2202b026deb49b69a2cc17bba5812180f12e))
+* **cli:** route reject and provide to hub ([#220](https://github.com/typicalday/owenloop/issues/220)) ([1697b8d](https://github.com/typicalday/owenloop/commit/1697b8d17ea549516fb0f326de55aab94966d594))
+* damp repeated capacity reclaims in Shift ([#243](https://github.com/typicalday/owenloop/issues/243)) ([c20003a](https://github.com/typicalday/owenloop/commit/c20003a179c71763043961d1c583da3cbe0865a0))
+* drain CLI output before exit ([#235](https://github.com/typicalday/owenloop/issues/235)) ([eecf853](https://github.com/typicalday/owenloop/commit/eecf85327b631eca5512bc87d522db060b603ba7))
+* **engine:** re-stamp owed version target when a reject re-arms a claim ([#211](https://github.com/typicalday/owenloop/issues/211)) ([ccf956c](https://github.com/typicalday/owenloop/commit/ccf956c02ed2cdec2659861724c3a235be99a6b8))
+* keep a source schema's own constraints when checking its union branches ([#260](https://github.com/typicalday/owenloop/issues/260)) ([4803906](https://github.com/typicalday/owenloop/commit/4803906d7f41b61b8f617b3a40da3e6f6d6227e4))
+* **mcp:** expose hub passthrough fields ([#227](https://github.com/typicalday/owenloop/issues/227)) ([32548f1](https://github.com/typicalday/owenloop/commit/32548f1cf2747f6599fd1e00a2cc859a8da64b53))
+* **mcp:** put the catalog rule first in the chief-of-staff charter ([#233](https://github.com/typicalday/owenloop/issues/233)) ([e5ff766](https://github.com/typicalday/owenloop/commit/e5ff76656041bfe4c66785e5d1ce0d573114a020))
+* model all collection member retractions ([#234](https://github.com/typicalday/owenloop/issues/234)) ([9b87542](https://github.com/typicalday/owenloop/commit/9b875423dd56f4153c386b75e3eda0861933ab15))
+* read the capability mappings the hub actually returns ([#216](https://github.com/typicalday/owenloop/issues/216)) ([f416396](https://github.com/typicalday/owenloop/commit/f416396039baefeb6ca86a1c063ae53b28a6c2fa))
+* report collection search cap usage ([#245](https://github.com/typicalday/owenloop/issues/245)) ([de4925c](https://github.com/typicalday/owenloop/commit/de4925cd0c72c8a4193bd3c8eee2a4507ba9f6f4))
+* retry rate-limited exec receipt submissions ([#225](https://github.com/typicalday/owenloop/issues/225)) ([c5ce4bb](https://github.com/typicalday/owenloop/commit/c5ce4bb505c83ea420b3549f928ea51891d76eac))
+* revive exclusive-group siblings when the winner is un-greened ([#253](https://github.com/typicalday/owenloop/issues/253)) ([66eab0a](https://github.com/typicalday/owenloop/commit/66eab0ad2805f09d0196673d968a54203a637222))
+* settle a calls output when its gate input is skipped ([#257](https://github.com/typicalday/owenloop/issues/257)) ([c773a4e](https://github.com/typicalday/owenloop/commit/c773a4ef8cd6b012b007d8134a80ca282ba9bf9e))
+* validate calls edges in lint and check ([#240](https://github.com/typicalday/owenloop/issues/240)) ([5741261](https://github.com/typicalday/owenloop/commit/5741261c19c7f694c2f25a919abd2acf2af13038))
+* validate hub workflow IDs locally ([#244](https://github.com/typicalday/owenloop/issues/244)) ([da5e91f](https://github.com/typicalday/owenloop/commit/da5e91f8072f500d26f752aa4060beea70b6b0fb))
+* **work:** surface and resolve command-step orders whose bundle is missing from the store ([#261](https://github.com/typicalday/owenloop/issues/261)) ([9dbd4f0](https://github.com/typicalday/owenloop/commit/9dbd4f03b1411b18c4f38e36a7da00cd1fc38b90))
+
 ## [0.5.9](https://github.com/typicalday/owenloop/compare/v0.5.8...v0.5.9) (2026-08-19)
 
 
