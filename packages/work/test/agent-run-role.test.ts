@@ -15,7 +15,9 @@
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -36,6 +38,7 @@ import type { InstructionResolver } from '../src/exec/instructions.ts';
 import type { StepDef } from '../../../src/types.ts';
 import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { buildDef } from '../../../src/defs.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 
 // ---- arg parsing ------------------------------------------------------------
 
@@ -112,6 +115,25 @@ const TEMPLATE = [
   'account: __OWENLOOP_ACCOUNT__',
   'shift: __OWENLOOP_SHIFT__',
 ].join('\n');
+
+function seedAgentCredential(home: string, origin: string, token: string): void {
+  const directory = join(home, '.owenloop');
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(
+    join(directory, 'credentials.json'),
+    JSON.stringify({ version: 2, hubs: { [origin]: { 'agent:default': { kind: 'agent', accessToken: token } } } }),
+  );
+}
+
+function makeTreeWritable(path: string): void {
+  if (!existsSync(path)) return;
+  chmodSync(path, 0o700);
+  for (const name of readdirSync(path)) {
+    const child = join(path, name);
+    if (statSync(child).isDirectory()) makeTreeWritable(child);
+    else chmodSync(child, 0o600);
+  }
+}
 
 function agentOrder(o: {
   claimed?: boolean;
@@ -442,6 +464,7 @@ beforeEach(() => {
 afterEach(() => {
   process.env = savedEnv;
   for (const id of registeredIds.splice(0)) unregister(id);
+  makeTreeWritable(home);
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -1042,7 +1065,7 @@ test('a bad OWENLOOP_HARNESS_MODULE is reported and does not crash the runner', 
 
 // ---- local instruction resolution --------------------------------------------
 
-test('run() exits 1 and releases when the order digest is not installed locally', async () => {
+test('injected resolver preserves the no-template release when the order digest is not installed locally', async () => {
   useAdapter(createFakeAdapter({ id: 'fake' }));
   const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
   const err: string[] = [];
@@ -1050,6 +1073,106 @@ test('run() exits 1 and releases when the order digest is not installed locally'
   assert.equal(code, 1);
   assert.match(err.join('\n'), /unknown local workflow digest 'sha256:deadbeef'/);
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('default agent wiring recovers a signed missing bundle before hosting the step', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'recovered-agent',
+    workflow: [
+      'name: recovered-agent',
+      'inputs:',
+      '  - name: seed',
+      '    seedOwed: true',
+      'steps:',
+      '  - name: builder',
+      '    consumes: [seed]',
+      '    produces: [out]',
+      '    terminal: true',
+      '    body: recovered agent brief',
+      '    x:',
+      '      harness:',
+      '        id: fake',
+      '        tools: [Read]',
+      '',
+    ].join('\n'),
+  });
+  const signed = await installSignedBundleFixture({ sourceDir, root: join(home, 'remote-publication'), home });
+  assert.equal(signed.source.kind, 'file');
+  const publication = readFileSync(`${signed.source.path}.dsse`);
+  const auths: string[] = [];
+  const server = createServer((req, res) => {
+    auths.push(req.headers.authorization ?? '');
+    if (req.url === `/api/bundles/${signed.packed.digest}`) {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end(signed.packed.bytes);
+      return;
+    }
+    if (req.url === `/api/publications/${signed.packed.digest}`) {
+      res.writeHead(200, { 'x-owenloop-publication-state': 'signed' });
+      res.end(publication);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  seedAgentCredential(home, origin, 'agent-recovery-token');
+  const fake = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  const { hub, releases } = probeHub({
+    responses: [agentOrder({ defDigest: signed.packed.digest }), noHold('ok')],
+    def: DEF,
+  });
+
+  try {
+    const code = await roleRun(['wf1/run1', '--origin', origin, '--confirm-interval', '1', '--submit-grace', '2000'], {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'agent-recovery-host',
+      cwd: '/work',
+      out: () => {},
+      err: () => {},
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(fake.calls.map((call) => call.kind), ['start', 'stop']);
+    assert.deepEqual(releases, []);
+    assert.deepEqual(auths, [
+      'Bearer agent-recovery-token',
+      'Bearer agent-recovery-token',
+      'Bearer agent-recovery-token',
+    ]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('default agent wiring preserves no-template when recovery fails verification', async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  seedAgentCredential(home, origin, 'agent-recovery-token');
+  const { hub, releases } = probeHub({ responses: [agentOrder({ defDigest: 'a'.repeat(64) }), noHold('ok')], def: DEF });
+  const err: string[] = [];
+
+  try {
+    const code = await roleRun(['wf1/run1', '--origin', origin], {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'agent-recovery-host',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+    assert.equal(code, 1, 'the loop keeps its no-template failure outcome');
+    assert.match(err.join('\n'), /instruction refusal \(integrity\).*HTTP 404/u);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test('run() exits 1 when the order has no definition digest', async () => {

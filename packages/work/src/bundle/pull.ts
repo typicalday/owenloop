@@ -35,6 +35,8 @@ export interface HubBundleRecoveryOptions {
   warn?: (line: string) => void;
   /** Injectable transport for hermetic recovery tests. */
   fetchImpl?: typeof fetch;
+  /** Per-request deadline; production uses the fixed 30-second default. */
+  timeoutMs?: number;
 }
 
 function originBase(origin: string): string {
@@ -58,17 +60,18 @@ async function request(
   args: HubBundleRecoveryOptions,
   route: string,
 ): Promise<Response> {
+  const timeoutMs = args.timeoutMs ?? RECOVERY_TIMEOUT_MS;
   try {
     return await (args.fetchImpl ?? globalThis.fetch)(route, {
       method: 'GET',
       headers: { Authorization: `Bearer ${args.token}` },
-      signal: AbortSignal.timeout(RECOVERY_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: 'error',
     });
   } catch (error) {
     const name = error instanceof Error ? error.name : 'request error';
     const detail = name === 'TimeoutError' || name === 'AbortError'
-      ? `timed out after ${RECOVERY_TIMEOUT_MS / 1_000}s`
+      ? `timed out after ${timeoutMs / 1_000}s`
       : 'request failed';
     throw failure(route, detail);
   }

@@ -965,6 +965,53 @@ test('modern command order fails closed when exact digest metadata is unavailabl
   assert.match(errors.join('\n'), /exact command routing metadata.*sha256:missing.*unavailable/u);
 });
 
+test('modern command dispatches when its exact resolver recovers the missing bundle', async () => {
+  const order = modernWo('run_recovered_digest', 'cmd', 'command', 'sha256:recovered');
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+  let recoveryResolutions = 0;
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    resolveOrderStep: async (received) => {
+      recoveryResolutions++;
+      assert.equal(received.defDigest, 'sha256:recovered');
+      // The injected resolver is the shift runtime's production store source;
+      // resolving here represents its one-shot fetch/install/re-prime recovery.
+      return { name: 'cmd', executor: 'command' };
+    },
+  })).run();
+
+  assert.equal(recoveryResolutions, 1);
+  assert.deepEqual(spawns.map((spawned) => spawned.run), ['run_recovered_digest']);
+});
+
+test('modern command verification recovery failure drops the claim without spawning or releasing it', async () => {
+  const order = modernWo('run_verification_failed', 'cmd', 'command', 'sha256:untrusted');
+  const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+  const events: Array<{ type: string; reason?: string; run?: string; message?: string }> = [];
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    resolveOrderStep: async () => { throw new Error('publication signature is invalid'); },
+    onEvent: (event) => events.push(event),
+  })).run();
+
+  assert.equal(spawns.length, 0);
+  assert.equal(count(calls, 'release'), 0, 'verification failures remain available for manual pickup');
+  assert.equal(
+    events.some((event) =>
+      event.type === 'order-dropped' &&
+      event.run === 'run_verification_failed' &&
+      event.reason === 'verification-failed' &&
+      /signature is invalid/u.test(event.message ?? '')),
+    true,
+  );
+});
+
 test('modern agent order never passes a disagreeing cache harness', async () => {
   cacheBuilderWithHarness('cache-harness');
   const order = modernWo('run_modern_harness', 'builder', 'agent');

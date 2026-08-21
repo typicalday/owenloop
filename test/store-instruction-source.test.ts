@@ -4,11 +4,13 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { defInstructionDigest } from '../src/order-resolver.ts';
+import { packBundle } from '../src/bundle/index.ts';
 import { finalizeDefs, loadDefFile } from '../src/defs.ts';
 import {
   createBundleIngestor,
   createStoreInstructionSource,
   defDigest,
+  globalStoreRoot,
   installWorkflowBundle,
   objectDirForDigest,
   readWorkflowStoreIndex,
@@ -20,7 +22,7 @@ import {
 } from '../src/store/index.ts';
 import { createStoreInstructionResolver } from '../packages/work/src/exec/instructions.ts';
 import type { OrderPacket } from '../packages/work/src/hub/types.ts';
-import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
+import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
 
 const WORKFLOW = `name: source-fixture
 inputs:
@@ -530,6 +532,57 @@ test('store instruction source: missing-object recovery is called once and canno
   assert.equal(await source.prime('b'.repeat(64)), 'unknown-digest');
   assert.equal(calls, 1);
   assert.deepEqual(source.lookup({ defDigest: 'b'.repeat(64), step: 'runner', key: '' }), { status: 'unknown-digest' });
+});
+
+test('store instruction source: a recovered install re-primes once and a fresh source hits the installed store without fetching', async () => {
+  const home = tempDir('owenloop-recovery-home-');
+  const globalRoot = globalStoreRoot(home);
+  const projectRoot = tempDir('owenloop-recovery-project-');
+  const fixtureSource = sourceDir();
+  let recoveryCalls = 0;
+  let recoveredDigest = '';
+  const recovering = createStoreInstructionSource({
+    projectRoot,
+    globalRoot,
+    verifier: createBundleIngestor(),
+    onMissing: {
+		async onMissing(requestedDigest): Promise<'retry'> {
+			recoveryCalls++;
+			const installed = await installSignedBundleFixture({
+				sourceDir: fixtureSource,
+				root: globalRoot,
+				home,
+				env: { OWENLOOP_DEF_POLICY: 'enforce' },
+			});
+			recoveredDigest = installed.packed.digest;
+			assert.equal(requestedDigest, recoveredDigest, 'the recovery install is pinned to the missing exact digest');
+			return 'retry';
+		},
+    },
+  });
+
+  // The fixture bundle digest is the exact order-reference form used by the
+  // remote recovery adapter; projection-digest mapping remains covered above.
+  const expected = packBundle(fixtureSource).digest;
+  assert.equal(await recovering.prime(expected), 'resolved');
+  assert.equal(recoveryCalls, 1);
+  assert.equal(recoveredDigest, expected);
+  assert.equal(recovering.getVerifiedStep(expected, 'runner')?.command, 'printf "from-store\\n"');
+
+  let unexpectedFetches = 0;
+  const fresh = createStoreInstructionSource({
+    projectRoot,
+    globalRoot,
+    verifier: createBundleIngestor(),
+    onMissing: {
+		async onMissing(): Promise<'retry'> {
+			unexpectedFetches++;
+			return 'retry';
+		},
+    },
+  });
+  assert.equal(await fresh.prime(expected), 'resolved');
+  assert.equal(unexpectedFetches, 0, 'a process-fresh source reads the installed global object and issues no fetch');
 });
 
 test('store instruction source: a tampered installed object is an integrity refusal, not an unknown digest', async () => {

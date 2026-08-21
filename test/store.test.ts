@@ -1326,9 +1326,11 @@ test('legacy/foreign id rows are addressed by natural key, not recomputed id', (
 
 // ---- a released lease is not a run, for budget or for cadence ---------------
 // `released` marks a lease that was handed straight back: the step never ran.
-// The three producers are a capacity release (a server already at its agent
-// cap), a lapsed pickup window, and a born-reject re-arm. All three burn a run
-// id and nothing else.
+// Public handbacks (capacity, pickup lapse, and the agent-lane release path)
+// increment the task's lease-churn `attempts` counter so status makes repeated
+// handbacks visible. The private born-reject/CAS release remains separate and
+// does not increment attempts. Neither kind of release consumes the run budget
+// or cadence clock.
 //
 // `no_work` is the opposite case and stays counted — the step DID run and found
 // nothing to produce. A `merge-gate` polling CI is the canonical one: if its
@@ -1341,6 +1343,8 @@ test('legacy/foreign id rows are addressed by natural key, not recomputed id', (
 // its artifact still at `attemptsUsed: 0`, because the release path already
 // declines to bump attempts for exactly this reason. Two budgets measuring the
 // same thing disagreed, and the wrong one was the one with no work behind it.
+// The artifact's `attemptsUsed` still stays at 0: it tracks judgment rework,
+// not public lease churn.
 
 test('countRuns: released leases do not spend the daily budget', () => {
   const s = mem();
