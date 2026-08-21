@@ -112,6 +112,39 @@ const EPHEMERAL_SKILL_PATHS = [
   'plugins/codex/plugins/owenloop/skills/ephemeral/SKILL.md',
 ] as const;
 
+/** plan's governed mixed MCP/CLI/file compiler surface under both spellings. */
+const PLAN_ALLOWED_TOOLS = [
+  'mcp__plugin_owenloop_owenloop__list_workflows',
+  'mcp__plugin_owenloop_owenloop__search_workflows',
+  'mcp__plugin_owenloop_owenloop__get_workflow',
+  'mcp__plugin_owenloop_owenloop__create_workflow',
+  'mcp__plugin_owenloop_owenloop__start_run',
+  'mcp__plugin_owenloop_owenloop__pending_gates',
+  'mcp__plugin_owenloop_owenloop__provide_input',
+  'mcp__plugin_owenloop_owenloop__get_status',
+  'mcp__plugin_owenloop_owenloop__delete_workflow',
+  'mcp__owenloop__list_workflows',
+  'mcp__owenloop__search_workflows',
+  'mcp__owenloop__get_workflow',
+  'mcp__owenloop__create_workflow',
+  'mcp__owenloop__start_run',
+  'mcp__owenloop__pending_gates',
+  'mcp__owenloop__provide_input',
+  'mcp__owenloop__get_status',
+  'mcp__owenloop__delete_workflow',
+  'Write',
+  'Bash(mktemp:*)',
+  'Bash(owenloop:*)',
+  'Bash(rm:*)',
+] as const;
+
+/** The canonical compiler skill plus both committed materializations. */
+const PLAN_SKILL_PATHS = [
+  'plugins/_skills/plan/SKILL.md',
+  'plugins/claude-code/plugin/skills/plan/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/plan/SKILL.md',
+] as const;
+
 /** shift's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
  *  tightly scoped Bash prefix. */
@@ -497,6 +530,114 @@ test('all shipped ephemeral skills prescribe honest self-execution and safe reti
   }
 });
 
+test('all shipped plan skills have the governed compiler identity and exact mixed tool set', () => {
+  for (const path of PLAN_SKILL_PATHS) {
+    const { data } = parseFrontmatter(readText(path));
+    assert.equal(data.name, 'plan');
+    assert.match(String(data.description), /checked, approval-gated ephemeral composite/u);
+    const tools = splitToolList(data['allowed-tools']);
+    assert.deepEqual(new Set(tools), new Set(PLAN_ALLOWED_TOOLS));
+    for (const forbidden of [
+      'Edit',
+      'Bash',
+      'mcp__plugin_owenloop_owenloop__whats_next',
+      'mcp__plugin_owenloop_owenloop__heartbeat',
+      'mcp__plugin_owenloop_owenloop__get_order',
+      'mcp__plugin_owenloop_owenloop__submit',
+      'mcp__plugin_owenloop_owenloop__reject_artifact',
+      'mcp__owenloop__whats_next',
+      'mcp__owenloop__heartbeat',
+      'mcp__owenloop__get_order',
+      'mcp__owenloop__submit',
+      'mcp__owenloop__reject_artifact',
+    ]) {
+      assert.ok(!tools.includes(forbidden), `${path} must not grant ${forbidden}`);
+    }
+  }
+});
+
+test('all shipped plan skills retain compiler selection, full-closure, and clean-check rules', () => {
+  for (const path of PLAN_SKILL_PATHS) {
+    const body = parseFrontmatter(readText(path)).body;
+    for (const clause of [
+      'no single catalog definition covers the task',
+      '`list_workflows` first',
+      '`search_workflows`',
+      '`get_workflow` for every promising candidate',
+      'candidates',
+      'coordinate',
+      'selected',
+      'reason',
+      'collision-safe root name',
+      'Refuse an exact-name\ncollision',
+      'create_workflow({ yaml, ephemeral: true })',
+      'remote ephemeral preflight',
+      'expected name, version, and content hash',
+      'complete exact calls closure',
+      'owenloop lint --defs <staging-dir>',
+      'owenloop check <composite-name> --defs <staging-dir> --format json',
+      'completable === true',
+      'bounded === false',
+      'deadlocks',
+      'stallStates',
+      'stuck',
+      'structurallyDeadSteps',
+      'unreachedSteps',
+      'invariantViolations',
+    ]) {
+      assert.ok(body.includes(clause), `${path} must retain ${clause}`);
+    }
+    assert.match(
+      body,
+      /candidates:[\s\S]*coordinate[\s\S]*selected[\s\S]*reason[\s\S]*additionalProperties: false/u,
+      `${path} must keep the closed structural selection rationale`,
+    );
+    assert.ok(body.includes('outside the\nrepository'), `${path} must stage definitions outside the repo`);
+    assert.ok(body.includes('Do not silently rewrite a\ntarget'), `${path} must preserve exact calls targets`);
+  }
+});
+
+test('all shipped plan skills prescribe the parked gate lifecycle and delegated execution', () => {
+  for (const path of PLAN_SKILL_PATHS) {
+    const body = parseFrontmatter(readText(path)).body;
+    assert.match(
+      body,
+      /name: planApproval\n  seedOwed: true\n  producer: human[\s\S]*required: \[approved\]/u,
+      `${path} must define an object-valued human approval input`,
+    );
+    assert.match(
+      body,
+      /first executable\nbespoke step consumes `task`, `compiledPlan`, and `planApproval`/u,
+      `${path} must place all work after approval`,
+    );
+    assert.ok(body.includes('onCancel:'), `${path} must retain the cancellation cleanup contract`);
+    assert.ok(body.includes('owenloop cancel <workflow>'), `${path} must cancel a declined plan`);
+    assert.ok(body.includes('never performs composite step work inline'), `${path} must prohibit inline step work`);
+    assert.ok(body.includes('never submits\nartifacts for a composite run'), `${path} must prohibit composite submission`);
+    assert.ok(body.includes('`conduct` or `shift`'), `${path} must hand supervision to the crew tools`);
+    assert.ok(!body.includes('approval-envelope'), `${path} must not teach an approval envelope`);
+    assert.ok(!body.includes('conversational-only approval'), `${path} must not teach a conversational-only gate`);
+
+    const lifecycle = body.slice(body.indexOf('## Publish, park, present, and release'));
+    const markers = [
+      'Call `create_workflow`',
+      'Call `get_workflow`',
+      'Call `start_run`',
+      'Require `eligible: []`',
+      'call\n   `pending_gates`',
+      'Present the exact `compiledPlan`',
+      'call `provide_input`',
+      'intended first step to be eligible',
+    ];
+    let previous = -1;
+    for (const marker of markers) {
+      const current = lifecycle.indexOf(marker);
+      assert.ok(current > previous, `${path} must order ${marker} after the preceding lifecycle action`);
+      previous = current;
+    }
+  }
+});
+
 test('ephemeral skill is hub-native and the legacy local skill is gone', () => {
   for (const path of EPHEMERAL_SKILL_PATHS) {
     const content = readText(path);
@@ -515,6 +656,7 @@ test('retirement docs list every plugin skill and describe conduct as Shift supe
     ['author', 'plugins/_skills/author/SKILL.md'],
     ['conduct', 'plugins/_skills/conduct/SKILL.md'],
     ['ephemeral', 'plugins/_skills/ephemeral/SKILL.md'],
+    ['plan', 'plugins/_skills/plan/SKILL.md'],
     ['shift', 'plugins/_skills/shift/SKILL.md'],
   ]) {
     assert.ok(readme.includes(`[\`${name}\`](${path})`), `README must link the ${name} plugin skill`);

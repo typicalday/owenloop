@@ -388,7 +388,7 @@ looks like:
   as scratch discipline rather than standing infrastructure.
 
 The engine doesn't know or care which of these is ticking it — an order is an
-order. The Owenloop Claude Code and Codex plugins provide four hub-native skills:
+order. The Owenloop Claude Code and Codex plugins provide five hub-native skills:
 
 - [`conduct`](plugins/_skills/conduct/SKILL.md) — supervise one existing workflow
   through a scoped Shift, check its status, and relay human gates.
@@ -397,6 +397,8 @@ order. The Owenloop Claude Code and Codex plugins provide four hub-native skills
   `start_run`. Use `conduct` or `shift` to supervise the resulting run.
 - [`ephemeral`](plugins/_skills/ephemeral/SKILL.md) — structure the caller's own
   one-off work with an ephemeral workflow.
+- [`plan`](plugins/_skills/plan/SKILL.md) — compile novel multi-domain work into
+  a checked, approval-gated ephemeral composite that delegates library playbooks.
 - [`shift`](plugins/_skills/shift/SKILL.md) — attend a crew's ongoing workflow
   workload through the blocking Shift loop and relay human gates.
 
