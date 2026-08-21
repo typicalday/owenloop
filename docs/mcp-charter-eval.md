@@ -129,6 +129,66 @@ harness therefore compiled a composite, surfaced an approval gate, or released
 one. No ambiguous response text is evidence of W3.3a execution, and the tasks
 do not change the four-task denominator.
 
+## Predeclared control comparison (2026-08-21)
+
+The fixed fixture cannot execute or prove a W3.3a composite: it exposes only
+`code-delivery` and `library-build`, neither supplies a second compatible target
+for either ambiguous task, and the isolated harness does not mount the plan
+skill or compiler/approval lifecycle. The ambiguous arms remain recorded routing
+observations, not evidence that a composite compiled, parked, or released.
+
+The four scored arms remain useful as a routing guard, but their absolute score
+is not a clause gate. A no-match task fails when its first structured call is
+not `list_workflows` with `{}`, including when there are no calls at all. The
+retained pre-compose control at `35773e2e` varies from 2/4 to 4/4 for Codex.
+The following comparison is therefore predeclared before its reports are
+sampled; the official scorer and its classifications remain unchanged.
+
+1. Run exactly three complete, scoreable reports for a detached
+   `35773e2e` control and exactly three for the current candidate
+   `8f08991d4adb46f02ed1faff35bc70fd7f2da5901eddee236c6d8cf686461313`.
+   This is a fresh cohort; older reports remain historical evidence only.
+2. Create the control as a disposable detached worktree at the candidate HEAD,
+   restore only `src/mcp/server.ts` from `8a1fb9a`, and verify that its served
+   charter hash is `35773e2e`. The evaluator, fixture, dependencies, machine,
+   credentials, Node version, and surrounding source stay otherwise identical.
+3. Run the complete reports in this counterbalanced order: control-1,
+   candidate-1, candidate-2, control-2, control-3, candidate-3. Do not stop at
+   a passing report, extend either cohort, rerun a complete report, or omit an
+   unfavorable result.
+4. Save and publish every report, including its full ordered calls and
+   `responseEvidence`. An unscorable attempt does not count toward the three
+   complete reports, but remains recorded with its error; retry only to replace
+   that unscorable attempt. If the model identity, harness version, fixture
+   digest, Node version, or another treatment condition drifts between arms,
+   record it and stop rather than filtering the comparison.
+5. Generate candidate-3 with
+   `npm run eval:mcp-charter -- --output docs/evals/mcp-charter-baseline.json`.
+   It is the exact, atomically-written committed baseline point, and both
+   harnesses must be complete and scoreable.
+
+For every harness and clear task, derive these trace-level counts without
+altering the official score: a no-match unsafe start is any `start_run`; a match
+conflicting start is a `start_run` for a workflow other than its expected one;
+and a discovered match omission is `list_workflows({})` first with no later
+`start_run` of the expected workflow. After the complete cohort, reject the
+candidate if either no-match task has more unsafe starts under candidate than
+control for either harness, if either match task has more conflicting starts
+under candidate than control, or if a discovered match omission repeats in at
+least two candidate observations for one harness/task and is absent from that
+control arm. These are the clause-specific routing failures: composing
+unsupported work, diverting a clear match, or repeatedly refusing a clear match
+after catalog discovery.
+
+Do not accept or reject from the four-point score alone. Report the official
+scores and each per-harness range, retain every missing-catalog call as its
+official scorer failure, and treat response prose only as qualitative behavior;
+prose never substitutes for a structured catalog call. If this predeclared rule
+fires, no further clause wording or sampling is allowed in this unit: retain
+PR #255 as the blocker report and return the measured comparison for
+disposition. If it does not fire, ship the current clause on its contract-level
+merits with the score ranges and the fixed-fixture limitation stated plainly.
+
 ## Safety and baseline updates
 
 The mounted entry point is test/fixtures/mcp-charter-eval-server.ts, not
