@@ -145,6 +145,25 @@ const PLAN_SKILL_PATHS = [
   'plugins/codex/plugins/owenloop/skills/plan/SKILL.md',
 ] as const;
 
+/** graduate's governed evidence/read-only MCP and scoped local-check surface. */
+const GRADUATE_ALLOWED_TOOLS = [
+  'mcp__plugin_owenloop_owenloop__get_workflow',
+  'mcp__plugin_owenloop_owenloop__get_status',
+  'mcp__owenloop__get_workflow',
+  'mcp__owenloop__get_status',
+  'Write',
+  'Bash(mktemp:*)',
+  'Bash(owenloop:*)',
+  'Bash(rm:*)',
+] as const;
+
+/** The authoritative graduate skill plus both committed materializations. */
+const GRADUATE_SKILL_PATHS = [
+  'plugins/_skills/graduate/SKILL.md',
+  'plugins/claude-code/plugin/skills/graduate/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/graduate/SKILL.md',
+] as const;
+
 /** shift's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
  *  tightly scoped Bash prefix. */
@@ -638,6 +657,88 @@ test('all shipped plan skills prescribe the parked gate lifecycle and delegated 
   }
 });
 
+test('all shipped graduate skills have the governed identity and exact evidence/check tool set', () => {
+  for (const path of GRADUATE_SKILL_PATHS) {
+    const { data } = parseFrontmatter(readText(path));
+    assert.equal(data.name, 'graduate');
+    assert.match(String(data.description), /successful completed ephemeral composite/u);
+    const tools = splitToolList(data['allowed-tools']);
+    assert.deepEqual(new Set(tools), new Set(GRADUATE_ALLOWED_TOOLS));
+    for (const forbidden of [
+      'Edit',
+      'Bash',
+      'mcp__plugin_owenloop_owenloop__whats_next',
+      'mcp__plugin_owenloop_owenloop__heartbeat',
+      'mcp__plugin_owenloop_owenloop__get_order',
+      'mcp__plugin_owenloop_owenloop__submit',
+      'mcp__plugin_owenloop_owenloop__reject_artifact',
+      'mcp__owenloop__whats_next',
+      'mcp__owenloop__heartbeat',
+      'mcp__owenloop__get_order',
+      'mcp__owenloop__submit',
+      'mcp__owenloop__reject_artifact',
+    ]) {
+      assert.ok(!tools.includes(forbidden), `${path} must not grant ${forbidden}`);
+    }
+  }
+});
+
+test('all shipped graduate skills retain capture, generalization, discovery, and handoff rules', () => {
+  for (const path of GRADUATE_SKILL_PATHS) {
+    const body = parseFrontmatter(readText(path)).body;
+    for (const clause of [
+      'before retirement',
+      'publication-time full bundle was preserved',
+      'ephemeral: true',
+      'name, version, and content hash',
+      'terminal === true',
+      'instanceStatus === "done"',
+      'Failed or cancelled terminal runs are not\n   graduation evidence',
+      'preserved `compiledPlan`',
+      'does not return artifact payloads',
+      'never use it to read',
+      'task`: replace the one-off value',
+      'compiledPlan`: remove it from candidate runtime inputs',
+      'planApproval`: remove the ephemeral compiler-release gate',
+      'explicit JSON Schema',
+      'every authored `produces`/`generates` artifact',
+      'every top-level output name to resolve to a schema-bearing',
+      'exact `calls:` closure',
+      'complete clean-export workflow set',
+      'exactly\n`description`, non-empty `whenToUse`, non-empty `notFor`, and',
+      'exactly once, with no unknown or duplicate',
+      'non-empty `name`, non-empty',
+      'beginning `#/`',
+      'owenloop lint --defs <staging-dir>',
+      'owenloop check <candidate-name> --defs <staging-dir> --format json',
+      'zero errors and zero warnings',
+      'completable === true',
+      'bounded === false',
+      'deadlocks',
+      'stallStates',
+      'stuck',
+      'structurallyDeadSteps',
+      'unreachedSteps',
+      'invariantViolations',
+      'Cite the originating workflow ID',
+      'Do not attempt a receipt read',
+      'workflowCoordinate',
+      'workflowVersion',
+      'originatingWorkflowId',
+      'completionResult',
+      'YYYY-MM-DD',
+      'Do not pack',
+      'publication boundary',
+    ]) {
+      assert.ok(body.includes(clause), `${path} must retain ${clause}`);
+    }
+    assert.ok(
+      body.indexOf('before retirement') < body.indexOf('After `delete_workflow` removes an ephemeral live pointer'),
+      `${path} must capture the live bundle before explaining retirement`,
+    );
+  }
+});
+
 test('ephemeral skill is hub-native and the legacy local skill is gone', () => {
   for (const path of EPHEMERAL_SKILL_PATHS) {
     const content = readText(path);
@@ -656,6 +757,7 @@ test('retirement docs list every plugin skill and describe conduct as Shift supe
     ['author', 'plugins/_skills/author/SKILL.md'],
     ['conduct', 'plugins/_skills/conduct/SKILL.md'],
     ['ephemeral', 'plugins/_skills/ephemeral/SKILL.md'],
+    ['graduate', 'plugins/_skills/graduate/SKILL.md'],
     ['plan', 'plugins/_skills/plan/SKILL.md'],
     ['shift', 'plugins/_skills/shift/SKILL.md'],
   ]) {
