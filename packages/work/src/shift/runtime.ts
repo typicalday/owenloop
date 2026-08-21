@@ -22,7 +22,7 @@ import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createShiftLogSink } from './logsink.ts';
 import { prepareShiftLogDir, shiftLogFile } from './logretention.ts';
 import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protocol.ts';
-import { createDefaultSpawner, type WorkerExit, type WorkerFailure } from './spawn.ts';
+import { createDefaultSpawner, type Spawner, type WorkerExit, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight, type Liveness, type Reconciliation } from './state.ts';
 import { FileLockTimeoutError, type AcquireFileLockOpts } from '../../../../src/lock.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
@@ -335,6 +335,8 @@ export interface ShiftRuntimeOptions {
   role?: 'shift';
   /** Socket path selected by the shift command. */
   socketPath?: string;
+  /** Test/embedder spawner; production uses the detached worker spawner. */
+  spawner?: Spawner;
 }
 
 /** Public Shift daemon transport is a Unix-domain socket on macOS and Linux. */
@@ -624,7 +626,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const reportWorkerExit = (exit: WorkerExit): void => {
     loopRef.current?.noteChildExited(exit);
   };
-  const spawner = createDefaultSpawner(
+  const spawner = options.spawner ?? createDefaultSpawner(
     origin,
     account,
     undefined,

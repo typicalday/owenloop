@@ -511,7 +511,7 @@ function warningText(source: BundleSource, coordinate: WorkflowCoordinate, verdi
 
 function absentOriginDetail(source: BundleSource, sidecars: Sidecars): string {
   if (source.kind !== 'file') {
-    return 'cannot carry an origin: installed from a non-file source, where no sidecar is available';
+    return 'no origin evidence was supplied or recorded for this remote source';
   }
   if (sidecars.unsigned) {
     return 'cannot carry an origin: the definition was published unsigned';

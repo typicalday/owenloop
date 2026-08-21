@@ -1100,8 +1100,21 @@ test('default agent wiring recovers a signed missing bundle before hosting the s
   assert.equal(signed.source.kind, 'file');
   const publication = readFileSync(`${signed.source.path}.dsse`);
   const auths: string[] = [];
+  const responses = [agentOrder({ defDigest: signed.packed.digest }), noHold('ok')];
+  let getOrderCalls = 0;
   const server = createServer((req, res) => {
     auths.push(req.headers.authorization ?? '');
+    if (req.method === 'POST' && req.url === '/api/get_order') {
+      const response = responses[Math.min(getOrderCalls++, responses.length - 1)]!;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(response));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/release') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ text: '' }));
+      return;
+    }
     if (req.url === `/api/bundles/${signed.packed.digest}`) {
       res.writeHead(200, { 'content-type': 'application/octet-stream' });
       res.end(signed.packed.bytes);
@@ -1120,14 +1133,9 @@ test('default agent wiring recovers a signed missing bundle before hosting the s
   seedAgentCredential(home, origin, 'agent-recovery-token');
   const fake = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);
-  const { hub, releases } = probeHub({
-    responses: [agentOrder({ defDigest: signed.packed.digest }), noHold('ok')],
-    def: DEF,
-  });
 
   try {
     const code = await roleRun(['wf1/run1', '--origin', origin, '--confirm-interval', '1', '--submit-grace', '2000'], {
-      hub,
       signalHost: fakeSignalHost().host,
       holderId: 'agent-recovery-host',
       cwd: '/work',
@@ -1136,31 +1144,38 @@ test('default agent wiring recovers a signed missing bundle before hosting the s
     });
     assert.equal(code, 0);
     assert.deepEqual(fake.calls.map((call) => call.kind), ['start', 'stop']);
-    assert.deepEqual(releases, []);
-    assert.deepEqual(auths, [
-      'Bearer agent-recovery-token',
-      'Bearer agent-recovery-token',
-      'Bearer agent-recovery-token',
-    ]);
+    assert.equal(getOrderCalls, 2, 'the role-owned production client contacted the worker before and after the turn');
+    assert.equal(auths.every((auth) => auth === 'Bearer agent-recovery-token'), true);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 
 test('default agent wiring preserves no-template when recovery fails verification', async () => {
-  const server = createServer((_req, res) => {
+  const responses = [agentOrder({ defDigest: 'a'.repeat(64) }), noHold('ok')];
+  let getOrderCalls = 0;
+  const server = createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/api/get_order') {
+      const response = responses[Math.min(getOrderCalls++, responses.length - 1)]!;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(response));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/release') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ text: '' }));
+      return;
+    }
     res.writeHead(404);
     res.end();
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   seedAgentCredential(home, origin, 'agent-recovery-token');
-  const { hub, releases } = probeHub({ responses: [agentOrder({ defDigest: 'a'.repeat(64) }), noHold('ok')], def: DEF });
   const err: string[] = [];
 
   try {
     const code = await roleRun(['wf1/run1', '--origin', origin], {
-      hub,
       signalHost: fakeSignalHost().host,
       holderId: 'agent-recovery-host',
       cwd: '/work',
@@ -1169,10 +1184,26 @@ test('default agent wiring preserves no-template when recovery fails verificatio
     });
     assert.equal(code, 1, 'the loop keeps its no-template failure outcome');
     assert.match(err.join('\n'), /instruction refusal \(integrity\).*HTTP 404/u);
-    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.equal(getOrderCalls, 1, 'failed resolution releases without waiting for a confirmation poll');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('an injected hub builds the default resolver without requiring an agent credential', async () => {
+  const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+  const err: string[] = [];
+  const code = await roleRun(WIRE, {
+    hub,
+    signalHost: fakeSignalHost().host,
+    holderId: 'embedded-host',
+    cwd: '/work',
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+  assert.equal(code, 1, 'the injected transport does not force a credential lookup before local resolution');
+  assert.match(err.join('\n'), /instruction refusal \(unknown-digest\).*no verified local workflow bundle matches/u);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
 test('run() exits 1 when the order has no definition digest', async () => {

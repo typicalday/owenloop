@@ -382,9 +382,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   };
   let hub = deps.hub;
   let token: string | undefined;
-  // Production resolution needs the same scoped bearer for the authenticated
-  // recovery hook. Fully injected tests/embedders keep their no-auth path.
-  if (hub === undefined || instructions === undefined) {
+  // An injected HubClient is already the embedding boundary's authenticated
+  // transport. Keep that seam credential-free even when it asks us to build
+  // the ordinary local resolver; authenticated recovery is attached only when
+  // this role owns the production hub client and its scoped bearer.
+  if (hub === undefined) {
     const bearer = await resolveBearer({ origin, account, env: workerEnv });
     if (!bearer.ok) {
       err(`owenloop work agent-run: ${bearer.message}`);
@@ -402,14 +404,18 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	cwd: instructionCwd,
 	env: workerEnv,
 	consumedVerifier,
-	onMissing: createHubBundleRecoveryHandler({
-	  origin,
-	  token: token!,
-	  home,
-	  projectRoot: join(instructionCwd, 'workflows'),
-	  env: workerEnv,
-	  warn: (line) => err(`owenloop work agent-run: ${line}`),
-	}),
+	...(token === undefined
+	  ? {}
+	  : {
+	      onMissing: createHubBundleRecoveryHandler({
+		origin,
+		token,
+		home,
+		projectRoot: join(instructionCwd, 'workflows'),
+		env: workerEnv,
+		warn: (line) => err(`owenloop work agent-run: ${line}`),
+	      }),
+	    }),
       });
     } catch (e) {
       err(`owenloop work agent-run: instruction store unavailable: ${errMsg(e)}`);
