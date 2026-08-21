@@ -172,14 +172,23 @@ test('absent, unverifiable, and invalid origin verdicts remain distinguishable',
   assert.match(invalidError.message, /not valid JSON/);
 });
 
-test('origin wording distinguishes unsigned, non-file, and signed-file absence', async () => {
+test('origin wording distinguishes unsigned, remote, and signed-file absence', async () => {
   const unsignedCwd = temp('owenloop-origin-wording-unsigned-');
   const unsignedError = await originError(verifier(unsignedCwd, { originPolicy: 'enforce' }).verify(installInput(unsignedCwd)));
   assert.match(unsignedError.message, /cannot carry an origin: the definition was published unsigned/);
 
   const urlCwd = temp('owenloop-origin-wording-url-');
-  const urlError = await originError(verifier(urlCwd, { originPolicy: 'enforce' }).verify(installInput(urlCwd, { kind: 'url', url: 'https://example.test/bundle.wnlp' })));
-  assert.match(urlError.message, /cannot carry an origin: installed from a non-file source/);
+  const remoteInput = {
+    ...installInput(urlCwd, { kind: 'url', url: 'https://example.test/bundle.wnlp' }),
+    verificationEvidence: { publication: { state: 'signed' as const, dsseBytes: publicationSidecar() } },
+  };
+  const urlError = await originError(verifier(urlCwd, { originPolicy: 'enforce' }).verify(remoteInput));
+  assert.match(urlError.message, /no origin evidence was supplied or recorded for this remote source/);
+
+  const warnings: string[] = [];
+  await verifier(urlCwd, { originPolicy: 'warn', warn: warnings }).verify(remoteInput);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /no origin evidence was supplied or recorded for this remote source/);
 
   const signedFileCwd = temp('owenloop-origin-wording-signed-');
   setup(signedFileCwd);

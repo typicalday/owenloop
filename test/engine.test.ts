@@ -1326,6 +1326,11 @@ test('concurrency: a born-rejected (CAS-stale) run auto-releases its lease — n
     'born-reject auto-closes the run as a returned lease, not as work that found nothing',
   );
   assert.equal(store.getTask(wf, 'builder', '')?.status, 'idle', 'born-reject re-arms the task');
+  assert.equal(
+    store.getTask(wf, 'builder', '')?.attempts,
+    0,
+    'the private born-reject release is not public lease churn and does not burn an attempt',
+  );
   const builder2 = fire(engine, wf, 'builder', 3000);          // NO manual close()
   assert.notEqual(builder2.run, builder.run, 'fresh run id on next tick');
   assert.deepEqual(builder2.consumes, { plan: { plan: 'v2' } });
@@ -1403,6 +1408,26 @@ test('reap bumps the attempts counter', () => {
   fire(engine, wf, 'planner', 1000);
   engine.tick(wf, { now: 1300 });
   assert.equal(store.getTask(wf, 'planner', '')?.attempts, 1);
+});
+
+test('public released leases are visible as lease-churn attempts', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const order = fire(engine, wf, 'planner', 1_000 + attempt);
+    engine.close(wf, order.run, 'released');
+    assert.equal(
+      store.getTask(wf, 'planner', '')?.attempts,
+      attempt,
+      'every public handback increments the persisted lease-churn counter',
+    );
+    assert.equal(
+      engine.status(wf).debts.find((debt) => debt.path === 'plan')?.attempts,
+      attempt,
+      'Engine.status() exposes public lease churn on the re-armed output debt',
+    );
+  }
 });
 
 // ---- cadence + daily budget --------------------------------------------------

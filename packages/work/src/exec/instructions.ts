@@ -10,7 +10,7 @@
 
 import { join } from 'node:path';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../../src/store/index.ts';
-import type { BundleIngestor, StoreInstructionSource } from '../../../../src/store/index.ts';
+import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource } from '../../../../src/store/index.ts';
 import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
 import { compareStoreText, parseWorkflowCoordinate } from '../../../../src/store/types.ts';
@@ -98,6 +98,8 @@ export interface StoreInstructionResolverOptions {
   globalRoot: string;
   verifier: BundleIngestor;
   source?: StoreInstructionSource;
+  /** Optional one-shot authenticated recovery hook for a true store miss. */
+  onMissing?: MissingObjectHandler;
   /** Optional execution-time publication verifier. Omitted means publication trust is unverifiable and command orders refuse. */
   definitionVerifier?: DefinitionVerifier;
   /** Optional execution-time origin verifier. */
@@ -165,6 +167,7 @@ export function createStoreInstructionResolver(
     projectRoot: options.projectRoot,
     globalRoot: options.globalRoot,
     verifier: options.verifier,
+    ...(options.onMissing !== undefined ? { onMissing: options.onMissing } : {}),
   });
   const env = options.env ?? {};
   let mergedPolicies: ReturnType<typeof mergePolicyFloorWithLocal> | undefined;
@@ -441,6 +444,7 @@ export function createDefaultStoreInstructionResolver(args: {
   cwd: string;
   env: Record<string, string | undefined>;
   verifier?: BundleIngestor;
+  onMissing?: MissingObjectHandler;
   definitionVerifier?: DefinitionVerifier;
   originVerifier?: OriginVerifier;
   consumedVerifier?: ConsumedVerifier;
@@ -463,12 +467,14 @@ export function createDefaultStoreInstructionResolver(args: {
     projectRoot,
     globalRoot,
     verifier,
+    ...(args.onMissing !== undefined ? { onMissing: args.onMissing } : {}),
   });
   return createStoreInstructionResolver({
     projectRoot,
     globalRoot,
     verifier,
     source,
+    ...(args.onMissing !== undefined ? { onMissing: args.onMissing } : {}),
     definitionVerifier: args.definitionVerifier ?? createExecutionDefinitionVerifier({ env: args.env }),
     originVerifier: args.originVerifier ?? createExecutionOriginVerifier({ env: args.env }),
     ...(args.consumedVerifier !== undefined ? { consumedVerifier: args.consumedVerifier } : {}),

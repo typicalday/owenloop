@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
-import type { BundleSource, PreCommitVerifier } from './install.ts';
+import type { BundleSource, BundleVerificationEvidence, PreCommitVerifier } from './install.ts';
 import { defDigest, parseWorkflowCoordinate } from './types.ts';
 import type { DefDigest, WorkflowCoordinate } from './types.ts';
 import { readOwenloopSettingsRaw, owenloopSettingsPath } from '../work-settings.ts';
@@ -163,6 +163,47 @@ interface Sidecars {
   contradiction: boolean;
   invalidReason?: string;
   originInvalidReason?: string;
+}
+
+/** Convert transport-supplied evidence into the same internal shape as files. */
+function sidecarsFromEvidence(evidence: BundleVerificationEvidence): Sidecars {
+  const originDsseBytes = evidence.originDsseBytes;
+  if (evidence.publication.state === 'signed') {
+    if (!(evidence.publication.dsseBytes instanceof Uint8Array)) {
+      return {
+	unsigned: false,
+	contradiction: false,
+	invalidReason: 'signed publication evidence is not raw DSSE bytes',
+	originDsseBytes,
+      };
+    }
+    return {
+      unsigned: false,
+      contradiction: false,
+      dsseBytes: evidence.publication.dsseBytes,
+      originDsseBytes,
+    };
+  }
+  if (evidence.publication.state === 'unsigned') {
+    if (
+      evidence.publication.markerBytes !== undefined &&
+      !(evidence.publication.markerBytes instanceof Uint8Array)
+    ) {
+      return {
+	unsigned: true,
+	contradiction: false,
+	invalidReason: 'unsigned publication marker is not raw bytes',
+	originDsseBytes,
+      };
+    }
+    return { unsigned: true, contradiction: false, originDsseBytes };
+  }
+  return {
+    unsigned: false,
+    contradiction: false,
+    invalidReason: 'publication evidence state must be signed or unsigned',
+    originDsseBytes,
+  };
 }
 
 function readSidecars(source: BundleSource, cwd: string | undefined): Sidecars {
@@ -470,7 +511,7 @@ function warningText(source: BundleSource, coordinate: WorkflowCoordinate, verdi
 
 function absentOriginDetail(source: BundleSource, sidecars: Sidecars): string {
   if (source.kind !== 'file') {
-    return 'cannot carry an origin: installed from a non-file source, where no sidecar is available';
+    return 'no origin evidence was supplied or recorded for this remote source';
   }
   if (sidecars.unsigned) {
     return 'cannot carry an origin: the definition was published unsigned';
@@ -510,6 +551,7 @@ export function createPreCommitVerifier(options: PreCommitVerifierOptions = {}):
       coordinate: WorkflowCoordinate;
       digest: DefDigest;
       objectDir: string;
+      verificationEvidence?: BundleVerificationEvidence;
     }): Promise<void> {
       const namespace = parseWorkflowCoordinate(input.coordinate).namespace;
       const originRules = resolveOriginRules(env, options.originRules);
@@ -525,7 +567,9 @@ export function createPreCommitVerifier(options: PreCommitVerifierOptions = {}):
 
       let sidecars: Sidecars;
       try {
-        sidecars = readSidecars(input.source, options.cwd);
+	sidecars = input.verificationEvidence === undefined
+	  ? readSidecars(input.source, options.cwd)
+	  : sidecarsFromEvidence(input.verificationEvidence);
       } catch (error) {
         const detail = `publication sidecar could not be inspected: ${error instanceof Error ? error.message : String(error)}`;
         throw new StoreDefinitionVerificationError('unverifiable', policy, input.coordinate, detail);

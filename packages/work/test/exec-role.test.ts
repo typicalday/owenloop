@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -15,6 +15,7 @@ import type { CommandResult, CommandRunner } from '../src/exec/runner.ts';
 import type { CommandReceipt } from '../src/exec/receipt.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
 import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 
 /**
  * Seed a hermetic owenloop v2 credential file at `<home>/.owenloop/
@@ -53,6 +54,16 @@ function startRecordingHub(): Promise<{ server: Server; origin: string; auths: s
       resolve({ server, origin: `http://127.0.0.1:${port}`, auths });
     });
   });
+}
+
+function makeTreeWritable(path: string): void {
+  if (!existsSync(path)) return;
+  chmodSync(path, 0o700);
+  for (const name of readdirSync(path)) {
+    const child = join(path, name);
+    if (statSync(child).isDirectory()) makeTreeWritable(child);
+    else chmodSync(child, 0o600);
+  }
 }
 
 // ---- arg parsing ------------------------------------------------------------
@@ -133,6 +144,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   process.env = savedEnv;
+  makeTreeWritable(home);
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -181,13 +193,14 @@ interface OrderOpts {
   command?: string;
   claimed?: boolean;
   outcome?: string;
+  defDigest?: string;
 }
 
 const testCommands = new Map<string, string>();
 let nextTestDigest = 0;
 
 function commandOrder(o: OrderOpts = {}): GetOrderResponse {
-  const defDigest = `test-role-digest-${++nextTestDigest}`;
+  const defDigest = o.defDigest ?? `test-role-digest-${++nextTestDigest}`;
   testCommands.set(defDigest, o.command ?? 'echo hi');
   return {
     text: '',
@@ -410,6 +423,98 @@ test('run() signal wiring: exec message line, SIGINT mid-run kills + releases, e
   assert.ok(killState.kills >= 1);
   assert.equal(submits.length, 0);
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('default exec wiring recovers a signed missing bundle before resolving the command', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'recovered-exec',
+    workflow: [
+      'name: recovered-exec',
+      'inputs:',
+      '  - name: seed',
+      '    seedOwed: true',
+      'steps:',
+      '  - name: builder',
+      '    consumes: [seed]',
+      '    produces: [out]',
+      '    terminal: true',
+      '    executor: command',
+      '    command: echo recovered-exec',
+      '',
+    ].join('\n'),
+  });
+  const signed = await installSignedBundleFixture({ sourceDir, root: join(home, 'remote-publication'), home });
+  assert.equal(signed.source.kind, 'file');
+  const publication = readFileSync(`${signed.source.path}.dsse`);
+  const auths: string[] = [];
+  const server = createServer((req, res) => {
+    auths.push(req.headers.authorization ?? '');
+    if (req.url === `/api/bundles/${signed.packed.digest}`) {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end(signed.packed.bytes);
+      return;
+    }
+    if (req.url === `/api/publications/${signed.packed.digest}`) {
+      res.writeHead(200, { 'x-owenloop-publication-state': 'signed' });
+      res.end(publication);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  process.env['OWENLOOP_TOKEN'] = 'exec-recovery-token';
+  const { hub, submits, releases } = roleHub({ getOrder: commandOrder({ defDigest: signed.packed.digest }) });
+
+  try {
+    const code = await roleRun(['wf1/run1', '--origin', origin], {
+      hub,
+      runner: immediateRunner(0),
+      signalHost: fakeSignalHost().host,
+      cwd: '/work',
+      out: () => {},
+      err: () => {},
+    });
+    assert.equal(code, 0);
+    assert.equal((submits[0] as CommandReceipt).command, 'echo recovered-exec');
+    assert.deepEqual(releases, []);
+    assert.deepEqual(auths, [
+      'Bearer exec-recovery-token',
+      'Bearer exec-recovery-token',
+      'Bearer exec-recovery-token',
+    ]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('default exec wiring preserves unresolved-instructions when recovery cannot verify a missing bundle', async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  process.env['OWENLOOP_TOKEN'] = 'exec-recovery-token';
+  const { hub, releases } = roleHub({ getOrder: commandOrder({ defDigest: 'a'.repeat(64) }) });
+  const err: string[] = [];
+
+  try {
+    const code = await roleRun(['wf1/run1', '--origin', origin], {
+      hub,
+      runner: immediateRunner(0),
+      signalHost: fakeSignalHost().host,
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+    assert.equal(code, 1, 'the loop keeps its unresolved-instructions failure outcome');
+    assert.match(err.join('\n'), /instruction refusal \(integrity\).*HTTP 404/u);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 // ---- store-backed success (no OWENLOOP_TOKEN — the primary path) -------------

@@ -92,6 +92,23 @@ export type BundleSource =
   | { kind: 'url'; url: string };
 
 /**
+ * Publication and optional origin statements obtained alongside a bundle.
+ *
+ * This is deliberately separate from {@link BundleSource}: a URL says where
+ * bytes were obtained, while these bytes are the claims that the required
+ * pre-commit verifier must independently validate. A remote caller must make
+ * an explicit signed/unsigned publication declaration; absence is never
+ * silently converted into an unsigned marker by this contract.
+ */
+export interface BundleVerificationEvidence {
+  publication:
+    | { state: 'signed'; dsseBytes: Uint8Array }
+    | { state: 'unsigned'; markerBytes?: Uint8Array };
+  /** Exact optional origin DSSE bytes; undefined means the publisher supplied no origin statement. */
+  originDsseBytes?: Uint8Array;
+}
+
+/**
  * The bundle-ingestion port: bundle unpacking, canonical digest computation,
  * manifest integrity, safe extraction, and the full `namespace/name@version`
  * coordinate. The concrete implementation lands with the bundle-format
@@ -131,6 +148,8 @@ export interface PreCommitVerifier {
     coordinate: WorkflowCoordinate;
     digest: DefDigest;
     objectDir: string;
+    /** Explicit remote publication/origin evidence, when the caller fetched it. */
+    verificationEvidence?: BundleVerificationEvidence;
   }): Promise<void>;
 }
 
@@ -172,6 +191,10 @@ export interface InstallWorkflowBundleArgs {
   ingestor: BundleIngestor;
   /** Pre-commit verifier — REQUIRED (fail-closed without it). */
   verifier: PreCommitVerifier;
+  /** Digest the caller requested. A mismatch is refused before any store ownership mutation. */
+  expectedDigest?: DefDigest;
+  /** Explicit publication/origin evidence forwarded to the mandatory verifier. */
+  verificationEvidence?: BundleVerificationEvidence;
   /**
    * Project-level installs ONLY: the installed.json ledger lookup so the
    * inline recovery can roll back/forward a legacy v1 (GitHub-route) journal
@@ -405,6 +428,13 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // A refusal here (tamper, bad manifest, oversized archive) leaves staging
     // debris only — no object, no index, no journal touched.
     const { coordinate, digest, workflows: ingestedWorkflows } = await ingestor.ingest({ source, bytes, stagingDir });
+    if (args.expectedDigest !== undefined && digest !== args.expectedDigest) {
+      throw new StoreIntegrityError(
+	'object-corrupt',
+	args.expectedDigest,
+	`canonical bundle digest mismatch — expected ${args.expectedDigest}, got ${digest}; nothing was committed`,
+      );
+    }
     const workflows = [...ingestedWorkflows].sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
 
     // Ownership/conflict decisions, inside the lock:
@@ -500,7 +530,13 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 
     // A2 pre-commit verification: after content/engine validation, before ANY
     // destination swap or index write. A rejection commits nothing.
-    await verifier.verify({ source, coordinate, digest, objectDir: stagingDir });
+    await verifier.verify({
+      source,
+      coordinate,
+      digest,
+      objectDir: stagingDir,
+      ...(args.verificationEvidence !== undefined ? { verificationEvidence: args.verificationEvidence } : {}),
+    });
 
     // Existing same-digest objects have two paths. A verified object keeps the
     // normal idempotent dedupe. A broken object is repaired only from the

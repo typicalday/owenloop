@@ -275,6 +275,13 @@ expiry, and `agent-lane-closed` reasons return the claim to the hub; malformed
 and unsupported reasons leave it for the pickup window. `message` is human
 text — match on `reason`, display `message`.
 
+Malformed, unsupported, verification, and metadata drops leave a modern order
+for the hub's pickup window. `dispatch-cap-full`, `agent-cap-full`,
+`agent-lane-closed`, and `claim-expired` return the claim immediately. When a
+claim instead reaches its pickup lapse, the public released-lease close records
+lease churn by incrementing the task `attempts` shown in status; it does not
+turn the released row into a daily/cadence run or a judgment rework attempt.
+
 ### The first record is self-describing
 
 A shift's first record is `parked`, and it exists so a reader holding only the

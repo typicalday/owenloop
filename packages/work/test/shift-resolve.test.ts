@@ -1,4 +1,6 @@
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -27,6 +29,18 @@ import {
   startReservedChild,
   writeChildRecord,
 } from '../src/shift/state.ts';
+import type { SpawnSpec, Spawner } from '../src/shift/spawn.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+
+function makeTreeWritable(path: string): void {
+  if (!existsSync(path)) return;
+  chmodSync(path, 0o700);
+  for (const name of readdirSync(path)) {
+    const child = join(path, name);
+    if (statSync(child).isDirectory()) makeTreeWritable(child);
+    else chmodSync(child, 0o600);
+  }
+}
 
 test('public Shift daemon fails explicitly on Windows while direct Shift remains the fallback', () => {
   assert.throws(
@@ -480,6 +494,117 @@ test('runtime writes a corrupt-roster serving warning as one terminated stderr r
 		else process.env.OWENLOOP_CONFIG_DIR = previous.configDir;
 		if (previous.token === undefined) delete process.env.OWENLOOP_TOKEN;
 		else process.env.OWENLOOP_TOKEN = previous.token;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('shift runtime recovers a true command-store miss, installs it, and dispatches', async () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-runtime-recovery-'));
+	const previous = { home: process.env.HOME, token: process.env.OWENLOOP_TOKEN };
+	const spawns: SpawnSpec[] = [];
+	const spawner: Spawner = (spec) => {
+		spawns.push(spec);
+		return { pid: 4242 };
+	};
+	try {
+		process.env.HOME = root;
+		process.env.OWENLOOP_TOKEN = 'shift-runtime-recovery-token';
+		const sourceDir = writeBundleSource({
+			name: 'recovered-shift',
+			workflow: [
+				'name: recovered-shift',
+				'inputs:',
+				'  - name: seed',
+				'    seedOwed: true',
+				'steps:',
+				'  - name: builder',
+				'    consumes: [seed]',
+				'    produces: [out]',
+				'    terminal: true',
+				'    executor: command',
+				'    command: echo recovered-shift',
+				'',
+			].join('\n'),
+		});
+		const signed = await installSignedBundleFixture({ sourceDir, root: join(root, 'remote-publication'), home: root });
+		assert.equal(signed.source.kind, 'file');
+		const publication = readFileSync(`${signed.source.path}.dsse`);
+		const seen: Array<{ url: string; auth?: string }> = [];
+		const order = {
+			workflow: 'wf1', run: 'run_runtime_recovered', step: 'builder', key: '',
+			consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '',
+			worker: 'command', defDigest: signed.packed.digest,
+		};
+		const server = createServer((req, res) => {
+			seen.push({ url: req.url ?? '', auth: req.headers.authorization });
+			if (req.method === 'GET' && req.url?.startsWith('/api/whoami')) {
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ text: '', orgId: 'org', orgName: 'org', actor: { id: 'agent', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' }));
+				return;
+			}
+			if (req.method === 'GET' && req.url?.startsWith('/api/rosters')) {
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ text: '', global: {}, crews: [] }));
+				return;
+			}
+			if (req.method === 'GET' && req.url?.startsWith('/api/wake')) {
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ text: '', cursor: 1, changed: true }));
+				return;
+			}
+			if (req.method === 'POST' && req.url === '/api/presence_ping') {
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ text: '', ok: true, name: 'runtime-test', lastSeen: 0 }));
+				return;
+			}
+			if (req.method === 'POST' && req.url === '/api/whats_next') {
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ text: '', workflow: 'wf1', def: 'recovered-shift', orders: [order] }));
+				return;
+			}
+			if (req.method === 'GET' && req.url === `/api/bundles/${signed.packed.digest}`) {
+				res.writeHead(200, { 'content-type': 'application/octet-stream' });
+				res.end(signed.packed.bytes);
+				return;
+			}
+			if (req.method === 'GET' && req.url === `/api/publications/${signed.packed.digest}`) {
+				res.writeHead(200, { 'x-owenloop-publication-state': 'signed' });
+				res.end(publication);
+				return;
+			}
+			if (req.method === 'GET' && req.url === `/api/origins/${signed.packed.digest}`) {
+				res.writeHead(404);
+				res.end();
+				return;
+			}
+			res.writeHead(404);
+			res.end();
+		});
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+		try {
+			assert.equal(await runShiftRuntime({
+				origin,
+				workflow: 'wf1',
+				once: true,
+				cacheDir: join(root, 'cache'),
+				stateDir: join(root, 'state'),
+			}, { spawner }), 0);
+		} finally {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+		assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_runtime_recovered']);
+		assert.deepEqual(
+			seen.filter((request) => request.url.startsWith('/api/bundles/') || request.url.startsWith('/api/publications/') || request.url.startsWith('/api/origins/')).map((request) => request.url),
+			[`/api/bundles/${signed.packed.digest}`, `/api/publications/${signed.packed.digest}`, `/api/origins/${signed.packed.digest}`],
+		);
+		assert.equal(seen.every((request) => request.auth === 'Bearer shift-runtime-recovery-token'), true);
+	} finally {
+		if (previous.home === undefined) delete process.env.HOME;
+		else process.env.HOME = previous.home;
+		if (previous.token === undefined) delete process.env.OWENLOOP_TOKEN;
+		else process.env.OWENLOOP_TOKEN = previous.token;
+		makeTreeWritable(root);
 		rmSync(root, { recursive: true, force: true });
 	}
 });

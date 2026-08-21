@@ -117,6 +117,7 @@ export type {
   BundleInstallResult,
   BundleIngestor,
   BundleSource,
+  BundleVerificationEvidence,
   CasDefInspectionResult,
   CasDefRegistration,
   DefDigest,
