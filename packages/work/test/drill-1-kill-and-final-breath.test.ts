@@ -22,8 +22,8 @@
  *  1b FINAL BREATH (graceful): a CLEAN exit — SIGTERM, SIGINT, or stdin EOF
  *     (session death) — fires a targeted `release` FAST, so the order re-offers
  *     immediately instead of stranding until the lease TTL. Three variants, each
- *     asserting exactly one `release {workflow, run}` on the wire, delivered far
- *     inside the (multi-minute, prod) lease TTL, and NO `submit`.
+ *     asserting exactly one `release {workflow, run, reason}` on the wire,
+ *     delivered far inside the (multi-minute, prod) lease TTL, and NO `submit`.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -129,11 +129,16 @@ test('1a: SIGKILL mid-work emits NO release (uncatchable) — a fresh holder re-
 });
 
 /**
- * 1b core: a clean shutdown fires exactly one fast `release {workflow, run}`,
- * far inside the lease TTL, with no submit. `trigger` injects the shutdown and
- * returns the wall time just before it (for the timing bound).
+ * 1b core: a clean shutdown fires exactly one fast
+ * `release {workflow, run, reason}`, far inside the lease TTL, with no submit.
+ * The reason is `signal` for SIGTERM/SIGINT and `stdin-eof` for session death.
+ * `trigger` injects the shutdown and returns the wall time just before it (for
+ * the timing bound).
  */
-async function finalBreathVariant(trigger: (mcp: McpChild) => number): Promise<void> {
+async function finalBreathVariant(
+  reason: 'signal' | 'stdin-eof',
+  trigger: (mcp: McpChild) => number,
+): Promise<void> {
   const { origin, reqs, server } = await hubWithStore();
   const mcp = spawnHold(origin);
   try {
@@ -146,7 +151,7 @@ async function finalBreathVariant(trigger: (mcp: McpChild) => number): Promise<v
 
     const rels = of(reqs, 'release');
     assert.equal(rels.length, 1, 'exactly one targeted release');
-    assert.deepEqual(rels[0]!.body, { workflow: 'wf1', run: 'run1' }, 'release names the bound order');
+    assert.deepEqual(rels[0]!.body, { workflow: 'wf1', run: 'run1', reason }, 'release names the bound order and cause');
     // The final breath is effectively immediate — the drill proves it lands in
     // well under 2s, versus the multi-minute lease TTL a strand would wait out.
     assert.ok(rels[0]!.at - signalledAt <= 2000, `release landed ${rels[0]!.at - signalledAt}ms after shutdown (fast, not a TTL wait)`);
@@ -163,7 +168,7 @@ async function finalBreathVariant(trigger: (mcp: McpChild) => number): Promise<v
 }
 
 test('1b variant A: SIGTERM → immediate release, no submit, exit 0', async () => {
-  await finalBreathVariant((mcp) => {
+  await finalBreathVariant('signal', (mcp) => {
     const t = Date.now();
     mcp.child.kill('SIGTERM');
     return t;
@@ -171,7 +176,7 @@ test('1b variant A: SIGTERM → immediate release, no submit, exit 0', async () 
 });
 
 test('1b variant B: SIGINT → immediate release, no submit, exit 0', async () => {
-  await finalBreathVariant((mcp) => {
+  await finalBreathVariant('signal', (mcp) => {
     const t = Date.now();
     mcp.child.kill('SIGINT');
     return t;
@@ -179,7 +184,7 @@ test('1b variant B: SIGINT → immediate release, no submit, exit 0', async () =
 });
 
 test('1b variant C: stdin EOF (session death) → immediate release, no submit, exit 0', async () => {
-  await finalBreathVariant((mcp) => {
+  await finalBreathVariant('stdin-eof', (mcp) => {
     const t = Date.now();
     mcp.endStdin();
     return t;

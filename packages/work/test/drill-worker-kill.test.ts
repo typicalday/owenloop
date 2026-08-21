@@ -187,7 +187,7 @@ test('SIGTERM to a worker mid-turn tears the harness session down and releases t
     await until(() => reqs.some((r) => r.verb === 'release'), 'the targeted release', 10_000);
 
     const rel = reqs.find((r) => r.verb === 'release')!;
-    assert.deepEqual(rel.body, { workflow: 'wf1', run: 'run_x1234' }, 'a targeted release, not a session drain');
+    assert.deepEqual(rel.body, { workflow: 'wf1', run: 'run_x1234', reason: 'signal' }, 'a targeted release, not a session drain');
 
     // The session store records the attempt as dead, not submitted — a killed
     // worker never claims the task finished.

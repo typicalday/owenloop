@@ -46,10 +46,11 @@ stdout/stderr, so Shift dispatch preserves them in `<run>.log`. The claim
 warning states whether the harness will use its default or an authored step
 model/effort; the terminal message may name the harness-reported runtime model
 and bounded failure context when available. It is intentionally not a
-`shift.log` event and does not add a
-diagnosis to the reason-less targeted hub release. Local logging can still be
-disabled as described below, in which case the worker remains runnable but
-these local diagnostics are not retained.
+`shift.log` event. The targeted hub release receives only the stable
+`capability-silent-no-submit` reason; the detailed provider and failure context
+stays in worker output. Local logging can still be disabled as described below,
+in which case the worker remains runnable but these local diagnostics are not
+retained.
 
 | Command outcome | Worker channel | Header |
 | --- | --- | --- |

@@ -158,7 +158,7 @@ test('hold --mcp on SIGTERM before any submit: releases on the wire, never submi
     // The final breath: a targeted release rides the wire so the order
     // re-offers immediately instead of stranding until lease expiry.
     await until(() => of(reqs, 'release').length >= 1, 'release after SIGTERM');
-    assert.deepEqual(of(reqs, 'release')[0]!.body, { workflow: 'wf1', run: 'run1' });
+    assert.deepEqual(of(reqs, 'release')[0]!.body, { workflow: 'wf1', run: 'run1', reason: 'signal' });
     assert.equal(of(reqs, 'submit').length, 0, 'nothing was submitted');
 
     // The signal stops the LOOP, not the transport: the server keeps serving

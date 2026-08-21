@@ -147,7 +147,7 @@ test('beats at the interval carrying the session holder, then final-breath relea
   // Final breath = exactly one targeted release.
   const rel = only(calls, 'release');
   assert.equal(rel.length, 1);
-  assert.deepEqual(rel[0]!.arg, { workflow: 'wf1', run: 'run1' });
+  assert.deepEqual(rel[0]!.arg, { workflow: 'wf1', run: 'run1', reason: 'signal' });
 });
 
 test('omits the holder field entirely when no session identity is given', async () => {
@@ -363,6 +363,21 @@ test('final breath: a resolved release (released OR not-held) counts as released
   h.loop = loop;
   assert.equal(await loop.run(), 'released');
   assert.equal(only(calls, 'release').length, 1);
+});
+
+test('final breath: stop without a reason omits the reason property', async () => {
+  const h: { loop?: HoldLoop } = {};
+  const { hub, calls } = mockHub({
+    getOrder: [order(true)],
+    heartbeat: () => h.loop!.stop(),
+  });
+  const loop = createHoldLoop(baseOpts(hub, { sleep: macrotaskSleep }));
+  h.loop = loop;
+
+  assert.equal(await loop.run(), 'released');
+  const releases = only(calls, 'release');
+  assert.deepEqual(releases.map((call) => call.arg), [{ workflow: 'wf1', run: 'run1' }]);
+  assert.equal(Object.hasOwn(releases[0]!.arg as object, 'reason'), false);
 });
 
 test('final breath: a release throw ⇒ release-failed', async () => {

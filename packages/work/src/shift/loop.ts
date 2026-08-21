@@ -696,8 +696,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * deliberately stays off the dispatch critical path; a failed release falls
    * back to the existing pickup-window behavior and is observable.
    */
-  function releaseClaim(workflow: string, run: string): void {
-    void opts.hub.release({ workflow, run }).catch((e) => {
+  function releaseClaim(workflow: string, run: string, reason?: string): void {
+    void opts.hub.release({ workflow, run, ...(reason !== undefined ? { reason } : {}) }).catch((e) => {
       noteServerBackoff(e);
       const message = errMsg(e);
       opts.err(
@@ -706,6 +706,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       emit({ type: 'hub-error', op: 'release', workflow, message });
     });
   }
+
+  const formatReleaseReason = (reason: OrderDroppedEvent['reason'], message: string): string => `${reason}: ${message}`;
 
   function acquireDispatchLock(waitMs: number, label: string) {
     return acquireFileLockSync(join(opts.stateDir, '.dispatch.lock'), {
@@ -943,7 +945,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       reason: 'claim-expired',
       message,
     });
-    releaseClaim(candidate.workflow, candidate.order.run);
+    releaseClaim(candidate.workflow, candidate.order.run, formatReleaseReason('claim-expired', message));
     return true;
   }
 
@@ -1132,7 +1134,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       message: string,
     ): void => {
       dropOrder(workflow, order, reason, message);
-      releaseClaim(workflow, order.run);
+      releaseClaim(workflow, order.run, formatReleaseReason(reason, message));
       // Re-arm the next sweep, but only for the two TRANSIENT reasons — see
       // `SweepResult.releasedForCapacity` for why `agent-lane-closed` is not
       // one of them. The independent cooldown prevents a busy cursor from

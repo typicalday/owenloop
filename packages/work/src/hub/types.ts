@@ -380,8 +380,8 @@ export interface ReportResolutionResponse extends HubResponse {
 // ---- release ----------------------------------------------------------------
 
 // Exactly one form, mirroring the server's XOR: drain a whole session, OR
-// release one targeted (workflow, run).
-export type ReleaseRequest = { session: string } | { workflow: string; run: string };
+// release one targeted (workflow, run, optional reason).
+export type ReleaseRequest = { session: string } | { workflow: string; run: string; reason?: string };
 
 /**
  * Response shapes mirror hub-core `verbs/release.ts` (verified 2026-07-18):
@@ -392,6 +392,10 @@ export type ReleaseRequest = { session: string } | { workflow: string; run: stri
  *    drain-exempt-ion, never list which claims were exempt.
  *  - targeted: `{ released: boolean, reason?, workflow?, run? }` — idempotent
  *    (a not-held target is `released: false`, not an error).
+ *    Targeted requests may carry an optional `reason`; the hub trims it,
+ *    treats blank text as absent, truncates it to 1024 Unicode code points
+ *    without splitting surrogate pairs, and records whether truncation
+ *    occurred. It retains only the first observation for a workflow/step.
  *
  * The by-session form's `released` array is REQUIRED (the drain role reads it);
  * the targeted form's fields are all optional so callers that only do a

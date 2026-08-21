@@ -413,7 +413,7 @@ test('run() without --ignore-stdin: stdin EOF triggers stop(stdin-eof) → final
   assert.deepEqual(stdin.onCalls.sort(), ['close', 'end']);
   assert.ok(out.some((l) => /final breath \(stdin-eof\) — releasing wf1\/run1/.test(l)), out.join('\n'));
   assert.ok(out.some((l) => /released wf1\/run1/.test(l)), out.join('\n'));
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'stdin-eof' }]);
 });
 
 /**
@@ -514,7 +514,7 @@ test('run() signal wiring: hold-role message lines, stop(signal), second SIGINT 
   assert.ok(err.includes('owenloop work hold: second SIGINT — exiting now'), err.join('\n'));
   assert.deepEqual(sig.exits, [130]);
   assert.ok(out.some((l) => /final breath \(signal\) — releasing wf1\/run1/.test(l)), out.join('\n'));
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'signal' }]);
 });
 
 // ---- store-backed success (no OWENLOOP_TOKEN — the primary path) -------------
