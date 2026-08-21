@@ -189,6 +189,35 @@ PR #255 as the blocker report and return the measured comparison for
 disposition. If it does not fire, ship the current clause on its contract-level
 merits with the score ranges and the fixed-fixture limitation stated plainly.
 
+### Stopped outcome: cross-arm Node-version drift
+
+The comparison stopped before control-3 completed. The first four complete,
+scoreable reports followed the declared order and retained the same fixture
+digest (`5833c986e8cbb4261a6e34253a1170f40287eb00ccb52e3fcee429b6f3aabc94`),
+reported models, and harness versions, but not the required Node version:
+
+| report | charter | Node | Claude Code | Codex |
+| --- | --- | --- | --- | --- |
+| control-1 | `35773e2e…` | v26.5.0 | 4/4 | 3/4 |
+| candidate-1 | `8f08991d…` | v22.22.3 | 4/4 | 2/4 |
+| candidate-2 | `8f08991d…` | v22.22.3 | 4/4 | 3/4 |
+| control-2 | `35773e2e…` | v26.5.0 | 4/4 | 3/4 |
+
+The protocol says to record a model, harness, fixture, Node, or other
+treatment-condition drift and stop rather than filter it. That condition became
+known when the first completed candidate report recorded Node v22.22.3 after
+control-1 recorded Node v26.5.0. No complete report was rerun or discarded.
+Control-3 was then interrupted before producing a report (exit 130), and
+candidate-3 was not started. The raw complete reports are published on PR #255
+as control-1, candidate-1, candidate-2, and control-2 respectively.
+
+This partial, cross-version sequence is not a valid control comparison. Do not
+apply its trace-level rejection rule, infer a clause effect from its score
+differences, or replace the committed generated baseline with it. The committed
+baseline remains the earlier complete candidate report described above. PR #255
+stays open as the documented blocker pending a formal disposition that specifies
+a same-Node evaluation environment and a fresh cohort policy.
+
 ## Safety and baseline updates
 
 The mounted entry point is test/fixtures/mcp-charter-eval-server.ts, not
