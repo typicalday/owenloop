@@ -551,6 +551,16 @@ regardless of `executor:` — that requirement is orthogonal to this feature and
 applies even to a `executor: command` judge (the field just goes unread by a
 non-agent dispatcher).
 
+Native judges declared here inherit the producing step's `capabilities:` when a
+judge omits that key: the synthesized judge receives a copy. A non-empty
+`capabilities:` list on the judge is authoritative and replaces — rather than
+extends — the producer list; `capabilities: []` is invalid, so omit the key to
+request inheritance. At offer time, the run modifier composes with every
+capability in the resulting judge list just as it does for an ordinary step
+(for example, `wise` under `deep` is offered as `wise:deep`). If neither the
+producer nor judge supplies capabilities, the judge remains capability-silent,
+and there is nothing to compose.
+
 Author `x:` on the producer step, not on individual judge entries. Every native
 judge synthesized from that producer inherits the producer's complete parsed
 `x:` map. Each judge receives an independent deep clone, so runner-side
