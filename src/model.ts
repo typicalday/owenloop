@@ -2727,7 +2727,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       // An authority-only member retract does not prove its actor ever
       // produced an ordinary firing; preserve structural-dead-step accounting.
       if ((firing as Partial<MemberRetractFiring>).modelTransition !== 'member-retract') {
-		firedSteps.add(firing.step);
+        firedSteps.add(firing.step);
       }
       const outcomes = eligibleOutcomes(def, node.arts, firing);
 
