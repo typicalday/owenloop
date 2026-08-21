@@ -1,6 +1,7 @@
 /**
  * Unit: resolveBearer + slotArg — the ONE place bearer precedence lives, shared
- * by all five roles: dev-override (OWENLOOP_TOKEN) → agent-slot store → refuse.
+ * by the agent roles: dev-override (OWENLOOP_TOKEN) → agent-slot store →
+ * refuse. Human-only callers instead read the exact human slot.
  *
  * Store-backed cases run through the REAL owenloop file backend, seeded into a
  * hermetic temp HOME with OWENLOOP_NO_KEYCHAIN=1 (forces the file store, no
@@ -23,14 +24,15 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-/** Seed the agent:<account> slots for `origin` into the hermetic file store. */
-function seed(origin: string, slots: Record<string, string>): void {
+/** Seed agent:<account> slots and, optionally, the human slot for `origin`. */
+function seed(origin: string, slots: Record<string, string>, human?: string): void {
   const dir = join(home, '.owenloop');
   mkdirSync(dir, { recursive: true });
   const hubs: Record<string, Record<string, unknown>> = { [origin]: {} };
   for (const [account, token] of Object.entries(slots)) {
     hubs[origin]![`agent:${account}`] = { kind: 'agent', accessToken: token };
   }
+  if (human !== undefined) hubs[origin]!.human = { kind: 'agent', accessToken: human };
   writeFileSync(join(dir, 'credentials.json'), JSON.stringify({ version: 2, hubs }));
 }
 
@@ -94,6 +96,36 @@ test('a non-default account refuse names the agent:<account> slot in the hint', 
   assert.match((r as { message: string }).message, /account "ci"\) — run: owenloop login --hub https:\/\/hub\.example --as agent:ci/);
 });
 
+// ---- human slot -------------------------------------------------------------
+
+test('a human-only store satisfies human resolution', async () => {
+  seed(ORIGIN, {}, 'human_only');
+  const r = await resolveBearer({ origin: ORIGIN, principal: 'human', env: env() });
+  assert.equal(r.ok, true);
+});
+
+test('an agent-only store does not satisfy human resolution', async () => {
+  seed(ORIGIN, { default: 'agent_only' });
+  const r = await resolveBearer({ origin: ORIGIN, principal: 'human', env: env() });
+  assert.equal(r.ok, false);
+  assert.equal((r as { code: number }).code, 2);
+  assert.match(
+    (r as { message: string }).message,
+    /no human credential for https:\/\/hub\.example — run: owenloop login --hub https:\/\/hub\.example --as human/,
+  );
+});
+
+test('OWENLOOP_TOKEN cannot satisfy human resolution without a stored human credential', async () => {
+  const r = await resolveBearer({
+    origin: ORIGIN,
+    principal: 'human',
+    env: env({ OWENLOOP_TOKEN: 'dev_override' }),
+  });
+  assert.equal(r.ok, false);
+  assert.equal((r as { code: number }).code, 2);
+  assert.match((r as { message: string }).message, /--as human/);
+});
+
 // ---- error (code 1) ---------------------------------------------------------
 
 test('a read failure (remote plaintext origin, SEC-2 throw) → error (code 1) with the message', async () => {
@@ -101,4 +133,11 @@ test('a read failure (remote plaintext origin, SEC-2 throw) → error (code 1) w
   assert.equal(r.ok, false);
   assert.equal((r as { code: number }).code, 1);
   assert.match((r as { message: string }).message, /credential read failed for http:\/\/hub\.example \(account "default"\):/);
+});
+
+test('a human credential read failure is exit 1 with a human-specific message', async () => {
+  const r = await resolveBearer({ origin: 'http://hub.example', principal: 'human', env: env() });
+  assert.equal(r.ok, false);
+  assert.equal((r as { code: number }).code, 1);
+  assert.match((r as { message: string }).message, /human credential read failed for http:\/\/hub\.example:/);
 });

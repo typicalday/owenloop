@@ -15,9 +15,11 @@ Usage:
   owenloop work lint <workflow-name | path>   lint x.harness option bags in a def
   owenloop work sessions [--all] [--json]     list this machine's recorded harness
                                          sessions and how to re-open them
-  owenloop work approvals [--json]            every tool call a worker is blocked on
+  owenloop work approvals [--origin <url>] [--json]
+${' '.repeat(41)}every tool call a worker is blocked on
                                          RIGHT NOW, waiting for a person
-  owenloop work approvals approve|deny <wf>/<run> <tool-use-id> [--note <text>]
+  owenloop work approvals approve <wf>/<run> <tool-use-id> [--origin <url>] [--note <text>]
+  owenloop work approvals deny    <wf>/<run> <tool-use-id> [--origin <url>] [--note <text>]
                                          answer one; the answer goes back to the
                                          still-blocked call, not to a later attempt
   owenloop work release --session <id> [options]  drain a session's held claims
@@ -128,6 +130,15 @@ Options:
                                  included, instead of the table
       --cache-dir <p>            override the resolved cache dir
 
+  approvals options:
+      --origin <url>             hub origin (else settings.hubOrigin)
+      --json                     print pending approval rows as JSON (list only)
+      --note <text>              attach an operator note (approve / deny only)
+      credentials                list reads the agent:<account> slot selected by
+${' '.repeat(33)}OWENLOOP_ACCOUNT (default 'default'); approve
+${' '.repeat(33)}and deny read the stored human slot instead
+      missing human credential   run: owenloop login --hub <origin> --as human
+
   join options:
       --hub <origin>             hub to redeem against (else settings.hubOrigin;
                                  one of the two is REQUIRED — the code never
@@ -135,16 +146,21 @@ Options:
       --as <account>             credential account to store under (default:
                                  the Scoped Identity name the hub returns)
 
-  shift/hold/exec/prepare/release env:
+  shift/hold/exec/prepare/release and approvals-list env:
                credentials come from owenloop's store — each role reads the
                agent:<account> slot for its origin (never the human slot); a
                missing slot refuses with a runnable 'owenloop login' command.
+${' '.repeat(15)}approvals approve/deny are the read-only human-slot exception:
+${' '.repeat(15)}they ignore OWENLOOP_ACCOUNT and OWENLOOP_TOKEN, and refuse with
+${' '.repeat(15)}'owenloop login --hub <origin> --as human' when it is absent.
                OWENLOOP_ACCOUNT       Scoped Identity account for exec/prepare/release
-                                      (default 'default'; shift uses --as, and
-                                      stamps it onto dispatched holds/execs)
+${' '.repeat(38)}and approvals list (default 'default';
+${' '.repeat(38)}shift uses --as, and stamps it onto
+${' '.repeat(38)}dispatched holds/execs)
                OWENLOOP_TOKEN         dev-only bearer override — when set, used
                                       verbatim and the store + account are
-                                      bypassed (NOT the primary path)
+${' '.repeat(38)}bypassed (NOT the primary path; never for
+${' '.repeat(38)}approvals approve/deny)
                OWENLOOP_CACHE_DIR     cache root
                OWENLOOP_STATE_DIR     shift in-flight state dir
                OWENLOOP_SHIFT_LOG_DIR dir for the shift's shift.log and each
@@ -169,13 +185,16 @@ Options:
                                       settings.workRepo, default off
 
   Credentials / accounts:
-      owenloop work's RUNTIME roles (shift/hold/exec/prepare/release) are READ-ONLY
-      over owenloop's credential store — they never write credentials. Each
-      role reads the agent:<account> slot for its origin (never the human
-      slot); the account defaults to 'default'. 'owenloop work join' is the one
-      deliberate provisioning-time writer: it stores the Scoped Identity token a hub
-      redeem returns via owenloop's public storeCredential, once, at join time
-      — not a runtime write.
+      owenloop work's RUNTIME roles (shift/hold/exec/prepare/release and
+      approvals list) are READ-ONLY over owenloop's credential store — they
+      never write credentials. Each reads the agent:<account> slot for its
+      origin (never the human slot); the account defaults to 'default'.
+      Approval decisions are also read-only, but approve and deny require the
+      stored human slot rather than an agent slot; if it is absent, run:
+${' '.repeat(8)}owenloop login --hub <origin> --as human
+      'owenloop work join' is the one deliberate provisioning-time writer: it
+      stores the Scoped Identity token a hub redeem returns via owenloop's public
+      storeCredential, once, at join time — not a runtime write.
         store / connect an account (run owenloop; owenloop work never writes it):
           owenloop login --hub <origin> --as agent:<account>
                                  (use --as agent for the default account)
@@ -183,7 +202,7 @@ Options:
           owenloop work join <code> --hub <origin>
         select an account at run time:
           --as <account>         on shift / hold
-          OWENLOOP_ACCOUNT       on exec / prepare / release
+${' '.repeat(10)}OWENLOOP_ACCOUNT       on exec / prepare / release / approvals list
                                  (shift resolves once and threads both channels)
       owenloop work does NOT list stored accounts — enumerating an origin's accounts
       is an owenloop-side capability; check owenloop for which slots are stored.

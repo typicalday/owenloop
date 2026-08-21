@@ -17,12 +17,17 @@
  * touches settings — every case supplies its own `hub`, `env`, and clock.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { parseArgs, run, splitOrder } from '../src/roles/approvals.ts';
+import {
+  resolveBearer as realResolveBearer,
+  type BearerResult,
+  type ResolveBearerArgs,
+} from '../src/credentials/resolve.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { AnswerApprovalRequest, ApprovalState, ApprovalView } from '../src/hub/types.ts';
 
@@ -34,6 +39,9 @@ import type { AnswerApprovalRequest, ApprovalState, ApprovalView } from '../src/
  */
 const ENV = { HOME: mkdtempSync(join(tmpdir(), 'owenloop-approvals-')), OWENLOOP_TOKEN: 'tok' };
 const ORIGIN = ['--origin', 'https://hub.invalid'];
+type Resolver = (args: ResolveBearerArgs) => Promise<BearerResult>;
+
+const opaqueResolver: Resolver = async () => ({ ok: true, token: 'opaque' });
 
 function view(over: Partial<ApprovalView> = {}): ApprovalView {
   return {
@@ -69,6 +77,10 @@ async function invoke(
   args: string[],
   hub: HubClient = fakeHub(),
   now = 61_000,
+  deps: {
+    env?: Record<string, string | undefined>;
+    resolveBearer?: Resolver;
+  } = {},
 ): Promise<{ code: number; out: string[]; err: string[] }> {
   const out: string[] = [];
   const err: string[] = [];
@@ -76,8 +88,9 @@ async function invoke(
     hub,
     out: (l) => out.push(l),
     err: (l) => err.push(l),
-    env: { ...ENV },
+    env: deps.env ?? { ...ENV },
     now: () => now,
+    resolveBearer: deps.resolveBearer ?? opaqueResolver,
   });
   return { code, out, err };
 }
@@ -169,6 +182,57 @@ test('--json prints the hub rows unedited, for anything that is not a person', a
   assert.deepEqual(JSON.parse(out.join('\n')), [view()]);
 });
 
+test('approve requests the human credential with no account', async () => {
+  let requested: ResolveBearerArgs | undefined;
+  const resolver: Resolver = async (args) => {
+    requested = args;
+    return { ok: true, token: 'opaque' };
+  };
+
+  const { code } = await invoke(['approve', 'wf_1/run_1', 'toolu_01'], fakeHub(), 61_000, { resolveBearer: resolver });
+  assert.equal(code, 0);
+  assert.equal(requested?.principal, 'human');
+  assert.equal('account' in requested!, false);
+});
+
+test('deny requests the human credential with no account', async () => {
+  let requested: ResolveBearerArgs | undefined;
+  const resolver: Resolver = async (args) => {
+    requested = args;
+    return { ok: true, token: 'opaque' };
+  };
+
+  const { code } = await invoke(['deny', 'wf_1/run_1', 'toolu_01'], fakeHub(), 61_000, { resolveBearer: resolver });
+  assert.equal(code, 0);
+  assert.equal(requested?.principal, 'human');
+  assert.equal('account' in requested!, false);
+});
+
+test('list requests its selected agent account, including the default', async () => {
+  const requested: ResolveBearerArgs[] = [];
+  const resolver: Resolver = async (args) => {
+    requested.push(args);
+    return { ok: true, token: 'opaque' };
+  };
+
+  const defaultList = await invoke([], fakeHub(), 61_000, { resolveBearer: resolver });
+  const selectedList = await invoke(
+    ['list'],
+    fakeHub(),
+    61_000,
+    { env: { ...ENV, OWENLOOP_ACCOUNT: 'shift-wise' }, resolveBearer: resolver },
+  );
+  assert.equal(defaultList.code, 0);
+  assert.equal(selectedList.code, 0);
+  assert.deepEqual(
+    requested.map(({ principal, account }) => ({ principal, account })),
+    [
+      { principal: 'agent', account: 'default' },
+      { principal: 'agent', account: 'shift-wise' },
+    ],
+  );
+});
+
 // ---------------------------------------------------------------------------
 // The answer.
 // ---------------------------------------------------------------------------
@@ -240,6 +304,55 @@ test('a bad order id is refused before any hub call', async () => {
   assert.equal(code, 2);
   assert.equal(called, false);
   assert.match(err.join('\n'), /is not <workflow>\/<run>/u);
+});
+
+test('an approval decision with no human credential refuses before a hub call', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-approvals-human-'));
+  let answerCalls = 0;
+  try {
+    const dir = join(home, '.owenloop');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'credentials.json'),
+      JSON.stringify({
+	version: 2,
+	hubs: {
+		'https://hub.invalid': {
+			'agent:default': { kind: 'agent', accessToken: 'agent_only' },
+		},
+	},
+      }),
+    );
+    const hub = fakeHub({
+      async answerApproval() {
+	answerCalls += 1;
+	return { text: '', ok: true, approval: view({ state: 'approved' }) };
+      },
+    });
+
+    const { code, err } = await invoke(
+      ['approve', 'wf_1/run_1', 'toolu_01'],
+      hub,
+      61_000,
+      {
+	env: { HOME: home, OWENLOOP_NO_KEYCHAIN: '1' },
+	resolveBearer: realResolveBearer,
+      },
+    );
+    assert.equal(code, 2);
+    assert.equal(answerCalls, 0);
+    assert.match(err.join('\n'), /no human credential for https:\/\/hub\.invalid/);
+    assert.match(err.join('\n'), /owenloop login --hub https:\/\/hub\.invalid --as human/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('unknown --as usage errors expose the accepted --origin option', async () => {
+  const { code, err } = await invoke(['--as', 'human']);
+  assert.equal(code, 2);
+  assert.match(err.join('\n'), /unknown option '--as'/);
+  assert.match(err.join('\n'), /owenloop work approvals \[--origin <url>\] \[--json\]/);
 });
 
 test('a hub error is exit 1 with its message, not a stack trace', async () => {
