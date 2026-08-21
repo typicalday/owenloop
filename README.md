@@ -536,9 +536,13 @@ setup only prints the `OWENLOOP_ACCOUNT=<name>` instruction. Setup probes and,
 when needed, converges the bundled `owenloop` plugins for Claude Code and Codex.
 Plugin convergence is non-fatal; a missing harness or failed plugin command does
 not fail setup. A second run with the expected plugin version already installed
-performs no plugin writes. `owenloop doctor` is the read-only counterpart: it
-checks both harness plugin states, reports version skew, and prints a `✓`/`✗`
-line with the remedy. See
+performs no plugin writes when its effective MCP launch is verified safe.
+`owenloop doctor` is the read-only counterpart: it checks both harness plugin
+states, including the effective `owenloop mcp` command and arguments, Codex's
+`PATH` pass-through, and PATH availability. It reports same-version absolute or
+worktree launch declarations as drift, but does not treat a plugin's absolute
+marketplace or cache location as a launch verdict. A known unsafe declaration is
+repaired by the existing non-fatal `owenloop setup` convergence flow. See
 [`setup`](docs/cli.md#setup--onboard-a-machine) and
 [`doctor`](docs/cli.md#doctor--check-a-machines-install) in `docs/cli.md`.
 

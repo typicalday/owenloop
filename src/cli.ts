@@ -8040,6 +8040,7 @@ export interface HarnessPluginState {
   installed: boolean;
   installedVersion: string | null;
   cliVersion: string | null;
+  mcpLaunch: McpLaunchState | null;
 }
 
 interface HarnessConfig {
@@ -8111,18 +8112,126 @@ interface ParsedPluginList {
   known: boolean;
   installed: boolean;
   installedVersion: string | null;
+  mcpLaunch: McpLaunchState | null;
 }
 
-function parsePluginList(stdout: string, harness: HarnessId): ParsedPluginList {
+type McpLaunchStatus = 'path' | 'unsafe' | 'unknown';
+
+interface McpLaunchState {
+  status: McpLaunchStatus;
+  detail: string;
+}
+
+function unknownMcpLaunch(detail: string): McpLaunchState {
+  return { status: 'unknown', detail };
+}
+
+/**
+ * Describe an untrusted plugin launch without echoing manifest values. Plugin
+ * manifests are local user-controlled input, so command/argument strings can
+ * carry credentials even when the declaration is invalid.
+ */
+function describeMcpLaunch(command: string, args: string[]): string {
+  const commandShape = command === 'owenloop'
+    ? '"owenloop"'
+    : command === 'node'
+      ? '"node"'
+      : isAbsolute(command)
+		? 'an absolute command'
+		: 'a non-owenloop command';
+  const argsShape = args.length === 1 && args[0] === 'mcp'
+    ? 'exactly the "mcp" argument'
+    : args[0] === 'mcp'
+      ? `"mcp" plus ${args.length - 1} additional argument(s)`
+      : `${args.length} argument(s) not exactly "mcp"`;
+  return `declares ${commandShape} with ${argsShape}; expected "owenloop" with exactly "mcp" via PATH`;
+}
+
+function classifyMcpLaunch(
+  server: unknown,
+  harness: HarnessId,
+  env: Record<string, string | undefined>,
+): McpLaunchState {
+  const declaration = recordOf(server);
+  if (declaration === null) return unknownMcpLaunch('the owenloop MCP declaration is missing or malformed');
+
+  const command = declaration.command;
+  const args = declaration.args;
+  if (typeof command !== 'string' || !Array.isArray(args) || !args.every((arg) => typeof arg === 'string')) {
+    return unknownMcpLaunch('the owenloop MCP command or arguments are missing or malformed');
+  }
+
+  if (command !== 'owenloop' || args.length !== 1 || args[0] !== 'mcp') {
+    return { status: 'unsafe', detail: describeMcpLaunch(command, args) };
+  }
+
+  if (harness === 'codex') {
+    const envVars = declaration.env_vars;
+    if (!Array.isArray(envVars) || !envVars.includes('PATH')) {
+      return { status: 'unsafe', detail: 'declares "owenloop" "mcp" but does not pass PATH to the MCP subprocess' };
+    }
+  }
+
+  if (!commandOnPath(env, 'owenloop')) {
+    return { status: 'unsafe', detail: 'declares "owenloop" "mcp" but owenloop is not executable on PATH' };
+  }
+
+  return { status: 'path', detail: 'MCP resolves as owenloop mcp via PATH' };
+}
+
+function mcpLaunchFromManifest(
+  pluginRoot: unknown,
+  harness: HarnessId,
+  env: Record<string, string | undefined>,
+  rootName: string,
+): McpLaunchState {
+  if (typeof pluginRoot !== 'string' || pluginRoot.trim() === '') {
+    return unknownMcpLaunch(`${rootName} was not reported by the harness`);
+  }
+  try {
+    const manifest = recordOf(JSON.parse(readFileSync(join(pluginRoot, '.mcp.json'), 'utf8')));
+    const servers = recordOf(manifest?.mcpServers);
+    if (servers === null || !Object.hasOwn(servers, 'owenloop')) {
+      return unknownMcpLaunch(`${rootName}/.mcp.json does not declare mcpServers.owenloop`);
+    }
+    return classifyMcpLaunch(servers.owenloop, harness, env);
+  } catch {
+    return unknownMcpLaunch(`could not read ${rootName}/.mcp.json`);
+  }
+}
+
+function mcpLaunchFromPluginEntry(
+  entry: Record<string, unknown>,
+  harness: HarnessId,
+  env: Record<string, string | undefined>,
+): McpLaunchState {
+  if (harness === 'claude-code') {
+    if (Object.hasOwn(entry, 'mcpServers')) {
+      const servers = recordOf(entry.mcpServers);
+      if (servers === null) return unknownMcpLaunch('the inline mcpServers data is malformed');
+      if (Object.hasOwn(servers, 'owenloop')) return classifyMcpLaunch(servers.owenloop, harness, env);
+    }
+    return mcpLaunchFromManifest(entry.installPath, harness, env, 'installPath');
+  }
+
+  const source = recordOf(entry.source);
+  return mcpLaunchFromManifest(source?.path, harness, env, 'source.path');
+}
+
+function parsePluginList(
+  stdout: string,
+  harness: HarnessId,
+  env: Record<string, string | undefined>,
+): ParsedPluginList {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    return { known: false, installed: false, installedVersion: null };
+    return { known: false, installed: false, installedVersion: null, mcpLaunch: null };
   }
 
   if (harness === 'claude-code') {
-    if (!Array.isArray(parsed)) return { known: false, installed: false, installedVersion: null };
+    if (!Array.isArray(parsed)) return { known: false, installed: false, installedVersion: null, mcpLaunch: null };
     const entry = parsed.find((item): item is Record<string, unknown> => {
       const row = recordOf(item);
       if (row === null) return false;
@@ -8130,12 +8239,19 @@ function parsePluginList(stdout: string, harness: HarnessId): ParsedPluginList {
       return id === PLUGIN_SELECTOR || id.split('@', 1)[0] === 'owenloop';
     });
     return entry === undefined
-      ? { known: true, installed: false, installedVersion: null }
-      : { known: true, installed: true, installedVersion: normalizedPluginVersion(entry.version) };
+      ? { known: true, installed: false, installedVersion: null, mcpLaunch: null }
+      : {
+			known: true,
+			installed: true,
+			installedVersion: normalizedPluginVersion(entry.version),
+			mcpLaunch: mcpLaunchFromPluginEntry(entry, harness, env),
+		};
   }
 
   const root = recordOf(parsed);
-  if (root === null || !Array.isArray(root.installed)) return { known: false, installed: false, installedVersion: null };
+  if (root === null || !Array.isArray(root.installed)) {
+    return { known: false, installed: false, installedVersion: null, mcpLaunch: null };
+  }
   const entry = root.installed.find((item): item is Record<string, unknown> => {
     const row = recordOf(item);
     if (row === null || row.installed !== true) return false;
@@ -8145,8 +8261,13 @@ function parsePluginList(stdout: string, harness: HarnessId): ParsedPluginList {
     );
   });
   return entry === undefined
-    ? { known: true, installed: false, installedVersion: null }
-    : { known: true, installed: true, installedVersion: normalizedPluginVersion(entry.version) };
+    ? { known: true, installed: false, installedVersion: null, mcpLaunch: null }
+    : {
+		known: true,
+		installed: true,
+		installedVersion: normalizedPluginVersion(entry.version),
+		mcpLaunch: mcpLaunchFromPluginEntry(entry, harness, env),
+	};
 }
 
 function probeCliVersion(
@@ -8168,24 +8289,35 @@ function probePlugin(io: CliIO): HarnessPluginState[] {
     const config = HARNESS_CONFIGS[id];
     const cliFound = commandOnPath(io.env, config.cliName);
     if (!cliFound) {
-      return { id, cliName: config.cliName, cliFound: false, installed: false, installedVersion: null, cliVersion: null };
+      return {
+		id,
+		cliName: config.cliName,
+		cliFound: false,
+		installed: false,
+		installedVersion: null,
+		cliVersion: null,
+		mcpLaunch: null,
+	};
     }
 
     let installed = false;
     let installedVersion: string | null = null;
+    let mcpLaunch: McpLaunchState | null = null;
     try {
       const result = run(config.cliName, ['plugin', 'list', '--json']);
       if (result.status === 0) {
-        const parsed = parsePluginList(result.stdout, id);
+		const parsed = parsePluginList(result.stdout, id, io.env);
         // A successful command with malformed output cannot establish presence.
         // Treat it as not installed, matching the non-zero-exit path below.
         installed = parsed.known ? parsed.installed : false;
         installedVersion = parsed.installedVersion;
+		mcpLaunch = parsed.mcpLaunch;
       }
     } catch {
       // A failed probe cannot establish presence; the ACT remains PATH-gated.
       installed = false;
       installedVersion = null;
+      mcpLaunch = null;
     }
 
     return {
@@ -8195,6 +8327,7 @@ function probePlugin(io: CliIO): HarnessPluginState[] {
       installed,
       installedVersion,
       cliVersion: probeCliVersion(run, config.cliName),
+      mcpLaunch,
     };
   });
 }
@@ -8299,7 +8432,7 @@ function installPluginStep(io: CliIO, state: HarnessPluginState): PluginStepOutc
 
   const expectedVersion = packageVersion().trim();
   const currentVersion = state.installedVersion?.trim() ?? null;
-  if (state.installed && currentVersion === expectedVersion) {
+  if (state.installed && currentVersion === expectedVersion && state.mcpLaunch?.status !== 'unsafe') {
     return { action: 'skipped', detail: `owenloop ${currentVersion} already current` };
   }
 
@@ -8975,27 +9108,32 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
         `not installed — ${pluginRemedy(pluginState.id, root)} · ${config.cliName} ${cliVersion}`,
         PLUGIN_CHECK_FATAL,
       );
-    } else if (pluginState.installedVersion === null) {
-      record(
-        `plugin (${pluginState.id})`,
-        true,
-        `owenloop version unknown · ${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`,
-        PLUGIN_CHECK_FATAL,
-      );
-    } else if (pluginState.installedVersion === packageVersion().trim()) {
-      record(
-        `plugin (${pluginState.id})`,
-        true,
-        `owenloop ${pluginState.installedVersion} · ${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`,
-        PLUGIN_CHECK_FATAL,
-      );
     } else {
-      record(
-        `plugin (${pluginState.id})`,
-        false,
-        `owenloop ${pluginState.installedVersion} but CLI is ${packageVersion().trim()} — run owenloop setup · ${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`,
-        PLUGIN_CHECK_FATAL,
-      );
+      const launch = pluginState.mcpLaunch ?? unknownMcpLaunch('the effective MCP launch was not reported');
+      const expectedVersion = packageVersion().trim();
+      const findings: string[] = [];
+      if (launch.status === 'unsafe') {
+		findings.push(`MCP launch drift: ${launch.detail} — run owenloop setup`);
+      } else if (launch.status === 'unknown') {
+		findings.push(`MCP launch unverifiable: ${launch.detail} — run owenloop setup`);
+      }
+      if (pluginState.installedVersion !== null && pluginState.installedVersion !== expectedVersion) {
+		findings.push(`owenloop ${pluginState.installedVersion} but CLI is ${expectedVersion} — run owenloop setup`);
+      }
+
+      const cliVersion = `${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`;
+      if (findings.length > 0) {
+		record(`plugin (${pluginState.id})`, false, `${findings.join(' · ')} · ${cliVersion}`, PLUGIN_CHECK_FATAL);
+      } else if (pluginState.installedVersion === null) {
+		record(`plugin (${pluginState.id})`, true, `owenloop version unknown · ${launch.detail} · ${cliVersion}`, PLUGIN_CHECK_FATAL);
+      } else {
+		record(
+			`plugin (${pluginState.id})`,
+			true,
+			`owenloop ${pluginState.installedVersion} · ${launch.detail} · ${cliVersion}`,
+			PLUGIN_CHECK_FATAL,
+		);
+      }
     }
   }
 
