@@ -506,6 +506,14 @@ test('approval titles fall back to a tool name without serializing arbitrary inp
   assert.equal(approvals.seen[0]?.title, 'WebFetch');
 });
 
+test('approval titles fall back cleanly for an inherited Object.prototype tool name', async () => {
+  const approvals = requester(async () => ({ decision: 'approved' }));
+  const result = await askCallback(optionsWith('ask', () => {}, approvals.fn), 'constructor', {});
+
+  assert.equal(result.behavior, 'allow');
+  assert.equal(approvals.seen[0]?.title, 'constructor');
+});
+
 test('approval titles ignore empty and non-string candidate details', async () => {
   for (const [toolName, input] of [
     ['Bash', { command: '' }],

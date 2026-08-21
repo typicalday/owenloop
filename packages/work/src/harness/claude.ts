@@ -357,15 +357,15 @@ function decisionMessage(reason: string, note: string | undefined): string {
 }
 
 /** The only model-authored arguments safe to summarize for an approval prompt. */
-const APPROVAL_FILE_PATH_ARGS: Readonly<Record<string, readonly string[]>> = {
-  Read: ['file_path'],
-  Write: ['file_path'],
-  Edit: ['file_path'],
-  NotebookRead: ['notebook_path'],
-  NotebookEdit: ['notebook_path'],
-  Glob: ['path'],
-  Grep: ['path'],
-};
+const APPROVAL_FILE_PATH_ARGS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['Read', ['file_path']],
+  ['Write', ['file_path']],
+  ['Edit', ['file_path']],
+  ['NotebookRead', ['notebook_path']],
+  ['NotebookEdit', ['notebook_path']],
+  ['Glob', ['path']],
+  ['Grep', ['path']],
+]);
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
@@ -389,7 +389,7 @@ function approvalTitle(toolName: string, input: Record<string, unknown>, supplie
   if (title === undefined && toolName === 'Bash') title = inputString(input, 'command');
 
   if (title === undefined) {
-    const paths = (APPROVAL_FILE_PATH_ARGS[toolName] ?? [])
+    const paths = (APPROVAL_FILE_PATH_ARGS.get(toolName) ?? [])
       .map((key) => inputString(input, key))
       .filter((path): path is string => path !== undefined);
     if (paths.length > 0) title = `${toolName} ${paths.join(', ')}`;
