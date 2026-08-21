@@ -107,6 +107,15 @@ empty call trace and fails solely because its first call is absent; it made no
 `start_run` call. That distinguishes this variance from a loose clause
 starting an inappropriate tax or medical workflow.
 
+That structural failure does **not** make the response prose acceptable. In the
+same shipped `c418623` report, Codex finance begins “I can do this” and promises
+to produce a reconciliation report, categorized ledger, profit-and-loss summary,
+and tax-preparer package. Codex operations says the catalog has no available
+workflow, then asks, “Would you like me to proceed directly in this session
+using the relevant websites and your supplied details?” Both are offers of inline
+work rather than plain catalog-gap refusals. This is a substantive behavioral
+finding from the cohort, not a passing claim.
+
 The fixed fixture is a routing guard only. Its ambiguous tasks remain
 non-gating observations: the isolated harnesses do not expose the plan skill,
 `create_workflow`, `get_status`, or `pending_gates`, and the catalog cannot
@@ -116,10 +125,11 @@ one. No ambiguous response text is evidence of W3.3a execution, and the tasks
 do not change the four-task denominator.
 
 The scorer deliberately evaluates the structured call trace, not whether
-response prose semantically refuses inline execution. A response-behaviour
-assertion for that separate property is follow-up evaluator work and requires
-separate approval; this unit records the gap without changing the fixture or
-scorer.
+response prose semantically refuses inline execution. The approved follow-on is
+an evaluator unit, not a change in this PR: it needs a reproducible fixture, an
+explicit model and run policy, and a behavioral gate that distinguishes a
+zero-call trace from genuine compliant routing. This unit records that scope
+without changing the fixture or scorer.
 
 ## Safety and baseline updates
 
