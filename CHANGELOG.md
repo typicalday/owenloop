@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.17](https://github.com/typicalday/owenloop/compare/v0.5.16...v0.5.17) (2026-08-21)
+
+
+### Features
+
+* **work:** send the release reason so an unservable order stops being silent ([#279](https://github.com/typicalday/owenloop/issues/279)) ([6bd1194](https://github.com/typicalday/owenloop/commit/6bd119449a8684fb25eae034703d8746b28f175a))
+
 ## [0.5.16](https://github.com/typicalday/owenloop/compare/v0.5.15...v0.5.16) (2026-08-21)
 
 
