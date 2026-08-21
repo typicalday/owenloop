@@ -15,6 +15,7 @@ import { codexAdapter } from '../packages/work/src/harness/codex.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../packages/work/src/harness/contract.ts';
 import {
   DEFAULT_CHARTER_FIXTURE_PATH,
+  assertExpectedNodeVersion,
   makeReport,
   makeScoreRecord,
   loadCharterFixture,
@@ -25,10 +26,11 @@ import {
 } from './helpers/mcp-charter-eval.ts';
 import type { ParsedTrace, ScoreRecord, TaskRecord } from './helpers/mcp-charter-eval.ts';
 
-interface CliOptions {
+export interface CliOptions {
   output?: string;
   claudeModel?: string;
   codexModel?: string;
+  expectedNodeVersion: string;
   taskTimeoutMs: number;
 }
 
@@ -57,7 +59,7 @@ const STOP_TIMEOUT_MS = 10_000;
 
 function usage(): never {
   throw new Error(
-    'usage: npm run eval:mcp-charter -- [--output <path>] [--claude-model <model>] [--codex-model <model>] [--task-timeout-ms <positive integer>]',
+    'usage: npm run eval:mcp-charter -- --expected-node-version <exact process.version string> [--output <path>] [--claude-model <model>] [--codex-model <model>] [--task-timeout-ms <positive integer>]',
   );
 }
 
@@ -68,10 +70,11 @@ function positiveInteger(value: string, flag: string): number {
   return parsed;
 }
 
-function readOptions(argv: string[]): CliOptions {
-  const options: CliOptions = {
+export function readOptions(argv: string[]): CliOptions {
+  const options: Omit<CliOptions, 'expectedNodeVersion'> & { expectedNodeVersion?: string } = {
     claudeModel: process.env['OWENLOOP_MCP_CHARTER_CLAUDE_MODEL'],
     codexModel: process.env['OWENLOOP_MCP_CHARTER_CODEX_MODEL'],
+    expectedNodeVersion: process.env['OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION'],
     taskTimeoutMs:
       process.env['OWENLOOP_MCP_CHARTER_TASK_TIMEOUT_MS'] === undefined
         ? DEFAULT_TASK_TIMEOUT_MS
@@ -79,19 +82,31 @@ function readOptions(argv: string[]): CliOptions {
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === '--output' || arg === '--claude-model' || arg === '--codex-model' || arg === '--task-timeout-ms') {
+    if (
+      arg === '--output' ||
+      arg === '--claude-model' ||
+      arg === '--codex-model' ||
+      arg === '--expected-node-version' ||
+      arg === '--task-timeout-ms'
+    ) {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith('--')) usage();
       if (arg === '--output') options.output = value;
       if (arg === '--claude-model') options.claudeModel = value;
       if (arg === '--codex-model') options.codexModel = value;
+      if (arg === '--expected-node-version') options.expectedNodeVersion = value;
       if (arg === '--task-timeout-ms') options.taskTimeoutMs = positiveInteger(value, '--task-timeout-ms');
       index += 1;
       continue;
     }
     usage();
   }
-  return options;
+  if (options.expectedNodeVersion === undefined || options.expectedNodeVersion === '') {
+    throw new Error(
+      'expected Node version is required: pass --expected-node-version <exact process.version string> or set OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION',
+    );
+  }
+  return { ...options, expectedNodeVersion: options.expectedNodeVersion };
 }
 
 export function finalResponseEvidence(events: readonly AgentEvent[]): string[] {
@@ -395,6 +410,7 @@ async function replaceAtomically(path: string, contents: string): Promise<void> 
 
 async function main(): Promise<void> {
   const options = readOptions(process.argv.slice(2));
+  assertExpectedNodeVersion(options.expectedNodeVersion);
   const fixture = await loadCharterFixture();
   const charterSha256 = await servedCharterSha256();
   const harnesses: HarnessRun[] = [
@@ -439,7 +455,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const report = makeReport(fixture, scores);
+  const report = makeReport(fixture, scores, { expectedNodeVersion: options.expectedNodeVersion });
   const reportText = `${JSON.stringify(report, null, 2)}\n`;
   process.stdout.write(reportText);
 
