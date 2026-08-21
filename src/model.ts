@@ -191,6 +191,15 @@ function latestSkipKind(art: ArtifactData): RejectKind | undefined {
   }
   return undefined;
 }
+
+/** Only engine-authored structural skips are dead-branch cascades eligible for gate revival. */
+function isEngineStructuralSkip(art: ArtifactData): boolean {
+  for (let i = art.reasons.length - 1; i >= 0; i--) {
+    const reason = art.reasons[i]!;
+    if (reason.action === 'skip') return reason.kind === 'structural' && reason.by === 'engine';
+  }
+  return false;
+}
 /**
  * §6 liveness: a judgment-rejected artifact that has been knocked back `cap`
  * times has *stalled*. It stays a debt (so it surfaces as stuck), but the engine
@@ -515,6 +524,18 @@ export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: Artifac
   return plain;
 }
 
+/**
+ * Dependencies used only by maintenance. A calls step's `callsInputs` are its
+ * scheduling gate and its dead-branch edge, but deliberately do not belong to
+ * `requiredInputs()`: that function defines build fingerprints, while live
+ * calls outputs also carry a child-outcome pin key.
+ */
+function maintenanceInputs(def: WorkflowDef, arts: ArtifactMap, art: ArtifactData): string[] {
+  const step = stepByName(def, art.producer);
+  if (step?.calls) return Object.values(step.callsInputs ?? {});
+  return requiredInputs(def, arts, art);
+}
+
 /** The {path → version} snapshot over a set of input paths. */
 export function computeFingerprint(arts: ArtifactMap, paths: readonly string[]): Fingerprint {
   const fp: Fingerprint = {};
@@ -630,7 +651,10 @@ function idleEligible(
 
 /**
  * Is a `calls:` step's gate ready in this state — i.e. is every parent artifact
- * wired into `callsInputs` green?
+ * wired into `callsInputs` green? Those stems are also the maintenance
+ * dead-input edges for the calls output. They intentionally remain absent from
+ * `StepDef.consumes` and `requiredInputs()`, which define build fingerprints:
+ * a live calls output additionally carries its child-outcome pin.
  *
  * This is the model-side mirror of `Engine.callsGateReady` (engine.ts) and MUST
  * read the same field it does: `callsInputs`, the mapping {child input name →
@@ -1006,10 +1030,11 @@ export function canEverFire(step: StepDef, def: WorkflowDef, reachable?: Set<str
  * The standing guard: re-derive the invariant "an artifact is green only while
  * every artifact it directly consumed is green and unmoved" and report the
  * structural ops needed to restore it. Pure — the engine applies the ops and
- * re-runs to a fixpoint. Covers the forward reject cascade, retract/skip
- * tombstoning of map children, skip-propagation down dead branches, and the
- * re-arm of a skipped subtree when its branch revives, and the re-arm of an
- * exclusively skipped produce-group sibling when its green winner is removed.
+ * re-runs to a fixpoint. Covers ordinary build-fingerprint invalidation,
+ * retract/skip tombstoning of map children, skip-propagation down dead branches,
+ * and skipped-subtree revival. Calls gates are maintenance-local: they settle a
+ * dead calls branch and revive its engine cascade skip, but never validate a
+ * green calls fingerprint (which also includes a child-outcome pin).
  */
 export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): CascadeOp[] {
   const ops: CascadeOp[] = [];
@@ -1027,7 +1052,9 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     // Re-arming on "inputs are green" alone would thrash, since the skip itself
     // was made on green inputs (§16.1).
     if (art.acceptance === 'skipped') {
-      const req = requiredInputs(def, arts, art);
+      const producerStep = stepByName(def, art.producer);
+      const isCallsCascade = producerStep?.calls && isEngineStructuralSkip(art);
+      const req = isCallsCascade ? maintenanceInputs(def, arts, art) : requiredInputs(def, arts, art);
       const allGreen = req.length > 0 && req.every((p) => isGreen(arts.get(p)));
       const moved = !fingerprintMatches(arts, req, art.fingerprint ?? {});
       if (allGreen && moved) {
@@ -1036,13 +1063,12 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
       continue;
     }
 
-    const req = requiredInputs(def, arts, art);
-    if (req.length === 0) continue; // a seeded input with no producer-inputs: nothing to rest on
+    const maintenanceReq = maintenanceInputs(def, arts, art);
 
     // the first input that is not green (settled-dead or merely in-flight)
     let offender: ArtifactData | undefined;
     let offenderPath: string | undefined;
-    for (const p of req) {
+    for (const p of maintenanceReq) {
       const dep = arts.get(p);
       if (!isGreen(dep)) {
         offender = dep;
@@ -1057,15 +1083,15 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     // (§11.8). `submitted` is never terminal (terminal applies at judge-approve
     // time, §4.8, so a still-submitted artifact cannot have terminal:true yet).
     if ((art.acceptance === 'green' && !art.terminal) || art.acceptance === 'submitted') {
-      const versionsOk = fingerprintMatches(arts, req, art.fingerprint ?? {});
-      if (!offender && versionsOk) continue; // invariant holds
-
-      // Dead/settled input: structural cascade (retract or skip). NOT gated by effect:
-      // (§17.5 — dead-input cascade for non-idempotent steps is unconditionally structural).
       if (offender && offenderPath) {
         ops.push(cascadeFromDeadInput(art.path, offender, offenderPath, isMapChild));
         continue;
       }
+
+      const req = requiredInputs(def, arts, art);
+      if (req.length === 0) continue; // a seeded input with no producer-inputs: nothing to rest on
+      const versionsOk = fingerprintMatches(arts, req, art.fingerprint ?? {});
+      if (versionsOk) continue; // invariant holds
 
       // All inputs are green but at least one moved (version changed). Route on effect:.
       const moved = req.find((p) => (arts.get(p)?.version ?? -1) !== (art.fingerprint ?? {})[p]);

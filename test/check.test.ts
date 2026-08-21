@@ -1567,39 +1567,43 @@ test('modelCheck: a calls: step whose gate IS green completes — the handoff is
   assert.ok(!report.structurallyDeadSteps.includes('deliver'), 'the calls: step itself is not structurally dead');
 });
 
-test('modelCheck: a SKIPPED calls: gate strands the calls artifact — reported as a deadlock', () => {
-  // The mirror image of the test above, and the reason that one wires its gate
-  // to a workflow input. Here the gate `sandbox` is produced by `provision`,
-  // which can outcome `skip`. Two engine facts make that branch a true
-  // dead-end rather than a transient stall:
-  //
-  //   1. `Engine.maintainCalls` (src/engine.ts:955) `continue`s whenever
-  //      `callsGateReady` is false. A skipped gate is not green, so the child
-  //      is never spawned and `delivered` is never machine-greened.
-  //   2. The skip does NOT cascade onto `delivered` either: `requiredInputs`
-  //      (src/model.ts:324) derives cascade inputs from `plainConsumes(step)`,
-  //      and a calls: step's `consumes` is always `[]` (src/defs.ts, buildStep).
-  //      So the cascade sees no offender and leaves `delivered` owed.
-  //
-  // `delivered` is therefore owed forever with nothing able to discharge it.
-  // `retry` cannot lift it, which is exactly the deadlock/stall distinction, so
-  // modelCheck must report it as a deadlock. Pinning this stops a future change
-  // from "fixing" the fixture above by making skipped gates silently pass.
+test('modelCheck: a SKIPPED calls: gate settles the calls branch without passing it', () => {
+  // A calls gate that becomes skipped never provisions its child, so its output
+  // must settle through ordinary dead-input maintenance instead. The old defect
+  // was that maintenance derived no dependency for a calls output because its
+  // build consumes are intentionally empty. Settling skipped is neither handoff
+  // success nor silent gate passage: delivered and its downstream branch must
+  // both be skipped, never green.
   const d = def('calls-gate-skippable', [input('proposal', { seedOwed: false })], [
     step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'], maxAttempts: 1000, maxSchemaFailures: 0 }),
     callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { childIn: 'sandbox' } }),
     step({ name: 'teardown', consumes: ['delivered'], produces: ['torn_down'], terminal: true, maxAttempts: 1000, maxSchemaFailures: 0 }),
   ]);
 
+  let arts = new Map<string, ArtifactData>();
+  arts.set('proposal', {
+    workflow: '',
+    path: 'proposal',
+    producer: 'human',
+    acceptance: 'green',
+    version: 1,
+    reasons: [],
+    judgmentRejects: 0,
+    schemaRejects: 0,
+  });
+  arts = settleInMemory(d, arts);
+  const provision = eligibleFirings(d, arts).find((f) => f.step === 'provision');
+  assert.ok(provision !== undefined, 'provision should be eligible before its skip');
+  arts = applyOutcome(d, arts, provision!, 'skip', { maxCollectionSize: 2 })[0]!;
+
+  assert.equal(arts.get('sandbox')?.acceptance, 'skipped');
+  assert.equal(arts.get('delivered')?.acceptance, 'skipped');
+  assert.notEqual(arts.get('delivered')?.acceptance, 'green', 'the dead gate must not discharge the calls handoff');
+  assert.equal(arts.get('torn_down')?.acceptance, 'skipped');
+
   const report = modelCheck(d, { maxStates: 2000 });
-  const skipPaths = report.deadlocks.filter((dl) =>
-    dl.path.some((s) => s.step === 'provision' && s.outcome === 'skip'),
-  );
-  assert.ok(
-    skipPaths.length > 0,
-    'skipping the step that produces the calls: gate must surface as a deadlock, not be swallowed',
-  );
-  assert.equal(hasDefiniteCheckDefect(report), true, 'and it is a definite defect, so install rejects it');
+  assert.equal(report.deadlocks.length, 0, 'the settled skipped branch is not a deadlock');
+  assert.equal(hasDefiniteCheckDefect(report), false, 'the definition is now installable');
 });
 
 test('modelCheck: the calls: gate reads callsInputs, not consumes (per-step, not def-wide)', () => {
@@ -1627,10 +1631,11 @@ test('modelCheck: a calls: firing offers only the green outcome (no worker verbs
   // there is no worker to schema-reject a value and no consumer to
   // judgment-reject (a calls: step declares `consumes: []`). If the successor
   // expansion ever offered those verbs, the calls artifact could be walked into
-  // a rejected/skipped state the engine cannot actually produce.
+  // a rejected/skipped state the firing cannot actually produce. Maintenance may
+  // still skip a calls output when its gate dies; that is not a calls-discharge
+  // outcome.
   const d = def('calls-outcomes', [input('proposal', { seedOwed: false })], [
-    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'], maxAttempts: 1000, maxSchemaFailures: 0 }),
-    callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { proposal: 'sandbox' } }),
+    callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { proposal: 'proposal' } }),
   ]);
 
   const report = modelCheck(d, { maxStates: 1000 });
