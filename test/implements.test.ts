@@ -6,6 +6,7 @@ import {
   implementsIssues,
   type WorkflowInterfaceSignature,
 } from '../src/implements.ts';
+import { validateValue } from '../src/schema.ts';
 import type { JsonSchema } from '../src/types.ts';
 
 const requestSchema: JsonSchema = {
@@ -743,6 +744,32 @@ test('compatibility accepts a target oneOf with required const discriminators', 
   const result = outputCompatibility(source, target);
   assert.equal(result.compatible, true);
   assert.deepEqual(result.issues, []);
+});
+
+test('compatibility rejects untyped target oneOf discriminators that overlap on primitives', () => {
+  const source: JsonSchema = {
+    required: ['kind'],
+    properties: { kind: { const: 'path' } },
+  };
+  const target: JsonSchema = {
+    oneOf: [
+      { required: ['kind'], properties: { kind: { const: 'path' } } },
+      { required: ['kind'], properties: { kind: { const: 'command-receipt' } } },
+    ],
+  };
+
+  assert.equal(validateValue(source, 'not-an-object').valid, true);
+  assert.equal(validateValue(target, 'not-an-object').valid, false);
+  const result = outputCompatibility(source, target);
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some((issue) => issue.path === 'outputs.report.schema.oneOf'));
+});
+
+test('compatibility fails closed for a singleton target oneOf boolean branch', () => {
+  const result = outputCompatibility({ type: 'string' }, { oneOf: [true] });
+
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some((issue) => issue.path === 'outputs.report.schema.oneOf'));
 });
 
 test('compatibility rejects a target oneOf with optional discriminators', () => {

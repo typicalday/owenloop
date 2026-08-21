@@ -470,6 +470,13 @@ function discriminatorValues(schema: JsonSchema): unknown[] | undefined {
   return effectiveValues(object, 'discriminator', []);
 }
 
+function isExplicitObjectOnly(schema: JsonSchema): boolean {
+  const object = schemaObject(schema);
+  if (object === undefined) return false;
+  const types = typeSet(object.type, 'target oneOf branch.type', []);
+  return types?.size === 1 && types.has('object');
+}
+
 function branchesAreDisjoint(source: JsonSchema, target: JsonSchema): boolean {
   const sourceObject = schemaObject(source);
   const targetObject = schemaObject(target);
@@ -493,6 +500,7 @@ function branchesAreDisjoint(source: JsonSchema, target: JsonSchema): boolean {
 }
 
 function targetOneOfIsDisjoint(branches: JsonSchema[]): boolean {
+  if (branches.some((branch) => !isExplicitObjectOnly(branch))) return false;
   for (let left = 0; left < branches.length; left += 1) {
     for (let right = left + 1; right < branches.length; right += 1) {
       const leftBranch = branches[left];
@@ -548,7 +556,7 @@ function compareUnionObligations(
   for (const targetSet of targetSets) {
     const targetPath = joinPath(path, targetSet.keyword);
     if (targetSet.keyword === 'oneOf' && !targetOneOfIsDisjoint(targetSet.branches)) {
-      issues.push(message(targetPath, 'target oneOf branches are not proven pairwise disjoint by required const/enum discriminators'));
+      issues.push(message(targetPath, 'target oneOf branches are not proven pairwise disjoint by explicit object-only schemas with required const/enum discriminators'));
       continue;
     }
 
@@ -759,7 +767,8 @@ function publicOutput(def: WorkflowDef, name: string): JsonSchema | undefined {
  * bounds; array items and uniqueItems; object properties, required, and
  * additionalProperties; and oneOf/anyOf. Union sibling constraints are
  * compared separately from branch coverage. Target oneOf branches are accepted
- * only when required const/enum discriminators prove every pair disjoint.
+ * only when non-boolean, object-only schemas with required const/enum
+ * discriminators prove every pair disjoint.
  * The checker remains structural and incomplete: coverage requiring multiple
  * target branches fails closed. allOf, if/then/else, not, $ref, prefixItems,
  * and other validation keywords fail closed with a path-specific issue. For a
