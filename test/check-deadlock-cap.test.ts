@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { hasDefiniteCheckDefect } from '../src/cli.ts';
 import { loadDefFile } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
 
@@ -15,8 +16,8 @@ const wedgeColl2 = fixture('wedge-coll2');
 const maxStates = 2_000_000;
 
 test('modelCheck: natural collection cap reports the promoted deadlock witnesses', () => {
-  const control = modelCheck(wedge, { maxStates, assumeProvided: true });
-  const collection = modelCheck(wedgeColl2, { maxStates, assumeProvided: true });
+  const control = modelCheck(wedge, { maxStates, assumeProvided: false });
+  const collection = modelCheck(wedgeColl2, { maxStates, assumeProvided: false });
 
   assert.equal(control.deadlocks.length, 1);
   assert.equal(collection.deadlocks.length, 3);
@@ -24,12 +25,22 @@ test('modelCheck: natural collection cap reports the promoted deadlock witnesses
     assert.deepEqual(report.boundsHit, []);
     assert.equal(report.bounded, false);
     assert.equal(report.completable, false);
+    assert.equal(hasDefiniteCheckDefect(report), true);
   }
+});
+
+test('modelCheck: provided strict-input control has no deadlock', () => {
+  const report = modelCheck(wedge, { maxStates, assumeProvided: true });
+
+  assert.equal(report.deadlocks.length, 0);
+  assert.equal(report.completable, true);
+  assert.equal(report.bounded, false);
+  assert.equal(hasDefiniteCheckDefect(report), false);
 });
 
 test('modelCheck: non-collection deadlock control is cap-invariant', () => {
   const reports = [0, 1, 2, 3, 4].map((maxCollectionSize) =>
-    modelCheck(wedge, { maxCollectionSize, maxStates, assumeProvided: true }),
+    modelCheck(wedge, { maxCollectionSize, maxStates, assumeProvided: false }),
   );
   const baseline = reports[0]!.deadlocks;
 
@@ -44,7 +55,7 @@ test('modelCheck: non-collection deadlock control is cap-invariant', () => {
 
 test('modelCheck: collection deadlock witness grows monotonically across admissible caps', () => {
   const reports = [0, 1, 2, 3, 4].map((maxCollectionSize) =>
-    modelCheck(wedgeColl2, { maxCollectionSize, maxStates, assumeProvided: true }),
+    modelCheck(wedgeColl2, { maxCollectionSize, maxStates, assumeProvided: false }),
   );
 
   for (const [index, report] of reports.entries()) {

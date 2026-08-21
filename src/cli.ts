@@ -2346,7 +2346,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 	}
       if (report.stallStates.length > 0) {
         io.out('');
-        io.out(`Stall states (expected — maxAttempts / human-escalation brakes) (${report.stallStates.length}):`);
+		io.out(`Stall states (expected — retryable brakes / future idle waits) (${report.stallStates.length}):`);
         for (const s of report.stallStates) {
           io.out(`  path: ${s.path.map((p) => `${p.step}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
         }
@@ -2426,9 +2426,10 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     // - definite (true) deadlock only when EXHAUSTIVE (!bounded) → nonzero
     // - stall states and stuck states are by-design brakes and NEVER affect the
     //   exit code — a stall state (report.stallStates) is EXPECTED (a human-
-    //   escalation brake whose freeze, once lifted, re-arms a producer), and a
-    //   stuck state (report.stuck) is purely informational (a brake tripped on
-    //   one branch while the line still moves on another). Neither is a defect.
+    //   escalation brake whose freeze, once lifted, re-arms a producer, or an
+    //   idle wait that becomes eligible after time passes), and a stuck state
+    //   (report.stuck) is purely informational (a brake tripped on one branch
+    //   while the line still moves on another). Neither is a defect.
     // - truncated with no invariant violations / structurally-dead steps / true
     //   deadlocks → 0
     const hasDefiniteDefect = hasDefiniteCheckDefect(report);

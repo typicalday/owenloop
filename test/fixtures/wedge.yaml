@@ -1,15 +1,13 @@
-name: wedge
-title: idle wedge
-description: minimal deadlock witness candidate
+name: unprovided-input
+title: unprovided input deadlock
+description: minimal strict-input deadlock witness
 
 inputs:
   - name: contract
     seedOwed: true
 
 steps:
-  - name: monitor
-    on: [idle]
-    idleAfter: 1h
+  - name: work
+    consumes: [contract]
     produces: [outcome]
-    body: |
-      never fires
+    terminal: true

@@ -978,9 +978,10 @@ export interface CheckReport {
   maxCollectionSize: number;
   /**
    * Reachable non-done states with zero eligible firings that have NO path to
-   * completion even at unlimited attempts — i.e. recomputing eligibility with
-   * all freezes lifted (a human `retry` = unlimited attempts) STILL yields
-   * zero firings. A genuine structural dead-end (TRUE deadlock). A definite
+   * completion even after unlimited attempts and elapsed idle time — i.e.
+   * recomputing eligibility with all freezes lifted (a human `retry` =
+   * unlimited attempts) and eventual idle time STILL yields zero firings. A
+   * genuine structural dead-end (TRUE deadlock). A definite
    * defect only when the search was exhaustive (`!bounded`) — the
    * maxCollectionSize cap can otherwise manufacture a spurious no-moves
    * state. Always present ([] when none).
@@ -988,12 +989,14 @@ export interface CheckReport {
   deadlocks: CheckFinding[];
   /**
    * Reachable non-done states with zero eligible firings whose ONLY blocker
-   * is a frozen/stalled debt (maxAttempts / maxSchemaFailures / held).
-   * Recomputing eligibility with all freezes lifted (a human `retry` =
-   * unlimited attempts) yields >= 1 firing, so a producer would re-arm and
-   * the line could move. These are the DESIGNED human-escalation brakes —
-   * EXPECTED, never a defect; they do not affect the exit code. Always
-   * present ([] when none).
+   * is a frozen/stalled debt (maxAttempts / maxSchemaFailures / held) or an
+   * idle trigger whose threshold has not yet elapsed. Recomputing eligibility
+   * with all freezes lifted (a human `retry` = unlimited attempts) and
+   * eventual idle time yields >= 1 firing, so a producer would re-arm or an
+   * idle step would become eligible. These are expected brakes/waits — never
+   * a defect; they do not affect the exit code. This classification does not
+   * itself make an idle successor reachable in the timeless BFS, so
+   * `completable` can remain false. Always present ([] when none).
    */
   stallStates: CheckFinding[];
   /**

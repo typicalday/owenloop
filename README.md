@@ -752,13 +752,16 @@ can NEVER fire regardless of search bounds are **structurally dead** — a real 
 defect, reported nonzero exit — while steps that CAN fire but the bounded search
 just didn't reach are **unreached within bounds** — informational only, exit 0.
 It also splits every reachable non-done, no-moves state into exactly one of two
-buckets: a **stall state** — the state's only blocker is a frozen/stalled debt
-(maxAttempts / maxSchemaFailures / held); recomputing eligibility with the freeze
-lifted (a human `retry` = unlimited attempts) shows a producer would re-arm and the
-line could move — this is an EXPECTED, by-design human-escalation brake and never
-fails the check — versus a **true deadlock** — the same recompute STILL yields no
-moves, a genuine structural dead-end, which fails the check nonzero when the search
-is exhaustive. See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
+buckets: a **stall state** — the state is blocked only by a frozen/stalled debt
+(maxAttempts / maxSchemaFailures / held) *or* an idle trigger waiting for its
+threshold; recomputing eligibility with the freeze lifted (a human `retry` =
+unlimited attempts) and with eventual idle time shows a move would become
+available. This is an EXPECTED, by-design human-escalation brake or future wait
+and never fails the check. The classifier does not add future idle transitions to
+the timeless reachability search, so an idle-only completion path can still report
+`completable: false`. A **true deadlock** is a state where the same recompute STILL
+yields no moves, a genuine structural dead-end which fails the check nonzero when
+the search is exhaustive. See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
 for the full breakdown.
 
 By default, `seedOwed` inputs are assumed provided (modeling the operator's `provide`
