@@ -1237,6 +1237,36 @@ test('collection: a retracted member drops out of the reduce', () => {
   assert.equal(engine.status(wf).done, true);
 });
 
+test('collection: a reducer can reject an empty green seal, then the producer can reseal and complete', () => {
+  const sealRecovery = def(
+    'seal-recovery',
+    [input('request')],
+    [
+      step({ name: 'produce', consumes: ['request'], produces: ['q[]'] }),
+      step({ name: 'reduce', consumes: ['q[*]'], produces: ['report'], terminal: true }),
+    ],
+  );
+  const { engine, store } = makeEngine([sealRecovery]);
+  const wf = engine.createInstance('seal-recovery');
+
+  const firstProduce = fire(engine, wf, 'produce', 1000);
+  assert.deepEqual(engine.emit(wf, firstProduce.run, []), { outcome: 'emitted', created: [] });
+  assert.equal(engine.seal(wf, firstProduce.run).outcome, 'green');
+  engine.close(wf, firstProduce.run);
+
+  const firstReduce = fire(engine, wf, 'reduce', 2000);
+  assert.equal(engine.reject(wf, 'q.sealed', 'reduce', 'please reseal the collection').outcome, 'rejected');
+  assert.equal(store.getArtifact(wf, 'q.sealed')?.acceptance, 'rejected');
+  engine.close(wf, firstReduce.run, 'no_work');
+
+  const reseal = fire(engine, wf, 'produce', 3000);
+  assert.equal(engine.seal(wf, reseal.run).outcome, 'green');
+  engine.close(wf, reseal.run);
+
+  complete(engine, wf, fire(engine, wf, 'reduce', 4000), { complete: true });
+  assert.equal(engine.status(wf).done, true);
+});
+
 // ---- routing: skip cascade + revival ----------------------------------------
 
 const routed = def(

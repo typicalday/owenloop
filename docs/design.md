@@ -231,6 +231,13 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
 - **§11.8** — the forward cascade (above).
 - **§11.9** — the three reject kinds (above): judgment, validation (§19), structural.
 
+A green seal is a normal artifact for authority purposes: a consumer of
+`src[*]` may judgment-reject it. That reopens the collection producer, which
+may emit additional members and seal again; `emit` only refuses while the seal
+is currently green. A judgment-rejected bare member is different: its index is
+not rebuilt, so an authorized consumer `retract`s it to remove it from the
+surviving set. Retraction cascades to indexed map children.
+
 ## §12 Concurrency
 
 - **§12.1 versions** — each artifact carries a monotonic version; a green bumps it.
@@ -1042,6 +1049,14 @@ an ordinary worker firing for dead-step accounting, and a synthesized judge's
 read-only context never grants member-retract authority. Applying it terminally
 retracts the member and lets the normal cascade retract its indexed map
 children, removing them from a reduce's surviving-member set.
+
+Retract transitions remain in the reachability graph, including when they are
+the only move that prevents a deadlock. They do not, by themselves, make a
+stalled debt an unrelated-branch `stuck` state: a retract-only state is
+authority recovery, and an indexed stalled debt clearable by an authorized
+member retract is recoverable rather than stranded. Ordinary worker progress
+on another branch can still report `stuck`; scalar parallel-workflow controls
+remain subject to that finding.
 
 **Stall states vs true deadlocks.** A reachable, non-done state with zero
 available transitions is classified into exactly ONE of two mutually exclusive

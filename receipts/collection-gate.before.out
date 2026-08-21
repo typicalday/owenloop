@@ -1,0 +1,122 @@
+engine HEAD=cc84e5b6c568a8192adcc8328dbe4987d70c6474
+engine tree=7400cbcca479e063bf47c8b1b2c8cd25e98f7ddf
+engine dirty-paths=2
+
+######## shapeA ########
+title: CONSUMER - bare reduce over a sealed collection
+  check-exit=0
+  stderr:
+    (node:94936) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=True boundsHit=['maxStates']
+  deadlocks=0
+  stuck=79
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+  stuck witness: a-producer:emit-seal -> a-reduce:schema-reject -> a-reduce:schema-reject -> a-reduce:schema-reject -> a-reduce:schema-reject -> a-reduce:schema-reject
+
+######## shapeB ########
+title: CONSUMER - map then suffix reduce
+  check-exit=0
+  stderr:
+    (node:94941) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=True boundsHit=['maxStates']
+  deadlocks=0
+  stuck=3
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+  stuck witness: b-producer:emit-seal -> b-map:schema-reject -> b-map:schema-reject -> b-map:schema-reject -> b-map:schema-reject -> b-map:schema-reject
+
+######## shapeC ########
+title: CONSUMER - human-seeded collection
+  check-exit=1
+  stderr:
+    error: workflow 'shapeC' has validation errors:
+      - step 'c-map' consumes collection 'q[$i]' but no step produces 'q[]'
+      - step 'c-reduce' consumes collection 'q[*].out' but no step produces 'q[]'
+    (node:94948) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  (no check result)
+
+######## shapeE ########
+title: CONSUMER - map then suffix reduce
+  check-exit=0
+  stderr:
+    (node:94953) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=True boundsHit=['maxStates']
+  deadlocks=0
+  stuck=317
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+  stuck witness: b-producer:emit-seal -> b-map:judgment-reject
+
+######## shapeP ########
+title: CONTROL for Q - chained two-step def, no collection
+  check-exit=0
+  stderr:
+    (node:94958) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=False boundsHit=[]
+  deadlocks=0
+  stuck=0
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+
+######## shapeQ ########
+title: PRODUCE-ONLY - chained def plus a collection nobody consumes
+  check-exit=0
+  stderr:
+    (node:94963) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=False bounded=True boundsHit=['maxDepth']
+  deadlocks=0
+  stuck=0
+  structurallyDeadSteps=0
+  unreachedSteps=1
+  invariantViolations=0
+
+######## shapeH ########
+title: CONTROL for I - lone step, no collection
+  check-exit=0
+  stderr:
+    (node:94973) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=False boundsHit=[]
+  deadlocks=0
+  stuck=0
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+
+######## shapeI ########
+title: PRODUCE-ONLY - lone step, collection is the sole output
+  check-exit=0
+  stderr:
+    (node:94989) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=False boundsHit=[]
+  deadlocks=0
+  stuck=0
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+
+######## shapeN ########
+title: CONTROL - two independent output producers, no collection
+  check-exit=0
+  stderr:
+    (node:94994) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+    (Use `node --trace-warnings ...` to show where the warning was created)
+  completable=True bounded=False boundsHit=[]
+  deadlocks=0
+  stuck=10
+  structurallyDeadSteps=0
+  unreachedSteps=0
+  invariantViolations=0
+  stuck witness: n-logger:schema-reject -> n-logger:schema-reject -> n-logger:schema-reject -> n-logger:schema-reject -> n-logger:schema-reject
