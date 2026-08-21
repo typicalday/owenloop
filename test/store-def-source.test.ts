@@ -25,9 +25,9 @@ import { test } from 'node:test';
 
 import { mainAsync } from '../src/cli.ts';
 import { Engine, CallsPinError } from '../src/engine.ts';
-import { finalizeDefs, resolveCallsTarget, DefError } from '../src/defs.ts';
+import { digestScopedCallsTargetKey, finalizeDefs, resolveCallsTarget, DefError } from '../src/defs.ts';
 import { openStore } from '../src/store.ts';
-import type { WorkflowDef } from '../src/types.ts';
+import type { InterfaceCallBinding, WorkflowDef } from '../src/types.ts';
 import {
   inspectCasDefs,
   loadCasDefs,
@@ -120,6 +120,131 @@ steps:
       finish ${marker}
 outputs: [delivered]
 `;
+}
+
+const interfaceTarget = 'report/report@1.0.0';
+const interfaceClaim = { name: 'research-report', version: '1' } as const;
+const interfaceSignature = {
+  inputs: [{
+    name: 'payload',
+    schema: {
+      type: 'object',
+      properties: { message: { type: 'string' } },
+      required: ['message'],
+      additionalProperties: false,
+    },
+  }],
+  outputs: [{
+    name: 'result',
+    schema: {
+      type: 'object',
+      properties: { report: { type: 'string' } },
+      required: ['report'],
+      additionalProperties: false,
+    },
+  }],
+};
+
+function interfaceParentYaml(): string {
+  return `name: caller
+inputs:
+  - name: payload
+    seedOwed: true
+    schema:
+      type: object
+      properties:
+        message: { type: string }
+      required: [message]
+      additionalProperties: false
+steps:
+  - name: deliver
+    callsInterface:
+      name: research-report
+      version: "1"
+    inputs:
+      payload: payload
+    produces: [delivered]
+  - name: finish
+    consumes: [delivered]
+    produces: [done]
+    body: finish
+outputs: [delivered]
+`;
+}
+
+function interfaceImplementationYaml(marker: string): string {
+  return `name: report
+x:
+  implements:
+    - name: research-report
+      version: "1"
+inputs:
+  - name: payload
+    seedOwed: true
+    schema:
+      type: object
+      properties:
+        message: { type: string }
+      required: [message]
+      additionalProperties: false
+steps:
+  - name: work
+    consumes: [payload]
+    produces:
+      - name: result
+        schema:
+          type: object
+          properties:
+            report: { type: string }
+          required: [report]
+          additionalProperties: false
+    body: implementation ${marker}
+outputs: [result]
+`;
+}
+
+async function installInterfaceShadowFixture(): Promise<{
+  projectRoot: string;
+  globalRoot: string;
+  callerDigest: string;
+  selectedDigest: string;
+  shadowDigest: string;
+}> {
+  const globalSource = writeBundleSource({
+    name: 'report',
+    version: '1.0.0',
+    workflow: interfaceImplementationYaml('GLOBAL-SELECTED'),
+  });
+  const selected = await installBundleFixture({ sourceDir: globalSource });
+  const projectRoot = tempDir('owenloop-interface-project-');
+  const shadowSource = writeBundleSource({
+    name: 'report',
+    version: '1.0.0',
+    workflow: interfaceImplementationYaml('PROJECT-SHADOW'),
+  });
+  const shadow = await installBundleFixture({ sourceDir: shadowSource, root: projectRoot });
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: interfaceParentYaml(),
+  });
+  const caller = await installBundleFixture({ sourceDir: callerSource, root: projectRoot });
+  return {
+    projectRoot,
+    globalRoot: selected.root,
+    callerDigest: caller.result.digest,
+    selectedDigest: selected.result.digest,
+    shadowDigest: shadow.result.digest,
+  };
+}
+
+function interfaceBinding(digest: string): InterfaceCallBinding {
+  return {
+    interface: { ...interfaceClaim },
+    target: interfaceTarget,
+    digest,
+    signature: structuredClone(interfaceSignature),
+  };
 }
 
 /**
@@ -817,6 +942,87 @@ test('explicit versioned calls resolve end-to-end and spawn the lock-pinned chil
     const child = store.findChildByParent(parent, 'delivered');
     assert.ok(child, 'the explicit versioned target spawned');
     assert.equal(store.getWorkflow(child.id)?.defSnapshot?.bundleDigest, installed.childDigest);
+  } finally {
+    store.close();
+  }
+});
+
+test('interface binding resolves through its digest-scoped alias despite a project coordinate shadow', async () => {
+  const installed = await installInterfaceShadowFixture();
+  const defs = defMap(load(installed.projectRoot, installed.globalRoot).registrations);
+  assert.equal(defs.get(interfaceTarget)?.bundleDigest, installed.shadowDigest, 'direct coordinate has project precedence');
+  assert.equal(
+    defs.get(digestScopedCallsTargetKey(installed.selectedDigest, interfaceTarget))?.bundleDigest,
+    installed.selectedDigest,
+    'the selected global implementation remains addressable by exact digest',
+  );
+
+  const store = openStore(join(tempDir('owenloop-interface-shadow-db-'), 'state.db'));
+  try {
+    const resolutionTransactions: boolean[] = [];
+    const engine = new Engine(store, (name, from, digest) => {
+      if (digest !== undefined) resolutionTransactions.push(store.db.isTransaction);
+      const resolved = digest !== undefined
+        ? defs.get(digestScopedCallsTargetKey(digest, name)) ?? defs.get(name)
+        : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      if (resolved === undefined) throw new Error(`unknown workflow definition '${name}'`);
+      return resolved;
+    });
+    const parent = engine.createInstance('caller/caller@1.0.0', {
+      provide: { payload: { message: 'go' } },
+      interfaceBindings: [interfaceBinding(installed.selectedDigest)],
+    });
+    engine.tick(parent, { deep: false });
+
+    const child = store.findChildByParent(parent, 'delivered');
+    assert.ok(child);
+    assert.equal(child.def, interfaceTarget);
+    assert.equal(child.defSnapshot?.bundleDigest, installed.selectedDigest);
+    assert.match(child.defSnapshot!.steps[0]!.body, /GLOBAL-SELECTED/u);
+    assert.ok(resolutionTransactions.length >= 2, 'binding resolves at start and again before spawn');
+    assert.ok(resolutionTransactions.every((inside) => !inside), 'exact target resolution never occurs inside SQLite');
+  } finally {
+    store.close();
+  }
+});
+
+test('interface binding adversarial repoint becomes one visible structural refusal with no child', async () => {
+  const installed = await installInterfaceShadowFixture();
+  const defs = defMap(load(installed.projectRoot, installed.globalRoot).registrations);
+  const store = openStore(join(tempDir('owenloop-interface-repoint-db-'), 'state.db'));
+  try {
+    let repoint = false;
+    const resolutionTransactions: boolean[] = [];
+    const engine = new Engine(store, (name, from, digest) => {
+      if (digest !== undefined) {
+        resolutionTransactions.push(store.db.isTransaction);
+        if (repoint) return defs.get(name)!;
+        const exact = defs.get(digestScopedCallsTargetKey(digest, name));
+        if (exact !== undefined) return exact;
+      }
+      const resolved = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      if (resolved === undefined) throw new Error(`unknown workflow definition '${name}'`);
+      return resolved;
+    });
+    const binding = interfaceBinding(installed.selectedDigest);
+    const parent = engine.createInstance('caller/caller@1.0.0', { interfaceBindings: [binding] });
+    repoint = true;
+    resolutionTransactions.length = 0;
+    engine.provideInput(parent, 'payload', { message: 'open gate' });
+    assert.doesNotThrow(() => engine.tick(parent, { deep: false }));
+
+    assert.equal(store.findChildByParent(parent, 'delivered'), undefined);
+    const delivered = store.getArtifact(parent, 'delivered')!;
+    assert.equal(delivered.acceptance, 'rejected');
+    assert.equal(delivered.schemaRejects, 0, 'pin refusals are structural, not schema failures');
+    assert.match(delivered.reasons.at(-1)!.text, /interface call 'research-report@1'.*immutable start-time pin check/u);
+    assert.deepEqual(store.getWorkflow(parent)?.interfaceBindings, [binding]);
+    assert.ok(resolutionTransactions.length > 0);
+    assert.ok(resolutionTransactions.every((inside) => !inside), 'adversarial resolution still occurs before BEGIN IMMEDIATE');
+
+    const reasonsBefore = delivered.reasons.length;
+    engine.tick(parent, { deep: false });
+    assert.equal(store.getArtifact(parent, 'delivered')?.reasons.length, reasonsBefore, 'unchanged gate does not duplicate refusal reasons');
   } finally {
     store.close();
   }

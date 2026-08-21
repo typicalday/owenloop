@@ -11,10 +11,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Engine, SchemaRefusalError } from '../src/engine.ts';
+import { Engine, InterfaceBindingRefusalError, SchemaRefusalError } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
-import type { ArtifactData, StepDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, InterfaceCallBinding, StepDef, WorkflowDef, WorkflowInterfaceSignature } from '../src/types.ts';
 import { DefError, loadDefs } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -145,6 +145,240 @@ function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
 function getArt(store: Store, wf: string, path: string): ArtifactData | undefined {
   return store.getArtifact(wf, path);
 }
+
+// ---- callsInterface: immutable start-time binding ---------------------------
+
+const INTERFACE_DIGEST = 'a'.repeat(64);
+const INTERFACE_TARGET = 'implementations/report@1.2.3';
+const REPORT_INTERFACE = { name: 'research-report', version: '1' } as const;
+const REPORT_INPUT_SCHEMA = {
+  type: 'object',
+  properties: { message: { type: 'string' } },
+  required: ['message'],
+  additionalProperties: false,
+};
+const REPORT_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: { report: { type: 'string' } },
+  required: ['report'],
+  additionalProperties: false,
+};
+const REPORT_SIGNATURE: WorkflowInterfaceSignature = {
+  inputs: [{ name: 'payload', schema: REPORT_INPUT_SCHEMA }],
+  outputs: [{ name: 'result', schema: REPORT_OUTPUT_SCHEMA }],
+};
+
+function interfaceFixtures(): { parent: WorkflowDef; child: WorkflowDef; binding: InterfaceCallBinding } {
+  const childInput = { ...input('payload', { seedOwed: true }), schema: REPORT_INPUT_SCHEMA };
+  const worker = step({ name: 'worker', consumes: ['payload'], produces: ['result'] });
+  worker.produces[0]!.schema = REPORT_OUTPUT_SCHEMA;
+  const child: WorkflowDef = {
+    ...def('reportImplementation', [childInput], [worker]),
+    outputs: ['result'],
+    x: { implements: [{ ...REPORT_INTERFACE }] },
+    bundleDigest: INTERFACE_DIGEST,
+  };
+  const interfaceStep: StepDef = {
+    ...step({ name: 'deliver', produces: ['delivered'] }),
+    callsInterface: { ...REPORT_INTERFACE },
+    callsInputs: { payload: 'payload' },
+    consumes: [],
+  };
+  const parent = def(
+    'interfaceParent',
+    [{ ...input('payload', { seedOwed: true }), schema: REPORT_INPUT_SCHEMA }],
+    [interfaceStep, step({ name: 'finish', consumes: ['delivered'], produces: ['done'] })],
+  );
+  return {
+    parent,
+    child,
+    binding: {
+      interface: { ...REPORT_INTERFACE },
+      target: INTERFACE_TARGET,
+      digest: INTERFACE_DIGEST,
+      signature: structuredClone(REPORT_SIGNATURE),
+    },
+  };
+}
+
+function makeInterfaceEngine(): {
+  engine: Engine;
+  store: Store;
+  parent: WorkflowDef;
+  child: WorkflowDef;
+  binding: InterfaceCallBinding;
+} {
+  const fixtures = interfaceFixtures();
+  const store = openStore(':memory:');
+  const engine = new Engine(store, (name) => {
+    if (name === fixtures.parent.name) return fixtures.parent;
+    if (name === INTERFACE_TARGET) return fixtures.child;
+    throw new Error(`no def: ${name}`);
+  });
+  return { engine, store, ...fixtures };
+}
+
+test('callsInterface: a missing binding refuses before any workflow row exists', () => {
+  const { engine, store } = makeInterfaceEngine();
+  assert.throws(
+    () => engine.createInstance('interfaceParent'),
+    (error: unknown) => {
+      assert.ok(error instanceof InterfaceBindingRefusalError);
+      assert.equal(error.step, 'deliver');
+      assert.match(error.message, /research-report@1/);
+      assert.match(error.message, /missing/);
+      return true;
+    },
+  );
+  assert.deepEqual(store.listWorkflows(), []);
+  const artifactCount = store.db.prepare('SELECT COUNT(*) AS n FROM artifact').get() as { n: number };
+  assert.equal(artifactCount.n, 0);
+  store.close();
+});
+
+test('callsInterface: malformed and duplicate bindings are named pre-insert refusals', () => {
+  const { engine, store, binding } = makeInterfaceEngine();
+  assert.throws(
+    () => engine.createInstance('interfaceParent', {
+      interfaceBindings: [{ ...binding, digest: binding.digest.toUpperCase() }],
+    }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /canonical lowercase 64-hex/.test(error.message),
+  );
+  assert.throws(
+    () => engine.createInstance('interfaceParent', {
+      interfaceBindings: [binding, structuredClone(binding)],
+    }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /duplicated/.test(error.message),
+  );
+  assert.equal(store.listWorkflows().length, 0);
+  store.close();
+});
+
+test('callsInterface: compatibility refusal preserves checker issue paths', () => {
+  const { engine, store, binding } = makeInterfaceEngine();
+  const incompatibleInput = structuredClone(binding);
+  incompatibleInput.signature.inputs[0]!.schema = { type: 'string' };
+  assert.throws(
+    () => engine.createInstance('interfaceParent', { interfaceBindings: [incompatibleInput] }),
+    (error: unknown) => {
+      assert.ok(error instanceof InterfaceBindingRefusalError);
+      assert.match(error.message, /incompatible/);
+      assert.match(error.message, /inputs\.payload\.schema/);
+      return true;
+    },
+  );
+  const incompatibleOutput = structuredClone(binding);
+  incompatibleOutput.signature.outputs[0]!.schema = { type: 'string' };
+  assert.throws(
+    () => engine.createInstance('interfaceParent', { interfaceBindings: [incompatibleOutput] }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /outputs\.result\.schema/.test(error.message),
+  );
+  assert.equal(store.listWorkflows().length, 0);
+  store.close();
+});
+
+test('callsInterface: target claim, output count, and wired child inputs are validated before insert', () => {
+  const fixtures = interfaceFixtures();
+  const noClaim: WorkflowDef = { ...fixtures.child, x: undefined };
+  const noOutputs: WorkflowDef = { ...fixtures.child, outputs: [] };
+  const multipleOutputs: WorkflowDef = { ...fixtures.child, outputs: ['result', 'other'] };
+  const missingInput: WorkflowDef = { ...fixtures.child, inputs: [] };
+  let selected = noClaim;
+  const store = openStore(':memory:');
+  const engine = new Engine(store, (name) => {
+    if (name === fixtures.parent.name) return fixtures.parent;
+    if (name === INTERFACE_TARGET) return selected;
+    throw new Error(`no def: ${name}`);
+  });
+
+  assert.throws(
+    () => engine.createInstance('interfaceParent', { interfaceBindings: [fixtures.binding] }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /exact valid x\.implements claim/.test(error.message),
+  );
+  selected = noOutputs;
+  assert.throws(
+    () => engine.createInstance('interfaceParent', { interfaceBindings: [fixtures.binding] }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /declares 0 public outputs/.test(error.message),
+  );
+  selected = multipleOutputs;
+  assert.throws(
+    () => engine.createInstance('interfaceParent', { interfaceBindings: [fixtures.binding] }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /declares 2 public outputs/.test(error.message),
+  );
+  selected = missingInput;
+  assert.throws(
+    () => engine.createInstance('interfaceParent', { interfaceBindings: [fixtures.binding] }),
+    (error: unknown) => error instanceof InterfaceBindingRefusalError && /target .* does not declare/.test(error.message),
+  );
+  assert.equal(store.listWorkflows().length, 0);
+  const artifactCount = store.db.prepare('SELECT COUNT(*) AS n FROM artifact').get() as { n: number };
+  assert.equal(artifactCount.n, 0);
+  store.close();
+});
+
+test('callsInterface: valid binding spawns the exact pinned child and emits no call-step worker order', () => {
+  const { engine, store, binding } = makeInterfaceEngine();
+  const parentWf = engine.createInstance('interfaceParent', {
+    provide: { payload: { message: 'hello' } },
+    interfaceBindings: [binding],
+  });
+  const tick = engine.tick(parentWf);
+  assert.ok(tick.orders.every((order) => order.step !== 'deliver'));
+  const child = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(child !== undefined);
+  assert.equal(child.def, INTERFACE_TARGET);
+  assert.equal(child.defSnapshot?.bundleDigest, INTERFACE_DIGEST);
+  assert.deepEqual(child.interfaceBindings, [binding]);
+  assert.deepEqual(store.getWorkflow(parentWf)?.interfaceBindings, [binding]);
+  assert.equal(tick.orders.find((order) => order.workflow === child.id)?.step, 'worker');
+  store.close();
+});
+
+test('callsInterface: an existing-child pin mismatch records one reason and event episode on an unchanged gate', () => {
+  const { parent, child, binding } = interfaceFixtures();
+  const adoptedChild = structuredClone(child);
+  adoptedChild.bundleDigest = 'b'.repeat(64);
+  let liveChild = child;
+  const store = openStore(':memory:');
+  const engine = new Engine(store, (name, _from, digest) => {
+    if (name === parent.name) return parent;
+    if (name === INTERFACE_TARGET) return digest === undefined ? liveChild : child;
+    throw new Error(`no def: ${name}`);
+  });
+  const parentWf = engine.createInstance(parent.name, {
+    provide: { payload: { message: 'hello' } },
+    interfaceBindings: [binding],
+  });
+  engine.tick(parentWf, { deep: false });
+  const spawnedChild = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(spawnedChild !== undefined);
+
+  liveChild = adoptedChild;
+  engine.adopt(spawnedChild.id);
+  assert.equal(store.getWorkflow(spawnedChild.id)?.defSnapshot?.bundleDigest, adoptedChild.bundleDigest);
+  assert.deepEqual(store.getWorkflow(spawnedChild.id)?.interfaceBindings, [binding]);
+
+  let rejectCommits = 0;
+  let parentSettled = 0;
+  const unsubscribe = engine.subscribe((event) => {
+    if (event.type === 'commit'
+      && event.workflow === parentWf
+      && event.path === 'delivered'
+      && event.action === 'reject') rejectCommits++;
+    if (event.type === 'settled' && event.workflow === parentWf) parentSettled++;
+  });
+  assert.doesNotThrow(() => engine.tick(parentWf, { deep: false }));
+  assert.doesNotThrow(() => engine.tick(parentWf, { deep: false }));
+  unsubscribe();
+
+  const delivered = store.getArtifact(parentWf, 'delivered')!;
+  assert.equal(delivered.acceptance, 'rejected');
+  assert.equal(delivered.reasons.length, 1, 'the same existing-child pin mismatch is recorded once');
+  assert.match(delivered.reasons[0]!.text, /existing child.*expected/u);
+  assert.equal(rejectCommits, 1, 'only the persisted refusal emits a commit event');
+  assert.equal(parentSettled, 1, 'only the persisted refusal emits a settled event');
+  store.close();
+});
 
 interface CleanupCallRun {
   parentWf: string;

@@ -18,7 +18,7 @@ import {
   sealPath,
   sealStem,
 } from './paths.ts';
-import { DEBT_STATES, OUTSTANDING_STATES, SETTLED_STATES } from './types.ts';
+import { DEBT_STATES, isCallStep, OUTSTANDING_STATES, SETTLED_STATES } from './types.ts';
 import type {
   Acceptance,
   ArtifactBiography,
@@ -532,7 +532,7 @@ export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: Artifac
  */
 function maintenanceInputs(def: WorkflowDef, arts: ArtifactMap, art: ArtifactData): string[] {
   const step = stepByName(def, art.producer);
-  if (step?.calls) return Object.values(step.callsInputs ?? {});
+  if (step !== undefined && isCallStep(step)) return Object.values(step.callsInputs ?? {});
   return requiredInputs(def, arts, art);
 }
 
@@ -698,7 +698,7 @@ function callsGateReady(step: StepDef, arts: ArtifactMap): boolean {
 function callsDischargeFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
   const firings: Firing[] = [];
   for (const step of def.steps) {
-    if (!step.calls) continue;
+    if (!isCallStep(step)) continue;
     if (!callsGateReady(step, arts)) continue;
     const outs = plainOutputs(step).filter((p) => isDebt(arts.get(p)));
     if (outs.length === 0) continue;
@@ -780,7 +780,7 @@ export function eligibleFirings(
 
   for (const step of def.steps) {
     // M2: calls: steps are machine-handled (the engine spawns the child); never emit a worker firing.
-    if (step.calls) continue;
+    if (isCallStep(step)) continue;
 
     // §24: a judge step fires through the NORMAL pipeline (§7.1) — level-triggered
     // on "the judged stem is submitted and this judge hasn't approved the current
@@ -1053,7 +1053,7 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     // was made on green inputs (§16.1).
     if (art.acceptance === 'skipped') {
       const producerStep = stepByName(def, art.producer);
-      const isCallsCascade = producerStep?.calls && isEngineStructuralSkip(art);
+      const isCallsCascade = producerStep !== undefined && isCallStep(producerStep) && isEngineStructuralSkip(art);
       const req = isCallsCascade ? maintenanceInputs(def, arts, art) : requiredInputs(def, arts, art);
       const allGreen = req.length > 0 && req.every((p) => isGreen(arts.get(p)));
       const moved = !fingerprintMatches(arts, req, art.fingerprint ?? {});
@@ -2262,7 +2262,7 @@ function eligibleOutcomes(
   // calls: produce may carry neither `judges:` nor `group:` (rejected by
   // `buildStep`). Modeling only the green keeps the successor set faithful to
   // what the engine can actually do here.
-  if (step.calls) return ['green'];
+  if (isCallStep(step)) return ['green'];
 
   const stem = collectionStem(step);
   const outPath = firing.outputs[0] ?? '';

@@ -190,6 +190,7 @@ export function defInstructionDigest(def: WorkflowDef): string {
     ...(s.capabilities !== undefined ? { capabilities: s.capabilities } : {}),
     ...(s.maxLeaseMs !== undefined ? { maxLeaseMs: s.maxLeaseMs } : {}),
     ...(s.calls !== undefined ? { calls: s.calls } : {}),
+    ...(s.callsInterface !== undefined ? { callsInterface: s.callsInterface } : {}),
     ...(s.callsInputs !== undefined ? { callsInputs: s.callsInputs } : {}),
     ...(s.judges !== undefined ? { judges: s.judges } : {}),
     ...(s.groups !== undefined ? { groups: s.groups } : {}),

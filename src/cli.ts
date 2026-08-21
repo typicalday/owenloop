@@ -49,6 +49,7 @@ import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import {
   buildDef,
   DefError,
+  digestScopedCallsTargetKey,
   finalizeDefs,
   lintDef,
   loadDefFile,
@@ -851,8 +852,10 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
   // `finalizeDefs` validated against at load time, so load-time and run-time
   // agree). With `from` absent — every other resolver caller — this is the plain
   // flat-map lookup it has always been.
-  const engine = new Engine(store, (name, from) => {
-    const d = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+  const engine = new Engine(store, (name, from, bundleDigest) => {
+    const d = bundleDigest !== undefined
+      ? defs.get(digestScopedCallsTargetKey(bundleDigest, name)) ?? defs.get(name)
+      : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
   }, { instructionSource });

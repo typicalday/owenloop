@@ -26,6 +26,7 @@ import type {
   ArtifactVersion,
   Author,
   Fingerprint,
+  InterfaceCallBinding,
   Order,
   ReasonEntry,
   RunData,
@@ -64,6 +65,8 @@ export interface RuntimeSnapshotBundlePins {
   bundleLock: string[];
   /** Exact versioned calls not already covered by this snapshot's bundle lock. */
   exactCalls?: string[];
+  /** Start-bound implementation bundles retained before any child is spawned. */
+  interfaceBindingDigests?: string[];
 }
 
 function exactCallsFromSnapshot(record: Record<string, unknown>, workflow: string): string[] {
@@ -137,24 +140,38 @@ export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBund
 			.get() !== undefined;
 		if (!hasWorkflow) return [];
 		const columns = db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>;
-		if (!columns.some((column) => column.name === 'def_snapshot')) return [];
+		const hasSnapshotColumn = columns.some((column) => column.name === 'def_snapshot');
+		const hasBindingsColumn = columns.some((column) => column.name === 'interface_bindings');
+		if (!hasSnapshotColumn && !hasBindingsColumn) return [];
 
+		const snapshotProjection = hasSnapshotColumn ? 'def_snapshot' : 'NULL AS def_snapshot';
+		const bindingProjection = hasBindingsColumn ? 'interface_bindings' : 'NULL AS interface_bindings';
+		const predicates = [
+			...(hasSnapshotColumn ? ['def_snapshot IS NOT NULL'] : []),
+			...(hasBindingsColumn ? ['interface_bindings IS NOT NULL'] : []),
+		];
 		const rows = db
-			.prepare('SELECT id, def_snapshot FROM workflow WHERE def_snapshot IS NOT NULL ORDER BY created_at, id')
-			.all() as unknown as Array<{ id: string; def_snapshot: string }>;
+			.prepare(
+				`SELECT id, ${snapshotProjection}, ${bindingProjection} FROM workflow `
+				+ `WHERE ${predicates.join(' OR ')} ORDER BY created_at, id`,
+			)
+			.all() as unknown as Array<{ id: string; def_snapshot: string | null; interface_bindings: string | null }>;
 		return rows.map((row) => {
-			let snapshot: unknown;
-			try {
-				snapshot = JSON.parse(row.def_snapshot);
-			} catch (error) {
-				throw new Error(
-					`workflow '${row.id}' has malformed def_snapshot JSON: ${(error as Error).message}`,
-				);
+			let record: Record<string, unknown> = {};
+			if (row.def_snapshot !== null) {
+				let snapshot: unknown;
+				try {
+					snapshot = JSON.parse(row.def_snapshot);
+				} catch (error) {
+					throw new Error(
+						`workflow '${row.id}' has malformed def_snapshot JSON: ${(error as Error).message}`,
+					);
+				}
+				if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
+					throw new Error(`workflow '${row.id}' has malformed def_snapshot: expected an object`);
+				}
+				record = snapshot as Record<string, unknown>;
 			}
-			if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
-				throw new Error(`workflow '${row.id}' has malformed def_snapshot: expected an object`);
-			}
-			const record = snapshot as Record<string, unknown>;
 			const rawDigest = record.bundleDigest;
 			let bundleDigest: string | undefined;
 			if (rawDigest !== undefined && rawDigest !== '') {
@@ -182,11 +199,15 @@ export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBund
 				return digest;
 			});
 
-			const exactCalls = exactCallsFromSnapshot(record, row.id);
+			const exactCalls = row.def_snapshot === null ? [] : exactCallsFromSnapshot(record, row.id);
+			const interfaceBindingDigests = [
+				...new Set((parseStoredInterfaceBindings(row.interface_bindings, row.id) ?? []).map((binding) => binding.digest)),
+			].sort(compareStoreText);
 			return {
 				...(bundleDigest === undefined ? {} : { bundleDigest }),
 				bundleLock: [...new Set(bundleLock)].sort(compareStoreText),
 				...(exactCalls.length === 0 ? {} : { exactCalls }),
+				...(interfaceBindingDigests.length === 0 ? {} : { interfaceBindingDigests }),
 			};
 		});
 	} finally {
@@ -213,6 +234,7 @@ CREATE TABLE IF NOT EXISTS workflow (
   params      TEXT NOT NULL DEFAULT '{}',
   modifier    TEXT,
   meta        TEXT,
+  interface_bindings TEXT,
   created_at  INTEGER NOT NULL
 );
 
@@ -338,8 +360,11 @@ CREATE TABLE IF NOT EXISTS meta (
  *
  * Bumped to '11' for bound artifacts: the `workflow` table gains nullable
  * JSON `meta` for non-routing `meta.<key>` artifact binds.
+ *
+ * Bumped to '12' for immutable start-time interface-call bindings: the
+ * `workflow` table gains nullable JSON `interface_bindings`.
  */
-const SCHEMA_VERSION = '11';
+const SCHEMA_VERSION = '12';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -411,6 +436,101 @@ function fromJson<T>(s: unknown, fallback: T, ctx: { table: string; id: string; 
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`Corrupt JSON in ${ctx.table}.${ctx.column} for row ${ctx.id}: ${msg}`);
   }
+}
+
+function parseStoredInterfaceBindings(s: unknown, workflow: string): InterfaceCallBinding[] | undefined {
+  const value = fromJson<unknown | undefined>(s, undefined, {
+    table: 'workflow',
+    id: workflow,
+    column: 'interface_bindings',
+  });
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`workflow '${workflow}' has malformed interface_bindings: expected an array`);
+  }
+  const seenClaims = new Set<string>();
+  for (const [index, binding] of value.entries()) {
+    const path = `workflow '${workflow}' interface_bindings[${index}]`;
+    if (typeof binding !== 'object' || binding === null || Array.isArray(binding)) {
+      throw new Error(`${path} is malformed: expected an object`);
+    }
+    const record = binding as Record<string, unknown>;
+    const bindingKeys = Object.keys(record).filter(
+      (key) => key !== 'interface' && key !== 'target' && key !== 'digest' && key !== 'signature',
+    );
+    if (bindingKeys.length > 0) {
+      throw new Error(`${path} is malformed: unknown field${bindingKeys.length === 1 ? '' : 's'} ${bindingKeys.join(', ')}`);
+    }
+    const claim = record.interface;
+    if (typeof claim !== 'object' || claim === null || Array.isArray(claim)) {
+      throw new Error(`${path}.interface is malformed: expected an object`);
+    }
+    const claimRecord = claim as Record<string, unknown>;
+    const claimKeys = Object.keys(claimRecord).filter((key) => key !== 'name' && key !== 'version');
+    if (claimKeys.length > 0) {
+      throw new Error(`${path}.interface is malformed: unknown field${claimKeys.length === 1 ? '' : 's'} ${claimKeys.join(', ')}`);
+    }
+    if (typeof claimRecord.name !== 'string' || claimRecord.name.trim() === ''
+      || typeof claimRecord.version !== 'string' || claimRecord.version.trim() === '') {
+      throw new Error(`${path}.interface is malformed: name and version must be non-empty strings`);
+    }
+    const claimKey = JSON.stringify([claimRecord.name, claimRecord.version]);
+    if (seenClaims.has(claimKey)) {
+      throw new Error(`${path}.interface is malformed: duplicate interface claim ${claimRecord.name}@${claimRecord.version}`);
+    }
+    seenClaims.add(claimKey);
+    if (typeof record.target !== 'string') {
+      throw new Error(`${path}.target is malformed: expected an exact workflow coordinate`);
+    }
+    try {
+      parseWorkflowCoordinate(record.target);
+    } catch (error) {
+      throw new Error(`${path}.target is malformed: ${(error as Error).message}`);
+    }
+    if (typeof record.digest !== 'string' || !isDefDigest(record.digest)) {
+      throw new Error(`${path}.digest is noncanonical: ${JSON.stringify(record.digest)}`);
+    }
+    const signature = record.signature;
+    if (typeof signature !== 'object' || signature === null || Array.isArray(signature)) {
+      throw new Error(`${path}.signature is malformed: expected an object`);
+    }
+    const signatureRecord = signature as Record<string, unknown>;
+    const signatureKeys = Object.keys(signatureRecord).filter((key) => key !== 'inputs' && key !== 'outputs');
+    if (signatureKeys.length > 0) {
+      throw new Error(`${path}.signature is malformed: unknown field${signatureKeys.length === 1 ? '' : 's'} ${signatureKeys.join(', ')}`);
+    }
+    if (!Array.isArray(signatureRecord.inputs) || !Array.isArray(signatureRecord.outputs)) {
+      throw new Error(`${path}.signature is malformed: inputs and outputs must be arrays`);
+    }
+    const signatureArtifacts: Record<'inputs' | 'outputs', unknown[]> = {
+      inputs: signatureRecord.inputs,
+      outputs: signatureRecord.outputs,
+    };
+    for (const direction of ['inputs', 'outputs'] as const) {
+      for (const [artifactIndex, artifact] of signatureArtifacts[direction].entries()) {
+        const artifactPath = `${path}.signature.${direction}[${artifactIndex}]`;
+        if (typeof artifact !== 'object' || artifact === null || Array.isArray(artifact)) {
+          throw new Error(`${artifactPath} is malformed: expected an object`);
+        }
+        const artifactRecord = artifact as Record<string, unknown>;
+        const artifactKeys = Object.keys(artifactRecord).filter((key) => key !== 'name' && key !== 'schema');
+        if (artifactKeys.length > 0) {
+          throw new Error(`${artifactPath} is malformed: unknown field${artifactKeys.length === 1 ? '' : 's'} ${artifactKeys.join(', ')}`);
+        }
+        if (typeof artifactRecord.name !== 'string' || artifactRecord.name.trim() === '') {
+          throw new Error(`${artifactPath}.name is malformed: expected a non-empty string`);
+        }
+        if (
+          artifactRecord.schema !== undefined
+          && typeof artifactRecord.schema !== 'boolean'
+          && (typeof artifactRecord.schema !== 'object' || artifactRecord.schema === null || Array.isArray(artifactRecord.schema))
+        ) {
+          throw new Error(`${artifactPath}.schema is malformed: expected a JSON Schema object or boolean`);
+        }
+      }
+    }
+  }
+  return value as InterfaceCallBinding[];
 }
 
 interface ArtifactRowRaw {
@@ -583,6 +703,7 @@ interface WorkflowRowRaw {
   def_hash: string | null;
   modifier: string | null;
   meta: string | null;
+  interface_bindings: string | null;
   created_at: number;
 }
 
@@ -614,6 +735,8 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
     column: 'meta',
   });
   if (meta !== undefined) out.meta = meta;
+  const interfaceBindings = parseStoredInterfaceBindings(r.interface_bindings, r.id);
+  if (interfaceBindings !== undefined) out.interfaceBindings = interfaceBindings;
   return out;
 }
 
@@ -790,6 +913,9 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'meta')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN meta TEXT`);
     }
+    if (!wfCols.some((c) => c.name === 'interface_bindings')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN interface_bindings TEXT`);
+    }
 
     // Only a genuine pre-v8 -> v8 upgrade may backfill the current projection's
     // reason thread. Re-opening an already-v8 database must not manufacture a
@@ -884,8 +1010,8 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO workflow
-					 (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, interface_bindings, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -897,7 +1023,8 @@ export class Store {
         toJson(data.defSnapshot),
         data.defHash ?? null,
         data.modifier ?? null,
-				toJson(data.meta),
+        toJson(data.meta),
+        toJson(data.interfaceBindings),
         at,
       );
     return this.getWorkflow(id) as WorkflowRow;

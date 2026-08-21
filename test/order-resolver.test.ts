@@ -322,6 +322,19 @@ test('workdirFrom changes the instruction digest when its consumed value path ch
   );
 });
 
+test('callsInterface coordinate participates in definition instruction identity', () => {
+  const callStep = {
+    ...step({ name: 'deliver', produces: ['delivered'] }),
+    callsInterface: { name: 'research-report', version: '1' },
+    callsInputs: {},
+    consumes: [],
+  };
+  const first = def('interface-caller', [], [callStep]);
+  const second = structuredClone(first);
+  second.steps[0]!.callsInterface = { name: 'research-report', version: '2' };
+  assert.notEqual(defInstructionDigest(first), defInstructionDigest(second));
+});
+
 test('digestOf registers the exact snapshot it digested — resolution survives source change', () => {
   const source = createDefInstructionSource();
   const digest = source.digestOf(fixtureDef);

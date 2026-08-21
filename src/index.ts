@@ -12,7 +12,13 @@
  * process — software delivery, research, triage — on top of it.
  */
 
-export { CallsPinError, Engine, ModifierRefusalError } from './engine.ts';
+export {
+  CallsPinError,
+  Engine,
+  InterfaceBindingRefusalError,
+  InterfaceCallPinError,
+  ModifierRefusalError,
+} from './engine.ts';
 export type {
   CommitResult,
   CreateOpts,
@@ -142,7 +148,7 @@ export type {
   WorkflowStoreStatePaths,
 } from './store/index.ts';
 
-export { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, resolveCallsTarget, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
+export { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, InterfaceCallDefinitionError, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, resolveCallsTarget, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
 export { checkInterfaceCompatibility, implementsIssues } from './implements.ts';
 export type {
   InterfaceCompatibilityCheck,
@@ -405,7 +411,7 @@ export type {
   PackResult,
 } from './bundle/index.ts';
 
-export { DEBT_STATES, SETTLED_STATES } from './types.ts';
+export { DEBT_STATES, isCallStep, SETTLED_STATES } from './types.ts';
 export type {
   Acceptance,
   ArtifactBiography,
@@ -422,6 +428,7 @@ export type {
   GraphNode,
   GraphNodeState,
   InputDef,
+  InterfaceCallBinding,
   InvariantDef,
   InvariantPredicate,
   InvariantViolation,

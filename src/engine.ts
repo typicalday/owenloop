@@ -38,6 +38,8 @@ import type { ArtifactMap, CascadeOp, ChildStatusSummary, Firing, TimeFacts, Wor
 import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
+import { checkInterfaceCompatibility } from './implements.ts';
+import { isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
 import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
 import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
@@ -48,6 +50,7 @@ import type {
   ArtifactData,
   Author,
   Fingerprint,
+  InterfaceCallBinding,
   JsonSchema,
   Order,
   StepDef,
@@ -55,7 +58,10 @@ import type {
   RejectKind,
   ReasonAction,
   WorkflowDef,
+  WorkflowInterfaceClaim,
+  WorkflowInterfaceSignature,
 } from './types.ts';
+import { isCallStep } from './types.ts';
 import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
 import type { OrderInstructionSource, ResolvedInstructions } from './order-resolver.ts';
 
@@ -156,6 +162,85 @@ export class CallsPinError extends Error {
     this.target = target;
     this.detail = detail;
   }
+}
+
+/**
+ * A caller-supplied start binding is missing, malformed, unresolved, or
+ * incompatible. This is a named 400-class refusal: no workflow row exists when
+ * it is thrown from the public start path.
+ */
+export class InterfaceBindingRefusalError extends Error {
+  override readonly name = 'InterfaceBindingRefusalError';
+  readonly workflow: string;
+  readonly step: string;
+  readonly interfaceName?: string;
+  readonly interfaceVersion?: string;
+  readonly detail: string;
+
+  constructor(
+    workflow: string,
+    step: string,
+    claim: Partial<WorkflowInterfaceClaim> | undefined,
+    detail: string,
+  ) {
+    const interfaceName = typeof claim?.name === 'string' && claim.name.trim() !== '' ? claim.name : undefined;
+    const interfaceVersion = typeof claim?.version === 'string' && claim.version.trim() !== '' ? claim.version : undefined;
+    const coordinate = interfaceName === undefined
+      ? 'an unknown interface coordinate'
+      : `'${interfaceName}${interfaceVersion === undefined ? '' : `@${interfaceVersion}`}'`;
+    super(
+      `refusing to start workflow '${workflow}': interface binding for ${coordinate} `
+      + `(step '${step}') ${detail}`,
+    );
+    this.workflow = workflow;
+    this.step = step;
+    this.interfaceName = interfaceName;
+    this.interfaceVersion = interfaceVersion;
+    this.detail = detail;
+  }
+}
+
+/**
+ * A persisted interface binding no longer agrees with the optimistically
+ * resolved child at spawn time. The provision transaction rolls back and the
+ * parent call artifact receives one visible structural refusal.
+ */
+export class InterfaceCallPinError extends Error {
+  override readonly name = 'InterfaceCallPinError';
+  readonly interface: WorkflowInterfaceClaim;
+  readonly target: string;
+  readonly detail: string;
+
+  constructor(claim: WorkflowInterfaceClaim, target: string, detail: string) {
+    super(`interface call '${claim.name}@${claim.version}' bound to '${target}' failed its pin check: ${detail}`);
+    this.interface = { ...claim };
+    this.target = target;
+    this.detail = detail;
+  }
+}
+
+function sameInterfaceClaim(a: WorkflowInterfaceClaim, b: WorkflowInterfaceClaim): boolean {
+  return a.name === b.name && a.version === b.version;
+}
+
+function callTargetLabel(step: StepDef): string {
+  if (step.calls !== undefined) return step.calls;
+  const claim = step.callsInterface;
+  return claim === undefined ? '<invalid call step>' : `${claim.name}@${claim.version}`;
+}
+
+function hasExactImplementationClaim(def: WorkflowDef, expected: WorkflowInterfaceClaim): boolean {
+  const claims = def.x?.implements;
+  if (!Array.isArray(claims)) return false;
+  return claims.some((claim) => {
+    if (typeof claim !== 'object' || claim === null || Array.isArray(claim)) return false;
+    const record = claim as Record<string, unknown>;
+    const keys = Object.keys(record);
+    return keys.length === 2
+      && keys.every((key) => key === 'name' || key === 'version')
+      && record.name === expected.name
+      && record.version === expected.version;
+  });
 }
 
 /**
@@ -348,6 +433,12 @@ export interface CreateOpts {
    * rewriting this stored value.
    */
   modifier?: string;
+  /**
+   * Hub-selected interface implementations. Every entry is validated and the
+   * complete normalized set is pinned immutably before the root row is written,
+   * then inherited by calls children.
+   */
+  interfaceBindings?: InterfaceCallBinding[];
 }
 
 /**
@@ -384,9 +475,17 @@ export class ModifierRefusalError extends Error {
  * unrelated `build` from bundle B). Because the parameter is optional, every
  * existing single-argument resolver — including a host's hand-written one —
  * keeps today's exact behavior with no change: a resolver that ignores `from`
- * simply performs the flat lookup it always did.
+ * simply performs the flat lookup it always did. Interface bindings add the
+ * optional third `bundleDigest`: store-backed resolvers use it to prefer the
+ * exact digest-scoped alias, while the engine independently verifies the
+ * returned definition's digest before accepting or spawning it.
  */
-export type DefResolver = (defName: string, from?: WorkflowDef) => WorkflowDef;
+export type DefResolver = (
+  defName: string,
+  from?: WorkflowDef,
+  /** Exact CAS bundle digest requested by a persisted interface binding. */
+  bundleDigest?: string,
+) => WorkflowDef;
 
 /**
  * A push notification of a committed engine change, delivered to observers
@@ -523,11 +622,250 @@ export class Engine {
 
   // ---- instance lifecycle ----------------------------------------------------
 
+  /** Validate, resolve, and JSON-normalize every supplied start binding. */
+  private normalizeInterfaceBindings(
+    defName: string,
+    def: WorkflowDef,
+    supplied: InterfaceCallBinding[] | undefined,
+  ): { bindings: InterfaceCallBinding[]; targets: WorkflowDef[] } {
+    const raw: unknown = supplied ?? [];
+    const refuse = (
+      step: string,
+      claim: Partial<WorkflowInterfaceClaim> | undefined,
+      detail: string,
+    ): never => {
+      throw new InterfaceBindingRefusalError(defName, step, claim, detail);
+    };
+    const rawBindings = Array.isArray(raw)
+      ? raw
+      : refuse('interfaceBindings', undefined, 'must be supplied as an array');
+
+    const bindings: InterfaceCallBinding[] = [];
+    const targets: WorkflowDef[] = [];
+    for (const [index, candidate] of rawBindings.entries()) {
+      const stepLabel = `interfaceBindings[${index}]`;
+      if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+        refuse(stepLabel, undefined, 'must be an object');
+      }
+      const candidateRecord = candidate as unknown as Record<string, unknown>;
+      const extraBindingKeys = Object.keys(candidateRecord)
+        .filter((key) => key !== 'interface' && key !== 'target' && key !== 'digest' && key !== 'signature');
+      if (extraBindingKeys.length > 0) {
+        refuse(stepLabel, undefined, `has unknown field${extraBindingKeys.length === 1 ? '' : 's'} ${extraBindingKeys.join(', ')}`);
+      }
+
+      const cloned = (() => {
+        try {
+          const json = JSON.stringify(candidateRecord);
+          if (json === undefined) return refuse(stepLabel, undefined, 'is not JSON-serializable');
+          return JSON.parse(json) as Record<string, unknown>;
+        } catch (error) {
+          if (error instanceof InterfaceBindingRefusalError) throw error;
+          return refuse(stepLabel, undefined, `is not JSON-serializable: ${(error as Error).message}`);
+        }
+      })();
+
+      const interfaceValue = cloned.interface;
+      if (typeof interfaceValue !== 'object' || interfaceValue === null || Array.isArray(interfaceValue)) {
+        refuse(stepLabel, undefined, ".interface must be a map with exactly 'name' and 'version'");
+      }
+      const interfaceRecord = interfaceValue as Record<string, unknown>;
+      const claim: Partial<WorkflowInterfaceClaim> = {
+        ...(typeof interfaceRecord.name === 'string' ? { name: interfaceRecord.name } : {}),
+        ...(typeof interfaceRecord.version === 'string' ? { version: interfaceRecord.version } : {}),
+      };
+      const extraInterfaceKeys = Object.keys(interfaceRecord).filter((key) => key !== 'name' && key !== 'version');
+      if (extraInterfaceKeys.length > 0) {
+        refuse(stepLabel, claim, `.interface has unknown field${extraInterfaceKeys.length === 1 ? '' : 's'} ${extraInterfaceKeys.join(', ')}`);
+      }
+      const interfaceName = typeof interfaceRecord.name === 'string' && interfaceRecord.name.trim() !== ''
+        ? interfaceRecord.name
+        : refuse(stepLabel, claim, '.interface.name must be a non-empty string');
+      const interfaceVersion = typeof interfaceRecord.version === 'string' && interfaceRecord.version.trim() !== ''
+        ? interfaceRecord.version
+        : refuse(stepLabel, claim, '.interface.version must be a non-empty string');
+      const normalizedClaim: WorkflowInterfaceClaim = {
+        name: interfaceName,
+        version: interfaceVersion,
+      };
+      if (bindings.some((binding) => sameInterfaceClaim(binding.interface, normalizedClaim))) {
+        refuse(stepLabel, normalizedClaim, 'is duplicated; each exact name/version pair must have one unambiguous binding');
+      }
+
+      const target = typeof cloned.target === 'string'
+        ? cloned.target
+        : refuse(stepLabel, normalizedClaim, '.target must be an exact installed workflow coordinate');
+      try {
+        parseWorkflowCoordinate(target);
+      } catch (error) {
+        refuse(stepLabel, normalizedClaim, `.target is not an exact installed workflow coordinate: ${(error as Error).message}`);
+      }
+      const digest = typeof cloned.digest === 'string' && isDefDigest(cloned.digest)
+        ? cloned.digest
+        : refuse(stepLabel, normalizedClaim, '.digest must be a canonical lowercase 64-hex bundle digest');
+
+      const signatureRecord = typeof cloned.signature === 'object'
+        && cloned.signature !== null
+        && !Array.isArray(cloned.signature)
+        ? cloned.signature as Record<string, unknown>
+        : refuse(stepLabel, normalizedClaim, '.signature must be a map with inputs and outputs arrays');
+      const extraSignatureKeys = Object.keys(signatureRecord).filter((key) => key !== 'inputs' && key !== 'outputs');
+      if (extraSignatureKeys.length > 0) {
+        refuse(stepLabel, normalizedClaim, `.signature has unknown field${extraSignatureKeys.length === 1 ? '' : 's'} ${extraSignatureKeys.join(', ')}`);
+      }
+      const normalizeArtifacts = (value: unknown, path: 'inputs' | 'outputs'): WorkflowInterfaceSignature[typeof path] => {
+        const artifacts = Array.isArray(value)
+          ? value
+          : refuse(stepLabel, normalizedClaim, `.signature.${path} must be an array`);
+        return artifacts.map((artifact: unknown, artifactIndex: number) => {
+          if (typeof artifact !== 'object' || artifact === null || Array.isArray(artifact)) {
+            refuse(stepLabel, normalizedClaim, `.signature.${path}[${artifactIndex}] must be an object`);
+          }
+          const artifactRecord = artifact as Record<string, unknown>;
+          const extraArtifactKeys = Object.keys(artifactRecord).filter((key) => key !== 'name' && key !== 'schema');
+          if (extraArtifactKeys.length > 0) {
+            refuse(
+              stepLabel,
+              normalizedClaim,
+              `.signature.${path}[${artifactIndex}] has unknown field${extraArtifactKeys.length === 1 ? '' : 's'} ${extraArtifactKeys.join(', ')}`,
+            );
+          }
+          const artifactName = typeof artifactRecord.name === 'string' && artifactRecord.name.trim() !== ''
+            ? artifactRecord.name
+            : refuse(stepLabel, normalizedClaim, `.signature.${path}[${artifactIndex}].name must be a non-empty string`);
+          if (
+            artifactRecord.schema !== undefined
+            && typeof artifactRecord.schema !== 'boolean'
+            && (typeof artifactRecord.schema !== 'object' || artifactRecord.schema === null || Array.isArray(artifactRecord.schema))
+          ) {
+            refuse(stepLabel, normalizedClaim, `.signature.${path}[${artifactIndex}].schema must be a JSON Schema object or boolean`);
+          }
+          return artifactRecord.schema === undefined
+            ? { name: artifactName }
+            : { name: artifactName, schema: artifactRecord.schema as JsonSchema };
+        });
+      };
+      const signature: WorkflowInterfaceSignature = {
+        inputs: normalizeArtifacts(signatureRecord.inputs, 'inputs'),
+        outputs: normalizeArtifacts(signatureRecord.outputs, 'outputs'),
+      };
+
+      const targetDef = (() => {
+        try {
+          return this.resolveDef(target, def, digest);
+        } catch (error) {
+          return refuse(stepLabel, normalizedClaim, `cannot resolve target '${target}' at digest ${digest}: ${(error as Error).message}`);
+        }
+      })();
+      if (targetDef.bundleDigest !== digest) {
+        refuse(
+          stepLabel,
+          normalizedClaim,
+          `resolved target '${target}' carries bundle digest ${targetDef.bundleDigest ?? '<none>'}, expected ${digest}`,
+        );
+      }
+      if (!hasExactImplementationClaim(targetDef, normalizedClaim)) {
+        refuse(
+          stepLabel,
+          normalizedClaim,
+          `target '${target}' does not carry an exact valid x.implements claim for ${normalizedClaim.name}@${normalizedClaim.version}`,
+        );
+      }
+      const targetOutputs = targetDef.outputs ?? [];
+      if (targetOutputs.length !== 1) {
+        refuse(
+          stepLabel,
+          normalizedClaim,
+          `target '${target}' declares ${targetOutputs.length} public outputs; interface calls v1 requires exactly one`,
+        );
+      }
+
+      const signatureInputNames = new Set(signature.inputs.map((input) => input.name));
+      const targetInputNames = new Set(targetDef.inputs.map((input) => input.name));
+      for (const interfaceStep of def.steps) {
+        if (interfaceStep.callsInterface === undefined || !sameInterfaceClaim(interfaceStep.callsInterface, normalizedClaim)) continue;
+        for (const childInput of Object.keys(interfaceStep.callsInputs ?? {})) {
+          if (!signatureInputNames.has(childInput)) {
+            refuse(interfaceStep.name, normalizedClaim, `maps input '${childInput}', which the supplied interface signature does not declare`);
+          }
+          if (!targetInputNames.has(childInput)) {
+            refuse(interfaceStep.name, normalizedClaim, `maps input '${childInput}', which target '${target}' does not declare`);
+          }
+        }
+      }
+
+      const compatibility = checkInterfaceCompatibility(signature, targetDef);
+      if (!compatibility.compatible) {
+        refuse(
+          stepLabel,
+          normalizedClaim,
+          `target '${target}' is incompatible: ${compatibility.issues.map((issue) => issue.message).join('; ')}`,
+        );
+      }
+
+      bindings.push({
+        interface: normalizedClaim,
+        target,
+        digest,
+        signature,
+      });
+      targets.push(targetDef);
+    }
+
+    for (const step of def.steps) {
+      if (step.callsInterface === undefined) continue;
+      if (!bindings.some((binding) => sameInterfaceClaim(binding.interface, step.callsInterface!))) {
+        refuse(step.name, step.callsInterface, 'is missing; every directly called interface must be bound at instance start');
+      }
+    }
+    return { bindings, targets };
+  }
+
+  /** Pure child-insert guard over an already-normalized inherited binding set. */
+  private assertDirectInterfaceBindings(
+    defName: string,
+    def: WorkflowDef,
+    bindings: readonly InterfaceCallBinding[] | undefined,
+  ): void {
+    for (const step of def.steps) {
+      if (step.callsInterface === undefined) continue;
+      const binding = (bindings ?? []).find((candidate) =>
+        sameInterfaceClaim(candidate.interface, step.callsInterface!));
+      if (binding === undefined) {
+        throw new InterfaceBindingRefusalError(
+          defName,
+          step.name,
+          step.callsInterface,
+          'is missing from the inherited immutable binding set',
+        );
+      }
+      const interfaceInputs = new Set(binding.signature.inputs.map((input) => input.name));
+      for (const childInput of Object.keys(step.callsInputs ?? {})) {
+        if (!interfaceInputs.has(childInput)) {
+          throw new InterfaceBindingRefusalError(
+            defName,
+            step.name,
+            step.callsInterface,
+            `maps input '${childInput}', which the inherited interface signature does not declare`,
+          );
+        }
+      }
+    }
+  }
+
   /** Start a workflow instance: persist it, seed its declared inputs, settle. */
   createInstance(defName: string, opts: CreateOpts = {}): string {
     const def = this.resolveDef(defName);
+    const normalized = this.normalizeInterfaceBindings(defName, def, opts.interfaceBindings);
     const id = randId('wf');
-    this.store.txWithWorkflowSnapshots(def, () => this.createInstanceInTx(defName, def, id, opts));
+    const createOpts: CreateOpts = {
+      ...opts,
+      ...(normalized.bindings.length === 0 ? { interfaceBindings: undefined } : { interfaceBindings: normalized.bindings }),
+    };
+    this.store.txWithWorkflowSnapshots(
+      [def, ...normalized.targets],
+      () => this.createInstanceInTx(defName, def, id, createOpts),
+    );
     this.fire({ type: 'instance', workflow: id, def: defName });
     this.fireSettled(id);
     return id;
@@ -542,16 +880,22 @@ export class Engine {
    * under a single `BEGIN IMMEDIATE` without nesting transactions.
    */
   private createInstanceInTx(defName: string, def: WorkflowDef, id: string, opts: CreateOpts): void {
+    // Root starts were fully resolved before SQLite; children inherit that
+    // normalized set. Re-check only direct presence here so a statically-called
+    // descendant can never be inserted without the interface it will need.
+    this.assertDirectInterfaceBindings(defName, def, opts.interfaceBindings);
     // §28: pin this instance to the def it was created against — a snapshot
     // of the fully-expanded compiled def plus its content hash. Every new
     // instance is stamped; "no snapshot" is strictly a legacy-row
     // compatibility case (see defFor), never a choice made here.
     const wfData: {
       def: string; title?: string; params?: Record<string, string>;
-      modifier?: string; defSnapshot: WorkflowDef; defHash: string;
+      modifier?: string; interfaceBindings?: InterfaceCallBinding[];
+      defSnapshot: WorkflowDef; defHash: string;
     } = { def: defName, defSnapshot: def, defHash: hashDef(def) };
     if (opts.title !== undefined) wfData.title = opts.title;
     if (opts.params !== undefined) wfData.params = opts.params;
+    if (opts.interfaceBindings !== undefined) wfData.interfaceBindings = opts.interfaceBindings;
     // Validated against the SNAPSHOT being pinned on this same row, not
     // against a live re-resolution — the modifier and the vocabulary that
     // legitimizes it are stamped together. Later bound-artifact writes still
@@ -642,6 +986,34 @@ export class Engine {
     type ProvisionResult = { childId: string; created: boolean; provided: string[] } | null;
     const needsSnapshot = Symbol('needs-workflow-snapshot');
     let snapshotDef: WorkflowDef | undefined;
+    let optimisticInterfaceBinding: InterfaceCallBinding | undefined;
+
+    // Interface targets are selected once, stored on the parent, and resolved by
+    // exact digest BEFORE either the workflow-store guard or SQLite write lock.
+    // The transaction below re-reads and compares the persisted selection.
+    if (step.callsInterface !== undefined) {
+      const parent = this.store.getWorkflow(parentWf);
+      const binding = parent?.interfaceBindings?.find((candidate) =>
+        sameInterfaceClaim(candidate.interface, step.callsInterface!));
+      if (binding === undefined) {
+        throw new InterfaceCallPinError(
+          step.callsInterface,
+          '<missing>',
+          'the parent workflow row has no matching immutable start-time binding',
+        );
+      }
+      optimisticInterfaceBinding = binding;
+      try {
+        snapshotDef = this.resolveDef(binding.target, parentDef, binding.digest);
+      } catch (error) {
+        throw new InterfaceCallPinError(
+          step.callsInterface,
+          binding.target,
+          `the exact digest-scoped target could not be resolved: ${(error as Error).message}`,
+        );
+      }
+    }
+
     const transactionBody = (): ProvisionResult | typeof needsSnapshot => {
         // 1. FRESH parent snapshot — re-read inside the write lock; never trust
         //    the caller's STEP-1 map.
@@ -665,6 +1037,50 @@ export class Engine {
           if (deepEqual(fp, parentCallsArt.fingerprint ?? {})) return null;
         }
 
+        // Re-read immutable instance state under the SAME BEGIN IMMEDIATE as the
+        // gate, find-or-create, and input sync. Interface calls compare both the
+        // stored selection and the already-loaded child's bundle digest here;
+        // there is no resolver/catalog/filesystem access inside this boundary.
+        const parentRow = this.store.getWorkflow(parentWf);
+        if (parentRow === undefined) throw new Error(`no such workflow instance: ${parentWf}`);
+        let target: string;
+        if (step.callsInterface !== undefined) {
+          const freshBinding = parentRow.interfaceBindings?.find((candidate) =>
+            sameInterfaceClaim(candidate.interface, step.callsInterface!));
+          if (freshBinding === undefined) {
+            throw new InterfaceCallPinError(
+              step.callsInterface,
+              optimisticInterfaceBinding?.target ?? '<missing>',
+              'the matching persisted binding disappeared before child provisioning',
+            );
+          }
+          if (
+            optimisticInterfaceBinding === undefined
+            || freshBinding.target !== optimisticInterfaceBinding.target
+            || freshBinding.digest !== optimisticInterfaceBinding.digest
+          ) {
+            throw new InterfaceCallPinError(
+              step.callsInterface,
+              freshBinding.target,
+              `the persisted binding changed from ${optimisticInterfaceBinding?.target ?? '<missing>'}`
+                + `@${optimisticInterfaceBinding?.digest ?? '<missing>'} to ${freshBinding.target}@${freshBinding.digest}`,
+            );
+          }
+          if (snapshotDef === undefined) {
+            throw new InterfaceCallPinError(step.callsInterface, freshBinding.target, 'no exact target was resolved before the write transaction');
+          }
+          if (snapshotDef.bundleDigest !== freshBinding.digest) {
+            throw new InterfaceCallPinError(
+              step.callsInterface,
+              freshBinding.target,
+              `the resolved definition carries bundle digest ${snapshotDef.bundleDigest ?? '<none>'}, expected ${freshBinding.digest}`,
+            );
+          }
+          target = freshBinding.target;
+        } else {
+          target = step.calls!;
+        }
+
         // 4. Find-or-create the child (in-tx check-then-insert — absorbs the old
         //    spawnChildIfAbsent guarantee, only its home moved).
         let child = this.store.findChildByParent(parentWf, callsStem);
@@ -683,10 +1099,11 @@ export class Engine {
           // same bundle's workflow — the version the parent was pinned against —
           // and not to whatever a later install happened to name the same thing.
 			childDef = snapshotDef;
-          // WS-6: and the resolved child must still be the PINNED one. See
-          // `callsPinViolation`.
-          const violation = callsPinViolation(parentDef, childDef, step.calls!);
-          if (violation !== undefined) throw new CallsPinError(step.calls!, violation);
+          // WS-6: concrete calls retain their existing authoring-time pin path.
+          if (step.calls !== undefined) {
+            const violation = callsPinViolation(parentDef, childDef, step.calls);
+            if (violation !== undefined) throw new CallsPinError(step.calls, violation);
+          }
           const seedProvide: Record<string, Record<string, unknown>> = {};
           for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
             const parentArt = parentArts.get(parentArtifactName);
@@ -696,15 +1113,40 @@ export class Engine {
           }
           // createInstanceInTx validates the seed against the child input schema
           // and throws SchemaRefusalError (tx rolls back — no orphan child).
-          this.createInstanceInTx(step.calls!, childDef, childId, {
+          const childOpts: CreateOpts = {
             producedBy: { parentWf, parentPath: callsStem },
             provide: seedProvide,
-          });
+          };
+          if (parentRow.interfaceBindings !== undefined) {
+            childOpts.interfaceBindings = parentRow.interfaceBindings;
+          }
+          try {
+            this.createInstanceInTx(target, childDef, childId, childOpts);
+          } catch (error) {
+            if (error instanceof InterfaceBindingRefusalError) {
+              const missingClaim: WorkflowInterfaceClaim = {
+                name: error.interfaceName ?? '<unknown>',
+                version: error.interfaceVersion ?? '<unknown>',
+              };
+              throw new InterfaceCallPinError(missingClaim, target, error.detail);
+            }
+            throw error;
+          }
           child = this.store.getWorkflow(childId)!;
           created = true;
         } else {
           // §28: read the existing child per its own pinned snapshot.
           childDef = this.defFor(child.id);
+          if (step.callsInterface !== undefined) {
+            const expectedDigest = optimisticInterfaceBinding!.digest;
+            if (child.def !== target || childDef.bundleDigest !== expectedDigest) {
+              throw new InterfaceCallPinError(
+                step.callsInterface,
+                target,
+                `existing child is '${child.def}' at digest ${childDef.bundleDigest ?? '<none>'}, expected '${target}' at ${expectedDigest}`,
+              );
+            }
+          }
         }
 
         // 5. Synchronize EVERY mapped child input from the SAME fresh snapshot.
@@ -1041,6 +1483,45 @@ export class Engine {
     this.fireSettled(parentWf);
   }
 
+  /** Persist one interface-binding/pin refusal with the unchanged-gate guard. */
+  private recordInterfaceCallPinReject(
+    parentWf: string,
+    def: WorkflowDef,
+    callsStem: string,
+    gateStems: string[],
+    err: InterfaceCallPinError,
+    now?: number,
+  ): void {
+    const text = `interface call '${err.interface.name}@${err.interface.version}' bound to '${err.target}' `
+      + `failed its immutable start-time pin check: ${err.detail}; this provision was refused without creating or replacing a child row — `
+      + `restore the pinned bundle or start a new parent with a valid binding`;
+    let recorded = false;
+    this.store.tx(() => {
+      const art = this.store.getArtifact(parentWf, callsStem);
+      if (!art) return;
+      const gateArts = this.artMap(parentWf);
+      const fp = computeFingerprint(gateArts, gateStems);
+      const alreadyRecorded = art.acceptance === 'rejected'
+        && deepEqual(fp, art.fingerprint ?? {})
+        && art.reasons.some((entry) => entry.action === 'reject'
+          && entry.kind === 'structural'
+          && entry.by === 'engine'
+          && entry.text === text);
+      if (alreadyRecorded) return;
+      this.store.putArtifact({
+        ...art,
+        acceptance: 'rejected',
+        fingerprint: fp,
+        reasons: [...art.reasons, reason('reject', 'structural', 'engine', text, art.version)],
+      });
+      this.settle(parentWf, def, now);
+      recorded = true;
+    });
+    if (!recorded) return;
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
+    this.fireSettled(parentWf);
+  }
+
   /**
    * M2B: Maintain all `calls:` steps for a parent workflow.
    * Called at the top of tick (outside any tx) and as cascade-up prompt.
@@ -1054,7 +1535,7 @@ export class Engine {
     this._inMaintainCalls.add(parentWf);
     try {
       for (const step of def.steps) {
-        if (!step.calls) continue;
+        if (!isCallStep(step)) continue;
 
         // STEP 1 — Gather gate stems and check gate readiness.
         const callsStem = step.produces[0]!.stem; // single produced artifact name
@@ -1090,7 +1571,7 @@ export class Engine {
         // needs no in-tx recheck. Record a rejection on the parent calls artifact
         // (clean stop; the STEP-2 F2 fingerprint guard then skips re-attempts).
         if (!existingChild && this.callsAncestryDepth(parentWf) >= this.maxCallDepth) {
-          this.recordCallsDepthReject(parentWf, def, callsStem, gateStems, step.calls, now);
+          this.recordCallsDepthReject(parentWf, def, callsStem, gateStems, callTargetLabel(step), now);
           continue;
         }
 
@@ -1130,6 +1611,10 @@ export class Engine {
             this.recordCallsDigestReject(parentWf, def, callsStem, gateStems, err, now);
             continue;
           }
+          if (err instanceof InterfaceCallPinError) {
+            this.recordInterfaceCallPinReject(parentWf, def, callsStem, gateStems, err, now);
+            continue;
+          }
           throw err;
         }
         if (!provision) continue; // silent abort (gate re-armed / F2 debt landed) — next tick retries.
@@ -1140,7 +1625,12 @@ export class Engine {
         // (idempotent maintenance — once per provision, not once per input) so a
         // grandchild gets re-provided in the same pass.
         if (provision.created) {
-          this.fire({ type: 'instance', workflow: provision.childId, def: step.calls });
+          const createdChild = this.store.getWorkflow(provision.childId);
+          this.fire({
+            type: 'instance',
+            workflow: provision.childId,
+            def: createdChild?.def ?? callTargetLabel(step),
+          });
           this.fireSettled(provision.childId);
         }
         for (const name of provision.provided) {
@@ -1686,7 +2176,7 @@ export class Engine {
     const arts = this.artMap(parentWf);
     const out: Array<{ step: StepDef; child: WorkflowRow }> = [];
     for (const step of def.steps) {
-      if (!step.calls) continue;
+      if (!isCallStep(step)) continue;
       const stem = step.produces[0]!.stem;
       if (!this.callsGateReady(arts, step)) continue; // 1. gate green
       const child = this.store.findChildByParent(parentWf, stem);
@@ -2633,7 +3123,7 @@ export class Engine {
     // ever spawned there is nothing to judge, so refuse (consistent with the
     // verb-guard rule below that a verdict needs a built version).
     const producingStep = def.steps.find((s) => s.produces.some((p) => p.stem === path));
-    if (producingStep?.calls) {
+    if (producingStep !== undefined && isCallStep(producingStep)) {
       const bind = producingStep.produces.find((p) => p.stem === path)?.bind;
       if (requested !== undefined) {
 				if (bind?.to !== 'modifier') {
@@ -2865,7 +3355,7 @@ export class Engine {
       // skip made on evidence from child version N survives arbitrary ticks
       // (order A) until the child actually rebuilds past N (order B).
       const producingStep = def.steps.find((s) => s.name === art.producer);
-      if (producingStep?.calls) {
+      if (producingStep !== undefined && isCallStep(producingStep)) {
         const pin = this.childOutcomePin(workflow, path);
         if (pin !== undefined) fp[Engine.CHILD_OUTCOME_PIN_KEY] = pin;
       }
@@ -3160,7 +3650,7 @@ export class Engine {
     // recursive child summary (all instance-crossing logic stays here, in the
     // engine — the pure workflowStatus never touches another instance).
     for (const d of st.debts) {
-      const callsStep = def.steps.find((s) => s.calls && s.produces[0]!.stem === d.path);
+      const callsStep = def.steps.find((s) => isCallStep(s) && s.produces[0]!.stem === d.path);
       if (!callsStep) continue;
       const child = this.store.findChildByParent(workflow, d.path);
       if (!child) continue;
@@ -3636,7 +4126,7 @@ export class Engine {
     let stalled = cs.debts.some((d) => d.stalled);
     if (!stalled) {
       for (const d of cs.debts) {
-        const callsStep = childDef.steps.find((s) => s.calls && s.produces[0]!.stem === d.path);
+        const callsStep = childDef.steps.find((s) => isCallStep(s) && s.produces[0]!.stem === d.path);
         if (!callsStep) continue;
         const grandchild = this.store.findChildByParent(childWf, d.path);
         if (!grandchild || visited.has(grandchild.id)) continue;

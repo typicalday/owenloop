@@ -30,7 +30,8 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
-import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef } from './types.ts';
+import { isCallStep } from './types.ts';
+import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef, WorkflowInterfaceClaim } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -109,6 +110,8 @@ interface RawStep {
   bodyFile?: unknown;
   /** M2-GRAMMAR: if present, this entry is a calls: step (Mode 2 runtime composition). */
   calls?: unknown;
+  /** Versioned interface discriminator for a start-bound Mode 2 call. */
+  callsInterface?: unknown;
   reapTtl?: unknown;
   /** A2: opaque routing capabilities for peer-orchestrator claim filtering. */
   capabilities?: unknown;
@@ -133,7 +136,7 @@ const RAW_STEP_KEYS = [
   'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'workdirFrom', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
-  'calls', 'reapTtl', 'capabilities', 'maxLease', 'x', 'executor', 'command', 'spec',
+  'calls', 'callsInterface', 'reapTtl', 'capabilities', 'maxLease', 'x', 'executor', 'command', 'spec',
   'escalation', 'onCancel',
 ] as const;
 
@@ -141,12 +144,13 @@ const RAW_STEP_KEYS = [
 interface RawCalls {
   name?: unknown;
   calls?: unknown;
+  callsInterface?: unknown;
   inputs?: unknown;
   produces?: unknown;
 }
 /** Keys valid on a calls: step entry — a DIFFERENT (smaller) shape than RawStep;
  *  the `calls:` key is what routes an entry here instead of RAW_STEP_KEYS. */
-const RAW_CALLS_KEYS = ['name', 'calls', 'inputs', 'produces'] as const;
+const RAW_CALLS_KEYS = ['name', 'calls', 'callsInterface', 'inputs', 'produces'] as const;
 
 /** Duck-typed sniffer for a raw include directive. */
 interface RawInclude {
@@ -603,6 +607,52 @@ function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: P
 
 export class DefError extends Error {}
 
+/** Named, actionable refusal for a malformed authored interface call. */
+export class InterfaceCallDefinitionError extends DefError {
+  override readonly name = 'InterfaceCallDefinitionError';
+  readonly step: string;
+  readonly interfaceName?: string;
+  readonly interfaceVersion?: string;
+  readonly detail: string;
+
+  constructor(step: string, claim: Record<string, unknown> | undefined, detail: string) {
+    const interfaceName = typeof claim?.name === 'string' && claim.name.trim() !== '' ? claim.name : undefined;
+    const interfaceVersion = typeof claim?.version === 'string' && claim.version.trim() !== '' ? claim.version : undefined;
+    const coordinate = interfaceName === undefined
+      ? ''
+      : ` for interface '${interfaceName}${interfaceVersion === undefined ? '' : `@${interfaceVersion}`}'`;
+    super(`definition loading refused for interface-call step '${step}'${coordinate}: ${detail}`);
+    this.step = step;
+    this.interfaceName = interfaceName;
+    this.interfaceVersion = interfaceVersion;
+    this.detail = detail;
+  }
+}
+
+function parseCallsInterface(value: unknown, step: string): WorkflowInterfaceClaim {
+  const claim = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+  if (claim === undefined) {
+    throw new InterfaceCallDefinitionError(step, undefined, "callsInterface must be a map with exactly 'name' and 'version'");
+  }
+  const unknown = Object.keys(claim).filter((key) => key !== 'name' && key !== 'version');
+  if (unknown.length > 0) {
+    throw new InterfaceCallDefinitionError(
+      step,
+      claim,
+      `callsInterface has unknown field${unknown.length === 1 ? '' : 's'} ${unknown.map((key) => `'${key}'`).join(', ')}`,
+    );
+  }
+  if (typeof claim.name !== 'string' || claim.name.trim() === '') {
+    throw new InterfaceCallDefinitionError(step, claim, 'callsInterface.name must be a non-empty string');
+  }
+  if (typeof claim.version !== 'string' || claim.version.trim() === '') {
+    throw new InterfaceCallDefinitionError(step, claim, 'callsInterface.version must be a non-empty string');
+  }
+  return { name: claim.name, version: claim.version };
+}
+
 // ---- Mode 1 include-directive helpers (M1-GRAMMAR) ---------------------------
 
 /** Duck-check: does this raw step-list entry look like an include directive? */
@@ -612,7 +662,7 @@ function isIncludeDirective(v: unknown): boolean {
 
 /** Duck-check: does this raw step-list entry look like a calls: directive (M2-GRAMMAR)? */
 function isCallsDirective(v: unknown): boolean {
-  return typeof v === 'object' && v !== null && 'calls' in v && !('include' in v);
+  return typeof v === 'object' && v !== null && ('calls' in v || 'callsInterface' in v) && !('include' in v);
 }
 
 /** Parse and validate a raw include directive (M1-GRAMMAR pre-checks). */
@@ -1157,12 +1207,28 @@ function synthesizeJudgeSteps(
 }
 
 function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
-  // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: step (Mode 2).
-  if (typeof rl.calls !== 'undefined') {
+  // M2-GRAMMAR: either discriminator routes through the same restricted
+  // machine-call shape. A definition may never author both.
+  if (typeof rl.calls !== 'undefined' || typeof rl.callsInterface !== 'undefined') {
     const rawCalls = rl as RawCalls;
     assertNoUnknownKeys(rawCalls, RAW_CALLS_KEYS, `steps[${i}] (calls: step)`);
     const name = asString(rawCalls.name, `steps[${i}].name`);
-    const callsTarget = asString(rawCalls.calls, `step '${name}'.calls`);
+    const hasCalls = rawCalls.calls !== undefined;
+    const hasInterface = rawCalls.callsInterface !== undefined;
+    const claimRecord = typeof rawCalls.callsInterface === 'object' && rawCalls.callsInterface !== null
+      && !Array.isArray(rawCalls.callsInterface)
+      ? rawCalls.callsInterface as Record<string, unknown>
+      : undefined;
+    if (hasCalls && hasInterface) {
+      throw new InterfaceCallDefinitionError(
+        name,
+        claimRecord,
+        'calls and callsInterface are mutually exclusive; author exactly one call discriminator',
+      );
+    }
+    const callsTarget = hasCalls ? asString(rawCalls.calls, `step '${name}'.calls`) : undefined;
+    const callsInterface = hasInterface ? parseCallsInterface(rawCalls.callsInterface, name) : undefined;
+    const callLabel = callsInterface === undefined ? 'calls:' : 'callsInterface';
     // parse inputs: optional mapping of child input name -> parent artifact name
     const callsInputs: Record<string, string> = {};
     if (rawCalls.inputs !== undefined) {
@@ -1178,15 +1244,16 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     const { patterns: producesPatterns, groups: callsGroups } = parseProduces(rawCalls.produces, `step '${name}'.produces`, baseDir);
     for (const p of producesPatterns) {
       if (p.judges && p.judges.length > 0) {
-        throw new DefError(`step '${name}': judges: is not supported on a calls: step's produces (produce '${p.stem}')`);
+        throw new DefError(`step '${name}': judges: is not supported on a ${callLabel} step's produces (produce '${p.stem}')`);
       }
     }
     if (callsGroups.length > 0) {
-      throw new DefError(`step '${name}': group: is not supported on a calls: step's produces (group '${callsGroups[0]!.group}')`);
+      throw new DefError(`step '${name}': group: is not supported on a ${callLabel} step's produces (group '${callsGroups[0]!.group}')`);
     }
     const step: StepDef = {
       name,
-      calls: callsTarget,
+      ...(callsTarget === undefined ? {} : { calls: callsTarget }),
+      ...(callsInterface === undefined ? {} : { callsInterface }),
       callsInputs,
       consumes: [],          // calls: steps have no consumes in StepDef (eligibility is engine-managed)
       produces: producesPatterns,
@@ -1649,26 +1716,32 @@ export function validateDef(def: WorkflowDef): string[] {
   // because validateDef is a pure per-def function with no resolver. Those checks live in loadDefs
   // Phase 2, analogous to how expandIncludes validates include input-key mappings.
   for (const l of def.steps) {
-    if (!l.calls) continue;
+    if (!isCallStep(l)) continue;
+    if (l.calls !== undefined && l.callsInterface !== undefined) {
+      errors.push(
+        `call step '${l.name}' declares both calls and callsInterface; the discriminators are mutually exclusive`,
+      );
+    }
+    const callLabel = l.callsInterface === undefined ? 'calls:' : 'callsInterface';
     // (a) calls: step must produce exactly one output (one child, one outcome path — v1)
     if (l.produces.length !== 1) {
-      errors.push(`calls: step '${l.name}' must produce exactly one output (got ${l.produces.length})`);
+      errors.push(`${callLabel} step '${l.name}' must produce exactly one output (got ${l.produces.length})`);
     }
     // A calls: outcome is published by the composition machinery rather than
     // accepted through green(), so it has no transactional bind write path.
     // Refuse it at definition load instead of allowing a silently stale route.
     for (const produce of l.produces) {
       if (produce.bind !== undefined) {
-				errors.push(
-					`calls: step '${l.name}' produce '${produce.raw}' declares bind, which is not supported on calls: outcomes`,
-				);
+        errors.push(
+          `${callLabel} step '${l.name}' produce '${produce.raw}' declares bind, which is not supported on ${callLabel} outcomes`,
+        );
       }
     }
     // (b) callsInputs VALUES must be real parent artifacts (inputs or step-produced stems)
     for (const [, parentArtifact] of Object.entries(l.callsInputs ?? {})) {
       if (!producerOf.has(parentArtifact)) {
         errors.push(
-          `calls: step '${l.name}' maps to parent artifact '${parentArtifact}' which is not produced by any step or input`,
+          `${callLabel} step '${l.name}' maps to parent artifact '${parentArtifact}' which is not produced by any step or input`,
         );
       }
     }
