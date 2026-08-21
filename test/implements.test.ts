@@ -790,6 +790,90 @@ test('compatibility rejects a target oneOf with optional discriminators', () => 
   assert.ok(result.issues.some((issue) => issue.path === 'outputs.report.schema.oneOf'));
 });
 
+const unionRefinedReport: JsonSchema = {
+  type: 'object',
+  required: ['question', 'answer', 'gaps'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    answer: { type: 'string', minLength: 1 },
+    gaps: { type: 'array', items: { type: 'string' } },
+    conclusions: { type: 'array', items: { type: 'string' } },
+  },
+  anyOf: [
+    { properties: { conclusions: { minItems: 1 } } },
+    { properties: { gaps: { minItems: 1 } } },
+  ],
+  additionalProperties: false,
+};
+
+const compatibleReportSubset: JsonSchema = {
+  type: 'object',
+  required: ['question', 'answer'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    answer: { type: 'string', minLength: 1 },
+  },
+  additionalProperties: false,
+};
+
+test('compatibility keeps source object constraints when anyOf refines a public output', () => {
+  const result = outputCompatibility(unionRefinedReport, compatibleReportSubset);
+
+  assert.equal(result.compatible, true);
+  assert.deepEqual(result.issues, []);
+});
+
+test('compatibility keeps source object constraints when anyOf refines an interface input', () => {
+  const signature: WorkflowInterfaceSignature = {
+    inputs: [{ name: 'request', schema: unionRefinedReport }],
+    outputs: [],
+  };
+  const relaxedImplementationInput: JsonSchema = {
+    type: 'object',
+    required: ['question', 'answer'],
+    properties: {
+      question: { type: 'string' },
+      answer: { type: 'string' },
+      gaps: { type: 'array', items: { type: 'string' } },
+      conclusions: { type: 'array', items: { type: 'string' } },
+    },
+    additionalProperties: false,
+  };
+
+  const result = checkInterfaceCompatibility(
+    signature,
+    reportDef('anyof-refined-interface-input', relaxedImplementationInput),
+  );
+
+  assert.equal(result.compatible, true);
+  assert.deepEqual(result.issues, []);
+});
+
+test('compatibility keeps source object constraints when target anyOf has a compatible branch', () => {
+  const target: JsonSchema = {
+    anyOf: [compatibleReportSubset, { type: 'string', minLength: 1 }],
+  };
+
+  const result = outputCompatibility(unionRefinedReport, target);
+
+  assert.equal(result.compatible, true);
+  assert.deepEqual(result.issues, []);
+});
+
+test('compatibility retains indexed union diagnostics when the source root is incompatible', () => {
+  const source: JsonSchema = {
+    ...unionRefinedReport,
+    required: ['question', 'gaps'],
+  };
+  const result = outputCompatibility(source, compatibleReportSubset);
+
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some((issue) => (
+    issue.path === 'outputs.report.schema.anyOf[0]'
+      && issue.message === 'outputs.report.schema.anyOf[0]: source union branch is not a subset of the target schema'
+  )));
+});
+
 test('compatibility rejects a union branch without target coverage', () => {
   const source: JsonSchema = { anyOf: [{ type: 'string', const: 'unmatched' }] };
   const target: JsonSchema = { anyOf: [{ type: 'string', const: 'matched' }] };

@@ -170,6 +170,14 @@ catalog contract; it deliberately copies no schemas, artifact mappings, or
 summaries and introduces no second pointer convention. Catalog lookup and
 publish-time rejection are hub responsibilities, not owenloop lint.
 
+Catalog or publish tooling that needs to compare a claimed interface with a
+workflow can use the exported `checkInterfaceCompatibility` helper. It checks
+inputs contravariantly and outputs covariantly using the supported structural
+JSON Schema subset. When a schema combines root constraints with a top-level
+`anyOf` or `oneOf`, those root constraints remain in force while branch coverage
+is checked; union branches are not treated as standalone schemas. The checker
+continues to fail closed for unsupported or unprovable schema constructs.
+
 ## `model:` — quality tiers, not vendor ids
 
 The engine never calls a model; `model:` is an opaque string that rides the

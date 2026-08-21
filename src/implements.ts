@@ -457,6 +457,11 @@ function unionBranchSets(schema: SchemaObject): UnionBranchSet[] {
   return sets;
 }
 
+function withoutTopLevelUnions(schema: SchemaObject): SchemaObject {
+  const { oneOf: _oneOf, anyOf: _anyOf, ...root } = schema;
+  return root;
+}
+
 function requiredNames(schema: SchemaObject): Set<string> {
   const required = schema.required;
   return Array.isArray(required) && required.every((name) => typeof name === 'string')
@@ -533,6 +538,10 @@ function compareUnionObligations(
 ): void {
   const sourceSets = unionBranchSets(source);
   const targetSets = unionBranchSets(target);
+
+  if (sourceSets.length > 0 && isSubsetOfOneBranch(withoutTopLevelUnions(source), [target], path, direction)) {
+    return;
+  }
 
   if (targetSets.length === 0) {
     for (const sourceSet of sourceSets) {
