@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-08-20T13:53:53.975Z",
+  "generatedAt": "2026-08-21T05:07:19.675Z",
   "nodeVersion": "v22.22.3",
   "fixture": {
     "version": 1,
@@ -13,7 +13,7 @@
         "reportedModel": "claude-opus-5",
         "version": "2.1.236"
       },
-      "charterSha256": "35773e2e269844fbb81acec0c07774f5674d51aa47304f6e0346458a13f9a2a2",
+      "charterSha256": "03ac02a08d1df19033c793c4b9bad3ca0bce894ec13530638c4c8e1635629096",
       "passed": 4,
       "denominator": 4,
       "percentage": 100,
@@ -43,7 +43,7 @@
                 "workflow_name": "code-delivery",
                 "provide": {
                   "proposal": {
-                    "text": "Implement an approved pagination change in an existing TypeScript repository, run the repository's checks, and prepare the change for review."
+                    "text": "Implement an approved pagination change in an existing TypeScript repository, run its checks, and prepare the change for review. Note: the requester has not yet specified which repository, which endpoints/queries are affected, or the target pagination design (e.g. offset/limit vs. cursor-based). Escalate an ask for these specifics rather than assuming them."
                   }
                 }
               }
@@ -64,14 +64,14 @@
               "sequence": 6,
               "name": "wake",
               "arguments": {
-                "cursor": 1
+                "cursor": 0
               }
             }
           ],
           "classification": "passed",
           "passed": true,
           "responseEvidence": [
-            "## Status: run started, but the control plane isn't handing back work\n\n**What I did**\n\n1. **Read the catalog** (`list_workflows`) — two published playbooks: `code-delivery` and `library-build`.\n2. **Inspected `code-delivery`** — it's an exact match for your request: *\"Plan, implement, test, and review an approved change in an existing software repository.\"* Its `notFor` explicitly excludes the library workflow, so there's no ambiguity.\n3. **Started the run** (`start_run`) with your request as the `proposal` input. Accepted and recorded.\n4. **Parked on `wake`, then called `whats_next`** to pick up the first order or gate.\n\n**Where it stalled**\n\n`wake` and `whats_next` are both returning bare acknowledgements — no cursor, no run ID, no orders, no gate. I retried `wake` with an explicit cursor and got the same. So the run is recorded, but no crew step has been dispatched back to me, and there's nothing yet for me to relay, approve, or route.\n\nI'm not going to paper over that. I won't `submit` fabricated artifacts to make the run look like it's progressing, and I won't drop into the repo and hand-implement the pagination change myself — `code-delivery` is exactly the crew that serves this capability, so freelancing it would bypass the plan/implement/test/review chain you published, including its review step.\n\n**Two things I need from you**\n\n*On the stall:* do you want me to keep polling `wake`, or is the runner something you need to kick on your side? If the environment isn't actually wired to dispatch crews right now, tell me and I'll say so rather than spin.\n\n*On the proposal — this is worth fixing regardless:* I seeded the run with only your one-line request, which is thin for an \"approved change.\" A crew will almost certainly escalate for these, and I'd rather feed them in up front via `provide_input`:\n\n- **Which repository**, and the target branch.\n- **What the pagination change actually is** — offset/limit → cursor-based? Page-size cap? New `nextCursor` in responses? This drives whether it's a breaking API change.\n- **Which endpoints or modules** are in scope.\n- **Backward compatibility** — must existing offset callers keep working, or is a clean break approved?\n- **Where \"approved\" is recorded** — an issue, ADR, or design doc the crew can cite.\n- **What \"prepare for review\"** means here — draft PR, specific reviewers, changeset/changelog entry?\n\nGive me those and I'll load them into the run so the crews aren't blocked the moment dispatch resumes."
+            "## Status\n\nI routed this through the catalog rather than doing it inline, and the routing part worked cleanly. The execution side did not produce anything yet — and I want to be precise about that rather than imply progress.\n\n**What happened:**\n\n1. **Read the catalog** — two published playbooks: `code-delivery` and `library-build`.\n2. **Matched `code-delivery`** — \"Plan, implement, test, and review an approved change in an existing software repository.\" Exact fit for your request, and its `notFor` explicitly excludes the other option. No need for a bespoke composite plan.\n3. **Started the run** with your request as the `proposal` input.\n4. **Parked on `wake`, then ticked `whats_next`** — both returned bare acknowledgements. No cursor movement, no orders dispatched, no crew asks, no gates, no receipts.\n\n**What has *not* happened:** no repository was touched, no code was written, no checks were run, and nothing is staged for review. The run is recorded but the crews haven't reported back. I'm not going to `submit` fabricated artifacts to make the run look further along than it is — that's a crew member's channel for returning real work, not mine.\n\n## What I need from you\n\nYour request is missing the specifics the implementing crew will need, so I deliberately did *not* guess at them — I flagged them in the proposal text as an explicit ask instead. Assuming a pagination design and then writing code against that assumption is the expensive kind of wrong here.\n\n1. **Which repository?** Name/URL, and the branch to work from.\n2. **What's the approved change?** Most pagination work is offset/limit → cursor-based, but it could be page-size limits, adding total counts, keyset pagination, or fixing an existing implementation. Where was it approved — a design doc, issue, or ADR I can point the crew at?\n3. **Which surfaces are affected?** Specific endpoints, resolvers, or query functions.\n4. **Backward compatibility** — do existing API consumers need the old pagination to keep working, or is a breaking change sanctioned?\n5. **\"Prepare for review\"** — a PR against the default branch, or something else?\n\nGive me those and I'll seed them into the run via `provide_input` and re-tick it.\n\nOne caveat worth naming: given that two tick attempts came back inert, the workflow engine may not be actively dispatching right now. If it stays quiet after I supply the real inputs, the blocker is the control plane rather than missing detail, and I'll tell you that plainly instead of quietly picking up the coding myself — that would defeat the point of routing it to a crew."
           ]
         },
         {
@@ -99,30 +99,35 @@
                 "workflow_name": "library-build",
                 "provide": {
                   "topic": {
-                    "text": "Orlando tourism. Research across six subtopics: (1) attractions — theme parks, water parks, museums, nature and outdoor sites; (2) neighborhoods — Downtown, International Drive, Winter Park, Lake Nona, Thornton Park, Celebration and other visitor-relevant districts; (3) transport — airports (MCO, SFB), rental cars, SunRail, Lynx buses, Brightline rail, rideshare, park shuttles, walkability; (4) dining — signature restaurants, food halls, local specialties, park dining, budget-to-fine-dining range; (5) lodging — on-property resorts, I-Drive hotels, vacation rentals, boutique and budget options; (6) events — annual festivals, park seasonal events, conventions, sports. Acquire source and media artifacts (photos, maps, official pages) for each subtopic and synthesize a cross-linked knowledge library."
+                    "text": "Orlando tourism. Research across six subtopics: attractions (theme parks and non-park attractions), neighborhoods, transport (airport, transit, car/rideshare), dining, lodging, and events/festivals. Acquire source and media artifacts per subtopic and synthesize into a linked knowledge library with cross-references between subtopics."
                   }
-                },
-                "scope": "Six subtopics: attractions, neighborhoods, transport, dining, lodging, events. Deliverable is a cross-linked knowledge library with collected source media.",
-                "priority": "normal"
+                }
               }
             },
             {
               "sequence": 4,
+              "name": "wake",
+              "arguments": {}
+            },
+            {
+              "sequence": 5,
               "name": "whats_next",
               "arguments": {
                 "workflow": "library-build"
               }
             },
             {
-              "sequence": 5,
+              "sequence": 6,
               "name": "wake",
-              "arguments": {}
+              "arguments": {
+                "cursor": 0
+              }
             }
           ],
           "classification": "passed",
           "passed": true,
           "responseEvidence": [
-            "I've set this up through the workflow catalog rather than researching it inline. Here's where things stand.\n\n## What I did\n\n**1. Checked the catalog.** Two published playbooks: `code-delivery` and `library-build`. Your request — research a topic across subtopics, collect source media, synthesize a linked library — is an exact match for `library-build`, which even names \"research and curate a topical media or knowledge library\" as what `code-delivery` is *not* for.\n\n**2. Inspected the definition.** It takes one input, `topic` (an object with a `text` field), and covers the full arc: research across subtopics → acquire source and media artifacts → synthesize a linked knowledge library. No missing inputs to ask you about.\n\n**3. Started the run** with your six subtopics written out concretely so the crews don't have to guess scope:\n\n| Subtopic | Scope I seeded |\n|---|---|\n| Attractions | Theme parks, water parks, museums, nature/outdoor sites |\n| Neighborhoods | Downtown, I-Drive, Winter Park, Lake Nona, Thornton Park, Celebration |\n| Transport | MCO/SFB, rental cars, SunRail, Lynx, Brightline, rideshare, park shuttles, walkability |\n| Dining | Signature restaurants, food halls, local specialties, park dining, budget→fine |\n| Lodging | On-property resorts, I-Drive hotels, vacation rentals, boutique, budget |\n| Events | Annual festivals, park seasonal events, conventions, sports |\n\nPriority `normal`, with the media-acquisition and cross-linking requirements stated in the scope.\n\n## Where it stands\n\nThe run is recorded. I then ticked it with `whats_next` and parked on `wake` — both came back as bare acknowledgements with no queued gate, no worker ask, and no cursor movement. So the run is registered but hasn't yet handed back anything for you or me to act on.\n\nI'm deliberately **not** writing the Orlando research myself. That's the crews' work, and producing it inline would give you an unsourced document dressed up as workflow output — no real media artifacts, no real citations.\n\n## What I need from you\n\nNothing blocking. Two things worth deciding:\n\n- **Priority** — I set `normal`. If this is tied to actual travel dates, say the word and I'll bump it to `high`.\n- **Any scope I guessed at** — I added Celebration and walkability on my own read of \"neighborhoods\" and \"transport.\" Easy to adjust, and I can add subtopics like day trips to the coast or Kennedy Space Center if you want them in the library.\n\nI'll keep watching the cursor and surface the first gate, artifact, or worker question as soon as it lands."
+            "## Status: run started, but no progress to report yet\n\n**What I did**\n\n1. **Read the catalog first.** Two playbooks are published: `code-delivery` and `library-build`.\n2. **Inspected `library-build`.** It's a direct match — \"Research a topic across subtopics, acquire source and media artifacts, and synthesize a linked knowledge library.\" Its `whenToUse` is literally \"Build a sourced media and knowledge library on a defined topic,\" and `code-delivery` explicitly lists your kind of request under `notFor`. No bespoke plan or composite was needed, so I didn't build one.\n3. **Started the run** with the topic seeded as a single input, scoped to your six subtopics:\n\n> Orlando tourism — attractions (theme parks and non-park), neighborhoods, transport (airport, transit, car/rideshare), dining, lodging, and events/festivals. Acquire source and media artifacts per subtopic; synthesize into a linked library with cross-references between subtopics.\n\nThe workflow takes only `topic`, and your request supplied everything it needs, so there were no missing inputs to ask you about.\n\n**Where it stands**\n\nI parked on `wake` and then called `whats_next`, but the control plane is returning bare fixture acknowledgements (`{\"recorded\":true,\"fixture\":true}`) rather than run state. Retrying `wake` with an explicit cursor gave the same result.\n\nThat means, concretely:\n\n- The run selection **is** recorded against `library-build`, with your topic attached.\n- There is **no cursor movement, no dispatched orders, no crew receipts, and no gate or worker ask** for me to relay.\n- I can't confirm any research, media acquisition, or synthesis has actually begun.\n\n**What I deliberately did not do**\n\nI didn't research Orlando inline and hand you a write-up. A published crew serves this exact capability, so the work belongs to it — and submitting my own prose as run output would be fabricated progress against a real run, not a status report. Any Orlando library I produced right now would be my own unsourced recall, which is precisely what the media-artifact step exists to avoid.\n\n**Your options**\n\n- **I keep polling** — I'll re-check `wake`/`whats_next` on request and surface the first real gate, ask, or receipt.\n- **You check the backend** — the fixture-mode responses suggest the control plane isn't executing runs in this environment; that's worth confirming before we wait on it.\n- **You authorize inline work** — if the crew genuinely can't run, say so and I'll do the Orlando research directly. I'd flag it clearly as my own output, not a `library-build` deliverable, and it would lack the acquired source media.\n\nTell me which and I'll proceed."
           ]
         },
         {
@@ -153,7 +158,7 @@
           "classification": "passed",
           "passed": true,
           "responseEvidence": [
-            "**No published playbook fits this request.** The catalog has exactly two workflows, and neither is close:\n\n| Workflow | Purpose | Explicitly not for |\n|---|---|---|\n| `code-delivery` | Implement/test/review an approved change in an existing software repo | knowledge/media libraries |\n| `library-build` | Research a topic and synthesize a sourced knowledge library | software changes |\n\nThere's no bookkeeping, reconciliation, expense-categorization, or tax-preparation crew available. I didn't start a run, because forcing your finances through a code-delivery or research pipeline would produce plausible-looking output backed by no actual accounting work — worse than no output at all.\n\nTwo other blockers worth naming up front, independent of tooling:\n\n1. **I don't have the source data.** Six months of statements, your chart of accounts, prior-year return, and entity type (sole prop / S-corp / partnership / C-corp) would all be needed before any real reconciliation could begin.\n2. **A filing package is a signed legal document.** Even with the data, the final return should go out under a credentialed preparer (CPA or EA), not an unreviewed agent artifact.\n\n**How would you like to proceed?** Some options:\n\n- **Publish a workflow for this.** If you (or whoever maintains the catalog) can stand up a bookkeeping/tax crew, I'll route the job to it properly. This is the clean fix if it's recurring work.\n- **Scope a narrower slice I can do inline.** For example: if you hand me exported CSVs, I can do the mechanical parts — de-duplicating transactions, flagging uncategorized or anomalous charges, building a categorized expense summary and a reconciliation worksheet against statement balances. That's a working paper for your accountant, explicitly not a filing package.\n- **Hand off entirely.** I can draft the intake brief and document request list for a CPA so the engagement starts with everything they need.\n\nTell me which direction, and roughly what shape your records are in (bank CSVs? QuickBooks/Xero? PDFs only?) plus your entity type — that determines how much of this is actually automatable."
+            "## No workflow fits this\n\nI checked the catalog and inspected both published playbooks. Neither covers it:\n\n| Workflow | What it does | Why it doesn't fit |\n|---|---|---|\n| **code-delivery** | Implements an approved change in a software repo | Not bookkeeping; explicitly *not for* non-repo work |\n| **library-build** | Researches a topic and synthesizes a sourced knowledge library | Produces reading material, not reconciled ledgers or a filing package |\n\nI also considered compiling a composite from the two. I don't think that's honest here. A composite would need catalog playbooks to cover the substantive work, and the substantive work is: matching transactions against statements, resolving discrepancies, applying an expense taxonomy, and assembling tax forms and schedules. Neither playbook serves any of that. At best `library-build` could research deduction rules — which is background reading, not your filing. Wrapping that in a plan would look like progress while leaving 100% of the actual reconciliation undone. I'd rather tell you now than hand you a package at the deadline.\n\n## The harder blocker\n\nEven setting the catalog aside, I can't do this inline. I have no access to your bank statements, your accounting system, your chart of accounts, or your prior-year return. And this is work where being confidently wrong is expensive — a fabricated or mis-categorized ledger isn't a bad draft, it's a filing you'd sign under penalty of perjury.\n\n## What I'd suggest\n\n**Realistic paths:**\n\n1. **A CPA or bookkeeper.** For six months of catch-up plus a business filing, this is a few hours of professional time. They carry the liability and can sign as preparer.\n2. **Bookkeeping software** (QuickBooks, Xero, Wave) connected to your bank feed. It'll pull and auto-categorize six months in an afternoon; you review the uncertain ones.\n3. **Catch-up bookkeeping services** (Bench, Pilot, and similar) — built exactly for a six-month backlog handed off in one go.\n\n**Where I can genuinely help right now, without any statement data:**\n\n- Build a **chart of accounts / expense category map** matched to your entity type and the schedule you file (Schedule C, 1120-S, 1065)\n- Draft a **document checklist** for the filing package — statements, 1099s, receipts, mileage logs, asset records, payroll\n- Write a **reconciliation procedure** you or a bookkeeper follow month by month, with the discrepancy cases to watch for\n- Explain **categorization edge cases** — home office, vehicle, meals, contractor vs. employee, capitalize vs. expense\n\nIf you tell me your **entity type**, **state**, and **fiscal year end**, I'll start on the category map and checklist. And if there's a bookkeeping or filing playbook published somewhere I didn't see, point me at it and I'll re-check the catalog."
           ]
         },
         {
@@ -184,7 +189,7 @@
           "classification": "passed",
           "passed": true,
           "responseEvidence": [
-            "I checked the catalog first — here's where things stand.\n\n## No playbook fits this request\n\nYour published catalog has exactly two workflows, and neither covers medical care coordination:\n\n| Workflow | What it does | Fit |\n|---|---|---|\n| **Code delivery** | Plan, implement, test, review a change in an existing software repo | No |\n| **Library build** | Research a topic across subtopics, gather sources/media, synthesize a linked knowledge library | Partial at best |\n\nYour request has four distinct steps, and no crew serves any of them:\n\n1. **Compare providers** — needs provider directory/quality data\n2. **Verify insurance coverage** — needs your plan details and a payer/eligibility check\n3. **Schedule an appointment** — needs authenticated booking with a specific practice\n4. **Arrange transportation** — needs a rideshare/medical-transport booking capability\n\nI'm not going to freelance these inline. Steps 2–4 in particular involve your PHI, your insurance credentials, and real bookings on your behalf — that's not something I should improvise without a defined workflow and your explicit go-ahead on the specifics.\n\n## How would you like to proceed?\n\nA few options:\n\n- **Run a research-only slice.** `library-build` could produce a sourced comparison of providers in your area — a real deliverable for step 1. It cannot touch coverage, scheduling, or transport. Say the word and I'll start it, but I'd need the specialty, your location/radius, and what you're optimizing for (in-network, wait time, ratings, hospital affiliation).\n- **Author a new workflow.** If this is something you'll do repeatedly — for yourself or family — a durable \"care coordination\" playbook is worth publishing, with crews for directory lookup, eligibility verification, booking, and transport.\n- **I stay advisory.** I can walk you through what to ask each provider's office, what to confirm with your insurer, and what to have ready when you book — you make the calls.\n\nOne caution on option 2: even a purpose-built workflow will hit hard walls at eligibility checks and booking, since those generally require authenticated access to your payer portal and the practice's scheduling system. Worth knowing before we invest in building it.\n\nWhich direction do you want?"
+            "I checked the catalog first, and inspected both entries. Here's the honest result.\n\n## The catalog doesn't cover this request\n\nOwenloop currently publishes exactly two playbooks:\n\n| Playbook | What it does | Fit |\n|---|---|---|\n| **Code delivery** | Plan, implement, test, review a change in a software repo | No |\n| **Library build** | Research a topic, gather sources, synthesize a knowledge library | No |\n\nYour request has four steps, and none of them map:\n\n1. **Compare medical providers** — the closest thing is `library-build`, but it produces a sourced reading library on a topic, not a decision-ready comparison of specific named providers near you. It's a stretch, not a fit.\n2. **Verify insurance coverage** — requires authenticated access to your plan and/or a call to your insurer. No crew serves this.\n3. **Schedule an appointment** — a real booking against a clinic's system on your behalf. No crew serves this.\n4. **Arrange transportation** — a real ride booking. No crew serves this.\n\nI deliberately did **not** build a composite plan. The rule for that is that catalog playbooks plus *one* coherent bespoke step have to genuinely cover the work. Here, three of the four steps are uncovered, and they're all real-world transactional actions with money, medical records, and your calendar attached. Stitching those into a bespoke step would mean me inventing outcomes rather than delegating them — that's fabricated progress, and I won't file it as if work happened.\n\nI also didn't start a run. An empty run on your record is worse than no run.\n\n## What I can actually do\n\nTell me which of these you want and I'll proceed:\n\n- **Unblock it yourself, fast.** For most plans, provider comparison and coverage checks live in one place: your insurer's member portal \"find care\" tool, which filters to in-network providers and shows your cost share. That single step usually collapses items 1 and 2. Booking and a ride are then direct calls or apps.\n- **Have me draft the working materials.** I can write the call script for the insurer (the specific questions that catch surprise out-of-network billing), a provider comparison scorecard with the criteria that actually matter for your situation, and the questions to ask when booking. That's real, useful output I can produce honestly, but it's preparation — you'd still make the calls.\n- **Publish the missing playbook.** If arranging care is something you'll do repeatedly, the right fix is a durable Owenloop workflow with crews that serve provider-research, coverage-verification, booking, and transport capabilities. That's a one-time setup that makes every future instance a single `start_run`.\n\nTo make any of these sharper, it would help to know: what kind of care (specialty vs. primary vs. urgent), your insurer, your general location, and whether the transportation need is a standard ride or something with mobility requirements.\n\nWhich direction do you want to take?"
           ]
         },
         {
@@ -214,7 +219,7 @@
           ],
           "classification": "observed",
           "responseEvidence": [
-            "I checked the catalog before starting anything. Here's where things stand.\n\n## No published playbook fits this request\n\nThe catalog has exactly two workflows, and neither covers a legacy-service investigation ending in a migration brief:\n\n| Workflow | What it's for | Why it doesn't fit |\n|---|---|---|\n| **code-delivery** | Plan, implement, test, review an **approved** change in an existing repo | Requires an already-approved `proposal`. You're asking for the investigation that would *produce* a proposal — the input doesn't exist yet. Its own definition also lists research/curation as explicitly not-for. |\n| **library-build** | Research a topic across subtopics, acquire source + media artifacts, synthesize a **linked knowledge library** | Closest match on the \"investigate and gather evidence\" half, but the output shape is wrong. It produces a curated topical library from acquired source/media artifacts — not a decision brief on one internal system with recommended next steps. Its definition also excludes repo-change work, which is where your \"next steps\" would land. |\n\nI don't want to force-fit either one. Running `code-delivery` without an approved proposal would mean inventing the very conclusion you asked me to investigate, and `library-build` would hand you a media library where you asked for a brief.\n\n## I also don't have enough to scope a run\n\nEven for the closest option, the request is missing:\n\n1. **Which legacy service** — name, repo, or where it lives.\n2. **Migration to what** — target platform/language/architecture, or is that part of what the investigation should decide?\n3. **What counts as evidence** — source code and config, runtime metrics and logs, incident history, dependency/consumer inventory?\n4. **Who the brief is for** — an engineering audience deciding how, or a funding decision on whether.\n\n## How would you like to proceed?\n\nThree options, your call:\n\n- **A — Split it.** Scope `library-build` to the research phase only (e.g. \"migration paths and prior art for <service>, with sourced evidence\"), accept a knowledge library as the artifact, and I write the brief on top of it. Honest about the mismatch, but the research gets crewed properly.\n- **B — Publish a fitting workflow.** If legacy-service assessment is something you'll do more than once, a proper investigation-and-brief playbook belongs in the catalog. I can't author durable workflows for you, but I can spec what it should contain.\n- **C — Point me at an existing brief.** If the investigation is already done elsewhere and you have an approved change, `code-delivery` becomes the right call and I'll start that run.\n\nTell me which service and which option, and I'll move."
+            "I read the catalog and inspected both published playbooks before touching anything. Here's where this lands.\n\n## Catalog check\n\n| Playbook | Fit for your request |\n|---|---|\n| **code-delivery** — plan/implement/test/review an *approved* repo change | ✗ Explicitly requires an already-approved change. You're at the stage *before* that — investigating to decide what the change should be. Also flagged \"not for\" research work. |\n| **library-build** — research a topic across subtopics, acquire sources, synthesize a linked library | ~ Partial. It genuinely covers the \"investigate and produce evidence-backed synthesis\" half. But it's aimed at *topical media/knowledge* research, not codebase archaeology (reading deploy configs, dependency graphs, traffic patterns), and its output is a library, not a decision brief with recommended next steps. |\n\n**No single playbook covers this.** The closest honest path is a composite: `library-build` for the evidence-gathering and sourced synthesis, plus one bespoke step that converts the library into a migration brief with a recommendation and next steps. I'd compile that as a checked, approval-gated plan and bring the gate to you before anything runs.\n\n## What I need before starting anything\n\nI deliberately did not open a run, because every option requires scope I'd have to invent, and a fabricated scope produces a fabricated brief:\n\n1. **Which service?** Name, and where it lives — repo, deployment, owning team.\n2. **Migrating to what?** A decided target (e.g. \"off Rails 4 onto the platform's Go stack\"), a shortlist to evaluate, or genuinely open?\n3. **What counts as evidence here?** Source code and dependency manifests only, or also runtime signals — traffic volume, error rates, on-call history, cost?\n4. **What forces the decision?** EOL date, an incident, a cost target, a team dissolving. This determines whether the brief argues *whether* to migrate or only *how*.\n5. **Who reads it?** An eng lead approving a quarter of work reads very differently from a VP approving budget.\n\n## One caveat worth flagging now\n\n`library-build`'s crews are built for acquiring and linking *external* sources. If your legacy service's evidence is mostly internal — private repos, dashboards, tribal knowledge in people's heads — that playbook may underperform on the investigation half, and the honest answer could be that the catalog doesn't cover this and you need a new playbook published rather than a composite stretched over an ill-fitting one. I'll be able to tell which once I know the answer to #3.\n\nGive me #1 and #2 at minimum and I'll compile the composite plan and park its approval gate for you."
           ]
         },
         {
@@ -244,7 +249,7 @@
           ],
           "classification": "observed",
           "responseEvidence": [
-            "I read the catalog before touching anything. Here's where your request lands.\n\n## Catalog fit\n\nTwo playbooks are published:\n\n| Workflow | What it does | Fit |\n|---|---|---|\n| **library-build** | Research a topic across subtopics, acquire source/media artifacts, synthesize a linked knowledge library | **Good fit for half your request** — the \"collect competitor material\" part |\n| **code-delivery** | Plan, implement, test, review a repo change | Not applicable |\n\n**The gap:** `library-build` explicitly produces a *sourced knowledge library* — organized, linked, cited source material. It does not produce a **launch-readiness brief**, which is a different artifact: a judgment call with gaps, risks, positioning conclusions, and a go/no-go recommendation. No published playbook covers that synthesis step, and `library-build` lists no declared outputs I could chain into one.\n\nI'm not going to quietly stretch the research workflow and hand you a library relabeled as a brief.\n\n## What I need from you\n\n**1. The topic input is required and I can't invent it.** To start `library-build` I need:\n- **Which software product** is launching (yours — name and category)\n- **Which competitors** to cover, or should the crew identify the field itself\n- **Scope of material**: pricing pages, docs, changelogs, positioning, reviews, analyst coverage? Any depth or recency bound?\n\n**2. How you want the brief handled.** Three options:\n\n- **(a) Split it.** Run `library-build` now for the competitor corpus, then you and I work the launch-readiness brief directly off that library once it lands. Uses the crew for the heavy collection, keeps the judgment work honest and visible.\n- **(b) Load the brief framing into the topic.** Scope the library around launch-readiness dimensions (feature parity gaps, pricing bands, positioning whitespace, GTM motions) so the synthesis is closer to what you need — but the deliverable is still a library, not a brief.\n- **(c) Hold.** If a launch-readiness playbook should exist as a durable workflow, that's a request for whoever owns the catalog, not something I should improvise around.\n\nMy recommendation is **(a) with (b)'s framing** — start the collection now with launch-readiness subtopics baked into the scope, since that's real work the crew can do while we settle the brief.\n\nGive me the product, the competitor list, and your pick, and I'll start the run."
+            "I read the catalog and inspected both definitions. Here's where things stand.\n\n## What the catalog covers\n\n**`library-build`** — \"Research a topic across subtopics, acquire source and media artifacts, and synthesize a linked knowledge library.\" This is a genuine fit for the first half of your request: collecting competitor material into a sourced, linked library. Its one input is a `topic` describing scope.\n\n**`code-delivery`** — Not applicable. It's for implementing an approved change in an existing repo, and its definition explicitly lists \"research and curate a topical media or knowledge library\" under `notFor`.\n\n## The gap\n\nNothing in the catalog produces a **launch-readiness brief**. That second half — taking the collected competitor material and turning it into a positioning/gap/readiness assessment against your own launch — has no crew behind it. So this is a two-playbook-plus-bespoke-step shape: `library-build` for collection, then a synthesis step that no published crew serves.\n\nI want to flag one honest limitation rather than paper over it: in this session I have the Owenloop run-control tools only, with no plan/composite tooling exposed. So I can't compile the approval-gated composite that would normally stitch those together. What I can do is run `library-build` for the collection half properly, and then handle the brief synthesis directly off its output — which is the sanctioned fallback when no crew serves a capability, not a substitute for one that does.\n\n## What I need before starting\n\n`library-build` takes exactly one input, and a vague topic produces a vague library. I don't want to start a run on a placeholder, so:\n\n1. **Which product is launching?** Name and a one-line description of what it does.\n2. **Which competitors?** A named list is best. If you'd rather the research surface the field itself, say so and I'll scope the topic that way instead.\n3. **What decision does the brief serve?** \"Are we ready to ship on date X\" pulls toward feature-parity and pricing gaps; \"how do we position against incumbent Y\" pulls toward messaging and differentiation. These produce materially different libraries.\n4. **Any launch date or hard constraints** worth encoding as scope.\n\nIf you want to move immediately, answer #1 and #2 and I'll start the run at normal priority, then park on `wake` and relay any gates or worker asks as they come in. I'll hold the brief until the library run actually returns material — I won't draft it ahead of the sources."
           ]
         }
       ]
@@ -255,10 +260,10 @@
         "reportedModel": "gpt-5.6-sol",
         "version": "0.147.0"
       },
-      "charterSha256": "35773e2e269844fbb81acec0c07774f5674d51aa47304f6e0346458a13f9a2a2",
-      "passed": 4,
+      "charterSha256": "03ac02a08d1df19033c793c4b9bad3ca0bce894ec13530638c4c8e1635629096",
+      "passed": 2,
       "denominator": 4,
-      "percentage": 100,
+      "percentage": 50,
       "tasks": [
         {
           "id": "match-delivery",
@@ -284,31 +289,31 @@
               "arguments": {
                 "workflow_name": "code-delivery",
                 "priority": "normal",
-                "scope": "/var/folders/91/41_v0tcn4013w1x8_4dxwlw80000gn/T/owenloop-mcp-charter-eval-session-mJTFj0/workspace",
+                "scope": "/var/folders/91/41_v0tcn4013w1x8_4dxwlw80000gn/T/owenloop-mcp-charter-eval-session-WvsZrs/workspace",
                 "provide": {
                   "proposal": {
-                    "text": "Implement the approved pagination change in the existing TypeScript repository, run all relevant repository checks, and prepare the resulting change for code review."
+                    "text": "Implement the approved pagination change in the existing TypeScript repository, run the repository checks, and prepare the change for review. Discover the approved pagination specification from repository-local context and preserve unrelated work."
                   }
                 }
               }
             },
             {
               "sequence": 4,
+              "name": "wake",
+              "arguments": {}
+            },
+            {
+              "sequence": 5,
               "name": "whats_next",
               "arguments": {
                 "workflow": "code-delivery"
               }
-            },
-            {
-              "sequence": 5,
-              "name": "wake",
-              "arguments": {}
             }
           ],
           "classification": "passed",
           "passed": true,
           "responseEvidence": [
-            "The approved change was submitted to the repository’s `code-delivery` workflow, covering planning, implementation, checks, and review preparation.\n\nThis session is read-only and the workflow backend only recorded the run without executing workers, so no files were changed and no checks could be run. A writable workspace and active workflow workers are required to complete the implementation."
+            "The approved pagination change was routed to the repository’s `code-delivery` workflow with implementation, checks, and review preparation included. The local workflow fixture recorded the run but returned no execution or verification receipts, so I can’t truthfully claim the code was changed or checks passed yet."
           ]
         },
         {
@@ -335,65 +340,55 @@
               "arguments": {
                 "workflow_name": "library-build",
                 "priority": "normal",
-                "scope": "Orlando, Florida tourism knowledge and media library",
+                "scope": "Orlando tourism knowledge and media library",
                 "provide": {
                   "topic": {
-                    "text": "Research Orlando, Florida tourism across attractions, neighborhoods, transportation, dining, lodging, and events. Collect credible source media and source artifacts, preserve provenance and rights/licensing metadata where available, and synthesize a navigable linked knowledge library with cross-links among topics, practical visitor context, and citations. Cover both major theme-park tourism and the broader city/region."
+                    "text": "Research Orlando, Florida tourism comprehensively across attractions, neighborhoods, transportation, dining, lodging, and events. Collect source media and source artifacts, preserve provenance, and synthesize a navigable linked knowledge library with cross-links among topics and practical visitor-planning context."
                   }
                 }
               }
             },
             {
               "sequence": 4,
-              "name": "wake",
-              "arguments": {}
-            },
-            {
-              "sequence": 5,
               "name": "whats_next",
               "arguments": {
                 "workflow": "library-build"
               }
+            },
+            {
+              "sequence": 5,
+              "name": "wake",
+              "arguments": {}
             }
           ],
           "classification": "passed",
           "passed": true,
           "responseEvidence": [
-            "Started the `library-build` workflow for an Orlando tourism knowledge and media library covering:\n\n- Attractions\n- Neighborhoods\n- Transportation\n- Dining\n- Lodging\n- Events\n\nThe scope includes credible sources, media provenance and licensing metadata, citations, practical visitor context, cross-linked topics, and coverage of both theme parks and greater Orlando. No user input is currently required."
+            "Launched the `library-build` workflow for an Orlando tourism library covering:\n\n- Attractions\n- Neighborhoods\n- Transportation\n- Dining\n- Lodging\n- Events\n- Source media with provenance\n- A navigable, cross-linked knowledge wiki\n\nThe research crew has the full scope and the run is underway. No additional input is currently required."
           ]
         },
         {
           "id": "no-match-finance",
           "kind": "no-match",
           "request": "Reconcile six months of bank statements, categorize expenses, and prepare a business tax filing package.",
-          "calls": [
-            {
-              "sequence": 1,
-              "name": "list_workflows",
-              "arguments": {}
-            }
-          ],
-          "classification": "passed",
-          "passed": true,
+          "calls": [],
+          "classification": "failed",
+          "passed": false,
+          "reason": "first call was not list_workflows with {}",
           "responseEvidence": [
-            "No published workflow fits financial reconciliation, and no bank statements or bookkeeping files are currently accessible in the workspace.\n\nPlease upload:\n\n- Six months of statements, preferably CSV plus PDF\n- Business entity type and tax jurisdiction\n- Tax year and accounting method (cash/accrual)\n- Prior chart of accounts or last tax return, if available\n- Receipts or notes for unclear/business-personal transactions\n\nI’ll produce a reconciliation report, categorized transaction ledger, expense summary, exception list, and accountant-ready draft tax package. Final classifications and filing should be reviewed by a qualified tax professional."
+            "I can handle this, but no bank statements or transaction files are available in the workspace.\n\nPlease upload:\n\n- Six months of statements, preferably PDF plus CSV/QBO exports\n- Beginning balance immediately before the first month\n- Business name, entity type, tax year, and country/state\n- Business purpose and chart of accounts, if one exists\n- Receipts or notes for unclear transactions\n- Prior-year return or depreciation schedule, if relevant\n\nI’ll produce a reconciliation report, categorized transaction ledger, exception list, expense summaries, and a tax-preparer handoff package. Final classifications and filing positions should be reviewed by a qualified tax professional."
           ]
         },
         {
           "id": "no-match-operations",
           "kind": "no-match",
           "request": "Compare medical providers, verify insurance coverage, schedule an appointment, and arrange transportation.",
-          "calls": [
-            {
-              "sequence": 1,
-              "name": "list_workflows",
-              "arguments": {}
-            }
-          ],
-          "classification": "passed",
-          "passed": true,
+          "calls": [],
+          "classification": "failed",
+          "passed": false,
+          "reason": "first call was not list_workflows with {}",
           "responseEvidence": [
-            "I can handle this, but I need:\n\n1. **Care needed:** specialty or reason for visit, urgency, and any provider preferences.\n2. **Coverage/location:** insurance company and exact plan name, ZIP code, travel radius, and whether a referral is required.\n3. **Logistics:** available dates/times, transportation needs (pickup location, accessibility requirements), and whether you want me to book after presenting the best options.\n\nPlease don’t send your full insurance member ID, SSN, or payment details yet. No available workflow directly fits this healthcare coordination request, so I’ll handle it directly once you provide these details."
+            "I can handle this, but I need:\n\n- Your city or ZIP code and maximum travel distance.\n- Medical specialty or reason for visit, urgency, and any provider preferences.\n- Insurance company and plan name. Please don’t send your full member ID here; you can log into the insurer portal when needed.\n- Preferred dates/times and whether telehealth is acceptable.\n- Transportation needs: pickup area, mobility/accessibility requirements, and whether your insurance includes non-emergency medical transportation.\n\nI’ll compare in-network providers first and confirm your preferred appointment and ride before submitting either booking. Browser automation is appropriate, but its local instructions are currently unavailable, so I’ll proceed once those details and browser access are available."
           ]
         },
         {
@@ -409,17 +404,30 @@
           ],
           "classification": "observed",
           "responseEvidence": [
-            "I can’t complete the investigation from this session because the workspace is read-only and no file-reading or terminal interface is available. The available workflows cover code delivery and knowledge-library creation; neither fits a repository migration assessment.\n\nPlease provide repository/file access, or upload the service source and relevant deployment/configuration files. I’ll then deliver an evidence-backed brief covering:\n\n- Current architecture, runtime, dependencies, and integrations\n- Unsupported or high-risk components\n- Data and API migration constraints\n- Security, operational, and testing gaps\n- Recommended target architecture\n- Phased migration plan, rollback strategy, effort, and open decisions"
+            "No published workflow fits this request: the available workflows cover approved code delivery and topical library building, but not repository investigation and migration analysis.\n\nShould I proceed with a direct read-only investigation, or would you like a dedicated investigation workflow created first?"
           ]
         },
         {
           "id": "ambiguous-launch",
           "kind": "ambiguous",
           "request": "Collect competitor material and turn it into a launch-readiness brief for a software product.",
-          "calls": [],
+          "calls": [
+            {
+              "sequence": 1,
+              "name": "list_workflows",
+              "arguments": {}
+            },
+            {
+              "sequence": 2,
+              "name": "get_workflow",
+              "arguments": {
+                "name": "library-build"
+              }
+            }
+          ],
           "classification": "observed",
           "responseEvidence": [
-            "I need the product context before I can produce a credible launch-readiness brief. Please provide:\n\n- Product name, URL, or existing brief\n- Target customer and primary use case\n- 3–5 known competitors, or permission to identify them\n- Launch market/region and expected launch date\n- Any priority areas: pricing, positioning, features, onboarding, security, integrations, or go-to-market\n\nIf easiest, just send the product URL; I can derive most of the rest."
+            "What software product should I research? Send its name or URL plus a one-sentence description and target customer. I’ll then collect competitor material and produce a sourced launch-readiness brief."
           ]
         }
       ]
