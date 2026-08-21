@@ -323,6 +323,15 @@ Untargeted inbox polling and sibling workflows continue, but command work in a
 cooled workflow can wait until its cooldown expires. This shift-local damper
 is separate from `--local-queue-hold` and from server `Retry-After` backoff.
 
+**Fleet inbox filtering.** In org-wide mode, after the untargeted inbox
+response, the shift skips a workflow only when its `eligible` value is exactly
+the number `0`; missing, malformed, or nonzero values still receive a targeted
+`whats_next` call. An explicit `--workflow` always receives its targeted call.
+An inbox-only skip is not counted as a successful targeted observation, so it
+cannot by itself make the work-directory reaper scan or remove that workflow's
+directories. Work that becomes eligible after the inbox snapshot is picked up
+on a later poll.
+
 **On-disk logs.** A running shift appends its dispatch record to
 `<log-dir>/shift.log` as JSON Lines, and gives each dispatched worker's stdout
 and stderr their own `<log-dir>/<run>.log`. Both files outlive the shift
