@@ -22,8 +22,8 @@
  *  1b FINAL BREATH (graceful): a CLEAN exit — SIGTERM, SIGINT, or stdin EOF
  *     (session death) — fires a targeted `release` FAST, so the order re-offers
  *     immediately instead of stranding until the lease TTL. Three variants, each
- *     asserting exactly one `release {workflow, run}` on the wire, delivered far
- *     inside the (multi-minute, prod) lease TTL, and NO `submit`.
+ *     asserting exactly one `release {workflow, run, reason}` on the wire,
+ *     delivered far inside the (multi-minute, prod) lease TTL, and NO `submit`.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -129,9 +129,11 @@ test('1a: SIGKILL mid-work emits NO release (uncatchable) — a fresh holder re-
 });
 
 /**
- * 1b core: a clean shutdown fires exactly one fast `release {workflow, run}`,
- * far inside the lease TTL, with no submit. `trigger` injects the shutdown and
- * returns the wall time just before it (for the timing bound).
+ * 1b core: a clean shutdown fires exactly one fast
+ * `release {workflow, run, reason}`, far inside the lease TTL, with no submit.
+ * The reason is `signal` for SIGTERM/SIGINT and `stdin-eof` for session death.
+ * `trigger` injects the shutdown and returns the wall time just before it (for
+ * the timing bound).
  */
 async function finalBreathVariant(
   reason: 'signal' | 'stdin-eof',

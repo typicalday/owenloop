@@ -17,8 +17,9 @@ which policy applies. If the turn ends without a hub outcome, its
 terminal local line repeats the provider-reported runtime model and a bounded
 harness diagnostic when either was reported; missing values are named rather
 than guessed. These messages are telemetry only. The hub remains the sole
-source of task outcome, and the targeted release request carries no diagnostic
-fields.
+source of task outcome. Its targeted release receives the stable
+`capability-silent-no-submit` reason, while the provider-reported runtime model
+and bounded harness diagnostic remain local to the worker output.
 
 Native judge entries do not carry a separately authored `x` map. The definition
 compiler deep-clones the producer step's complete parsed `x` map onto every
