@@ -27,7 +27,7 @@ import {
 } from '../src/harness/gatekeeper.ts';
 import { buildClaudeOptions, gatePolicyFor } from '../src/harness/claude.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
-import type { ApprovalRequest, ApprovalRequester } from '../src/harness/contract.ts';
+import type { ApprovalRequest, ApprovalRequester, FilesystemPermission } from '../src/harness/contract.ts';
 
 const WORKDIR = resolve('/tmp/owenloop-gatekeeper-fixture/run');
 
@@ -44,12 +44,16 @@ function optionsWith(
   permissionMode: string | undefined,
   onEvent: (t: string) => void = () => {},
   approvals?: ApprovalRequester,
+  filesystem?: FilesystemPermission,
 ) {
   return buildClaudeOptions(
     {
       cwd: WORKDIR,
       owenloopMcp: { command: 'node', args: [] },
-      permissions: normalizeStepPermissions(permissionMode === undefined ? {} : { permissionMode }),
+      permissions: normalizeStepPermissions({
+        ...(permissionMode === undefined ? {} : { permissionMode }),
+        ...(filesystem === undefined ? {} : { filesystem }),
+      }),
       ...(approvals !== undefined ? { approvals } : {}),
     },
     {
@@ -118,6 +122,43 @@ test('a READ outside the working directory escalates too, which is the probe tha
   assert.equal(v.decision, 'escalate');
 });
 
+test('an unrestricted filesystem allows audited filesystem reads outside the working directory', () => {
+  const outside = resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md');
+  for (const c of [
+    { toolName: 'Read', input: { file_path: outside } },
+    { toolName: 'Glob', input: { path: outside, pattern: '**/*.md' } },
+    { toolName: 'Grep', input: { path: outside, pattern: 'fixture' } },
+  ]) {
+    assert.equal(
+      verdict({ ...c, filesystem: 'unrestricted' }, 'classifier').decision,
+      'allow',
+      `unrestricted ${c.toolName} may read outside the workdir`,
+    );
+  }
+});
+
+test('an unrestricted filesystem does not widen mutating tools outside the working directory', () => {
+  const outside = resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md');
+  for (const c of [
+    { toolName: 'Write', input: { file_path: outside, content: 'x' } },
+    { toolName: 'Edit', input: { file_path: outside, old_string: 'x', new_string: 'y' } },
+    { toolName: 'NotebookEdit', input: { notebook_path: outside, new_source: 'x' } },
+  ]) {
+    const v = verdict({ ...c, filesystem: 'unrestricted' }, 'classifier');
+    assert.equal(v.decision, 'escalate', `unrestricted ${c.toolName} remains contained`);
+    assert.match(v.decision === 'escalate' ? v.reason : '', /outside this step's working directory/u);
+  }
+});
+
+test('narrower filesystem declarations retain the outside-workdir read boundary', () => {
+  const outside = resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md');
+  for (const filesystem of ['read-only', 'workspace-write'] as const) {
+    const v = verdict({ toolName: 'Read', input: { file_path: outside }, filesystem }, 'classifier');
+    assert.equal(v.decision, 'escalate', `${filesystem} remains workdir-contained`);
+    assert.match(v.decision === 'escalate' ? v.reason : '', /outside this step's working directory/u);
+  }
+});
+
 test('ordinary work inside the working directory is allowed under the classifier', () => {
   for (const c of [
     { toolName: 'Read', input: { file_path: join(WORKDIR, 'README.md') } },
@@ -140,6 +181,20 @@ test('the harness own blockedPath is authoritative and escalates on its own', ()
   );
   assert.equal(v.decision, 'escalate');
   assert.match(v.decision === 'escalate' ? v.reason : '', /\/etc\/shadow/u);
+});
+
+test('the harness blockedPath remains authoritative over an unrestricted filesystem read', () => {
+  const v = verdict(
+    {
+      toolName: 'Read',
+      input: { file_path: resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md') },
+      filesystem: 'unrestricted',
+      blockedPath: '/etc/shadow',
+    },
+    'classifier',
+  );
+  assert.equal(v.decision, 'escalate');
+  assert.match(v.decision === 'escalate' ? v.reason : '', /the harness flagged/u);
 });
 
 // ---------------------------------------------------------------------------
@@ -218,6 +273,21 @@ test('human-gate allows a contained read and escalates everything else', () => {
   }
 });
 
+test('human-gate allows an unrestricted filesystem read outside the workdir but not writes or network reads', () => {
+  const outside = resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md');
+  assert.equal(
+    verdict({ toolName: 'Read', input: { file_path: outside }, filesystem: 'unrestricted' }, 'human-gate').decision,
+    'allow',
+  );
+  for (const c of [
+    { toolName: 'Write', input: { file_path: outside, content: 'x' } },
+    { toolName: 'WebFetch', input: { url: 'https://example.test' } },
+  ]) {
+    const v = verdict({ ...c, filesystem: 'unrestricted' }, 'human-gate');
+    assert.equal(v.decision, 'escalate', `${c.toolName} remains human-gated`);
+  }
+});
+
 test('the same call divides on policy — that division is what `ask` vs `auto-safe` now means', () => {
   const c = { toolName: 'Write', input: { file_path: join(WORKDIR, 'src/x.ts'), content: 'x' } };
   assert.equal(verdict(c, 'classifier').decision, 'allow');
@@ -228,6 +298,19 @@ test('deny-unapproved keeps its narrow meaning rather than widening into the cla
   const c = { toolName: 'Read', input: { file_path: join(WORKDIR, 'README.md') } };
   assert.equal(verdict(c, 'classifier').decision, 'allow');
   assert.equal(verdict(c, 'deny-unapproved').decision, 'escalate');
+});
+
+test('deny-unapproved returns before an unrestricted filesystem can widen a read', () => {
+  const v = verdict(
+    {
+      toolName: 'Read',
+      input: { file_path: resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md') },
+      filesystem: 'unrestricted',
+    },
+    'deny-unapproved',
+  );
+  assert.equal(v.decision, 'escalate');
+  assert.match(v.decision === 'escalate' ? v.reason : '', /permissionMode denies unapproved tool calls/u);
 });
 
 test('the owenloop mount is allowed under every policy, including deny-unapproved', () => {
@@ -292,6 +375,17 @@ test('an escalated call denies with a message routing the agent to ask, and reco
 
   const allowed = await askCallback(options, 'Read', { file_path: join(WORKDIR, 'README.md') });
   assert.equal(allowed.behavior, 'allow');
+});
+
+test('the callback receives the declared filesystem boundary', async () => {
+  const options = optionsWith('auto-safe', () => {}, undefined, 'unrestricted');
+  const outside = resolve('/tmp/owenloop-gatekeeper-fixture/target/README.md');
+
+  assert.equal((await askCallback(options, 'Read', { file_path: outside })).behavior, 'allow');
+  assert.equal(
+    (await askCallback(options, 'Write', { file_path: outside, content: 'x' })).behavior,
+    'deny',
+  );
 });
 
 test('the callback fails closed: an unjudgeable call denies rather than hanging', async () => {

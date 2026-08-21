@@ -52,6 +52,8 @@
 
 import { isAbsolute, relative, resolve } from 'node:path';
 
+import type { FilesystemPermission } from './contract.ts';
+
 /**
  * How much the gatekeeper escalates, derived by the adapter from the step's
  * authored `permissionMode`.
@@ -90,6 +92,11 @@ export interface GateCall {
    * shell commands this module deliberately does not try to parse.
    */
   blockedPath?: string;
+  /**
+   * The normalized filesystem boundary declared by the step. An explicit
+   * `unrestricted` declaration may widen audited filesystem reads only.
+   */
+  filesystem?: FilesystemPermission;
 }
 
 /** The gatekeeper's answer. `reason` is written to be shown to a person and to
@@ -100,13 +107,11 @@ export type GateVerdict =
 
 const ALLOW: GateVerdict = { decision: 'allow' };
 
-/**
- * Tools that read without mutating anything. Under `human-gate` these are the
- * "trivially safe reads" the `ask` position exempts — but only inside the
- * step's own directory; a read of an arbitrary absolute path is exactly the
- * probe that ran unchallenged under `auto`.
- */
-const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'NotebookRead']);
+/** Audited built-ins that cannot mutate the filesystem. WebFetch/WebSearch
+ *  can read the unrestricted network without weakening a read-only filesystem.
+ *  This is the canonical audited read-tool set used by both the adapter's tool
+ *  surface and the explicit unrestricted-filesystem containment exception. */
+export const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
 
 /**
  * Where each tool names a filesystem path. Only tools whose path argument is a
@@ -114,14 +119,14 @@ const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'NotebookRead']);
  * a tool absent from this table simply is not path-checked rather than being
  * guessed at.
  */
-const PATH_ARGS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  Read: ['file_path'],
-  Write: ['file_path'],
-  Edit: ['file_path'],
-  NotebookRead: ['notebook_path'],
-  NotebookEdit: ['notebook_path'],
-  Glob: ['path'],
-  Grep: ['path'],
+const PATH_ARGS: Readonly<Record<string, { args: readonly string[]; humanGateSafeRead?: true }>> = Object.freeze({
+  Read: { args: ['file_path'], humanGateSafeRead: true },
+  Write: { args: ['file_path'] },
+  Edit: { args: ['file_path'] },
+  NotebookRead: { args: ['notebook_path'], humanGateSafeRead: true },
+  NotebookEdit: { args: ['notebook_path'] },
+  Glob: { args: ['path'], humanGateSafeRead: true },
+  Grep: { args: ['path'], humanGateSafeRead: true },
 });
 
 /**
@@ -231,24 +236,31 @@ export function classifyToolCall(call: GateCall, policy: GatePolicy): GateVerdic
     };
   }
 
-  const paths = (PATH_ARGS[call.toolName] ?? [])
+  const pathArgs = PATH_ARGS[call.toolName];
+  const paths = (pathArgs?.args ?? [])
     .map((key) => stringArg(call.input, key))
     .filter((p): p is string => p !== undefined);
 
-  for (const p of paths) {
-    if (!isInside(call.workdir, p)) {
-      return {
-        decision: 'escalate',
-        reason: `\`${p}\` is outside this step's working directory (\`${call.workdir}\`)`,
-      };
+  // An explicit unrestricted filesystem declaration widens only the declared
+  // boundary of the shared audited read set. It does not change which operation
+  // categories the `ask` policy regards as safe.
+  if (call.filesystem !== 'unrestricted' || !READ_ONLY_TOOLS.has(call.toolName)) {
+    for (const p of paths) {
+      if (!isInside(call.workdir, p)) {
+        return {
+          decision: 'escalate',
+          reason: `\`${p}\` is outside this step's working directory (\`${call.workdir}\`)`,
+        };
+      }
     }
   }
 
   if (policy === 'human-gate') {
-    // Every path this tool named is contained, or it named none. A read is the
-    // one thing `ask` lets through; anything that can mutate or reach the
-    // network is what the position exists to put in front of a person.
-    if (READ_ONLY_TOOLS.has(call.toolName)) return ALLOW;
+    // Every path this tool named is contained, or it was an explicitly
+    // unrestricted audited read. A declared-safe filesystem read is the one
+    // thing `ask` lets through; anything that can mutate or reach the network
+    // is what the position exists to put in front of a person.
+    if (pathArgs?.humanGateSafeRead === true) return ALLOW;
     return {
       decision: 'escalate',
       reason: `permissionMode is \`ask\`, so \`${call.toolName}\` needs a person's approval`,
