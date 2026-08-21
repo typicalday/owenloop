@@ -31,24 +31,25 @@
  * whole point of the list.
  *
  * COMMANDS
- *   owenloop work approvals [--json]              every approval a worker is blocked on
- *   owenloop work approvals approve <wf>/<run> <tool-use-id> [--note <text>]
- *   owenloop work approvals deny    <wf>/<run> <tool-use-id> [--note <text>]
+ *   owenloop work approvals [--origin <url>] [--json]              every approval a worker is blocked on
+ *   owenloop work approvals approve <wf>/<run> <tool-use-id> [--origin <url>] [--note <text>]
+ *   owenloop work approvals deny    <wf>/<run> <tool-use-id> [--origin <url>] [--note <text>]
  *
  * The decision is a positional VERB rather than an `--approve` flag, because a
  * flag that grants a dangerous command is one typo away from being omitted, and
  * an omitted flag has to mean something. A verb cannot be omitted.
  *
- * Origin and bearer resolve exactly as in `release`: `--origin` → settings
- * `hubOrigin`, and the `agent:<account>` credential slot for `OWENLOOP_ACCOUNT`
- * (default `default`). The hub refuses `answer_approval` to an agent token by
- * design — this verb is for a person's key.
+ * Origin resolves as in `release`: `--origin` → settings `hubOrigin`.
+ * Listing reads the `agent:<account>` credential slot selected by
+ * `OWENLOOP_ACCOUNT` (default `default`). Approve and deny always read the
+ * stored `human` slot because the hub correctly reserves `answer_approval`
+ * for a person's key.
  *
  * Exit codes: 0 on success (including an empty list) · 1 on a hub/network error
  * · 2 on a usage error.
  */
 import { createHubClient, type HubClient } from '../hub/client.ts';
-import { resolveBearer } from '../credentials/resolve.ts';
+import { resolveBearer, type BearerResult, type ResolveBearerArgs } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import type { ApprovalView } from '../hub/types.ts';
 
@@ -123,9 +124,9 @@ export function splitOrder(order: string): { workflow: string; run: string } | u
 }
 
 function usage(err: (line: string) => void): void {
-  err('usage: owenloop work approvals [--json]');
-  err('       owenloop work approvals approve <workflow>/<run> <tool-use-id> [--note <text>]');
-  err('       owenloop work approvals deny    <workflow>/<run> <tool-use-id> [--note <text>]');
+  err('usage: owenloop work approvals [--origin <url>] [--json]');
+  err('       owenloop work approvals approve <workflow>/<run> <tool-use-id> [--origin <url>] [--note <text>]');
+  err('       owenloop work approvals deny    <workflow>/<run> <tool-use-id> [--origin <url>] [--note <text>]');
 }
 
 function errMsg(err: unknown): string {
@@ -158,6 +159,7 @@ export interface RunDeps {
   err?: (line: string) => void;
   env?: Record<string, string | undefined>;
   now?: () => number;
+  resolveBearer?: (args: ResolveBearerArgs) => Promise<BearerResult>;
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -197,8 +199,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
-  const account = env['OWENLOOP_ACCOUNT'] ?? 'default';
-  const bearer = await resolveBearer({ origin, account, env });
+  const bearerArgs: ResolveBearerArgs =
+    parsed.action === 'list'
+      ? { principal: 'agent', origin, account: env['OWENLOOP_ACCOUNT'] ?? 'default', env }
+      : { principal: 'human', origin, env };
+  const bearer = await (deps.resolveBearer ?? resolveBearer)(bearerArgs);
   if (!bearer.ok) {
     err(`owenloop work approvals: ${bearer.message}`);
     return bearer.code;

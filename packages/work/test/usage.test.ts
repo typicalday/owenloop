@@ -50,6 +50,23 @@ test('USAGE documents join as the one-time provisioning writer exception', () =>
   assert.match(USAGE, /one-time provisioning|provisioning-time writer/, 'help should call out join as provisioning, not runtime');
 });
 
+test('USAGE documents approval flags and the split between list and decision credentials', () => {
+  assert.match(USAGE, /owenloop work approvals \[--origin <url>\] \[--json\]/);
+  assert.match(
+    USAGE,
+    /owenloop work approvals approve <wf>\/<run> <tool-use-id> \[--origin <url>\] \[--note <text>\]/,
+  );
+  assert.match(
+    USAGE,
+    /owenloop work approvals deny {4}<wf>\/<run> <tool-use-id> \[--origin <url>\] \[--note <text>\]/,
+  );
+  assert.match(USAGE, /list reads the agent:<account> slot selected by[\s\S]*OWENLOOP_ACCOUNT/);
+  assert.match(USAGE, /approve[\s\S]*deny[\s\S]*stored human slot/);
+  assert.match(USAGE, /owenloop login --hub <origin> --as human/);
+  assert.match(USAGE, /never mint or log credentials/);
+  assert.match(USAGE, /expiring[\s\S]*human OAuth credential may refresh and persist its[\s\S]*rotation/);
+});
+
 // ---- Phase 3: agent-run + runner dispatch are documented --------------------
 
 test('USAGE documents the agent-run role, its harness flag, and the hub-is-truth grace', () => {

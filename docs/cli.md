@@ -654,10 +654,23 @@ The execution settings file is `<config>/settings.json` (see
 | `prepare <workflow> [--origin <url>]` | fetch, cache, and normalize step specs |
 | `lint <workflow-name \| path>` | lint `x.harness` option bags in a workflow definition |
 | `sessions [--all] [--json]` | list recorded harness sessions and how to reopen them |
+| `approvals [--origin <url>] [--json]` | list every tool call a worker is currently blocked on, waiting for a person |
+| `approvals approve <wf>/<run> <tool-use-id> [--origin <url>] [--note <text>]` | approve one still-pending tool call; the answer returns to that blocked call |
+| `approvals deny <wf>/<run> <tool-use-id> [--origin <url>] [--note <text>]` | deny one still-pending tool call; the answer returns to that blocked call |
 | `release --session <id> [options]` | drain a session's held claims |
 | `settings` | print the resolved execution settings file |
 | `join <code> [--hub <origin>] [--as <account>]` | redeem a join code and store the Scoped Identity credential |
 | `util modifier-init --default <value>` | print the requested modifier from `OWENLOOP_FEEDBACK`, else `OWENLOOP_MODIFIER`, else the required default |
+
+`work approvals` distinguishes a worker that is still running and waiting on a
+tool decision from a pending input gate or an `ask` that ends the current run.
+Listing uses the agent credential selected by `OWENLOOP_ACCOUNT` (default
+`default`). `approve` and `deny` always use the stored `human` credential,
+ignore `OWENLOOP_ACCOUNT` and `OWENLOOP_TOKEN`, and require
+`owenloop login --hub <origin> --as human` when that slot is absent. They never
+mint or log credentials. If the stored human credential is an expiring OAuth
+credential, the decision path may refresh it and persist a rotated token under
+the shared credential lock before answering the hub.
 
 ### `util modifier-init`
 
