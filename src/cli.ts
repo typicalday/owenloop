@@ -1608,6 +1608,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
                                          bounded reachability check (stall states, true deadlocks, stuck, dead steps, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
+${' '.repeat(41)}create a local SQLite workflow instance
   provide <wf> <name> [--value json] [--hub <url>]  supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
   tick <wf> [--now <ms>] [--shallow] [--capability <c>]...  pull eligible orders (deep: also from calls: children; --shallow for this instance only; --capability filters to matching-capability steps)
@@ -1618,7 +1619,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   status --all                           every instance's status in one call (fleet read)
   wait <wf> --until eligible|done [--timeout <dur>]   block until engine state matches
   show <wf>                              dump raw artifacts
-  trace <wf> [--format text]             causal timeline + artifact biographies
+  trace <wf> [--format text]             local causal timeline + artifact biographies
   graph <def-or-wf> [--format dot|mermaid|json]   wiring graph (+ live overlay if wf id)
   list                                   list workflow instances
   green <wf> <run> <path> [--value json] [--terminal]
