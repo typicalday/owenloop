@@ -77,11 +77,13 @@ async function askCallback(
   options: ReturnType<typeof buildClaudeOptions>,
   toolName: string,
   input: Record<string, unknown>,
+  callbackOptions: { title?: string } = {},
 ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
   const result = await options.canUseTool!(toolName, input, {
     signal: new AbortController().signal,
     toolUseID: 'toolu_fixture',
     requestId: 'req_fixture',
+    ...callbackOptions,
   });
   assert.notEqual(result, null, 'this adapter never answers out-of-band, so null would hang the tool');
   if (result!.behavior === 'deny') return { behavior: 'deny', message: result!.message };
@@ -456,6 +458,7 @@ test('an approved escalation runs the call, and the person is asked about the ex
   assert.equal(asked.toolName, 'Write');
   assert.match(asked.reason, /\/etc\/hosts/u, 'the person sees what actually triggered it, not a generic label');
   assert.deepEqual(asked.toolInput, { file_path: '/etc/hosts', content: 'x' });
+  assert.equal(asked.title, 'Write /etc/hosts');
 
   assert.equal(
     events.some((t) => t.startsWith('permission escalation: Write raised for approval')),
@@ -466,6 +469,74 @@ test('an approved escalation runs the call, and the person is asked about the ex
     events.some((t) => t === 'permission escalation: Write approved by a human'),
     true,
   );
+});
+
+test('an approval for a Bash deny-list match names the exact command', async () => {
+  const approvals = requester(async () => ({ decision: 'approved' }));
+  const command = "git grep -n 'launchctl' packages/work/src";
+
+  const result = await askCallback(optionsWith('auto-safe', () => {}, approvals.fn), 'Bash', { command });
+
+  assert.equal(result.behavior, 'allow');
+  assert.equal(approvals.seen[0]?.title, command);
+});
+
+test('approval titles use a supplied SDK title before call detail', async () => {
+  const approvals = requester(async () => ({ decision: 'approved' }));
+  const result = await askCallback(
+    optionsWith('auto-safe', () => {}, approvals.fn),
+    'Bash',
+    { command: 'launchctl list' },
+    { title: 'SDK permission prompt' },
+  );
+
+  assert.equal(result.behavior, 'allow');
+  assert.equal(approvals.seen[0]?.title, 'SDK permission prompt');
+});
+
+test('approval titles fall back to a tool name without serializing arbitrary input', async () => {
+  const approvals = requester(async () => ({ decision: 'approved' }));
+  const result = await askCallback(
+    optionsWith('ask', () => {}, approvals.fn),
+    'WebFetch',
+    { url: 'https://example.test', secret: 'do not show this' },
+  );
+
+  assert.equal(result.behavior, 'allow');
+  assert.equal(approvals.seen[0]?.title, 'WebFetch');
+});
+
+test('approval titles ignore empty and non-string candidate details', async () => {
+  for (const [toolName, input] of [
+    ['Bash', { command: '' }],
+    ['Write', { file_path: null, content: 'do not show this' }],
+  ] as const) {
+    const approvals = requester(async () => ({ decision: 'approved' }));
+    const result = await askCallback(optionsWith('ask', () => {}, approvals.fn), toolName, input);
+
+    assert.equal(result.behavior, 'allow');
+    assert.equal(approvals.seen[0]?.title, toolName);
+  }
+});
+
+test('approval titles use the shared cap for derived and SDK-supplied text', async () => {
+  const longCommand = `launchctl ${'x'.repeat(2_000)}`;
+  const longSdkTitle = 't'.repeat(2_001);
+  for (const [toolName, input, title, expected] of [
+    ['Bash', { command: longCommand }, undefined, `${longCommand.slice(0, 2_000)}…`],
+    ['WebFetch', { url: 'https://example.test' }, longSdkTitle, `${longSdkTitle.slice(0, 2_000)}…`],
+  ] as const) {
+    const approvals = requester(async () => ({ decision: 'approved' }));
+    const result = await askCallback(
+      optionsWith('ask', () => {}, approvals.fn),
+      toolName,
+      input,
+      title === undefined ? {} : { title },
+    );
+
+    assert.equal(result.behavior, 'allow');
+    assert.equal(approvals.seen[0]?.title, expected);
+  }
 });
 
 test('an allowed call never reaches the approval channel', async () => {

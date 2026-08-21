@@ -171,6 +171,23 @@ test('each waiting approval prints what is being asked and the command that answ
   assert.match(text, /deny: {4}owenloop work approvals deny wf_1\/run_1 toolu_01/u);
 });
 
+test('a genuinely empty approval title omits the call line without changing its answer commands', async () => {
+  const hub = fakeHub({
+    async listPendingApprovals() {
+      return { text: '', approvals: [view({ title: '' })] };
+    },
+  });
+  const { code, out } = await invoke([], hub);
+  const text = out.join('\n');
+
+  assert.equal(code, 0);
+  assert.match(text, /wf_1\/run_1/u);
+  assert.match(text, /why: the command changes file ownership/u);
+  assert.match(text, /approve: owenloop work approvals approve wf_1\/run_1 toolu_01/u);
+  assert.match(text, /deny: {4}owenloop work approvals deny wf_1\/run_1 toolu_01/u);
+  assert.doesNotMatch(text, /call:/u);
+});
+
 test('--json prints the hub rows unedited, for anything that is not a person', async () => {
   const hub = fakeHub({
     async listPendingApprovals() {

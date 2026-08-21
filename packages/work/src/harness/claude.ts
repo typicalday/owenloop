@@ -356,6 +356,49 @@ function decisionMessage(reason: string, note: string | undefined): string {
   ].join(' ');
 }
 
+/** The only model-authored arguments safe to summarize for an approval prompt. */
+const APPROVAL_FILE_PATH_ARGS: Readonly<Record<string, readonly string[]>> = {
+  Read: ['file_path'],
+  Write: ['file_path'],
+  Edit: ['file_path'],
+  NotebookRead: ['notebook_path'],
+  NotebookEdit: ['notebook_path'],
+  Glob: ['path'],
+  Grep: ['path'],
+};
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+/** A hostile model-authored input must not turn an approval into a hung callback. */
+function inputString(input: Record<string, unknown>, key: string): string | undefined {
+  try {
+    return nonEmptyString(input[key]);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Return the bounded one-line call detail an operator needs to approve Claude
+ * tool use, without serializing the arbitrary model-authored input bag.
+ */
+function approvalTitle(toolName: string, input: Record<string, unknown>, suppliedTitle: unknown): string | undefined {
+  let title = nonEmptyString(suppliedTitle);
+  if (title === undefined && toolName === 'Bash') title = inputString(input, 'command');
+
+  if (title === undefined) {
+    const paths = (APPROVAL_FILE_PATH_ARGS[toolName] ?? [])
+      .map((key) => inputString(input, key))
+      .filter((path): path is string => path !== undefined);
+    if (paths.length > 0) title = `${toolName} ${paths.join(', ')}`;
+  }
+
+  const selected = title ?? nonEmptyString(toolName);
+  return selected === undefined ? undefined : cap(selected);
+}
+
 /**
  * The `canUseTool` callback, wired on every start.
  *
@@ -404,6 +447,7 @@ function buildCanUseTool(
     if (verdict.decision === 'allow') return { behavior: 'allow' };
 
     if (approvals !== undefined) {
+      const title = approvalTitle(toolName, input, options.title);
       onEvent({
         kind: 'progress',
         text: `permission escalation: ${toolName} raised for approval — ${verdict.reason}`,
@@ -415,7 +459,7 @@ function buildCanUseTool(
           toolName,
           toolInput: input,
           reason: verdict.reason,
-          ...(options.title !== undefined ? { title: options.title } : {}),
+	  ...(title !== undefined ? { title } : {}),
           ...(options.signal !== undefined ? { signal: options.signal } : {}),
         });
       } catch (err) {
