@@ -1,27 +1,17 @@
-import type { JsonSchema, WorkflowDef } from './types.ts';
+import type {
+  JsonSchema,
+  WorkflowDef,
+  WorkflowInterfaceArtifact,
+  WorkflowInterfaceSignature,
+} from './types.ts';
 
-/** A versioned external interface coordinate claimed in a workflow's x bag. */
-export interface WorkflowInterfaceClaim {
-  name: string;
-  version: string;
-}
-
-/** A named input or public output and the schema that defines its values. */
-export interface WorkflowInterfaceArtifact {
-  name: string;
-  schema?: JsonSchema;
-}
-
-/**
- * The typed portion of an external workflow interface. Its catalog coordinate
- * is deliberately separate: this checker compares a supplied signature and
- * does not resolve a hub catalog or decide whether the workflow authored a
- * matching x.implements claim.
- */
-export interface WorkflowInterfaceSignature {
-  inputs: WorkflowInterfaceArtifact[];
-  outputs: WorkflowInterfaceArtifact[];
-}
+// Retain the existing module-level type surface while sharing one structural
+// definition with authored callsInterface claims and persisted bindings.
+export type {
+  WorkflowInterfaceArtifact,
+  WorkflowInterfaceClaim,
+  WorkflowInterfaceSignature,
+} from './types.ts';
 
 /** One deterministic reason an implementation does not satisfy an interface. */
 export interface InterfaceCompatibilityIssue {

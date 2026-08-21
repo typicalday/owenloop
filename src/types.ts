@@ -77,6 +77,36 @@ export type ReasonAction =
 /** A JSON Schema, as authored in a definition: an object, or a boolean (allow/deny all). */
 export type JsonSchema = Record<string, unknown> | boolean;
 
+/** A versioned external interface coordinate. Names and versions are opaque. */
+export interface WorkflowInterfaceClaim {
+  name: string;
+  version: string;
+}
+
+/** A named input or public output and the schema that defines its values. */
+export interface WorkflowInterfaceArtifact {
+  name: string;
+  schema?: JsonSchema;
+}
+
+/** The typed portion of an external workflow interface. */
+export interface WorkflowInterfaceSignature {
+  inputs: WorkflowInterfaceArtifact[];
+  outputs: WorkflowInterfaceArtifact[];
+}
+
+/**
+ * One hub-selected implementation pinned when an instance starts. The engine
+ * validates the exact coordinate, bundle digest, nominal claim, and structural
+ * signature before persisting this immutable mapping.
+ */
+export interface InterfaceCallBinding {
+  interface: WorkflowInterfaceClaim;
+  target: string;
+  digest: string;
+  signature: WorkflowInterfaceSignature;
+}
+
 /** One entry in an artifact's append-only reason thread (design §4). */
 export interface ReasonEntry {
   at: number;
@@ -403,6 +433,12 @@ export interface WorkflowData {
   modifier?: string;
   /** Engine-written, non-routing metadata populated by artifact binds. */
   meta?: Record<string, unknown>;
+  /**
+   * Complete, normalized start-time interface-call bindings inherited by every
+   * calls child. Immutable instance state: routing/meta updates and adopt never
+   * rewrite it, and legacy rows map SQL NULL to true property absence.
+   */
+  interfaceBindings?: InterfaceCallBinding[];
   /** Instance-to-definition pinning (§28): the compiled def this instance was
    *  created against, snapshotted verbatim as JSON. Absent on rows created
    *  before this feature shipped — those instances fall back to today's
@@ -663,6 +699,8 @@ export interface StepDef {
   body: string; // prompt body
   /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */
   calls?: string;
+  /** Versioned interface delegated to through the instance's immutable start-time binding. */
+  callsInterface?: WorkflowInterfaceClaim;
   /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: step. */
   callsInputs?: Record<string, string>;
   /** §24 judges: marker naming the produce stem this synthesized step judges. Mirrors `calls?`. */
@@ -673,6 +711,11 @@ export interface StepDef {
    *  load time, never interpreted by the engine — carried untouched through
    *  `buildOrder` onto the Order for an external runner/tooling to read. */
   x?: Record<string, unknown>;
+}
+
+/** True for either statically-targeted or start-bound machine call steps. */
+export function isCallStep(step: Pick<StepDef, 'calls' | 'callsInterface'>): boolean {
+  return step.calls !== undefined || step.callsInterface !== undefined;
 }
 
 /** A workflow definition: a set of steps plus declared external inputs. */

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, reportCallsCycles, validateCallsEdges, validateDef } from '../src/defs.ts';
+import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, InterfaceCallDefinitionError, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, reportCallsCycles, validateCallsEdges, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -2715,6 +2715,87 @@ test('D-D: buildDef with valid named-handler passes (no throw)', () => {
 });
 
 // ---- M2-GRAMMAR: calls: parsing + validation + cycle tests -------------------
+
+test('parseDef: callsInterface loads without a concrete authoring-time target', () => {
+  const parsed = parseDef({
+    name: 'parent',
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'deliver',
+      callsInterface: { name: 'research-report', version: '1' },
+      inputs: { proposal: 'proposal' },
+      produces: ['delivered'],
+    }],
+  });
+  assert.deepEqual(parsed.steps[0]!.callsInterface, { name: 'research-report', version: '1' });
+  assert.equal(parsed.steps[0]!.calls, undefined);
+  assert.deepEqual(parsed.steps[0]!.callsInputs, { proposal: 'proposal' });
+  assert.deepEqual(parsed.steps[0]!.consumes, []);
+  assert.doesNotThrow(() => finalizeDefs(new Map([[parsed.name, parsed]])));
+});
+
+test('parseDef: malformed and mutually-exclusive interface calls use the named definition refusal', () => {
+  for (const rawStep of [
+    { name: 'deliver', callsInterface: { name: '', version: '1' }, produces: ['delivered'] },
+    { name: 'deliver', callsInterface: { name: 'research-report', version: '1', extra: true }, produces: ['delivered'] },
+    { name: 'deliver', calls: 'child', callsInterface: { name: 'research-report', version: '1' }, produces: ['delivered'] },
+  ]) {
+    assert.throws(
+      () => buildDef({ name: 'parent', steps: [rawStep] }),
+      (error: unknown) => {
+        assert.ok(error instanceof InterfaceCallDefinitionError);
+        assert.equal(error.name, 'InterfaceCallDefinitionError');
+        assert.equal(error.step, 'deliver');
+        assert.match(error.message, /definition loading refused/);
+        assert.match(error.message, /deliver/);
+        return true;
+      },
+    );
+  }
+});
+
+test('validateDef: callsInterface keeps the calls one-output, bind, and parent-wiring rules', () => {
+  const parsed = buildDef({
+    name: 'parent',
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'deliver',
+      callsInterface: { name: 'research-report', version: '1' },
+      inputs: { proposal: 'missing' },
+      produces: [{ name: 'delivered', bind: 'modifier' }],
+    }],
+  });
+  parsed.steps[0]!.produces.push({ ...parsed.steps[0]!.produces[0]!, raw: 'second', stem: 'second' });
+  const errors = validateDef(parsed);
+  assert.ok(errors.some((error) => /callsInterface step 'deliver' must produce exactly one output/.test(error)));
+  assert.ok(errors.some((error) => /callsInterface step 'deliver' produce 'delivered' declares bind/.test(error)));
+  assert.ok(errors.some((error) => /parent artifact 'missing'.*not produced/.test(error)));
+});
+
+test('parseDef: callsInterface rejects produce judges and groups exactly like calls', () => {
+  assert.throws(
+    () => buildDef({
+      name: 'parent',
+      steps: [{
+        name: 'deliver',
+        callsInterface: { name: 'research-report', version: '1' },
+        produces: [{ name: 'delivered', judges: [{ name: 'review', body: 'review' }] }],
+      }],
+    }),
+    /judges: is not supported on a callsInterface step/,
+  );
+  assert.throws(
+    () => buildDef({
+      name: 'parent',
+      steps: [{
+        name: 'deliver',
+        callsInterface: { name: 'research-report', version: '1' },
+        produces: ['delivered', { group: 'choice', mode: 'exactlyOne', of: ['delivered', 'other'] }],
+      }],
+    }),
+    /group: is not supported on a callsInterface step/,
+  );
+});
 
 test('parseDef: calls: step sets calls and callsInputs fields', () => {
   const d = parseDef({

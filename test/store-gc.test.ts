@@ -731,6 +731,26 @@ test('a runtime-pinned orphan and project exact-digest fallback into global are 
 	);
 });
 
+test('an interface binding digest is a runtime retention root before child spawn', async () => {
+  const installed = await installThree();
+  const selected = installed.digests['1.0.0'];
+  const result = plan({
+    projectRoot: installed.root,
+    keep: 1,
+    pins: [{ bundleLock: [], interfaceBindingDigests: [selected] }],
+  });
+  assert.equal(
+    result.report.objects.some((object) => object.digest === selected),
+    false,
+    'the start-bound implementation object remains reachable without a child workflow row',
+  );
+  assert.equal(
+    result.report.coordinates.includes('widget/widget@1.0.0'),
+    false,
+    'the selected implementation coordinate is retained with its object',
+  );
+});
+
 test('global GC retains every digest named by the project index even when project bytes exist', async () => {
   const project = await installThree();
   const global = await installThree();
@@ -1458,15 +1478,22 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
 
   const digest = 'a'.repeat(64);
   const dependency = 'b'.repeat(64);
+  const selected = 'c'.repeat(64);
   const db = new DatabaseSync(dbPath);
-  db.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, def_snapshot TEXT, created_at INTEGER)');
-  db.prepare('INSERT INTO workflow (id, def_snapshot, created_at) VALUES (?, ?, ?)').run(
+  db.exec('CREATE TABLE workflow (id TEXT PRIMARY KEY, def_snapshot TEXT, interface_bindings TEXT, created_at INTEGER)');
+  db.prepare('INSERT INTO workflow (id, def_snapshot, interface_bindings, created_at) VALUES (?, ?, ?, ?)').run(
     'wf_good',
     JSON.stringify({
       bundleDigest: digest,
       bundleLock: { 'dep/dep@1.0.0': dependency },
       steps: [{ calls: 'legacy/child@1.0.0' }, { calls: 'dep/dep@1.0.0' }],
     }),
+    JSON.stringify([{
+      interface: { name: 'research-report', version: '1' },
+      target: 'implementations/report@1.0.0',
+      digest: selected,
+      signature: { inputs: [], outputs: [] },
+    }]),
     1,
   );
   db.close();
@@ -1475,6 +1502,7 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
     bundleDigest: digest,
     bundleLock: [dependency],
     exactCalls: ['legacy/child@1.0.0'],
+    interfaceBindingDigests: [selected],
   }]);
   assert.deepEqual(readFileSync(dbPath), bytesBefore);
   assert.equal(existsSync(`${dbPath}-wal`), false);
@@ -1486,6 +1514,20 @@ test('runtime snapshot pin reader is read-only, legacy-aware, and fails closed o
   );
   corrupt.close();
   assert.throws(() => readRuntimeSnapshotBundlePins(dbPath), /noncanonical/u);
+
+  const corruptBinding = new DatabaseSync(dbPath);
+  corruptBinding.prepare('UPDATE workflow SET def_snapshot = ?, interface_bindings = ? WHERE id = ?').run(
+    JSON.stringify({ bundleDigest: digest }),
+    JSON.stringify([{
+      interface: { name: 'research-report', version: '1' },
+      target: 'implementations/report@1.0.0',
+      digest: 'NOT-A-DIGEST',
+      signature: { inputs: [], outputs: [] },
+    }]),
+    'wf_good',
+  );
+  corruptBinding.close();
+  assert.throws(() => readRuntimeSnapshotBundlePins(dbPath), /interface_bindings\[0\]\.digest is noncanonical/u);
 
   const legacyPath = join(dir, 'legacy.db');
   const legacy = new DatabaseSync(legacyPath);

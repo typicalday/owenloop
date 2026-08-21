@@ -652,7 +652,7 @@ from dead-end warnings, but unlike `terminal:` they stay re-armable.
 | `generates:` | step | yes | yes | internal sink, not the public interface |
 | `outputs:` | workflow | yes | yes | public interface / composition boundary |
 
-## Composition — `include:` (compile-time) and `calls:` (runtime)
+## Composition — `include:` (compile-time) and runtime calls
 
 Two ways to build a workflow out of other workflows:
 
@@ -725,6 +725,64 @@ the engine re-provides it to the existing child — it never spawns a duplicate.
 | Steps | Inlined with `as:` prefix | Run in a separate child instance |
 | Use for | New combined workflows | Embedding an existing workflow as a black box |
 | Visibility | All child stems visible in the parent | Only the declared `produces:` artifact |
+
+### Calling a start-bound interface
+
+`callsInterface:` is the interface-targeted form of a runtime call. The workflow
+author names the exact interface version the step requires, while the host that starts
+the instance selects the installed implementation. The engine validates that selection
+before it writes the root instance and pins the complete binding set for the lifetime of
+the run.
+
+```yaml
+steps:
+  - name: report
+    callsInterface:
+      name: report
+      version: 1.0.0
+    inputs:
+      source: prepared_source
+    produces: [report]
+```
+
+`callsInterface:` and `calls:` are mutually exclusive. Otherwise the call-step contract
+is the same: exactly one `produces:` entry, child-input-to-parent-artifact `inputs:`
+wiring, no `judges:` or `group:`, engine-managed spawning, and no Worker order for the
+call step itself. Interface calls v1 also require the chosen implementation workflow to
+declare exactly one public `outputs:` entry.
+
+The host supplies one binding for every interface called directly by the workflow when
+it invokes `Engine.createInstance`:
+
+```ts
+engine.createInstance('parent', {
+  interfaceBindings: [{
+    interface: { name: 'report', version: '1.0.0' },
+    target: 'acme/report@2.3.1',
+    digest: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    signature: {
+      inputs: [{ name: 'source', schema: { type: 'object' } }],
+      outputs: [{ name: 'report', schema: { type: 'object' } }],
+    },
+  }],
+});
+```
+
+`target` must be an exact installed workflow coordinate and `digest` must be that
+bundle's canonical lowercase SHA-256 digest. The target must carry a matching valid
+`x.implements` claim, its declared input and output schemas must be structurally
+compatible with the supplied signature, and every wired child input must exist in both
+the signature and target. A missing, duplicate, malformed, stale, or incompatible
+binding throws the named `InterfaceBindingRefusalError` before any workflow or artifact
+row is inserted.
+
+The root's normalized bindings are inherited unchanged by every child. At spawn time
+the engine resolves the implementation by its exact digest again and transactionally
+compares it with the persisted target and digest. A missing or repointed implementation
+becomes visible structural debt on the parent call output; the engine does not fall
+back, reselect, or rebind. Updates to installed implementations therefore affect only
+new instances whose host selects them. Selection, ranking, and receipt authorship belong
+to the host; the engine accepts, validates, persists, and enforces the resulting pin.
 
 ## `effect:` — re-running steps with side effects
 

@@ -425,6 +425,7 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     const digests = [
       ...(snapshot.bundleDigest === undefined ? [] : [defDigest(snapshot.bundleDigest)]),
       ...snapshot.bundleLock.map((digest) => defDigest(digest)),
+      ...(snapshot.interfaceBindingDigests ?? []).map((digest) => defDigest(digest)),
     ];
     for (const digest of digests) {
       if (targetCoordinatesForDigest(digest).length > 0) {
