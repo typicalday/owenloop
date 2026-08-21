@@ -454,8 +454,11 @@ function schemaSubset(
   sourceAtMost(source, target, 'maxLength', path, issues);
   sourceAtLeast(source, target, 'minItems', path, issues);
   sourceAtMost(source, target, 'maxItems', path, issues);
-  sourceAtLeast(source, target, 'minProperties', path, issues);
-  sourceAtMost(source, target, 'maxProperties', path, issues);
+  const outputProjection = direction === 'output' && isClosed(target) && isClosed(source);
+  if (!outputProjection) {
+    sourceAtLeast(source, target, 'minProperties', path, issues);
+    sourceAtMost(source, target, 'maxProperties', path, issues);
+  }
 
   for (const keyword of ['pattern', 'format'] as const) {
     if (target[keyword] === undefined) continue;
@@ -492,6 +495,32 @@ function compareObjects(
   const targetRequired = stringSet(target.required, joinPath(path, 'required'), issues);
   const sourceAdditional = additionalSchema(source, path, issues);
   const targetAdditional = additionalSchema(target, path, issues);
+  const outputProjection = direction === 'output' && isClosed(target) && isClosed(source);
+
+  if (outputProjection) {
+    const visibleProperties = Object.keys(sourceProperties).filter((property) => Object.hasOwn(targetProperties, property));
+    const implementationOnlyCount = Object.keys(sourceProperties).length - visibleProperties.length;
+    const visibleRequiredCount = visibleProperties.filter((property) => sourceRequired.has(property)).length;
+    const sourceMinimum = typeof source.minProperties === 'number' ? source.minProperties : 0;
+    const projectedMinimum = Math.max(visibleRequiredCount, sourceMinimum - implementationOnlyCount, 0);
+    const targetMinimum = typeof target.minProperties === 'number' ? target.minProperties : undefined;
+    if (targetMinimum !== undefined && projectedMinimum < targetMinimum) {
+	issues.push(message(
+	  joinPath(path, 'minProperties'),
+	  `projected source minimum ${projectedMinimum} does not satisfy target minimum ${targetMinimum}`,
+	));
+    }
+
+    const targetMaximum = typeof target.maxProperties === 'number' ? target.maxProperties : undefined;
+    const sourceMaximum = typeof source.maxProperties === 'number' ? source.maxProperties : Number.POSITIVE_INFINITY;
+    const projectedMaximum = Math.min(visibleProperties.length, sourceMaximum);
+    if (targetMaximum !== undefined && projectedMaximum > targetMaximum) {
+	issues.push(message(
+	  joinPath(path, 'maxProperties'),
+	  `projected source maximum ${projectedMaximum} does not satisfy target maximum ${targetMaximum}`,
+	));
+    }
+  }
 
   for (const property of targetRequired) {
     if (sourceRequired.has(property)) continue;
@@ -521,7 +550,6 @@ function compareObjects(
     }
   }
 
-  const outputProjection = direction === 'output' && isClosed(target) && isClosed(source);
   for (const property of Object.keys(sourceProperties)) {
     if (Object.hasOwn(targetProperties, property)) continue;
     if (outputProjection) continue;

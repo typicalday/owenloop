@@ -172,6 +172,41 @@ test('compatibility accepts the shared request and projected closed report schem
   assert.deepEqual(investigate, beforeInvestigate, 'investigate def is never mutated');
 });
 
+test('closed output projection checks property cardinality after dropping implementation-only fields', () => {
+  const signature: WorkflowInterfaceSignature = {
+    inputs: [{ name: 'request', schema: requestSchema }],
+    outputs: [{
+      name: 'report',
+      schema: {
+	type: 'object',
+	minProperties: 1,
+	properties: { visible: { type: 'string' } },
+	additionalProperties: false,
+      },
+    }],
+  };
+  const implementationSchema: JsonSchema = {
+    type: 'object',
+    minProperties: 1,
+    required: ['internal'],
+    properties: {
+      visible: { type: 'string' },
+      internal: { type: 'string' },
+    },
+    additionalProperties: false,
+  };
+
+  const result = checkInterfaceCompatibility(
+    signature,
+    reportDef('projection-cardinality', requestSchema, implementationSchema),
+  );
+
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some(
+    (issue) => issue.message === 'outputs.report.schema.minProperties: projected source minimum 0 does not satisfy target minimum 1',
+  ));
+});
+
 test('compatibility distinguishes extra required input properties from missing output properties', () => {
   const inputWithExtraRequirement: JsonSchema = {
     type: 'object',

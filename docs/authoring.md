@@ -143,7 +143,7 @@ authoring-lint convention is recognized.
 
 ## x.implements — advisory external interface claims
 
-x.implements is an optional extension-bag list of external interface
+When present, x.implements must be a non-empty array of external interface
 coordinates a definition claims to satisfy:
 
 ~~~yaml
