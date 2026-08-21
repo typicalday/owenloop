@@ -161,6 +161,25 @@ This check is separate from the read-only file modes applied during install. Ins
 
 An executable file installed by an older Owenloop release may already have lost its execute bit because older hardening mapped every regular file to `0444`. Reinstalling the exact original `.wnlp` is a supported atomic repair for that same-digest object. Owenloop first applies strict archive parsing, manifest and runtime admission, configured signature and policy verification, per-file integrity verification, and canonical digest verification to the supplied archive. Owenloop then reconstructs and completely verifies a clean staged object before replacing the broken destination through the normal journaled directory swap. The broken object's bytes are never reused. The prior object remains as the swap backup until the unchanged same-digest index state is durably committed; a failed repair restores the recoverable prior object and index state. A successful repair preserves the existing coordinate-to-digest mapping, and a later reinstall follows normal idempotent deduplication.
 
+## Authenticated recovery for worker store misses
+
+When a modern command or agent worker cannot resolve an exact order digest from
+either local workflow store, it performs one authenticated recovery attempt.
+Using that worker's scoped bearer, it reads raw canonical bytes from
+`GET /api/bundles/<digest>`, required publication evidence from
+`GET /api/publications/<digest>`, and optional origin evidence from
+`GET /api/origins/<digest>`, then installs only into the global store. The
+original store lookup is retried once after a successful install; a store hit
+does no hub I/O.
+
+Recovery is fail-closed. The installer compares the ingested canonical digest
+with the order digest before any object or index mutation, and the required
+pre-commit verifier validates the supplied publication/origin evidence under
+the normal policy before the journaled install can commit. Missing or malformed
+publication evidence, redirects, non-404 origin errors, body caps, timeouts,
+content mismatches, invalid signatures, or policy refusals leave the store
+unchanged and the worker reports the ordinary instruction-resolution failure.
+
 ## Bundle assets during execution
 
 When a command or agent step resolves its definition from an installed bundle,

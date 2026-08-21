@@ -1405,6 +1405,21 @@ test('reap bumps the attempts counter', () => {
   assert.equal(store.getTask(wf, 'planner', '')?.attempts, 1);
 });
 
+test('public released leases are visible as lease-churn attempts', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const order = fire(engine, wf, 'planner', 1_000 + attempt);
+    engine.close(wf, order.run, 'released');
+    assert.equal(
+      store.getTask(wf, 'planner', '')?.attempts,
+      attempt,
+      'every public handback is visible in status without changing the released outcome',
+    );
+  }
+});
+
 // ---- cadence + daily budget --------------------------------------------------
 
 test('cadence gates re-runs and the daily budget caps them', () => {

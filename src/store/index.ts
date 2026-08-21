@@ -129,6 +129,7 @@ export type {
   BundleInstallResult,
   BundleIngestor,
   BundleSource,
+  BundleVerificationEvidence,
   InstallWorkflowBundleArgs,
   PreCommitVerifier,
   RecoverWorkflowStoreArgs,

@@ -711,6 +711,54 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   assert.ok(!existsSync(join(root, '.owenloop-staging')), 'staging root cleared');
 });
 
+test('install: expected digest mismatch refuses before verifier, object, or index mutation', async () => {
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
+  const bundle = makeBundle();
+  let verifierCalls = 0;
+  const expected = defDigest('a'.repeat(64));
+
+  await assert.rejects(
+    installWorkflowBundle({
+      bytes: bundleBytes(bundle),
+      source: SRC,
+      root,
+      level: 'project',
+      lockPath,
+      journalPath,
+      recoveryMarkerDir: installMarkerDir,
+      ingestor: fakeIngestor(),
+      verifier: { verify: async () => { verifierCalls += 1; } },
+      expectedDigest: expected,
+    }),
+    /canonical bundle digest mismatch/u,
+  );
+  assert.equal(verifierCalls, 0, 'remote evidence is not trusted before exact canonical identity');
+  assert.ok(!existsSync(join(root, 'objects')), 'the mismatched object was never committed');
+  assert.deepEqual(readWorkflowStoreIndex(storeIndexPath(root)).entries, {}, 'the index remains untouched');
+});
+
+test('install: explicit remote evidence reaches the mandatory verifier', async () => {
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
+  const bundle = makeBundle();
+  const evidence = { publication: { state: 'signed' as const, dsseBytes: new Uint8Array([1, 2, 3]) } };
+  let received: unknown;
+
+  await installWorkflowBundle({
+    bytes: bundleBytes(bundle),
+    source: { kind: 'url', url: 'https://hub.example/api/bundles/widget' },
+    root,
+    level: 'project',
+    lockPath,
+    journalPath,
+    recoveryMarkerDir: installMarkerDir,
+    ingestor: fakeIngestor(),
+    verifier: { verify: async (input) => { received = input.verificationEvidence; } },
+    expectedDigest: defDigest(bundle.digest),
+    verificationEvidence: evidence,
+  });
+  assert.equal(received, evidence, 'the verifier receives exact transport evidence, not URL-derived identity');
+});
+
 test('install: a two-workflow bundle persists both names in index.json', async () => {
   const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle(

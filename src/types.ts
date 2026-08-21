@@ -356,17 +356,17 @@ export interface RunData {
    *   spend budget and restart the cadence clock, which is exactly how a
    *   `cadenceSecs` poll stays throttled.
    * - `released` — the LEASE WAS RETURNED UNUSED. Nothing ran. A server already
-   *   at its agent cap handing the claim straight back, a pickup window that
-   *   lapsed with no first contact, a born-reject re-arm. These must not spend
-   *   budget and must not touch cadence: they are not firings, they are claims
-   *   that were withdrawn.
+   *   at its agent cap handing the claim straight back or a pickup window that
+   *   lapsed with no first contact increments the task's lease-churn
+   *   `attempts`, while a private born-reject re-arm does not. All remain
+   *   outside the daily budget and cadence: they are not firings, they are
+   *   claims that were withdrawn.
    *
    * Conflating them stalled a live run. Six capacity handbacks against a step
    * declaring `maxRunsPerDay: 6` spent the whole allowance before it executed
    * once; the engine then deferred it `daily-budget` until local midnight while
-   * its artifact still read `attemptsUsed: 0`, because the release path already
-   * declines to bump attempts for precisely this reason. A released lease is
-   * not an attempt. It is not a run, either.
+   * its artifact still read `attemptsUsed: 0`. Lease-churn attempts are status
+   * telemetry, not the rework budget (`judgmentRejects`) and not a run.
    */
   outcome?: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped';
   summary?: string;

@@ -3014,7 +3014,10 @@ export class Engine {
           step: r.step,
           key: r.key ?? '',
           status: 'idle',
-          attempts: task.attempts,
+	  // A public close hands back a real claimed lease. Count the churn so
+	  // pickup-window lapses and explicit holder releases are visible in
+	  // instance status; released runs still remain outside run budgets.
+	  attempts: outcome === 'released' ? task.attempts + 1 : task.attempts,
           ...(task.alarmAt !== undefined ? { alarmAt: task.alarmAt } : {}),
         });
       }

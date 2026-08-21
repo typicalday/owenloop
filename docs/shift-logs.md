@@ -275,6 +275,11 @@ expiry, and `agent-lane-closed` reasons return the claim to the hub; malformed
 and unsupported reasons leave it for the pickup window. `message` is human
 text — match on `reason`, display `message`.
 
+For a dropped modern order, the claim is intentionally left for the hub's
+pickup window. When that window lapses the public released-lease close records
+lease churn by incrementing the task `attempts` shown in status; it does not
+turn the released row into a daily/cadence run or a judgment rework attempt.
+
 ### The first record is self-describing
 
 A shift's first record is `parked`, and it exists so a reader holding only the

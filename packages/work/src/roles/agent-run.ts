@@ -77,6 +77,7 @@
 import '../harnesses.ts';
 // ─────────────────────────────────────────────────────────────────────────────
 import { hostname } from 'node:os';
+import { join } from 'node:path';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import {
@@ -86,6 +87,7 @@ import {
   type CrewRosterResolution,
 } from '../agent/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
+import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
@@ -327,14 +329,6 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   const instructionCwd = deps.cwd ?? process.cwd();
   let instructions = deps.instructions;
-  if (instructions === undefined) {
-    try {
-      instructions = createDefaultStoreInstructionResolver({ cwd: instructionCwd, env, consumedVerifier });
-    } catch (e) {
-      err(`owenloop work agent-run: instruction store unavailable: ${errMsg(e)}`);
-      return 1;
-    }
-  }
 
   let cacheDir: string;
   try {
@@ -387,14 +381,43 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return { ok: true, rosters };
   };
   let hub = deps.hub;
-  if (hub === undefined) {
+  let token: string | undefined;
+  // Production resolution needs the same scoped bearer for the authenticated
+  // recovery hook. Fully injected tests/embedders keep their no-auth path.
+  if (hub === undefined || instructions === undefined) {
     const bearer = await resolveBearer({ origin, account, env: workerEnv });
     if (!bearer.ok) {
       err(`owenloop work agent-run: ${bearer.message}`);
       return bearer.code;
     }
-    const token = bearer.token;
-    hub = createHubClient({ origin, getToken: async () => token });
+    token = bearer.token;
+  }
+  if (instructions === undefined) {
+    try {
+      const home = [workerEnv.HOME, workerEnv.USERPROFILE].find(
+	(value) => value !== undefined && value.trim() !== '',
+      );
+      if (home === undefined) throw new Error('cannot locate the global workflow store: set HOME or USERPROFILE');
+      instructions = createDefaultStoreInstructionResolver({
+	cwd: instructionCwd,
+	env: workerEnv,
+	consumedVerifier,
+	onMissing: createHubBundleRecoveryHandler({
+	  origin,
+	  token: token!,
+	  home,
+	  projectRoot: join(instructionCwd, 'workflows'),
+	  env: workerEnv,
+	  warn: (line) => err(`owenloop work agent-run: ${line}`),
+	}),
+      });
+    } catch (e) {
+      err(`owenloop work agent-run: instruction store unavailable: ${errMsg(e)}`);
+      return 1;
+    }
+  }
+  if (hub === undefined) {
+    hub = createHubClient({ origin, getToken: async () => token! });
   }
   const client = hub;
 

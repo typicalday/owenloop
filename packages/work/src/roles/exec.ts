@@ -32,6 +32,7 @@
  * is the contract. Exit codes are documented in `src/usage.ts`.
  */
 import { hostname } from 'node:os';
+import { join } from 'node:path';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
@@ -39,6 +40,7 @@ import { resolveAllowedWorkdirRoots } from '../agent/workdir.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createExecLoop, type ExecOutcome } from '../exec/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
+import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createDefaultRunner, type CommandRunner } from '../exec/runner.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import { resolveShiftId, resolveTarget } from './hold.ts';
@@ -224,16 +226,6 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // independently launched `owenloop work exec` therefore honours the settings
   // file on its own, with no shift involved.
   const allowedWorkdirRoots = resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, cwd);
-  let instructions = deps.instructions;
-  if (instructions === undefined) {
-    try {
-      instructions = createDefaultStoreInstructionResolver({ cwd, env, consumedVerifier });
-    } catch (e) {
-      err(`owenloop work exec: instruction store unavailable: ${errMsg(e)}`);
-      return 1;
-    }
-  }
-
   const account = env['OWENLOOP_ACCOUNT'] ?? 'default';
   const bearer = await resolveBearer({ origin, account, env });
   if (!bearer.ok) {
@@ -241,6 +233,32 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return bearer.code;
   }
   const token = bearer.token;
+
+  let instructions = deps.instructions;
+  if (instructions === undefined) {
+    try {
+      const home = [env.HOME, env.USERPROFILE].find(
+	(value) => value !== undefined && value.trim() !== '',
+      );
+      if (home === undefined) throw new Error('cannot locate the global workflow store: set HOME or USERPROFILE');
+      instructions = createDefaultStoreInstructionResolver({
+	cwd,
+	env,
+	consumedVerifier,
+	onMissing: createHubBundleRecoveryHandler({
+	  origin,
+	  token,
+	  home,
+	  projectRoot: join(cwd, 'workflows'),
+	  env,
+	  warn: (line) => err(`owenloop work exec: ${line}`),
+	}),
+      });
+    } catch (e) {
+      err(`owenloop work exec: instruction store unavailable: ${errMsg(e)}`);
+      return 1;
+    }
+  }
 
   const shiftId = resolveShiftId(parsed.shift, env);
   const holder: ContactHolder = {

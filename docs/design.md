@@ -818,6 +818,16 @@ opinion about the artifact's quality — it's a fact about worker
 availability, and the two must stay uncorrelated so a flaky judge worker
 cannot exhaust the producer's `maxAttempts` budget on its own.
 
+### §24.5.1 Released lease churn
+
+A public `Engine.close(..., 'released')` returns a claimed lease without
+counting a run for daily-budget or cadence purposes, but increments the task's
+`attempts` status field. This makes repeated pickup-window lapses and explicit
+holder/capacity handbacks visible in instance status. It remains lease-churn
+telemetry: it does not affect `judgmentRejects`, which is the rework budget.
+The private born-reject/CAS-stale release remains excluded because that firing
+was invalidated before it became a holder lease attempt.
+
 ### §24.6 Human override
 
 Two human-facing bypass points, both reusing the existing `green`/`retry`
