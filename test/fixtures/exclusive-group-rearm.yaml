@@ -1,0 +1,21 @@
+# Incident-shaped route: a mentor can reject the consult winner, at which
+# point the exclusive `pr` sibling must return to owed without input movement.
+name: exclusive-group-rearm
+inputs:
+  - name: proposal
+steps:
+  - name: router
+    consumes: [proposal]
+    produces:
+      - pr
+      - consultRequest
+      - branchA
+      - branchB
+      - { group: route, mode: atMostOne, of: [pr, consultRequest] }
+      - { group: structural-control, mode: atMostOne, of: [branchA, branchB] }
+  - name: checks
+    consumes: [pr]
+    produces: [localChecks]
+  - name: mentor
+    consumes: [consultRequest]
+    produces: [advice]

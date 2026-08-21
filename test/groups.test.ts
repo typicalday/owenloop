@@ -15,12 +15,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 import { Engine } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { ArtifactData, WorkflowDef } from '../src/types.ts';
-import { buildDef, validateDef } from '../src/defs.ts';
+import { buildDef, loadDefFile, validateDef } from '../src/defs.ts';
 import { applyOutcome, eligibleFirings, modelCheck, settleInMemory } from '../src/model.ts';
 
 // ---- fixture def --------------------------------------------------------------
@@ -52,6 +53,10 @@ function routerDef(mode: 'exactlyOne' | 'atMostOne' | 'atLeastOne' = 'exactlyOne
       { name: 'handleUrgent', consumes: ['urgent'], produces: ['urgentDone'], maxSchemaFailures: 0, maxAttempts: 1000 },
     ],
   });
+}
+
+function exclusiveGroupRearmDef(): WorkflowDef {
+  return loadDefFile(fileURLToPath(new URL('./fixtures/exclusive-group-rearm.yaml', import.meta.url)));
 }
 
 function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
@@ -283,6 +288,7 @@ test('groups: (e) rejecting the winner re-arms the auto-skipped sibling (cascade
 
   // the ticket is re-triaged: reject the winner, re-fire triage, this time producing urgent
   engine.reject(wf, 'simple', 'human', 're-triage: now urgent');
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'owed');
   const triageRun2 = fire(engine, wf, 'triage').run;
   engine.green(wf, triageRun2, 'urgent', { ok: true });
   engine.close(wf, triageRun2);
@@ -294,6 +300,77 @@ test('groups: (e) rejecting the winner re-arms the auto-skipped sibling (cascade
   const t = engine.tick(wf);
   assert.ok(t.orders.some((o) => o.step === 'handleUrgent'));
   assert.ok(t.orders.every((o) => o.step !== 'handleSimple'));
+});
+
+test('groups: fixture — an atMostOne winner removal revives only its exclusive sibling and downstream recovers on re-green', () => {
+  const d = exclusiveGroupRearmDef();
+  assert.deepEqual(validateDef(d), []);
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance(d.name, { provide: { proposal: { text: 'route this' } } });
+
+  const firstRouterRun = fire(engine, wf, 'router').run;
+  // This separate winnerless group records ordinary routing skips. They must
+  // remain skipped when a route-group winner is later removed.
+  engine.skip(wf, 'branchA', 'router', 'not selected');
+  engine.skip(wf, 'branchB', 'router', 'not selected');
+  assert.equal(getArt(store, wf, 'branchA')?.reasons.at(-1)?.kind, 'structural');
+  assert.equal(getArt(store, wf, 'branchB')?.reasons.at(-1)?.kind, 'structural');
+
+  assert.equal(engine.green(wf, firstRouterRun, 'consultRequest', { question: 'review this route' }).outcome, 'green');
+  engine.close(wf, firstRouterRun);
+  const skippedPr = getArt(store, wf, 'pr');
+  assert.equal(skippedPr?.acceptance, 'skipped');
+  assert.equal(skippedPr?.reasons.at(-1)?.action, 'skip');
+  assert.equal(skippedPr?.reasons.at(-1)?.kind, 'exclusive');
+  assert.equal(getArt(store, wf, 'localChecks')?.acceptance, 'skipped');
+
+  // A later tick does not weaken the winner-present auto-skip. Close the
+  // mentor order it may claim; the rejection below is the state transition
+  // under test, not a claimed-run behavior test.
+  const retained = engine.tick(wf);
+  assert.equal(getArt(store, wf, 'pr')?.acceptance, 'skipped');
+  assert.equal(getArt(store, wf, 'pr')?.reasons.at(-1)?.kind, 'exclusive');
+  for (const order of retained.orders) engine.close(wf, order.run);
+
+  engine.reject(wf, 'consultRequest', 'human', 'mentor sent it back');
+  const revivedPr = getArt(store, wf, 'pr');
+  assert.equal(revivedPr?.acceptance, 'owed');
+  assert.equal(revivedPr?.version, 0, 'exclusive rearm does not bump the sibling version');
+  assert.equal(getArt(store, wf, 'localChecks')?.acceptance, 'skipped', 'descendants remain movement-gated');
+  for (const stem of ['branchA', 'branchB']) {
+    const branch = getArt(store, wf, stem);
+    assert.equal(branch?.acceptance, 'skipped');
+    assert.equal(branch?.reasons.at(-1)?.kind, 'structural');
+  }
+
+  // Once the revived sibling is actually greened, its version changes and the
+  // existing generic fingerprint path re-arms its structural descendant.
+  const secondRouterRun = fire(engine, wf, 'router').run;
+  assert.equal(engine.green(wf, secondRouterRun, 'pr', { url: 'https://example.test/pr/1' }).outcome, 'green');
+  engine.close(wf, secondRouterRun);
+  assert.equal(getArt(store, wf, 'localChecks')?.acceptance, 'owed');
+  const checksRun = fire(engine, wf, 'checks').run;
+  assert.equal(engine.green(wf, checksRun, 'localChecks', { passed: true }).outcome, 'green');
+  engine.close(wf, checksRun);
+
+  // Pure checker parity: its exclusive skip marker must lead to the same
+  // settled owed sibling after the mentor's judgment-reject transition.
+  let mem = new Map<string, ArtifactData>([
+    ['proposal', {
+      workflow: '', path: 'proposal', producer: 'human', acceptance: 'green', version: 1,
+      reasons: [], judgmentRejects: 0, schemaRejects: 0,
+    }],
+  ]);
+  mem = settleInMemory(d, mem);
+  const routeFiring = eligibleFirings(d, mem).find((f) => f.step === 'router');
+  assert.ok(routeFiring, 'router should be eligible in the initial modeled state');
+  mem = applyOutcome(d, mem, { ...routeFiring!, outputs: ['consultRequest'] }, 'green', { maxCollectionSize: 2 })[0]!;
+  assert.equal(mem.get('pr')?.acceptance, 'skipped');
+  assert.equal(mem.get('pr')?.reasons.at(-1)?.kind, 'exclusive');
+  const mentorFiring = eligibleFirings(d, mem).find((f) => f.step === 'mentor');
+  assert.ok(mentorFiring, 'mentor should consume the green consult request');
+  mem = applyOutcome(d, mem, mentorFiring!, 'judgment-reject', { maxCollectionSize: 2 })[0]!;
+  assert.equal(mem.get('pr')?.acceptance, 'owed');
 });
 
 // ---- (f) judges interaction: group refusal gates the judge-approve moment ------
@@ -469,18 +546,16 @@ test('groups: (f4) rejecting the winner re-arms the ex-submitted skipped sibling
   assert.equal(skipped?.acceptance, 'skipped');
   assert.equal(skipped?.approvals, undefined, 'approvals must be cleared on the skipped ex-submitted artifact');
 
-  // the winner is later rejected — 'ticket' itself never moves (only 'simple'
-  // does), so the fingerprint-gated §16.1 rearm loop does not flip 'urgent'
-  // to 'owed' by itself (mirrors (e): the sibling stays exactly as settle left
-  // it — skipped, approvals-clean — until re-triage directly re-produces it).
-  // Re-triage fires because the now-rejected 'simple' is once again a debt.
+  // The winner is later rejected. The exclusive-sibling inverse immediately
+  // re-arms urgent without moving ticket; its cleared approvals ledger stays
+  // cleared until the new submission.
   engine.reject(wf, 'simple', 'human', 're-triage: now urgent');
   t = engine.tick(wf, { now: Date.now() });
   const triageRun2 = t.orders.find((o) => o.step === 'triage')!.run;
 
   const beforeResubmit = getArt(store, wf, 'urgent');
-  assert.equal(beforeResubmit?.acceptance, 'skipped');
-  assert.equal(beforeResubmit?.approvals, undefined, 'skipped artifact must still have a clean approvals ledger');
+  assert.equal(beforeResubmit?.acceptance, 'owed');
+  assert.equal(beforeResubmit?.approvals, undefined, 're-armed artifact must still have a clean approvals ledger');
 
   const resubmitRes = engine.green(wf, triageRun2, 'urgent', { ok: true });
   assert.equal(resubmitRes.outcome, 'submitted');
@@ -719,10 +794,10 @@ test('groups: (i) a human retry of a group-blocked judged sibling is still suppr
   );
 
   // Knock the winner down — the real, documented lever: un-green the winner,
-  // not a retry bypass. 'urgent' stays skipped (its own required inputs never
-  // moved), but 'triage' becomes eligible again since 'simple' is no longer a
-  // group-blocking winner — the next tick re-fires triage itself.
+  // not a retry bypass. The exclusively skipped sibling re-arms immediately;
+  // triage is then eligible because 'simple' is no longer group-blocking.
   engine.reject(wf, 'simple', 'human', 're-triage');
+  assert.equal(store.getArtifact(wf, 'urgent')?.acceptance, 'owed');
   t = engine.tick(wf);
   assert.ok(t.orders.some((o) => o.step === 'triage'));
 });
