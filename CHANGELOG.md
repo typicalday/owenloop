@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.12](https://github.com/typicalday/owenloop/compare/v0.5.11...v0.5.12) (2026-08-21)
+
+
+### Bug Fixes
+
+* **engine:** count callsInputs wiring as a consumer in the dead-end lint ([#265](https://github.com/typicalday/owenloop/issues/265)) ([9d2df92](https://github.com/typicalday/owenloop/commit/9d2df92c5cd18418b5eaee170e2d7c9099521f18))
+
 ## [0.5.11](https://github.com/typicalday/owenloop/compare/v0.5.10...v0.5.11) (2026-08-21)
 
 
