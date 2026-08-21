@@ -69,6 +69,273 @@ const investigateReport: JsonSchema = {
   additionalProperties: false,
 };
 
+// Fully resolved public-report fixtures copied from owenloop-playbooks@45f95d2
+// (workflows/investigate.yaml and workflows/research.yaml). They stay local so
+// this suite does not depend on a sibling checkout at runtime.
+const pinnedInvestigateScope: JsonSchema = {
+  type: 'object',
+  required: ['question', 'includedAreas', 'excludedAreas'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    includedAreas: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 3,
+      items: {
+	type: 'object',
+	required: ['id', 'question', 'rationale', 'decisionIndex'],
+	properties: {
+	  id: { type: 'string', minLength: 1 },
+	  question: { type: 'string', minLength: 1 },
+	  rationale: { type: 'string', minLength: 1 },
+	  decisionIndex: { type: 'integer', minimum: 0 },
+	},
+	additionalProperties: false,
+      },
+    },
+    excludedAreas: {
+      type: 'array',
+      items: {
+	type: 'object',
+	required: ['subject', 'reason', 'decisionIndex'],
+	properties: {
+	  subject: { type: 'string', minLength: 1 },
+	  reason: { type: 'string', minLength: 1 },
+	  decisionIndex: { type: 'integer', minimum: 0 },
+	},
+	additionalProperties: false,
+      },
+    },
+  },
+  additionalProperties: false,
+};
+
+const pinnedInvestigateEvidencePointer: JsonSchema = {
+  oneOf: [
+    {
+      type: 'object',
+      required: ['kind', 'path', 'line'],
+      properties: {
+	kind: { const: 'file-line' },
+	path: { type: 'string', minLength: 1 },
+	line: { type: 'integer', minimum: 1 },
+	endLine: { type: 'integer', minimum: 1 },
+      },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['kind', 'path'],
+      properties: { kind: { const: 'path' }, path: { type: 'string', minLength: 1 } },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['kind', 'receiptRef'],
+      properties: { kind: { const: 'command-receipt' }, receiptRef: { type: 'string', minLength: 1 } },
+      additionalProperties: false,
+    },
+  ],
+};
+
+const pinnedInvestigateFinding: JsonSchema = {
+  type: 'object',
+  required: ['id', 'areaId', 'claim', 'evidence'],
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    areaId: { type: 'string', minLength: 1 },
+    claim: { type: 'string', minLength: 1 },
+    evidence: { type: 'array', minItems: 1, items: pinnedInvestigateEvidencePointer },
+  },
+  additionalProperties: false,
+};
+
+const pinnedInvestigateGap: JsonSchema = {
+  type: 'object',
+  required: ['areaId', 'question', 'reason'],
+  properties: {
+    areaId: { type: 'string', minLength: 1 },
+    question: { type: 'string', minLength: 1 },
+    reason: { type: 'string', minLength: 1 },
+  },
+  additionalProperties: false,
+};
+
+const pinnedInvestigateReport: JsonSchema = {
+  type: 'object',
+  required: ['question', 'answer', 'scope', 'findings', 'gaps'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    answer: { type: 'string', minLength: 1 },
+    scope: pinnedInvestigateScope,
+    findings: { type: 'array', items: pinnedInvestigateFinding },
+    gaps: { type: 'array', items: pinnedInvestigateGap },
+  },
+  additionalProperties: false,
+};
+
+const pinnedResearchScope: JsonSchema = {
+  type: 'object',
+  required: ['question', 'constraints', 'areas', 'excludedAreas'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    target: { type: 'string', minLength: 1 },
+    constraints: { type: 'array', items: { type: 'string', minLength: 1 } },
+    areas: {
+      type: 'array',
+      minItems: 3,
+      maxItems: 3,
+      items: {
+	type: 'object',
+	required: ['ordinal', 'id', 'question', 'rationale'],
+	properties: {
+	  ordinal: { type: 'integer', enum: [1, 2, 3] },
+	  id: { enum: ['area-one', 'area-two', 'area-three'] },
+	  question: { type: 'string', minLength: 1 },
+	  rationale: { type: 'string', minLength: 1 },
+	},
+	additionalProperties: false,
+      },
+    },
+    excludedAreas: {
+      type: 'array',
+      items: {
+	type: 'object',
+	required: ['subject', 'reason'],
+	properties: {
+	  subject: { type: 'string', minLength: 1 },
+	  reason: { type: 'string', minLength: 1 },
+	},
+	additionalProperties: false,
+      },
+    },
+  },
+  additionalProperties: false,
+};
+
+const pinnedResearchEvidence: JsonSchema = {
+  oneOf: [
+    {
+      type: 'object',
+      required: ['kind', 'url'],
+      properties: {
+	kind: { const: 'url' },
+	url: { type: 'string', minLength: 1 },
+	title: { type: 'string', minLength: 1 },
+      },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['kind', 'path', 'line'],
+      properties: {
+	kind: { const: 'file-line' },
+	path: { type: 'string', minLength: 1 },
+	line: { type: 'integer', minimum: 1 },
+	endLine: { type: 'integer', minimum: 1 },
+      },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['kind', 'path'],
+      properties: { kind: { const: 'path' }, path: { type: 'string', minLength: 1 } },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['kind', 'receiptRef'],
+      properties: { kind: { const: 'command-receipt' }, receiptRef: { type: 'string', minLength: 1 } },
+      additionalProperties: false,
+    },
+  ],
+};
+
+const pinnedResearchFinding: JsonSchema = {
+  type: 'object',
+  required: ['id', 'claim', 'evidence'],
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    claim: { type: 'string', minLength: 1 },
+    evidence: { type: 'array', minItems: 1, items: pinnedResearchEvidence },
+  },
+  additionalProperties: false,
+};
+
+const pinnedResearchGap: JsonSchema = {
+  type: 'object',
+  required: ['question', 'reason'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    reason: { type: 'string', minLength: 1 },
+  },
+  additionalProperties: false,
+};
+
+const pinnedResearchAreaResult: JsonSchema = {
+  type: 'object',
+  required: ['ordinal', 'areaId', 'question', 'summary', 'findings', 'gaps'],
+  properties: {
+    ordinal: { type: 'integer', enum: [1, 2, 3] },
+    areaId: { enum: ['area-one', 'area-two', 'area-three'] },
+    question: { type: 'string', minLength: 1 },
+    summary: { type: 'string', minLength: 1 },
+    findings: { type: 'array', items: pinnedResearchFinding },
+    gaps: { type: 'array', items: pinnedResearchGap },
+  },
+  anyOf: [
+    { properties: { findings: { minItems: 1 } } },
+    { properties: { gaps: { minItems: 1 } } },
+  ],
+  additionalProperties: false,
+};
+
+const pinnedResearchReport: JsonSchema = {
+  type: 'object',
+  required: ['question', 'answer', 'scope', 'areaResults', 'conclusions', 'gaps'],
+  properties: {
+    question: { type: 'string', minLength: 1 },
+    answer: { type: 'string', minLength: 1 },
+    scope: pinnedResearchScope,
+    areaResults: { type: 'array', minItems: 3, maxItems: 3, items: pinnedResearchAreaResult },
+    conclusions: {
+      type: 'array',
+      items: {
+	type: 'object',
+	required: ['claim', 'findingIds'],
+	properties: {
+	  claim: { type: 'string', minLength: 1 },
+	  findingIds: {
+	    type: 'array',
+	    minItems: 1,
+	    uniqueItems: true,
+	    items: { type: 'string', minLength: 1 },
+	  },
+	},
+	additionalProperties: false,
+      },
+    },
+    gaps: {
+      type: 'array',
+      items: {
+	type: 'object',
+	required: ['areaId', 'question', 'reason'],
+	properties: {
+	  areaId: { enum: ['area-one', 'area-two', 'area-three'] },
+	  question: { type: 'string', minLength: 1 },
+	  reason: { type: 'string', minLength: 1 },
+	},
+	additionalProperties: false,
+      },
+    },
+  },
+  anyOf: [
+    { properties: { conclusions: { minItems: 1 } } },
+    { properties: { gaps: { minItems: 1 } } },
+  ],
+  additionalProperties: false,
+};
+
 const reportInterface: WorkflowInterfaceSignature = {
   inputs: [{ name: 'request', schema: requestSchema }],
   outputs: [{
@@ -99,6 +366,25 @@ function reportDef(name: string, inputSchema: JsonSchema = requestSchema, report
       terminal: true,
     }],
   });
+}
+
+function outputOnlyDef(name: string, schema: JsonSchema) {
+  return buildDef({
+    name,
+    outputs: ['report'],
+    steps: [{
+      name: 'reporter',
+      produces: [{ name: 'report', schema }],
+      terminal: true,
+    }],
+  });
+}
+
+function outputCompatibility(source: JsonSchema, target: JsonSchema) {
+  return checkInterfaceCompatibility({
+    inputs: [],
+    outputs: [{ name: 'report', schema: target }],
+  }, outputOnlyDef('output-compatibility', source));
 }
 
 function messages(signature: WorkflowInterfaceSignature, def = reportDef('compat-fixture')): string[] {
@@ -367,11 +653,158 @@ test('compatibility fails closed for missing schemas, primitives, booleans, open
     (issue) => issue.includes('unprovable open-property surface'),
   ));
 
-  const unsupported: WorkflowInterfaceSignature = {
-    inputs: [{ name: 'request', schema: { oneOf: [{ type: 'string' }, { type: 'number' }] } }],
-    outputs: [],
+});
+
+test('compatibility recursively validates oneOf, anyOf, and uniqueItems values', () => {
+  const invalidSchemas: Array<[string, JsonSchema, string]> = [
+    ['non-array oneOf', { oneOf: {} }, 'outputs[0].schema.oneOf'],
+    ['empty oneOf', { oneOf: [] }, 'outputs[0].schema.oneOf'],
+    ['non-array anyOf', { anyOf: {} }, 'outputs[0].schema.anyOf'],
+    ['empty anyOf', { anyOf: [] }, 'outputs[0].schema.anyOf'],
+    ['non-schema branch', { oneOf: [42] }, 'outputs[0].schema.oneOf[0]'],
+    ['invalid nested branch', { anyOf: [{ type: 42 }] }, 'outputs[0].schema.anyOf[0].type'],
+    ['non-boolean uniqueItems', { type: 'array', uniqueItems: 'yes' }, 'outputs[0].schema.uniqueItems'],
+  ];
+
+  for (const [label, invalidSchema, path] of invalidSchemas) {
+    const result = outputCompatibility({ type: 'string' }, invalidSchema);
+    assert.ok(result.issues.some((issue) => issue.path === path), label);
+  }
+});
+
+test('compatibility is reflexive for pinned investigate and research public reports', () => {
+  for (const [name, report] of [
+    ['investigate', pinnedInvestigateReport],
+    ['research', pinnedResearchReport],
+  ] as const) {
+    const interfaceSchema = structuredClone(report);
+    const implementationSchema = structuredClone(report);
+    assert.notStrictEqual(interfaceSchema, implementationSchema);
+    const result = outputCompatibility(implementationSchema, interfaceSchema);
+    assert.equal(result.compatible, true, name);
+    assert.deepEqual(result.issues, [], name);
+  }
+});
+
+test('compatibility rejects a source covered by overlapping target oneOf branches', () => {
+  const source: JsonSchema = {
+    type: 'object',
+    required: ['value'],
+    properties: { value: { type: 'string', minLength: 1 } },
+    additionalProperties: false,
   };
-  assert.ok(messages(unsupported).some((issue) => issue.includes('oneOf: unsupported JSON Schema keyword')));
+  const target: JsonSchema = {
+    oneOf: [
+      {
+	type: 'object',
+	required: ['value'],
+	properties: { value: { type: 'string' } },
+	additionalProperties: false,
+      },
+      {
+	type: 'object',
+	required: ['value'],
+	properties: { value: { type: 'string', minLength: 1 } },
+	additionalProperties: false,
+      },
+    ],
+  };
+
+  const result = outputCompatibility(source, target);
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some((issue) => issue.path === 'outputs.report.schema.oneOf'));
+});
+
+test('compatibility accepts a target oneOf with required const discriminators', () => {
+  const target: JsonSchema = {
+    oneOf: [
+      {
+	type: 'object',
+	required: ['kind', 'path'],
+	properties: {
+	  kind: { const: 'path' },
+	  path: { type: 'string', minLength: 1 },
+	},
+	additionalProperties: false,
+      },
+      {
+	type: 'object',
+	required: ['kind', 'receiptRef'],
+	properties: {
+	  kind: { const: 'command-receipt' },
+	  receiptRef: { type: 'string', minLength: 1 },
+	},
+	additionalProperties: false,
+      },
+    ],
+  };
+  const source = structuredClone((target as { oneOf: JsonSchema[] }).oneOf[0]!);
+
+  const result = outputCompatibility(source, target);
+  assert.equal(result.compatible, true);
+  assert.deepEqual(result.issues, []);
+});
+
+test('compatibility rejects a target oneOf with optional discriminators', () => {
+  const source: JsonSchema = {
+    type: 'object',
+    properties: { kind: { const: 'path' } },
+    additionalProperties: false,
+  };
+  const target: JsonSchema = {
+    oneOf: [
+      { type: 'object', properties: { kind: { const: 'path' } }, additionalProperties: false },
+      { type: 'object', properties: { kind: { const: 'command-receipt' } }, additionalProperties: false },
+    ],
+  };
+
+  const result = outputCompatibility(source, target);
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some((issue) => issue.path === 'outputs.report.schema.oneOf'));
+});
+
+test('compatibility rejects a union branch without target coverage', () => {
+  const source: JsonSchema = { anyOf: [{ type: 'string', const: 'unmatched' }] };
+  const target: JsonSchema = { anyOf: [{ type: 'string', const: 'matched' }] };
+
+  const result = outputCompatibility(source, target);
+  assert.equal(result.compatible, false);
+  assert.ok(result.issues.some((issue) => issue.path === 'outputs.report.schema.anyOf[0]'));
+});
+
+test('compatibility applies uniqueItems narrowing directionally', () => {
+  const duplicatePermitting: JsonSchema = { type: 'array', items: { type: 'string' } };
+  const uniqueOnly: JsonSchema = { type: 'array', uniqueItems: true, items: { type: 'string' } };
+
+  assert.equal(outputCompatibility(uniqueOnly, uniqueOnly).compatible, true);
+  const duplicateSource = outputCompatibility(duplicatePermitting, uniqueOnly);
+  assert.equal(duplicateSource.compatible, false);
+  assert.ok(duplicateSource.issues.some((issue) => issue.path === 'outputs.report.schema.uniqueItems'));
+  assert.equal(outputCompatibility(uniqueOnly, duplicatePermitting).compatible, true);
+});
+
+test('compatibility keeps every out-of-scope JSON Schema keyword unsupported', () => {
+  const unsupportedKeywords: Array<[string, unknown]> = [
+    ['allOf', [{ type: 'string' }]],
+    ['if', { type: 'string' }],
+    ['then', { type: 'string' }],
+    ['else', { type: 'string' }],
+    ['not', { type: 'string' }],
+    ['$ref', '#/definitions/value'],
+    ['prefixItems', [{ type: 'string' }]],
+    ['patternProperties', { value: { type: 'string' } }],
+    ['contains', { type: 'string' }],
+    ['dependentRequired', { value: ['other'] }],
+    ['dependentSchemas', { value: { type: 'string' } }],
+    ['multipleOf', 1],
+  ];
+
+  for (const [keyword, value] of unsupportedKeywords) {
+    const result = outputCompatibility({ type: 'string' }, { [keyword]: value });
+    assert.ok(result.issues.some(
+      (issue) => issue.path === `outputs[0].schema.${keyword}` && issue.message.endsWith('unsupported JSON Schema keyword'),
+    ), keyword);
+  }
 });
 
 test('compatibility reports missing implementation artifact schemas and workflow-level extra inputs', () => {

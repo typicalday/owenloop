@@ -52,6 +52,10 @@ const ANNOTATION_KEYWORDS = new Set([
   '$dynamicAnchor',
 ]);
 
+/**
+ * This is a syntax/value allowlist, not a guarantee that every accepted
+ * composition can be structurally proved safe by schemaSubset.
+ */
 const SUPPORTED_KEYWORDS = new Set([
   'type',
   'const',
@@ -66,12 +70,15 @@ const SUPPORTED_KEYWORDS = new Set([
   'format',
   'minItems',
   'maxItems',
+  'uniqueItems',
   'items',
   'minProperties',
   'maxProperties',
   'properties',
   'required',
   'additionalProperties',
+  'oneOf',
+  'anyOf',
 ]);
 
 function isMap(value: unknown): value is SchemaObject {
@@ -84,6 +91,10 @@ function isJsonSchema(value: unknown): value is JsonSchema {
 
 function joinPath(path: string, segment: string): string {
   return path === '' ? segment : path + '.' + segment;
+}
+
+function indexedPath(path: string, index: number): string {
+  return path + '[' + index + ']';
 }
 
 function message(path: string, text: string): InterfaceCompatibilityIssue {
@@ -331,6 +342,12 @@ function validateSchema(schema: JsonSchema, path: string, issues: InterfaceCompa
 	  valid = false;
 	}
 	break;
+      case 'uniqueItems':
+	if (typeof value !== 'boolean') {
+	  issues.push(message(fieldPath, 'expected a boolean'));
+	  valid = false;
+	}
+	break;
       case 'pattern':
 	if (typeof value !== 'string') {
 	  issues.push(message(fieldPath, 'expected a string'));
@@ -348,6 +365,19 @@ function validateSchema(schema: JsonSchema, path: string, issues: InterfaceCompa
 	if (typeof value !== 'string') {
 	  issues.push(message(fieldPath, 'expected a string'));
 	  valid = false;
+	}
+	break;
+      case 'oneOf':
+      case 'anyOf':
+	if (!Array.isArray(value) || value.length === 0) {
+	  issues.push(message(fieldPath, 'expected a non-empty array'));
+	  valid = false;
+	  break;
+	}
+	for (const [index, entry] of value.entries()) {
+	  const branchPath = indexedPath(fieldPath, index);
+	  const branch = schemaAt(entry, branchPath, issues);
+	  if (branch === undefined || !validateSchema(branch, branchPath, issues)) valid = false;
 	}
 	break;
       case 'items': {
@@ -404,6 +434,136 @@ function isClosed(schema: SchemaObject): boolean {
   return schema.additionalProperties === false;
 }
 
+const UNION_KEYWORDS = ['oneOf', 'anyOf'] as const;
+type UnionKeyword = typeof UNION_KEYWORDS[number];
+
+type UnionBranchSet = {
+  keyword: UnionKeyword;
+  branches: JsonSchema[];
+};
+
+function unionBranches(schema: SchemaObject, keyword: UnionKeyword): JsonSchema[] | undefined {
+  const value = schema[keyword];
+  if (!Array.isArray(value) || value.length === 0 || value.some((branch) => !isJsonSchema(branch))) return undefined;
+  return value as JsonSchema[];
+}
+
+function unionBranchSets(schema: SchemaObject): UnionBranchSet[] {
+  const sets: UnionBranchSet[] = [];
+  for (const keyword of UNION_KEYWORDS) {
+    const branches = unionBranches(schema, keyword);
+    if (branches !== undefined) sets.push({ keyword, branches });
+  }
+  return sets;
+}
+
+function requiredNames(schema: SchemaObject): Set<string> {
+  const required = schema.required;
+  return Array.isArray(required) && required.every((name) => typeof name === 'string')
+    ? new Set(required)
+    : new Set();
+}
+
+function discriminatorValues(schema: JsonSchema): unknown[] | undefined {
+  const object = schemaObject(schema);
+  if (object === undefined) return undefined;
+  return effectiveValues(object, 'discriminator', []);
+}
+
+function branchesAreDisjoint(source: JsonSchema, target: JsonSchema): boolean {
+  const sourceObject = schemaObject(source);
+  const targetObject = schemaObject(target);
+  if (sourceObject === undefined || targetObject === undefined) return false;
+
+  const sourceProperties = sourceObject.properties;
+  const targetProperties = targetObject.properties;
+  if (!isMap(sourceProperties) || !isMap(targetProperties)) return false;
+
+  const sourceRequired = requiredNames(sourceObject);
+  const targetRequired = requiredNames(targetObject);
+  for (const property of Object.keys(sourceProperties)) {
+    if (!sourceRequired.has(property) || !targetRequired.has(property) || !Object.hasOwn(targetProperties, property)) continue;
+    const sourceValues = discriminatorValues(sourceProperties[property] as JsonSchema);
+    const targetValues = discriminatorValues(targetProperties[property] as JsonSchema);
+    if (sourceValues === undefined || targetValues === undefined) continue;
+    const targetValueKeys = new Set(targetValues.map(stableJson));
+    if (sourceValues.every((value) => !targetValueKeys.has(stableJson(value)))) return true;
+  }
+  return false;
+}
+
+function targetOneOfIsDisjoint(branches: JsonSchema[]): boolean {
+  for (let left = 0; left < branches.length; left += 1) {
+    for (let right = left + 1; right < branches.length; right += 1) {
+      const leftBranch = branches[left];
+      const rightBranch = branches[right];
+      if (leftBranch === undefined || rightBranch === undefined || !branchesAreDisjoint(leftBranch, rightBranch)) return false;
+    }
+  }
+  return true;
+}
+
+function isSubsetOfOneBranch(
+  source: JsonSchema,
+  targets: JsonSchema[],
+  path: string,
+  direction: Direction,
+): boolean {
+  return targets.some((target) => {
+    const probeIssues: InterfaceCompatibilityIssue[] = [];
+    schemaSubset(source, target, path, direction, probeIssues);
+    return probeIssues.length === 0;
+  });
+}
+
+function compareUnionObligations(
+  source: SchemaObject,
+  target: SchemaObject,
+  path: string,
+  direction: Direction,
+  issues: InterfaceCompatibilityIssue[],
+): void {
+  const sourceSets = unionBranchSets(source);
+  const targetSets = unionBranchSets(target);
+
+  if (targetSets.length === 0) {
+    for (const sourceSet of sourceSets) {
+      for (const [index, branch] of sourceSet.branches.entries()) {
+	const branchPath = indexedPath(joinPath(path, sourceSet.keyword), index);
+	if (!isSubsetOfOneBranch(branch, [target], branchPath, direction)) {
+	  issues.push(message(branchPath, 'source union branch is not a subset of the target schema'));
+	}
+      }
+    }
+    return;
+  }
+
+  const sourceCandidates = sourceSets.length === 0
+    ? [{ branches: [source as JsonSchema], path }]
+    : sourceSets.map((set) => ({
+	branches: set.branches,
+	path: joinPath(path, set.keyword),
+      }));
+
+  for (const targetSet of targetSets) {
+    const targetPath = joinPath(path, targetSet.keyword);
+    if (targetSet.keyword === 'oneOf' && !targetOneOfIsDisjoint(targetSet.branches)) {
+      issues.push(message(targetPath, 'target oneOf branches are not proven pairwise disjoint by required const/enum discriminators'));
+      continue;
+    }
+
+    for (const sourceSet of sourceCandidates) {
+      for (const [index, branch] of sourceSet.branches.entries()) {
+	const branchPath = sourceSet.path === path ? targetPath : indexedPath(sourceSet.path, index);
+	if (!isSubsetOfOneBranch(branch, targetSet.branches, branchPath, direction)) {
+	  const sourceDescription = sourceSet.path === path ? 'source schema' : 'source union branch';
+	  issues.push(message(branchPath, `${sourceDescription} is not a subset of any target ${targetSet.keyword} branch`));
+	}
+      }
+    }
+  }
+}
+
 /**
  * Checks whether every value admitted by source is admitted by target. Inputs
  * call it as interface → implementation (contravariance); public outputs call
@@ -454,6 +614,9 @@ function schemaSubset(
   sourceAtMost(source, target, 'maxLength', path, issues);
   sourceAtLeast(source, target, 'minItems', path, issues);
   sourceAtMost(source, target, 'maxItems', path, issues);
+  if (target.uniqueItems === true && source.uniqueItems !== true) {
+    issues.push(message(joinPath(path, 'uniqueItems'), 'source schema permits duplicate array items that the target forbids'));
+  }
   const outputProjection = direction === 'output' && isClosed(target) && isClosed(source);
   if (!outputProjection) {
     sourceAtLeast(source, target, 'minProperties', path, issues);
@@ -479,6 +642,7 @@ function schemaSubset(
     }
   }
 
+  compareUnionObligations(source, target, path, direction, issues);
   compareObjects(source, target, path, direction, issues);
 }
 
@@ -592,9 +756,13 @@ function publicOutput(def: WorkflowDef, name: string): JsonSchema | undefined {
  *
  * This is structural JSON Schema compatibility, not a general theorem prover.
  * It supports booleans; type/const/enum; numeric, string, array, and object
- * bounds; array items; object properties, required, and
- * additionalProperties. Composition, references, conditionals, and every
- * other validation keyword fail closed with a path-specific issue. For a
+ * bounds; array items and uniqueItems; object properties, required, and
+ * additionalProperties; and oneOf/anyOf. Union sibling constraints are
+ * compared separately from branch coverage. Target oneOf branches are accepted
+ * only when required const/enum discriminators prove every pair disjoint.
+ * The checker remains structural and incomplete: coverage requiring multiple
+ * target branches fails closed. allOf, if/then/else, not, $ref, prefixItems,
+ * and other validation keywords fail closed with a path-specific issue. For a
  * closed interface output, the projection rule permits extra implementation
  * properties only when that implementation is also closed.
  */
