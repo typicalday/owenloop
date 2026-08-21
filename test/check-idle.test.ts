@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { hasDefiniteCheckDefect } from '../src/cli.ts';
+import { parseDef } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -16,6 +17,23 @@ const futureIdleCompletion = def(
     step({ name: 'finish', consumes: ['wake'], produces: ['result'], terminal: true }),
   ],
 );
+
+test('parseDef: rejects an overflowing authored idle duration', () => {
+  const idleAfter = `${'9'.repeat(400)}h`;
+
+  assert.throws(
+    () => parseDef({
+      name: 'overflowing-idle-duration',
+      inputs: [{ name: 'start', seedOwed: false }],
+      steps: [
+		{ name: 'fanout', consumes: ['start'], produces: ['items[]'] },
+		{ name: 'monitor', on: ['idle'], idleAfter, produces: ['wake'] },
+		{ name: 'finish', consumes: ['wake'], produces: ['result'], terminal: true },
+      ],
+    }),
+    /duration is too large/,
+  );
+});
 
 for (const maxCollectionSize of [1, 2]) {
   test(`modelCheck: future idle wait is not a deadlock at collection cap ${maxCollectionSize}`, () => {
