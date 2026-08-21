@@ -106,7 +106,7 @@ is independent of the `SEARCH INCOMPLETE` bounds notice.
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
 | `util modifier-init --default <value>` | choose a modifier from rejection feedback, the order hint, or a default; intended for command steps |
 | `trust init\|grant\|revoke` | create and sign local enrollment trust records offline — see [`trust`](#trust--local-enrollment-trust) |
-| `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
+| `create <def> [--title t] [--provide name=json …] [--param k=v …]` | create a local SQLite instance in the selected `--db` store; prints `{workflow}` |
 | `provide <wf> <name> [--value json] [--hub <url>]` | supply a seeded input after the fact; `--hub` targets a hosted workflow |
 | `tick <wf> [--now=<ms>] [--shallow] [--capability <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--capability` claims steps without capabilities plus matching-capability steps — see below |
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
@@ -114,6 +114,7 @@ is independent of the `SEARCH INCOMPLETE` bounds notice.
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
 | `wait <wf> --until eligible\|done [--timeout <dur>]` | block until engine state matches, then print `status` |
 | `show <wf>` | dump raw artifacts (debugging) |
+| `trace <wf> [--format text\|json]` | read the local causal timeline and artifact biographies from the selected store; JSON is the default and both formats are local-store reads |
 | `list` | list instances |
 | `green <wf> <run> <path> [--value json] [--terminal]` | accept an owed output |
 | `emit <wf> <run> --items '[{…},{…}]'` | add collection elements |
@@ -125,6 +126,20 @@ is independent of the `SEARCH INCOMPLETE` bounds notice.
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
+
+### Local versus hosted instances
+
+`create`, `tick`, `list`, `runs`, `status`, `show`, and `trace` are the local
+engine path. `create` creates a local SQLite workflow instance; it does not
+copy or expose the history of an existing hub run. `start` is the authenticated
+hub path for creating a published workflow.
+
+Every local invocation must resolve the same runtime database and definitions.
+Repeat `--db` and `--defs` on each command, or set stable `OWENLOOP_DB` and
+`OWENLOOP_DEFS` values. `list` returning `[]` means only that the selected
+database has no instances. Changing the database selector can legitimately
+produce `[]` or “workflow not found”; changing the definitions selector can
+leave a stored workflow's definition unresolvable.
 
 Without `--hub`, `provide` and `reject` use the local SQLite engine exactly as
 before. With `--hub`, they operate on the project-bound (or explicitly named)
@@ -3285,15 +3300,20 @@ owenloop() { node bin/owenloop.mjs "$@"; }   # or `npm link` to put it on PATH
 
 owenloop defs                                  # what workflows are available
 
-# start an instance; `proposal` is seeded as owed, so we provide it up front
+# create a local instance; `proposal` is seeded as owed, so we provide it up front
 wf=$(owenloop create delivery \
        --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
+
+owenloop list                               # includes $wf in this local database
 
 # the Step Agent loop: tick → run → report
 run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
 owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
+owenloop close "$wf" "$run"                        # complete the planner firing
 
 owenloop status $wf                            # done / debts / eligible / blocked / pending / inFlight
+owenloop trace "$wf"                           # local causal timeline as JSON
+owenloop trace "$wf" --format text             # the same local trace as text
 ```
 
 **A knock-back.** When the reviewer's job comes up, instead of greening its
