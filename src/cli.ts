@@ -63,6 +63,7 @@ import {
   validateDef,
 } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
+import { implementsIssues } from './implements.ts';
 import { createDefInstructionSource } from './order-resolver.ts';
 import type { CheckReport, WorkflowDef } from './types.ts';
 import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
@@ -2237,6 +2238,18 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   return 0;
 }
 
+/**
+ * Authoring-only lint additions belong here rather than in defs.ts: the
+ * engine's vendored surface keeps extension contents opaque. Base hard errors
+ * deliberately suppress advisory extension warnings just like lintDef does.
+ */
+function lintForAuthoring(def: WorkflowDef): { errors: string[]; warnings: string[] } {
+  const result = lintDef(def);
+  return result.errors.length === 0
+    ? { ...result, warnings: [...result.warnings, ...implementsIssues(def)] }
+    : result;
+}
+
 function dispatch(command: string, io: CliIO, args: Args): number {
   // help and lint need no store
   if (command === 'help' || command === '--help' || command === '-h') {
@@ -2254,14 +2267,14 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     if (defName !== undefined) {
       const def = defs.get(defName);
       if (!def) throw new CliError(`unknown workflow definition '${defName}' (looked in ${defsDir})${failureNote(failures)}`);
-      const result = lintDef(def);
+      const result = lintForAuthoring(def);
       const errors = [...validateCallsEdges(def, rawDefs), ...result.errors, ...(cycleErrors.get(defName) ?? [])];
       if (errors.length) hasErrors = true;
       print(io, { def: def.name, errors, warnings: errors.length ? [] : result.warnings });
     } else {
       const results: { def?: string; file?: string; errors: string[]; warnings: string[] }[] =
 		[...defs].map(([key, def]) => {
-			const result = lintDef(def);
+			const result = lintForAuthoring(def);
 			const errors = [...validateCallsEdges(def, rawDefs), ...result.errors, ...(cycleErrors.get(key) ?? [])];
 			if (errors.length) hasErrors = true;
 			return { def: def.name, errors, warnings: errors.length ? [] : result.warnings };

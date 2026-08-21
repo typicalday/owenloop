@@ -141,6 +141,35 @@ warnings. These warnings do not fail lint, loading, packing, publishing, pushing
 or execution. Other x vocabularies remain opaque and unrestricted; only this
 authoring-lint convention is recognized.
 
+## x.implements — advisory external interface claims
+
+When present, x.implements must be a non-empty array of external interface
+coordinates a definition claims to satisfy:
+
+~~~yaml
+x:
+  implements:
+    - name: research-report
+      version: "1"
+    - name: auditable-report
+      version: "2026-08"
+~~~
+
+Every entry contains exactly non-empty string name and version fields. More
+than one claim is allowed, but an exact name/version coordinate may appear only
+once. Version is intentionally an opaque string here: Owenloop does not impose
+SemVer or catalog policy. Malformed claims are warning-only authoring lint, so
+they neither stop lint nor turn loading or execution into a failure. Keeping
+the field under x also means binaries at engine version 1 ignore it and continue
+to load definitions written before or after the convention.
+
+x.discovery.interface and x.implements answer different questions.
+x.discovery.interface describes this definition's own inputs and public outputs
+and owns the local schemaRef vocabulary. x.implements only names an external
+catalog contract; it deliberately copies no schemas, artifact mappings, or
+summaries and introduces no second pointer convention. Catalog lookup and
+publish-time rejection are hub responsibilities, not owenloop lint.
+
 ## `model:` — quality tiers, not vendor ids
 
 The engine never calls a model; `model:` is an opaque string that rides the
