@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.13](https://github.com/typicalday/owenloop/compare/v0.5.12...v0.5.13) (2026-08-21)
+
+
+### Bug Fixes
+
+* **eval:** score charter no-match safety and catalog discovery independently ([#267](https://github.com/typicalday/owenloop/issues/267)) ([6c2cfea](https://github.com/typicalday/owenloop/commit/6c2cfea1ffa75168864c9b1d3d7e14b980857cdd))
+
 ## [0.5.12](https://github.com/typicalday/owenloop/compare/v0.5.11...v0.5.12) (2026-08-21)
 
 
