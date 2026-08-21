@@ -150,9 +150,11 @@ ${' '.repeat(33)}and deny read the stored human slot instead
                credentials come from owenloop's store — each role reads the
                agent:<account> slot for its origin (never the human slot); a
                missing slot refuses with a runnable 'owenloop login' command.
-${' '.repeat(15)}approvals approve/deny are the read-only human-slot exception:
-${' '.repeat(15)}they ignore OWENLOOP_ACCOUNT and OWENLOOP_TOKEN, and refuse with
-${' '.repeat(15)}'owenloop login --hub <origin> --as human' when it is absent.
+${' '.repeat(15)}approvals approve/deny ignore OWENLOOP_ACCOUNT and OWENLOOP_TOKEN,
+${' '.repeat(15)}never mint or log credentials, and refuse with 'owenloop login
+${' '.repeat(15)}--hub <origin> --as human' when the human slot is absent. An
+${' '.repeat(15)}expiring stored human OAuth credential may refresh and persist its
+${' '.repeat(15)}rotation through owenloop's shared credential lock.
                OWENLOOP_ACCOUNT       Scoped Identity account for exec/prepare/release
 ${' '.repeat(38)}and approvals list (default 'default';
 ${' '.repeat(38)}shift uses --as, and stamps it onto
@@ -189,8 +191,10 @@ ${' '.repeat(38)}approvals approve/deny)
       approvals list) are READ-ONLY over owenloop's credential store — they
       never write credentials. Each reads the agent:<account> slot for its
       origin (never the human slot); the account defaults to 'default'.
-      Approval decisions are also read-only, but approve and deny require the
-      stored human slot rather than an agent slot; if it is absent, run:
+      Approval decisions require the stored human slot rather than an agent
+      slot. They never mint or log credentials, but an expiring stored OAuth
+      credential may refresh and persist its rotation under the shared lock; if
+      the human slot is absent, run:
 ${' '.repeat(8)}owenloop login --hub <origin> --as human
       'owenloop work join' is the one deliberate provisioning-time writer: it
       stores the Scoped Identity token a hub redeem returns via owenloop's public

@@ -63,6 +63,8 @@ test('USAGE documents approval flags and the split between list and decision cre
   assert.match(USAGE, /list reads the agent:<account> slot selected by[\s\S]*OWENLOOP_ACCOUNT/);
   assert.match(USAGE, /approve[\s\S]*deny[\s\S]*stored human slot/);
   assert.match(USAGE, /owenloop login --hub <origin> --as human/);
+  assert.match(USAGE, /never mint or log credentials/);
+  assert.match(USAGE, /expiring[\s\S]*human OAuth credential may refresh and persist its[\s\S]*rotation/);
 });
 
 // ---- Phase 3: agent-run + runner dispatch are documented --------------------

@@ -1,14 +1,16 @@
 /**
- * Credential read seam. owenloop reads hub credentials through owenloop's
- * store ONLY — it never writes, prints, or stores credentials itself, and it
- * never reads the keychain or `credentials.json` formats directly.
+ * Credential read seam for agent runtime roles. owenloop reads hub credentials
+ * through owenloop's store ONLY — it never prints credentials or reads the
+ * keychain or `credentials.json` formats directly.
  *
  * The live wiring is against owenloop 0.4.0's `readStoredCredential`
- * (src/credentials/owenloop.ts → `OwenloopCredentialReader`). owenloop reads
- * ONLY the `agent:<account>` slots — never the `human` slot — so a human-only
- * origin reads as absent (`null`), which the roles surface as a clean refuse.
- * `Credential` is re-exported from owenloop below so this seam and the store
- * speak the exact same union.
+ * (src/credentials/owenloop.ts → `OwenloopCredentialReader`). That reader
+ * addresses ONLY `agent:<account>` slots — never `human` — so a human-only
+ * origin reads as absent (`null`) on agent paths. Human decision resolution
+ * uses the root `ensureFreshOAuth` surface after its explicit `human` read;
+ * an expiring OAuth credential can therefore persist its locked rotation.
+ * `Credential` is re-exported below so this seam and the store speak the same
+ * union.
  */
 
 /** The root package's stored-credential union (agent / oauth / oauth-pasted). */
