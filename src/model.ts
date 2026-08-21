@@ -605,7 +605,7 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
         const el = parseElement(m.path);
         if (!el) continue;
         if (!isGreen(arts.get(mapInputPath(mc, el.index)))) continue;
-	for (const mp of mps) ensure(bindProduce(mp, el.index), step.name);
+        for (const mp of mps) ensure(bindProduce(mp, el.index), step.name);
       }
     } else {
       for (const p of singletonProduces(step)) ensure(p.stem, step.name);
@@ -746,12 +746,12 @@ export function memberRetractFirings(def: WorkflowDef, arts: ArtifactMap): Membe
       // as its normal stem comparison. `some` also deduplicates repeated edges.
       if (!step.consumes.some((consume) => consume.stem === el.stem || consume.stem === art.path)) continue;
       firings.push({
-		modelTransition: 'member-retract',
-		step: step.name,
-		key: art.path,
-		index: el.index,
-		inputs: [],
-		outputs: [art.path],
+        modelTransition: 'member-retract',
+        step: step.name,
+        key: art.path,
+        index: el.index,
+        inputs: [],
+        outputs: [art.path],
       });
     }
   }
@@ -832,8 +832,8 @@ export function eligibleFirings(
       } else if (mode === 'map') {
         if (plainSatisfied) {
           const mc = mapConsume(step);
-	  const mps = mapProduces(step);
-	  if (mc && mps.length > 0) {
+          const mps = mapProduces(step);
+          if (mc && mps.length > 0) {
             for (const m of members(arts, mc.stem)) {
               const el = parseElement(m.path);
               if (!el) continue;
@@ -841,24 +841,24 @@ export function eligibleFirings(
               // suffixed child when this map chains off another map's output.
               const inPath = mapInputPath(mc, el.index);
               if (!isGreen(arts.get(inPath))) continue;
-	      const outputs = mps
-		.map((mp) => bindProduce(mp, el.index))
-		.filter((outPath) => {
-		  const outArt = arts.get(outPath);
-		  // Group membership is singleton-only (§26.3), so a map-produce
-		  // path cannot be a group member today. Keep the defensive check
-		  // so a future relaxation cannot reopen the eligibility/commit gap.
-		  return isDebt(outArt)
-		    && (opts?.ignoreFreeze || !frozen(outArt, step))
-		    && groupBlockingWinner(def, arts, outPath) === undefined;
-		});
-	      if (outputs.length === 0) continue;
+              const outputs = mps
+                .map((mp) => bindProduce(mp, el.index))
+                .filter((outPath) => {
+                  const outArt = arts.get(outPath);
+                  // Group membership is singleton-only (§26.3), so a map-produce
+                  // path cannot be a group member today. Keep the defensive check
+                  // so a future relaxation cannot reopen the eligibility/commit gap.
+                  return isDebt(outArt)
+                    && (opts?.ignoreFreeze || !frozen(outArt, step))
+                    && groupBlockingWinner(def, arts, outPath) === undefined;
+                });
+              if (outputs.length === 0) continue;
               firings.push({
                 step: step.name,
                 key: m.path,
                 index: el.index,
                 inputs: [inPath, ...plainPaths],
-		outputs,
+                outputs,
               });
             }
           }
@@ -1139,16 +1139,16 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
       if (g.mode === 'atLeastOne') continue;
       const winner = g.of.find((stem) => arts.get(stem)?.acceptance === 'green');
       if (!winner) {
-	for (const stem of g.of) {
-	  const sib = arts.get(stem);
-	  if (sib?.acceptance !== 'skipped' || latestSkipKind(sib) !== 'exclusive') continue;
-	  ops.push({
-	    kind: 'rearm',
-	    path: stem,
-	    reason: `group '${g.group}' (${g.mode}): winner is no longer green, re-arming exclusive sibling`,
-	  });
-	}
-	continue;
+        for (const stem of g.of) {
+          const sib = arts.get(stem);
+          if (sib?.acceptance !== 'skipped' || latestSkipKind(sib) !== 'exclusive') continue;
+          ops.push({
+            kind: 'rearm',
+            path: stem,
+            reason: `group '${g.group}' (${g.mode}): winner is no longer green, re-arming exclusive sibling`,
+          });
+        }
+        continue;
       }
       for (const stem of g.of) {
         if (stem === winner) continue;
@@ -2084,8 +2084,8 @@ function applyOpInMemory(
       ...art,
       acceptance: 'owed',
       reasons: [
-	...art.reasons,
-	{ at: 0, action: 'reopen', kind: 'structural', by: 'engine', text: op.reason, fromVersion: art.version },
+        ...art.reasons,
+        { at: 0, action: 'reopen', kind: 'structural', by: 'engine', text: op.reason, fromVersion: art.version },
       ],
     });
     return;
@@ -2102,15 +2102,15 @@ function applyOpInMemory(
       ...(clearApprovals ? { approvals: undefined } : {}),
       fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
       reasons: [
-	...art.reasons,
-	{
-	  at: 0,
-	  action: 'skip',
-	  kind: op.rejectKind ?? 'structural',
-	  by: 'engine',
-	  text: op.reason,
-	  fromVersion: art.version,
-	},
+        ...art.reasons,
+        {
+          at: 0,
+          action: 'skip',
+          kind: op.rejectKind ?? 'structural',
+          by: 'engine',
+          text: op.reason,
+          fromVersion: art.version,
+        },
       ],
     });
     return;
@@ -2503,8 +2503,8 @@ export function applyOutcome(
       acceptance: 'skipped',
       fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
       reasons: [
-	...art.reasons,
-	{ at: 0, action: 'skip', kind: 'structural', by: 'engine', text: 'producer skipped output', fromVersion: art.version },
+        ...art.reasons,
+        { at: 0, action: 'skip', kind: 'structural', by: 'engine', text: 'producer skipped output', fromVersion: art.version },
       ],
     });
   } else if (outcome === 'retract') {
@@ -2765,7 +2765,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
         }
 
         const step: CheckStep = { step: firing.step, key: firing.key, outcome };
-	if (outcome === 'emit-seal') report.collectionCapApplied = true;
+        if (outcome === 'emit-seal') report.collectionCapApplied = true;
         const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize });
 
         for (const suc of successors) {
