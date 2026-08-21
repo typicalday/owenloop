@@ -142,6 +142,14 @@ export type {
 } from './store/index.ts';
 
 export { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, resolveCallsTarget, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
+export { checkInterfaceCompatibility, implementsIssues } from './implements.ts';
+export type {
+  InterfaceCompatibilityCheck,
+  InterfaceCompatibilityIssue,
+  WorkflowInterfaceArtifact,
+  WorkflowInterfaceClaim,
+  WorkflowInterfaceSignature,
+} from './implements.ts';
 export { credentialSlot, hashDefForHub, keychainServiceFor, normalizeOrigin, readStoredCredential } from './hub.ts';
 export type { Credential, CredentialSlotSelector, Keychain, ReadStoredCredentialOpts } from './hub.ts';
 export type { DefLoadFailure } from './defs.ts';
