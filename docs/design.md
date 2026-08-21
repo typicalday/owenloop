@@ -1213,13 +1213,21 @@ fix for free, but `applyOpInMemory` mirrors the engine's mutation 1:1 and
 needs the same approvals-clear applied independently), both clear `approvals`
 on the skipped artifact whenever its prior acceptance was `submitted`.
 
-Re-arming an auto-skipped sibling needs zero group-specific code: it goes
-through the exact same generic skip-re-arm mechanism (fingerprint-keyed,
-§7) that already re-arms a manually-skipped branch when its upstream inputs
-move. `rejectKind: 'exclusive'` only changes how the artifact is
-*classified* for liveness accounting; it does not change how it re-arms — and
-the cleared approvals ledger travels with it, so a re-armed (or freshly
-re-produced) sibling always starts its judge ledger from empty.
+Re-arm has two deliberately separate paths. A manual or branch skip remains
+fingerprint-keyed (§7): its direct inputs must all be green and have moved.
+For an exclusive group, when no winner remains, a currently skipped sibling
+whose **latest** `ReasonEntry` with `action: 'skip'` has `kind: 'exclusive'`
+re-arms directly to `owed`. The latest entry matters: a later structural skip
+supersedes any historical exclusive skip. This inverse is group-specific
+because knocking down the winner changes none of the sibling producer's input
+versions, so the generic movement gate correctly cannot see it.
+
+`Engine.applyOp` records the exclusive skip marker and re-arms without a
+version bump; its pure `applyOpInMemory` mirror records the same deterministic
+skip/reopen metadata. The model checker's canonical state key also includes a
+skipped artifact's latest skip kind, since exclusive and structural skips now
+have different outgoing transitions. The cleared approvals ledger travels with
+the re-arm, so a freshly resubmitted judged sibling starts from empty.
 
 ### §26.3 Grammar and validation
 
@@ -1282,13 +1290,13 @@ Suppression applies to the automatic sweep only. A human `retry` re-arms the
 named artifact directly and does not itself run `eligibleFirings` — but the
 artifact is still subject to `maintainDecisions`' own auto-skip cascade
 (§26.2), which runs synchronously inside `retry`'s `settle()` call and
-re-skips it immediately if the winning sibling is still green. Either way — a
-retried stem is suppressed again on the next tick exactly like a
-machine-originated re-arm, unless the winning sibling has been knocked down
-first (`reject`/`retract`), which makes the *producer* eligible to re-fire
-again (`test/groups.test.ts` scenario (i)). This mirrors the existing
-human-bypass symmetry at `green()` (§24.6): a human bypasses the run/lease/CAS
-machinery, never the group-exclusivity contract itself.
+re-skips it immediately while the winning sibling is green. In contrast,
+rejecting or retracting that winner directly re-arms siblings whose current
+skip is exclusive; manual/branch-skipped artifacts still wait for input
+movement. The producer then becomes eligible to re-fire
+(`test/groups.test.ts` scenario (i)). This mirrors the existing human-bypass
+symmetry at `green()` (§24.6): a human bypasses the run/lease/CAS machinery,
+never the group-exclusivity contract itself.
 
 ## §27 Engine-version contract and unknown-key rejection
 

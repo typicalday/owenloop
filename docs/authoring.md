@@ -577,11 +577,13 @@ produces:
 - **`atLeastOne`** — no refusal, no auto-skip; once any one member is green,
   the rest no longer count as outstanding for done-ness.
 
-A group's auto-skip re-arms exactly like a manual skip (same fingerprint
-mechanism) if the upstream inputs it depended on move. See
+A manual/branch skip re-arms only after its upstream inputs move. An exclusive
+group skip has an additional inverse: if the green winner is rejected or
+retracted, a sibling whose latest skip reason is `exclusive` immediately
+returns to `owed`; a structurally skipped sibling does not. See
 [`routing-groups.yaml`](../examples/workflows/routing-groups.yaml) for a
-runnable example, and [`docs/design.md` §26](design.md) for the full
-design (refusal timing, the judges interaction, and the model-checker parity
+runnable example, and [`docs/design.md` §26](design.md) for the full design
+(refusal timing, the judges interaction, and the model-checker parity
 guarantee).
 
 Eligibility (the automatic sweep) is pre-filtered the same way commit-time

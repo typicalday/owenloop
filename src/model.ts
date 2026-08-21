@@ -182,6 +182,15 @@ export function isDebt(a: ArtifactData | undefined): boolean {
 export function isGreen(a: ArtifactData | undefined): boolean {
   return !!a && a.acceptance === 'green';
 }
+
+/** The newest skip event wins: later structural routing can supersede an older exclusive skip. */
+function latestSkipKind(art: ArtifactData): RejectKind | undefined {
+  for (let i = art.reasons.length - 1; i >= 0; i--) {
+    const reason = art.reasons[i]!;
+    if (reason.action === 'skip') return reason.kind;
+  }
+  return undefined;
+}
 /**
  * §6 liveness: a judgment-rejected artifact that has been knocked back `cap`
  * times has *stalled*. It stays a debt (so it surfaces as stuck), but the engine
@@ -999,7 +1008,8 @@ export function canEverFire(step: StepDef, def: WorkflowDef, reachable?: Set<str
  * structural ops needed to restore it. Pure — the engine applies the ops and
  * re-runs to a fixpoint. Covers the forward reject cascade, retract/skip
  * tombstoning of map children, skip-propagation down dead branches, and the
- * re-arm of a skipped subtree when its branch revives.
+ * re-arm of a skipped subtree when its branch revives, and the re-arm of an
+ * exclusively skipped produce-group sibling when its green winner is removed.
  */
 export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): CascadeOp[] {
   const ops: CascadeOp[] = [];
@@ -1091,25 +1101,29 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     }
   }
 
-  // §26: declarative exclusive produce-groups — auto-skip losing siblings.
-  // Once a group (exactlyOne/atMostOne) has a green winner, every other member
-  // still resting in a debt state (owed/rejected) or awaiting judgment
-  // (submitted) can never legally commit — the group's exclusivity is
-  // enforced at commit time by the engine's groupCasCheck, so those siblings
-  // would just stall forever without this. A submitted sibling in particular
-  // is an OUTSTANDING state; left alone the instance can never reach
-  // done: true. Auto-skip settles them (clearing any partial approvals so a
-  // later resubmission never inherits a stale sign-off); the ordinary
-  // skipped-artifact rearm loop above (which runs on the artifact's own next
-  // maintenance pass) revives them if the winner is later un-greened
-  // (rejected/retracted) and the group's fingerprint-gated inputs move again
-  // — no separate rearm code is needed.
+  // §26: declarative exclusive produce-groups. A green winner auto-skips
+  // competing debt/submitted siblings. Once no winner remains, only siblings
+  // whose latest skip reason is 'exclusive' re-arm: their routing decision was
+  // the winner, not their producer inputs. The generic fingerprint gate above
+  // intentionally cannot cover winner-only movement because those inputs did
+  // not move. The two paths are mutually exclusive in one maintenance pass.
   for (const step of def.steps) {
     if (!step.groups || step.groups.length === 0) continue;
     for (const g of step.groups) {
       if (g.mode === 'atLeastOne') continue;
       const winner = g.of.find((stem) => arts.get(stem)?.acceptance === 'green');
-      if (!winner) continue;
+      if (!winner) {
+	for (const stem of g.of) {
+	  const sib = arts.get(stem);
+	  if (sib?.acceptance !== 'skipped' || latestSkipKind(sib) !== 'exclusive') continue;
+	  ops.push({
+	    kind: 'rearm',
+	    path: stem,
+	    reason: `group '${g.group}' (${g.mode}): winner is no longer green, re-arming exclusive sibling`,
+	  });
+	}
+	continue;
+      }
       for (const stem of g.of) {
         if (stem === winner) continue;
         const sib = arts.get(stem);
@@ -2039,8 +2053,15 @@ function applyOpInMemory(
   const art = arts.get(op.path);
   if (!art) return;
   if (op.kind === 'rearm') {
-    // mirrors Engine.applyOp rearm branch: acceptance → 'owed'
-    arts.set(op.path, { ...art, acceptance: 'owed' });
+    // mirrors Engine.applyOp rearm branch: acceptance → 'owed' + reopen reason.
+    arts.set(op.path, {
+      ...art,
+      acceptance: 'owed',
+      reasons: [
+	...art.reasons,
+	{ at: 0, action: 'reopen', kind: 'structural', by: 'engine', text: op.reason, fromVersion: art.version },
+      ],
+    });
     return;
   }
   if (op.kind === 'skip') {
@@ -2054,6 +2075,17 @@ function applyOpInMemory(
       acceptance: 'skipped',
       ...(clearApprovals ? { approvals: undefined } : {}),
       fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
+      reasons: [
+	...art.reasons,
+	{
+	  at: 0,
+	  action: 'skip',
+	  kind: op.rejectKind ?? 'structural',
+	  by: 'engine',
+	  text: op.reason,
+	  fromVersion: art.version,
+	},
+      ],
     });
     return;
   }
@@ -2444,6 +2476,10 @@ export function applyOutcome(
       ...art,
       acceptance: 'skipped',
       fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
+      reasons: [
+	...art.reasons,
+	{ at: 0, action: 'skip', kind: 'structural', by: 'engine', text: 'producer skipped output', fromVersion: art.version },
+      ],
     });
   } else if (outcome === 'retract') {
     next.set(outPath, { ...art, acceptance: 'retracted' });
@@ -2465,8 +2501,8 @@ export function applyOutcome(
  *     are distinct but anything >= cap is the same (frozen state)
  *   schemaRejects: BUCKETED to min(count, maxSchemaFailures) similarly
  *
- * For 'skipped' artifacts, the fingerprint is encoded as sorted "inputPath:versionRank"
- * pairs to capture rearm eligibility correctly.
+ * For 'skipped' artifacts, the fingerprint and latest skip kind are encoded to
+ * capture their distinct rearm eligibility correctly.
  */
 function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
   const parts: string[] = [];
@@ -2512,6 +2548,7 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
         .join(',');
       entry += `|fp:${fpParts}`;
     }
+    if (art.acceptance === 'skipped') entry += `|skip:${latestSkipKind(art) ?? 'none'}`;
     parts.push(entry);
   }
   return parts.join(';');
