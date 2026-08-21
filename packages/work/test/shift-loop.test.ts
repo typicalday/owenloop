@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,6 +83,7 @@ interface WakeStep {
 interface MockCfg {
   wake?: WakeStep[];
   inbox?: string[];
+  inboxInstances?: InboxInstance[];
   perWf?: Record<string, { def?: string; orders: WorkOrder[] }>;
   perWfThrows?: Record<string, Error>;
   onTargetedWhatsNext?: () => void | Promise<void>;
@@ -119,7 +120,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
     async whatsNext(req) {
       calls.push({ verb: 'whats_next', arg: req });
       if (req === undefined || req.workflow === undefined) {
-        const instances: InboxInstance[] = (cfg.inbox ?? []).map((w) => ({
+	const instances: InboxInstance[] = cfg.inboxInstances ?? (cfg.inbox ?? []).map((w) => ({
           workflow: w,
           def: 'demo',
           done: false,
@@ -830,6 +831,152 @@ test('inbox mode fans out to each servable instance', async () => {
   // one inbox call + one per-instance whats_next each
   assert.equal(count(calls, 'whats_next'), 3);
   assert.deepEqual(spawns.map((s) => s.run).sort(), ['run_a', 'run_b']);
+});
+
+const inboxInstance = (workflow: string, eligible: number): InboxInstance => ({
+  workflow,
+  def: 'demo',
+  done: false,
+  eligible,
+  blocked: 0,
+  owedSeededInputs: [],
+});
+
+async function inboxFanOutScenario(servable: ReadonlySet<string>): Promise<{ calls: Call[]; spawns: SpawnSpec[]; workflows: string[] }> {
+  cacheCommandBundle();
+  const workflows = Array.from({ length: 11 }, (_, index) => `wf${String(index + 1).padStart(2, '0')}`);
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    inboxInstances: workflows.map((workflow) => inboxInstance(workflow, servable.has(workflow) ? 1 : 0)),
+    perWf: Object.fromEntries(workflows.map((workflow) => [
+      workflow,
+      { def: 'demo', orders: [wo(`run_${workflow}`, 'cmd', workflow)] },
+    ])),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, cap: workflows.length })).run();
+  return { calls, spawns, workflows };
+}
+
+const targetedWorkflows = (calls: Call[]): string[] => calls
+  .filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow !== undefined)
+  .map((call) => (call.arg as { workflow: string }).workflow);
+
+test('inbox mode targets only the two workflows with eligible work', async () => {
+  const servable = new Set(['wf03', 'wf09']);
+  const { calls, spawns } = await inboxFanOutScenario(servable);
+
+  assert.equal(
+    calls.filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow === undefined).length,
+    1,
+  );
+  assert.deepEqual(targetedWorkflows(calls), ['wf03', 'wf09']);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_wf03', 'run_wf09']);
+});
+
+test('inbox mode keeps the all-servable fan-out and dispatch control unchanged', async () => {
+  const servable = new Set(Array.from({ length: 11 }, (_, index) => `wf${String(index + 1).padStart(2, '0')}`));
+  const { calls, spawns, workflows } = await inboxFanOutScenario(servable);
+
+  assert.equal(
+    calls.filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow === undefined).length,
+    1,
+  );
+  assert.deepEqual(targetedWorkflows(calls), workflows);
+  assert.deepEqual(
+    calls
+      .filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow !== undefined)
+      .map((call) => call.arg),
+    workflows.map((workflow) => ({ workflow, serve_crews: [], serve_capabilities: [] })),
+  );
+  assert.deepEqual(spawns.map((spawn) => spawn.run), workflows.map((workflow) => `run_${workflow}`));
+});
+
+test('inbox filtering fails open for missing and malformed eligible values', async () => {
+  const malformed = {
+    workflow: 'wfMalformed',
+    def: 'demo',
+    done: false,
+    eligible: 'zero',
+    blocked: 0,
+    owedSeededInputs: [],
+  } as unknown as InboxInstance;
+  const missing = {
+    workflow: 'wfMissing',
+    def: 'demo',
+    done: false,
+    blocked: 0,
+    owedSeededInputs: [],
+  } as unknown as InboxInstance;
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    inboxInstances: [inboxInstance('wfZero', 0), missing, malformed],
+  });
+  const { spawner } = fakeSpawner();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true })).run();
+
+  assert.deepEqual(targetedWorkflows(calls), ['wfMissing', 'wfMalformed']);
+});
+
+test('explicit workflow mode has no inbox request and always targets the configured workflow', async () => {
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    inboxInstances: [inboxInstance('wfExplicit', 0)],
+    perWf: { wfExplicit: { orders: [] } },
+  });
+  const { spawner } = fakeSpawner();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wfExplicit' })).run();
+
+  assert.deepEqual(calls.filter((call) => call.verb === 'whats_next').map((call) => call.arg), [{
+    workflow: 'wfExplicit',
+    serve_crews: [],
+    serve_capabilities: [],
+  }]);
+});
+
+test('a zero-eligible inbox snapshot defers newly eligible work until the next poll', async () => {
+  cacheCommandBundle();
+  const instances = [inboxInstance('wfRace', 0)];
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: true, cursor: 2 }],
+    inboxInstances: instances,
+    perWf: { wfRace: { def: 'demo', orders: [wo('run_race', 'cmd', 'wfRace')] } },
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner));
+
+  await loop.iterate();
+  assert.deepEqual(targetedWorkflows(calls), []);
+  instances[0]!.eligible = 1;
+  await loop.iterate();
+  assert.deepEqual(targetedWorkflows(calls), ['wfRace']);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_race']);
+});
+
+test('the reaper keeps a zero-eligible workflow directory while reaping an observed sibling', async () => {
+  const workRoot = join(cacheDir, 'work');
+  const skipped = join(workRoot, 'wfZero', 'run_zero');
+  const observed = join(workRoot, 'wfEligible', 'run_eligible');
+  mkdirSync(skipped, { recursive: true });
+  mkdirSync(observed, { recursive: true });
+  for (const dir of [skipped, observed]) utimesSync(dir, new Date(0), new Date(0));
+
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    inboxInstances: [inboxInstance('wfZero', 0), inboxInstance('wfEligible', 1)],
+    perWf: { wfEligible: { orders: [] } },
+  });
+  const { spawner } = fakeSpawner();
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workRoot,
+    workDirTtlMs: 0,
+    now: () => Date.now(),
+  })).run();
+
+  assert.deepEqual(targetedWorkflows(calls), ['wfEligible']);
+  assert.ok(existsSync(skipped), 'the inbox-only workflow has no run-list evidence and is not scanned');
+  assert.ok(!existsSync(observed), 'the targeted sibling is scanned and its expired empty directory is reaped');
 });
 
 test('a terminal-between-inbox-and-fetch race is consumed once without repeated error logging', async () => {

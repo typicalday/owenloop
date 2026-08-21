@@ -64,7 +64,7 @@ import {
 } from '../../../../src/lock.ts';
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
-import { HubError, type WorkOrder } from '../hub/types.ts';
+import { HubError, type InboxInstance, type WorkOrder } from '../hub/types.ts';
 import type { FetchedStep } from '../bundle/types.ts';
 import { isCommandStep, resolveCommandRouting } from './routing.ts';
 import {
@@ -365,6 +365,13 @@ interface Candidate {
   requestStartedAt: number;
   /** True when this run already had a live record (handout lapsed → re-offer). */
   reoffer: boolean;
+}
+
+/** A workflow the fleet inbox asked this Shift to consider. */
+interface PollCandidate {
+  workflow: string;
+  /** Present only for fleet inbox candidates; absent for explicit `opts.workflow`. */
+  inbox?: InboxInstance;
 }
 
 /** The `maxConcurrentAgents` fallback when the option is absent. */
@@ -1064,14 +1071,16 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       ...reserved.filter((r) => r.childKind === 'agent-run').map((r) => r.run),
     ]);
 
-    // Resolve which instances to poll.
-    let instances: string[];
+    // Resolve which instances to poll. Fleet candidates retain their source
+    // inbox row so only a proven zero may avoid a targeted observation. An
+    // explicit workflow has no inbox row and must always receive one.
+    let instances: PollCandidate[];
     if (opts.workflow !== undefined) {
-      instances = [opts.workflow];
+      instances = [{ workflow: opts.workflow }];
     } else {
       try {
 	const inbox = await opts.hub.whatsNext({ serve_capabilities: [...serveCapabilities] });
-        instances = (inbox.instances ?? []).map((i) => i.workflow);
+	instances = (inbox.instances ?? []).map((inbox) => ({ workflow: inbox.workflow, inbox }));
       } catch (e) {
 	noteServerBackoff(e);
         opts.err(`inbox whats_next failed: ${errMsg(e)}`);
@@ -1135,12 +1144,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	releasedForCapacity = true;
       }
     };
-    for (const wf of instances) {
+    for (const candidate of instances) {
+      const wf = candidate.workflow;
       // Skipping means no targeted hub observation happened: leave this
       // workflow out of `polled`/`openRuns` so the work-directory reaper never
       // mistakes damping for an empty response. The inbox call and other
       // workflows remain eligible.
       if (workflowCapacityCooldownActive(wf, remaining, agentRoom)) continue;
+      // Only a numeric zero is authoritative enough to skip. Missing or
+      // malformed wire data deliberately falls through to the targeted call.
+      // This runs after the cooldown check so a newly ready cooldown is cleared.
+      if (candidate.inbox?.eligible === 0) continue;
       let res;
       const requestStartedAt = monotonicNow();
       try {
