@@ -109,9 +109,10 @@ type PluginCall = { cmd: string; args: string[] };
 type CommandResult = { status: number | null; stdout: string; stderr: string };
 
 /** PATH fixture for plugin acceptance tests; the stubs are never executed. */
-function pluginPathDir(harnesses: readonly HarnessName[]): string {
+function pluginPathDir(harnesses: readonly HarnessName[], withOwenloop = false): string {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-setup-plugin-path-'));
   for (const harness of harnesses) writeFileSync(join(dir, harness), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  if (withOwenloop) writeFileSync(join(dir, 'owenloop'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   return dir;
 }
 
@@ -128,13 +129,14 @@ async function runPluginSetup(
   harnesses: readonly HarnessName[],
   runCommand: (cmd: string, args: string[], calls: PluginCall[]) => CommandResult,
   resolver?: (harness: 'claude-code' | 'codex') => string | null,
+  withOwenloop = false,
 ): Promise<{ code: number; t: ReturnType<typeof makeIo>; calls: PluginCall[] }> {
   const { routes } = makeIdentityHub();
   const { fetch } = routedFetch(routes);
   const calls: PluginCall[] = [];
   const t = makeIo({
     fetch,
-    env: { PATH: pluginPathDir(harnesses) },
+    env: { PATH: pluginPathDir(harnesses, withOwenloop) },
     runCommand: (cmd, args) => {
       const call = { cmd, args: [...args] };
       calls.push(call);
@@ -489,24 +491,93 @@ test('setup plugin: Claude fresh install runs marketplace add then plugin instal
   assertNoOlp(t);
 });
 
-test('setup plugin: Claude matching version performs zero plugin writes', async () => {
+test('setup plugin: verified PATH launch and matching version perform zero plugin writes', async () => {
   const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
     if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
       return {
         status: 0,
-        stdout: JSON.stringify([{ id: 'owenloop@owenloop', version: ` ${PACKAGE_VERSION} ` }]),
+		stdout: JSON.stringify([
+			{
+				id: 'owenloop@owenloop',
+				version: ` ${PACKAGE_VERSION} `,
+				mcpServers: { owenloop: { command: 'owenloop', args: ['mcp'] } },
+			},
+		]),
         stderr: '',
       };
     }
     if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
     return { status: 0, stdout: '', stderr: '' };
-  });
+  }, undefined, true);
 
   assert.equal(code, 0, t.err.join('\n'));
   assert.deepEqual(pluginMutationCalls(calls), [], 'matching version is idempotent');
   const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string; detail: string }[] };
   assert.deepEqual(summary.steps.filter((step) => step.step === 'plugin (claude-code)').map((step) => step.action), ['skipped']);
   assert.match(summary.steps.find((step) => step.step === 'plugin (claude-code)')!.detail, /already current/);
+  assertNoOlp(t);
+});
+
+test('setup plugin: same-version unsafe Claude launch runs marketplace add then plugin update', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return {
+		status: 0,
+		stdout: JSON.stringify([
+			{
+				id: 'owenloop@owenloop',
+				version: PACKAGE_VERSION,
+				mcpServers: { owenloop: { command: '/Users/example/.nvm/versions/node/v22/bin/owenloop', args: ['mcp'] } },
+			},
+		]),
+		stderr: '',
+      };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  }, undefined, true);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'claude', args: ['plugin', 'update', 'owenloop@owenloop'] },
+  ]);
+  assertNoOlp(t);
+});
+
+test('setup plugin: same-version unsafe Codex launch runs the marketplace gate and plugin add', async () => {
+  const root = resolveBundledMarketplaceRoot('codex');
+  assert.ok(root);
+  const codexPluginRoot = mkdtempSync(join(tmpdir(), 'owenloop-setup-unsafe-codex-'));
+  writeFileSync(
+    join(codexPluginRoot, '.mcp.json'),
+    JSON.stringify({ mcpServers: { owenloop: { command: 'node', args: ['/worktrees/owenloop/dist/cli.js', 'mcp'], env_vars: ['PATH'] } } }),
+  );
+  const { code, t, calls } = await runPluginSetup(['codex'], (cmd, args) => {
+    if (cmd === 'codex' && args.join(' ') === 'plugin list --json') {
+      return {
+		status: 0,
+		stdout: JSON.stringify({
+			installed: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION, installed: true, source: { path: codexPluginRoot } }],
+			available: [],
+		}),
+		stderr: '',
+      };
+    }
+    if (cmd === 'codex' && args.join(' ') === 'plugin marketplace list --json') {
+      return { status: 0, stdout: JSON.stringify({ marketplaces: [] }), stderr: '' };
+    }
+    if (cmd === 'codex' && args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.146.0\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  }, undefined, true);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'codex', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'codex', args: ['plugin', 'add', 'owenloop@owenloop'] },
+  ]);
   assertNoOlp(t);
 });
 

@@ -50,11 +50,12 @@ function writeSettings(env: Record<string, string | undefined>, hubOrigin: strin
   writeFileSync(path, JSON.stringify({ hubOrigin }));
 }
 
-/** A PATH fixture dir with executable harness stubs; PATH scans never execute these files. */
-function pathDir(withClaude: boolean, withCodex = false): string {
+/** A PATH fixture dir with executable command stubs; PATH scans never execute these files. */
+function pathDir(withClaude: boolean, withCodex = false, withOwenloop = false): string {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-doctor-path-'));
   if (withClaude) writeFileSync(join(dir, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   if (withCodex) writeFileSync(join(dir, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  if (withOwenloop) writeFileSync(join(dir, 'owenloop'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   return dir;
 }
 
@@ -143,9 +144,14 @@ test('doctor: agent slot present but hub 401s the token → ✗ revoked or inval
 test('doctor: all green → every line ✓, exit 0, and a strict zero-write', async () => {
   const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
   const { fetch } = routedFetch(routes);
+  const codexPluginRoot = mkdtempSync(join(tmpdir(), 'owenloop-doctor-codex-plugin-'));
+  writeFileSync(
+    join(codexPluginRoot, '.mcp.json'),
+    JSON.stringify({ mcpServers: { owenloop: { command: 'owenloop', args: ['mcp'], env_vars: ['PATH'] } } }),
+  );
   const t = makeIo({
     fetch,
-    env: { PATH: pathDir(true, true) },
+    env: { PATH: pathDir(true, true, true) },
     runCommand: (cmd, args) => {
       if (args[0] === '--version') {
         return {
@@ -155,11 +161,20 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
         };
       }
       if (cmd === 'claude') {
-        return { status: 0, stdout: JSON.stringify([{ id: 'owenloop@owenloop', version: PACKAGE_VERSION }]), stderr: '' };
+		return {
+			status: 0,
+			stdout: JSON.stringify([
+				{ id: 'owenloop@owenloop', version: PACKAGE_VERSION, mcpServers: { owenloop: { command: 'owenloop', args: ['mcp'] } } },
+			]),
+			stderr: '',
+		};
       }
       return {
         status: 0,
-        stdout: JSON.stringify({ installed: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION, installed: true }], available: [] }),
+		stdout: JSON.stringify({
+			installed: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION, installed: true, source: { path: codexPluginRoot } }],
+			available: [],
+		}),
         stderr: '',
       };
     },
@@ -184,11 +199,104 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
   ]) {
     assert.ok(err.includes(`✓ ${label}`), `${label} passed`);
   }
-  assert.ok(err.includes(`✓ plugin (claude-code): owenloop ${PACKAGE_VERSION} · claude 2.1.222 (Claude Code)`));
-  assert.ok(err.includes(`✓ plugin (codex): owenloop ${PACKAGE_VERSION} · codex codex-cli 0.146.0`));
+  assert.ok(err.includes(`✓ plugin (claude-code): owenloop ${PACKAGE_VERSION} · MCP resolves as owenloop mcp via PATH · claude 2.1.222 (Claude Code)`));
+  assert.ok(err.includes(`✓ plugin (codex): owenloop ${PACKAGE_VERSION} · MCP resolves as owenloop mcp via PATH · codex codex-cli 0.146.0`));
   assert.doesNotMatch(err, /Update available: 2\.2\.0/, 'only the first CLI version output line is reported');
 
   assert.deepEqual([...t.store.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)), before, 'doctor performed no writes');
+  assertNoOlpErr(t);
+});
+
+test('doctor: same-version pinned Claude launch is non-fatal but reported as drift', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({
+    fetch,
+    env: { PATH: pathDir(true, false, true) },
+    runCommand: (cmd, args) => {
+      if (args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+      return {
+		status: 0,
+		stdout: JSON.stringify([
+			{
+				id: 'owenloop@owenloop',
+				version: PACKAGE_VERSION,
+				mcpServers: { owenloop: { command: '/Users/example/.nvm/versions/node/v22/bin/owenloop', args: ['mcp'] } },
+			},
+		]),
+		stderr: '',
+      };
+    },
+  });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  const err = t.err.join('\n');
+  assert.match(err, /✗ plugin \(claude-code\): MCP launch drift: declares "\/Users\/example\/.nvm\/versions\/node\/v22\/bin\/owenloop" "mcp"; expected "owenloop" "mcp" via PATH/u);
+  assert.match(err, /run owenloop setup/u);
+  assertNoOlpErr(t);
+});
+
+test('doctor: same-version worktree Codex launch is non-fatal but reported as drift', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const codexPluginRoot = mkdtempSync(join(tmpdir(), 'owenloop-doctor-unsafe-codex-'));
+  writeFileSync(
+    join(codexPluginRoot, '.mcp.json'),
+    JSON.stringify({ mcpServers: { owenloop: { command: 'node', args: ['/worktrees/owenloop/dist/cli.js', 'mcp'], env_vars: ['PATH'] } } }),
+  );
+  const t = makeIo({
+    fetch,
+    env: { PATH: pathDir(false, true, true) },
+    runCommand: (cmd, args) => {
+      if (args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.146.0\n', stderr: '' };
+      return {
+		status: 0,
+		stdout: JSON.stringify({
+			installed: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION, installed: true, source: { path: codexPluginRoot } }],
+			available: [],
+		}),
+		stderr: '',
+      };
+    },
+  });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  const err = t.err.join('\n');
+  assert.match(err, /✗ plugin \(codex\): MCP launch drift: declares "node" "\/worktrees\/owenloop\/dist\/cli\.js" "mcp"; expected "owenloop" "mcp" via PATH/u);
+  assert.match(err, /run owenloop setup/u);
+  assertNoOlpErr(t);
+});
+
+test('doctor: an unreadable installed MCP manifest is explicitly unverifiable', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({
+    fetch,
+    env: { PATH: pathDir(false, true, true) },
+    runCommand: (cmd, args) => {
+      if (args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.146.0\n', stderr: '' };
+      return {
+		status: 0,
+		stdout: JSON.stringify({
+			installed: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION, installed: true, source: { path: '/missing/plugin/root' } }],
+			available: [],
+		}),
+		stderr: '',
+      };
+    },
+  });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.match(t.err.join('\n'), /✗ plugin \(codex\): MCP launch unverifiable: could not read source\.path\/.mcp\.json — run owenloop setup/u);
   assertNoOlpErr(t);
 });
 

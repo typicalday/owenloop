@@ -262,11 +262,17 @@ for (const { harness, config } of MCP_MANIFESTS) {
   });
 }
 
-test('Claude Code .mcp.json owenloop entry uses the PATH CLI and only the plugin version env (INV-38)', () => {
+test('both .mcp.json owenloop entries launch exactly owenloop mcp through PATH (INV-38)', () => {
+  for (const { harness, config } of MCP_MANIFESTS) {
+    const owenloop = config.mcpServers['owenloop']!;
+    assert.equal(owenloop['command'], 'owenloop', `${harness} command`);
+    assert.deepEqual(owenloop['args'], ['mcp'], `${harness} arguments`);
+  }
+});
+
+test('Claude Code .mcp.json keeps its stdio shape and only the plugin version env (INV-38)', () => {
   const owenloop = MCP_MANIFESTS[0]!.config.mcpServers['owenloop']!;
   assert.equal(owenloop['type'], 'stdio');
-  assert.equal(owenloop['command'], 'owenloop');
-  assert.deepEqual(owenloop['args'], ['mcp']);
   assert.equal(owenloop['url'], undefined);
   assert.equal(owenloop['headers'], undefined);
   assert.deepEqual(Object.keys(owenloop['env'] as Record<string, unknown>), ['OWENLOOP_PLUGIN_VERSION']);

@@ -2718,7 +2718,8 @@ The plugin step probes and, when needed, converges the bundled `owenloop` plugin
 for each available harness: Claude Code and Codex. Plugin convergence is
 non-fatal and setup continues when a harness is missing, the bundled marketplace
 root is unavailable, or a plugin command fails. A second run with the expected
-plugin version already installed performs no plugin writes. The steps:
+plugin version already installed performs no plugin writes when its effective
+MCP launch is verified safe. The steps:
 
 1. **inspect** — read-only report of what's already present (human credential,
    execution settings, `claude` and `codex` on PATH, agent slots). No writes.
@@ -2745,16 +2746,23 @@ plugin version already installed performs no plugin writes. The steps:
    it reports that file as skipped and leaves its bytes untouched. If setup does
    not know any crews for the identity, it records a non-fatal noted result.
 7. **plugin** — probe and converge the bundled `owenloop` plugin separately
-   for Claude Code and Codex. When the installed plugin is missing or its
-   version differs from the CLI package, setup adds the bundled marketplace
-   when needed and installs or updates the plugin. Claude Code uses
+   for Claude Code and Codex. Setup verifies the installed MCP declaration
+   itself: it must run exactly `owenloop mcp` through `PATH`; Codex must also
+   pass `PATH` through to that subprocess, and the current environment must
+   resolve an executable `owenloop`. When the installed plugin is missing, its
+   version differs from the CLI package, or its launch is known unsafe, setup
+   adds the bundled marketplace when needed and installs or updates the plugin.
+   Claude Code uses
    `claude plugin install` for a fresh install and `claude plugin update` for
    an existing plugin. Codex uses `codex plugin add owenloop@owenloop` for both
    fresh installs and upgrades; setup does not call
    `codex plugin marketplace upgrade`, which applies only to Git marketplaces.
    **Non-fatal:** a missing harness or failed convergence is reported as
-   `noted` and never fails setup. If the bundled marketplace root is
-   unavailable, setup prints manual commands instead.
+   `noted` and never fails setup. Unverifiable launch metadata is reported by
+   doctor but does not cause repeated setup writes. An absolute marketplace,
+   cache, install, or source location is not unsafe by itself—the effective
+   command and arguments determine the verdict. If the bundled marketplace root
+   is unavailable, setup prints manual commands instead.
 8. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
    the same surfaces, whose result becomes setup's exit code.
 
@@ -2938,15 +2946,23 @@ The checks, in order:
 | 3 | agent slot | an `agent:<name>` credential is stored | yes |
 | 4 | agent plane | that agent credential verifies live against the hub | yes |
 | 5 | execution settings | the settings file's `hubOrigin` matches this hub | yes |
-| 6 | plugin (claude-code) | the Claude Code `owenloop` plugin is installed at the package version | **no** (rendered only) |
-| 7 | plugin (codex) | the Codex `owenloop` plugin is installed at the package version | **no** (rendered only) |
+| 6 | plugin (claude-code) | the Claude Code `owenloop` plugin is at the package version and its effective launch resolves as `owenloop mcp` through PATH | **no** (rendered only) |
+| 7 | plugin (codex) | the Codex `owenloop` plugin is at the package version, launches `owenloop mcp` through PATH, and passes PATH through | **no** (rendered only) |
 
 The plugin checks also report the detected harness CLI version. An installed
 plugin whose version cannot be parsed is reported as `version unknown` and is
 not treated as a failure. A parsed plugin version that differs from the
 package version is reported as version skew with the remedy `run owenloop
-setup`. A missing harness reports that the harness is not on `PATH`; a missing
-plugin reports the harness-specific marketplace and install command.
+setup`. Doctor also reads each installed plugin's effective MCP declaration:
+an absolute or worktree command, alternate arguments, missing Codex PATH
+pass-through, or a missing executable `owenloop` on PATH is launch drift even
+when versions currently match. Missing or malformed launch metadata is rendered
+as explicitly unverifiable rather than guessed safe. Absolute marketplace,
+cache, install, and source paths are harness storage locations and are not by
+themselves launch drift. A missing harness reports that the harness is not on
+`PATH`; a missing plugin reports the harness-specific marketplace and install
+command. `owenloop setup` repairs a known unsafe declaration through its
+existing non-fatal convergence flow.
 
 Each `✗` line names its own remedy (`run owenloop setup`, `owenloop login --hub
 <origin>`, re-run setup's Replace, and so on). doctor never short-circuits — a
@@ -2977,8 +2993,11 @@ error telling you to run `owenloop login --hub <origin>` in a terminal and retry
 ### Plugin/CLI version alignment
 
 The shipped Claude Code and Codex plugins launch `owenloop mcp` from `PATH` and
-carry the plugin version in `.mcp.json` as `OWENLOOP_PLUGIN_VERSION`. The MCP
-server compares that expected version with its own package version on every
+carry the plugin version in `.mcp.json` as `OWENLOOP_PLUGIN_VERSION`; Codex also
+explicitly passes `PATH` through to the subprocess. Doctor verifies that
+effective installed launch shape as well as version equality, so a same-version
+absolute or worktree launch declaration is reported as drift. The MCP server
+still compares that expected version with its own package version on every
 recognized `tools/call`. The comparison is strict equality: a mismatch returns
 a tool error that names both versions and says `Run: owenloop setup`. The
 server does not reject the MCP startup handshake, so the diagnostic reaches the
