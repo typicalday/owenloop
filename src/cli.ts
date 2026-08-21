@@ -8126,8 +8126,25 @@ function unknownMcpLaunch(detail: string): McpLaunchState {
   return { status: 'unknown', detail };
 }
 
-function renderMcpCommand(command: string, args: string[]): string {
-  return [command, ...args].map((part) => JSON.stringify(part)).join(' ');
+/**
+ * Describe an untrusted plugin launch without echoing manifest values. Plugin
+ * manifests are local user-controlled input, so command/argument strings can
+ * carry credentials even when the declaration is invalid.
+ */
+function describeMcpLaunch(command: string, args: string[]): string {
+  const commandShape = command === 'owenloop'
+    ? '"owenloop"'
+    : command === 'node'
+      ? '"node"'
+      : isAbsolute(command)
+		? 'an absolute command'
+		: 'a non-owenloop command';
+  const argsShape = args.length === 1 && args[0] === 'mcp'
+    ? 'exactly the "mcp" argument'
+    : args[0] === 'mcp'
+      ? `"mcp" plus ${args.length - 1} additional argument(s)`
+      : `${args.length} argument(s) not exactly "mcp"`;
+  return `declares ${commandShape} with ${argsShape}; expected "owenloop" with exactly "mcp" via PATH`;
 }
 
 function classifyMcpLaunch(
@@ -8144,9 +8161,8 @@ function classifyMcpLaunch(
     return unknownMcpLaunch('the owenloop MCP command or arguments are missing or malformed');
   }
 
-  const rendered = renderMcpCommand(command, args);
   if (command !== 'owenloop' || args.length !== 1 || args[0] !== 'mcp') {
-    return { status: 'unsafe', detail: `declares ${rendered}; expected "owenloop" "mcp" via PATH` };
+    return { status: 'unsafe', detail: describeMcpLaunch(command, args) };
   }
 
   if (harness === 'codex') {

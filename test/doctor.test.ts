@@ -234,7 +234,7 @@ test('doctor: same-version pinned Claude launch is non-fatal but reported as dri
 
   assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
   const err = t.err.join('\n');
-  assert.match(err, /✗ plugin \(claude-code\): MCP launch drift: declares "\/Users\/example\/.nvm\/versions\/node\/v22\/bin\/owenloop" "mcp"; expected "owenloop" "mcp" via PATH/u);
+  assert.match(err, /✗ plugin \(claude-code\): MCP launch drift: declares an absolute command with exactly the "mcp" argument; expected "owenloop" with exactly "mcp" via PATH/u);
   assert.match(err, /run owenloop setup/u);
   assertNoOlpErr(t);
 });
@@ -268,7 +268,7 @@ test('doctor: same-version worktree Codex launch is non-fatal but reported as dr
 
   assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
   const err = t.err.join('\n');
-  assert.match(err, /✗ plugin \(codex\): MCP launch drift: declares "node" "\/worktrees\/owenloop\/dist\/cli\.js" "mcp"; expected "owenloop" "mcp" via PATH/u);
+  assert.match(err, /✗ plugin \(codex\): MCP launch drift: declares "node" with 2 argument\(s\) not exactly "mcp"; expected "owenloop" with exactly "mcp" via PATH/u);
   assert.match(err, /run owenloop setup/u);
   assertNoOlpErr(t);
 });
@@ -297,6 +297,43 @@ test('doctor: an unreadable installed MCP manifest is explicitly unverifiable', 
 
   assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
   assert.match(t.err.join('\n'), /✗ plugin \(codex\): MCP launch unverifiable: could not read source\.path\/.mcp\.json — run owenloop setup/u);
+  assertNoOlpErr(t);
+});
+
+test('doctor: unsafe manifest arguments never leak credentials to stdout or stderr', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const secret = 'olp_manifest_secret';
+  const bearer = 'mcpat_manifest_secret';
+  const t = makeIo({
+    fetch,
+    env: { PATH: pathDir(true, false, true) },
+    runCommand: (cmd, args) => {
+      if (args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+      return {
+		status: 0,
+		stdout: JSON.stringify([
+			{
+				id: 'owenloop@owenloop',
+				version: PACKAGE_VERSION,
+				mcpServers: { owenloop: { command: 'owenloop', args: ['mcp', '--token', secret, bearer] } },
+			},
+		]),
+		stderr: '',
+      };
+    },
+  });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  const stdout = t.out.join('\n');
+  const stderr = t.err.join('\n');
+  for (const output of [stdout, stderr]) {
+    assert.doesNotMatch(output, /olp_manifest_secret|mcpat_manifest_secret/u);
+  }
+  assert.match(stderr, /MCP launch drift: declares "owenloop" with "mcp" plus 3 additional argument\(s\)/u);
   assertNoOlpErr(t);
 });
 
