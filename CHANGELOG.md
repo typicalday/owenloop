@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.14](https://github.com/typicalday/owenloop/compare/v0.5.13...v0.5.14) (2026-08-21)
+
+
+### Bug Fixes
+
+* **engine:** let a sealed collection be consumed without deadlocking a multi-step def ([#269](https://github.com/typicalday/owenloop/issues/269)) ([e3be862](https://github.com/typicalday/owenloop/commit/e3be8627a227a9e5fc134306e935ec816eafcb00))
+
 ## [0.5.13](https://github.com/typicalday/owenloop/compare/v0.5.12...v0.5.13) (2026-08-21)
 
 
