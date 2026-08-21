@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { buildDef } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -75,12 +76,12 @@ test('owenloop#236: a produce-only collection is clean', () => {
   assert.deepEqual(report.invariantViolations, []);
 });
 
-test('owenloop#236: reduce without a map exhausts but still reports stuck', () => {
+test('owenloop#229: a bare reduce exhausts without recoverable collection states reported as stuck', () => {
   const report = modelCheck(reduceOnlyFixture, { maxStates: 5_000, maxCollectionSize: 2, assumeProvided: true });
 
   assert.equal(report.bounded, false);
   assert.deepEqual(report.boundsHit, []);
-  assert.ok(report.stuck.length > 0);
+  assert.deepEqual(report.stuck, []);
 });
 
 test('owenloop#236: map with a member reduce hits maxStates', () => {
@@ -111,6 +112,23 @@ test('owenloop#236: map with a member reduce hits maxStates', () => {
   assert.ok(report.boundsHit.includes('maxStates'));
 });
 
+test('owenloop#229: minimal-budget map then suffix reduce is exhaustively clean', () => {
+  const report = modelCheck(memberReduceFixture(1, 0), {
+    maxStates: 10_000,
+    maxCollectionSize: 2,
+    assumeProvided: true,
+  });
+
+  assert.equal(report.completable, true);
+  assert.equal(report.bounded, false);
+  assert.deepEqual(report.boundsHit, []);
+  assert.deepEqual(report.deadlocks, []);
+  assert.deepEqual(report.stuck, []);
+  assert.deepEqual(report.structurallyDeadSteps, []);
+  assert.deepEqual(report.unreachedSteps, []);
+  assert.deepEqual(report.invariantViolations, []);
+});
+
 test('owenloop#236: reject-budget profiles control collection tractability', () => {
   const options = { maxStates: 5_000, maxCollectionSize: 3, assumeProvided: true };
   const oneZero = modelCheck(memberReduceFixture(1, 0), options);
@@ -132,16 +150,62 @@ test('owenloop#236: reject-budget profiles control collection tractability', () 
   assert.ok(twoFive.boundsHit.includes('maxStates'));
 });
 
-test('owenloop#236: archive-gate conditions expose stuck as the single failure', () => {
+test('owenloop#229: archive-gate conditions are clean after collection recovery classification', () => {
   const report = modelCheck(reduceOnlyFixture, { maxStates: 5_000, maxCollectionSize: 2, assumeProvided: true });
 
   assert.equal(report.completable, true);
   assert.equal(report.bounded, false);
   assert.deepEqual(report.boundsHit, []);
   assert.deepEqual(report.deadlocks, []);
-  // This is the single archive-gate failure in owenloop#236; a future fix must make it empty.
-  assert.ok(report.stuck.length > 0);
+  assert.deepEqual(report.stuck, []);
   assert.deepEqual(report.structurallyDeadSteps, []);
   assert.deepEqual(report.unreachedSteps, []);
   assert.deepEqual(report.invariantViolations, []);
+});
+
+test('owenloop#229: a loader-faithful mixed singleton and generated collection reaches its second step', () => {
+  const fixture = buildDef({
+    name: 'owenloop-229-mixed-producer',
+    outputs: ['report', 'q'],
+    inputs: [{ name: 'request', seedOwed: false }],
+    steps: [
+      {
+	name: 'p-first',
+	consumes: ['request'],
+	produces: ['note'],
+	generates: ['q[]'],
+	body: 'write both independent outputs',
+      },
+      {
+	name: 'p-second',
+	consumes: ['note'],
+	produces: ['report'],
+	terminal: true,
+	body: 'use the singleton output',
+      },
+    ],
+  });
+  const report = modelCheck(fixture, { maxStates: 5_000, maxCollectionSize: 2, assumeProvided: true });
+
+  assert.equal(report.completable, true);
+  assert.deepEqual(report.deadlocks, []);
+  assert.deepEqual(report.stuck, []);
+  assert.deepEqual(report.structurallyDeadSteps, []);
+  assert.deepEqual(report.unreachedSteps, []);
+  assert.deepEqual(report.invariantViolations, []);
+});
+
+test('owenloop#229: scalar parallel branches remain a genuine stuck control', () => {
+  const fixture = def(
+    'owenloop-229-scalar-stuck-control',
+    [input('request', { seedOwed: false })],
+    [
+      step({ name: 'logger', consumes: ['request'], produces: ['note'] }),
+      step({ name: 'worker', consumes: ['request'], produces: ['report'], terminal: true }),
+    ],
+  );
+  const report = modelCheck(fixture, { maxStates: 5_000, assumeProvided: true });
+
+  assert.equal(report.completable, true);
+  assert.ok(report.stuck.length > 0);
 });

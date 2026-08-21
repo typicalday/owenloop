@@ -226,7 +226,9 @@ A step can emit any number of elements at runtime; a `map` step runs once per
 element, and a `reduce` step runs once after they're all in (or, with a
 suffixed reduce, once every element's own per-element output is in). See
 [`docs/authoring.md`](docs/authoring.md#consume--produce-grammar) and
-[`research.yaml`](examples/workflows/research.yaml).
+[`research.yaml`](examples/workflows/research.yaml). A rejected collection
+seal can be re-emitted and resealed; rejected members are recovered by an
+authorized retract, as described in the authoring guide.
 
 ### Composition — `include:` and `calls:`
 

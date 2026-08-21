@@ -759,6 +759,58 @@ export function memberRetractFirings(def: WorkflowDef, arts: ArtifactMap): Membe
 }
 
 /**
+ * Return the bare collection member that would be terminally removed by
+ * retracting an indexed debt. A bare member maps to itself; a suffixed map
+ * child maps back to its bare member, whose retraction cascades to that child.
+ * Non-indexed debts, including collection seals, have no member-retract
+ * recovery path.
+ */
+function retractableMemberPath(path: string): string | undefined {
+  const element = parseElement(path);
+  return element ? elementPath(element.stem, element.index) : undefined;
+}
+
+/** Whether a modeled authority retraction can clear this stalled debt. */
+function retractClearsDebt(path: string, retractFirings: readonly MemberRetractFiring[]): boolean {
+  const memberPath = retractableMemberPath(path);
+  return memberPath !== undefined && retractFirings.some((firing) => firing.outputs[0] === memberPath);
+}
+
+/**
+ * A remaining output of the stalled debt's own producer or of an upstream
+ * producer is not unrelated-line progress. One worker may separately commit
+ * singleton and collection outputs, but that does not make a downstream
+ * schema-stalled sibling output `stuck`.
+ */
+function progressMovesAnotherBranch(
+  def: WorkflowDef,
+  path: string,
+  arts: ArtifactMap,
+  progressFirings: readonly Firing[],
+): boolean {
+  const producer = arts.get(path)?.producer;
+  if (producer === undefined) return progressFirings.length > 0;
+
+  const sameLine = new Set<string>([producer]);
+  const pending = [producer];
+  while (pending.length > 0) {
+    const stepName = pending.pop()!;
+    const step = def.steps.find((candidate) => candidate.name === stepName);
+    if (!step) continue;
+    for (const consume of step.consumes) {
+      for (const candidate of def.steps) {
+		if (!candidate.produces.some((produce) => produce.stem === consume.stem)) continue;
+		if (!sameLine.has(candidate.name)) {
+		  sameLine.add(candidate.name);
+		  pending.push(candidate.name);
+		}
+      }
+    }
+  }
+  return progressFirings.some((firing) => !sameLine.has(firing.step));
+}
+
+/**
  * Every firing eligible *right now* — inputs satisfied AND an owed/rejected
  * output to discharge. This is the scheduling gate (§11.4): necessary, not
  * sufficient; the commit fingerprint (§12.2) is the correctness boundary.
@@ -2270,8 +2322,12 @@ function eligibleOutcomes(
   const isMember = !!el && el.suffix === '';
 
   const outcomes: CheckStep['outcome'][] = [];
-  if (stem && !el) {
-    // collection producer (plain step with collection output) — emit-seal path
+  // A mixed producer commits its singleton outputs separately before it emits
+  // and seals its collection. `plainOutputs()` intentionally orders those
+  // singletons before the seal, so only the seal is the collection verb; the
+  // runtime still permits a consumer to judgment-reject that green seal.
+  if (stem && !el && outPath === sealPath(stem)) {
+    // collection producer's actual seal output — emit-seal path
     outcomes.push('emit-seal');
     return outcomes;
   }
@@ -2716,7 +2772,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // a worker firing. It is separate from eligibleFirings so a rejected map
     // input still has the later retract move the runtime permits.
     const retractFirings = memberRetractFirings(def, node.arts);
-    const firings = [...status.eligible, ...callsFirings, ...retractFirings];
+    // Member retractions remain real successor transitions, including in the
+    // zero-move branch below. They are recovery authority actions, though, not
+    // ordinary worker/calls progress on another branch for `stuck` reporting.
+    const progressFirings = [...status.eligible, ...callsFirings];
+    const firings = [...progressFirings, ...retractFirings];
 
     // Non-done state with no eligible firings: classify by recomputing
     // eligibility as if every freeze/stall were lifted and idle time had
@@ -2734,11 +2794,17 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       continue;
     }
 
-    // The state HAS eligible firings (the line can still move). If a brake tripped
-    // on some *other* branch, record it as an informational stuck state. A no-moves
-    // stall state never reaches here (it `continue`d above), so no state is ever
-    // listed in both `stuck` and `stallStates`/`deadlocks`.
-    if (status.debts.some((d) => d.stalled)) {
+    // A state is stuck only if ordinary work (or a machine child discharge) can
+    // still progress while another debt is irrecoverably stalled. A retract-only
+    // transition is intentionally explored but is authority recovery, not
+    // unrelated-branch progress; likewise a stalled indexed debt that an
+    // authorized member retract clears is recoverable rather than stranded.
+    // A no-moves state never reaches here, so it is never also a stall/deadlock.
+    if (status.debts.some((debt) =>
+      debt.stalled
+      && !retractClearsDebt(debt.path, retractFirings)
+      && progressMovesAnotherBranch(def, debt.path, node.arts, progressFirings),
+    )) {
       report.stuck.push({ path: node.path });
     }
 

@@ -894,6 +894,13 @@ suffixed reduce (`src[*].child`) can fan in on a map's per-element output
 instead of the bare elements. See [`research.yaml`](../examples/workflows/research.yaml)
 for a runnable example.
 
+Recovery is deliberate: a consumer of `src[*]` can judgment-reject a green
+seal, re-offering the producer to emit more items and seal again. If a bare
+member itself is rejected, it is not regenerated at that index; a consumer
+authorized by its consume edge should `retract` it instead, which also removes
+its indexed children. See [the collection design](design.md#11-collections)
+for the lifecycle details.
+
 ## Artifact values are JSON, and secrets don't belong in them
 
 An artifact's `value` is always a JSON object (`Record<string, unknown>`,
