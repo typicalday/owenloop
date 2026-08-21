@@ -1717,6 +1717,11 @@ export function validateDef(def: WorkflowDef): string[] {
   // Phase 2, analogous to how expandIncludes validates include input-key mappings.
   for (const l of def.steps) {
     if (!isCallStep(l)) continue;
+    if (l.calls !== undefined && l.callsInterface !== undefined) {
+      errors.push(
+        `call step '${l.name}' declares both calls and callsInterface; the discriminators are mutually exclusive`,
+      );
+    }
     const callLabel = l.callsInterface === undefined ? 'calls:' : 'callsInterface';
     // (a) calls: step must produce exactly one output (one child, one outcome path — v1)
     if (l.produces.length !== 1) {

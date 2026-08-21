@@ -334,6 +334,52 @@ test('callsInterface: valid binding spawns the exact pinned child and emits no c
   store.close();
 });
 
+test('callsInterface: an existing-child pin mismatch records one reason and event episode on an unchanged gate', () => {
+  const { parent, child, binding } = interfaceFixtures();
+  const adoptedChild = structuredClone(child);
+  adoptedChild.bundleDigest = 'b'.repeat(64);
+  let liveChild = child;
+  const store = openStore(':memory:');
+  const engine = new Engine(store, (name, _from, digest) => {
+    if (name === parent.name) return parent;
+    if (name === INTERFACE_TARGET) return digest === undefined ? liveChild : child;
+    throw new Error(`no def: ${name}`);
+  });
+  const parentWf = engine.createInstance(parent.name, {
+    provide: { payload: { message: 'hello' } },
+    interfaceBindings: [binding],
+  });
+  engine.tick(parentWf, { deep: false });
+  const spawnedChild = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(spawnedChild !== undefined);
+
+  liveChild = adoptedChild;
+  engine.adopt(spawnedChild.id);
+  assert.equal(store.getWorkflow(spawnedChild.id)?.defSnapshot?.bundleDigest, adoptedChild.bundleDigest);
+  assert.deepEqual(store.getWorkflow(spawnedChild.id)?.interfaceBindings, [binding]);
+
+  let rejectCommits = 0;
+  let parentSettled = 0;
+  const unsubscribe = engine.subscribe((event) => {
+    if (event.type === 'commit'
+      && event.workflow === parentWf
+      && event.path === 'delivered'
+      && event.action === 'reject') rejectCommits++;
+    if (event.type === 'settled' && event.workflow === parentWf) parentSettled++;
+  });
+  assert.doesNotThrow(() => engine.tick(parentWf, { deep: false }));
+  assert.doesNotThrow(() => engine.tick(parentWf, { deep: false }));
+  unsubscribe();
+
+  const delivered = store.getArtifact(parentWf, 'delivered')!;
+  assert.equal(delivered.acceptance, 'rejected');
+  assert.equal(delivered.reasons.length, 1, 'the same existing-child pin mismatch is recorded once');
+  assert.match(delivered.reasons[0]!.text, /existing child.*expected/u);
+  assert.equal(rejectCommits, 1, 'only the persisted refusal emits a commit event');
+  assert.equal(parentSettled, 1, 'only the persisted refusal emits a settled event');
+  store.close();
+});
+
 interface CleanupCallRun {
   parentWf: string;
   childWf: string;

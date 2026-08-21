@@ -254,6 +254,24 @@ test('createEngine: REL-4 in-memory calls target that does not exist is rejected
   );
 });
 
+test('createEngine: an in-memory call step cannot carry both concrete and interface discriminators', () => {
+  const child: WorkflowDef = {
+    ...def('child', [], [step({ name: 'worker', produces: ['result'] })]),
+    outputs: ['result'],
+  };
+  const hybrid = caller('hybrid', child.name);
+  hybrid.steps[0]!.callsInterface = { name: 'research-report', version: '1' };
+
+  assert.throws(
+    () => createEngine({ db: ':memory:', defs: [hybrid, child] }),
+    (err: unknown) => {
+      assert.ok(err instanceof DefError, `expected DefError, got ${String(err)}`);
+      assert.match(err.message, /call step 'call'.*both calls and callsInterface.*mutually exclusive/u);
+      return true;
+    },
+  );
+});
+
 test('createEngine: REL-4 a valid composed in-memory set still constructs and drives (no regression)', () => {
   const child: WorkflowDef = {
     ...def('childOk', [input('data', { seedOwed: true })], [

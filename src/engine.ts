@@ -1493,13 +1493,21 @@ export class Engine {
     now?: number,
   ): void {
     const text = `interface call '${err.interface.name}@${err.interface.version}' bound to '${err.target}' `
-      + `failed its immutable start-time pin check: ${err.detail}; this spawn was refused with no child row — `
+      + `failed its immutable start-time pin check: ${err.detail}; this provision was refused without creating or replacing a child row — `
       + `restore the pinned bundle or start a new parent with a valid binding`;
+    let recorded = false;
     this.store.tx(() => {
       const art = this.store.getArtifact(parentWf, callsStem);
       if (!art) return;
       const gateArts = this.artMap(parentWf);
       const fp = computeFingerprint(gateArts, gateStems);
+      const alreadyRecorded = art.acceptance === 'rejected'
+        && deepEqual(fp, art.fingerprint ?? {})
+        && art.reasons.some((entry) => entry.action === 'reject'
+          && entry.kind === 'structural'
+          && entry.by === 'engine'
+          && entry.text === text);
+      if (alreadyRecorded) return;
       this.store.putArtifact({
         ...art,
         acceptance: 'rejected',
@@ -1507,7 +1515,9 @@ export class Engine {
         reasons: [...art.reasons, reason('reject', 'structural', 'engine', text, art.version)],
       });
       this.settle(parentWf, def, now);
+      recorded = true;
     });
+    if (!recorded) return;
     this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
     this.fireSettled(parentWf);
   }
