@@ -12,6 +12,8 @@ import { buildClaudeOptions } from '../packages/work/src/harness/claude.ts';
 import { buildThreadStartParams } from '../packages/work/src/harness/codex.ts';
 import {
   FIXTURE_NO_OP_TOOL_NAMES,
+  assertComparableNodeTreatment,
+  assertExpectedNodeVersion,
   createFixtureMcpServer,
   fixtureToolRegistrations,
   loadCharterFixture,
@@ -24,13 +26,14 @@ import {
   sha256,
   validateReport,
 } from './helpers/mcp-charter-eval.ts';
-import type { CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/mcp-charter-eval.ts';
+import type { CharterEvalReport, CharterTask, ParsedTrace, TaskRecord, TraceCall } from './helpers/mcp-charter-eval.ts';
 import {
   CLAUDE_EVAL_PERMISSIONS,
   CODEX_EVAL_PERMISSIONS,
   claudeFixtureMountFailure,
   finalResponseEvidence,
   mergeReportedModel,
+  readOptions,
   reportedMetadata,
   runTask,
 } from './mcp-charter-eval.ts';
@@ -401,7 +404,7 @@ test('mcp charter: stub is local with an ambient hub and records exact wire argu
   }
 });
 
-test('mcp charter: scorer covers clear-task failures, observations, and unscorable traces', async () => {
+test('mcp charter: scorer records catalog discovery and arm safety independently', async () => {
   const fixture = await loadCharterFixture();
   const hash = 'a'.repeat(64);
   const delivery = fixture.tasks.find((task) => task.id === 'match-delivery')!;
@@ -410,48 +413,106 @@ test('mcp charter: scorer covers clear-task failures, observations, and unscorab
   const list: TraceCall = { sequence: 1, name: 'list_workflows', arguments: {} };
   const deliveryStart: TraceCall = { sequence: 2, name: 'start_run', arguments: { workflow_name: 'code-delivery' } };
 
+  const zeroCallNoMatch = scoreTask(finance, initTrace(hash, []));
+  assert.deepEqual(zeroCallNoMatch.dimensions, { catalogDiscovery: 'failed', taskSafety: 'passed' });
+  assert.equal(zeroCallNoMatch.classification, 'failed');
+
+  const discoveredUnsafeNoMatch = scoreTask(finance, initTrace(hash, [list, deliveryStart]));
+  assert.deepEqual(discoveredUnsafeNoMatch.dimensions, { catalogDiscovery: 'passed', taskSafety: 'failed' });
+  assert.equal(discoveredUnsafeNoMatch.classification, 'failed');
+
+  const unsafeUndiscoveredNoMatch = scoreTask(
+    finance,
+    initTrace(hash, [
+      { sequence: 1, name: 'start_run', arguments: { workflow_name: 'code-delivery' } },
+      { sequence: 2, name: 'list_workflows', arguments: {} },
+    ]),
+  );
+  assert.deepEqual(unsafeUndiscoveredNoMatch.dimensions, { catalogDiscovery: 'failed', taskSafety: 'failed' });
+
+  const expectedBeforeDiscovery = scoreTask(
+    delivery,
+    initTrace(hash, [
+      { sequence: 1, name: 'start_run', arguments: { workflow_name: 'code-delivery' } },
+      { sequence: 2, name: 'list_workflows', arguments: {} },
+    ]),
+  );
+  assert.deepEqual(expectedBeforeDiscovery.dimensions, { catalogDiscovery: 'failed', taskSafety: 'passed' });
+  assert.equal(expectedBeforeDiscovery.classification, 'failed');
+
+  const conflictingMatch = scoreTask(
+    delivery,
+    initTrace(hash, [
+      list,
+      deliveryStart,
+      { sequence: 3, name: 'start_run', arguments: { workflow_name: 'library-build' } },
+    ]),
+  );
+  assert.deepEqual(conflictingMatch.dimensions, { catalogDiscovery: 'passed', taskSafety: 'failed' });
+  assert.match(conflictingMatch.reason ?? '', /task safety failed/u);
+
   assert.equal(scoreTask(delivery, initTrace(hash, [list, deliveryStart])).classification, 'passed');
-  assert.equal(
-    scoreTask(
-      delivery,
-      initTrace(hash, [
-        { sequence: 1, name: 'start_run', arguments: { workflow_name: 'code-delivery' } },
-        { sequence: 2, name: 'list_workflows', arguments: {} },
-      ]),
-    ).classification,
-    'failed',
-    'start-before-list fails discovery order',
+  assert.deepEqual(scoreTask(delivery, initTrace(hash, [list, deliveryStart])).dimensions, {
+    catalogDiscovery: 'passed',
+    taskSafety: 'passed',
+  });
+  assert.deepEqual(
+    scoreTask(delivery, initTrace(hash, [list, { sequence: 2, name: 'start_run', arguments: { workflow_name: 'library-build' } }])).dimensions,
+    { catalogDiscovery: 'passed', taskSafety: 'failed' },
+    'wrong workflow fails task safety',
   );
-  assert.equal(scoreTask(delivery, initTrace(hash, [])).classification, 'failed', 'initialized no-call clear task fails');
-  assert.equal(
-    scoreTask(delivery, initTrace(hash, [list, { sequence: 2, name: 'start_run', arguments: { workflow_name: 'library-build' } }])).classification,
-    'failed',
-    'wrong workflow fails',
+  const missingExpectedSelection = scoreTask(delivery, initTrace(hash, [list]));
+  assert.deepEqual(missingExpectedSelection.dimensions, { catalogDiscovery: 'passed', taskSafety: 'failed' });
+  assert.equal(missingExpectedSelection.classification, 'failed');
+  assert.deepEqual(
+    scoreTask(delivery, initTrace(hash, [list, { sequence: 2, name: 'start_run', arguments: {} }])).dimensions,
+    { catalogDiscovery: 'passed', taskSafety: 'failed' },
+    'schema-rejected start_run still fails task safety',
   );
-  assert.equal(
-    scoreTask(
-      delivery,
-      initTrace(hash, [
-        list,
-        deliveryStart,
-        { sequence: 3, name: 'start_run', arguments: { workflow_name: 'library-build' } },
-      ]),
-    ).classification,
-    'failed',
-    'conflicting workflow fails',
+  const malformedExpectedSelection = scoreTask(
+    delivery,
+    initTrace(hash, [list, { sequence: 2, name: 'start_run', arguments: { workflow_name: 'code-delivery', priority: 'urgent' } }]),
   );
+  assert.deepEqual(malformedExpectedSelection.dimensions, { catalogDiscovery: 'passed', taskSafety: 'failed' });
+  assert.equal(malformedExpectedSelection.classification, 'failed');
   assert.equal(scoreTask(finance, initTrace(hash, [list])).classification, 'passed');
-  assert.equal(
-    scoreTask(finance, initTrace(hash, [list, deliveryStart])).classification,
-    'failed',
-    'no-match start fails',
+  const observed = scoreTask(ambiguous, parseTraceJsonl('', hash));
+  assert.equal(observed.classification, 'observed');
+  assert.equal(observed.dimensions, undefined);
+  const unscorable = scoreTask(delivery, parseTraceJsonl('', hash));
+  assert.equal(unscorable.classification, 'unscorable');
+  assert.deepEqual(unscorable.dimensions, { catalogDiscovery: 'unscorable', taskSafety: 'unscorable' });
+});
+
+test('mcp charter: re-scores immutable baseline traces with both clear dimensions passing', async () => {
+  const fixture = await loadCharterFixture();
+  const tasksById = new Map(fixture.tasks.map((task) => [task.id, task]));
+  const baseline = JSON.parse(
+    await readFile(new URL('../docs/evals/mcp-charter-baseline.json', import.meta.url), 'utf8'),
+  ) as {
+    scores: Array<{
+      harness: { id: string; configuredModel?: string; reportedModel?: string; version?: string };
+      charterSha256: string;
+      tasks: Array<{ id: string; calls: TraceCall[]; responseEvidence: string[] }>;
+    }>;
+  };
+  const scores = baseline.scores.map((storedScore) => {
+    const records = storedScore.tasks.map((storedTask) => {
+      const task = tasksById.get(storedTask.id);
+      assert.ok(task !== undefined, `baseline task ${storedTask.id} must remain in the authoritative fixture`);
+      return { ...scoreTask(task, initTrace(storedScore.charterSha256, storedTask.calls)), responseEvidence: storedTask.responseEvidence };
+    });
+    return makeScoreRecord(storedScore.harness, storedScore.charterSha256, records);
+  });
+  assert.deepEqual(
+    Object.fromEntries(scores.map((score) => [score.harness.id, `${score.passed}/${score.denominator}`])),
+    { 'claude-code': '4/4', codex: '4/4' },
   );
-  assert.equal(scoreTask(ambiguous, initTrace(hash, [list])).classification, 'observed');
-  assert.equal(scoreTask(delivery, parseTraceJsonl('', hash)).classification, 'unscorable');
-  assert.equal(
-    scoreTask(delivery, parseTraceJsonl(JSON.stringify({ kind: 'initialize', charterSha256: 'b'.repeat(64) }), hash)).classification,
-    'unscorable',
-  );
+  for (const score of scores) {
+    for (const task of score.tasks.filter((task) => task.kind !== 'ambiguous')) {
+      assert.deepEqual(task.dimensions, { catalogDiscovery: 'passed', taskSafety: 'passed' });
+    }
+  }
 });
 
 test('mcp charter: report aggregates two harnesses under one hash and excludes observations', async () => {
@@ -475,8 +536,13 @@ test('mcp charter: report aggregates two harnesses under one hash and excludes o
       makeScoreRecord({ id: 'claude-code', reportedModel: 'fixture' }, hash, records),
       makeScoreRecord({ id: 'codex', configuredModel: 'fixture', reportedModel: 'fixture' }, hash, records),
     ],
-    '2026-08-20T00:00:00.000Z',
+    {
+      expectedNodeVersion: 'v22.22.3',
+      generatedAt: '2026-08-20T00:00:00.000Z',
+      nodeVersion: 'v22.22.3',
+    },
   );
+  assert.equal(report.schemaVersion, 2);
   assert.equal(report.scores.length, 2);
   assert.ok(report.scores.every((score) => score.charterSha256 === hash));
   assert.ok(report.scores.every((score) => score.denominator === 4 && score.passed === 4 && score.tasks.length === 6));
@@ -490,6 +556,37 @@ test('mcp charter: report aggregates two harnesses under one hash and excludes o
     validateReport(unattributed).includes('codex: provider-selected model is missing'),
     'a configured override alone must not masquerade as the provider-selected model',
   );
+
+  const mismatchedNode = structuredClone(report);
+  mismatchedNode.nodeVersion = 'v26.5.0';
+  assert.ok(validateReport(mismatchedNode).includes('Node treatment mismatch: expected v22.22.3, actual v26.5.0'));
+  assert.doesNotThrow(() => assertComparableNodeTreatment([report, structuredClone(report)]));
+  const crossNode = structuredClone(report);
+  crossNode.expectedNodeVersion = 'v26.5.0';
+  crossNode.nodeVersion = 'v26.5.0';
+  assert.throws(() => assertComparableNodeTreatment([report, crossNode]), /v22\.22\.3.*v26\.5\.0/u);
+  const missingPin = structuredClone(report) as unknown as { expectedNodeVersion?: string };
+  delete missingPin.expectedNodeVersion;
+  assert.throws(
+    () => assertComparableNodeTreatment([missingPin as CharterEvalReport]),
+    /no declared expected Node version/u,
+  );
+});
+
+test('mcp charter: requires an explicit Node treatment pin before live setup', () => {
+  const previous = process.env['OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION'];
+  try {
+    delete process.env['OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION'];
+    assert.throws(() => readOptions([]), /expected Node version is required/u);
+    process.env['OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION'] = 'v26.5.0';
+    assert.equal(readOptions([]).expectedNodeVersion, 'v26.5.0');
+    assert.equal(readOptions(['--expected-node-version', 'v22.22.3']).expectedNodeVersion, 'v22.22.3');
+  } finally {
+    if (previous === undefined) delete process.env['OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION'];
+    else process.env['OWENLOOP_MCP_CHARTER_EXPECTED_NODE_VERSION'] = previous;
+  }
+  assert.doesNotThrow(() => assertExpectedNodeVersion('v22.22.3', 'v22.22.3'));
+  assert.throws(() => assertExpectedNodeVersion('v22.22.3', 'v26.5.0'), /v22\.22\.3.*v26\.5\.0/u);
 });
 
 test('mcp charter runner makes adapter exits unscorable and retains only final response evidence', async () => {
