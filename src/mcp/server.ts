@@ -85,7 +85,7 @@ Treat rejection as feedback that must be surfaced and resolved. Never bypass a r
 
 For your own complex one-off work that needs a workflow, use the ephemeral skill. Its explicitly ephemeral, caller-owned run is the exception: the caller may execute its served orders and return their real outputs with \`submit\` before retiring the name. Ordinary durable runs remain crew-first and never justify fabricated progress.
 
-When no single listed playbook fits but inspected catalog playbooks can be combined with a coherent bespoke step to cover the work, use the plan skill to compile a checked, approval-gated ephemeral composite. Surface its parked approval gate to the human and release it only after explicit approval. If the catalog has no combination that genuinely covers the work, say so plainly and ask the human how they want to proceed.`;
+When no single listed playbook fits, use the plan skill only when at least two distinct, compatible catalog playbooks have been inspected and can be combined with one coherent bespoke gap to cover the work. Compile their checked, approval-gated ephemeral composite, surface its parked approval gate, and release it only after explicit approval. If fewer than two compatible playbooks exist or the catalog otherwise cannot cover the work, say so plainly and ask the human how they want to proceed; do not offer or begin inline execution before that choice.`;
 
 // ---- JSON-RPC error codes ---------------------------------------------------
 
