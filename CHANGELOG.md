@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.15](https://github.com/typicalday/owenloop/compare/v0.5.14...v0.5.15) (2026-08-21)
+
+
+### Bug Fixes
+
+* **setup:** resolve the MCP plugin launch through the PATH binary ([#271](https://github.com/typicalday/owenloop/issues/271)) ([ce25164](https://github.com/typicalday/owenloop/commit/ce25164f0397a1c70e62feeea11715fb6fe59823))
+* **work:** answer an approval with a human credential, not an agent one ([#273](https://github.com/typicalday/owenloop/issues/273)) ([6cd5330](https://github.com/typicalday/owenloop/commit/6cd53308c8040f0e0fc4b7303e555104af0d5e57))
+
+
+### Performance Improvements
+
+* **work:** skip the targeted whats_next for instances the inbox shows unservable ([#277](https://github.com/typicalday/owenloop/issues/277)) ([4b18fe6](https://github.com/typicalday/owenloop/commit/4b18fe6a2b6e272e7d62b797ad6a8a6c452b0046))
+
 ## [0.5.14](https://github.com/typicalday/owenloop/compare/v0.5.13...v0.5.14) (2026-08-21)
 
 
