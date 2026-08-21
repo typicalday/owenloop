@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.16](https://github.com/typicalday/owenloop/compare/v0.5.15...v0.5.16) (2026-08-21)
+
+
+### Bug Fixes
+
+* **work:** let a declared unrestricted filesystem widen the gatekeeper's read check ([#276](https://github.com/typicalday/owenloop/issues/276)) ([e353402](https://github.com/typicalday/owenloop/commit/e353402d64b57adcd03d6a727a350b918126dbe7))
+* **work:** name capability-silent harness failures ([#272](https://github.com/typicalday/owenloop/issues/272)) ([cff319f](https://github.com/typicalday/owenloop/commit/cff319f32296ca287b37a506d01ba4df3629fdac))
+
 ## [0.5.15](https://github.com/typicalday/owenloop/compare/v0.5.14...v0.5.15) (2026-08-21)
 
 
