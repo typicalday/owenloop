@@ -2961,8 +2961,10 @@ as explicitly unverifiable rather than guessed safe. Absolute marketplace,
 cache, install, and source paths are harness storage locations and are not by
 themselves launch drift. A missing harness reports that the harness is not on
 `PATH`; a missing plugin reports the harness-specific marketplace and install
-command. `owenloop setup` repairs a known unsafe declaration through its
-existing non-fatal convergence flow.
+command. Unsafe declarations are summarized by command shape and argument
+count; doctor does not echo manifest values, which may contain credentials.
+`owenloop setup` repairs a known unsafe declaration through its existing
+non-fatal convergence flow.
 
 Each `✗` line names its own remedy (`run owenloop setup`, `owenloop login --hub
 <origin>`, re-run setup's Replace, and so on). doctor never short-circuits — a
