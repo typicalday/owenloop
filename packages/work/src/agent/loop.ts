@@ -170,7 +170,8 @@ export const DEFAULT_CONFIRM_INTERVAL_MS = 1_000;
 export const DEFAULT_SUBMIT_GRACE_MS = 15_000;
 /** Keep capability-silent release diagnostics useful without growing worker logs without bound. */
 const HARNESS_FAILURE_TAIL_SIZE = 4;
-const HARNESS_FAILURE_FRAGMENT_CAP = 480;
+const HARNESS_FAILURE_FRAGMENT_CAP = 700;
+const HARNESS_FAILURE_TAIL_CAP = 2_000;
 
 export interface AgentRunLoopOptions {
   hub: HubClient;
@@ -552,7 +553,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   }
 
   function harnessFailureTail(): string | undefined {
-    return harnessFailures.length > 0 ? harnessFailures.join(' | ') : undefined;
+    if (harnessFailures.length === 0) return undefined;
+    const tail = harnessFailures.join(' | ');
+    return tail.length > HARNESS_FAILURE_TAIL_CAP
+      ? `${tail.slice(0, HARNESS_FAILURE_TAIL_CAP - 1)}…`
+      : tail;
   }
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
@@ -930,9 +935,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     if (routing.kind === 'unrouted') {
+      const authoredSettings: string[] = [];
+      if (permissions.model !== undefined) authoredSettings.push(`model '${permissions.model}'`);
+      if (permissions.effort !== undefined) authoredSettings.push(`effort '${permissions.effort}'`);
+      const executionPolicy =
+	authoredSettings.length === 0
+	  ? 'no roster model or effort override and no authored step model or effort; it will choose its own default model'
+	  : `no roster model or effort override; authored step ${authoredSettings.join(' and ')} remains in effect`;
       opts.err(
 	`CAPABILITY-SILENT owenloop work agent-run: ${order} step '${packet.step}' declares no capabilities, so no crew roster row applies; ` +
-	  `selected harness '${resolution.id}' receives no model or effort override and will choose its own default model ` +
+	  `selected harness '${resolution.id}' receives ${executionPolicy} ` +
 	  `(the exact runtime model id will be reported by the harness when available).`,
       );
     } else {

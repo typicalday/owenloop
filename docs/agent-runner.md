@@ -9,9 +9,11 @@ Runtime preflight is authoritative. `owenloop work lint` runs the same common an
 ## Capability-silent steps
 
 A step with no declared capabilities is valid loud-proceed work: no crew roster
-model or effort is injected, so the selected harness chooses its own default.
-The worker emits a `CAPABILITY-SILENT` claim-time warning that names that
-policy and the selected harness. If the turn ends without a hub outcome, its
+model or effort is injected. An authored `x.harness.model` or
+`x.harness.effort` still applies; only when neither is authored does the
+selected harness choose its own default. The worker emits a
+`CAPABILITY-SILENT` claim-time warning that names the selected harness and
+which policy applies. If the turn ends without a hub outcome, its
 terminal local line repeats the provider-reported runtime model and a bounded
 harness diagnostic when either was reported; missing values are named rather
 than guessed. These messages are telemetry only. The hub remains the sole

@@ -519,7 +519,7 @@ test('resume preserves unrestricted network readers under a read-only filesystem
   assert.equal(options.strictMcpConfig, true);
 });
 
-test('env and abortController are always set, and stderr forwards to onEvent as progress', () => {
+test('env and abortController are always set, and stderr preserves display text with bounded failure metadata', () => {
   const events: AgentEvent[] = [];
   const env = bareEnv({ HOME: '/home/x' });
   const abortController = new AbortController();
@@ -534,6 +534,14 @@ test('env and abortController are always set, and stderr forwards to onEvent as 
 
   options.stderr?.('boom\n');
   assert.deepEqual(events, [{ kind: 'progress', text: 'stderr: boom', failure: 'boom' }]);
+
+  const longLine = 'x'.repeat(2_100);
+  options.stderr?.(`${longLine}\n`);
+  assert.deepEqual(events[1], {
+    kind: 'progress',
+    text: `stderr: ${longLine}`,
+    failure: `${longLine.slice(0, 2_000)}…`,
+  });
 });
 
 // ---------------------------------------------------------------------------

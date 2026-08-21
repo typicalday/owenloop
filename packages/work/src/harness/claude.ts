@@ -670,8 +670,8 @@ export function buildClaudeOptions(
       : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
-      const line = cap(data.trimEnd());
-      extra.onEvent({ kind: 'progress', text: `stderr: ${line}`, failure: line });
+      const line = data.trimEnd();
+      extra.onEvent({ kind: 'progress', text: `stderr: ${line}`, failure: cap(line) });
     },
     // Set here, before the `permissionMode` block below, because it is not
     // conditional on that block running: a step naming no mode at all is exactly
