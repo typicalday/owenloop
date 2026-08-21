@@ -83,18 +83,20 @@ so a previous 4/4 point is not a stable floor. The full retained history is:
 | `582fa513` | discarded single clause correction | 3 | 4/4, 4/4, 4/4 | 4/4, 3/4, 2/4 |
 
 Only the committed baseline JSON lives in this repository; the table is the
-durable record of the other complete reports. The three same-SHA samples at
-`582fa513` were run consecutively and are retained in execution order, not
-filtered to the one passing Codex score. The shipped `c418623` baseline is
-the third sample in its own complete series and records Codex at 3/4.
+durable record of the other complete reports. PR #255 publishes the full raw
+call traces and response evidence for all three `c418623` reports. The three
+same-SHA samples at `582fa513` were run consecutively and are retained in
+execution order, not filtered to the one passing Codex score. The shipped
+`c418623` baseline is the third sample in its own complete series and records
+Codex at 3/4.
 
 The old committed Codex 4/4 figure was one sample, not a stable floor. Across
 the unchanged `35773e2e` control, the shipped `c418623` clause, and the
-discarded `582fa513` correction, Codex varies independently of charter
-wording. The plan's three-report 4/4 cohort gate is therefore not achievable
-for Codex on this fixture at any charter text sampled by this unit. This is an
-evaluation finding, not a reason to alter the generated baseline or to claim a
-charter-only fix.
+discarded `582fa513` correction, the observed Codex scores are unstable and
+neither three-report treatment cohort reaches 4/4 throughout. This is blocking
+evidence after the one permitted clause correction, not proof that no possible
+charter wording could affect the probability of a catalog call. It is not a
+reason to alter the generated baseline or claim a charter-only fix.
 
 A raw isolated Codex session confirmed the fixture was exposed before the
 model's first response: the fixture received `initialize`, then
@@ -116,6 +118,16 @@ using the relevant websites and your supplied details?” Both are offers of inl
 work rather than plain catalog-gap refusals. This is a substantive behavioral
 finding from the cohort, not a passing claim.
 
+The response evidence for every no-match arm in all three `c418623` reports was
+also reviewed. Claude consistently names the catalog gap, but its follow-up is
+not uniformly non-inline: the first report offers finance organization and a
+provider comparison, the second operations reply explicitly offers “I draft
+your action kit inline,” and the final operations reply offers a call-ready
+packet. Codex offers inline work in all six responses: “I’m ready” / “I can
+handle this” in report 1, “I can handle this” in both report-2 arms, and the two
+report-3 offers quoted above. No claim of universally compliant no-match prose
+is made from this cohort.
+
 The fixed fixture is a routing guard only. Its ambiguous tasks remain
 non-gating observations: the isolated harnesses do not expose the plan skill,
 `create_workflow`, `get_status`, or `pending_gates`, and the catalog cannot
@@ -125,7 +137,7 @@ one. No ambiguous response text is evidence of W3.3a execution, and the tasks
 do not change the four-task denominator.
 
 The scorer deliberately evaluates the structured call trace, not whether
-response prose semantically refuses inline execution. The approved follow-on is
+response prose semantically refuses inline execution. The recorded follow-on is
 an evaluator unit, not a change in this PR: it needs a reproducible fixture, an
 explicit model and run policy, and a behavioral gate that distinguishes a
 zero-call trace from genuine compliant routing. This unit records that scope
