@@ -422,7 +422,7 @@ test('run() signal wiring: exec message line, SIGINT mid-run kills + releases, e
   assert.ok(err.includes('owenloop work exec: SIGINT received — killing the command and releasing the order'), err.join('\n'));
   assert.ok(killState.kills >= 1);
   assert.equal(submits.length, 0);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'signal' }]);
 });
 
 test('default exec wiring recovers a signed missing bundle before resolving the command', async () => {
@@ -511,7 +511,7 @@ test('default exec wiring preserves unresolved-instructions when recovery cannot
     });
     assert.equal(code, 1, 'the loop keeps its unresolved-instructions failure outcome');
     assert.match(err.join('\n'), /instruction refusal \(integrity\).*HTTP 404/u);
-    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'unresolved-instructions' }]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
