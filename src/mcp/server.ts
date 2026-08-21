@@ -65,11 +65,9 @@ const OUR_PROTOCOL_VERSION = '2025-06-18';
 //
 // Commit the charter edit and the regenerated baseline together.
 //
-// One run is one sample, not a measurement. Codex's score moves between runs
-// at a FIXED charter sha: 35773e2e scored 3/4, 4/4 and 4/4 on three runs
-// across fifteen minutes. Read the committed number as a point in a range, and
-// re-run before concluding an edit helped or hurt. The run history and the
-// per-arm ranges live in docs/mcp-charter-eval.md.
+// The unchanged 35773e2e control has ten Claude 4/4 samples and Codex values
+// 3, 4, 4, 2, 3, 2, 2, 3, 3, 3. No charter effect can be inferred from the
+// Codex score; the full negative-result finding is in docs/mcp-charter-eval.md.
 //
 // search_workflows is deliberately NOT named here. The eval scores the first
 // tool call, and offering a second discovery verb in the charter competes with
@@ -85,7 +83,7 @@ Treat rejection as feedback that must be surfaced and resolved. Never bypass a r
 
 For your own complex one-off work that needs a workflow, use the ephemeral skill. Its explicitly ephemeral, caller-owned run is the exception: the caller may execute its served orders and return their real outputs with \`submit\` before retiring the name. Ordinary durable runs remain crew-first and never justify fabricated progress.
 
-Only after the mandatory catalog read, when no single listed playbook fits, use the plan skill solely if the inspected catalog itself contains at least two distinct, compatible playbooks that together cover the work except for one coherent bespoke gap. Compile only those catalog pieces into their checked, approval-gated ephemeral composite, surface its parked approval gate, and release it only after explicit approval. Otherwise, state plainly that the catalog has no fitting playbook or composite and ask the human how to proceed; do not offer, begin, or describe doing any of the requested work inline.`;
+If no listed playbook fits, say so plainly and ask the human how they want to proceed.`;
 
 // ---- JSON-RPC error codes ---------------------------------------------------
 
