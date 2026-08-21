@@ -670,7 +670,8 @@ export function buildClaudeOptions(
       : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
-      extra.onEvent({ kind: 'progress', text: `stderr: ${data.trimEnd()}` });
+      const line = cap(data.trimEnd());
+      extra.onEvent({ kind: 'progress', text: `stderr: ${line}`, failure: line });
     },
     // Set here, before the `permissionMode` block below, because it is not
     // conditional on that block running: a step naming no mode at all is exactly
@@ -884,7 +885,11 @@ function toolResultText(content: ToolResultBlockParam['content']): string {
 function emitAssistant(message: SDKAssistantMessage, onEvent: (e: AgentEvent) => void): void {
   const from = origin(message.parent_tool_use_id);
   if (message.error !== undefined) {
-    onEvent({ kind: 'progress', text: `${from}assistant error: ${message.error}` });
+    onEvent({
+      kind: 'progress',
+      text: `${from}assistant error: ${message.error}`,
+      failure: cap(message.error),
+    });
   }
   for (const block of message.message.content) {
     switch (block.type) {
@@ -1000,6 +1005,7 @@ export async function consumeTurn(
           `session ${message.session_id}: cliVersion=${message.claude_code_version} ` +
           `model=${message.model} apiKeySource=${message.apiKeySource} ` +
           `permissionMode=${message.permissionMode} cwd=${message.cwd} mcp=[${servers}]`,
+	model: cap(message.model),
       });
       onInit?.(sessionId);
     } else if (message.type === 'result') {

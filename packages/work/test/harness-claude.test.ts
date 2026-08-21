@@ -533,7 +533,7 @@ test('env and abortController are always set, and stderr forwards to onEvent as 
   assert.equal(options.abortController, abortController);
 
   options.stderr?.('boom\n');
-  assert.deepEqual(events, [{ kind: 'progress', text: 'stderr: boom' }]);
+  assert.deepEqual(events, [{ kind: 'progress', text: 'stderr: boom', failure: 'boom' }]);
 });
 
 // ---------------------------------------------------------------------------

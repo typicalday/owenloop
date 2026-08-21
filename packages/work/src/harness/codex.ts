@@ -1119,7 +1119,10 @@ async function openClient(
     // in `jsonrpc-stdio.ts`), so the reader keeps draining notifications, and no
     // timeout wraps a server request the way `client.request` wraps ours.
     onServerRequest: handleServerRequest(onEvent, approvals),
-    onStderr: (line) => onEvent({ kind: 'progress', text: cap(line) }),
+    onStderr: (line) => {
+      const text = cap(line);
+      onEvent({ kind: 'progress', text, failure: text });
+    },
     onExit: (code, signal) => {
       reportExit(code, signal === null ? undefined : `killed by ${signal}`);
       // Resolve-on-turn-end means a death BEFORE `turn/completed` is a failure,

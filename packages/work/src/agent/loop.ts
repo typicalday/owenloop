@@ -168,6 +168,9 @@ export type CrewRosterResolver = (crews: readonly string[]) => CrewRosterResolut
 export const DEFAULT_CONFIRM_INTERVAL_MS = 1_000;
 /** Default confirm-phase bound: give the hub 15s to show the submit's outcome. */
 export const DEFAULT_SUBMIT_GRACE_MS = 15_000;
+/** Keep capability-silent release diagnostics useful without growing worker logs without bound. */
+const HARNESS_FAILURE_TAIL_SIZE = 4;
+const HARNESS_FAILURE_FRAGMENT_CAP = 480;
 
 export interface AgentRunLoopOptions {
   hub: HubClient;
@@ -516,6 +519,41 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   let deliveredReasonAt: number | undefined;
   /** Captures a thrown safety-gate append from the synchronous `started` event. */
   let activePersistenceFailure: unknown;
+  /** Provider-selected model, when a harness reports it after its synchronous start gate. */
+  let runtimeModel: string | undefined;
+  /** Recent unique harness diagnostics for the capability-silent no-submit log only. */
+  const harnessFailures: string[] = [];
+
+  function oneLine(text: string): string {
+    return text.replace(/\s+/gu, ' ').trim();
+  }
+
+  function bounded(text: string): string {
+    const line = oneLine(text);
+    return line.length > HARNESS_FAILURE_FRAGMENT_CAP
+      ? `${line.slice(0, HARNESS_FAILURE_FRAGMENT_CAP)}…`
+      : line;
+  }
+
+  function rememberRuntimeModel(model: string | undefined): void {
+    if (model === undefined) return;
+    const normalized = bounded(model);
+    if (normalized !== '') runtimeModel = normalized;
+  }
+
+  function rememberHarnessFailure(failure: string | undefined): void {
+    if (failure === undefined) return;
+    const normalized = bounded(failure);
+    if (normalized === '') return;
+    const previous = harnessFailures.indexOf(normalized);
+    if (previous >= 0) harnessFailures.splice(previous, 1);
+    harnessFailures.push(normalized);
+    if (harnessFailures.length > HARNESS_FAILURE_TAIL_SIZE) harnessFailures.shift();
+  }
+
+  function harnessFailureTail(): string | undefined {
+    return harnessFailures.length > 0 ? harnessFailures.join(' | ') : undefined;
+  }
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -627,6 +665,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     switch (e.kind) {
       case 'started':
         sessionRef = e.ref;
+	rememberRuntimeModel(e.model);
         opts.err(`owenloop work agent-run: session started for ${order} (harness '${e.ref.harness}')`);
 	// This synchronous event is the cold-start gate. The adapter must not
 	// begin provider work until the callback returns. A thrown durable append
@@ -640,6 +679,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 	}
         return;
       case 'progress':
+	rememberRuntimeModel(e.model);
+	rememberHarnessFailure(e.failure);
         opts.err(`owenloop work agent-run: ${e.text}`);
         return;
       case 'assistant_response':
@@ -658,6 +699,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         opts.err(`owenloop work agent-run: turn ended for ${order} (telemetry — the hub decides the outcome)`);
         return;
       case 'exited':
+	rememberHarnessFailure(e.error);
+	if (e.error === undefined && e.exitCode !== null && e.exitCode !== 0) {
+	  rememberHarnessFailure(`harness exited with code ${String(e.exitCode)}`);
+	}
         opts.err(
           `owenloop work agent-run: harness exited (code ${String(e.exitCode)}${e.error !== undefined ? `, ${e.error}` : ''}) — telemetry only, ignored for the outcome`,
         );
@@ -886,8 +931,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
     if (routing.kind === 'unrouted') {
       opts.err(
-        `owenloop work agent-run: ${order} carries no capabilities, so no crew roster row applies — ` +
-          `running on '${resolution.id}'s own default model.`,
+	`CAPABILITY-SILENT owenloop work agent-run: ${order} step '${packet.step}' declares no capabilities, so no crew roster row applies; ` +
+	  `selected harness '${resolution.id}' receives no model or effort override and will choose its own default model ` +
+	  `(the exact runtime model id will be reported by the harness when available).`,
       );
     } else {
       opts.out(
@@ -1125,6 +1171,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
     // TURN END — NOT task end. Log the failure shape for humans, then confirm.
     if (raced.failure !== undefined) {
+      rememberHarnessFailure(errMsg(raced.failure));
       const why = isResumeUnavailable(raced.failure)
         ? `the harness could not resume the session (${errMsg(raced.failure)})`
         : errMsg(raced.failure);
@@ -1178,6 +1225,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return 'lease-lost';
       case 'no-submit':
         record('dead');
+	if (routing.kind === 'unrouted') {
+	  const model = runtimeModel ?? 'model id not reported by the harness';
+	  const failure = harnessFailureTail() ?? 'no specific harness failure was reported';
+	  opts.err(
+	    `CAPABILITY-SILENT owenloop work agent-run: ${order} step '${packet.step}' on harness '${resolution.id}' ` +
+	      `reported runtime model ${model}; harness failure context: ${failure}; no submit reached the hub within the confirm grace — releasing for re-offer.`,
+	  );
+	  return releaseWith('capability-silent-no-submit', 'no-submit');
+	}
         opts.err(
           `owenloop work agent-run: the turn ended and no submit reached the hub within the confirm grace — releasing ${order} for re-offer`,
         );
