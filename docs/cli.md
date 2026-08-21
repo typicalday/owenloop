@@ -3266,6 +3266,7 @@ owenloop list                               # includes $wf in this local databas
 # the Step Agent loop: tick → run → report
 run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
 owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
+owenloop close "$wf" "$run"                        # complete the planner firing
 
 owenloop status $wf                            # done / debts / eligible / blocked / pending / inFlight
 owenloop trace "$wf"                           # local causal timeline as JSON
