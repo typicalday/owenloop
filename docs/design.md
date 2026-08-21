@@ -1050,8 +1050,11 @@ attempts," i.e. what a human `retry` grants):
   owed input with no producer). This is folded into `hasDefiniteCheckDefect` and
   always makes `check` exit nonzero. `boundsHit` limits completeness, not the
   validity of an already-reached deadlock witness: max-depth, max-states, and
-  `--max-collection` may omit findings but cannot fabricate this cap-free
-  freeze-lifted classification.
+  `--max-collection` may omit findings but cannot fabricate this cap-free,
+  future-idle-aware freeze-lifted classification. The checker has no workflow
+  clock, so it checks whether an idle evaluator can become eligible after its
+  threshold before classifying a deadlock; it does not expand that timed path in
+  the timeless BFS.
 
 The freeze-lift recompute ONLY lifts the `frozen()` guard — it does not
 bypass group-exclusivity (`groupBlockingWinner`), input-green gates, or

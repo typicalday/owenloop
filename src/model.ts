@@ -61,6 +61,20 @@ export interface TimeFacts {
   alarms: Map<string, number>;
 }
 
+/**
+ * modelCheck has no workflow clock, but deadlock classification must recognize
+ * an idle evaluator that can fire after its finite threshold elapses. This
+ * synthetic future contains no in-flight work or alarm override, so it answers
+ * only whether an eventual idle firing exists; ordinary BFS expansion remains
+ * timeless.
+ */
+const EVENTUAL_IDLE_TIME: TimeFacts = {
+  now: Number.POSITIVE_INFINITY,
+  lastProgressMs: 0,
+  inFlight: false,
+  alarms: new Map(),
+};
+
 /** A candidate run: a step bound to a particular key, with its concrete edges. */
 export interface Firing {
   step: string;
@@ -2509,9 +2523,11 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
  * Bounded reachability / liveness checker over a workflow definition.
  *
  * Explores the full (or depth/state-bounded) state space via BFS to find:
- * - a non-done, zero-eligible-firings state is split into exactly ONE of two
- *   mutually exclusive buckets by recomputing eligibility with every freeze
- *   lifted (unlimited attempts — see `eligibleFirings`'s `ignoreFreeze`):
+ * - a non-done state with no current eligible firings is classified only after
+ *   checking whether an idle evaluator can become eligible in the future. States
+ *   with no eventual idle firing split into exactly ONE of two mutually exclusive
+ *   buckets by recomputing eligibility with every freeze lifted (unlimited
+ *   attempts — see `eligibleFirings`'s `ignoreFreeze`):
  *   - stall states: the recompute yields >= 1 firing — the state's only
  *     blocker is a frozen/stalled debt (maxAttempts / maxSchemaFailures /
  *     held). A by-design human-escalation brake. EXPECTED, never a defect.
@@ -2592,8 +2608,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // deadlocks are real witnesses. Counterexample paths are produced by real
     // applyOutcome/settleInMemory transitions (the same transitions the
     // conformance test pins to the live Engine), and true deadlocks are classified
-    // by a cap-free freeze-lifted eligibility recomputation. Bounds can cause
-    // MISSES, never fabricate either witness. `stuck` remains informational.
+    // by a cap-free, future-idle-aware freeze-lifted eligibility recomputation.
+    // Bounds can cause MISSES, never fabricate either witness. `stuck` remains
+    // informational.
     if (def.invariants) {
       for (const inv of def.invariants) {
         if (reportedInvariants.has(inv.name)) continue;
@@ -2643,13 +2660,16 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     const retractFirings = memberRetractFirings(def, node.arts);
     const firings = [...status.eligible, ...callsFirings, ...retractFirings];
 
-    // Non-done state with no eligible firings: classify by recomputing eligibility
-    // as if every freeze/stall were lifted (unlimited attempts). If a producer
-    // would re-arm → an EXPECTED stall state (a by-design brake). If not → a
-    // TRUE deadlock (a structural dead-end with no path to completion even at
-    // unlimited attempts).
+    // Non-done state with no current firings: first account for an idle evaluator
+    // that becomes eligible after waiting. modelCheck is intentionally timeless,
+    // so it does not expand that transition, but it must never call the state a
+    // true deadlock. Otherwise classify by recomputing eligibility as if every
+    // freeze/stall were lifted (unlimited attempts). If a producer would re-arm
+    // → an EXPECTED stall state (a by-design brake). If not → a TRUE deadlock.
     if (firings.length === 0 && !status.done) {
-      const lifted = eligibleFirings(def, node.arts, undefined, { ignoreFreeze: true });
+      const eventualIdle = eligibleFirings(def, node.arts, EVENTUAL_IDLE_TIME).some((firing) => firing.cause === 'idle');
+      if (eventualIdle) continue;
+      const lifted = eligibleFirings(def, node.arts, EVENTUAL_IDLE_TIME, { ignoreFreeze: true });
       if (lifted.length > 0) {
         report.stallStates.push({ path: node.path });
       } else {
@@ -2737,11 +2757,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
  *
  * Invariant violations, structurally-dead steps, and reported true deadlocks are
  * ALWAYS definite (sound regardless of bounds). A reported deadlock is a
- * reachable state whose cap-free freeze-lifted eligibility recomputation has no
- * moves. max-depth, max-states, and collection caps can cause missed findings,
- * but cannot fabricate that witness. `unreachedSteps` is deliberately EXCLUDED
- * — it is a bounds artifact ("raise --max-states/--max-depth"), never a definite
- * defect.
+ * reachable state whose cap-free, future-idle-aware freeze-lifted eligibility
+ * recomputation has no moves. max-depth, max-states, and collection caps can
+ * cause missed findings, but cannot fabricate that witness. `unreachedSteps` is
+ * deliberately EXCLUDED — it is a bounds artifact ("raise
+ * --max-states/--max-depth"), never a definite defect.
  */
 export function hasDefiniteCheckDefect(report: CheckReport): boolean {
   return (

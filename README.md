@@ -759,7 +759,8 @@ line could move — this is an EXPECTED, by-design human-escalation brake and ne
 fails the check — versus a **true deadlock** — the same recompute STILL yields no
 moves, a genuine structural dead-end, which fails the check nonzero when the search
 is bounded or exhaustive; bounds may omit findings but cannot invalidate a reached
-deadlock witness. See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
+deadlock witness. The checker accounts for eventual idle-trigger eligibility when
+it classifies that witness. See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
 for the full breakdown.
 
 By default, `seedOwed` inputs are assumed provided (modeling the operator's `provide`

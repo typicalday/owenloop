@@ -980,10 +980,12 @@ export interface CheckReport {
    * Reachable non-done states with zero eligible firings that have NO path to
    * completion even at unlimited attempts — i.e. recomputing eligibility with
    * all freezes lifted (a human `retry` = unlimited attempts) STILL yields
-   * zero firings. A genuine structural dead-end (TRUE deadlock) and always a
-   * definite defect: max-depth, max-states, and collection caps can miss other
-   * witnesses, but cannot fabricate this reached, cap-free classification.
-   * Always present ([] when none).
+   * zero firings. The checker checks for idle evaluators that can become eligible
+   * after their threshold before classifying this state, so it is a genuine
+   * structural dead-end (TRUE deadlock) and always a definite defect: max-depth,
+   * max-states, and collection caps can miss other witnesses, but cannot
+   * fabricate this reached, cap-free classification. Always present ([] when
+   * none).
    */
   deadlocks: CheckFinding[];
   /**

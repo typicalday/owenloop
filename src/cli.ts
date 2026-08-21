@@ -2412,8 +2412,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     //   ALWAYS nonzero, regardless of bounded. Invariant paths use real
     //   applyOutcome/settleInMemory transitions; structurally-dead is a STATIC
     //   canEverFire finding; a true deadlock is a reached state with no moves in a
-    //   cap-free freeze-lifted eligibility recomputation. Search bounds may omit
-    //   findings, but they cannot invalidate an already-reached witness.
+    //   cap-free, future-idle-aware freeze-lifted eligibility recomputation.
+    //   Search bounds may omit findings, but they cannot invalidate an
+    //   already-reached witness.
     // - unreachedSteps must NEVER affect the exit code: it is purely a bounds
     //   artifact.
     // - stall states and stuck states are by-design brakes and NEVER affect the
