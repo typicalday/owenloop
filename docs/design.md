@@ -628,7 +628,7 @@ A green, value-defined declared outcome may carry a status-bearing value (e.g. `
 
 #### §23.6.5 Gate fingerprint and re-arm
 
-The machine-green fingerprint covers `gateStems` (the parent artifacts wired into the child via `callsInputs`) plus, as of F4 (§23.6.8), a reserved `__child_outcome_version__` key pinning the child outcome's version. The cross-instance join/re-green trigger is handled by `maintainCalls`'s outcome-value, `workflowDone`, and version-pin checks, not by the pure forward cascade (`fingerprintMatches`) — `eligibleFirings`/`settle`'s cascade never looks at a calls: artifact's fingerprint or child state to decide re-arming, since a calls: step declares `consumes: []`.
+The machine-green fingerprint covers `gateStems` (the parent artifacts wired into the child via `callsInputs`) plus, as of F4 (§23.6.8), a reserved `__child_outcome_version__` key pinning the child outcome's version. The cross-instance join/re-green trigger is handled by `maintainCalls`'s outcome-value, `workflowDone`, and version-pin checks, not by green-fingerprint invalidation in the pure forward cascade: a calls: step still declares `consumes: []`, and its live green fingerprint must not be compared with the gate-only dependency set. Maintenance does use `callsInputs` separately to find dead gate branches, structurally skip the calls output and its downstream branch, and revive an engine-authored cascade skip after the gate returns green with moved versions. Human or producer skips retain the child-outcome pin semantics in §23.6.8 and are not revived merely because the gate is green.
 
 #### §23.6.6 Transaction composition
 

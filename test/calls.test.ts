@@ -615,6 +615,90 @@ test('calls: (g) provideInput cascades to calls: child without extra tick', () =
   );
 });
 
+test('calls: a skipped gate settles its calls branch and re-arms it when the gate revives', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+
+  const provision = engine.tick(parentWf, { deep: false }).orders.find((o) => o.step === 'provision');
+  assert.ok(provision !== undefined, 'provision should be claimable');
+  engine.skip(parentWf, 'sandbox', 'provision', 'sandbox is not needed');
+  engine.close(parentWf, provision!.run, 'skipped');
+
+  const delivered = getArt(store, parentWf, 'delivered');
+  assert.equal(getArt(store, parentWf, 'sandbox')?.acceptance, 'skipped');
+  assert.equal(delivered?.acceptance, 'skipped', 'a dead calls gate settles the parent calls debt');
+  assert.notEqual(delivered?.acceptance, 'green', 'a dead calls gate must not silently pass');
+  assert.equal(delivered?.reasons.at(-1)?.by, 'engine', 'the calls skip is an engine cascade');
+  assert.equal(delivered?.reasons.at(-1)?.kind, 'structural');
+  assert.equal(getArt(store, parentWf, 'done')?.acceptance, 'skipped', 'the downstream branch cascades too');
+  assert.equal(store.findChildByParent(parentWf, 'delivered'), undefined, 'a dead gate must not spawn a child');
+
+  engine.provideInput(parentWf, 'proposal', { text: 'revised' });
+  const reprovision = engine.tick(parentWf, { deep: false }).orders.find((o) => o.step === 'provision');
+  assert.ok(reprovision !== undefined, 'the revived provision branch should be claimable');
+  engine.green(parentWf, reprovision!.run, 'sandbox', { env: 'v2' });
+
+  assert.equal(
+    getArt(store, parentWf, 'delivered')?.acceptance,
+    'owed',
+    'a structural calls skip re-arms immediately when its gate becomes green again',
+  );
+});
+
+test('calls: a green calls output remains green across repeated settles', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+
+  const provision = engine.tick(parentWf, { deep: false }).orders.find((o) => o.step === 'provision');
+  assert.ok(provision !== undefined);
+  engine.green(parentWf, provision!.run, 'sandbox', { env: 'v1' });
+  engine.close(parentWf, provision!.run);
+  engine.tick(parentWf, { deep: false });
+
+  const child = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(child !== undefined, 'the ready calls gate should spawn its child');
+  const worker = engine.tick(child!.id).orders.find((o) => o.step === 'worker');
+  assert.ok(worker !== undefined);
+  engine.green(child!.id, worker!.run, 'result', { value: 'done' });
+  engine.close(child!.id, worker!.run);
+  engine.tick(parentWf, { deep: false });
+
+  const initial = getArt(store, parentWf, 'delivered');
+  assert.equal(initial?.acceptance, 'green');
+  const version = initial!.version;
+  for (let i = 0; i < 3; i++) {
+    engine.tick(parentWf, { deep: false });
+    const delivered = getArt(store, parentWf, 'delivered');
+    assert.equal(delivered?.acceptance, 'green');
+    assert.equal(delivered?.version, version, 'the gate stems must not invalidate the N+1 calls fingerprint');
+  }
+});
+
+test('calls: maintenance-only gate dependencies leave plain cascade revival unchanged', () => {
+  const plainControl = def(
+    'plain-cascade-control',
+    [input('seed', { seedOwed: true })],
+    [
+      step({ name: 'source', consumes: ['seed'], produces: ['gate'] }),
+      step({ name: 'dependent', consumes: ['gate'], produces: ['result'] }),
+    ],
+  );
+  const { engine, store } = makeEngine([plainControl]);
+  const wf = engine.createInstance('plain-cascade-control', { provide: { seed: { revision: 1 } } });
+
+  const source = engine.tick(wf, { deep: false }).orders.find((o) => o.step === 'source');
+  assert.ok(source !== undefined);
+  engine.skip(wf, 'gate', 'source', 'not selected');
+  engine.close(wf, source!.run, 'skipped');
+  assert.equal(getArt(store, wf, 'result')?.acceptance, 'skipped');
+
+  engine.provideInput(wf, 'seed', { revision: 2 });
+  const revivedSource = engine.tick(wf, { deep: false }).orders.find((o) => o.step === 'source');
+  assert.ok(revivedSource !== undefined);
+  engine.green(wf, revivedSource!.run, 'gate', { revision: 2 });
+  assert.equal(getArt(store, wf, 'result')?.acceptance, 'owed');
+});
+
 // ---- defs validation tests (outputs: check) ----------------------------------
 
 test('loadDefs: calls target with no outputs: throws DefError', () => {
