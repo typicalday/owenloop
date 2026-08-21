@@ -1,0 +1,15 @@
+name: wedge
+title: idle wedge
+description: minimal deadlock witness candidate
+
+inputs:
+  - name: contract
+    seedOwed: true
+
+steps:
+  - name: monitor
+    on: [idle]
+    idleAfter: 1h
+    produces: [outcome]
+    body: |
+      never fires
