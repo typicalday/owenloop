@@ -1035,22 +1035,29 @@ children, removing them from a reduce's surviving-member set.
 
 **Stall states vs true deadlocks.** A reachable, non-done state with zero
 available transitions is classified into exactly ONE of two mutually exclusive
-buckets, by recomputing eligibility as if every freeze were lifted
-(`eligibleFirings(def, arts, undefined, { ignoreFreeze: true })` — "unlimited
-attempts," i.e. what a human `retry` grants):
+buckets, by recomputing eligibility with every freeze lifted and with an
+eventual-time bag (`eligibleFirings(def, arts, EVENTUAL_TIME_FACTS,
+{ ignoreFreeze: true })`). That represents unlimited attempts (what a human
+`retry` grants) and an elapsed idle threshold, but is used only for
+classification — it does not add time to the BFS canonical key or expand an
+idle successor.
 - **stall state** (`report.stallStates`) — the recompute yields >= 1 firing:
   the state's ONLY blocker is a frozen/stalled debt — `maxAttempts` reached
   (`isStalled`, §6), `maxSchemaFailures` reached (`isSchemaStalled`, §6/§18),
-  or held (`isHeld`, §20). Lifting the freeze re-arms a producer, so the
-  line COULD move. This is a by-design human-escalation brake — EXPECTED,
-  never a defect, and it never affects the exit code.
+  or held (`isHeld`, §20) — or a future idle threshold. Lifting the freeze
+  re-arms a producer, or elapsed time enables the idle step, so the line
+  COULD move. This is a by-design human-escalation brake or expected future
+  wait — never a defect, and it never affects the exit code. Because the
+  reachability search remains timeless, this classification does not by
+  itself prove that an idle-only path is `completable`.
 - **true deadlock** (`report.deadlocks`) — the recompute STILL yields zero
-  firings: no producer would re-arm even at unlimited attempts. A genuine
-  structural dead-end (e.g. a `group:`-blocked or ungreen-input state, or an
-  owed input with no producer). This is folded into `hasDefiniteDefect` and
-  makes `check` exit nonzero — but only when the search was exhaustive
-  (`!report.bounded`), since a tight `--max-collection`/`--max-states` cap
-  can otherwise manufacture a spurious no-moves state.
+  firings: no producer would re-arm even after unlimited attempts or elapsed
+  idle time. A genuine structural dead-end (e.g. a `group:`-blocked or
+  ungreen-input state, or an owed input with no producer). This is folded
+  into `hasDefiniteDefect` and makes `check` exit nonzero — but only when the
+  search was exhaustive (`!report.bounded`), since a tight
+  `--max-collection`/`--max-states` cap can otherwise manufacture a spurious
+  no-moves state.
 
 The freeze-lift recompute ONLY lifts the `frozen()` guard — it does not
 bypass group-exclusivity (`groupBlockingWinner`), input-green gates, or

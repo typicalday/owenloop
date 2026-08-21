@@ -61,6 +61,18 @@ export interface TimeFacts {
   alarms: Map<string, number>;
 }
 
+/**
+ * Time facts used only when classifying a model-checker no-moves state. This
+ * asks whether elapsed idle time could release a move; it deliberately does
+ * not make time an input to BFS expansion or canonical state identity.
+ */
+const EVENTUAL_TIME_FACTS: TimeFacts = {
+  now: Number.POSITIVE_INFINITY,
+  lastProgressMs: 0,
+  inFlight: false,
+  alarms: new Map(),
+};
+
 /** A candidate run: a step bound to a particular key, with its concrete edges. */
 export interface Firing {
   step: string;
@@ -2511,13 +2523,14 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
  * Explores the full (or depth/state-bounded) state space via BFS to find:
  * - a non-done, zero-eligible-firings state is split into exactly ONE of two
  *   mutually exclusive buckets by recomputing eligibility with every freeze
- *   lifted (unlimited attempts — see `eligibleFirings`'s `ignoreFreeze`):
- *   - stall states: the recompute yields >= 1 firing — the state's only
- *     blocker is a frozen/stalled debt (maxAttempts / maxSchemaFailures /
- *     held). A by-design human-escalation brake. EXPECTED, never a defect.
+ *   lifted and eventual idle time (unlimited attempts — see
+ *   `eligibleFirings`'s `ignoreFreeze`):
+ *   - stall states: the recompute yields >= 1 firing — a retryable frozen debt
+ *     or future idle threshold is the only blocker. An expected brake/wait,
+ *     never a defect.
  *   - true deadlocks: the recompute STILL yields zero firings — a genuine
- *     structural dead-end with no path to completion even at unlimited
- *     attempts. A real defect.
+ *     structural dead-end with no move even after retry or elapsed idle time.
+ *     A real defect.
  * - stuck states: reachable states that have a stalled debt but STILL have
  *   >= 1 eligible firing elsewhere (a brake tripped on one branch while the
  *   line moves on another). Informational only; a no-moves state is never
@@ -2642,14 +2655,15 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     const retractFirings = memberRetractFirings(def, node.arts);
     const firings = [...status.eligible, ...callsFirings, ...retractFirings];
 
-    // Non-done state with no eligible firings: classify by recomputing eligibility
-    // as if every freeze/stall were lifted (unlimited attempts). If a producer
-    // would re-arm → an EXPECTED stall state (a by-design brake). If not → a
-    // TRUE deadlock (a structural dead-end with no path to completion even at
-    // unlimited attempts).
+    // Non-done state with no eligible firings: classify by recomputing
+    // eligibility as if every freeze/stall were lifted and idle time had
+    // elapsed. If retry or time would make a producer eligible, this is an
+    // expected stall/wait; otherwise it is a true structural deadlock.
+    // EVENTUAL_TIME_FACTS is classification-only: the timeless BFS below does
+    // not enqueue these future idle transitions or include time in its key.
     if (firings.length === 0 && !status.done) {
-      const lifted = eligibleFirings(def, node.arts, undefined, { ignoreFreeze: true });
-      if (lifted.length > 0) {
+      const eventualFirings = eligibleFirings(def, node.arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true });
+      if (eventualFirings.length > 0) {
         report.stallStates.push({ path: node.path });
       } else {
         report.deadlocks.push({ path: node.path });

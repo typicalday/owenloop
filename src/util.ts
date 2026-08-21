@@ -145,7 +145,9 @@ const UNIT_MS: Record<string, number> = { h: 3600000, m: 60000, s: 1000, '': 100
 export function parseDurationMs(spec: string): number {
   const m = DUR_RE.exec(String(spec).trim());
   if (!m) throw new Error(`bad duration: ${spec} (use 90m, 2h, or seconds)`);
-  return Number(m[1]) * (UNIT_MS[m[2] as string] as number);
+  const milliseconds = Number(m[1]) * (UNIT_MS[m[2] as string] as number);
+  if (!Number.isFinite(milliseconds)) throw new Error(`bad duration: ${spec} (duration is too large)`);
+  return milliseconds;
 }
 
 /** "30m" → 1800 seconds. */

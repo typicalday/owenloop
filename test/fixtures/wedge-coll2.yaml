@@ -1,9 +1,11 @@
-name: wedge-coll2
-title: leaner idle wedge with collection
-description: collection variant, no reduce
+name: unprovided-coll
+title: unprovided input collection deadlock
+description: collection variant with an independently blocked terminal step
 
 inputs:
   - name: brief
+    seedOwed: false
+  - name: contract
     seedOwed: true
 
 steps:
@@ -12,9 +14,7 @@ steps:
     produces: ["gather.item[]"]
     body: |
       emit then seal
-  - name: monitor
-    on: [idle]
-    idleAfter: 1h
+  - name: work
+    consumes: [contract]
     produces: [outcome]
-    body: |
-      never fires
+    terminal: true
