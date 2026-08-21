@@ -40,8 +40,7 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources';
 
-import type { GatePolicy, GateVerdict } from './gatekeeper.ts';
-import { classifyToolCall } from './gatekeeper.ts';
+import { classifyToolCall, READ_ONLY_TOOLS, type GatePolicy, type GateVerdict } from './gatekeeper.ts';
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
@@ -388,13 +387,17 @@ function decisionMessage(reason: string, note: string | undefined): string {
 function buildCanUseTool(
   cwd: string,
   policy: GatePolicy,
+  filesystem: StepPermissions['filesystem'],
   onEvent: (e: AgentEvent) => void,
   approvals?: ApprovalRequester,
 ): CanUseTool {
   return async (toolName, input, options) => {
     let verdict: GateVerdict;
     try {
-      verdict = classifyToolCall({ toolName, input, workdir: cwd, blockedPath: options.blockedPath }, policy);
+      verdict = classifyToolCall(
+        { toolName, input, workdir: cwd, blockedPath: options.blockedPath, filesystem },
+        policy,
+      );
     } catch (err) {
       verdict = { decision: 'escalate', reason: `the gatekeeper could not judge this call (${errText(err)})` };
     }
@@ -450,9 +453,6 @@ function buildCanUseTool(
 /** The five-value closed union the SDK types `Options.effort` as. */
 const EFFORT_LEVELS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** Audited built-ins that cannot mutate the filesystem. WebFetch/WebSearch
- *  can read the unrestricted network without weakening a read-only filesystem. */
-const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
 /** Audited built-ins allowed when only the network is restricted. */
 const OWENLOOP_ONLY_NETWORK_TOOLS = new Set([
   'Read',
@@ -679,6 +679,7 @@ export function buildClaudeOptions(
     canUseTool: buildCanUseTool(
       inputs.cwd,
       gatePolicyFor(permissions.permissionMode),
+      permissions.filesystem,
       extra.onEvent,
       inputs.approvals,
     ),
