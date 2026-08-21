@@ -58,10 +58,12 @@ import type { FilesystemPermission } from './contract.ts';
  * How much the gatekeeper escalates, derived by the adapter from the step's
  * authored `permissionMode`.
  *
- * - `human-gate` — the `ask` position. Everything beyond a trivially safe read
- *   inside the step's own directory escalates. The classifier is not consulted:
- *   the point of `ask` is that a person sees the call, not that a pattern list
- *   approves of it first.
+ * - `human-gate` — the `ask` position. Everything beyond a declared-safe
+ *   filesystem read escalates. Such reads are workdir-contained unless the
+ *   step explicitly declares `filesystem: unrestricted` and the call belongs
+ *   to the shared audited read-tool set; a harness `blockedPath` remains
+ *   authoritative. The classifier is not consulted: the point of `ask` is
+ *   that a person sees the call, not that a pattern list approves of it first.
  * - `classifier` — the `auto-safe` position, and the right reading of a step
  *   that named the vendor's own `default`/`acceptEdits` or named nothing at all.
  *   Ordinary work proceeds; the checks below escalate what they can actually
@@ -111,7 +113,7 @@ const ALLOW: GateVerdict = { decision: 'allow' };
  *  can read the unrestricted network without weakening a read-only filesystem.
  *  This is the canonical audited read-tool set used by both the adapter's tool
  *  surface and the explicit unrestricted-filesystem containment exception. */
-export const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
 
 /**
  * Where each tool names a filesystem path. Only tools whose path argument is a
@@ -218,8 +220,11 @@ export function dangerousCommand(command: string): string | undefined {
  * ORDER MATTERS. The owenloop mount is cleared first so no later rule can strand
  * a step's ability to submit or escalate. The harness's own `blockedPath` is
  * consulted next because it is authoritative and covers cases this module cannot
- * see. Only then does policy divide: `human-gate` escalates everything but a
- * contained read, `classifier` runs the two checks it can actually decide.
+ * see. Path calls then stay contained, except when an explicitly unrestricted
+ * filesystem declaration and the shared audited read-tool set both permit the
+ * exception. Only then does policy divide: `human-gate` allows declared-safe
+ * filesystem reads but escalates writes and network operations; `classifier`
+ * runs the two checks it can actually decide.
  */
 export function classifyToolCall(call: GateCall, policy: GatePolicy): GateVerdict {
   if (call.toolName.startsWith(OWENLOOP_MCP_PREFIX)) return ALLOW;
