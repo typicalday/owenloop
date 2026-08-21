@@ -63,8 +63,14 @@ export type AgentEvent =
       /** Provider-selected model when the session-start response exposes it. */
       model?: string;
     }
-  /** Optional log line. Adapters may emit none; nothing may depend on it. */
-  | { kind: 'progress'; text: string }
+  /**
+   * Optional log line. Adapters may emit none; nothing may depend on it.
+   *
+   * Model and failure fields enrich local telemetry when a provider reports them
+   * after the synchronous started-event gate. They never affect task outcome,
+   * hub confirmation, or release behavior, and adapters may omit either.
+   */
+  | { kind: 'progress'; text: string; model?: string; failure?: string }
   /** The completed top-level assistant reply, assembled by the owning adapter.
    * Unlike `progress`, this is suitable for a caller that explicitly needs the
    * final response rather than transport, tool, reasoning, or stderr telemetry. */

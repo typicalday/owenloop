@@ -38,6 +38,19 @@ tail; for a failed command, the receipt is ask context rather than an artifact.
 Full streams are represented only by the receipt's output hash and stdout/stderr
 byte counts.
 
+## Capability-silent agent diagnostics
+
+Capability-silent `agent-run` attempts write their claim-time
+`CAPABILITY-SILENT` warning and any terminal no-submit diagnostic to worker
+stdout/stderr, so Shift dispatch preserves them in `<run>.log`. The claim
+warning states whether the harness will use its default or an authored step
+model/effort; the terminal message may name the harness-reported runtime model
+and bounded failure context when available. It is intentionally not a
+`shift.log` event and does not add a
+diagnosis to the reason-less targeted hub release. Local logging can still be
+disabled as described below, in which case the worker remains runnable but
+these local diagnostics are not retained.
+
 | Command outcome | Worker channel | Header |
 | --- | --- | --- |
 | exit 0 and no machinery error | stdout | `… the command for step 'X' succeeded; its output follows` |

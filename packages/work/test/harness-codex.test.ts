@@ -1206,6 +1206,8 @@ const STUB_TURN = '22222222-2222-4222-8222-222222222222';
  *    stays alive forever, so "was it disposed?" is answerable by signalling it.
  *  - `hang-turn` — acknowledges `turn/start`, emits `turn/started`, and then
  *    never completes the turn on its own. Only a `turn/interrupt` ends it.
+ *  - `stderr-turn` — as `hang-turn`, after emitting one app-server stderr
+ *    diagnostic for the adapter telemetry seam.
  *  - `mount-failure` — as `hang-turn`, plus an owenloop mount that reports
  *    `failed` right after the turn begins.
  *  - `elicit` — asks TWO `mcpServer/elicitation/request`s (one for the owenloop
@@ -1287,6 +1289,7 @@ function handle(m) {
       // The ACK, exactly as recorded: the turn is created, not finished.
       send({ id: m.id, result: { turn: { id: TURN, status: 'inProgress', error: null } } });
       send({ method: 'turn/started', params: { threadId: THREAD, turn: { id: TURN, status: 'inProgress' } } });
+      if (spec.mode === 'stderr-turn') process.stderr.write('stub app-server failure\\n');
       if (spec.mode === 'mount-failure') {
         send({
           method: 'mcpServer/startupStatus/updated',
@@ -1609,6 +1612,30 @@ async function waitFor(cond: () => boolean, what: string, ms = 5_000): Promise<v
     await new Promise((r) => setTimeout(r, 10));
   }
 }
+
+test('D5d app-server stderr remains progress telemetry with bounded failure metadata', async (t) => {
+  const stub = useStub(t, 'stderr-turn');
+  const events: AgentEvent[] = [];
+  const running = codexAdapter.start(startArgs(undefined, { cwd: stub.dir }), (event) => events.push(event));
+
+  await waitFor(
+    () => events.some((event) => event.kind === 'progress' && event.failure === 'stub app-server failure'),
+    'the stub to report its stderr diagnostic',
+  );
+  const stderrEvent = events.find(
+    (event) => event.kind === 'progress' && event.failure === 'stub app-server failure',
+  );
+  assert.deepEqual(stderrEvent, {
+    kind: 'progress',
+    text: 'stub app-server failure',
+    failure: 'stub app-server failure',
+  });
+
+  const started = events.find((event) => event.kind === 'started');
+  assert.ok(started !== undefined && started.kind === 'started');
+  await codexAdapter.stop(started.ref);
+  await running;
+});
 
 test('D6 a MID-TURN stop interrupts the live turn, and start resolves through it', async (t) => {
   // REGRESSION GUARD (reviewer error 1). The turn id used to be recorded only

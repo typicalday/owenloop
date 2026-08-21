@@ -37,7 +37,7 @@ import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
 import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
-import { readChildRecords } from '../src/shift/state.ts';
+import { readChildRecords, ShiftStateRecordError } from '../src/shift/state.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
 import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
@@ -231,6 +231,22 @@ function stopDaemonAndChildren(daemon: ShiftChild): void {
   }
 }
 
+/**
+ * Reservation creation opens the canonical pathname exclusively before it
+ * writes and fsyncs the JSON. This acceptance test observes the state directory
+ * outside the daemon's dispatch lock, so its poll can land in that publication
+ * window. Retry only the state reader's explicit fail-closed error; `until()`
+ * remains bounded and any record that does not settle still fails the test.
+ */
+function publishedChildRecords(): ReturnType<typeof readChildRecords> | undefined {
+  try {
+    return readChildRecords(stateDir);
+  } catch (error) {
+    if (error instanceof ShiftStateRecordError) return undefined;
+    throw error;
+  }
+}
+
 async function startSingleOrderHub(): Promise<Awaited<ReturnType<typeof startMockHub>>> {
   let wakes = 0;
   let getOrders = 0;
@@ -314,11 +330,15 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     const parked = daemon.request({ op: 'next', wait_ms: 5_000 });
 
     // A real detached child was spawned and recorded as one.
+    let records: ReturnType<typeof readChildRecords> | undefined;
     await until(
-      () => readChildRecords(stateDir).length === 1,
+      () => {
+	records = publishedChildRecords();
+	return records?.length === 1;
+      },
       `the agent-run child record; stderr:\n${daemon.stderr()}`,
     );
-    const rec = readChildRecords(stateDir)[0]!;
+    const rec = records![0]!;
     assert.equal(rec.kind, 'agent-run');
     assert.equal(rec.run, 'run_x1234');
     assert.equal(rec.step, 'builder');

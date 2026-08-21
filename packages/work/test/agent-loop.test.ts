@@ -710,6 +710,119 @@ test('a clean turn with no hub outcome is a FAILURE: no-submit, released for re-
   assert.ok(verbs(calls).includes('release'));
 });
 
+test('a capability-silent no-submit names the provider model and bounded harness failures locally', async () => {
+  const longFailure = (label: string) => `${label}: ${'x'.repeat(1_000)}`;
+  const adapter = createFakeAdapter({
+    start: {
+      events: [
+	{
+	  kind: 'started',
+	  ref: { harness: 'fake', token: 'capability-silent-session' },
+	  model: 'claude-ox-alpha',
+	},
+	{
+	  kind: 'progress',
+	  text: 'stderr: [claude-code:unrecognized_model]',
+	  failure: '[claude-code:unrecognized_model]',
+	},
+	{ kind: 'progress', text: 'assistant error: model_not_found', failure: 'model_not_found' },
+	{ kind: 'progress', text: 'assistant error: model_not_found', failure: 'model_not_found' },
+	{ kind: 'progress', text: 'stderr: first long failure', failure: longFailure('first') },
+	{ kind: 'progress', text: 'stderr: second long failure', failure: longFailure('second') },
+	{ kind: 'progress', text: 'stderr: third long failure', failure: longFailure('third') },
+	{ kind: 'exited', exitCode: 0 },
+	{ kind: 'turn_ended' },
+      ],
+    },
+  });
+  const { hub, calls } = mockHub({ getOrder: [agentOrder(), agentOrder()] });
+  const h = buildOpts({ hub, adapter });
+
+  const outcome = await createAgentRunLoop(h.opts).run();
+
+  assert.equal(outcome, 'no-submit');
+  const starts = adapter.calls.filter((call) => call.kind === 'start');
+  assert.equal(starts.length, 1, 'the capability-silent order starts exactly one harness turn');
+  const start = starts[0];
+  assert.ok(start !== undefined && start.kind === 'start');
+  assert.equal(start.args.model, undefined);
+  assert.equal(start.args.effort, undefined);
+  const claimWarning = h.errs.find((line) => line.startsWith('CAPABILITY-SILENT'));
+  assert.ok(claimWarning?.includes('wf1/run1'));
+  assert.ok(claimWarning?.includes("step 'builder'"));
+  assert.ok(claimWarning?.includes('declares no capabilities'));
+  assert.ok(claimWarning?.includes("selected harness 'fake'"));
+  assert.ok(claimWarning?.includes('no roster model or effort override'));
+  assert.ok(claimWarning?.includes('will choose its own default model'));
+  const terminal = h.errs.at(-1) ?? '';
+  assert.match(terminal, /^CAPABILITY-SILENT/);
+  assert.match(terminal, /claude-ox-alpha/);
+  assert.match(terminal, /unrecognized_model|model_not_found/);
+  assert.match(terminal, /releasing for re-offer/);
+  const failureMarker = 'harness failure context: ';
+  const failureStart = terminal.indexOf(failureMarker);
+  const failureEnd = terminal.indexOf('; no submit reached the hub', failureStart);
+  assert.ok(failureStart >= 0 && failureEnd > failureStart, 'the terminal message includes the failure tail');
+  const failureTail = terminal.slice(failureStart + failureMarker.length, failureEnd);
+  assert.ok(failureTail.length <= 2_000, 'the aggregate failure tail is bounded to 2,000 characters');
+  assert.equal((failureTail.match(/model_not_found/gu) ?? []).length, 1, 'duplicate failures are removed from the tail');
+  assert.ok(failureTail.endsWith('…'), 'an oversized aggregate failure tail is visibly truncated');
+  assert.deepEqual(statuses(h.records), ['active', 'turn-ended', 'dead']);
+  assert.equal(calls.filter((call) => call.verb === 'report_resolution').length, 0);
+  const releases = calls.filter((call) => call.verb === 'release');
+  assert.deepEqual(releases.map((call) => call.arg), [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('a capability-silent warning preserves authored model and effort settings', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({ getOrder: [agentOrder(), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({
+    hub,
+    adapter,
+    spec: {
+      ...baseSpec(),
+      permissions: { extensions: {}, model: 'claude-authored', effort: 'high' },
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  const starts = adapter.calls.filter((call) => call.kind === 'start');
+  assert.equal(starts.length, 1);
+  const start = starts[0];
+  assert.ok(start !== undefined && start.kind === 'start');
+  assert.equal(start.args.model, undefined, 'no roster model is injected');
+  assert.equal(start.args.effort, undefined, 'no roster effort is injected');
+  assert.equal(start.args.permissions.model, 'claude-authored');
+  assert.equal(start.args.permissions.effort, 'high');
+  const warning = h.errs.find((line) => line.startsWith('CAPABILITY-SILENT'));
+  assert.ok(warning?.includes("authored step model 'claude-authored' and effort 'high' remains in effect"));
+  assert.ok(!warning?.includes('will choose its own default model'));
+});
+
+test('a capability-silent no-submit names missing model and failure context instead of guessing', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({ getOrder: [agentOrder(), agentOrder()] });
+  const h = buildOpts({ hub, adapter });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit');
+  const terminal = h.errs.at(-1) ?? '';
+  assert.match(terminal, /model id not reported by the harness/);
+  assert.match(terminal, /no specific harness failure was reported/);
+});
+
+test('a capability-bearing no-submit keeps the generic terminal message', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({
+    getOrder: [agentOrder({ capabilities: ['build'], crews: ['test-crew'] }), agentOrder()],
+  });
+  const h = buildOpts({ hub, adapter, resolveCrewRosters: resolvedRosters([MAP]) });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit');
+  const terminal = h.errs.at(-1) ?? '';
+  assert.match(terminal, /the turn ended and no submit reached the hub within the confirm grace/);
+  assert.ok(!terminal.includes('CAPABILITY-SILENT'));
+});
+
 test('start() rejecting as unresumable is a cold-start failure: dead, released, and never crashes', async () => {
   const adapter = createFakeAdapter({ start: { resumeUnavailable: true } });
   const { hub, calls } = mockHub({ getOrder: [agentOrder(), agentOrder()] });

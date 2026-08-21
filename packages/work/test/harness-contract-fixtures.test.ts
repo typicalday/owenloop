@@ -391,6 +391,12 @@ test('the recorded SDK stream maps the init line, the assistant turn, and turn_e
   assert.match(initText, /apiKeySource=none/);
   assert.match(initText, /model=claude-opus-5/);
   assert.match(initText, /permissionMode=bypassPermissions/);
+  const initEvent = events[0];
+  assert.equal(
+    initEvent?.kind === 'progress' ? initEvent.model : undefined,
+    'claude-opus-5',
+    'the init progress event carries the provider-selected model structurally',
+  );
   // `mcp_servers` is read field-by-field, so a rename would surface as
   // `undefined=undefined` here rather than as a silent blank in production.
   assert.match(initText, /mcp=\[owenloop=pending\]/);
@@ -490,6 +496,20 @@ test('assistant progress text is capped and labels subagent output', async () =>
   assert.match(text, /^\[subagent toolu_parent_1\] assistant: /);
   assert.ok(text.length < 2_100, `expected capped progress text, got ${text.length} characters`);
   assert.ok(text.endsWith('…'));
+});
+
+test('assistant error preserves its display text and carries bounded failure metadata', async () => {
+  const assistant = claudeMessages().find((m): m is SDKAssistantMessage => m.type === 'assistant');
+  assert.ok(assistant, 'recording carries an assistant message to derive from');
+  const failedAssistant: SDKAssistantMessage = { ...assistant, error: 'model_not_found' };
+  const events: AgentEvent[] = [];
+  await consumeTurn(asStream([failedAssistant]), (e) => events.push(e));
+
+  assert.deepEqual(events[0], {
+    kind: 'progress',
+    text: 'assistant error: model_not_found',
+    failure: 'model_not_found',
+  });
 });
 
 test('a stream that ends before the result reports sawResult false and emits no turn_ended', async () => {

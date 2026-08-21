@@ -6,6 +6,20 @@ The runtime worker resolves the verified workflow definition from the local work
 
 Runtime preflight is authoritative. `owenloop work lint` runs the same common and adapter checks for author feedback, but lint cannot account for a later `--harness` override or a selected crew-roster candidate.
 
+## Capability-silent steps
+
+A step with no declared capabilities is valid loud-proceed work: no crew roster
+model or effort is injected. An authored `x.harness.model` or
+`x.harness.effort` still applies; only when neither is authored does the
+selected harness choose its own default. The worker emits a
+`CAPABILITY-SILENT` claim-time warning that names the selected harness and
+which policy applies. If the turn ends without a hub outcome, its
+terminal local line repeats the provider-reported runtime model and a bounded
+harness diagnostic when either was reported; missing values are named rather
+than guessed. These messages are telemetry only. The hub remains the sole
+source of task outcome, and the targeted release request carries no diagnostic
+fields.
+
 Native judge entries do not carry a separately authored `x` map. The definition
 compiler deep-clones the producer step's complete parsed `x` map onto every
 synthesized judge step, and generated and persisted judge orders expose that
