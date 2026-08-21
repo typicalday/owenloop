@@ -451,6 +451,11 @@ if nothing consumes it. A stem under `generates:` is deliberately consumed by no
 are otherwise identical: schema-validated, fingerprinted, greenable, and visible in
 `status`/`show`.
 
+Call steps are also consumers for this check. For `calls:` and `callsInterface:`, each
+parent-artifact value in the child-input `inputs:` mapping counts as consumed even when
+the step's ordinary `consumes:` list is empty; the mapping keys are child input names and
+do not count.
+
 ## `bind:` — write an accepted artifact into run state
 
 A produce mapping may declare a `bind:` target. When that artifact is accepted,

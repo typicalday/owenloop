@@ -15,7 +15,7 @@ import { Engine, InterfaceBindingRefusalError, SchemaRefusalError } from '../src
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { ArtifactData, InterfaceCallBinding, StepDef, WorkflowDef, WorkflowInterfaceSignature } from '../src/types.ts';
-import { DefError, loadDefs } from '../src/defs.ts';
+import { DefError, lintDef, loadDefs } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
 // ---- fixture defs ------------------------------------------------------------
@@ -931,6 +931,46 @@ test('calls: maintenance-only gate dependencies leave plain cascade revival unch
   assert.ok(revivedSource !== undefined);
   engine.green(wf, revivedSource!.run, 'gate', { revision: 2 });
   assert.equal(getArt(store, wf, 'result')?.acceptance, 'owed');
+});
+
+// ---- lint: callsInputs consumers ---------------------------------------------
+
+function callsInputsLintDef(decomposeProduces: string[] = ['delegatedRequest']): WorkflowDef {
+  const delegate: StepDef = {
+    ...step({ name: 'delegate', produces: ['delivered'] }),
+    calls: 'child',
+    callsInputs: { request: 'delegatedRequest' },
+    consumes: [],
+  };
+  const steps: StepDef[] = [
+    step({ name: 'decompose', produces: decomposeProduces }),
+    delegate,
+    step({ name: 'finish', consumes: ['delivered'], produces: ['done'], terminal: true }),
+  ];
+  const discovery = {
+    description: 'Delegates a prepared request to a child workflow.',
+    whenToUse: ['A child workflow should receive a parent artifact.'],
+    notFor: ['Workflows that do not delegate to a child.'],
+    interface: { inputs: [], outputs: [] },
+  };
+  return {
+    ...def('calls-inputs-lint', [], steps),
+    x: { discovery },
+  };
+}
+
+test('lintDef treats callsInputs parent artifacts as consumed', () => {
+  const { errors, warnings } = lintDef(callsInputsLintDef());
+  assert.deepEqual(errors, []);
+  assert.deepEqual(warnings, []);
+});
+
+test('lintDef still warns for an artifact absent from consumes and callsInputs', () => {
+  const { errors, warnings } = lintDef(callsInputsLintDef(['delegatedRequest', 'orphan']));
+  assert.deepEqual(errors, []);
+  assert.equal(warnings.length, 1, warnings.join('; '));
+  assert.match(warnings[0]!, /step 'decompose' produces 'orphan' but nothing consumes it/);
+  assert.ok(!warnings[0]!.includes('delegatedRequest'), warnings.join('; '));
 });
 
 // ---- defs validation tests (outputs: check) ----------------------------------

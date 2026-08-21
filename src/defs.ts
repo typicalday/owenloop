@@ -2053,9 +2053,12 @@ function reachabilityErrors(
  * explicitly intended sinks. Stems declared under generates: are exempt.
  */
 function deadEndWarnings(def: WorkflowDef): string[] {
-  // all stems consumed by any step
+  // all stems consumed by any ordinary or child-workflow step
   const consumed = new Set<string>(
-    def.steps.flatMap((l) => l.consumes.map((c) => c.stem)),
+    def.steps.flatMap((l) => [
+      ...l.consumes.map((c) => c.stem),
+      ...Object.values(l.callsInputs ?? {}),
+    ]),
   );
   // stems declared under generates: are intentionally unconsumed — lint-exempt
   const generatedStems = new Set<string>(
