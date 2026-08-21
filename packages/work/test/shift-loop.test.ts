@@ -2494,7 +2494,11 @@ test('a zero agent ceiling releases agent work instead of holding its claim', as
   assert.equal(spawns.length, 0);
   assert.deepEqual(events.map((event) => event.type === 'order-dropped' ? event.reason : event.type), ['agent-lane-closed']);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_agent_1' },
+    {
+      workflow: 'wf1',
+      run: 'run_agent_1',
+      reason: 'agent-lane-closed: this shift runs no agent-run children (agent ceiling 0) — handing the claim back to the hub',
+    },
   ]);
   assert.match(errors.join('\n'), /agent ceiling 0/);
 });
@@ -2530,7 +2534,11 @@ test('a cap-1 shift releases an extra agent claim rather than keeping it locally
   assert.equal(await loop.iterate(), 1);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_second' },
+    {
+      workflow: 'wf1',
+      run: 'run_second',
+      reason: 'dispatch-cap-full: at the dispatch cap (1) — handing the claim back to the hub',
+    },
   ]);
   assert.equal(
     events.some((event) =>
@@ -2624,7 +2632,11 @@ test('an agent-lane cap releases an undispatchable agent claim', async () => {
 
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_second' },
+    {
+      workflow: 'wf1',
+      run: 'run_second',
+      reason: 'agent-cap-full: at the agent-run cap (1) — handing the claim back to the hub',
+    },
   ]);
   assert.equal(
     events.some((event) => event.type === 'order-dropped' && event.reason === 'agent-cap-full'),
@@ -2712,7 +2724,11 @@ test('an agent-capacity cooldown suppresses fresh-run churn until its fixed mono
   await loop.iterate();
   assert.equal(count(calls, 'whats_next'), 1);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_agent_reoffer_1' },
+    {
+      workflow: 'wf1',
+      run: 'run_agent_reoffer_1',
+      reason: 'agent-cap-full: at the agent-run cap (1) — handing the claim back to the hub',
+    },
   ]);
 
   monotonic = 1;
@@ -2725,8 +2741,16 @@ test('an agent-capacity cooldown suppresses fresh-run churn until its fixed mono
   await loop.iterate();
   assert.equal(count(calls, 'whats_next'), 2, 'the fixed deadline retries on an unchanged wake');
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_agent_reoffer_1' },
-    { workflow: 'wf1', run: 'run_agent_reoffer_2' },
+    {
+      workflow: 'wf1',
+      run: 'run_agent_reoffer_1',
+      reason: 'agent-cap-full: at the agent-run cap (1) — handing the claim back to the hub',
+    },
+    {
+      workflow: 'wf1',
+      run: 'run_agent_reoffer_2',
+      reason: 'agent-cap-full: at the agent-run cap (1) — handing the claim back to the hub',
+    },
   ]);
 
   monotonic = 30_001;
@@ -2845,7 +2869,11 @@ test('a command lane at capacity releases its extra claim', async () => {
 
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_second' },
+    {
+      workflow: 'wf1',
+      run: 'run_second',
+      reason: 'dispatch-cap-full: at the dispatch cap (1) — handing the claim back to the hub',
+    },
   ]);
 });
 
@@ -3033,7 +3061,11 @@ test('pending age includes a 40-second whats_next response before 81 seconds in 
   assert.match(err.join('\n'), /queued claim expired before local dispatch/);
   assert.equal(count(calls, 'whats_next'), 1);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_stale' },
+    {
+      workflow: 'wf1',
+      run: 'run_stale',
+      reason: 'claim-expired: queued claim expired before local dispatch — handing the claim back to the hub',
+    },
   ]);
 });
 
@@ -3060,7 +3092,11 @@ test('a whats_next response older than 90 seconds is not dispatched into immedia
   assert.equal(spawns.length, 0);
   assert.match(err.join('\n'), /claim expired before local dispatch/);
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_stale' },
+    {
+      workflow: 'wf1',
+      run: 'run_stale',
+      reason: 'claim-expired: claim expired before local dispatch — handing the claim back to the hub',
+    },
   ]);
   assert.equal(
     events.some((event) => event.type === 'order-dropped' && event.reason === 'claim-expired'),
@@ -3175,8 +3211,16 @@ test('queued claims release at their hold deadline even while capacity remains s
   assert.match(err.join('\n'), /queued claim expired before local dispatch/);
   assert.equal(count(calls, 'whats_next'), 1, 'classifying the stale local candidate does not require another hub sweep');
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
-    { workflow: 'wf1', run: 'run_stale' },
-    { workflow: 'wf1', run: 'run_stale_2' },
+    {
+      workflow: 'wf1',
+      run: 'run_stale',
+      reason: 'claim-expired: queued claim expired before local dispatch — handing the claim back to the hub',
+    },
+    {
+      workflow: 'wf1',
+      run: 'run_stale_2',
+      reason: 'claim-expired: queued claim expired before local dispatch — handing the claim back to the hub',
+    },
   ]);
   assert.equal(
     events.filter((event) => event.type === 'order-dropped' && event.reason === 'claim-expired').length,

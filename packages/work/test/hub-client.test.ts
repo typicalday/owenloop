@@ -112,9 +112,11 @@ test('release carries either XOR form unchanged', async () => {
   const c = client(fakeFetch(captured, { body: { text: 'ok' } }));
   await c.release({ session: 's1' });
   await c.release({ workflow: 'wf1', run: 'r1' });
+  await c.release({ workflow: 'wf1', run: 'r1', reason: 'no-template' });
 
   assert.deepEqual(captured[0]!.body, { session: 's1' });
   assert.deepEqual(captured[1]!.body, { workflow: 'wf1', run: 'r1' });
+  assert.deepEqual(captured[2]!.body, { workflow: 'wf1', run: 'r1', reason: 'no-template' });
 });
 
 test('submit sends its full body including done', async () => {

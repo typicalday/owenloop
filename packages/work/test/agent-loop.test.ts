@@ -770,7 +770,9 @@ test('a capability-silent no-submit names the provider model and bounded harness
   assert.deepEqual(statuses(h.records), ['active', 'turn-ended', 'dead']);
   assert.equal(calls.filter((call) => call.verb === 'report_resolution').length, 0);
   const releases = calls.filter((call) => call.verb === 'release');
-  assert.deepEqual(releases.map((call) => call.arg), [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases.map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run1', reason: 'capability-silent-no-submit' },
+  ]);
 });
 
 test('a capability-silent warning preserves authored model and effort settings', async () => {
@@ -812,7 +814,7 @@ test('a capability-silent no-submit names missing model and failure context inst
 
 test('a capability-bearing no-submit keeps the generic terminal message', async () => {
   const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
-  const { hub } = mockHub({
+  const { hub, calls } = mockHub({
     getOrder: [agentOrder({ capabilities: ['build'], crews: ['test-crew'] }), agentOrder()],
   });
   const h = buildOpts({ hub, adapter, resolveCrewRosters: resolvedRosters([MAP]) });
@@ -821,6 +823,9 @@ test('a capability-bearing no-submit keeps the generic terminal message', async 
   const terminal = h.errs.at(-1) ?? '';
   assert.match(terminal, /the turn ended and no submit reached the hub within the confirm grace/);
   assert.ok(!terminal.includes('CAPABILITY-SILENT'));
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run1', reason: 'no-submit' },
+  ]);
 });
 
 test('start() rejecting as unresumable is a cold-start failure: dead, released, and never crashes', async () => {
@@ -1102,6 +1107,9 @@ test('no template for the step releases the order for the pickup window', async 
   assert.equal(await createAgentRunLoop(h.opts).run(), 'no-template');
   assert.deepEqual(adapter.calls, []);
   assert.ok(verbs(calls).includes('release'));
+  assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
+    { workflow: 'wf1', run: 'run1', reason: 'no-template' },
+  ]);
 });
 
 test('a throwing step loader is treated as no-template, not as a crash', async () => {

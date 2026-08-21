@@ -278,8 +278,9 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
     if (!releaseOnStop) return 'stopped';
     opts.out(`owenloop work ${role}: final breath (${stopReason || 'stop'}) — releasing ${workflow}/${runId}`);
     try {
+      const request = { workflow, run: runId, ...(stopReason !== '' ? { reason: stopReason } : {}) };
       const raced = await Promise.race([
-        opts.hub.release({ workflow, run: runId }).then(() => 'ok' as const),
+	  opts.hub.release(request).then(() => 'ok' as const),
         opts.sleep(RELEASE_CAP_MS).then(() => 'timeout' as const),
       ]);
       if (raced === 'timeout') {

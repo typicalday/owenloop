@@ -693,7 +693,7 @@ test('run() refuses a legacy harness carrier instead of dropping permissions', a
   const result = await runMalformedHarnessCarrier({ 'claude-code': { tools: ['Read'], disallowedTools: ['Bash'], permissionMode: 'strict' } });
   assert.equal(result.code, 1);
   assert.deepEqual(result.calls, [], 'the malformed carrier must never start a harness');
-  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
   assert.match(result.stderr, /legacy 'x\.claude-code'.*rename/);
 });
 
@@ -701,7 +701,7 @@ test('run() refuses a non-map x.harness carrier instead of dropping it', async (
   const result = await runMalformedHarnessCarrier({ harness: 'not-a-map' });
   assert.equal(result.code, 1);
   assert.deepEqual(result.calls, [], 'the malformed carrier must never start a harness');
-  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
   assert.match(result.stderr, /non-map x\.harness/);
 });
 
@@ -709,7 +709,7 @@ test('run() refuses a non-string x.harness.id instead of selecting the default h
   const result = await runMalformedHarnessCarrier({ harness: { id: 42, tools: ['Read'] } });
   assert.equal(result.code, 1);
   assert.deepEqual(result.calls, [], 'the malformed carrier must never start a harness');
-  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
   assert.match(result.stderr, /non-string x\.harness\.id/);
 });
 
@@ -732,7 +732,7 @@ test('run() refuses explicit empty and whitespace-only local harness ids instead
 
     assert.equal(code, 1, `explicit id ${JSON.stringify(id)} must fail closed`);
     assert.deepEqual(fake.calls, [], 'the default harness must never start for an invalid explicit id');
-    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
     assert.match(err.join('\n'), /empty or whitespace-only x\.harness\.id/);
   }
 });
@@ -749,7 +749,7 @@ test('run() refuses invalid reserved fields in the verified local definition', a
   });
   assert.equal(result.code, 1);
   assert.deepEqual(result.calls, []);
-  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
   assert.match(result.stderr, /instruction refusal \(harness-policy\)/);
   assert.match(result.stderr, /filesystem must be one of/);
   assert.match(result.stderr, /'name' is generated and cannot be set/);
@@ -825,7 +825,7 @@ test('run() refuses unresolvable capability when every roster candidate is unava
   assert.match(text, /no crew roster row/);
   assert.match(text, /build/);
   // An unavailable candidate releases, so the hub can re-offer the order.
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'unresolvable-capability' }]);
 });
 
 test('run() resolves the roster layer selected by the order crew stamp', async () => {
@@ -859,7 +859,7 @@ test('run() releases a stamped crew whose roster file is corrupt', async () => {
   assert.equal(await run(WIRE, {
     hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: (line) => err.push(line),
   }), 1);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'unresolvable-crew' }]);
   assert.match(err.join('\n'), /broken/);
   assert.ok(err.join('\n').includes(crewPath));
 });
@@ -924,7 +924,7 @@ test('blank --harness with no selected roster candidate refuses without choosing
   });
 
   assert.equal(code, 1);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-harness' }]);
   assert.match(err.join('\n'), /no adapter registered for harness ''/);
 });
 
@@ -951,7 +951,7 @@ test('roster-selected harness policy preflight refuses before start', async () =
 
   assert.equal(code, 1);
   assert.deepEqual(overridden.calls, []);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'incompatible-harness-policy' }]);
   assert.match(err.join('\n'), /harness policy refusal.*overridden.*network 'owenloop-only' is unsupported/);
 });
 
@@ -974,7 +974,7 @@ test('selected Codex candidate refusal names the restriction and releases the he
     });
 
     assert.equal(code, 1, filesystem);
-    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'incompatible-harness-policy' }]);
     assert.match(
       err.join('\n'),
       new RegExp(
@@ -1002,7 +1002,7 @@ test('a roster-selected Codex candidate refuses inherited judge policy before st
   });
 
   assert.equal(code, 1);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'incompatible-harness-policy' }]);
   assert.match(err.join('\n'), /harness policy refusal.*codex.*\(tools\): tool allow-lists are unsupported/);
 });
 
@@ -1072,7 +1072,7 @@ test('injected resolver preserves the no-template release when the order digest 
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 1);
   assert.match(err.join('\n'), /unknown local workflow digest 'sha256:deadbeef'/);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
 });
 
 test('default agent wiring recovers a signed missing bundle before hosting the step', async () => {
@@ -1203,7 +1203,7 @@ test('an injected hub builds the default resolver without requiring an agent cre
   });
   assert.equal(code, 1, 'the injected transport does not force a credential lookup before local resolution');
   assert.match(err.join('\n'), /instruction refusal \(unknown-digest\).*no verified local workflow bundle matches/u);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'no-template' }]);
 });
 
 test('run() exits 1 when the order has no definition digest', async () => {
@@ -1225,7 +1225,7 @@ test('run() releases a COMMAND order as a misroute and exits 1', async () => {
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 1);
   assert.match(err.join('\n'), /is not an agent order \(misroute\)/);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'misroute' }]);
 });
 
 test('run() signal wiring: agent-run message line, SIGINT mid-turn stops the session and releases', async () => {
@@ -1253,5 +1253,5 @@ test('run() signal wiring: agent-run message line, SIGINT mid-turn stops the ses
     err.join('\n'),
   );
   assert.equal(parked.stops, 1);
-  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1', reason: 'signal' }]);
 });
