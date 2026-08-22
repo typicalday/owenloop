@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.20](https://github.com/typicalday/owenloop/compare/v0.5.19...v0.5.20) (2026-08-22)
+
+
+### Features
+
+* **cli:** manage the hub interface catalog ([#285](https://github.com/typicalday/owenloop/issues/285)) ([ca83565](https://github.com/typicalday/owenloop/commit/ca83565aa0d1a1f41c96c954b2f4add4b5b3ec65))
+
 ## [0.5.19](https://github.com/typicalday/owenloop/compare/v0.5.18...v0.5.19) (2026-08-22)
 
 
