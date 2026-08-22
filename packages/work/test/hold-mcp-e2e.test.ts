@@ -9,7 +9,7 @@
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -65,8 +65,12 @@ function hubScript(verb: string): unknown {
   }
 }
 
-function spawnHold(origin: string, extra: string[] = []): McpChild {
-  return spawnMcp(['hold', '--order', 'wf1/run1', '--origin', origin, '--heartbeat-interval', '25', '--mcp', ...extra], childEnv());
+function spawnHold(origin: string, extra: string[] = [], cwd?: string): McpChild {
+  return spawnMcp(
+    ['hold', '--order', 'wf1/run1', '--origin', origin, '--heartbeat-interval', '25', '--mcp', ...extra],
+    childEnv(),
+    cwd,
+  );
 }
 
 test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing submit answers, then fast-fails until stdin EOF (reviewer errors 1+2)', async () => {
@@ -144,6 +148,56 @@ test('hold --mcp restricted selector registers exactly get_order and submit on t
   } finally {
     mcp.child.kill('SIGKILL');
     server.close();
+  }
+});
+
+test('hold --mcp submits a large parsed valueFile from its cwd without echoing payload bytes through MCP', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'owenloop-hold-mcp-run-'));
+  const payload = 'p'.repeat(1024 * 1024);
+  writeFileSync(join(workdir, 'artifact.json'), JSON.stringify({ kind: 'large-artifact', payload }), 'utf8');
+  const { origin, reqs, server } = await startMockHub(hubScript);
+  const mcp = spawnHold(origin, [], workdir);
+  try {
+    await handshake(mcp);
+    const sub = await callTool(mcp, 'submit', { path: 'pr', valueFile: 'artifact.json', done: true });
+    assert.equal(sub.isError, false, 'file submit answered normally: ' + JSON.stringify(sub.body));
+    assert.equal(sub.body.outcome, 'green');
+    assert.equal(JSON.stringify(sub.frame).includes(payload), false, 'the MCP response does not duplicate the file payload');
+
+    await until(() => of(reqs, 'submit').length === 1, 'file-form submit on the wire');
+    const body = of(reqs, 'submit')[0]!.body;
+    assert.deepEqual(body?.['value'], { kind: 'large-artifact', payload });
+    assert.equal('valueFile' in (body ?? {}), false, 'the hub receives the unchanged submit request shape');
+
+    mcp.endStdin();
+    assert.equal(await mcp.exited, 0, 'exit 0, stderr:\n' + mcp.stderr());
+  } finally {
+    mcp.child.kill('SIGKILL');
+    server.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('hold --mcp refuses an existing valueFile outside its cwd without submitting', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'owenloop-hold-mcp-run-'));
+  const outside = join(tmpdir(), 'owenloop-hold-mcp-outside-' + Date.now() + '.json');
+  writeFileSync(outside, JSON.stringify({ private: true }), 'utf8');
+  const { origin, reqs, server } = await startMockHub(hubScript);
+  const mcp = spawnHold(origin, [], workdir);
+  try {
+    await handshake(mcp);
+    const sub = await callTool(mcp, 'submit', { path: 'pr', valueFile: outside, done: true });
+    assert.equal(sub.isError, true);
+    assert.match(sub.body.error, /submit-value-file-outside-workdir/);
+    assert.equal(of(reqs, 'submit').length, 0);
+
+    mcp.endStdin();
+    assert.equal(await mcp.exited, 0, 'exit 0, stderr:\n' + mcp.stderr());
+  } finally {
+    mcp.child.kill('SIGKILL');
+    server.close();
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
   }
 });
 

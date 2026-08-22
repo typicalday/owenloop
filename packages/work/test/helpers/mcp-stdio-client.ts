@@ -57,10 +57,11 @@ export interface McpChild {
 const REQUEST_TIMEOUT_MS = 10_000;
 
 /** Spawn `owenloop <args>` and wire a line-framed JSON-RPC client to it. */
-export function spawnMcp(args: string[], env: Record<string, string | undefined>): McpChild {
+export function spawnMcp(args: string[], env: Record<string, string | undefined>, cwd?: string): McpChild {
   const child = spawn(process.execPath, [BIN, 'work', ...args], {
     env: { ...process.env, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
+    ...(cwd !== undefined ? { cwd } : {}),
   });
 
   const frames: Frame[] = [];

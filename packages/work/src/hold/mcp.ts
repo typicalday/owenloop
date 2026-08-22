@@ -40,6 +40,7 @@ import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import { readSubmitValueFile } from '../submit-file.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
@@ -52,6 +53,8 @@ export interface HoldMcpDeps {
   hub: HubClient;
   workflow: string;
   run: string;
+  /** Sole containment root for submit value files. */
+  workdir: string;
   /** Positive registration list. Absent exposes the full three-tool server. */
   tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
@@ -200,15 +203,20 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const submitTool: ToolRegistration = {
     name: 'submit',
     description:
-      'Submit a receipt for one owed output path of this order. Set done=true when this is the final value for the path. When the hub reports the run has closed, the holder releases and exits.',
+      'Submit a receipt for one owed output path of this order. Provide exactly one of value or valueFile. valueFile names a UTF-8 JSON document inside the run working directory. Set done=true when this is the final value for the path. When the hub reports the run has closed, the holder releases and exits.',
     inputSchema: {
       type: 'object',
-      required: ['path', 'value'],
+      required: ['path'],
       properties: {
         path: { type: 'string', description: 'The owed output path to submit a receipt for.' },
         value: { description: 'The receipt value (any JSON).' },
+	valueFile: { type: 'string', description: 'A UTF-8 JSON file inside the run working directory.' },
         done: { type: 'boolean', description: 'Mark this the final submit for the path.' },
       },
+      oneOf: [
+	{ required: ['value'] },
+	{ required: ['valueFile'] },
+      ],
       additionalProperties: false,
     },
     handler: async (args) => {
@@ -218,8 +226,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (typeof path !== 'string' || path === '') {
         return textResult({ error: 'submit requires a non-empty string "path"' }, true);
       }
-      if (!('value' in args)) {
-        return textResult({ error: 'submit requires a "value"' }, true);
+      const hasValue = Object.prototype.hasOwnProperty.call(args, 'value');
+      const hasValueFile = Object.prototype.hasOwnProperty.call(args, 'valueFile');
+      if (hasValue === hasValueFile) {
+	return textResult({ error: 'submit-value-source-invalid: provide exactly one of value or valueFile' }, true);
+      }
+      const valueFile = args['valueFile'];
+      if (hasValueFile && (typeof valueFile !== 'string' || valueFile.trim() === '')) {
+	return textResult({ error: 'submit-value-file-invalid: valueFile must be a non-empty string' }, true);
       }
       const done = args['done'];
       // Normalize a JSON-encoded string value to the object the hub would
@@ -227,8 +241,11 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       // the proof (it stores normalized bytes the signature does not cover),
       // silently, on both sides — see `../submit-value.ts`. One value is used
       // for both the proof and the wire so the two can never diverge.
-      const value = normalizeSubmitValue(args['value']);
       try {
+	const rawValue = hasValue
+	  ? args['value']
+	  : await readSubmitValueFile(deps.workdir, valueFile);
+	const value = normalizeSubmitValue(rawValue);
         // Submit is also a dynamic-data boundary. Fetch and gate the bound
         // packet even when no origin was supplied for submit-proof signing;
         // otherwise a direct submit call could bypass MCP consume-side
