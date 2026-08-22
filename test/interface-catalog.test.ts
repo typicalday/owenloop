@@ -96,39 +96,11 @@ test('interface get encodes opaque name and version separately and returns the f
   });
 });
 
-test('interface get refuses whole dot segments before credential or network work', async () => {
-  const dotCases: [string, string][] = [
-    ['.', '1'],
-    ['..', '1'],
-    ['evidence-report', '.'],
-    ['evidence-report', '..'],
-  ];
-  for (const [name, version] of dotCases) {
-    const { fetch, calls } = routedFetch({
-      'GET /api/interfaces/evidence-report/2.0.0': () => ({ status: 200, json: exactOk() }),
-    });
-    const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
-
-    const code = await mainAsync(['interface', 'get', name, version, '--hub', HUB], t.io);
-    assert.equal(code, 2, `${name}@${version}`);
-    assert.match(
-      t.err.join('\n'),
-      /hub exact-read route is path-based; dot segments normalize away, so this coordinate cannot be addressed/,
-    );
-    assert.deepEqual(t.out, []);
-    assert.equal(calls.length, 0, `${name}@${version}`);
-  }
-});
-
-test('interface round-trips an ordinary dotted version while register and list preserve dot-segment rows', async () => {
-  const dotRow = { name: '.', version: '..', createdBy: 'user_2', createdAt: 2 };
+test('interface round-trips evidence-report@2.0.0 through register, get, and list', async () => {
   const { fetch, calls } = routedFetch({
-    'POST /api/register_interface': ({ body }) => {
-      const { name, version } = JSON.parse(body!) as { name: string; version: string };
-      return { status: 200, json: exactOk(name === '.' && version === '..' ? dotRow : ROW) };
-    },
+    'POST /api/register_interface': () => ({ status: 200, json: exactOk() }),
     'GET /api/interfaces/evidence-report/2.0.0': () => ({ status: 200, json: exactOk() }),
-    'GET /api/interfaces': () => ({ status: 200, json: { interfaces: [ROW, dotRow] } }),
+    'GET /api/interfaces': () => ({ status: 200, json: { interfaces: [ROW] } }),
   });
   const t = makeIo({ fetch });
   seedHuman(t);
@@ -146,12 +118,7 @@ test('interface round-trips an ordinary dotted version while register and list p
 
   assert.equal(await mainAsync(['interface', 'list', '--hub', HUB], t.io), 0, t.err.join('\n'));
   assert.equal(calls[2]!.pathname, '/api/interfaces');
-  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, interfaces: [ROW, dotRow] });
-  t.out.length = 0;
-
-  assert.equal(await mainAsync(['interface', 'register', '.', '..', '--signature', file, '--hub', HUB], t.io), 0, t.err.join('\n'));
-  assert.deepEqual(JSON.parse(calls[3]!.body!), { name: '.', version: '..', signature: SIGNATURE });
-  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, ...dotRow, signature: SIGNATURE });
+  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, interfaces: [ROW] });
 });
 
 test('interface list preserves wire order, omits signature bodies, and accepts an empty catalog', async () => {

@@ -6796,13 +6796,10 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  * This namespace stores no credential locally, so it deliberately permits an
  * `OWENLOOP_CREDENTIAL_COMMAND` backend just like `capability`. It accepts
  * opaque coordinates and an opaque, JSON-parsed signature without client-side
- * semantic validation; the hub owns all catalog validation. The sole transport
- * exception is exact read of a whole `.` or `..` path segment: the deployed
- * hub route cannot address it after URL normalization, so `get` refuses it
- * before I/O while register and list remain opaque. stdout is always one
- * whitelisted JSON document. Exit codes: 0 success; 1 runtime, hub, or
- * malformed-response error; 2 unresolvable hub or unaddressable dot segment;
- * 3 absent or irrecoverable human credential (with a runnable login remedy).
+ * semantic validation; the hub owns all catalog validation. stdout is always
+ * one whitelisted JSON document. Exit codes: 0 success; 1 runtime, hub, or
+ * malformed-response error; 2 unresolvable hub; 3 absent or irrecoverable
+ * human credential (with a runnable login remedy).
  */
 async function dispatchInterface(io: CliIO, args: Args): Promise<number> {
   const USAGE_FORMS =
@@ -6839,12 +6836,6 @@ async function dispatchInterface(io: CliIO, args: Args): Promise<number> {
     version = rawVersion;
     if (sub === 'get' && signatureFlags.length > 0) {
       throw new CliError(`--signature is only valid for interface register — ${USAGE_FORMS}`);
-    }
-    if (sub === 'get' && (name === '.' || name === '..' || version === '.' || version === '..')) {
-      throw new CliError(
-	'interface get cannot address a whole "." or ".." name or version segment: the hub exact-read route is path-based; dot segments normalize away, so this coordinate cannot be addressed',
-	{ exitCode: 2 },
-      );
     }
   }
 

@@ -2411,16 +2411,10 @@ duplicate coordinates are refused and are never overwritten.
 | `interface list [--hub <url>]` | `GET /api/interfaces` | human; hub applies `get_status` |
 
 `get` encodes `<name>` and `<version>` separately as URL path segments, so a
-slash or space in either coordinate does not alter the route. The only exact-read
-exception is a whole `.` or `..` name or version segment: the deployed hub
-route is path-based and URL normalization removes dot segments before it can
-address the coordinate. `interface get` therefore refuses either value before
-credential or network work with exit code 2 and explains that the path-based
-route cannot address it. This is not a general charset validator: `register`
-continues to send those values in its JSON body and `list` can return their
-metadata, so a dot-segment row is registerable and listable but not
-exact-readable. Ordinary dotted versions such as `evidence-report@2.0.0` are
-unaffected and round-trip through register, get, and list.
+slash or space in either coordinate does not alter the route. The CLI does not
+validate coordinate syntax; the hub is the enforcement of record. Ordinary
+dotted versions such as `evidence-report@2.0.0` round-trip through register,
+get, and list.
 
 ### Registering a signature
 
