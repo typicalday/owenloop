@@ -2412,9 +2412,14 @@ duplicate coordinates are refused and are never overwritten.
 
 `get` encodes `<name>` and `<version>` separately as URL path segments, so a
 slash or space in either coordinate does not alter the route. The CLI does not
-validate coordinate syntax; the hub is the enforcement of record. Ordinary
-dotted versions such as `evidence-report@2.0.0` round-trip through register,
-get, and list.
+validate coordinate syntax; the hub is the enforcement of record. At deployed
+hub SHA `d1dc2a1b02645ea6cf4eb4bf0319c3b917e137f4` (owenloop-service #263), the
+hub refuses a whole `.` or `..` name or version during registration with
+`interface_catalog_input_invalid`: those path segments normalize before the
+path-based exact-read route can address them. This is the only coordinate
+exception; ordinary dotted versions such as `evidence-report@2.0.0` round-trip
+through register, get, and list. The CLI sends all coordinates unchanged and
+does not add a local dot-segment guard or encoding workaround.
 
 ### Registering a signature
 
@@ -2429,10 +2434,11 @@ reusable without shell quoting or argument-size concerns. It is also unlike
 non-secret structured data.
 
 The CLI reads the file and runs `JSON.parse` only. It sends the resulting value
-unchanged and delegates signature shape, typed artifacts, JSON Schemas, duplicate
-artifact names, and size validation entirely to the hub. A syntactically valid
-but semantically invalid signature therefore reaches the hub and reports the
-hub's own error; an unreadable or invalid-JSON file fails before a network call.
+unchanged and delegates coordinate validity, signature shape, typed artifacts,
+JSON Schemas, duplicate artifact names, and size validation entirely to the
+hub. A syntactically valid but semantically invalid signature—or a whole `.` or
+`..` coordinate—therefore reaches the hub and reports its own typed error code
+and message; an unreadable or invalid-JSON file fails before a network call.
 
 ### Reading and output
 
@@ -2448,9 +2454,10 @@ exactly one whitelisted JSON document per successful invocation; the hub's
 | `interface list` | `{ "ok": true, "hub": "<origin>", "interfaces": [{ "name": "evidence-report", "version": "2.0.0", "createdBy": "<id>", "createdAt": 1738000000000 }] }` |
 
 Malformed 2xx bodies are rejected before printing. Typed hub refusals such as
-a duplicate/invalid registration (`400`), non-admin register (`403`), and an
-unknown exact coordinate (`404`) surface the hub's non-empty `message` on stderr
-and leave stdout empty.
+a duplicate/invalid registration (`400 interface_catalog_input_invalid`),
+non-admin register (`403 forbidden`), and an unknown exact coordinate (`404
+interface_catalog_not_found`) surface the hub's code and non-empty `message` on
+stderr and leave stdout empty.
 
 **Hub and credential selection.** All three commands resolve `--hub <url>`
 first; without it they require exactly one enumerable stored human hub. They do
@@ -2462,8 +2469,8 @@ enumerate hubs must receive `--hub` explicitly.
 | code | meaning |
 |---|---|
 | `0` | registered, read, or listed successfully |
-| `1` | runtime, hub, or malformed-response error |
-| `2` | the hub could not be resolved, or `interface get` received a whole `.`/`..` name or version segment that the path-based hub route cannot address |
+| `1` | runtime, hub, or malformed-response error, including a hub-side registration refusal |
+| `2` | the hub could not be resolved |
 | `3` | the human credential is missing or irrecoverable; stderr names `owenloop login --hub <origin>` |
 
 ## Routing

@@ -170,6 +170,33 @@ test('interface register delegates semantic validation to the hub and preserves 
   assert.deepEqual(tMissing.out, []);
 });
 
+test('interface passes whole dot-segment coordinates to the deployed hub and preserves its typed refusal', async () => {
+  const refusal = (field: 'name' | 'version', value: '.' | '..') =>
+    `${field} ${JSON.stringify(value)} is not registerable because exact interface reads address coordinates as URL path segments`;
+  const cases = [
+    { name: '.', version: 'v1', field: 'name' as const, value: '.' as const },
+    { name: '..', version: 'v1', field: 'name' as const, value: '..' as const },
+    { name: 'evidence-report', version: '.', field: 'version' as const, value: '.' as const },
+    { name: 'evidence-report', version: '..', field: 'version' as const, value: '..' as const },
+  ];
+
+  for (const { name, version, field, value } of cases) {
+    const message = refusal(field, value);
+    const { fetch, calls } = routedFetch({
+      'POST /api/register_interface': () => ({ status: 400, json: { error: 'interface_catalog_input_invalid', message } }),
+    });
+    const t = makeIo({ fetch });
+    seedHuman(t);
+    const file = writeSignature(t);
+
+    assert.equal(await mainAsync(['interface', 'register', name, version, '--signature', file, '--hub', HUB], t.io), 1, message);
+    assert.equal(calls.length, 1, 'the CLI delegates this coordinate decision to the hub');
+    assert.deepEqual(JSON.parse(calls[0]!.body!), { name, version, signature: SIGNATURE });
+    assert.match(t.err.join('\n'), new RegExp(`interface_catalog_input_invalid: ${message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.deepEqual(t.out, []);
+  }
+});
+
 test('interface commands use a human credential and give the exact exit-3 remedy for absent or rejected credentials', async () => {
   for (const argv of [
     ['interface', 'register', ROW.name, ROW.version, '--signature', 'signature.json', '--hub', HUB],
