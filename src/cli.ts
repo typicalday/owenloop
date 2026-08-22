@@ -175,6 +175,8 @@ import {
   asCapabilityRouteAdded,
   asCapabilityRouteRemoved,
   asCapabilityRoutes,
+  asInterfaceCatalogList,
+  asInterfaceCatalogVersion,
   asCrewCreated,
   asCrewDeleted,
   asCrewMemberAdded,
@@ -1572,6 +1574,9 @@ ${' '.repeat(41)}the instance has reached a terminal status.
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
   capability list [--hub <url>]               list the hub org's capability routes
+  interface register <name> <version> --signature <file> [--hub <url>]
+  interface get <name> <version> [--hub <url>]
+  interface list [--hub <url>]
   routing alerts [--workflow <wf>] [--limit <n>] [--hub <url>]
 ${' '.repeat(41)}list the hub org's routing alerts — newest first org-wide; --workflow scopes to
 ${' '.repeat(41)}one run and flips to oldest first. A \`binding-gap\` alert means the hub HELD an
@@ -1692,6 +1697,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['instance', cmdOpts('hub')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
+  ['interface', cmdOpts('hub', 'signature')],
   // Per-TOP-LEVEL-command allowlist, not per-subcommand: `--position` on
   // `routing alerts` is meaningless but accepted and ignored, exactly as
   // `--kind` is on `crew list`. Policing flags per subcommand is deliberately
@@ -6778,6 +6784,157 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * `owenloop interface register|get|list` — administer the hub's immutable
+ * interface catalog without inspecting the signature's schema semantics.
+ *
+ * | subcommand | endpoint | auth principal |
+ * |---|---|---|
+ * | `interface register <name> <version> --signature <file>` | `POST /api/register_interface` | human (admin role on the hub) |
+ * | `interface get <name> <version>` | `GET /api/interfaces/:name/:version` | human (`get_status`) |
+ * | `interface list` | `GET /api/interfaces` | human (`get_status`) |
+ *
+ * This namespace stores no credential locally, so it deliberately permits an
+ * `OWENLOOP_CREDENTIAL_COMMAND` backend just like `capability`. It accepts
+ * opaque coordinates and an opaque, JSON-parsed signature without client-side
+ * semantic validation; the hub owns all catalog validation. stdout is always
+ * one whitelisted JSON document. Exit codes: 0 success; 1 runtime, hub, or
+ * malformed-response error; 2 unresolvable hub; 3 absent or irrecoverable
+ * human credential (with a runnable login remedy).
+ */
+async function dispatchInterface(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORMS =
+    'usage: owenloop interface register <name> <version> --signature <file> [--hub <url>] | ' +
+    'owenloop interface get <name> <version> [--hub <url>] | owenloop interface list [--hub <url>]';
+  const sub = args.positionals[1];
+  if (sub !== 'register' && sub !== 'get' && sub !== 'list') {
+    throw new CliError(`unknown interface subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  }
+
+  const signatureFlags = all(args, 'signature');
+  let name = '';
+  let version = '';
+  if (sub === 'list') {
+    if (args.positionals[2] !== undefined) {
+      throw new CliError(`interface list takes no positional arguments — ${USAGE_FORMS}`);
+    }
+    if (signatureFlags.length > 0) {
+      throw new CliError(`--signature is only valid for interface register — ${USAGE_FORMS}`);
+    }
+  } else {
+    const rawName = args.positionals[2];
+    const rawVersion = args.positionals[3];
+    if (rawName === undefined || rawName === '') {
+      throw new CliError(`missing required argument: <name> (${USAGE_FORMS})`);
+    }
+    if (rawVersion === undefined || rawVersion === '') {
+      throw new CliError(`missing required argument: <version> (${USAGE_FORMS})`);
+    }
+    if (args.positionals[4] !== undefined) {
+      throw new CliError(`too many positional arguments — ${USAGE_FORMS}`);
+    }
+    name = rawName;
+    version = rawVersion;
+    if (sub === 'get' && signatureFlags.length > 0) {
+      throw new CliError(`--signature is only valid for interface register — ${USAGE_FORMS}`);
+    }
+  }
+
+  let signature: unknown;
+  if (sub === 'register') {
+    if (signatureFlags.length !== 1 || args.missingOptionValues.has('signature') || signatureFlags[0] === '') {
+      throw new CliError(`interface register requires exactly one non-empty --signature <file> — ${USAGE_FORMS}`);
+    }
+    const signaturePath = resolve(io.cwd, signatureFlags[0]!);
+    let source: string;
+    try {
+      source = readFileSync(signaturePath, 'utf8');
+    } catch (e) {
+      throw new CliError(`cannot read interface signature file ${signaturePath}: ${(e as Error).message}`);
+    }
+    try {
+      signature = JSON.parse(source) as unknown;
+    } catch {
+      throw new CliError('interface signature file is not valid JSON');
+    }
+  }
+
+  // All input validation and the only local file read happened above: hub,
+  // credential, and network work cannot obscure a usage failure.
+  const origin = resolveAgentHub(io, args, 'manage interfaces on');
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const credential = readCredential(io, origin, slot);
+  if (credential === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  try {
+    let res: Response;
+    let endpoint: 'register_interface' | 'interfaces';
+    if (sub === 'register') {
+      ({ res } = await authedPost(io, origin, slot, credential, '/api/register_interface', { name, version, signature }));
+      endpoint = 'register_interface';
+    } else if (sub === 'get') {
+      ({ res } = await authedGet(
+	io,
+	origin,
+	slot,
+	credential,
+	`/api/interfaces/${encodeURIComponent(name)}/${encodeURIComponent(version)}`,
+      ));
+      endpoint = 'interfaces';
+    } else {
+      ({ res } = await authedGet(io, origin, slot, credential, '/api/interfaces'));
+      endpoint = 'interfaces';
+    }
+
+    if (res.status === 401) {
+      throw new CliError('credential rejected by the hub — run `owenloop login`');
+    }
+    if (!res.ok) {
+      throw new CliError((await hubRequestMessage(res)) ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+    }
+
+    let body: unknown;
+    try {
+      body = (await res.json()) as unknown;
+    } catch {
+      throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
+    }
+    if (sub === 'list') {
+      let interfaces;
+      try {
+	interfaces = asInterfaceCatalogList(body);
+      } catch (e) {
+	throw new CliError((e as Error).message);
+      }
+      print(io, { ok: true, hub: origin, interfaces });
+      return 0;
+    }
+    let result;
+    try {
+      result = asInterfaceCatalogVersion(body, endpoint);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    print(io, {
+      ok: true,
+      hub: origin,
+      name: result.name,
+      version: result.version,
+      signature: result.signature,
+      createdBy: result.createdBy,
+      createdAt: result.createdAt,
+    });
+    return 0;
+  } catch (e) {
+    if (e instanceof CliError && /run `owenloop login`/.test(e.message)) {
+      throw new CliError(`${e.message} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+    }
+    throw e;
+  }
+}
+
+/**
  * `owenloop capability bind|unbind|list` — manage the hub org's **capability routes**, the
  * admin-owned table mapping a workflow-def `capabilities:` entry to a crew.
  *
@@ -9149,7 +9306,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'pending-gates', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'pending-gates', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'interface', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -9222,6 +9379,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchAgent(io, args);
       case 'capability':
         return await dispatchCapability(io, args);
+      case 'interface':
+	return await dispatchInterface(io, args);
       case 'routing':
         return await dispatchRouting(io, args);
       case 'crew':
