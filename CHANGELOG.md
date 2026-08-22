@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.18](https://github.com/typicalday/owenloop/compare/v0.5.17...v0.5.18) (2026-08-22)
+
+
+### Bug Fixes
+
+* **work:** show the call a parked approval is asking about ([#281](https://github.com/typicalday/owenloop/issues/281)) ([86ab4b0](https://github.com/typicalday/owenloop/commit/86ab4b0878b71a25e9d1f31290657a063030ea90))
+
 ## [0.5.17](https://github.com/typicalday/owenloop/compare/v0.5.16...v0.5.17) (2026-08-21)
 
 

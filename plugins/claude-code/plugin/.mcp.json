@@ -7,7 +7,7 @@
         "mcp"
       ],
       "env": {
-        "OWENLOOP_PLUGIN_VERSION": "0.5.17"
+        "OWENLOOP_PLUGIN_VERSION": "0.5.18"
       }
     }
   }
