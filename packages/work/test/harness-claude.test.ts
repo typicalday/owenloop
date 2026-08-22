@@ -29,11 +29,14 @@ import {
   buildChildEnv,
   buildClaudeOptions,
   claudeAdapter,
+  consumeTurn,
+  parseClaudeIdleTimeout,
   resolveExecutable,
   startClaude,
   type ClaudeOptionInputs,
   type ClaudeQueryFactory,
 } from '../src/harness/claude.ts';
+import { HarnessIdleTimeoutError } from '../src/harness/contract.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import { adapterFor } from '../src/harness/registry.ts';
 import type { AgentEvent } from '../src/harness/contract.ts';
@@ -542,6 +545,54 @@ test('env and abortController are always set, and stderr preserves display text 
     text: `stderr: ${longLine}`,
     failure: `${longLine.slice(0, 2_000)}…`,
   });
+});
+
+test('the idle-timeout parser accepts bounded canonical decimals and rejects invalid values', () => {
+  assert.equal(parseClaudeIdleTimeout(undefined), undefined);
+  assert.deepEqual(parseClaudeIdleTimeout('1000'), { idleTimeoutMs: 1000 });
+  assert.deepEqual(parseClaudeIdleTimeout('3600000'), { idleTimeoutMs: 3_600_000 });
+  for (const value of ['0999', '999', '3600001', '1e3', '+1000', '1000 ']) {
+    assert.throws(() => parseClaudeIdleTimeout(value), { name: 'HarnessTurnError' });
+  }
+});
+
+test('a silent SDK iterator aborts and closes its exact controlled query', async () => {
+  let fire: (() => void) | undefined;
+  let cleared = 0;
+  let closed = 0;
+  const controller = new AbortController();
+  const silent: AsyncIterable<SDKMessage> = {
+    [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+      return { next: async () => new Promise<IteratorResult<SDKMessage>>(() => {}) };
+    },
+  };
+  const pending = consumeTurn(silent, () => {}, undefined, undefined, {
+    idleTimeoutMs: 1_000,
+    abortController: controller,
+    close: () => { closed++; },
+    setTimer: (callback) => {
+      fire = callback;
+      return {} as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: () => { cleared++; },
+  });
+  assert.ok(fire, 'the first read is covered before it settles');
+  fire!();
+  await assert.rejects(pending, HarnessIdleTimeoutError);
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(closed, 1);
+  assert.equal(cleared, 0, 'the timer already fired and is not cleared twice');
+});
+
+test('partial SDK messages are enabled only by an explicit recovery policy', () => {
+  assert.equal(optionsFor(undefined).options.includePartialMessages, undefined);
+  const events: AgentEvent[] = [];
+  const options = buildClaudeOptions(
+    { cwd: '/tmp/work', owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy: { idleTimeoutMs: 1_000 } },
+    { env: bareEnv(), abortController: new AbortController(), onEvent: (event) => events.push(event) },
+  );
+  assert.equal(options.includePartialMessages, true);
+  assert.deepEqual(events, []);
 });
 
 // ---------------------------------------------------------------------------

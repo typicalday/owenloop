@@ -71,20 +71,25 @@ import type {
   AgentEvent,
   DeliverArgs,
   HarnessAdapter,
+  HarnessRecoveryPolicy,
   HarnessSessionRef,
   StartArgs,
 } from '../harness/contract.ts';
-import { isResumeUnavailable } from '../harness/contract.ts';
+import { isHarnessTurnError, isResumeUnavailable } from '../harness/contract.ts';
 import { preflightStepPermissions } from '../harness/permissions.ts';
 import {
   orderId,
   type SessionRecord,
+  type RecoveryCheckpoint,
+  type RecoveryPhase,
   type SessionStatus,
   type SessionTaskRef,
 } from '../harness/session-store.ts';
 import {
   buildOwenloopMcp,
+  renderColdRecoveryAppendix,
   renderBrief,
+  renderRecoveryWake,
   renderRejection,
   renderReplayBrief,
   type BriefSpec,
@@ -100,6 +105,7 @@ import type { MergedRoster } from '../settings/roster.ts';
 /** Discriminated result of one worker life; the role maps these to exit codes. */
 export type AgentRunOutcome =
   | 'submitted' // the hub reported an outcome — the agent's submit landed (exit 0)
+  | 'held' // bounded provider recovery exhausted and producer-side ask held the artifact (exit 0)
   | 'completed' // the order had already finished at first contact (exit 0)
   | 'misroute' // null packet, or a command order — released, not ours (exit 1)
   | 'workdir-denied' // the order named a cwd outside this machine's declared roots — released (exit 1)
@@ -235,6 +241,8 @@ export interface AgentRunLoopOptions {
    * exactly the pre-Phase-4 behaviour.
    */
   latestSession?: (task: SessionTaskRef) => SessionRecord | null;
+  /** Latest record for this exact concrete firing, used only by durable recovery. */
+  latestRunSession?: (workflow: string, run: string, step: string) => SessionRecord | null;
   /**
    * Does this directory still exist? Injected for the same reason every other
    * side effect here is: a unit test drives the "the work dir was reaped, so the
@@ -518,6 +526,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
    *  `SessionRecord.deliveredReasonAt`. Carried forward from the prior record
    *  when this firing delivered no new reasons, so it can never regress. */
   let deliveredReasonAt: number | undefined;
+  /** Recovery control is deliberately the only extra data persisted on recovery rows. */
+  let recovery: RecoveryCheckpoint | undefined;
+  let lastDurableActivityAt = 0;
   /** Captures a thrown safety-gate append from the synchronous `started` event. */
   let activePersistenceFailure: unknown;
   /** Provider-selected model, when a harness reports it after its synchronous start gate. */
@@ -614,6 +625,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       status,
       createdAt,
       ...(deliveredReasonAt !== undefined ? { deliveredReasonAt } : {}),
+      ...(recovery !== undefined ? { recovery } : {}),
       updatedAt: at,
     });
   }
@@ -700,6 +712,17 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
           `owenloop work agent-run: WARNING the step agent asked for input and this contract has no reply channel — ${e.question}`,
         );
         return;
+      case 'activity':
+				if (recovery !== undefined) {
+					recovery = { ...recovery, lastActivityAt: e.at, deadlineAt: e.deadlineAt };
+					// SDK partial events may arrive per token. Keep the in-memory deadline
+					// exact while bounding durable control writes to one per five seconds.
+					if (e.at - lastDurableActivityAt >= 5_000) {
+						lastDurableActivityAt = e.at;
+						record('active');
+					}
+				}
+				return;
       case 'turn_ended':
         opts.err(`owenloop work agent-run: turn ended for ${order} (telemetry — the hub decides the outcome)`);
         return;
@@ -934,6 +957,17 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
     }
 
+    // Adapter-owned configuration is resolved once per worker life.  Passing
+    // this object through every dispatch prevents a changing environment from
+    // changing recovery policy midway through a claimed order.
+    let recoveryPolicy: HarnessRecoveryPolicy | undefined;
+    let recoveryConfigurationFailure: unknown;
+    try {
+      recoveryPolicy = active.recoveryPolicy?.();
+    } catch (error) {
+      recoveryConfigurationFailure = error;
+    }
+
     if (routing.kind === 'unrouted') {
       const authoredSettings: string[] = [];
       if (permissions.model !== undefined) authoredSettings.push(`model '${permissions.model}'`);
@@ -1056,6 +1090,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       permissions,
       approvals,
       ...(resolvedModel ?? {}),
+      ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     };
     /** Built lazily: a cold start after a refused resume needs a FRESH one. */
     const coldArgs = (): StartArgs => ({
@@ -1072,7 +1107,268 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       permissions,
       approvals,
       ...(resolvedModel ?? {}),
+      ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     });
+
+    const recoveryPaths = (spec.owes ?? []).map((owed) => owed.path);
+    const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);
+    const recoveryEnabled =
+      recoveryPaths.length === 1 &&
+      (recoveryPolicy !== undefined || recoveryConfigurationIsTerminal);
+
+    if (recoveryEnabled) {
+      const recoveryPath = recoveryPaths[0]!;
+
+      /**
+       * The opt-in branch is intentionally self-contained.  The ordinary path
+       * below is left untouched for adapters/workflows that do not opt in.
+       */
+      const runRecovery = async (): Promise<AgentRunOutcome> => {
+				const exact = opts.latestRunSession?.(workflow, runId, packet.step) ?? null;
+				const saved = exact?.recovery;
+				recovery =
+					saved !== undefined && saved.generation === runId
+						? { ...saved }
+						: {
+								generation: runId,
+								phase: 'primary',
+								wakeUsed: false,
+								coldRestartUsed: false,
+							};
+
+				const setFailure = (failure: unknown): void => {
+					if (!isHarnessTurnError(failure)) return;
+					recovery = {
+						...recovery!,
+						lastFailure: { category: failure.category, at: opts.now() },
+					};
+				};
+				const checkpoint = (phase: RecoveryPhase, changes: Partial<RecoveryCheckpoint> = {}): void => {
+					recovery = {
+						...recovery!,
+						...changes,
+						phase,
+						phaseStartedAt: opts.now(),
+					};
+					record('active'); // recovery rows are fsynced by the store.
+				};
+				const stopCurrent = async (): Promise<void> => {
+					if (sessionRef === undefined) return;
+					const ref = sessionRef;
+					sessionRef = undefined;
+					try {
+						await active.stop(ref);
+					} catch (error) {
+						opts.err(`owenloop work agent-run: recovery session stop failed: ${errMsg(error)} (ignored)`);
+					}
+				};
+
+				type PhaseResult = { failure?: unknown } | { outcome: AgentRunOutcome };
+				const confirmPhase = async (): Promise<'continue' | AgentRunOutcome> => {
+					const confirmed = await Promise.race([
+						confirmOutcome({
+							hub,
+							workflow,
+							run: runId,
+							holder: opts.holder,
+							sleep: opts.sleep,
+							now: opts.now,
+							err: opts.err,
+							intervalMs: opts.confirmIntervalMs ?? DEFAULT_CONFIRM_INTERVAL_MS,
+							graceMs: opts.submitGraceMs ?? DEFAULT_SUBMIT_GRACE_MS,
+							cancelled: () => signalled || leaseSettled,
+						}).then((v) => ({ t: 'confirm' as const, v })),
+						leasePromise!.then((o) => ({ t: 'lease' as const, o })),
+					]);
+					if (confirmed.t === 'lease') {
+						await teardown();
+						if (confirmed.o === 'completed') {
+							record('submitted');
+							return 'submitted';
+						}
+						record('dead');
+						return signalled ? 'killed' : mapLeaseDuringTurn(confirmed.o);
+					}
+					if (confirmed.v === 'submitted') {
+						record('submitted');
+						lease.stop('submitted', { release: false });
+						await leasePromise;
+						return 'submitted';
+					}
+					if (confirmed.v === 'lease-lost') {
+						record('dead');
+						lease.stop('lease-lost', { release: false });
+						await leasePromise;
+						return 'lease-lost';
+					}
+					return 'continue';
+				};
+
+				const dispatch = async (
+					phase: RecoveryPhase,
+					changes: Partial<RecoveryCheckpoint>,
+					perform: () => Promise<void>,
+				): Promise<PhaseResult> => {
+					checkpoint(phase, changes);
+					const turn = perform().then(
+						() => ({ t: 'turn' as const }),
+						(failure: unknown) => ({ t: 'turn' as const, failure }),
+					);
+					const raced = await Promise.race([
+						turn,
+						leasePromise!.then((o) => ({ t: 'lease' as const, o })),
+					]);
+					if (raced.t === 'lease') {
+						await teardown();
+						if (raced.o === 'completed') {
+							record('submitted');
+							return { outcome: 'submitted' };
+						}
+						record('dead');
+						return { outcome: signalled ? 'killed' : mapLeaseDuringTurn(raced.o) };
+					}
+					if (activePersistenceFailure !== undefined) {
+						await teardown();
+						return { outcome: await releaseWith('session-store-failed', 'session-store-failed') };
+					}
+					const failure = 'failure' in raced ? raced.failure : undefined;
+					if (failure !== undefined) setFailure(failure);
+					record('turn-ended');
+					const confirmed = await confirmPhase();
+					if (confirmed !== 'continue') return { outcome: confirmed };
+					return failure === undefined ? {} : { failure };
+				};
+
+				const hold = async (): Promise<AgentRunOutcome> => {
+					checkpoint('held');
+					const facts = recovery!;
+					const question = `Claude recovery held ${recoveryPath} after ${facts.lastFailure?.category ?? facts.phase}; a human decision is required.`;
+					const context = JSON.stringify({
+						generation: facts.generation,
+						phase: facts.phase,
+						wakeUsed: facts.wakeUsed,
+						coldRestartUsed: facts.coldRestartUsed,
+						...(facts.lastFailure !== undefined ? { lastFailure: facts.lastFailure } : {}),
+						...(facts.lastActivityAt !== undefined ? { lastActivityAt: facts.lastActivityAt } : {}),
+						...(facts.deadlineAt !== undefined ? { deadlineAt: facts.deadlineAt } : {}),
+					});
+					// A transport error is ambiguous. Check the hub before one safe ask
+					// retry; neither path can construct a fourth provider dispatch.
+					for (let attemptAsk = 0; attemptAsk < 2; attemptAsk += 1) {
+						try {
+							await hub.ask({ workflow, run: runId, path: recoveryPath, question, context });
+							record('turn-ended');
+							lease.stop('recovery-held', { release: false });
+							await leasePromise;
+							return 'held';
+						} catch (error) {
+							try {
+								const current = await hub.getOrder({ workflow, run: runId, holder: opts.holder });
+								if (current.lease.outcome !== undefined) {
+									record('submitted');
+									lease.stop('submitted', { release: false });
+									await leasePromise;
+									return 'submitted';
+								}
+							} catch {
+								// The second ask is still the only recoverable transport action.
+							}
+							if (attemptAsk === 1) {
+								opts.err(`owenloop work agent-run: recovery ask failed: ${errMsg(error)}`);
+								lease.stop('recovery-ask-failed', { release: false });
+								await leasePromise;
+								return 'hub-unreachable';
+							}
+						}
+					}
+					return 'hub-unreachable';
+				};
+
+				if (recoveryConfigurationFailure !== undefined) {
+					setFailure(recoveryConfigurationFailure);
+					return hold();
+				}
+
+				// A re-dispatch of this concrete run consumes the checkpointed phase;
+				// it never repeats a provider call that was already prepared durably.
+				let next: RecoveryPhase = 'primary';
+				if (saved?.generation === runId) {
+					next = saved.phase === 'primary' ? 'wake' : saved.phase === 'wake' ? 'cold-restart' : 'held';
+					if (next === 'wake' && exact !== null && exact.token !== '') {
+						sessionRef = { harness: exact!.harness, token: exact!.token };
+						createdAt = exact!.createdAt;
+					}
+				}
+
+				if (next === 'primary') {
+					activePersistenceFailure = undefined;
+					const primary = await dispatch('primary', {}, async () => {
+						if (resumable && prev !== null) {
+							sessionRef = { harness: prev.harness, token: prev.token };
+							createdAt = prev.createdAt;
+							await active.deliver(sessionRef, delta.message, deliverArgs, onEvent);
+							markDelivered();
+							return;
+						}
+						const ref = await active.start(coldArgs(), onEvent);
+						sessionRef = ref;
+						markDelivered();
+					});
+					if ('outcome' in primary) return primary.outcome;
+					if (isHarnessTurnError(primary.failure) && primary.failure.terminal) {
+						await stopCurrent();
+						return hold();
+					}
+					// A primary resume that no longer exists has no live native session to wake.
+					next = isResumeUnavailable(primary.failure) ? 'cold-restart' : 'wake';
+				}
+
+				if (next === 'wake') {
+					if (sessionRef === undefined && exact?.token !== undefined && exact.token !== '') {
+						sessionRef = { harness: exact.harness, token: exact.token };
+						createdAt = exact.createdAt;
+					}
+					if (sessionRef === undefined) {
+						next = 'cold-restart';
+					} else {
+						const wake = await dispatch('wake', { wakeUsed: true }, async () => {
+							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs, onEvent);
+						});
+						if ('outcome' in wake) return wake.outcome;
+						if (isHarnessTurnError(wake.failure) && wake.failure.terminal) {
+							await stopCurrent();
+							return hold();
+						}
+						next = 'cold-restart';
+					}
+				}
+
+				if (next === 'cold-restart') {
+					await stopCurrent();
+					const cold = await dispatch('cold-restart', { coldRestartUsed: true }, async () => {
+						activePersistenceFailure = undefined;
+						const base = renderReplayBrief(renderBrief(step.brief, spec), {
+							packet,
+							...(prev?.deliveredReasonAt !== undefined ? { deliveredReasonAt: prev.deliveredReasonAt } : {}),
+						});
+						const ref = await active.start(
+							{ ...coldArgs(), brief: `${base}\n\n---\n\n${renderColdRecoveryAppendix(recovery!)}` },
+							onEvent,
+						);
+						sessionRef = ref;
+						markDelivered();
+					});
+					if ('outcome' in cold) return cold.outcome;
+					if (isHarnessTurnError(cold.failure) && cold.failure.terminal) {
+						await stopCurrent();
+						return hold();
+					}
+				}
+				await stopCurrent();
+				return hold();
+      };
+      return runRecovery();
+    }
 
     const path = resumable ? 'resume' : delta.message !== '' ? 'cold replay' : 'cold start';
     opts.out(

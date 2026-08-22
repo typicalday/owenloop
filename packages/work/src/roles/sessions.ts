@@ -115,6 +115,9 @@ function shellQuote(s: string): string {
  * LISTING — one bad row must not take down the other rows with it.
  */
 export function resumeCommandFor(rec: SessionRecord): string | undefined {
+  // Recovery control rows are intentionally safe to show to an operator or a
+  // script. A provider token would make that guarantee false.
+  if (rec.recovery !== undefined) return undefined;
   // An empty token is a real, readable record: the worker writes one before the
   // harness emits `started`, so a launch that died still leaves proof it existed.
   // Handing that empty string to `resumeCommand` would print a command that
@@ -130,6 +133,26 @@ export function resumeCommandFor(rec: SessionRecord): string | undefined {
   }
 }
 
+function recoverySummary(rec: SessionRecord): string {
+  const state = rec.recovery;
+  if (state === undefined) return '—';
+  const activity = state.lastActivityAt ?? state.deadlineAt;
+  return [
+    state.phase === 'held' ? 'held: action required' : state.phase,
+    `wake=${state.wakeUsed ? 'yes' : 'no'}`,
+    `cold=${state.coldRestartUsed ? 'yes' : 'no'}`,
+    ...(activity !== undefined ? [`at=${activity}`] : []),
+    ...(state.lastFailure !== undefined ? [`failure=${state.lastFailure.category}`] : []),
+  ].join(', ');
+}
+
+/** Recovery records are a safe projection, unlike legacy local-resume rows. */
+export function projectSession(rec: SessionRecord): Omit<SessionRecord, 'token'> | SessionRecord {
+  if (rec.recovery === undefined) return rec;
+  const { token: _token, ...safe } = rec;
+  return safe;
+}
+
 /** Render the table. Exported for the unit test; `run` does the I/O. */
 export function renderTable(records: readonly SessionRecord[], now: number): string {
   const rows = records.map((rec) => [
@@ -139,9 +162,10 @@ export function renderTable(records: readonly SessionRecord[], now: number): str
     rec.status,
     String(rec.attempt),
     formatAge(now - rec.updatedAt),
+    recoverySummary(rec),
     resumeCommandFor(rec) ?? '—',
   ]);
-  const header = ['ORDER', 'STEP', 'HARNESS', 'STATUS', 'ATTEMPT', 'AGE', 'RESUME'];
+  const header = ['ORDER', 'STEP', 'HARNESS', 'STATUS', 'ATTEMPT', 'AGE', 'RECOVERY', 'RESUME'];
   const widths = header.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)),
   );
@@ -186,10 +210,9 @@ export async function run(args: string[]): Promise<number> {
   visible.sort((a, b) => b.updatedAt - a.updatedAt);
 
   if (parsed.json) {
-    // The RAW records, tokens included. This is machine-local data an operator
-    // already owns, and withholding the token would make the output useless for
-    // exactly the scripting this flag exists for.
-    process.stdout.write(`${JSON.stringify(visible, null, 2)}\n`);
+    // Legacy records remain raw for established local-resume scripts. Opt-in
+    // recovery rows are a deliberately redacted projection.
+    process.stdout.write(`${JSON.stringify(visible.map(projectSession), null, 2)}\n`);
     return 0;
   }
 

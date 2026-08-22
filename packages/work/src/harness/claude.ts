@@ -44,13 +44,20 @@ import { classifyToolCall, READ_ONLY_TOOLS, type GatePolicy, type GateVerdict } 
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
-import { ResumeUnavailableError, NEUTRAL_PERMISSION_MODES, isNeutralPermissionMode } from './contract.ts';
+import {
+  HarnessIdleTimeoutError,
+  HarnessTurnError,
+  ResumeUnavailableError,
+  NEUTRAL_PERMISSION_MODES,
+  isNeutralPermissionMode,
+} from './contract.ts';
 import type { ApprovalRequester } from './contract.ts';
 import type { LintFinding } from './types.ts';
 import type {
   AgentEvent,
   DeliverArgs,
   HarnessAdapter,
+  HarnessRecoveryPolicy,
   HarnessSessionRef,
   NeutralPermissionModeMap,
   PermissionIssue,
@@ -98,6 +105,35 @@ const ALLOW_API_BILLING_VAR = 'OWENLOOP_ALLOW_API_BILLING';
 
 /** Operator override for the CLI binary; see `resolveExecutable`. */
 const BIN_OVERRIDE_VAR = 'OWENLOOP_CLAUDE_BIN';
+/** Host-only opt-in liveness controller. Never admitted to the child env. */
+export const CLAUDE_IDLE_TIMEOUT_VAR = 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS';
+const MIN_IDLE_TIMEOUT_MS = 1_000;
+const MAX_IDLE_TIMEOUT_MS = 3_600_000;
+
+/** Parse the one adapter-owned recovery setting without silently opting out. */
+export function parseClaudeIdleTimeout(value: string | undefined): HarnessRecoveryPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/u.test(value)) {
+    throw new HarnessTurnError(
+      'configuration',
+      true,
+      `${CLAUDE_IDLE_TIMEOUT_VAR} must be a canonical decimal integer between ${MIN_IDLE_TIMEOUT_MS} and ${MAX_IDLE_TIMEOUT_MS}`,
+    );
+  }
+  const idleTimeoutMs = Number(value);
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < MIN_IDLE_TIMEOUT_MS || idleTimeoutMs > MAX_IDLE_TIMEOUT_MS) {
+    throw new HarnessTurnError(
+      'configuration',
+      true,
+      `${CLAUDE_IDLE_TIMEOUT_VAR} must be a canonical decimal integer between ${MIN_IDLE_TIMEOUT_MS} and ${MAX_IDLE_TIMEOUT_MS}`,
+    );
+  }
+  return { idleTimeoutMs };
+}
+
+export function claudeRecoveryPolicy(env: Record<string, string | undefined> = process.env): HarnessRecoveryPolicy | undefined {
+  return parseClaudeIdleTimeout(env[CLAUDE_IDLE_TIMEOUT_VAR]);
+}
 
 /**
  * Build the environment the harness child runs under.
@@ -673,6 +709,7 @@ export interface ClaudeOptionInputs {
   /** The human approval channel, when this deployment has one. Absent keeps the
    *  refuse-and-route-to-`ask` behavior — see `buildCanUseTool`. */
   approvals?: ApprovalRequester;
+  recoveryPolicy?: HarnessRecoveryPolicy;
 }
 
 /** The non-declarative bits a caller supplies per invocation. */
@@ -728,6 +765,10 @@ export function buildClaudeOptions(
       inputs.approvals,
     ),
   };
+
+  // Partial messages are provider transport only: they reset liveness below but
+  // are never mapped into progress/evidence output.
+  if (inputs.recoveryPolicy !== undefined) options.includePartialMessages = true;
 
   // Omit the key entirely when nothing resolves — see `resolveExecutable`.
   const executable = resolveExecutable(extra.env);
@@ -869,11 +910,27 @@ export interface ClaudeStartDependencies {
   loadQuery: () => Promise<ClaudeQueryFactory>;
 }
 
+export interface ClaudeDeliverDependencies {
+  loadQuery: () => Promise<ClaudeQueryFactory>;
+  getSessionInfo: (token: string, opts: { dir: string }) => Promise<unknown>;
+}
+
 const DEFAULT_START_DEPENDENCIES: ClaudeStartDependencies = {
   createSessionId: randomUUID,
   loadQuery: async () => {
     const { query } = await import('@anthropic-ai/claude-agent-sdk');
     return (args) => query(args);
+  },
+};
+
+const DEFAULT_DELIVER_DEPENDENCIES: ClaudeDeliverDependencies = {
+  loadQuery: async () => {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    return (args) => query(args);
+  },
+  getSessionInfo: async (token, opts) => {
+    const { getSessionInfo } = await import('@anthropic-ai/claude-agent-sdk');
+    return getSessionInfo(token, opts);
   },
 };
 
@@ -896,6 +953,17 @@ export interface TurnOutcome {
   sessionId: string | undefined;
   /** Whether the turn-end (`result`) message arrived. */
   sawResult: boolean;
+}
+
+/** Per-turn liveness machinery. All callbacks are payload-free by contract. */
+export interface ConsumeTurnControl {
+  idleTimeoutMs?: number;
+  abortController?: AbortController;
+  close?: () => void;
+  onActivity?: (activity: { at: number; deadlineAt: number }) => void;
+  now?: () => number;
+  setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
 /** Trim a progress line to something a log can hold. Mirrors the codex adapter's
@@ -1029,10 +1097,71 @@ export async function consumeTurn(
   onEvent: (e: AgentEvent) => void,
   onInit?: (sessionId: string) => void,
   expectedSessionId?: string,
+  control: ConsumeTurnControl = {},
 ): Promise<TurnOutcome> {
   let sessionId: string | undefined;
   let finalResponse: string | undefined;
-  for await (const message of q) {
+  let terminalFailure: HarnessTurnError | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timeout: Promise<never> | undefined;
+  const now = control.now ?? Date.now;
+  const setTimer = control.setTimer ?? setTimeout;
+  const clearTimer = control.clearTimer ?? clearTimeout;
+
+  const arm = (): void => {
+    const idleTimeoutMs = control.idleTimeoutMs;
+    if (idleTimeoutMs === undefined) return;
+    if (timer !== undefined) clearTimer(timer);
+    const at = now();
+    const deadlineAt = at + idleTimeoutMs;
+    control.onActivity?.({ at, deadlineAt });
+    timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimer(() => {
+				timer = undefined;
+				try {
+					control.abortController?.abort();
+				} catch {
+					// An already-aborted controller is an equivalent successful teardown.
+				}
+				try {
+					control.close?.();
+				} catch {
+					// The structured timeout remains the authoritative failure.
+				}
+				reject(new HarnessIdleTimeoutError(idleTimeoutMs));
+      }, idleTimeoutMs);
+    });
+  };
+
+  const classifyAssistantError = (error: string | undefined): HarnessTurnError | undefined => {
+    if (error === 'authentication_failed' || error === 'oauth_org_not_allowed') {
+      return new HarnessTurnError('authentication', true, `provider authentication failure (${error})`);
+    }
+    if (error === 'model_not_found') {
+      return new HarnessTurnError('model-unavailable', true, 'provider model is unavailable');
+    }
+    return undefined;
+  };
+  const classifyResult = (message: SDKMessage): HarnessTurnError | undefined => {
+    if (message.type !== 'result' || message.subtype === 'success') return undefined;
+    const structured = message as unknown as { permission_denials?: unknown };
+    if (Array.isArray(structured.permission_denials) && structured.permission_denials.length > 0) {
+      return new HarnessTurnError('permission-policy', true, 'provider denied the configured permission policy');
+    }
+    return undefined;
+  };
+
+  const iterator = q[Symbol.asyncIterator]();
+  arm(); // Must cover silence before the first iterator result.
+  try {
+    for (;;) {
+      const next = iterator.next();
+      const item = timeout === undefined ? await next : await Promise.race([next, timeout]);
+      if (item.done) return { sessionId, sawResult: false };
+      const message = item.value;
+      // Reset BEFORE mapping. A partial event stays transport-only but is still
+      // proof of provider liveness.
+      arm();
     if (message.type === 'system' && message.subtype === 'init') {
       if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
 	throw new Error(
@@ -1066,10 +1195,13 @@ export async function consumeTurn(
         });
       }
       onEvent({ kind: 'turn_ended' });
+      const classified = terminalFailure ?? classifyResult(message);
+      if (classified !== undefined) throw classified;
       return { sessionId, sawResult: true };
     } else if (message.type === 'assistant') {
       emitAssistant(message, onEvent);
       finalResponse = assistantResponse(message) ?? finalResponse;
+      terminalFailure ??= classifyAssistantError(message.error);
     } else if (message.type === 'user') {
       emitUser(message, onEvent);
     }
@@ -1082,8 +1214,10 @@ export async function consumeTurn(
     // already carries. Unrecognized types stay silent by design: the vendor
     // adds message kinds between releases, and a mapping that threw on one
     // would turn a routine CLI upgrade into a failed order.
+    }
+  } finally {
+    if (timer !== undefined) clearTimer(timer);
   }
-  return { sessionId, sawResult: false };
 }
 
 /** The message text of an unknown thrown value, for an `exited` event. */
@@ -1134,6 +1268,19 @@ export async function startClaude(
   }
 
   SESSIONS.set(sessionId, { query: q, abortController, options });
+  const closeExact = (): void => {
+    if (SESSIONS.get(sessionId)?.query === q) SESSIONS.delete(sessionId);
+    try {
+      abortController.abort();
+    } catch {
+      // Best-effort, idempotent teardown.
+    }
+    try {
+      q.close();
+    } catch {
+      // The timeout/failure remains authoritative.
+    }
+  };
   let initVerified = false;
   let outcome: TurnOutcome;
   try {
@@ -1144,6 +1291,12 @@ export async function startClaude(
 	initVerified = true;
       },
       sessionId,
+      {
+				...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
+				abortController,
+				close: closeExact,
+				onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
+      },
     );
   } catch (err) {
     // An init mismatch or pre-init failure must not leave the preselected token
@@ -1185,11 +1338,12 @@ export async function startClaude(
   return ref;
 }
 
-async function deliver(
+export async function deliverClaude(
   ref: HarnessSessionRef,
   message: string,
   args: DeliverArgs,
   onEvent: (e: AgentEvent) => void,
+  dependencies: ClaudeDeliverDependencies = DEFAULT_DELIVER_DEPENDENCIES,
 ): Promise<void> {
   // Session lookup is scoped to the PROJECT DIRECTORY, so a deleted worktree can
   // never resume no matter how good the token is. Distinct message on purpose —
@@ -1207,8 +1361,7 @@ async function deliver(
   // hang and never a wrong-session resume — so it is the safe way to be wrong.
   let known = false;
   try {
-    const { getSessionInfo } = await import('@anthropic-ai/claude-agent-sdk');
-    known = (await getSessionInfo(ref.token, { dir: args.cwd })) !== undefined;
+    known = (await dependencies.getSessionInfo(ref.token, { dir: args.cwd })) !== undefined;
   } catch {
     known = false;
   }
@@ -1243,13 +1396,31 @@ async function deliver(
 
   // `forkSession` is deliberately NOT set: a fork would mint a new session id the
   // caller does not know about, and resume must continue the SAME session.
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const query = await dependencies.loadQuery();
   const q = query({ prompt: message, options });
   SESSIONS.set(ref.token, { query: q, abortController, options });
+  const closeExact = (): void => {
+    if (SESSIONS.get(ref.token)?.query === q) SESSIONS.delete(ref.token);
+    try {
+      abortController.abort();
+    } catch {
+      // Best-effort, idempotent teardown.
+    }
+    try {
+      q.close();
+    } catch {
+      // The timeout/failure remains authoritative.
+    }
+  };
 
   try {
     // Never emits `started` — the contract forbids re-emitting it on a resume.
-    await consumeTurn(q, onEvent);
+    await consumeTurn(q, onEvent, undefined, undefined, {
+      ...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
+      abortController,
+      close: closeExact,
+      onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
+    });
   } catch (err) {
     const text = errText(err);
     // Belt and braces behind the `getSessionInfo` pre-check.
@@ -1413,9 +1584,10 @@ export const claudeAdapter: HarnessAdapter = {
   // The provider stores the session and resumes it from the opaque token this
   // adapter puts in `HarnessSessionRef.token`.
   resumeTier: 'native-token',
+  recoveryPolicy: () => claudeRecoveryPolicy(),
   preflight: claudePreflight,
   start: startClaude,
-  deliver,
+  deliver: deliverClaude,
   stop,
   lintStep,
   resumeCommand,

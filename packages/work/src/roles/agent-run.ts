@@ -99,6 +99,7 @@ import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
 import {
   appendSession,
+  latestFor,
   latestForTask,
   sessionsPath,
   type SessionRecord,
@@ -213,6 +214,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
   switch (outcome) {
     case 'submitted':
     case 'completed':
+    case 'held':
       return 0;
     case 'misroute':
     case 'workdir-denied':
@@ -616,6 +618,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     // PHASE 4: the same reader `nextAttempt` uses, handed to the loop whole so
     // it can decide resume vs cold replay. Reads only; the loop is what writes.
     latestSession: (task) => latestForTask(sessionsFile, task),
+    // Recovery consumption belongs to this concrete hub run.  A human retry
+    // gets a fresh run id and therefore a fresh bounded recovery budget.
+    latestRunSession: (workflow, run, step) => latestFor(sessionsFile, workflow, run, step),
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now: () => Date.now(),
     out,

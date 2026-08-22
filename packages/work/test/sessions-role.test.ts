@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { formatAge, newestPerKey, renderTable, resumeCommandFor } from '../src/roles/sessions.ts';
+import { formatAge, newestPerKey, projectSession, renderTable, resumeCommandFor } from '../src/roles/sessions.ts';
 import { orderId, sessionsPath, type SessionRecord, type SessionStatus } from '../src/harness/session-store.ts';
 import { register, unregister } from '../src/harness/registry.ts';
 import type { HarnessAdapter, HarnessSessionRef } from '../src/harness/contract.ts';
@@ -233,6 +233,27 @@ test('a record with no session token renders a dash, not a command that cannot w
   } finally {
     unregister('fake-willing');
   }
+});
+
+test('recovery rows show safe control state and omit the provider token', () => {
+  const row = rec({
+    run: 'recovery-run',
+    step: 'builder',
+    status: 'turn-ended',
+    recovery: {
+      generation: 'recovery-run',
+      phase: 'held',
+      wakeUsed: true,
+      coldRestartUsed: true,
+      lastActivityAt: NOW,
+      lastFailure: { category: 'idle-timeout', at: NOW },
+    },
+  });
+  assert.equal(resumeCommandFor(row), undefined);
+  assert.match(renderTable([row], NOW), /held: action required/);
+  const projection = projectSession(row);
+  assert.equal('token' in projection, false);
+  assert.equal(JSON.stringify(projection).includes('tok-recovery-run-builder'), false);
 });
 
 test('the resume command is shell-quoted so an operator can paste it', () => {

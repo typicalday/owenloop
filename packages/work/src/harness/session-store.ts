@@ -64,10 +64,25 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
+import type { HarnessFailureCategory } from './contract.ts';
 import { defaultIsAlive, type Liveness } from '../shift/state.ts';
 
 /** Where a step attempt is in its life. */
 export type SessionStatus = 'active' | 'turn-ended' | 'submitted' | 'dead';
+
+export type RecoveryPhase = 'primary' | 'wake' | 'cold-restart' | 'held';
+
+/** Fsynced, sanitized control state for a recovery-enabled turn. */
+export interface RecoveryCheckpoint {
+  generation: string;
+  phase: RecoveryPhase;
+  wakeUsed: boolean;
+  coldRestartUsed: boolean;
+  phaseStartedAt?: number;
+  lastActivityAt?: number;
+  deadlineAt?: number;
+  lastFailure?: { category: HarnessFailureCategory; at: number };
+}
 
 const STATUSES = new Set<string>(['active', 'turn-ended', 'submitted', 'dead']);
 
@@ -132,6 +147,8 @@ export interface SessionRecord {
    * `attempt` stays outside it, per Phase 1.
    */
   deliveredReasonAt?: number;
+  /** Present only for opt-in recovery; never contains a prompt, token, or SDK payload. */
+  recovery?: RecoveryCheckpoint;
   updatedAt: number;
 }
 
@@ -268,6 +285,29 @@ function firstInvalidSessionRecordField(v: unknown): string | null {
   if (typeof r['token'] !== 'string') return 'token';
   if (r['key'] !== undefined && typeof r['key'] !== 'string') return 'key';
   if (typeof r['status'] !== 'string' || !STATUSES.has(r['status'])) return 'status';
+  if (r['recovery'] !== undefined) {
+    if (typeof r['recovery'] !== 'object' || r['recovery'] === null || Array.isArray(r['recovery'])) return 'recovery';
+    const recovery = r['recovery'] as Record<string, unknown>;
+    if (!isNonEmptyString(recovery['generation'])) return 'recovery.generation';
+    if (!['primary', 'wake', 'cold-restart', 'held'].includes(recovery['phase'] as string)) return 'recovery.phase';
+    if (typeof recovery['wakeUsed'] !== 'boolean') return 'recovery.wakeUsed';
+    if (typeof recovery['coldRestartUsed'] !== 'boolean') return 'recovery.coldRestartUsed';
+    for (const field of ['phaseStartedAt', 'lastActivityAt', 'deadlineAt'] as const) {
+      if (recovery[field] !== undefined && (!Number.isFinite(recovery[field]) || (recovery[field] as number) < 0)) {
+				return `recovery.${field}`;
+      }
+    }
+    if (recovery['lastFailure'] !== undefined) {
+      if (typeof recovery['lastFailure'] !== 'object' || recovery['lastFailure'] === null || Array.isArray(recovery['lastFailure'])) {
+				return 'recovery.lastFailure';
+      }
+      const failure = recovery['lastFailure'] as Record<string, unknown>;
+      if (!['idle-timeout', 'authentication', 'permission-policy', 'model-unavailable', 'configuration', 'provider'].includes(failure['category'] as string)) {
+				return 'recovery.lastFailure.category';
+      }
+      if (!Number.isFinite(failure['at']) || (failure['at'] as number) < 0) return 'recovery.lastFailure.at';
+    }
+  }
   return null;
 }
 
@@ -584,7 +624,7 @@ function appendSessionUnlocked(
   let failure: unknown;
   try {
     writeFileSync(fd, `${separator}${JSON.stringify(rec)}\n`);
-    if (rec.status === 'active') {
+    if (rec.status === 'active' || rec.recovery !== undefined) {
       const sync = opts.sync ?? fsyncSync;
       sync(fd);
       if (!existed) syncDirectory(join(file, '..'), sync);

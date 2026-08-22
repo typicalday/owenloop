@@ -148,7 +148,10 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
-    async ask() { return { text: '', ok: true }; },
+    async ask(req) {
+      calls.push({ verb: 'ask', arg: req });
+      return { text: '', ok: true, closed: true };
+    },
     // The tool-approval gate is not exercised by these tests; a fake that never
     // opens an approval, and a non-answer is a denial.
     async requestApproval() { return { text: '', ok: false }; },
@@ -322,6 +325,25 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
     adapter.calls.filter((c) => c.kind === 'stop').length,
     1,
   );
+});
+
+test('idle recovery is bounded to primary, one wake, one cold start, then one producer ask', async () => {
+  const adapter = createFakeAdapter({
+    start: { events: [{ kind: 'turn_ended' }] },
+    deliver: { events: [{ kind: 'turn_ended' }] },
+  });
+  adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+  const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+  const outcome = await createAgentRunLoop(h.opts).run();
+
+  assert.equal(outcome, 'held');
+  assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 2);
+  assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 1);
+  assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+  assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
+  assert.equal(verbs(calls).includes('release'), false);
 });
 
 test('the additional unbounded final-response evidence event is redacted while progress remains logged', async () => {
