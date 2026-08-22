@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { dsseVerifySubmission, valueDigestHex } from '../../../src/crypto/index.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
@@ -97,7 +99,16 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
 const ctx: ToolCallContext = { cancelled: false, onCancel: () => {}, sendProgress: () => {} };
 
 function deps(hub: HubClient, extra: Partial<Parameters<typeof createHoldMcp>[0]> = {}) {
-  return { hub, workflow: 'wf1', run: 'run1', sleep: async () => {}, now: () => 0, err: () => {}, ...extra };
+  return {
+    hub,
+    workflow: 'wf1',
+    run: 'run1',
+    workdir: process.cwd(),
+    sleep: async () => {},
+    now: () => 0,
+    err: () => {},
+    ...extra,
+  };
 }
 
 function tool(tools: ToolRegistration[], name: string): ToolRegistration {
@@ -145,6 +156,22 @@ test('the mount exposes exactly ask, get_order, reject, and submit, plus the lea
       path: { type: 'string', description: 'The consumed artifact path to reject.' },
       text: { type: 'string', description: 'The reason for rejecting the artifact.' },
     },
+    additionalProperties: false,
+  });
+  const submit = tool(mount.tools, 'submit');
+  assert.deepEqual(submit.inputSchema, {
+    type: 'object',
+    required: ['path'],
+    properties: {
+      path: { type: 'string', description: 'The owed output path to submit a receipt for.' },
+      value: { description: 'The receipt value (any JSON).' },
+      valueFile: { type: 'string', description: 'A UTF-8 JSON file inside the run working directory.' },
+      done: { type: 'boolean', description: 'Mark this the final submit for the path.' },
+    },
+    oneOf: [
+      { required: ['value'] },
+      { required: ['valueFile'] },
+    ],
     additionalProperties: false,
   });
   assert.equal(typeof mount.loop.run, 'function');
@@ -298,6 +325,49 @@ test('a JSON-string producer value is normalized once, so the signed bytes are t
   assert.equal(record.produced[0]!.artifact, 'pr');
   assert.equal(record.produced[0]!.version, 2);
   assert.equal(record.produced[0]!.valueDigest, valueDigestHex(req.value));
+});
+
+test('a file-form producer value is parsed before signing and sent unchanged on the wire', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'owenloop-hold-mcp-file-'));
+  try {
+    const submitted = { prUrl: 'https://example.test/146', number: 146 };
+    writeFileSync(join(workdir, 'pr.json'), JSON.stringify(submitted), 'utf8');
+    const orderResponse = producerOrderResponse();
+    orderResponse.order!.owes = [{ path: 'pr', version: 2, judgmentRejects: 0, schemaRejects: 0, reasons: [] }];
+    const { hub, calls } = mockHub({ getOrder: orderResponse, submit: { outcome: 'green', closed: false } });
+    const mount = createHoldMcp(deps(hub, {
+      workdir,
+      origin: 'https://hub.example.test',
+      principalKeys: signingKeys(),
+      sshProcess: fakeSshProcess(),
+      consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+    }));
+
+    const result = await tool(mount.tools, 'submit').handler(
+      { path: 'pr', valueFile: 'pr.json', done: true },
+      ctx,
+    );
+    assert.equal((result as { isError?: boolean }).isError, undefined);
+
+    const req = calls.find((call) => call.verb === 'submit')!.arg as { value: unknown; proof?: string };
+    assert.deepEqual(req.value, submitted);
+    assert.ok(req.proof !== undefined);
+    const verified = await dsseVerifySubmission(JSON.parse(req.proof), {
+      async verify(_bytes, signature) {
+	return signature.toString('utf8') === ARMOR
+	  ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+	  : null;
+      },
+    });
+    const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+      produced: Array<{ artifact: string; version: number; valueDigest: string }>;
+    };
+    assert.equal(record.produced[0]!.artifact, 'pr');
+    assert.equal(record.produced[0]!.version, 2);
+    assert.equal(record.produced[0]!.valueDigest, valueDigestHex(req.value));
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test('an unparseable string value reaches the hub unchanged, for the hub to reject', async () => {
@@ -492,13 +562,23 @@ test('a non-closed submit does NOT stop the loop', async () => {
   assert.equal(stopped, false);
 });
 
-test('submit validates path and value before touching the hub', async () => {
+test('submit validates path and its exact-one value source before touching the hub', async () => {
   const { hub, calls } = mockHub({});
   const mount = createHoldMcp(deps(hub));
   const noPath = await tool(mount.tools, 'submit').handler({ value: 1 }, ctx);
   assert.equal((noPath as { isError?: boolean }).isError, true);
-  const noValue = await tool(mount.tools, 'submit').handler({ path: 'pr' }, ctx);
-  assert.equal((noValue as { isError?: boolean }).isError, true);
+  const neither = await tool(mount.tools, 'submit').handler({ path: 'pr' }, ctx);
+  assert.equal((neither as { isError?: boolean }).isError, true);
+  assert.match(parse(neither).error, /submit-value-source-invalid/);
+  const both = await tool(mount.tools, 'submit').handler({ path: 'pr', value: 1, valueFile: 'receipt.json' }, ctx);
+  assert.equal((both as { isError?: boolean }).isError, true);
+  assert.match(parse(both).error, /submit-value-source-invalid/);
+  const invalidFile = await tool(mount.tools, 'submit').handler({ path: 'pr', valueFile: '  ' }, ctx);
+  assert.equal((invalidFile as { isError?: boolean }).isError, true);
+  assert.match(parse(invalidFile).error, /submit-value-file-invalid/);
+  const nonStringFile = await tool(mount.tools, 'submit').handler({ path: 'pr', valueFile: 1 }, ctx);
+  assert.equal((nonStringFile as { isError?: boolean }).isError, true);
+  assert.match(parse(nonStringFile).error, /submit-value-file-invalid/);
   assert.equal(calls.length, 0);
 });
 

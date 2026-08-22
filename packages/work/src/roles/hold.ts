@@ -370,6 +370,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       hub,
       workflow: target.workflow,
       run: target.run,
+      workdir: process.cwd(),
       ...(parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),
       origin,
       env,
