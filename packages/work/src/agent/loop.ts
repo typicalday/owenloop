@@ -968,7 +968,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
     // The live owed set is the only legitimate recovery target. `briefOwes`
     // preserves the legacy packet.outputs fallback for old hub projections.
-    const recoveryPaths = (briefOwes(packet) ?? []).map((owed) => owed.path);
+    const recoveryPaths = (briefOwes(packet) ?? [])
+      .map((owed) => owed.path)
+      .filter((path) => path !== '');
     const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);
     const recoveryEnabled =
       recoveryPaths.length === 1 &&
@@ -1130,7 +1132,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       permissions,
       approvals,
       ...(resolvedModel ?? {}),
-      ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
+      ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     };
     /** Built lazily: a cold start after a refused resume needs a FRESH one. */
     const coldArgs = (): StartArgs => ({
@@ -1147,7 +1149,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       permissions,
       approvals,
       ...(resolvedModel ?? {}),
-      ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
+      ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     });
 
     if (recoveryEnabled) {
@@ -1195,12 +1197,18 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					};
 				};
 					const checkpoint = (phase: RecoveryPhase, changes: Partial<RecoveryCheckpoint> = {}): boolean => {
-						recovery = {
-						...recovery!,
-						...changes,
+						const nextRecovery: RecoveryCheckpoint = {
+							...recovery!,
+							...changes,
 							phase,
 							phaseStartedAt: opts.now(),
 						};
+						// A failure describes the phase that just settled. Starting a later
+						// provider phase supersedes it so a clean wake/cold turn cannot leave
+						// a stale primary timeout in the eventual hold question. The held
+						// transition preserves the current phase's failure, when there is one.
+						if (phase !== 'held') delete nextRecovery.lastFailure;
+						recovery = nextRecovery;
 						try {
 							record('active'); // recovery rows are fsynced by the store.
 							return true;
@@ -1310,9 +1318,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					return failure === undefined ? {} : { failure };
 				};
 
-					const askHeld = async (): Promise<AgentRunOutcome> => {
-						const facts = recovery!;
-					const question = `Harness recovery held ${recoveryPath} after ${facts.lastFailure?.category ?? facts.phase}; a human decision is required.`;
+					const askHeld = async (heldAfter: RecoveryPhase | NonNullable<RecoveryCheckpoint['lastFailure']>['category']): Promise<AgentRunOutcome> => {
+							const facts = recovery!;
+					const question = `Harness recovery held ${recoveryPath} after ${heldAfter}; a human decision is required.`;
 					const context = JSON.stringify({
 						generation: facts.generation,
 						phase: facts.phase,
@@ -1370,13 +1378,22 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						return 'hub-unreachable';
 					};
 					const hold = async (failure?: unknown): Promise<AgentRunOutcome> => {
-						if (failure !== undefined) setFailure(failure);
-						// Persist the terminal transition before stopping a query or attempting
-						// an ask. A process death can underspend recovery, never repeat it.
-						if (!checkpoint('held')) return sessionStoreFailed();
-						await stopCurrent();
-						return askHeld();
-					};
+							if (failure !== undefined) setFailure(failure);
+							const heldAfter = recovery!.lastFailure?.category ?? (
+								recovery!.phase !== 'held'
+									? recovery!.phase
+									: recovery!.coldRestartUsed
+										? 'cold-restart'
+										: recovery!.wakeUsed
+											? 'wake'
+											: 'primary'
+							);
+							// Persist the terminal transition before stopping a query or attempting
+							// an ask. A process death can underspend recovery, never repeat it.
+							if (!checkpoint('held')) return sessionStoreFailed();
+							await stopCurrent();
+							return askHeld(heldAfter);
+						};
 					const prepareColdRestart = (): boolean =>
 						checkpoint('cold-restart', { wakeUsed: true, coldRestartUsed: true });
 

@@ -585,6 +585,43 @@ test('a silent SDK iterator aborts and closes its exact controlled query', async
   assert.equal(cleared, 0, 'the timer already fired and is not cleared twice');
 });
 
+test('idle timeout remains authoritative when abort or close rejects the pending iterator read', async () => {
+	let fire: (() => void) | undefined;
+	let rejectNext: ((error: Error) => void) | undefined;
+	const controller = new AbortController();
+	const silent: AsyncIterable<SDKMessage> = {
+		[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+			return {
+				next: async () => new Promise<IteratorResult<SDKMessage>>((_resolve, reject) => {
+					rejectNext = reject;
+					controller.signal.addEventListener(
+						'abort',
+						() => reject(new Error('iterator rejected during abort')),
+						{ once: true },
+					);
+				}),
+			};
+		},
+	};
+	const pending = consumeTurn(silent, () => {}, undefined, undefined, {
+		idleTimeoutMs: 1_000,
+		abortController: controller,
+		close: () => rejectNext?.(new Error('iterator rejected during close')),
+		setTimer: (callback) => {
+			fire = callback;
+			return callback as unknown as ReturnType<typeof setTimeout>;
+		},
+		clearTimer: () => {},
+	});
+
+	assert.ok(fire, 'the idle deadline is armed before the pending read');
+	fire!();
+	await assert.rejects(
+		pending,
+		(error: unknown) => error instanceof HarnessIdleTimeoutError && error.category === 'idle-timeout',
+	);
+});
+
 test('partial SDK messages are enabled only by an explicit recovery policy', () => {
   assert.equal(optionsFor(undefined).options.includePartialMessages, undefined);
   const events: AgentEvent[] = [];

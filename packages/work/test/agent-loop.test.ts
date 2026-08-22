@@ -349,9 +349,84 @@ test('idle recovery is bounded to primary, one wake, one cold start, then one pr
 	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
 	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
 	assert.match(recoveryAsk, /Harness recovery held pr/u);
+	assert.match(recoveryAsk, /after cold-restart/u);
 	assert.doesNotMatch(recoveryAsk, /claude|codex|anthropic|openai/iu);
 	assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
   assert.equal(verbs(calls).includes('release'), false);
+});
+
+test('a valid policy is not forwarded when zero, multiple, or only empty output paths make recovery ineligible', async () => {
+	const scenarios: Array<{ label: string; owes: NonNullable<OrderOpts['owes']> }> = [
+		{ label: 'zero outputs', owes: [] },
+		{ label: 'multiple outputs', owes: [{ path: 'first' }, { path: 'second' }] },
+		{ label: 'only an empty path', owes: [{ path: '' }] },
+	];
+
+	for (const scenario of scenarios) {
+		const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+		adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+		const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: scenario.owes })] });
+		const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+		assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit', scenario.label);
+		const starts = adapter.calls.filter((call) => call.kind === 'start');
+		assert.equal(starts.length, 1, scenario.label);
+		assert.equal(starts[0]?.args.recoveryPolicy, undefined, scenario.label);
+		assert.equal(adapter.calls.some((call) => call.kind === 'deliver'), false, scenario.label);
+		assert.equal(verbs(calls).includes('ask'), false, scenario.label);
+		assert.equal(verbs(calls).includes('release'), true, scenario.label);
+	}
+});
+
+test('one non-empty path among empty entries enables recovery only for the real target', async () => {
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: '' }, { path: 'pr' }] })],
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	for (const call of adapter.calls) {
+		if (call.kind === 'start' || call.kind === 'deliver') {
+			assert.deepEqual(call.args.recoveryPolicy, { idleTimeoutMs: 1_000 });
+		}
+	}
+	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
+	assert.match(recoveryAsk, /"path":"pr"/u);
+	assert.doesNotMatch(recoveryAsk, /"path":""/u);
+});
+
+test('a clean wake and cold restart supersede an earlier primary timeout in the hold question', async () => {
+	const ref: HarnessSessionRef = { harness: 'fake', token: 'recovery-token' };
+	let starts = 0;
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(_args, onEvent) {
+			starts += 1;
+			onEvent({ kind: 'started', ref });
+			if (starts === 1) throw new HarnessTurnError('idle-timeout', false, 'primary timed out');
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver(_ref, _message, _args, onEvent) {
+			onEvent({ kind: 'turn_ended' });
+		},
+		async stop() {},
+	};
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
+	assert.match(recoveryAsk, /after cold-restart/u);
+	assert.doesNotMatch(recoveryAsk, /after idle-timeout/u);
 });
 
 test('an opted-in permission preflight holds immediately without starting a provider turn', async () => {

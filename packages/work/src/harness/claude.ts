@@ -1105,6 +1105,8 @@ export async function consumeTurn(
   let terminalFailure: HarnessTurnError | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timeout: Promise<never> | undefined;
+  let idleTimeoutFailure: HarnessIdleTimeoutError | undefined;
+  let timerGeneration = 0;
   const now = control.now ?? Date.now;
   const setTimer = control.setTimer ?? setTimeout;
   const clearTimer = control.clearTimer ?? clearTimeout;
@@ -1113,14 +1115,21 @@ export async function consumeTurn(
     const idleTimeoutMs = control.idleTimeoutMs;
     if (idleTimeoutMs === undefined) return;
     if (timer !== undefined) clearTimer(timer);
+    const generation = ++timerGeneration;
+    idleTimeoutFailure = undefined;
     const at = now();
     const deadlineAt = at + idleTimeoutMs;
     control.onActivity?.({ at, deadlineAt });
     timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimer(() => {
-				timer = undefined;
-				try {
-					control.abortController?.abort();
+					if (generation !== timerGeneration) return;
+					timer = undefined;
+					idleTimeoutFailure = new HarnessIdleTimeoutError(idleTimeoutMs);
+					// Latch and reject first so an iterator read that synchronously rejects
+					// during abort/close cannot win the race as a generic provider failure.
+					reject(idleTimeoutFailure);
+					try {
+						control.abortController?.abort();
 				} catch {
 					// An already-aborted controller is an equivalent successful teardown.
 				}
@@ -1129,7 +1138,6 @@ export async function consumeTurn(
 				} catch {
 					// The structured timeout remains the authoritative failure.
 				}
-				reject(new HarnessIdleTimeoutError(idleTimeoutMs));
       }, idleTimeoutMs);
     });
   };
@@ -1221,12 +1229,14 @@ export async function consumeTurn(
     // routine CLI upgrade into a failed order.
     }
   } catch (error) {
-	if (isHarnessTurnError(error)) throw error;
+		if (idleTimeoutFailure !== undefined) throw idleTimeoutFailure;
+		if (isHarnessTurnError(error)) throw error;
 	// This is our own session-integrity guard, not a provider failure. Preserve
 	// its actionable detail while normalizing all actual SDK failures below.
 	if (error instanceof Error && error.message.startsWith('provider session id mismatch:')) throw error;
 	throw new HarnessTurnError('provider', false, 'provider SDK stream failed');
   } finally {
+    timerGeneration += 1;
     if (timer !== undefined) clearTimer(timer);
   }
 }
