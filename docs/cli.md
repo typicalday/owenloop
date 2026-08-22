@@ -81,6 +81,7 @@ is independent of the `SEARCH INCOMPLETE` bounds notice.
 | `capability bind <capability> <crew> [--hub <url>]` | add a crew to a workflow capability on the hub org — a capability may route to many crews (admin; human credential) — see [Capability routes](#capability-routes) |
 | `capability unbind <capability> <crew> [--hub <url>]` | remove one `(capability, crew)` route — see [Capability routes](#capability-routes) |
 | `capability list [--hub <url>]` | list the hub org's capability routes — see [Capability routes](#capability-routes) |
+| `catalog visibility <name> visible\|hidden [--hub <url>]` | set whether one published workflow definition appears in catalog discovery (admin; human credential) — see [Workflow catalog visibility](#workflow-catalog-visibility) |
 | `interface register <name> <version> --signature <file> [--hub <url>]` | register one immutable hub interface signature (admin; human credential) — see [Interface catalog](#interface-catalog) |
 | `interface get <name> <version> [--hub <url>]` | get one exact interface signature from the hub — see [Interface catalog](#interface-catalog) |
 | `interface list [--hub <url>]` | list every registered interface coordinate — see [Interface catalog](#interface-catalog) |
@@ -2395,6 +2396,48 @@ needs a translation step.
 | `1` | runtime or hub error — an unknown crew name (`capability bind` only; `capability unbind` answers a tolerant `removed: false` instead), a capability that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
+## Workflow catalog visibility
+
+Use `owenloop catalog visibility <name> visible|hidden [--hub <url>]` to set
+whether one published workflow definition is shown in catalog discovery. The
+`catalog` namespace names the discovery surface directly; `defs` is local
+definition discovery and `workflow` would be ambiguous with workflow-instance
+coordinates.
+
+The CLI sends `POST /api/set_workflow_catalog_visibility` with
+`{ "name": "<name>", "visible": true }` for `visible` and the same body with
+`false` for `hidden`. It accepts only those two state words and only requires
+that `<name>` is non-empty; definition-name syntax and existence remain hub
+decisions.
+
+This changes catalog discovery only. It does not change exact-name reads,
+starts, call resolution, authorization, or existing instances. Each invocation
+sets one definition: it does not read state, list/filter definitions, or accept
+bulk or glob inputs.
+
+The command resolves `--hub` first; without it, exactly one enumerable stored
+hub is required. It uses only the human/admin credential, and supports
+`OWENLOOP_CREDENTIAL_COMMAND` because it writes no local credential. Successful
+stdout is exactly one JSON document:
+
+`{ "ok": true, "hub": "<origin>", "name": "<server name>", "catalogVisible": false, "previousCatalogVisible": true, "unchanged": false }`
+
+The server-echoed fields are authoritative. `unchanged: false` means this call
+changed visibility; `unchanged: true` means it was already in the requested
+state. Both are successful exit-0 results. The hub's `text` field and unknown
+response fields are never printed.
+
+An unknown definition surfaces the hub's non-empty message unchanged (for
+example, its `DefNotFoundError` message), with no raw error code or replacement
+body. Malformed successful responses leave stdout empty.
+
+| code | meaning |
+|---|---|
+| `0` | visibility was set, including an idempotent repeat |
+| `1` | usage, runtime, hub, or malformed-response error |
+| `2` | the hub could not be resolved |
+| `3` | the human credential is missing or irrecoverable; stderr names `owenloop login --hub <origin>` |
 
 ## Interface catalog
 

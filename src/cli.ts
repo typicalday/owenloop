@@ -177,6 +177,7 @@ import {
   asCapabilityRoutes,
   asInterfaceCatalogList,
   asInterfaceCatalogVersion,
+  asWorkflowCatalogVisibility,
   asCrewCreated,
   asCrewDeleted,
   asCrewMemberAdded,
@@ -1574,6 +1575,7 @@ ${' '.repeat(41)}the instance has reached a terminal status.
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
   capability list [--hub <url>]               list the hub org's capability routes
+  catalog visibility <name> visible|hidden [--hub <url>]
   interface register <name> <version> --signature <file> [--hub <url>]
   interface get <name> <version> [--hub <url>]
   interface list [--hub <url>]
@@ -1697,6 +1699,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['instance', cmdOpts('hub')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
+  ['catalog', cmdOpts('hub')],
   ['interface', cmdOpts('hub', 'signature')],
   // Per-TOP-LEVEL-command allowlist, not per-subcommand: `--position` on
   // `routing alerts` is meaningless but accepted and ignored, exactly as
@@ -6935,6 +6938,83 @@ async function dispatchInterface(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * Set whether one published workflow definition appears in catalog discovery.
+ * The hub remains the source of truth for opaque definition-name semantics and
+ * returned state; this command only validates its small argv shape.
+ */
+async function dispatchCatalog(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORM = 'usage: owenloop catalog visibility <name> visible|hidden [--hub <url>]';
+  if (args.positionals[1] !== 'visibility') {
+    throw new CliError('unknown catalog subcommand ' + JSON.stringify(args.positionals[1] ?? '') + ' — ' + USAGE_FORM);
+  }
+  const name = args.positionals[2];
+  if (name === undefined || name === '') {
+    throw new CliError('missing required argument: <name> (' + USAGE_FORM + ')');
+  }
+  const state = args.positionals[3];
+  if (state === undefined || state === '') {
+    throw new CliError('missing required argument: visible|hidden (' + USAGE_FORM + ')');
+  }
+  if (args.positionals[4] !== undefined) {
+    throw new CliError('too many positional arguments — ' + USAGE_FORM);
+  }
+  if (state !== 'visible' && state !== 'hidden') {
+    throw new CliError('visibility state must be visible or hidden — ' + USAGE_FORM);
+  }
+  const visible = state === 'visible';
+
+  const origin = resolveAgentHub(io, args, 'set workflow catalog visibility on');
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const credential = readCredential(io, origin, slot);
+  if (credential === null) {
+    throw new CliError('no human credential for ' + origin + ' — run: owenloop login --hub ' + origin, { exitCode: 3 });
+  }
+
+  try {
+    const { res } = await authedPost(
+      io,
+      origin,
+      slot,
+      credential,
+      '/api/set_workflow_catalog_visibility',
+      { name, visible },
+    );
+    if (res.status === 401) {
+      throw new CliError('credential rejected by the hub — run `owenloop login`');
+    }
+    if (!res.ok) {
+      throw new CliError((await hubRequestMessage(res)) ?? ('hub ' + origin + ' rejected the request (HTTP ' + res.status + ')'));
+    }
+    let body: unknown;
+    try {
+      body = (await res.json()) as unknown;
+    } catch {
+      throw new CliError('set_workflow_catalog_visibility: malformed success response — body is not valid JSON');
+    }
+    let result;
+    try {
+      result = asWorkflowCatalogVisibility(body);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    print(io, {
+      ok: true,
+      hub: origin,
+      name: result.name,
+      catalogVisible: result.catalogVisible,
+      previousCatalogVisible: result.previousCatalogVisible,
+      unchanged: result.unchanged,
+    });
+    return 0;
+  } catch (e) {
+    if (e instanceof CliError && /run `owenloop login`/.test(e.message)) {
+      throw new CliError(e.message + ' — run: owenloop login --hub ' + origin, { exitCode: 3 });
+    }
+    throw e;
+  }
+}
+
+/**
  * `owenloop capability bind|unbind|list` — manage the hub org's **capability routes**, the
  * admin-owned table mapping a workflow-def `capabilities:` entry to a crew.
  *
@@ -9306,7 +9386,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'pending-gates', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'interface', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'pending-gates', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'catalog', 'interface', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -9379,6 +9459,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchAgent(io, args);
       case 'capability':
         return await dispatchCapability(io, args);
+      case 'catalog':
+	return await dispatchCatalog(io, args);
       case 'interface':
 	return await dispatchInterface(io, args);
       case 'routing':
