@@ -2410,10 +2410,17 @@ duplicate coordinates are refused and are never overwritten.
 | `interface get <name> <version> [--hub <url>]` | `GET /api/interfaces/:name/:version` | human; hub applies `get_status` |
 | `interface list [--hub <url>]` | `GET /api/interfaces` | human; hub applies `get_status` |
 
-`get` encodes `<name>` and `<version>` separately as URL path segments, so both
-remain opaque coordinates: a slash or space in either coordinate does not alter
-the route. The CLI does no coordinate charset check and the hub remains the
-enforcement of record.
+`get` encodes `<name>` and `<version>` separately as URL path segments, so a
+slash or space in either coordinate does not alter the route. The only exact-read
+exception is a whole `.` or `..` name or version segment: the deployed hub
+route is path-based and URL normalization removes dot segments before it can
+address the coordinate. `interface get` therefore refuses either value before
+credential or network work with exit code 2 and explains that the path-based
+route cannot address it. This is not a general charset validator: `register`
+continues to send those values in its JSON body and `list` can return their
+metadata, so a dot-segment row is registerable and listable but not
+exact-readable. Ordinary dotted versions such as `evidence-report@2.0.0` are
+unaffected and round-trip through register, get, and list.
 
 ### Registering a signature
 
@@ -2462,7 +2469,7 @@ enumerate hubs must receive `--hub` explicitly.
 |---|---|
 | `0` | registered, read, or listed successfully |
 | `1` | runtime, hub, or malformed-response error |
-| `2` | the hub could not be resolved |
+| `2` | the hub could not be resolved, or `interface get` received a whole `.`/`..` name or version segment that the path-based hub route cannot address |
 | `3` | the human credential is missing or irrecoverable; stderr names `owenloop login --hub <origin>` |
 
 ## Routing
