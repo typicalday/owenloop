@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.21](https://github.com/typicalday/owenloop/compare/v0.5.20...v0.5.21) (2026-08-22)
+
+
+### Bug Fixes
+
+* **work:** resolve bundle-locked calls targets on workers ([#287](https://github.com/typicalday/owenloop/issues/287)) ([a2a6b47](https://github.com/typicalday/owenloop/commit/a2a6b47699ddc8b02f8f645ecc4a0ddd5269cf11))
+
 ## [0.5.20](https://github.com/typicalday/owenloop/compare/v0.5.19...v0.5.20) (2026-08-22)
 
 
