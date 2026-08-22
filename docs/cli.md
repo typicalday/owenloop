@@ -703,6 +703,20 @@ mint or log credentials. If the stored human credential is an expiring OAuth
 credential, the decision path may refresh it and persist a rotated token under
 the shared credential lock before answering the hub.
 
+### `work hold --mcp` — machine-attached MCP holder
+
+`owenloop work hold --order <workflow>/<run> --mcp` keeps the order lease warm
+and exposes the holder's MCP tools over stdio. Its `submit` tool requires
+exactly one of `value` or `valueFile`, along with the owed `path`; `done: true`
+marks the final receipt for that path.
+
+`valueFile` is a UTF-8 JSON document resolved inside the holder's run working
+directory. Traversal, outside absolute paths, and symlinks that escape that
+directory are refused. The file is parsed as JSON before the normal submit
+value normalization, so the parsed value is the one sent to the hub and used
+for any submit proof. There is no client-side artifact-size limit; the hub's
+existing size policy still applies.
+
 ### `util modifier-init`
 
 `owenloop util modifier-init --default <value>` is a deterministic helper for
