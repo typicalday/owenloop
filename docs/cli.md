@@ -688,6 +688,13 @@ The execution settings file is `<config>/settings.json` (see
 
 `work approvals` distinguishes a worker that is still running and waiting on a
 tool decision from a pending input gate or an `ask` that ends the current run.
+Each human-readable pending approval includes a bounded `call:` title when the
+harness can provide one. Claude preserves a non-empty SDK title; otherwise it
+shows the Bash command, a known file-tool path, or the tool name as a fallback.
+Titles use the adapters' shared 2,000-character cap. The separate `why:` text
+continues to explain the gatekeeper decision. `--json` returns the hub's
+approval rows unchanged and therefore exposes the title, not the full
+model-authored tool-input bag.
 Listing uses the agent credential selected by `OWENLOOP_ACCOUNT` (default
 `default`). `approve` and `deny` always use the stored `human` credential,
 ignore `OWENLOOP_ACCOUNT` and `OWENLOOP_TOKEN`, and require
