@@ -49,6 +49,7 @@ import {
   HarnessTurnError,
   ResumeUnavailableError,
   NEUTRAL_PERMISSION_MODES,
+	isHarnessTurnError,
   isNeutralPermissionMode,
 } from './contract.ts';
 import type { ApprovalRequester } from './contract.ts';
@@ -1134,13 +1135,14 @@ export async function consumeTurn(
   };
 
   const classifyAssistantError = (error: string | undefined): HarnessTurnError | undefined => {
+	if (error === undefined) return undefined;
     if (error === 'authentication_failed' || error === 'oauth_org_not_allowed') {
       return new HarnessTurnError('authentication', true, `provider authentication failure (${error})`);
     }
     if (error === 'model_not_found') {
       return new HarnessTurnError('model-unavailable', true, 'provider model is unavailable');
     }
-    return undefined;
+	return new HarnessTurnError('provider', false, 'provider reported an unclassified assistant failure');
   };
   const classifyResult = (message: SDKMessage): HarnessTurnError | undefined => {
     if (message.type !== 'result' || message.subtype === 'success') return undefined;
@@ -1148,7 +1150,7 @@ export async function consumeTurn(
     if (Array.isArray(structured.permission_denials) && structured.permission_denials.length > 0) {
       return new HarnessTurnError('permission-policy', true, 'provider denied the configured permission policy');
     }
-    return undefined;
+	return new HarnessTurnError('provider', false, 'provider returned an unclassified error result');
   };
 
   const iterator = q[Symbol.asyncIterator]();
@@ -1202,19 +1204,28 @@ export async function consumeTurn(
       emitAssistant(message, onEvent);
       finalResponse = assistantResponse(message) ?? finalResponse;
       terminalFailure ??= classifyAssistantError(message.error);
+		} else if (message.type === 'auth_status' && message.error !== undefined) {
+			// `error` is a structured SDK field. Its prose is deliberately neither
+			// logged nor parsed for recovery decisions.
+			throw new HarnessTurnError('authentication', true, 'provider authentication status failed');
     } else if (message.type === 'user') {
       emitUser(message, onEvent);
     }
     // `needs_input` is NEVER emitted: this SDK path has no blocking-question
     // channel that maps to it, and the contract has no reply channel by design.
-    // `stream_event` is deliberately NOT mapped. The SDK only emits it when
-    // `Options.includePartialMessages` is set, and `buildClaudeOptions` never
-    // sets it — so the branch would be unreachable today, and if it ever
-    // became reachable it would duplicate the text the `assistant` message
-    // already carries. Unrecognized types stay silent by design: the vendor
-    // adds message kinds between releases, and a mapping that threw on one
-    // would turn a routine CLI upgrade into a failed order.
+    // `stream_event` is deliberately NOT mapped. Recovery-enabled options opt
+    // into partial messages only to reset liveness; their payload would merely
+    // duplicate the eventual assistant message and must not escape telemetry.
+    // Other unrecognized types stay silent by design: the vendor adds message
+    // kinds between releases, and a mapping that threw on one would turn a
+    // routine CLI upgrade into a failed order.
     }
+  } catch (error) {
+	if (isHarnessTurnError(error)) throw error;
+	// This is our own session-integrity guard, not a provider failure. Preserve
+	// its actionable detail while normalizing all actual SDK failures below.
+	if (error instanceof Error && error.message.startsWith('provider session id mismatch:')) throw error;
+	throw new HarnessTurnError('provider', false, 'provider SDK stream failed');
   } finally {
     if (timer !== undefined) clearTimer(timer);
   }
@@ -1264,7 +1275,9 @@ export async function startClaude(
       // An already-aborted controller is equivalent to success.
     }
     onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
-    throw err;
+	throw isHarnessTurnError(err)
+	  ? err
+	  : new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
   }
 
   SESSIONS.set(sessionId, { query: q, abortController, options });
@@ -1396,8 +1409,17 @@ export async function deliverClaude(
 
   // `forkSession` is deliberately NOT set: a fork would mint a new session id the
   // caller does not know about, and resume must continue the SAME session.
-  const query = await dependencies.loadQuery();
-  const q = query({ prompt: message, options });
+	let q: ClaudeQuery;
+	try {
+		const query = await dependencies.loadQuery();
+		q = query({ prompt: message, options });
+	} catch (err) {
+		const failure = isHarnessTurnError(err)
+			? err
+			: new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
+		onEvent({ kind: 'exited', exitCode: null, error: failure.message });
+		throw failure;
+	}
   SESSIONS.set(ref.token, { query: q, abortController, options });
   const closeExact = (): void => {
     if (SESSIONS.get(ref.token)?.query === q) SESSIONS.delete(ref.token);

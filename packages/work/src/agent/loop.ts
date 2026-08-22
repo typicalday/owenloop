@@ -75,7 +75,7 @@ import type {
   HarnessSessionRef,
   StartArgs,
 } from '../harness/contract.ts';
-import { isHarnessTurnError, isResumeUnavailable } from '../harness/contract.ts';
+import { HarnessTurnError, isHarnessTurnError, isResumeUnavailable } from '../harness/contract.ts';
 import { preflightStepPermissions } from '../harness/permissions.ts';
 import {
   orderId,
@@ -531,6 +531,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   let lastDurableActivityAt = 0;
   /** Captures a thrown safety-gate append from the synchronous `started` event. */
   let activePersistenceFailure: unknown;
+  /**
+   * Recovery control rows are a pre-dispatch safety boundary too. Activity is
+   * delivered from inside an adapter, so it cannot await cleanup; this signal
+   * lets the recovery race stop the exact active session and release instead of
+   * misclassifying the writer failure as a provider retry.
+   */
+  let recoveryPersistenceFailure: unknown;
+  let reportRecoveryPersistenceFailure: ((error: unknown) => void) | undefined;
   /** Provider-selected model, when a harness reports it after its synchronous start gate. */
   let runtimeModel: string | undefined;
   /** Recent unique harness diagnostics for the capability-silent no-submit log only. */
@@ -717,10 +725,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					recovery = { ...recovery, lastActivityAt: e.at, deadlineAt: e.deadlineAt };
 					// SDK partial events may arrive per token. Keep the in-memory deadline
 					// exact while bounding durable control writes to one per five seconds.
-					if (e.at - lastDurableActivityAt >= 5_000) {
-						lastDurableActivityAt = e.at;
-						record('active');
-					}
+						if (e.at - lastDurableActivityAt >= 5_000) {
+							lastDurableActivityAt = e.at;
+							try {
+								record('active');
+							} catch (error) {
+								recoveryPersistenceFailure ??= error;
+								reportRecoveryPersistenceFailure?.(error);
+								void teardown();
+							}
+						}
 				}
 				return;
       case 'turn_ended':
@@ -941,22 +955,6 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     };
     const permissions = step.permissions;
 
-    // Mandatory final-boundary preflight. Common checks run first, followed by
-    // the selected adapter's exact capability check.
-    const policyIssues = [
-      ...preflightStepPermissions(permissions),
-      ...active.preflight(permissions),
-    ];
-    if (policyIssues.length > 0) {
-      for (const issue of policyIssues) {
-	opts.err(
-	  `owenloop work agent-run: harness policy refusal for ${order} on '${resolution.id}'` +
-	    `${issue.field !== undefined ? ` (${issue.field})` : ''}: ${issue.message}`,
-	);
-      }
-      return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
-    }
-
     // Adapter-owned configuration is resolved once per worker life.  Passing
     // this object through every dispatch prevents a changing environment from
     // changing recovery policy midway through a claimed order.
@@ -966,6 +964,48 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       recoveryPolicy = active.recoveryPolicy?.();
     } catch (error) {
       recoveryConfigurationFailure = error;
+    }
+
+    // The live owed set is the only legitimate recovery target. `briefOwes`
+    // preserves the legacy packet.outputs fallback for old hub projections.
+    const recoveryPaths = (briefOwes(packet) ?? []).map((owed) => owed.path);
+    const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);
+    const recoveryEnabled =
+      recoveryPaths.length === 1 &&
+      (recoveryPolicy !== undefined || recoveryConfigurationIsTerminal);
+
+    // A present-but-invalid adapter setting must stop before *any* provider
+    // delivery, including multi-output orders that cannot use bounded recovery.
+    // The one-output opt-in path turns that terminal configuration failure into
+    // the same durable producer-side hold as other terminal failures below.
+    if (recoveryConfigurationFailure !== undefined && !recoveryEnabled) {
+      opts.err(`owenloop work agent-run: harness recovery configuration is invalid: ${errMsg(recoveryConfigurationFailure)}`);
+      return releaseWith('invalid-harness-recovery-configuration', 'incompatible-harness-policy');
+    }
+
+    // Mandatory final-boundary preflight. Common checks run first, followed by
+    // the selected adapter's exact capability check. In an eligible recovery
+    // firing this is a terminal policy failure and must hold, not re-offer.
+    const policyIssues = [
+      ...preflightStepPermissions(permissions),
+      ...active.preflight(permissions),
+    ];
+    for (const issue of policyIssues) {
+	opts.err(
+	  `owenloop work agent-run: harness policy refusal for ${order} on '${resolution.id}'` +
+	    `${issue.field !== undefined ? ` (${issue.field})` : ''}: ${issue.message}`,
+	);
+    }
+    let recoveryPreflightFailure: HarnessTurnError | undefined;
+	if (policyIssues.length > 0) {
+		recoveryPreflightFailure = new HarnessTurnError(
+			'permission-policy',
+			true,
+			'the selected harness refused the configured permission policy',
+		);
+	}
+    if (recoveryPreflightFailure !== undefined && !recoveryEnabled) {
+      return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
     }
 
     if (routing.kind === 'unrouted') {
@@ -1110,12 +1150,6 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     });
 
-    const recoveryPaths = (spec.owes ?? []).map((owed) => owed.path);
-    const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);
-    const recoveryEnabled =
-      recoveryPaths.length === 1 &&
-      (recoveryPolicy !== undefined || recoveryConfigurationIsTerminal);
-
     if (recoveryEnabled) {
       const recoveryPath = recoveryPaths[0]!;
 
@@ -1126,32 +1160,64 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       const runRecovery = async (): Promise<AgentRunOutcome> => {
 				const exact = opts.latestRunSession?.(workflow, runId, packet.step) ?? null;
 				const saved = exact?.recovery;
-				recovery =
-					saved !== undefined && saved.generation === runId
+					recovery =
+						saved !== undefined && saved.generation === runId
 						? { ...saved }
 						: {
 								generation: runId,
 								phase: 'primary',
 								wakeUsed: false,
-								coldRestartUsed: false,
-							};
+									coldRestartUsed: false,
+								};
+					let resolveRecoveryPersistenceFailure: (() => void) | undefined;
+					const recoveryPersistenceFailed = new Promise<void>((resolve) => {
+						resolveRecoveryPersistenceFailure = resolve;
+					});
+					let recoveryPersistenceSignalled = false;
+					const failRecoveryPersistence = (error: unknown): void => {
+						recoveryPersistenceFailure ??= error;
+						if (recoveryPersistenceSignalled) return;
+						recoveryPersistenceSignalled = true;
+						resolveRecoveryPersistenceFailure?.();
+					};
+					reportRecoveryPersistenceFailure = failRecoveryPersistence;
+					if (recoveryPersistenceFailure !== undefined) failRecoveryPersistence(recoveryPersistenceFailure);
+					const sessionStoreFailed = async (): Promise<AgentRunOutcome> => {
+						await teardown();
+						return releaseWith('session-store-failed', 'session-store-failed');
+					};
 
-				const setFailure = (failure: unknown): void => {
+					const setFailure = (failure: unknown): void => {
 					if (!isHarnessTurnError(failure)) return;
 					recovery = {
 						...recovery!,
 						lastFailure: { category: failure.category, at: opts.now() },
 					};
 				};
-				const checkpoint = (phase: RecoveryPhase, changes: Partial<RecoveryCheckpoint> = {}): void => {
-					recovery = {
+					const checkpoint = (phase: RecoveryPhase, changes: Partial<RecoveryCheckpoint> = {}): boolean => {
+						recovery = {
 						...recovery!,
 						...changes,
-						phase,
-						phaseStartedAt: opts.now(),
+							phase,
+							phaseStartedAt: opts.now(),
+						};
+						try {
+							record('active'); // recovery rows are fsynced by the store.
+							return true;
+						} catch (error) {
+							failRecoveryPersistence(error);
+							return false;
+						}
 					};
-					record('active'); // recovery rows are fsynced by the store.
-				};
+					const recordRecovery = (status: SessionStatus): boolean => {
+						try {
+							record(status);
+							return true;
+						} catch (error) {
+							failRecoveryPersistence(error);
+							return false;
+						}
+					};
 				const stopCurrent = async (): Promise<void> => {
 					if (sessionRef === undefined) return;
 					const ref = sessionRef;
@@ -1180,23 +1246,23 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						}).then((v) => ({ t: 'confirm' as const, v })),
 						leasePromise!.then((o) => ({ t: 'lease' as const, o })),
 					]);
-					if (confirmed.t === 'lease') {
-						await teardown();
-						if (confirmed.o === 'completed') {
-							record('submitted');
-							return 'submitted';
-						}
-						record('dead');
+						if (confirmed.t === 'lease') {
+							await teardown();
+							if (confirmed.o === 'completed') {
+								if (!recordRecovery('submitted')) return sessionStoreFailed();
+								return 'submitted';
+							}
+							if (!recordRecovery('dead')) return sessionStoreFailed();
 						return signalled ? 'killed' : mapLeaseDuringTurn(confirmed.o);
 					}
-					if (confirmed.v === 'submitted') {
-						record('submitted');
+						if (confirmed.v === 'submitted') {
+							if (!recordRecovery('submitted')) return sessionStoreFailed();
 						lease.stop('submitted', { release: false });
 						await leasePromise;
 						return 'submitted';
 					}
-					if (confirmed.v === 'lease-lost') {
-						record('dead');
+						if (confirmed.v === 'lease-lost') {
+							if (!recordRecovery('dead')) return sessionStoreFailed();
 						lease.stop('lease-lost', { release: false });
 						await leasePromise;
 						return 'lease-lost';
@@ -1204,44 +1270,48 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					return 'continue';
 				};
 
-				const dispatch = async (
+					const dispatch = async (
 					phase: RecoveryPhase,
-					changes: Partial<RecoveryCheckpoint>,
-					perform: () => Promise<void>,
-				): Promise<PhaseResult> => {
-					checkpoint(phase, changes);
-					const turn = perform().then(
+						changes: Partial<RecoveryCheckpoint>,
+						perform: () => Promise<void>,
+					): Promise<PhaseResult> => {
+						if (!checkpoint(phase, changes)) {
+							return { outcome: await sessionStoreFailed() };
+						}
+						const turn = perform().then(
 						() => ({ t: 'turn' as const }),
 						(failure: unknown) => ({ t: 'turn' as const, failure }),
 					);
-					const raced = await Promise.race([
-						turn,
-						leasePromise!.then((o) => ({ t: 'lease' as const, o })),
-					]);
-					if (raced.t === 'lease') {
-						await teardown();
-						if (raced.o === 'completed') {
-							record('submitted');
-							return { outcome: 'submitted' };
+						const raced = await Promise.race([
+							turn,
+							leasePromise!.then((o) => ({ t: 'lease' as const, o })),
+							recoveryPersistenceFailed.then(() => ({ t: 'persistence' as const })),
+						]);
+						if (raced.t === 'persistence') {
+							return { outcome: await sessionStoreFailed() };
 						}
-						record('dead');
+						if (raced.t === 'lease') {
+							await teardown();
+							if (raced.o === 'completed') {
+								if (!recordRecovery('submitted')) return { outcome: await sessionStoreFailed() };
+								return { outcome: 'submitted' };
+							}
+							if (!recordRecovery('dead')) return { outcome: await sessionStoreFailed() };
 						return { outcome: signalled ? 'killed' : mapLeaseDuringTurn(raced.o) };
 					}
-					if (activePersistenceFailure !== undefined) {
-						await teardown();
-						return { outcome: await releaseWith('session-store-failed', 'session-store-failed') };
+						if (activePersistenceFailure !== undefined || recoveryPersistenceFailure !== undefined) {
+							return { outcome: await sessionStoreFailed() };
 					}
 					const failure = 'failure' in raced ? raced.failure : undefined;
 					if (failure !== undefined) setFailure(failure);
-					record('turn-ended');
+						if (!recordRecovery('turn-ended')) return { outcome: await sessionStoreFailed() };
 					const confirmed = await confirmPhase();
 					if (confirmed !== 'continue') return { outcome: confirmed };
 					return failure === undefined ? {} : { failure };
 				};
 
-				const hold = async (): Promise<AgentRunOutcome> => {
-					checkpoint('held');
-					const facts = recovery!;
+					const askHeld = async (): Promise<AgentRunOutcome> => {
+						const facts = recovery!;
 					const question = `Harness recovery held ${recoveryPath} after ${facts.lastFailure?.category ?? facts.phase}; a human decision is required.`;
 					const context = JSON.stringify({
 						generation: facts.generation,
@@ -1256,17 +1326,34 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					// retry; neither path can construct a fourth provider dispatch.
 					for (let attemptAsk = 0; attemptAsk < 2; attemptAsk += 1) {
 						try {
-							await hub.ask({ workflow, run: runId, path: recoveryPath, question, context });
-							record('turn-ended');
-							lease.stop('recovery-held', { release: false });
-							await leasePromise;
-							return 'held';
-						} catch (error) {
-							try {
-								const current = await hub.getOrder({ workflow, run: runId, holder: opts.holder });
+							const asked = await hub.ask({ workflow, run: runId, path: recoveryPath, question, context });
+							if (asked.ok === true && asked.closed === true) {
+								if (!recordRecovery('turn-ended')) return sessionStoreFailed();
+								lease.stop('recovery-held', { release: false });
+									await leasePromise;
+									return 'held';
+								}
+								if (asked.ok !== true) {
+									opts.err(`owenloop work agent-run: recovery ask was refused: ${asked.text}`);
+								if (asked.closed === true) {
+									if (!recordRecovery('dead')) return sessionStoreFailed();
+									lease.stop('recovery-ask-refused', { release: false });
+										await leasePromise;
+										return 'no-submit';
+									}
+								if (!recordRecovery('dead')) return sessionStoreFailed();
+								return releaseWith('recovery-ask-refused', 'no-submit');
+								}
+								// `ask` is contractually closing. A success envelope that does not
+								// close is transport-ambiguous, so use the same authoritative
+								// outcome check/retry path as a thrown request below.
+								throw new Error('recovery ask was accepted without closing the run');
+							} catch (error) {
+								try {
+									const current = await hub.getOrder({ workflow, run: runId, holder: opts.holder });
 								if (current.lease.outcome !== undefined) {
-									record('submitted');
-									lease.stop('submitted', { release: false });
+									if (!recordRecovery('submitted')) return sessionStoreFailed();
+								lease.stop('submitted', { release: false });
 									await leasePromise;
 									return 'submitted';
 								}
@@ -1275,32 +1362,47 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							}
 							if (attemptAsk === 1) {
 								opts.err(`owenloop work agent-run: recovery ask failed: ${errMsg(error)}`);
-								lease.stop('recovery-ask-failed', { release: false });
-								await leasePromise;
-								return 'hub-unreachable';
+								if (!recordRecovery('dead')) return sessionStoreFailed();
+								return releaseWith('recovery-ask-failed', 'hub-unreachable');
 							}
 						}
 					}
-					return 'hub-unreachable';
-				};
+						return 'hub-unreachable';
+					};
+					const hold = async (failure?: unknown): Promise<AgentRunOutcome> => {
+						if (failure !== undefined) setFailure(failure);
+						// Persist the terminal transition before stopping a query or attempting
+						// an ask. A process death can underspend recovery, never repeat it.
+						if (!checkpoint('held')) return sessionStoreFailed();
+						await stopCurrent();
+						return askHeld();
+					};
+					const prepareColdRestart = (): boolean =>
+						checkpoint('cold-restart', { wakeUsed: true, coldRestartUsed: true });
 
-				if (recoveryConfigurationFailure !== undefined) {
-					setFailure(recoveryConfigurationFailure);
-					return hold();
-				}
+					if (recoveryConfigurationFailure !== undefined) {
+						return hold(recoveryConfigurationFailure);
+					}
+					if (recoveryPreflightFailure !== undefined) return hold(recoveryPreflightFailure);
 
 				// A re-dispatch of this concrete run consumes the checkpointed phase;
 				// it never repeats a provider call that was already prepared durably.
-				let next: RecoveryPhase = 'primary';
-				if (saved?.generation === runId) {
-					next = saved.phase === 'primary' ? 'wake' : saved.phase === 'wake' ? 'cold-restart' : 'held';
+					let next: RecoveryPhase = 'primary';
+					if (saved?.generation === runId) {
+						const terminal = saved.lastFailure !== undefined &&
+							['authentication', 'permission-policy', 'model-unavailable', 'configuration'].includes(saved.lastFailure.category);
+						next = terminal || saved.phase === 'held' || saved.coldRestartUsed || saved.phase === 'cold-restart'
+							? 'held'
+							: saved.wakeUsed || saved.phase === 'wake'
+								? 'cold-restart'
+								: 'wake';
 					if (next === 'wake' && exact !== null && exact.token !== '') {
 						sessionRef = { harness: exact!.harness, token: exact!.token };
 						createdAt = exact!.createdAt;
 					}
 				}
 
-				if (next === 'primary') {
+					if (next === 'primary') {
 					activePersistenceFailure = undefined;
 					const primary = await dispatch('primary', {}, async () => {
 						if (resumable && prev !== null) {
@@ -1314,10 +1416,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						sessionRef = ref;
 						markDelivered();
 					});
-					if ('outcome' in primary) return primary.outcome;
-					if (isHarnessTurnError(primary.failure) && primary.failure.terminal) {
-						await stopCurrent();
-						return hold();
+						if ('outcome' in primary) return primary.outcome;
+						if (isHarnessTurnError(primary.failure) && primary.failure.terminal) {
+							return hold();
 					}
 					// A primary resume that no longer exists has no live native session to wake.
 					next = isResumeUnavailable(primary.failure) ? 'cold-restart' : 'wake';
@@ -1334,18 +1435,20 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						const wake = await dispatch('wake', { wakeUsed: true }, async () => {
 							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs, onEvent);
 						});
-						if ('outcome' in wake) return wake.outcome;
-						if (isHarnessTurnError(wake.failure) && wake.failure.terminal) {
-							await stopCurrent();
-							return hold();
+							if ('outcome' in wake) return wake.outcome;
+							if (isHarnessTurnError(wake.failure) && wake.failure.terminal) {
+								return hold();
 						}
 						next = 'cold-restart';
 					}
 				}
 
-				if (next === 'cold-restart') {
-					await stopCurrent();
-					const cold = await dispatch('cold-restart', { coldRestartUsed: true }, async () => {
+					if (next === 'cold-restart') {
+						// This includes the ResumeUnavailable skip. Both the skipped wake
+						// and the cold dispatch are durably consumed before any stop await.
+						if (!prepareColdRestart()) return sessionStoreFailed();
+						await stopCurrent();
+						const cold = await dispatch('cold-restart', { wakeUsed: true, coldRestartUsed: true }, async () => {
 						activePersistenceFailure = undefined;
 						const base = renderReplayBrief(renderBrief(step.brief, spec), {
 							packet,
@@ -1358,14 +1461,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						sessionRef = ref;
 						markDelivered();
 					});
-					if ('outcome' in cold) return cold.outcome;
-					if (isHarnessTurnError(cold.failure) && cold.failure.terminal) {
-						await stopCurrent();
-						return hold();
+						if ('outcome' in cold) return cold.outcome;
+						if (isHarnessTurnError(cold.failure) && cold.failure.terminal) {
+							return hold();
 					}
 				}
-				await stopCurrent();
-				return hold();
+					return hold();
       };
       return runRecovery();
     }

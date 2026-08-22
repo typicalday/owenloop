@@ -23,7 +23,7 @@ import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
 import type { MergedRoster } from '../src/settings/roster.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
-import { ResumeUnavailableError } from '../src/harness/contract.ts';
+import { HarnessTurnError, ResumeUnavailableError } from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
 import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
@@ -116,6 +116,7 @@ function noHold(lease: GetOrderResponse['lease']): GetOrderResponse {
 interface MockCfg {
   getOrder: Array<GetOrderResponse | Error> | ((n: number) => GetOrderResponse | Error);
   heartbeat?: (n: number) => void;
+	ask?: { ok: boolean; closed?: boolean; text?: string } | Error;
 }
 
 function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
@@ -150,7 +151,9 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
     async reject() { return { text: '', ok: true }; },
     async ask(req) {
       calls.push({ verb: 'ask', arg: req });
-      return { text: '', ok: true, closed: true };
+		const response = cfg.ask ?? { text: '', ok: true, closed: true };
+		if (response instanceof Error) throw response;
+		return { text: response.text ?? '', ok: response.ok, ...(response.closed !== undefined ? { closed: response.closed } : {}) };
     },
     // The tool-approval gate is not exercised by these tests; a fake that never
     // opens an approval, and a non-answer is a denial.
@@ -259,6 +262,7 @@ interface BuildOpts {
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
+	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
   dirExists?: AgentRunLoopOptions['dirExists'];
 }
 
@@ -287,6 +291,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
+		...(b.latestRunSession === undefined ? {} : { latestRunSession: b.latestRunSession }),
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
     nextAttempt: () => 3,
     sleep: macrotaskSleep,
@@ -347,6 +352,211 @@ test('idle recovery is bounded to primary, one wake, one cold start, then one pr
 	assert.doesNotMatch(recoveryAsk, /claude|codex|anthropic|openai/iu);
 	assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
   assert.equal(verbs(calls).includes('release'), false);
+});
+
+test('an opted-in permission preflight holds immediately without starting a provider turn', async () => {
+	const adapter = createFakeAdapter();
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	adapter.preflight = () => [{ field: 'tools', message: 'policy refused' }];
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 0);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	assert.equal(h.records.at(-1)?.recovery?.phase, 'held');
+	assert.equal(h.records.at(-1)?.recovery?.lastFailure?.category, 'permission-policy');
+});
+
+test('an invalid recovery setting stops a multi-output run before model delivery', async () => {
+	const adapter = createFakeAdapter();
+	adapter.recoveryPolicy = () => {
+		throw new HarnessTurnError('configuration', true, 'invalid host setting');
+	};
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: 'first' }, { path: 'second' }] })],
+	});
+	const h = buildOpts({ hub, adapter });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'incompatible-harness-policy');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 0);
+	assert.equal(verbs(calls).includes('ask'), false);
+  assert.equal(verbs(calls).includes('release'), true);
+});
+
+test('an invalid recovery setting on one output takes the same immediate durable hold as a terminal provider failure', async () => {
+	const adapter = createFakeAdapter();
+	adapter.recoveryPolicy = () => {
+		throw new HarnessTurnError('configuration', true, 'invalid host setting');
+	};
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 0);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	assert.equal(h.records.at(-1)?.recovery?.lastFailure?.category, 'configuration');
+});
+
+test('a primary resume-unavailable checkpoint consumes the skipped wake before cold restart', async () => {
+	const ref: HarnessSessionRef = { harness: 'fake', token: 'cold-token' };
+	let starts = 0;
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(_args, onEvent) {
+			starts += 1;
+			if (starts === 1) throw new ResumeUnavailableError('primary session disappeared');
+			onEvent({ kind: 'started', ref });
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver() {
+			throw new Error('the skipped wake must never be delivered');
+		},
+		async stop() {},
+	};
+	const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(starts, 2);
+	const cold = h.records.find((record) => record.recovery?.phase === 'cold-restart');
+	assert.equal(cold?.recovery?.wakeUsed, true);
+	assert.equal(cold?.recovery?.coldRestartUsed, true);
+});
+
+test('a terminal primary failure and a restarted terminal checkpoint both hold without extra dispatch', async () => {
+	const terminal = new HarnessTurnError('authentication', true, 'structured authentication failure');
+	const adapter = createFakeAdapter({ start: { dieWith: terminal.message } });
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let terminalStarts = 0;
+	adapter.start = async () => {
+		terminalStarts += 1;
+		throw terminal;
+	};
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(terminalStarts, 1);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+
+	const saved: SessionRecord = {
+		workflow: 'wf1', run: 'run1', step: 'builder', key: 'k', order: 'wf1/run1', attempt: 1,
+		harness: 'fake', token: 'prior-token', cwd: '/fallback/cwd', status: 'turn-ended', createdAt: 1, updatedAt: 1,
+		recovery: {
+			generation: 'run1', phase: 'primary', wakeUsed: false, coldRestartUsed: false,
+			lastFailure: { category: 'authentication', at: 1 },
+		},
+	};
+	const restarted = createFakeAdapter();
+	restarted.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const second = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const secondHarness = buildOpts({ hub: second.hub, adapter: restarted, latestRunSession: () => saved, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(secondHarness.opts).run(), 'held');
+	assert.equal(restarted.calls.filter((call) => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('restart consumption advances from every durable recovery phase without repeating a provider dispatch', async () => {
+	const scenarios: Array<{
+		phase: NonNullable<SessionRecord['recovery']>['phase'];
+		wakeUsed: boolean;
+		coldRestartUsed: boolean;
+		starts: number;
+		delivers: number;
+	}> = [
+		{ phase: 'primary', wakeUsed: false, coldRestartUsed: false, starts: 1, delivers: 1 },
+		{ phase: 'wake', wakeUsed: true, coldRestartUsed: false, starts: 1, delivers: 0 },
+		{ phase: 'cold-restart', wakeUsed: true, coldRestartUsed: true, starts: 0, delivers: 0 },
+		{ phase: 'held', wakeUsed: true, coldRestartUsed: true, starts: 0, delivers: 0 },
+	];
+	for (const scenario of scenarios) {
+		const adapter = createFakeAdapter({
+			start: { events: [{ kind: 'turn_ended' }] },
+			deliver: { events: [{ kind: 'turn_ended' }] },
+		});
+		adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+		const saved: SessionRecord = {
+			workflow: 'wf1', run: 'run1', step: 'builder', key: 'k', order: 'wf1/run1', attempt: 1,
+			harness: 'fake', token: 'persisted-token', cwd: '/fallback/cwd', status: 'turn-ended', createdAt: 1, updatedAt: 1,
+			recovery: {
+				generation: 'run1', phase: scenario.phase, wakeUsed: scenario.wakeUsed,
+				coldRestartUsed: scenario.coldRestartUsed,
+			},
+		};
+		const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+		const h = buildOpts({ hub, adapter, latestRunSession: () => saved, submitGraceMs: 0 });
+		assert.equal(await createAgentRunLoop(h.opts).run(), 'held', scenario.phase);
+		assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, scenario.starts, scenario.phase);
+		assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, scenario.delivers, scenario.phase);
+	}
+});
+
+test('a failed recovery checkpoint releases before provider work, and an activity checkpoint cannot spend another phase', async () => {
+	const beforeDispatch = createFakeAdapter();
+	beforeDispatch.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const firstHub = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const first = buildOpts({
+		hub: firstHub.hub,
+		adapter: beforeDispatch,
+		appendSession: () => { throw new Error('fsync unavailable'); },
+	});
+	assert.equal(await createAgentRunLoop(first.opts).run(), 'session-store-failed');
+	assert.equal(beforeDispatch.calls.filter((call) => call.kind === 'start').length, 0);
+
+	const duringActivity = createFakeAdapter({ start: { events: [{ kind: 'activity', at: 6_000, deadlineAt: 7_000 }] } });
+	duringActivity.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let writes = 0;
+	const secondHub = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const second = buildOpts({
+		hub: secondHub.hub,
+		adapter: duringActivity,
+		appendSession: () => {
+			writes += 1;
+			if (writes === 3) throw new Error('activity fsync unavailable');
+		},
+	});
+	assert.equal(await createAgentRunLoop(second.opts).run(), 'session-store-failed');
+	assert.equal(duringActivity.calls.filter((call) => call.kind === 'deliver').length, 0);
+
+	const afterTurn = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+	afterTurn.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let terminalWrites = 0;
+	const thirdHub = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const third = buildOpts({
+		hub: thirdHub.hub,
+		adapter: afterTurn,
+		appendSession: () => {
+			terminalWrites += 1;
+			if (terminalWrites === 3) throw new Error('turn-ended fsync unavailable');
+		},
+	});
+	assert.equal(await createAgentRunLoop(third.opts).run(), 'session-store-failed');
+	assert.equal(afterTurn.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(verbs(thirdHub.calls).includes('release'), true);
+});
+
+test('a 2xx refusal from recovery ask is never recorded as held', async () => {
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: 'pr' }] })],
+		ask: { ok: false, closed: false, text: 'not accepted' },
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit');
+	assert.equal(h.records.at(-1)?.status, 'dead');
+	assert.equal(verbs(calls).includes('release'), true);
 });
 
 test('the additional unbounded final-response evidence event is redacted while progress remains logged', async () => {

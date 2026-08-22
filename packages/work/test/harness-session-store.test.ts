@@ -162,6 +162,26 @@ test('later lifecycle rows retain ordinary append durability without fsync', () 
   assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.status, 'turn-ended');
 });
 
+test('recovery control rows are validated and fsynced even after a turn has ended', () => {
+	const recovery = {
+		generation: 'run_1', phase: 'wake' as const, wakeUsed: true, coldRestartUsed: false,
+		phaseStartedAt: 1_100, lastActivityAt: 1_200, deadlineAt: 2_200,
+		lastFailure: { category: 'idle-timeout' as const, at: 1_150 },
+	};
+	let syncCalls = 0;
+	appendSession(file, rec({ status: 'turn-ended', recovery }), {
+		sync: () => { syncCalls += 1; },
+	});
+	assert.ok(syncCalls >= 1, 'recovery control state is durable independently of lifecycle status');
+	assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder')?.recovery, recovery);
+
+	const bad = { ...rec(), recovery: { ...recovery, phase: 'not-a-phase' } } as unknown as SessionRecord;
+	writeFileSync(join(dir, 'invalid-recovery.jsonl'), `${JSON.stringify(bad)}\n`);
+	const warnings: string[] = [];
+	assert.deepEqual(readSessions(join(dir, 'invalid-recovery.jsonl'), { warn: (line) => warnings.push(line) }), []);
+	assert.match(warnings[0] ?? '', /recovery\.phase/u);
+});
+
 test('an active-row fsync failure propagates to the provider-work gate', () => {
   assert.throws(
     () => appendSession(file, rec(), {
@@ -844,6 +864,20 @@ test('reconcileActiveSessions retires only newest orphaned active rows', () => {
   assert.equal(latestFor(file, 'wf_1', 'orphan', 'builder')?.status, 'dead');
   assert.equal(latestFor(file, 'wf_1', 'complete', 'builder')?.status, 'submitted');
   assert.equal(latestFor(file, 'wf_1', 'live', 'builder')?.status, 'active');
+});
+
+test('orphan retirement retains the recovery checkpoint for a later safe operator inspection', () => {
+	const recovery = {
+		generation: 'orphan', phase: 'cold-restart' as const, wakeUsed: true, coldRestartUsed: true,
+		lastFailure: { category: 'provider' as const, at: 4_000 },
+	};
+	appendSession(file, rec({
+		run: 'orphan', order: orderId('wf_1', 'orphan'), status: 'active', shiftName: 'A', pid: 101, recovery,
+	}));
+	reconcileActiveSessions(file, { shiftName: 'A', harness: 'fake', isAlive: () => false }, 5_000);
+	const retired = latestFor(file, 'wf_1', 'orphan', 'builder');
+	assert.equal(retired?.status, 'dead');
+	assert.deepEqual(retired?.recovery, recovery);
 });
 
 test('reconcileActiveSessions cannot shadow a submitted append from its retirement snapshot', async () => {

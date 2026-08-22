@@ -54,7 +54,7 @@ import type { SDKAssistantMessage, SDKMessage, SDKUserMessage } from '@anthropic
 import { codexAdapter } from '../src/harness/codex.ts';
 import { consumeTurn } from '../src/harness/claude.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
-import type { AgentEvent, DeliverArgs, StartArgs } from '../src/harness/contract.ts';
+import { HarnessTurnError, type AgentEvent, type DeliverArgs, type StartArgs } from '../src/harness/contract.ts';
 
 const FIXTURE_DIR = fileURLToPath(new URL('fixtures/', import.meta.url));
 
@@ -555,7 +555,13 @@ test('a failed result emits exited BEFORE turn_ended, carrying the errors', asyn
   );
 
   const events: AgentEvent[] = [];
-  await consumeTurn(asStream(messages), (e) => events.push(e));
+  await assert.rejects(
+    consumeTurn(asStream(messages), (e) => events.push(e)),
+    (error: unknown) =>
+      error instanceof HarnessTurnError &&
+      error.category === 'provider' &&
+      error.terminal === false,
+  );
 
   // Order matters to the caller: `src/agent/loop.ts` reads the event stream in
   // sequence, so the cause must arrive before the turn closes.

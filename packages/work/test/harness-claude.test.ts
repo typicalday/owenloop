@@ -30,13 +30,14 @@ import {
   buildClaudeOptions,
   claudeAdapter,
   consumeTurn,
+	deliverClaude,
   parseClaudeIdleTimeout,
   resolveExecutable,
   startClaude,
   type ClaudeOptionInputs,
   type ClaudeQueryFactory,
 } from '../src/harness/claude.ts';
-import { HarnessIdleTimeoutError } from '../src/harness/contract.ts';
+import { HarnessIdleTimeoutError, HarnessTurnError } from '../src/harness/contract.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import { adapterFor } from '../src/harness/registry.ts';
 import type { AgentEvent } from '../src/harness/contract.ts';
@@ -595,6 +596,77 @@ test('partial SDK messages are enabled only by an explicit recovery policy', () 
   assert.deepEqual(events, []);
 });
 
+test('raw partial SDK events reset liveness without exposing their payload, and timers are cleaned up', async () => {
+	const partialPayload = 'RAW_PARTIAL_PAYLOAD_MUST_NOT_ESCAPE';
+	const callbacks: Array<() => void> = [];
+	let cleared = 0;
+	const activities: Array<{ at: number; deadlineAt: number }> = [];
+	const events: AgentEvent[] = [];
+	const stream: AsyncIterable<SDKMessage> = {
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			yield { type: 'stream_event', event: { delta: partialPayload } } as unknown as SDKMessage;
+			yield { type: 'result', subtype: 'success' } as SDKMessage;
+		},
+	};
+	await consumeTurn(stream, (event) => events.push(event), undefined, undefined, {
+		idleTimeoutMs: 1_000,
+		now: (() => { let at = 10; return () => ++at; })(),
+		setTimer: (callback) => {
+			callbacks.push(callback);
+			return callback as unknown as ReturnType<typeof setTimeout>;
+		},
+		clearTimer: () => { cleared += 1; },
+		onActivity: (activity) => activities.push(activity),
+	});
+	assert.equal(activities.length, 3, 'initial read, partial event, and result each renew the deadline');
+	assert.equal(callbacks.length, 3);
+	assert.equal(cleared, 3);
+	assert.equal(JSON.stringify(events).includes(partialPayload), false);
+});
+
+test('structured auth status and unclassified SDK failures normalize to typed recovery errors', async () => {
+	const one = (message: SDKMessage): AsyncIterable<SDKMessage> => ({
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> { yield message; },
+	});
+	await assert.rejects(
+		consumeTurn(one({ type: 'auth_status', isAuthenticating: false, output: [], error: 'opaque' } as unknown as SDKMessage), () => {}),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication' && error.terminal,
+	);
+	const assistantThenResult: AsyncIterable<SDKMessage> = {
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			yield {
+				type: 'assistant', parent_tool_use_id: null, error: 'rate_limit', message: { content: [] },
+			} as unknown as SDKMessage;
+			yield { type: 'result', subtype: 'success' } as SDKMessage;
+		},
+	};
+	await assert.rejects(
+		consumeTurn(assistantThenResult, () => {}),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+	);
+	const broken: AsyncIterable<SDKMessage> = {
+		[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+			return { next: async () => { throw new Error('opaque SDK transport failure'); } };
+		},
+	};
+  await assert.rejects(
+    consumeTurn(broken, () => {}),
+    (error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+  );
+});
+
+test('SDK query construction failures are normalized as nonterminal provider failures', async () => {
+	await assert.rejects(
+		startClaude(coldStartArgs(process.cwd()), () => {}, {
+			createSessionId: () => '66666666-6666-4666-8666-666666666666',
+			loadQuery: async () => {
+				throw new Error('opaque query factory failure');
+			},
+		}),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+	);
+});
+
 // ---------------------------------------------------------------------------
 // Cold-start durable gate
 // ---------------------------------------------------------------------------
@@ -756,6 +828,55 @@ test('cold start fails closed when provider init does not confirm the supplied s
   assert.deepEqual(events.map((event) => event.kind), ['started', 'exited']);
   await claudeAdapter.stop({ harness: 'claude-code', token: supplied });
   assert.equal(probe.closes, 1, 'a mismatched init was removed from the session registry');
+});
+
+test('actual start and resume preserve dedicated Claude environment while keeping recovery config host-only', async () => {
+	const keys = ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS'] as const;
+	const prior = new Map(keys.map((key) => [key, process.env[key]]));
+	const token = '55555555-5555-4555-8555-555555555555';
+	const captured: Array<Record<string, string | undefined>> = [];
+	const factory: ClaudeQueryFactory = ({ options }) => ({
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			captured.push(options.env ?? {});
+			if (options.sessionId !== undefined) {
+				yield {
+					type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+					claude_code_version: 'test', model: 'test', apiKeySource: 'test', permissionMode: 'default', cwd: process.cwd(),
+				} as unknown as SDKMessage;
+			}
+			yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
+		},
+		close() {},
+	});
+	try {
+		process.env.CLAUDE_CONFIG_DIR = '/dedicated/claude-config';
+		process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
+		process.env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS = '1000';
+		const args = { ...coldStartArgs(process.cwd()), recoveryPolicy: { idleTimeoutMs: 1_000 } };
+		const ref = await startClaude(args, () => {}, {
+			createSessionId: () => token,
+			loadQuery: async () => factory,
+		});
+		await deliverClaude(ref, 'continue', {
+			cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy: { idleTimeoutMs: 1_000 },
+		}, () => {}, {
+			getSessionInfo: async () => ({}),
+			loadQuery: async () => factory,
+		});
+		await claudeAdapter.stop(ref);
+	} finally {
+		for (const key of keys) {
+			const value = prior.get(key);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+	assert.equal(captured.length, 2);
+	for (const env of captured) {
+		assert.equal(env.CLAUDE_CONFIG_DIR, '/dedicated/claude-config');
+		assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
+		assert.equal(env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS, undefined);
+	}
 });
 
 // ---------------------------------------------------------------------------
