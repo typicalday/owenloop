@@ -2437,8 +2437,8 @@ The CLI reads the file and runs `JSON.parse` only. It sends the resulting value
 unchanged and delegates coordinate validity, signature shape, typed artifacts,
 JSON Schemas, duplicate artifact names, and size validation entirely to the
 hub. A syntactically valid but semantically invalid signature—or a whole `.` or
-`..` coordinate—therefore reaches the hub and reports its own typed error code
-and message; an unreadable or invalid-JSON file fails before a network call.
+`..` coordinate—therefore reaches the hub and surfaces its non-empty error
+message; an unreadable or invalid-JSON file fails before a network call.
 
 ### Reading and output
 
@@ -2456,8 +2456,8 @@ exactly one whitelisted JSON document per successful invocation; the hub's
 Malformed 2xx bodies are rejected before printing. Typed hub refusals such as
 a duplicate/invalid registration (`400 interface_catalog_input_invalid`),
 non-admin register (`403 forbidden`), and an unknown exact coordinate (`404
-interface_catalog_not_found`) surface the hub's code and non-empty `message` on
-stderr and leave stdout empty.
+interface_catalog_not_found`) surface only the hub's non-empty `message` on
+stderr and leave stdout empty; the CLI does not prefix it with an `error` code.
 
 **Hub and credential selection.** All three commands resolve `--hub <url>`
 first; without it they require exactly one enumerable stored human hub. They do

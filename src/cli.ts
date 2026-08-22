@@ -5994,26 +5994,6 @@ async function hubRequestMessage(res: Response): Promise<string | undefined> {
 }
 
 /**
- * The interface catalog's typed refusals carry both a stable `error` code and
- * an operator-facing `message`. Keep both when this namespace reports one,
- * rather than flattening the hub-owned contract into an untyped local error.
- * As with `hubRequestMessage`, never echo an unparsed response body.
- */
-async function interfaceCatalogRequestMessage(res: Response): Promise<string | undefined> {
-  try {
-    const body = (await res.json()) as unknown;
-    if (typeof body !== 'object' || body === null) return undefined;
-    const record = body as Record<string, unknown>;
-    if (typeof record.message !== 'string' || record.message === '') return undefined;
-    return typeof record.error === 'string' && record.error !== ''
-      ? `${record.error}: ${record.message}`
-      : record.message;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * `owenloop start` — the small, public per-run control-plane command.
  * Durable setup (login/connect/push/prepare and a standing Shift) remains
  * separate; starting another instance is one authenticated POST using the
@@ -6911,7 +6891,7 @@ async function dispatchInterface(io: CliIO, args: Args): Promise<number> {
       throw new CliError('credential rejected by the hub — run `owenloop login`');
     }
     if (!res.ok) {
-      throw new CliError((await interfaceCatalogRequestMessage(res)) ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+      throw new CliError((await hubRequestMessage(res)) ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
     }
 
     let body: unknown;

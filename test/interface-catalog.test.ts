@@ -10,7 +10,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { credentialFilePath, writeCredentialFile } from '../src/hub.ts';
-import { kcHuman, makeIo, routedFetch, stallingFetch } from './hubkit.ts';
+import { kcHuman, makeIo, OAUTH_METADATA, routedFetch, stallingFetch } from './hubkit.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -170,7 +170,7 @@ test('interface register delegates semantic validation to the hub and preserves 
   assert.deepEqual(tMissing.out, []);
 });
 
-test('interface passes whole dot-segment coordinates to the deployed hub and preserves its typed refusal', async () => {
+test('interface passes whole dot-segment coordinates to the deployed hub and preserves its refusal message', async () => {
   const refusal = (field: 'name' | 'version', value: '.' | '..') =>
     `${field} ${JSON.stringify(value)} is not registerable because exact interface reads address coordinates as URL path segments`;
   const cases = [
@@ -192,7 +192,8 @@ test('interface passes whole dot-segment coordinates to the deployed hub and pre
     assert.equal(await mainAsync(['interface', 'register', name, version, '--signature', file, '--hub', HUB], t.io), 1, message);
     assert.equal(calls.length, 1, 'the CLI delegates this coordinate decision to the hub');
     assert.deepEqual(JSON.parse(calls[0]!.body!), { name, version, signature: SIGNATURE });
-    assert.match(t.err.join('\n'), new RegExp(`interface_catalog_input_invalid: ${message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(t.err.join('\n'), new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(t.err.join('\n'), /interface_catalog_input_invalid/);
     assert.deepEqual(t.out, []);
   }
 });
@@ -223,6 +224,30 @@ test('interface commands use a human credential and give the exact exit-3 remedy
   assert.equal(await mainAsync(['interface', 'list', '--hub', HUB], tRejected.io), 3);
   assert.match(tRejected.err.join('\n'), /credential rejected/);
   assert.match(tRejected.err.join('\n'), /owenloop login --hub http:\/\/127\.0\.0\.1:9/);
+});
+
+test('interface list: an expired human OAuth credential whose refresh fails is exit 3 with the login remedy', async () => {
+  const { fetch, calls } = routedFetch({
+    'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
+    'POST /mcp/token': () => ({ status: 400, json: { error: 'invalid_grant' } }),
+    'GET /api/interfaces': () => ({ status: 200, json: { interfaces: [] } }),
+  });
+  const t = makeIo({ fetch });
+  t.store.set(
+    kcHuman(ORIGIN),
+    JSON.stringify({
+      kind: 'oauth',
+      accessToken: 'mcpat_old',
+      refreshToken: 'rt',
+      expiresAt: Date.now() - 1_000,
+      clientId: 'interface-test-client',
+    }),
+  );
+
+  assert.equal(await mainAsync(['interface', 'list', '--hub', HUB], t.io), 3);
+  assert.match(t.err.join('\n'), /owenloop login --hub http:\/\/127\.0\.0\.1:9/);
+  assert.ok(calls.some((call) => call.pathname === '/mcp/token'), 'the expired credential attempted its one allowed refresh');
+  assert.ok(!calls.some((call) => call.pathname === '/api/interfaces'), 'no catalog request follows an irrecoverable refresh failure');
 });
 
 test('interface validates every subcommand-specific argument and signature file before credential or network work', async () => {
@@ -290,7 +315,7 @@ test('interface malformed responses are fixed field-only errors and invalid JSON
   assert.doesNotMatch(tRaw.err.join('\n'), /Unexpected token/);
 });
 
-test('interface resolves no or multiple hub safely before network and has no help side effects', async () => {
+test('interface resolves no, multiple, or non-enumerable hubs before helper, keychain, or network work and has no help side effects', async () => {
   const noHub = routedFetch({ 'GET /api/interfaces': () => ({ status: 200, json: { interfaces: [] } }) });
   const tNoHub = makeIo({ fetch: noHub.fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
   assert.equal(await mainAsync(['interface', 'list'], tNoHub.io), 2);
@@ -309,6 +334,30 @@ test('interface resolves no or multiple hub safely before network and has no hel
   assert.equal(await mainAsync(['interface', 'list'], tMultiple.io), 2);
   assert.match(tMultiple.err.join('\n'), /stored hubs: https:\/\/a\.example, https:\/\/b\.example/);
   assert.equal(multiple.calls.length, 0);
+
+  const nonEnumerable = routedFetch({ 'GET /api/interfaces': () => ({ status: 200, json: { interfaces: [] } }) });
+  let keychainReads = 0;
+  const tNonEnumerable = makeIo({
+    fetch: nonEnumerable.fetch,
+    env: { OWENLOOP_CREDENTIAL_COMMAND: 'exit 99' },
+    keychain: {
+      get(): string | null {
+	keychainReads += 1;
+	throw new Error('keychain must not be consulted while resolving an external credential backend');
+      },
+      set(): void {
+	throw new Error('keychain must not be written while resolving an external credential backend');
+      },
+      delete(): void {
+	throw new Error('keychain must not be written while resolving an external credential backend');
+      },
+    },
+  });
+  assert.equal(await mainAsync(['interface', 'list'], tNonEnumerable.io), 2);
+  assert.match(tNonEnumerable.err.join('\n'), /external-command credential store cannot be enumerated/);
+  assert.doesNotMatch(tNonEnumerable.err.join('\n'), /external credential command failed/);
+  assert.equal(keychainReads, 0);
+  assert.equal(nonEnumerable.calls.length, 0);
 
   const help = routedFetch({ 'POST /api/register_interface': () => ({ status: 200, json: exactOk() }) });
   const tHelp = makeIo({ fetch: help.fetch });
