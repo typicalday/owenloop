@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.19](https://github.com/typicalday/owenloop/compare/v0.5.18...v0.5.19) (2026-08-22)
+
+
+### Features
+
+* **work:** submit an artifact by file reference ([#283](https://github.com/typicalday/owenloop/issues/283)) ([8f0f988](https://github.com/typicalday/owenloop/commit/8f0f988f5a05952340014e40a8aefd4353efa46c))
+
 ## [0.5.18](https://github.com/typicalday/owenloop/compare/v0.5.17...v0.5.18) (2026-08-22)
 
 
