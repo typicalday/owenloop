@@ -339,10 +339,13 @@ test('idle recovery is bounded to primary, one wake, one cold start, then one pr
   const outcome = await createAgentRunLoop(h.opts).run();
 
   assert.equal(outcome, 'held');
-  assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 2);
-  assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 1);
-  assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
-  assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 2);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 1);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
+	assert.match(recoveryAsk, /Harness recovery held pr/u);
+	assert.doesNotMatch(recoveryAsk, /claude|codex|anthropic|openai/iu);
+	assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
   assert.equal(verbs(calls).includes('release'), false);
 });
 

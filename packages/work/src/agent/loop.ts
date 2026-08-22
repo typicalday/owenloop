@@ -1242,7 +1242,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 				const hold = async (): Promise<AgentRunOutcome> => {
 					checkpoint('held');
 					const facts = recovery!;
-					const question = `Claude recovery held ${recoveryPath} after ${facts.lastFailure?.category ?? facts.phase}; a human decision is required.`;
+					const question = `Harness recovery held ${recoveryPath} after ${facts.lastFailure?.category ?? facts.phase}; a human decision is required.`;
 					const context = JSON.stringify({
 						generation: facts.generation,
 						phase: facts.phase,
