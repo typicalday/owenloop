@@ -1699,6 +1699,41 @@ export function asInterfaceCatalogList(body: unknown): InterfaceCatalogRowWire[]
   );
 }
 
+/** The whitelisted success fields from set_workflow_catalog_visibility. */
+export interface WorkflowCatalogVisibilityWire {
+  name: string;
+  catalogVisible: boolean;
+  previousCatalogVisible: boolean;
+  unchanged: boolean;
+}
+
+/** Narrow the visibility setter response without preserving its text or unknown fields. */
+export function asWorkflowCatalogVisibility(body: unknown): WorkflowCatalogVisibilityWire {
+  const prefix = 'set_workflow_catalog_visibility: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(prefix + ' — response is not an object');
+  }
+  const value = body as Record<string, unknown>;
+  if (typeof value.name !== 'string' || value.name === '') {
+    throw new Error(prefix + ' — response missing non-empty string name');
+  }
+  if (typeof value.catalogVisible !== 'boolean') {
+    throw new Error(prefix + ' — response missing boolean catalogVisible');
+  }
+  if (typeof value.previousCatalogVisible !== 'boolean') {
+    throw new Error(prefix + ' — response missing boolean previousCatalogVisible');
+  }
+  if (value.unchanged !== undefined && typeof value.unchanged !== 'boolean') {
+    throw new Error(prefix + ' — response unchanged must be boolean when present');
+  }
+  return {
+    name: value.name,
+    catalogVisible: value.catalogVisible,
+    previousCatalogVisible: value.previousCatalogVisible,
+    unchanged: value.unchanged ?? false,
+  };
+}
+
 /**
  * One **routing alert** as the hub reports it — an org-scoped record that the
  * hub made a routing decision an operator needs to know about.
