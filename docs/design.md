@@ -1875,10 +1875,21 @@ operation required by `OrderResolver`:
    is loaded. A project object that exists but is corrupt is an integrity
    refusal; it is not hidden by a valid global copy.
 3. The source reads the verified object's `bundle.yaml`, loads every workflow
-   path listed in the `workflows` map, finalizes all definitions together, and
-   computes each instruction projection digest. The source caches the matching
-   definition when one projection digest equals the order's `defDigest`.
-4. `lookup` then serves the cached step's authored body and command bytes. A
+   path listed in the `workflows` map, and attaches its package, digest, and
+   copied manifest lock as CAS provenance. For every exact versioned
+   `calls:` edge, it follows only that verified manifest's lock digest,
+   verifies the exact child object with the same installed-object verifier,
+   resolves the child's explicit default (or its sole workflow), and repeats
+   recursively. It strictly finalizes the combined private map, so child
+   inputs, output shape, and cross-bundle cycles remain executable-time
+   validations rather than deferred assumptions.
+4. The cache exposes only definitions originating in the requested object; a
+   dependency is never addressable through its parent's digest. Each cache entry
+   records every verified supporting object, and a later `prime` re-verifies
+   that entire support set, evicting every dependent cached parent on a failure.
+   The source then computes each requested-object instruction projection digest
+   and caches the matching definition when one equals the order's `defDigest`.
+5. `lookup` then serves the cached step's authored body and command bytes. A
    cache miss is `unknown-digest`; a known digest with no matching step is
    `unknown-step`.
 

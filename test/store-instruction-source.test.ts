@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, lstatSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, lstatSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -56,6 +56,96 @@ async function installedSource(workflow = WORKFLOW, name = 'source-fixture') {
   const definition = defs.get(loaded.name);
   assert.ok(definition !== undefined);
   return { ...installed, definition };
+}
+
+const LOCKED_CHILD = `name: child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: child-runner
+    consumes: [data]
+    produces: [delivered]
+    terminal: true
+    executor: command
+    command: 'printf "child-from-store\\n"'
+    body: ""
+outputs: [delivered]
+`;
+
+function lockedParent(target: string): string {
+  return `name: locked-parent
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: ordinary
+    consumes: [seed]
+    produces: [ordinary-out]
+    executor: command
+    command: 'printf "parent-from-store\\n"'
+    body: ""
+  - name: invoke-child
+    calls: ${target}
+    inputs:
+      data: seed
+    produces: [delivered]
+  - name: finish
+    consumes: [ordinary-out, delivered]
+    produces: [out]
+    terminal: true
+    body: ""
+outputs: [out]
+`;
+}
+
+function lockedMiddle(target: string): string {
+  return `name: child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: invoke-grandchild
+    calls: ${target}
+    inputs:
+      data: data
+    produces: [grandchild-delivered]
+  - name: finish
+    consumes: [grandchild-delivered]
+    produces: [delivered]
+    terminal: true
+    body: ""
+outputs: [delivered]
+`;
+}
+
+function permissiveVerifier() {
+  const ingestor = createBundleIngestor();
+  return {
+    ingest: (input: Parameters<typeof ingestor.ingest>[0]) => ingestor.ingest(input),
+    verifyInstalledObject: async (): Promise<void> => {},
+  };
+}
+
+async function installLockedPair(args: { childSource?: string; root?: string } = {}) {
+  const root = args.root ?? tempDir('owenloop-locked-worker-root-');
+  const target = 'dep/child@1.0.0';
+  const child = await installBundleFixture({
+    root,
+    sourceDir: args.childSource ?? writeBundleSource({ name: 'child', workflow: LOCKED_CHILD }),
+  });
+  // A lock namespace is an index alias, while identity remains the child
+  // manifest's package name and version.
+  addIndexEntry(root, target, child.result.digest);
+  const parent = await installBundleFixture({
+    root,
+    sourceDir: writeBundleSource({
+      name: 'locked-parent',
+      workflow: lockedParent(target),
+      lock: { [target]: child.result.digest },
+    }),
+  });
+  return { root, target, child, parent };
 }
 
 function order(defDigest: string, step = 'runner'): OrderPacket {
@@ -137,6 +227,202 @@ test('store instruction source: a real installed bundle bridges bundle and order
   const bundleLookedUp = source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' });
   assert.equal(bundleLookedUp.status, 'resolved');
   assert.equal(source.getVerifiedDefinition(installed.result.digest, 'runner')?.name, 'source-fixture');
+});
+
+test('store instruction source: a locked parent verifies and validates its child without exposing child steps', async () => {
+  const { root, child, parent } = await installLockedPair();
+  const delegate = createBundleIngestor();
+  const verified: Array<{ objectDir: string; digest: string }> = [];
+  const source = createStoreInstructionSource({
+    projectRoot: root,
+    globalRoot: tempDir('owenloop-locked-worker-global-'),
+    verifier: {
+      ingest: (input) => delegate.ingest(input),
+      verifyInstalledObject: async (input) => {
+	verified.push(input);
+	await delegate.verifyInstalledObject(input);
+      },
+    },
+  });
+
+  assert.equal(await source.prime(parent.result.digest), 'resolved');
+  assert.equal(source.lookup({ defDigest: parent.result.digest, step: 'ordinary', key: '' }).status, 'resolved');
+  assert.deepEqual(
+    source.lookup({ defDigest: parent.result.digest, step: 'child-runner', key: '' }),
+    { status: 'unknown-step' },
+    'dependency definitions are validation-only under the parent digest',
+  );
+  assert.deepEqual(
+    verified.map((entry) => entry.objectDir).sort(),
+    [parent.result.objectPath, child.result.objectPath].sort(),
+    'the parent and the digest-pinned child both passed installed-object verification before loading',
+  );
+  assert.equal(await source.prime(child.result.digest), 'resolved');
+  assert.equal(source.lookup({ defDigest: child.result.digest, step: 'child-runner', key: '' }).status, 'resolved');
+});
+
+test('store instruction source: locked dependency failures are target-specific and cached parents reverify children', async () => {
+  const missing = await installLockedPair();
+  chmodSync(missing.child.result.objectPath, 0o755);
+  chmodSync(join(missing.child.result.objectPath, 'bundle.yaml'), 0o644);
+  chmodSync(join(missing.child.result.objectPath, 'workflow.yaml'), 0o644);
+  rmSync(missing.child.result.objectPath, { recursive: true, force: true });
+  const missingSource = createStoreInstructionSource({
+    projectRoot: missing.root,
+    globalRoot: tempDir('owenloop-locked-missing-global-'),
+    verifier: createBundleIngestor(),
+  });
+  await assert.rejects(
+    missingSource.prime(missing.parent.result.digest),
+    new RegExp(`locked calls target '${missing.target}' digest ${missing.child.result.digest} is absent from every configured workflow store root`),
+  );
+
+  const corrupt = await installLockedPair();
+  chmodSync(corrupt.child.result.objectPath, 0o755);
+  chmodSync(join(corrupt.child.result.objectPath, 'workflow.yaml'), 0o644);
+  writeFileSync(join(corrupt.child.result.objectPath, 'workflow.yaml'), `${LOCKED_CHILD}# tampered\n`);
+  const corruptSource = createStoreInstructionSource({
+    projectRoot: corrupt.root,
+    globalRoot: tempDir('owenloop-locked-corrupt-global-'),
+    verifier: createBundleIngestor(),
+  });
+  await assert.rejects(
+    corruptSource.prime(corrupt.parent.result.digest),
+    new RegExp(`locked calls target '${corrupt.target}' digest ${corrupt.child.result.digest} at project-level root .*failed installed-object verification`),
+  );
+
+  const cached = await installLockedPair();
+  const cachedSource = createStoreInstructionSource({
+    projectRoot: cached.root,
+    globalRoot: tempDir('owenloop-locked-cache-global-'),
+    verifier: createBundleIngestor(),
+  });
+  assert.equal(await cachedSource.prime(cached.parent.result.digest), 'resolved');
+  chmodSync(cached.child.result.objectPath, 0o755);
+  chmodSync(join(cached.child.result.objectPath, 'workflow.yaml'), 0o644);
+  writeFileSync(join(cached.child.result.objectPath, 'workflow.yaml'), `${LOCKED_CHILD}# changed after parent prime\n`);
+  await assert.rejects(cachedSource.prime(cached.parent.result.digest), /integrity mismatch/);
+  assert.deepEqual(
+    cachedSource.lookup({ defDigest: cached.parent.result.digest, step: 'ordinary', key: '' }),
+    { status: 'unknown-digest' },
+    'a changed support object evicts the requested parent cache',
+  );
+});
+
+test('store instruction source: malformed lock metadata remains distinguishable from a default-selection failure', async () => {
+  const missingLock = await installLockedPair();
+  chmodSync(missingLock.parent.result.objectPath, 0o755);
+  const parentManifest = join(missingLock.parent.result.objectPath, 'bundle.yaml');
+  chmodSync(parentManifest, 0o644);
+  writeFileSync(
+    parentManifest,
+    readFileSync(parentManifest, 'utf8').replace(/lock:\n(?:  .*\n)+$/, 'lock: {}\n'),
+  );
+  const missingLockSource = createStoreInstructionSource({
+    projectRoot: missingLock.root,
+    globalRoot: tempDir('owenloop-locked-no-lock-global-'),
+    verifier: permissiveVerifier(),
+  });
+  await assert.rejects(
+    missingLockSource.prime(missingLock.parent.result.digest),
+    new RegExp(`locked calls target '${missingLock.target}' has no entry in parent bundle ${missingLock.parent.result.digest} manifest lock`),
+  );
+
+  const multiChild = writeBundleSource({
+    name: 'child',
+    workflow: LOCKED_CHILD,
+    workflows: {
+	other: LOCKED_CHILD
+	  .replace('name: child', 'name: other')
+	  .replace('name: child-runner', 'name: other-runner'),
+    },
+    defaultWorkflow: 'child',
+  });
+  const noDefault = await installLockedPair({ childSource: multiChild });
+  chmodSync(noDefault.child.result.objectPath, 0o755);
+  const childManifest = join(noDefault.child.result.objectPath, 'bundle.yaml');
+  chmodSync(childManifest, 0o644);
+  writeFileSync(
+    childManifest,
+    readFileSync(childManifest, 'utf8').replace('default: "child"\n', ''),
+  );
+  const noDefaultSource = createStoreInstructionSource({
+    projectRoot: noDefault.root,
+    globalRoot: tempDir('owenloop-locked-no-default-global-'),
+    verifier: permissiveVerifier(),
+  });
+  await assert.rejects(
+    noDefaultSource.prime(noDefault.parent.result.digest),
+    new RegExp(`locked calls target '${noDefault.target}' digest ${noDefault.child.result.digest} exports multiple workflows and has no default`),
+  );
+});
+
+test('store instruction source: recursively locked dependencies resolve and a real cross-bundle cycle remains a finalization error', async () => {
+  const root = tempDir('owenloop-recursive-locked-worker-root-');
+  const grandchild = await installBundleFixture({
+    root,
+    sourceDir: writeBundleSource({
+      name: 'grandchild',
+      workflow: LOCKED_CHILD
+	.replace('name: child', 'name: grandchild')
+	.replace('name: child-runner', 'name: grandchild-runner'),
+    }),
+  });
+  const child = await installBundleFixture({
+    root,
+    sourceDir: writeBundleSource({
+      name: 'child',
+      workflow: lockedMiddle('grandchild/grandchild@1.0.0'),
+      lock: { 'grandchild/grandchild@1.0.0': grandchild.result.digest },
+    }),
+  });
+  const parent = await installBundleFixture({
+    root,
+    sourceDir: writeBundleSource({
+      name: 'locked-parent',
+      workflow: lockedParent('child/child@1.0.0'),
+      lock: { 'child/child@1.0.0': child.result.digest },
+    }),
+  });
+  const recursive = createStoreInstructionSource({
+    projectRoot: root,
+    globalRoot: tempDir('owenloop-recursive-locked-worker-global-'),
+    verifier: createBundleIngestor(),
+  });
+  assert.equal(await recursive.prime(parent.result.digest), 'resolved');
+  assert.equal(recursive.lookup({ defDigest: parent.result.digest, step: 'ordinary', key: '' }).status, 'resolved');
+
+  const cycle = await installLockedPair();
+  chmodSync(cycle.child.result.objectPath, 0o755);
+  const childWorkflow = join(cycle.child.result.objectPath, 'workflow.yaml');
+  const childManifest = join(cycle.child.result.objectPath, 'bundle.yaml');
+  chmodSync(childWorkflow, 0o644);
+  chmodSync(childManifest, 0o644);
+  writeFileSync(childWorkflow, `name: child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: invoke-parent
+    calls: dep/locked-parent@1.0.0
+    inputs:
+      seed: data
+    produces: [delivered]
+outputs: [delivered]
+`);
+  writeFileSync(
+    childManifest,
+    readFileSync(childManifest, 'utf8').replace(
+	'lock: {}\n',
+	`lock:\n  "dep/locked-parent@1.0.0": "${cycle.parent.result.digest}"\n`,
+    ),
+  );
+  const cyclic = createStoreInstructionSource({
+    projectRoot: cycle.root,
+    globalRoot: tempDir('owenloop-cyclic-locked-worker-global-'),
+    verifier: permissiveVerifier(),
+  });
+  await assert.rejects(cyclic.prime(cycle.parent.result.digest), /calls cycle/);
 });
 
 test('store instruction source: a project projection wins even when the matching global bundle digest sorts first', async () => {

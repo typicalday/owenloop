@@ -6,9 +6,12 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
 
-import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { finalizeDefs, loadDefFile, resolveCallsTarget } from '../../../src/defs.ts';
+import { Engine } from '../../../src/engine.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
-import { createBundleIngestor } from '../../../src/store/index.ts';
+import { openStore } from '../../../src/store.ts';
+import { createBundleIngestor, loadCasDefs } from '../../../src/store/index.ts';
+import type { WorkflowDef } from '../../../src/types.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import type { InstructionResolver } from '../src/exec/instructions.ts';
@@ -33,6 +36,45 @@ steps:
     executor: command
     command: '${LOCAL_COMMAND}'
     body: ""
+`;
+const LOCKED_CHILD_COMMAND = 'printf "locked-child-run\\n"';
+const LOCKED_CHILD_WORKFLOW = `name: child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: child-runner
+    consumes: [data]
+    produces: [delivered]
+    terminal: true
+    executor: command
+    command: '${LOCKED_CHILD_COMMAND}'
+    body: ""
+outputs: [delivered]
+`;
+const LOCKED_PARENT_COMMAND = 'printf "locked-parent-run\\n"';
+const LOCKED_PARENT_WORKFLOW = `name: locked-parent
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: ordinary
+    consumes: [seed]
+    produces: [ordinary-out]
+    executor: command
+    command: '${LOCKED_PARENT_COMMAND}'
+    body: ""
+  - name: invoke-child
+    calls: child/child@1.0.0
+    inputs:
+      data: seed
+    produces: [delivered]
+  - name: finish
+    consumes: [ordinary-out, delivered]
+    produces: [out]
+    terminal: true
+    body: ""
+outputs: [out]
 `;
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -61,11 +103,16 @@ async function startHub(order: GetOrderResponse): Promise<{ origin: string; reqs
   return { origin: `http://127.0.0.1:${port}`, reqs, server };
 }
 
-function order(defDigest: string, remoteCommand: string): GetOrderResponse {
+function order(
+  defDigest: string,
+  remoteCommand: string,
+  step = 'builder',
+  identity: { workflow: string; run: string } = { workflow: 'wf1', run: 'run1' },
+): GetOrderResponse {
   const packet = {
-    run: 'run1',
-    workflow: 'wf1',
-    step: 'builder',
+    run: identity.run,
+    workflow: identity.workflow,
+    step,
     key: 'k',
     inputs: [],
     outputs: [],
@@ -78,7 +125,7 @@ function order(defDigest: string, remoteCommand: string): GetOrderResponse {
   // resolver must ignore it because the local digest is the only instruction
   // authority.
   (packet as unknown as Record<string, unknown>)['command'] = remoteCommand;
-  return { text: '', workflow: 'wf1', run: 'run1', order: packet, lease: { claimed: true } };
+  return { text: '', workflow: identity.workflow, run: identity.run, order: packet, lease: { claimed: true } };
 }
 
 function makeLoop(
@@ -177,6 +224,96 @@ test('exec store e2e: empty store refuses, installed bytes run, and tampering re
     assert.equal(empty.reqs.filter((request) => request.verb === 'release').length, 1);
   } finally {
     empty.server.close();
+  }
+});
+
+test('exec store e2e: a worker executes an unrelated locked parent step, then the engine dispatches and a worker executes the pinned child', async () => {
+  const projectRoot = join(tempDir('owenloop-locked-worker-project-'), 'workflows');
+  const child = await installBundleFixture({
+    root: projectRoot,
+    sourceDir: writeBundleSource({ name: 'child', workflow: LOCKED_CHILD_WORKFLOW }),
+  });
+  const parent = await installBundleFixture({
+    root: projectRoot,
+    sourceDir: writeBundleSource({
+      name: 'locked-parent',
+      workflow: LOCKED_PARENT_WORKFLOW,
+      lock: { 'child/child@1.0.0': child.result.digest },
+    }),
+  });
+  const resolver = createStoreInstructionResolver({
+    projectRoot,
+    globalRoot: tempDir('owenloop-locked-worker-global-'),
+    verifier: createBundleIngestor(),
+    definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
+  });
+  const parentIdentity = { workflow: 'wf-locked-parent', run: 'run-locked-parent' };
+  const remoteParentMarker = join(CWD, 'locked-remote-parent-ran');
+  const parentHub = await startHub(order(
+    parent.result.digest,
+    `touch ${remoteParentMarker}`,
+    'ordinary',
+    parentIdentity,
+  ));
+  try {
+    assert.equal(await makeLoop(parentHub.origin, resolver, undefined, parentIdentity).run(), 'submitted');
+    const submitted = parentHub.reqs.find((request) => request.verb === 'submit');
+    assert.ok(submitted !== undefined);
+    assert.equal((submitted.body?.['value'] as CommandReceipt).command, LOCKED_PARENT_COMMAND);
+    assert.equal(pathExists(remoteParentMarker), false, 'the parent packet command is not trusted');
+  } finally {
+    parentHub.server.close();
+  }
+
+  const defs = new Map<string, WorkflowDef>();
+  for (const registration of loadCasDefs({
+    projectRoot,
+    globalRoot: projectRoot,
+    warn: () => {},
+  })) {
+    defs.set(registration.key, registration.def);
+  }
+  const state = openStore(join(tempDir('owenloop-locked-worker-engine-'), 'state.db'));
+  let childWorkflow: string | undefined;
+  try {
+    const engine = new Engine(state, (name, from) => {
+      const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
+      return def;
+    });
+    const parentWorkflow = engine.createInstance('locked-parent/locked-parent@1.0.0', {
+      provide: { seed: { ready: true } },
+    });
+    engine.tick(parentWorkflow, { deep: false });
+    const dispatched = state.findChildByParent(parentWorkflow, 'delivered');
+    assert.ok(dispatched, 'the Engine provisioned the locked child');
+    childWorkflow = dispatched.id;
+    assert.equal(
+      state.getWorkflow(dispatched.id)?.defSnapshot?.bundleDigest,
+      child.result.digest,
+      'dispatch uses the parent manifest lock digest',
+    );
+  } finally {
+    state.close();
+  }
+  assert.ok(childWorkflow !== undefined);
+
+  const childIdentity = { workflow: childWorkflow, run: 'run-locked-child' };
+  const remoteChildMarker = join(CWD, 'locked-remote-child-ran');
+  const childHub = await startHub(order(
+    child.result.digest,
+    `touch ${remoteChildMarker}`,
+    'child-runner',
+    childIdentity,
+  ));
+  try {
+    assert.equal(await makeLoop(childHub.origin, resolver, undefined, childIdentity).run(), 'submitted');
+    const submitted = childHub.reqs.find((request) => request.verb === 'submit');
+    assert.ok(submitted !== undefined);
+    assert.equal((submitted.body?.['value'] as CommandReceipt).command, LOCKED_CHILD_COMMAND);
+    assert.equal(pathExists(remoteChildMarker), false, 'the child packet command is not trusted');
+  } finally {
+    childHub.server.close();
   }
 });
 

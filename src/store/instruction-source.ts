@@ -8,16 +8,17 @@
  * in the in-memory cache populated by that prime.
  */
 
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { parseManifestBytes } from '../bundle/manifest.ts';
+import { isVersionedReference, parseManifestBytes } from '../bundle/manifest.ts';
+import type { BundleManifest } from '../bundle/types.ts';
 import { defInstructionDigest } from '../order-resolver.ts';
 import type {
   OrderInstructionLookup,
   OrderInstructionRef,
   OrderInstructionSource,
 } from '../order-resolver.ts';
-import { finalizeDefs, loadDefFile } from '../defs.ts';
+import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile } from '../defs.ts';
 import type { StepDef, WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import {
@@ -25,6 +26,7 @@ import {
   compareStoreText,
   defDigest,
   objectDirForDigest,
+  parseWorkflowCoordinate,
 } from './types.ts';
 import type { DefDigest, ResolutionLevel } from './types.ts';
 import {
@@ -66,6 +68,20 @@ interface CachedDefinition {
   def: WorkflowDef;
   bundleDigest: DefDigest;
   objectPath: string;
+  /** Every object whose verified bytes supported this parent definition. */
+  support: readonly SupportingObject[];
+}
+
+interface SupportingObject {
+  bundleDigest: DefDigest;
+  objectPath: string;
+  root: string;
+  level: ResolutionLevel;
+}
+
+interface LoadedObject extends SupportingObject {
+  manifest: BundleManifest;
+  defs: Map<string, WorkflowDef>;
 }
 
 /** A synchronous lookup source backed by verified local workflow-store objects. */
@@ -135,57 +151,251 @@ function asDefDigest(raw: string): DefDigest | undefined {
   }
 }
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Read every workflow from one exact, already-addressed object. This is shared
+ * by a requested parent and its lock-pinned dependencies so child bytes get
+ * precisely the same installed-object verification before they are parsed.
+ */
+async function loadVerifiedObject(
+  root: string,
+  bundleDigest: DefDigest,
+  level: ResolutionLevel,
+  verifier: BundleIngestor,
+): Promise<LoadedObject> {
+  return coordinateDigestRead(root, bundleDigest, async () => {
+    const objectPath = await verifiedCandidateObject(root, bundleDigest, level, verifier);
+    try {
+      const manifest = parseManifestBytes(readFileSync(join(objectPath, 'bundle.yaml')));
+      const defs = new Map<string, WorkflowDef>();
+      for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+	const def = loadDefFile(join(objectPath, workflowPath));
+	if (def.name !== workflowName) {
+	  throw new StoreIntegrityError(
+	    'object-corrupt',
+	    bundleDigest,
+	    `workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
+	  );
+	}
+	// CAS provenance is part of calls: resolution, not the instruction
+	// projection. defInstructionDigest deliberately excludes it.
+	def.bundlePackage = manifest.package.name;
+	def.bundleDigest = bundleDigest;
+	def.bundleLock = { ...manifest.lock };
+	defs.set(def.name, def);
+      }
+      return { bundleDigest, objectPath, root, level, manifest, defs };
+    } catch (error) {
+      if (error instanceof StoreIntegrityError) throw error;
+      throw new StoreIntegrityError('object-corrupt', bundleDigest, errorText(error));
+    }
+  });
+}
+
 export function createStoreInstructionSource(args: StoreInstructionSourceArgs): StoreInstructionSource {
   const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
   const globalRoot = projectStoreRoot(args.globalRoot);
   const cache = new Map<string, CachedDefinition[]>();
   const inFlight = new Map<string, Promise<'resolved' | 'unknown-digest'>>();
 
+  const configuredRoots = (): Array<{ root: string; level: ResolutionLevel }> => {
+    const roots: Array<{ root: string; level: ResolutionLevel }> = [];
+    if (projectRoot !== undefined) roots.push({ root: projectRoot, level: 'project' });
+    roots.push({ root: globalRoot, level: 'global' });
+    return roots.filter((candidate, index) =>
+      roots.findIndex((other) => other.root === candidate.root) === index,
+    );
+  };
+
+  /**
+   * Build the private, verified closure required to validate exact locked
+   * calls. It intentionally walks only digests named by the parent chain, not
+   * the whole store: unrelated indexed corruption must not poison this order.
+   */
   const loadCandidate = async (
     requestedDigest: string,
     bundleDigest: DefDigest,
     root: string,
     level: ResolutionLevel,
-  ): Promise<boolean> => coordinateDigestRead(root, bundleDigest, async () => {
-    const objectPath = await verifiedCandidateObject(root, bundleDigest, level, args.verifier);
-    const manifest = parseManifestBytes(readFileSync(join(objectPath, 'bundle.yaml')));
-    const loaded = new Map<string, WorkflowDef>();
-    for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
-      const def = loadDefFile(join(objectPath, workflowPath));
-      if (def.name !== workflowName) {
+  ): Promise<boolean> => {
+    const parent = await loadVerifiedObject(root, bundleDigest, level, args.verifier);
+    const validation = new Map<string, WorkflowDef>(parent.defs);
+    const support = new Map<string, SupportingObject>();
+    const loadedByRootAndDigest = new Map<string, LoadedObject>();
+    const registeredDependencies = new Set<string>();
+    const walked = new Set<string>();
+    const keyFor = (object: SupportingObject): string => `${object.root}:${object.bundleDigest}`;
+    const remember = (object: SupportingObject): void => {
+      support.set(keyFor(object), object);
+    };
+    const registerDependencyDefinitions = (object: LoadedObject): void => {
+      const key = keyFor(object);
+      if (registeredDependencies.has(key)) return;
+      registeredDependencies.add(key);
+      for (const [workflowName, def] of object.defs) {
+	validation.set(digestScopedCallsTargetKey(object.bundleDigest, workflowName), def);
+      }
+    };
+    remember(parent);
+    loadedByRootAndDigest.set(keyFor(parent), parent);
+
+    const dependencyRoots = (from: LoadedObject): Array<{ root: string; level: ResolutionLevel }> => {
+      const roots = [{ root: from.root, level: from.level }, ...configuredRoots()];
+      return roots.filter((candidate, index) =>
+	roots.findIndex((other) => other.root === candidate.root) === index,
+      );
+    };
+
+    const loadAt = async (
+      childDigest: DefDigest,
+      candidate: { root: string; level: ResolutionLevel },
+    ): Promise<LoadedObject> => {
+      const key = `${candidate.root}:${childDigest}`;
+      const existing = loadedByRootAndDigest.get(key);
+      if (existing !== undefined) return existing;
+      const loaded = await loadVerifiedObject(
+	candidate.root,
+	childDigest,
+	candidate.level,
+	args.verifier,
+      );
+      loadedByRootAndDigest.set(key, loaded);
+      remember(loaded);
+      return loaded;
+    };
+
+    const selectLockedTarget = (
+      target: string,
+      childDigest: DefDigest,
+      child: LoadedObject,
+    ): WorkflowDef => {
+      let coordinate: ReturnType<typeof parseWorkflowCoordinate>;
+      try {
+	coordinate = parseWorkflowCoordinate(target);
+      } catch (error) {
 	throw new StoreIntegrityError(
 	  'object-corrupt',
-	  bundleDigest,
-	  `workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
+	  childDigest,
+	  `locked calls target '${target}' has an invalid coordinate: ${errorText(error)}`,
 	);
       }
-      loaded.set(def.name, def);
-    }
-    const finalized = finalizeDefs(loaded);
+      if (
+	coordinate.name !== child.manifest.package.name
+	|| coordinate.version !== child.manifest.package.version
+      ) {
+	throw new StoreIntegrityError(
+	  'object-corrupt',
+	  childDigest,
+	  `locked calls target '${target}' does not match child manifest package '${child.manifest.package.name}@${child.manifest.package.version}'`,
+	);
+      }
+      const workflowName = child.manifest.default
+	?? (child.defs.size === 1 ? child.defs.keys().next().value as string | undefined : undefined);
+      if (workflowName === undefined) {
+	throw new StoreIntegrityError(
+	  'object-corrupt',
+	  childDigest,
+	  `locked calls target '${target}' digest ${childDigest} exports multiple workflows and has no default`,
+	);
+      }
+      const selected = child.defs.get(workflowName);
+      if (selected === undefined) {
+	throw new StoreIntegrityError(
+	  'object-corrupt',
+	  childDigest,
+	  `locked calls target '${target}' selects missing child workflow '${workflowName}'`,
+	);
+      }
+      return selected;
+    };
+
+    const walkObject = async (object: LoadedObject): Promise<void> => {
+      const objectKey = keyFor(object);
+      if (walked.has(objectKey)) return;
+      walked.add(objectKey);
+      for (const def of object.defs.values()) {
+	for (const step of def.steps) {
+	  if (step.calls === undefined || !isVersionedReference(step.calls)) continue;
+	  const target = step.calls;
+	  if (!Object.prototype.hasOwnProperty.call(object.manifest.lock, target)) {
+	    throw new StoreIntegrityError(
+	      'object-corrupt',
+	      object.bundleDigest,
+	      `locked calls target '${target}' has no entry in parent bundle ${object.bundleDigest} manifest lock`,
+	    );
+	  }
+	  const childDigest = defDigest(object.manifest.lock[target]!);
+	  let child: LoadedObject | undefined;
+	  for (const candidate of dependencyRoots(object)) {
+	    try {
+	      child = await loadAt(childDigest, candidate);
+	      break;
+	    } catch (error) {
+	      if (error instanceof StoreIntegrityError && error.code === 'object-missing') continue;
+	      const verified = error instanceof StoreIntegrityError
+		&& error.message.includes('object failed verification');
+	      throw new StoreIntegrityError(
+		'object-corrupt',
+		childDigest,
+		`locked calls target '${target}' digest ${childDigest} at ${candidate.level}-level root '${candidate.root}' ` +
+		  `${verified ? 'failed installed-object verification' : 'could not load verified child'}: ${errorText(error)}`,
+	      );
+	    }
+	  }
+	  if (child === undefined) {
+	    throw new StoreIntegrityError(
+	      'object-corrupt',
+	      childDigest,
+	      `locked calls target '${target}' digest ${childDigest} is absent from every configured workflow store root`,
+	    );
+	  }
+	  const selected = selectLockedTarget(target, childDigest, child);
+	  // An alias is the only qualified path a parent calls: edge may take.
+	  // All child workflows also retain an internal digest-scoped key so their
+	  // bare sibling calls validate in the bundle that authored them.
+	  if (child !== parent) registerDependencyDefinitions(child);
+	  validation.set(digestScopedCallsTargetKey(childDigest, target), selected);
+	  await walkObject(child);
+	}
+      }
+    };
+
+    await walkObject(parent);
+    const finalized = finalizeDefs(validation);
+    const parentDefinitions = [...parent.defs.keys()].map((name) => finalized.get(name)!);
+    const cachedSupport = [...support.values()];
 
     // Hub-backed orders use the immutable bundle digest as their execution
-    // identity. Keep every workflow from that exact verified object in the
-    // cache; the later step lookup selects a unique definition and refuses an
-    // ambiguous step name instead of choosing one by manifest order.
+    // identity. Dependencies are validation-only: never cache or publish them
+    // under the parent digest, even when a child step name is globally unique.
     if (requestedDigest === bundleDigest) {
-      cache.set(requestedDigest, [...finalized.values()].map((def) => ({
+      cache.set(requestedDigest, parentDefinitions.map((def) => ({
 	def,
 	bundleDigest,
-	objectPath,
+	objectPath: parent.objectPath,
+	support: cachedSupport,
       })));
       return true;
     }
 
     // Plain-YAML/local-engine orders retain the per-definition projection
     // digest path for backwards compatibility.
-    for (const def of finalized.values()) {
+    for (const def of parentDefinitions) {
       if (defInstructionDigest(def) === requestedDigest) {
-	cache.set(requestedDigest, [{ def, bundleDigest, objectPath }]);
+	cache.set(requestedDigest, [{
+	  def,
+	  bundleDigest,
+	  objectPath: parent.objectPath,
+	  support: cachedSupport,
+	}]);
 	return true;
       }
     }
     return false;
-  });
+  };
 
   const candidateFailureForRefusal = (error: unknown): unknown =>
     error instanceof StoreIntegrityError && error.code === 'object-missing' ? undefined : error;
@@ -213,11 +423,14 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 
   const evictObject = (bundleDigest: DefDigest, objectPath: string): void => {
     for (const [instructionDigest, cached] of cache) {
-      const retained = cached.filter(
-	(candidate) => candidate.bundleDigest !== bundleDigest || candidate.objectPath !== objectPath,
-      );
-      if (retained.length === 0) cache.delete(instructionDigest);
-      else if (retained.length !== cached.length) cache.set(instructionDigest, retained);
+      // A cached entry is valid only while EVERY object that supported its
+      // locked-edge closure is valid. Never leave a parent usable after a
+      // supporting child changes or disappears.
+      if (cached.some((candidate) => candidate.support.some(
+	(support) => support.bundleDigest === bundleDigest && support.objectPath === objectPath,
+      ))) {
+	cache.delete(instructionDigest);
+      }
     }
   };
 
@@ -226,21 +439,22 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     if (cached === undefined) return false;
     const verified = new Set<string>();
     for (const candidate of cached) {
-      const key = `${candidate.bundleDigest}:${candidate.objectPath}`;
-      if (verified.has(key)) continue;
-      verified.add(key);
-      const root = dirname(dirname(dirname(candidate.objectPath)));
-      try {
-	await coordinateDigestRead(root, candidate.bundleDigest, async () => {
-	  const verify = args.verifier.verifyInstalledObjectAfterCoordination ?? args.verifier.verifyInstalledObject;
-	  await verify.call(args.verifier, {
-	    objectDir: candidate.objectPath,
-	    digest: candidate.bundleDigest,
+      for (const support of candidate.support) {
+	const key = `${support.root}:${support.bundleDigest}`;
+	if (verified.has(key)) continue;
+	verified.add(key);
+	try {
+	  await coordinateDigestRead(support.root, support.bundleDigest, async () => {
+	    const verify = args.verifier.verifyInstalledObjectAfterCoordination ?? args.verifier.verifyInstalledObject;
+	    await verify.call(args.verifier, {
+	      objectDir: support.objectPath,
+	      digest: support.bundleDigest,
+	    });
 	  });
-	});
-      } catch (error) {
-	evictObject(candidate.bundleDigest, candidate.objectPath);
-	throw error;
+	} catch (error) {
+	  evictObject(support.bundleDigest, support.objectPath);
+	  throw error;
+	}
       }
     }
     return true;
