@@ -137,9 +137,13 @@ const instructions = resolver.resolveOrder(order); // synchronous cache lookup
 
 `prime` returns `resolved` or `unknown-digest`; an integrity failure is a
 separate refusal. The source enumerates indexed bundle objects, verifies each
-candidate on read, loads every workflow path listed by its `bundle.yaml`, and
-matches each finalized definition's instruction projection digest to
-`order.defDigest`. The order's digest is the
+candidate on read, and for an exact versioned `calls:` edge follows only the
+digest in that verified parent's manifest lock. Each pinned child is verified
+before its workflow bytes are read; the combined closure is finalized strictly,
+but only definitions from the requested object enter the instruction cache.
+Later primes re-verify every object supporting that closure. The source matches
+each requested definition's instruction projection digest to `order.defDigest`.
+The order's digest is the
 only instruction key supplied by the transport; the source never accepts
 prompt or command text from the packet. `createEngine` keeps its default
 loaded-definition emitter, because the store source's `digestOf` is deliberately
