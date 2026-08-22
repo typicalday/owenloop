@@ -1630,6 +1630,75 @@ export function asCapabilityRoutes(body: unknown): CapabilityRouteWire[] {
   );
 }
 
+/** One signature-free row returned by `GET /api/interfaces`. */
+export interface InterfaceCatalogRowWire {
+  name: string;
+  version: string;
+  createdBy: string;
+  createdAt: number;
+}
+
+/** The exact-coordinate form returned by register and exact get. */
+export interface InterfaceCatalogVersionWire extends InterfaceCatalogRowWire {
+  /** Opaque hub-owned signature. The CLI deliberately does not validate its semantics. */
+  signature: unknown;
+}
+
+/**
+ * Narrow one interface-catalog row without interpreting the signature or any
+ * schemas it may contain. The hub is the only semantic validator; this guard
+ * only protects CLI output from malformed transport data.
+ */
+function asInterfaceCatalogRow(
+  entry: unknown,
+  prefix: string,
+  where: string,
+): InterfaceCatalogRowWire {
+  if (typeof entry !== 'object' || entry === null) {
+    throw new Error(`${prefix} — ${where} is not an object`);
+  }
+  const value = entry as Record<string, unknown>;
+  for (const field of ['name', 'version', 'createdBy'] as const) {
+    if (typeof value[field] !== 'string' || value[field] === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
+    }
+  }
+  if (typeof value.createdAt !== 'number') {
+    throw new Error(`${prefix} — ${where} missing number createdAt`);
+  }
+  return {
+    name: value.name as string,
+    version: value.version as string,
+    createdBy: value.createdBy as string,
+    createdAt: value.createdAt,
+  };
+}
+
+/** Narrow a register or exact-get response while retaining its opaque signature. */
+export function asInterfaceCatalogVersion(
+  body: unknown,
+  endpoint: 'register_interface' | 'interfaces',
+): InterfaceCatalogVersionWire {
+  const prefix = `${endpoint}: malformed response`;
+  const row = asInterfaceCatalogRow(body, prefix, 'response');
+  const value = body as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(value, 'signature')) {
+    throw new Error(`${prefix} — response missing signature`);
+  }
+  return { ...row, signature: value.signature };
+}
+
+/** Narrow `GET /api/interfaces`, preserving the hub's opaque row order. */
+export function asInterfaceCatalogList(body: unknown): InterfaceCatalogRowWire[] {
+  const prefix = 'interfaces: malformed response';
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).interfaces)) {
+    throw new Error(`${prefix} — missing interfaces array`);
+  }
+  return ((body as Record<string, unknown>).interfaces as unknown[]).map((entry, index) =>
+    asInterfaceCatalogRow(entry, prefix, `interfaces[${index}]`),
+  );
+}
+
 /**
  * One **routing alert** as the hub reports it — an org-scoped record that the
  * hub made a routing decision an operator needs to know about.

@@ -81,6 +81,9 @@ is independent of the `SEARCH INCOMPLETE` bounds notice.
 | `capability bind <capability> <crew> [--hub <url>]` | add a crew to a workflow capability on the hub org — a capability may route to many crews (admin; human credential) — see [Capability routes](#capability-routes) |
 | `capability unbind <capability> <crew> [--hub <url>]` | remove one `(capability, crew)` route — see [Capability routes](#capability-routes) |
 | `capability list [--hub <url>]` | list the hub org's capability routes — see [Capability routes](#capability-routes) |
+| `interface register <name> <version> --signature <file> [--hub <url>]` | register one immutable hub interface signature (admin; human credential) — see [Interface catalog](#interface-catalog) |
+| `interface get <name> <version> [--hub <url>]` | get one exact interface signature from the hub — see [Interface catalog](#interface-catalog) |
+| `interface list [--hub <url>]` | list every registered interface coordinate — see [Interface catalog](#interface-catalog) |
 | `routing alerts [--workflow <wf>] [--limit <n>] [--hub <url>]` | list the hub org's routing alerts — every hold, reroute, wait and fallback the hub recorded — see [Routing](#routing) |
 | `routing show <workflow> [--hub <url>]` | print one **hub run's** routing: modifier, wait policy, alerts, resolution reports and escalations — see [Routing](#routing) |
 | `routing rule list [--hub <url>]` | list the org's capability **reroute rules**, in the order the hub tries them — see [Routing](#routing) |
@@ -2392,6 +2395,83 @@ needs a translation step.
 | `1` | runtime or hub error — an unknown crew name (`capability bind` only; `capability unbind` answers a tolerant `removed: false` instead), a capability that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
+## Interface catalog
+
+The hub's interface catalog is an append-only registry of exact opaque
+`name@version` signatures. It is the operator surface for registering a
+breaking interface version before a workflow definition claims it. There is no
+update, delete, latest lookup, implementation index, or `x.implements` tooling:
+duplicate coordinates are refused and are never overwritten.
+
+| command | method and endpoint | principal |
+|---|---|---|
+| `interface register <name> <version> --signature <file> [--hub <url>]` | `POST /api/register_interface` with `{name,version,signature}` | human; admin role required |
+| `interface get <name> <version> [--hub <url>]` | `GET /api/interfaces/:name/:version` | human; hub applies `get_status` |
+| `interface list [--hub <url>]` | `GET /api/interfaces` | human; hub applies `get_status` |
+
+`get` encodes `<name>` and `<version>` separately as URL path segments, so a
+slash or space in either coordinate does not alter the route. The CLI does not
+validate coordinate syntax; the hub is the enforcement of record. At deployed
+hub SHA `d1dc2a1b02645ea6cf4eb4bf0319c3b917e137f4` (owenloop-service #263), the
+hub refuses a whole `.` or `..` name or version during registration with
+`interface_catalog_input_invalid`: those path segments normalize before the
+path-based exact-read route can address them. This is the only coordinate
+exception; ordinary dotted versions such as `evidence-report@2.0.0` round-trip
+through register, get, and list. The CLI sends all coordinates unchanged and
+does not add a local dot-segment guard or encoding workaround.
+
+### Registering a signature
+
+Pass a UTF-8 JSON file with `--signature`; a relative path is resolved from the
+current directory. For example, after reviewing a local file, use
+`owenloop interface register evidence-report 2.0.0 --signature interfaces/evidence-report-2.json --hub https://hub.example`.
+This is intentionally a file rather than the small inline JSON accepted by
+`start --provide name=json` and `provide --value json`: interface signatures
+can approach the hub's 64 KiB serialized limit and should be reviewable and
+reusable without shell quoting or argument-size concerns. It is also unlike
+`login --with-token`, which reads a secret from stdin; an interface signature is
+non-secret structured data.
+
+The CLI reads the file and runs `JSON.parse` only. It sends the resulting value
+unchanged and delegates coordinate validity, signature shape, typed artifacts,
+JSON Schemas, duplicate artifact names, and size validation entirely to the
+hub. A syntactically valid but semantically invalid signature—or a whole `.` or
+`..` coordinate—therefore reaches the hub and surfaces its non-empty error
+message; an unreadable or invalid-JSON file fails before a network call.
+
+### Reading and output
+
+`get` and successful `register` return the full opaque signature for one exact
+coordinate. `list` preserves hub order and deliberately returns signature-free
+rows, so listing a catalog does not transfer every signature body. stdout is
+exactly one whitelisted JSON document per successful invocation; the hub's
+`text` field and unknown response fields are never printed.
+
+| command | stdout |
+|---|---|
+| `interface register` / `interface get` | `{ "ok": true, "hub": "<origin>", "name": "evidence-report", "version": "2.0.0", "signature": { … }, "createdBy": "<id>", "createdAt": 1738000000000 }` |
+| `interface list` | `{ "ok": true, "hub": "<origin>", "interfaces": [{ "name": "evidence-report", "version": "2.0.0", "createdBy": "<id>", "createdAt": 1738000000000 }] }` |
+
+Malformed 2xx bodies are rejected before printing. Typed hub refusals such as
+a duplicate/invalid registration (`400 interface_catalog_input_invalid`),
+non-admin register (`403 forbidden`), and an unknown exact coordinate (`404
+interface_catalog_not_found`) surface only the hub's non-empty `message` on
+stderr and leave stdout empty; the CLI does not prefix it with an `error` code.
+
+**Hub and credential selection.** All three commands resolve `--hub <url>`
+first; without it they require exactly one enumerable stored human hub. They do
+not default from `OWENLOOP_HUB` or a production origin. The human credential slot
+is used for every command. `OWENLOOP_CREDENTIAL_COMMAND` is supported because
+this namespace stores no credential locally; an external backend that cannot
+enumerate hubs must receive `--hub` explicitly.
+
+| code | meaning |
+|---|---|
+| `0` | registered, read, or listed successfully |
+| `1` | runtime, hub, or malformed-response error, including a hub-side registration refusal |
+| `2` | the hub could not be resolved |
+| `3` | the human credential is missing or irrecoverable; stderr names `owenloop login --hub <origin>` |
 
 ## Routing
 
