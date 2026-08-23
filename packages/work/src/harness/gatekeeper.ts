@@ -99,13 +99,21 @@ export interface GateCall {
    * `unrestricted` declaration may widen audited filesystem reads only.
    */
   filesystem?: FilesystemPermission;
+  /**
+   * The host-owned exact-work-root boundary. This is deliberately separate from
+   * an authored filesystem permission: the latter may describe an unrestricted
+   * legacy workflow, while this flag is the narrow audit profile that must never
+   * be widened by an approval or an SDK shortcut.
+   */
+  exactWorkdir?: boolean;
 }
 
 /** The gatekeeper's answer. `reason` is written to be shown to a person and to
  *  the agent, so it names the specific thing that triggered it. */
 export type GateVerdict =
   | { decision: 'allow' }
-  | { decision: 'escalate'; reason: string };
+  | { decision: 'escalate'; reason: string }
+  | { decision: 'deny'; reason: string };
 
 const ALLOW: GateVerdict = { decision: 'allow' };
 
@@ -121,15 +129,24 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['Read', 'Glob', 'Gr
  * a tool absent from this table simply is not path-checked rather than being
  * guessed at.
  */
-const PATH_ARGS: Readonly<Record<string, { args: readonly string[]; humanGateSafeRead?: true }>> = Object.freeze({
-  Read: { args: ['file_path'], humanGateSafeRead: true },
-  Write: { args: ['file_path'] },
-  Edit: { args: ['file_path'] },
-  NotebookRead: { args: ['notebook_path'], humanGateSafeRead: true },
-  NotebookEdit: { args: ['notebook_path'] },
-  Glob: { args: ['path'], humanGateSafeRead: true },
-  Grep: { args: ['path'], humanGateSafeRead: true },
+const PATH_ARGS: Readonly<Record<string, { args: readonly { key: string; optional?: true }[]; humanGateSafeRead?: true }>> = Object.freeze({
+  Read: { args: [{ key: 'file_path' }], humanGateSafeRead: true },
+  Write: { args: [{ key: 'file_path' }] },
+  Edit: { args: [{ key: 'file_path' }] },
+  NotebookRead: { args: [{ key: 'notebook_path' }], humanGateSafeRead: true },
+  NotebookEdit: { args: [{ key: 'notebook_path' }] },
+  // Glob/Grep schemas deliberately default an omitted path to cwd.
+  // Empty, non-string, or inaccessible values are NOT that omission.
+  Glob: { args: [{ key: 'path', optional: true }], humanGateSafeRead: true },
+  Grep: { args: [{ key: 'path', optional: true }], humanGateSafeRead: true },
 });
+
+/** The path-bearing built-ins, derived from the same metadata as extraction. */
+export const PATH_BEARING_TOOL_NAMES: ReadonlySet<string> = new Set(Object.keys(PATH_ARGS));
+
+/** Fixed, payload-free guidance for the exact audit boundary. */
+export const EXACT_WORKDIR_DENIAL_MESSAGE =
+  'The exact work-root policy denied this path-bearing tool call. Work inside the assigned directory, or call the born-bound `ask` tool on the mounted `owenloop` MCP server if the order cannot be completed there.';
 
 /**
  * The owenloop MCP mount, which is ALWAYS allowed under every policy.
@@ -185,6 +202,37 @@ function stringArg(input: Record<string, unknown>, key: string): string | undefi
 }
 
 /**
+ * Classify a path-bearing call for the host-controlled exact-work-root policy.
+ * It deliberately catches model-authored getters/Proxies and path-normalization
+ * errors so an unexpected input cannot make a hook throw and leave the SDK
+ * waiting for a response.
+ */
+export function classifyExactWorkdirPath(call: GateCall): GateVerdict {
+  const spec = PATH_ARGS[call.toolName];
+  if (spec === undefined) return ALLOW;
+  try {
+    if (call.blockedPath !== undefined && call.blockedPath !== '') {
+      return { decision: 'deny', reason: EXACT_WORKDIR_DENIAL_MESSAGE };
+    }
+    for (const arg of spec.args) {
+      const present = Object.prototype.hasOwnProperty.call(call.input, arg.key);
+      if (!present && arg.optional === true) continue;
+      if (!present) return { decision: 'deny', reason: EXACT_WORKDIR_DENIAL_MESSAGE };
+      const value = call.input[arg.key];
+      if (typeof value !== 'string' || value === '') {
+	return { decision: 'deny', reason: EXACT_WORKDIR_DENIAL_MESSAGE };
+      }
+      if (!isInside(call.workdir, value)) {
+	return { decision: 'deny', reason: EXACT_WORKDIR_DENIAL_MESSAGE };
+      }
+    }
+    return ALLOW;
+  } catch {
+    return { decision: 'deny', reason: EXACT_WORKDIR_DENIAL_MESSAGE };
+  }
+}
+
+/**
  * Whether `candidate` resolves inside `root`.
  *
  * Resolved against `root` first, so a relative path means what the harness will
@@ -229,6 +277,13 @@ export function dangerousCommand(command: string): string | undefined {
 export function classifyToolCall(call: GateCall, policy: GatePolicy): GateVerdict {
   if (call.toolName.startsWith(OWENLOOP_MCP_PREFIX)) return ALLOW;
 
+  // This host profile runs before legacy policy semantics. It is intentionally
+  // not an escalation: no human approval can widen the exact snapshot boundary.
+  if (call.exactWorkdir === true) {
+    const exact = classifyExactWorkdirPath(call);
+    if (exact.decision === 'deny') return exact;
+  }
+
   if (policy === 'deny-unapproved') {
     return { decision: 'escalate', reason: `permissionMode denies unapproved tool calls` };
   }
@@ -243,7 +298,7 @@ export function classifyToolCall(call: GateCall, policy: GatePolicy): GateVerdic
 
   const pathArgs = PATH_ARGS[call.toolName];
   const paths = (pathArgs?.args ?? [])
-    .map((key) => stringArg(call.input, key))
+    .map(({ key }) => stringArg(call.input, key))
     .filter((p): p is string => p !== undefined);
 
   // An explicit unrestricted filesystem declaration widens only the declared

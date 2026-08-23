@@ -123,15 +123,46 @@ The Claude Code adapter refuses a `read-only` allow-list containing anything out
 
 ## Owenloop control-plane exception
 
-`network: owenloop-only` means that the Step Agent may reach only the born-bound Owenloop MCP control plane for the held order. The exception exists so the Step Agent can call `get_order` and `submit`; without those calls the Step Agent cannot inspect or complete the order.
+`network: owenloop-only` means that the Step Agent may reach only the born-bound Owenloop MCP control plane for the held order. The exception exists so the Step Agent can call `get_order`, `submit`, and `ask`; without those calls the Step Agent cannot inspect, complete, or honestly hold an impossible order.
 
-For Claude Code isolation, the adapter sets `settingSources: []`, `strictMcpConfig: true`, disables skills, excludes hooks and external MCP servers, and mounts only the worker-created `owenloop` MCP server. The restricted MCP child positively registers exactly `get_order` and `submit`; the restricted MCP child does not register `reject`. A future work-holder tool therefore does not enter restricted sessions unless the adapter explicitly adds the tool to the positive registration list. The adapter also restricts built-in tools to an audited no-network set. The same option construction runs for cold start and resume.
+For Claude Code isolation, the adapter sets `settingSources: []`, `strictMcpConfig: true`, disables skills, excludes hooks and external MCP servers, and mounts only the worker-created `owenloop` MCP server. The restricted MCP child positively registers exactly `get_order`, `submit`, and `ask`; the restricted MCP child does not register `reject`. A future work-holder tool therefore does not enter restricted sessions unless the adapter explicitly adds the tool to the positive registration list. The adapter also restricts built-in tools to an audited no-network set. The same option construction runs for cold start and resume.
 
-The born-bound Owenloop MCP server is created by the worker from the live workflow, run, origin, account, Shift, and held claim. Workflow extension data cannot replace that mount. During isolation, the adapter adds `mcp__owenloop__get_order` and `mcp__owenloop__submit` to `allowedTools` so both control calls execute without an unattended permission prompt. `allowedTools` controls permission automation; `allowedTools` does not filter the MCP server's `tools/list` response. The positive registration list on the MCP child is the visibility boundary. The adapter also adds `mcp__owenloop__reject` to `disallowedTools` as defense in depth. A direct deny or an MCP wildcard deny that blocks Owenloop `get_order` or `submit` is refused.
+The born-bound Owenloop MCP server is created by the worker from the live workflow, run, origin, account, Shift, and held claim. Workflow extension data cannot replace that mount. During isolation, the adapter adds `mcp__owenloop__get_order`, `mcp__owenloop__submit`, and `mcp__owenloop__ask` to `allowedTools` so those control calls execute without an unattended permission prompt. `allowedTools` controls permission automation; `allowedTools` does not filter the MCP server's `tools/list` response. The positive registration list on the MCP child is the visibility boundary. The adapter also adds `mcp__owenloop__reject` to `disallowedTools` as defense in depth. A direct deny or an MCP wildcard deny that blocks Owenloop `get_order`, `submit`, or `ask` is refused.
 
 Outside Claude Code isolation, the default work-holder MCP child continues to register `get_order`, `submit`, and `reject`.
 
 ## Security boundary
+
+### Claude exact work root
+
+A dedicated audit Shift may enable `OWENLOOP_CLAUDE_EXACT_WORKDIR=1` in the
+host environment. It is a host-only setting: it is removed before the Claude
+child is launched and is not carried in prompts, events, provider options, or
+durable session records. Absence leaves existing workflows unchanged; any other
+present value fails configuration before a provider query starts.
+
+This profile requires an explicit or derived built-in surface containing only
+`Read`, `Glob`, and `Grep` (an explicit `tools: []` remains valid). It forces
+the same isolated settings/MCP/skills profile described above, rejects an
+incompatible authored surface rather than silently filtering it, and keeps the
+born-bound `get_order`, `submit`, and `ask` controls headless.
+
+Every path-bearing built-in is intercepted by a host-owned `PreToolUse` guard
+before the SDK's bare `allowedTools` approval can run. A well-formed lexical
+path inside the exact step directory proceeds headlessly. Outside, malformed,
+or SDK-blocked paths are final fixed-message denials: they never create a human
+tool approval, and the agent must work inside the directory or use `ask` when
+the order is impossible there. The callback retains the same final-deny check
+as defense in depth.
+
+For a configured model, both cold and resumed strict turns require the provider
+to confirm the identical literal model name. Missing identity, a different
+model, an unavailable model, or a structured fallback event fails the turn
+instead of accepting a substitute. No fallback model is configured.
+
+The boundary is lexical containment only; it does not claim to defeat symlinks
+or special files. Snapshot construction remains responsible for those separate
+checks.
 
 `x.harness` permission fields are enforced policy. Adapter preflight must prove that the selected adapter can implement each authored restriction exactly; unsupported policy fails closed.
 
