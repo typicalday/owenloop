@@ -546,6 +546,18 @@ test('env and abortController are always set, and stderr preserves display text 
     text: `stderr: ${longLine}`,
     failure: `${longLine.slice(0, 2_000)}…`,
   });
+
+	const recoveryOptions = buildClaudeOptions(
+		{
+			cwd: '/tmp/work',
+			owenloopMcp: MOUNT,
+			permissions: { extensions: {} },
+			recoveryPolicy: { idleTimeoutMs: 1_000 },
+		},
+		{ env, abortController: new AbortController(), onEvent: (event) => events.push(event) },
+	);
+	recoveryOptions.stderr?.('RECOVERY_STDERR_PAYLOAD_MUST_NOT_ESCAPE\n');
+	assert.equal(events.length, 2, 'recovery stderr produces no provider-controlled telemetry');
 });
 
 test('the idle-timeout parser accepts bounded canonical decimals and rejects invalid values', () => {
@@ -661,6 +673,52 @@ test('raw partial SDK events reset liveness without exposing their payload, and 
 	assert.equal(JSON.stringify(events).includes(partialPayload), false);
 });
 
+test('recovery turn telemetry contains only structured categories, never provider payloads or tokens', async () => {
+	const sessionToken = 'RECOVERY_SESSION_TOKEN_MUST_NOT_ESCAPE';
+	const providerCwd = '/RECOVERY_PROVIDER_CWD_MUST_NOT_ESCAPE';
+	const assistantPayload = 'RECOVERY_ASSISTANT_PAYLOAD_MUST_NOT_ESCAPE';
+	const userPayload = 'RECOVERY_USER_PAYLOAD_MUST_NOT_ESCAPE';
+	const resultError = 'RECOVERY_RESULT_ERROR_MUST_NOT_ESCAPE';
+	const events: AgentEvent[] = [];
+	let initialized: string | undefined;
+	const stream: AsyncIterable<SDKMessage> = {
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			yield {
+				type: 'system', subtype: 'init', session_id: sessionToken, mcp_servers: [],
+				claude_code_version: 'provider-version', model: 'provider-model', apiKeySource: 'provider-key-source',
+				permissionMode: 'provider-permission', cwd: providerCwd,
+			} as unknown as SDKMessage;
+			yield {
+				type: 'assistant', parent_tool_use_id: null,
+				message: { content: [{ type: 'text', text: assistantPayload }] },
+			} as unknown as SDKMessage;
+			yield {
+				type: 'user', parent_tool_use_id: null, message: { content: userPayload },
+			} as unknown as SDKMessage;
+			yield {
+				type: 'result', subtype: 'error_during_execution', errors: [resultError],
+			} as unknown as SDKMessage;
+		},
+	};
+
+	await assert.rejects(
+		consumeTurn(stream, (event) => events.push(event), (token) => { initialized = token; }, undefined, {
+			sanitizeProviderTelemetry: true,
+		}),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider',
+	);
+
+	assert.equal(initialized, sessionToken, 'the internal session gate still receives the provider token');
+	assert.deepEqual(events, [
+		{ kind: 'exited', exitCode: null, error: 'provider failure category=provider (details redacted)' },
+		{ kind: 'turn_ended' },
+	]);
+	const rendered = JSON.stringify(events);
+	for (const sentinel of [sessionToken, providerCwd, assistantPayload, userPayload, resultError]) {
+		assert.equal(rendered.includes(sentinel), false, sentinel);
+	}
+});
+
 test('structured auth status and unclassified SDK failures normalize to typed recovery errors', async () => {
 	const one = (message: SDKMessage): AsyncIterable<SDKMessage> => ({
 		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> { yield message; },
@@ -693,15 +751,35 @@ test('structured auth status and unclassified SDK failures normalize to typed re
 });
 
 test('SDK query construction failures are normalized as nonterminal provider failures', async () => {
+	const initializationProse = 'OPAQUE_QUERY_INITIALIZATION_PROSE_MUST_NOT_ESCAPE_RECOVERY';
+	const legacyEvents: AgentEvent[] = [];
 	await assert.rejects(
-		startClaude(coldStartArgs(process.cwd()), () => {}, {
+		startClaude(coldStartArgs(process.cwd()), (event) => legacyEvents.push(event), {
 			createSessionId: () => '66666666-6666-4666-8666-666666666666',
 			loadQuery: async () => {
-				throw new Error('opaque query factory failure');
+				throw new Error(initializationProse);
 			},
 		}),
 		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
 	);
+	assert.equal(JSON.stringify(legacyEvents).includes(initializationProse), true, 'opt-out telemetry remains unchanged');
+
+	const recoveryEvents: AgentEvent[] = [];
+	await assert.rejects(
+		startClaude(
+			{ ...coldStartArgs(process.cwd()), recoveryPolicy: { idleTimeoutMs: 1_000 } },
+			(event) => recoveryEvents.push(event),
+			{
+				createSessionId: () => '99999999-9999-4999-8999-999999999999',
+				loadQuery: async () => { throw new Error(initializationProse); },
+			},
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+	);
+	assert.equal(JSON.stringify(recoveryEvents).includes(initializationProse), false);
+	assert.ok(recoveryEvents.some(
+		(event) => event.kind === 'exited' && event.error === 'provider failure category=provider (details redacted)',
+	));
 });
 
 // ---------------------------------------------------------------------------

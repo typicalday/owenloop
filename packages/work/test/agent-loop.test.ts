@@ -21,6 +21,7 @@ import {
 import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
+import { claudeAdapter, deliverClaude, startClaude, type ClaudeQueryFactory } from '../src/harness/claude.ts';
 import type { MergedRoster } from '../src/settings/roster.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
 import { HarnessTurnError, ResumeUnavailableError } from '../src/harness/contract.ts';
@@ -28,6 +29,7 @@ import type { SessionRecord } from '../src/harness/session-store.ts';
 import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 // ---- fakes ------------------------------------------------------------------
 
@@ -353,6 +355,79 @@ test('idle recovery is bounded to primary, one wake, one cold start, then one pr
 	assert.doesNotMatch(recoveryAsk, /claude|codex|anthropic|openai/iu);
 	assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
   assert.equal(verbs(calls).includes('release'), false);
+});
+
+test('recovery-enabled Claude provider tokens and failure payloads never reach worker logs', async () => {
+	const sessionTokens = [
+		'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+		'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+	] as const;
+	const providerCwd = '/PROVIDER_CWD_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const stderrPayload = 'PROVIDER_STDERR_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const resultPayload = 'PROVIDER_RESULT_ERROR_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const assistantPayload = 'PROVIDER_ASSISTANT_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const wakeInitializationPayload = 'WAKE_INITIALIZATION_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const coldInitializationPayload = 'COLD_INITIALIZATION_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	let queryCalls = 0;
+	let starts = 0;
+	const queryFactory: ClaudeQueryFactory = ({ options }) => {
+		queryCalls += 1;
+		if (queryCalls === 2) throw new Error(wakeInitializationPayload);
+		if (queryCalls === 3) throw new Error(coldInitializationPayload);
+		options.stderr?.(`${stderrPayload}\n`);
+		return {
+			async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+				yield {
+					type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+					claude_code_version: 'provider-version', model: 'provider-model', apiKeySource: 'provider-key-source',
+					permissionMode: 'provider-permission', cwd: providerCwd,
+				} as unknown as SDKMessage;
+				yield {
+					type: 'assistant', parent_tool_use_id: null,
+					message: { content: [{ type: 'text', text: assistantPayload }] },
+				} as unknown as SDKMessage;
+				yield {
+					type: 'result', subtype: 'error_during_execution', errors: [resultPayload],
+				} as unknown as SDKMessage;
+			},
+			close() {},
+		};
+	};
+	const adapter: HarnessAdapter = {
+		id: claudeAdapter.id,
+		resumeTier: 'native-token',
+		preflight: () => [],
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		start: (args, onEvent) => startClaude(args, onEvent, {
+			createSessionId: () => sessionTokens[starts++]!,
+			loadQuery: async () => queryFactory,
+		}),
+		deliver: (ref, message, args, onEvent) => deliverClaude(ref, message, args, onEvent, {
+			getSessionInfo: async () => ({}),
+			loadQuery: async () => queryFactory,
+		}),
+		stop: (ref) => claudeAdapter.stop(ref),
+	};
+	const { hub } = mockHub({
+		getOrder: [agentOrder({ workdir: process.cwd(), owes: [{ path: 'pr' }] })],
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(queryCalls, 3, 'primary, wake, and cold each reach one query-construction boundary');
+	const log = h.errs.join('\n');
+	for (const sentinel of [
+		...sessionTokens,
+		providerCwd,
+		stderrPayload,
+		resultPayload,
+		assistantPayload,
+		wakeInitializationPayload,
+		coldInitializationPayload,
+	]) {
+		assert.equal(log.includes(sentinel), false, sentinel);
+	}
+	assert.match(log, /recovery harness failure category=provider/u);
 });
 
 test('a valid policy is not forwarded when zero, multiple, or only empty output paths make recovery ineligible', async () => {

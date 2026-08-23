@@ -739,6 +739,7 @@ export function buildClaudeOptions(
   extra: ClaudeOptionExtras,
 ): Options {
   const { permissions } = inputs;
+	const diagnosticEvent = inputs.recoveryPolicy === undefined ? extra.onEvent : (_event: AgentEvent): void => {};
   const isolated =
     permissions.tools !== undefined ||
     permissions.filesystem === 'read-only' ||
@@ -752,8 +753,10 @@ export function buildClaudeOptions(
       : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
+	  // Recovery control state and worker logs are deliberately payload-free.
+	  // Legacy turns keep their established stderr telemetry verbatim.
       const line = data.trimEnd();
-      extra.onEvent({ kind: 'progress', text: `stderr: ${line}`, failure: cap(line) });
+	  diagnosticEvent({ kind: 'progress', text: `stderr: ${line}`, failure: cap(line) });
     },
     // Set here, before the `permissionMode` block below, because it is not
     // conditional on that block running: a step naming no mode at all is exactly
@@ -762,7 +765,7 @@ export function buildClaudeOptions(
       inputs.cwd,
       gatePolicyFor(permissions.permissionMode),
       permissions.filesystem,
-      extra.onEvent,
+	  diagnosticEvent,
       inputs.approvals,
     ),
   };
@@ -788,7 +791,7 @@ export function buildClaudeOptions(
       // Dropped rather than thrown or coerced — the same stance normalization
       // takes for a bad `maxTurns`. The linter only checks effort is a string,
       // so an unlintable-but-legal bag can carry an out-of-union value.
-      extra.onEvent({
+	  diagnosticEvent({
         kind: 'progress',
         text: `dropped out-of-range effort '${rawEffort}' (expected one of ${EFFORT_LEVELS.join('|')})`,
       });
@@ -810,7 +813,7 @@ export function buildClaudeOptions(
       // means the step stalls forever on a prompt no human will answer.
       if (mode === 'bypassPermissions') options.allowDangerouslySkipPermissions = true;
     } else {
-      extra.onEvent({
+	  diagnosticEvent({
         kind: 'progress',
         text: `dropped unknown permissionMode '${permissions.permissionMode}' (expected one of ${ACCEPTED_PERMISSION_MODES.join('|')})`,
       });
@@ -959,6 +962,9 @@ export interface TurnOutcome {
 /** Per-turn liveness machinery. All callbacks are payload-free by contract. */
 export interface ConsumeTurnControl {
   idleTimeoutMs?: number;
+	/** Suppress provider-controlled payload telemetry while retaining liveness and
+	 * structured failure categories for a recovery-enabled turn. */
+	sanitizeProviderTelemetry?: boolean;
   abortController?: AbortController;
   close?: () => void;
   onActivity?: (activity: { at: number; deadlineAt: number }) => void;
@@ -975,6 +981,12 @@ const PROGRESS_TEXT_CAP = 2_000;
 
 function cap(text: string): string {
   return text.length > PROGRESS_TEXT_CAP ? `${text.slice(0, PROGRESS_TEXT_CAP)}…` : text;
+}
+
+/** A payload-free failure line safe for recovery logs and durable telemetry. */
+function sanitizedFailureText(error: unknown): string {
+	const category = isHarnessTurnError(error) ? error.category : 'provider';
+	return `provider failure category=${category} (details redacted)`;
 }
 
 /** Mark messages produced inside a Task-tool subagent. A flat log cannot
@@ -1108,6 +1120,7 @@ export async function consumeTurn(
   let idleTimeoutFailure: HarnessIdleTimeoutError | undefined;
   let timerGeneration = 0;
   let controlledQueryClosed = false;
+	const sanitizeProviderTelemetry = control.sanitizeProviderTelemetry === true;
   const now = control.now ?? Date.now;
   const setTimer = control.setTimer ?? setTimeout;
   const clearTimer = control.clearTimer ?? clearTimeout;
@@ -1180,6 +1193,9 @@ export async function consumeTurn(
       arm();
     if (message.type === 'system' && message.subtype === 'init') {
       if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
+		if (sanitizeProviderTelemetry) {
+		  throw new HarnessTurnError('provider', false, 'provider session identity mismatch (details redacted)');
+		}
 	throw new Error(
 	  `provider session id mismatch: expected ${expectedSessionId}, received ${message.session_id}`,
 	);
@@ -1188,18 +1204,23 @@ export async function consumeTurn(
       // The ONLY place these are observable. The live smoke asserts on the
       // `apiKeySource` here (subscription OAuth vs. an API key), and a later
       // phase's version-mismatch warning will want `claude_code_version`.
-      const servers = message.mcp_servers.map((s) => `${s.name}=${s.status}`).join(',');
-      onEvent({
-        kind: 'progress',
-        text:
-          `session ${message.session_id}: cliVersion=${message.claude_code_version} ` +
-          `model=${message.model} apiKeySource=${message.apiKeySource} ` +
-          `permissionMode=${message.permissionMode} cwd=${message.cwd} mcp=[${servers}]`,
-	model: cap(message.model),
-      });
+	  if (!sanitizeProviderTelemetry) {
+		const servers = message.mcp_servers.map((s) => `${s.name}=${s.status}`).join(',');
+		onEvent({
+		  kind: 'progress',
+		  text:
+			`session ${message.session_id}: cliVersion=${message.claude_code_version} ` +
+			`model=${message.model} apiKeySource=${message.apiKeySource} ` +
+			`permissionMode=${message.permissionMode} cwd=${message.cwd} mcp=[${servers}]`,
+		  model: cap(message.model),
+		});
+	  }
       onInit?.(sessionId);
     } else if (message.type === 'result') {
-      if (finalResponse !== undefined) onEvent({ kind: 'assistant_response', text: finalResponse });
+	  const classified = terminalFailure ?? classifyResult(message);
+	  if (!sanitizeProviderTelemetry && finalResponse !== undefined) {
+		onEvent({ kind: 'assistant_response', text: finalResponse });
+	  }
       if (message.subtype !== 'success') {
         // The contract's channel for "something went wrong that is not a resume
         // failure". Emitted BEFORE turn_ended so a caller reading events in
@@ -1207,23 +1228,26 @@ export async function consumeTurn(
         onEvent({
           kind: 'exited',
           exitCode: null,
-          error: message.errors.join('; ') || message.subtype,
+		  error: sanitizeProviderTelemetry
+			? sanitizedFailureText(classified)
+			: message.errors.join('; ') || message.subtype,
         });
       }
       onEvent({ kind: 'turn_ended' });
-      const classified = terminalFailure ?? classifyResult(message);
       if (classified !== undefined) throw classified;
       return { sessionId, sawResult: true };
     } else if (message.type === 'assistant') {
-      emitAssistant(message, onEvent);
-      finalResponse = assistantResponse(message) ?? finalResponse;
+	  if (!sanitizeProviderTelemetry) {
+		emitAssistant(message, onEvent);
+		finalResponse = assistantResponse(message) ?? finalResponse;
+	  }
       terminalFailure ??= classifyAssistantError(message.error);
 		} else if (message.type === 'auth_status' && message.error !== undefined) {
 			// `error` is a structured SDK field. Its prose is deliberately neither
 			// logged nor parsed for recovery decisions.
 			throw new HarnessTurnError('authentication', true, 'provider authentication status failed');
     } else if (message.type === 'user') {
-      emitUser(message, onEvent);
+	  if (!sanitizeProviderTelemetry) emitUser(message, onEvent);
     }
     // `needs_input` is NEVER emitted: this SDK path has no blocking-question
     // channel that maps to it, and the contract has no reply channel by design.
@@ -1300,10 +1324,15 @@ export async function startClaude(
     } catch {
       // An already-aborted controller is equivalent to success.
     }
-    onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
-	throw isHarnessTurnError(err)
+	const failure = isHarnessTurnError(err)
 	  ? err
 	  : new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
+	onEvent({
+	  kind: 'exited',
+	  exitCode: null,
+	  error: args.recoveryPolicy !== undefined ? sanitizedFailureText(failure) : errText(err),
+	});
+	throw failure;
   }
 
   SESSIONS.set(sessionId, { query: q, abortController, options });
@@ -1335,6 +1364,7 @@ export async function startClaude(
       sessionId,
       {
 				...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
+				sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
 				abortController,
 				close: closeExact,
 				onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
@@ -1346,7 +1376,11 @@ export async function startClaude(
     // delete preserves the cold-start gate even if that cleanup seam changes.
     if (!initVerified) SESSIONS.delete(sessionId);
     closeExact();
-    onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+	onEvent({
+	  kind: 'exited',
+	  exitCode: null,
+	  error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : errText(err),
+	});
     throw err;
   }
 
@@ -1372,7 +1406,11 @@ export async function deliverClaude(
   // never resume no matter how good the token is. Distinct message on purpose —
   // the caller reads these to tell the two failures apart.
   if (!existsSync(args.cwd)) {
-    throw new ResumeUnavailableError(`resume cwd no longer exists: ${args.cwd}`);
+	throw new ResumeUnavailableError(
+	  args.recoveryPolicy !== undefined
+		? 'recovery resume cwd is unavailable (details redacted)'
+		: `resume cwd no longer exists: ${args.cwd}`,
+	);
   }
 
   // Deterministic pre-check, rather than parsing a failed query's error text
@@ -1389,7 +1427,11 @@ export async function deliverClaude(
     known = false;
   }
   if (!known) {
-    throw new ResumeUnavailableError(`provider no longer knows session ${ref.token}`);
+	throw new ResumeUnavailableError(
+	  args.recoveryPolicy !== undefined
+		? 'provider no longer knows the recovery session (details redacted)'
+		: `provider no longer knows session ${ref.token}`,
+	);
   }
 
   const env = buildChildEnv(process.env, { allowApiBilling: allowApiBillingFrom(process.env) });
@@ -1424,10 +1466,14 @@ export async function deliverClaude(
 		const query = await dependencies.loadQuery();
 		q = query({ prompt: message, options });
 	} catch (err) {
-		const failure = isHarnessTurnError(err)
-			? err
-			: new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
-		onEvent({ kind: 'exited', exitCode: null, error: failure.message });
+			const failure = isHarnessTurnError(err)
+				? err
+				: new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
+			onEvent({
+				kind: 'exited',
+				exitCode: null,
+				error: args.recoveryPolicy !== undefined ? sanitizedFailureText(failure) : failure.message,
+			});
 		throw failure;
 	}
   SESSIONS.set(ref.token, { query: q, abortController, options });
@@ -1452,6 +1498,7 @@ export async function deliverClaude(
     // Never emits `started` — the contract forbids re-emitting it on a resume.
     await consumeTurn(q, onEvent, undefined, undefined, {
       ...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
+	  sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
       abortController,
       close: closeExact,
       onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
@@ -1460,9 +1507,17 @@ export async function deliverClaude(
     const text = errText(err);
     // Belt and braces behind the `getSessionInfo` pre-check.
     if (RESUME_FAILURE_RE.test(text)) {
-      throw new ResumeUnavailableError(`provider refused resume of session ${ref.token}: ${text}`);
+	  throw new ResumeUnavailableError(
+		args.recoveryPolicy !== undefined
+		  ? 'provider refused recovery resume (details redacted)'
+		  : `provider refused resume of session ${ref.token}: ${text}`,
+	  );
     }
-    onEvent({ kind: 'exited', exitCode: null, error: text });
+	onEvent({
+	  kind: 'exited',
+	  exitCode: null,
+	  error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : text,
+	});
     throw err;
   }
 }

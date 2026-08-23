@@ -691,7 +691,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     switch (e.kind) {
       case 'started':
         sessionRef = e.ref;
-	rememberRuntimeModel(e.model);
+		if (recovery === undefined) rememberRuntimeModel(e.model);
         opts.err(`owenloop work agent-run: session started for ${order} (harness '${e.ref.harness}')`);
 	// This synchronous event is the cold-start gate. The adapter must not
 	// begin provider work until the callback returns. A thrown durable append
@@ -705,7 +705,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 	}
         return;
       case 'progress':
-	rememberRuntimeModel(e.model);
+		// Recovery logs are a payload-free control surface. The selected adapter
+		// suppresses provider prose at source; this second boundary prevents a future
+		// adapter regression from printing it through the generic worker logger.
+		if (recovery !== undefined) return;
+		rememberRuntimeModel(e.model);
 	rememberHarnessFailure(e.failure);
         opts.err(`owenloop work agent-run: ${e.text}`);
         return;
@@ -717,6 +721,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         opts.err('owenloop work agent-run: final response evidence received (redacted)');
         return;
       case 'needs_input':
+		if (recovery !== undefined) {
+		  opts.err('owenloop work agent-run: recovery harness requested input (details redacted)');
+		  return;
+		}
         opts.err(
           `owenloop work agent-run: WARNING the step agent asked for input and this contract has no reply channel — ${e.question}`,
         );
@@ -742,7 +750,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         opts.err(`owenloop work agent-run: turn ended for ${order} (telemetry — the hub decides the outcome)`);
         return;
       case 'exited':
-	rememberHarnessFailure(e.error);
+		if (recovery !== undefined) return;
+		rememberHarnessFailure(e.error);
 	if (e.error === undefined && e.exitCode !== null && e.exitCode !== 0) {
 	  rememberHarnessFailure(`harness exited with code ${String(e.exitCode)}`);
 	}
@@ -1238,9 +1247,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					sessionRef = undefined;
 					try {
 						await active.stop(ref);
-					} catch (error) {
-						opts.err(`owenloop work agent-run: recovery session stop failed: ${errMsg(error)} (ignored)`);
-					}
+						} catch {
+							opts.err('owenloop work agent-run: recovery session stop failed (details redacted; ignored)');
+						}
 				};
 
 				type PhaseResult = { failure?: unknown } | { outcome: AgentRunOutcome };
@@ -1336,7 +1345,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							return { outcome: await sessionStoreFailedAfterDispatch() };
 					}
 					const failure = 'failure' in raced ? raced.failure : undefined;
-					if (failure !== undefined) setFailure(failure);
+					if (failure !== undefined) {
+						setFailure(failure);
+						if (isHarnessTurnError(failure)) {
+							opts.err(`owenloop work agent-run: recovery harness failure category=${failure.category}`);
+						}
+					}
 						if (!recordRecovery('turn-ended')) return { outcome: await sessionStoreFailedAfterDispatch() };
 					const confirmed = await confirmPhase();
 					if (confirmed !== 'continue') return { outcome: confirmed };
