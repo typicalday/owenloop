@@ -1259,6 +1259,7 @@ export async function consumeTurn(
     // routine CLI upgrade into a failed order.
     }
   } catch (error) {
+		if (terminalFailure?.terminal === true) throw terminalFailure;
 		if (idleTimeoutFailure !== undefined) throw idleTimeoutFailure;
 		if (isHarnessTurnError(error)) throw error;
 	// This is our own session-integrity guard, not a provider failure. Preserve

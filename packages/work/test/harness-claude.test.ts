@@ -634,6 +634,58 @@ test('idle timeout remains authoritative when abort or close rejects the pending
 	);
 });
 
+test('a terminal assistant error remains authoritative when the provider then goes silent', async () => {
+	const cases = [
+		{ providerError: 'authentication_failed', category: 'authentication' },
+		{ providerError: 'model_not_found', category: 'model-unavailable' },
+	] as const;
+
+	for (const scenario of cases) {
+		let fire: (() => void) | undefined;
+		let nextCalls = 0;
+		let announceSecondRead: (() => void) | undefined;
+		const secondReadStarted = new Promise<void>((resolve) => { announceSecondRead = resolve; });
+		const stream: AsyncIterable<SDKMessage> = {
+			[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+				return {
+					next(): Promise<IteratorResult<SDKMessage>> {
+						nextCalls += 1;
+						if (nextCalls === 1) {
+							return Promise.resolve({
+								done: false,
+								value: {
+									type: 'assistant', parent_tool_use_id: null,
+									error: scenario.providerError, message: { content: [] },
+								} as unknown as SDKMessage,
+							});
+						}
+						announceSecondRead?.();
+						return new Promise<IteratorResult<SDKMessage>>(() => {});
+					},
+				};
+			},
+		};
+		const pending = consumeTurn(stream, () => {}, undefined, undefined, {
+			idleTimeoutMs: 1_000,
+			setTimer: (callback) => {
+				fire = callback;
+				return callback as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimer: () => {},
+		});
+
+		await secondReadStarted;
+		assert.ok(fire, `${scenario.providerError} arms the post-assistant idle deadline`);
+		fire!();
+		await assert.rejects(
+			pending,
+			(error: unknown) =>
+				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
+			scenario.providerError,
+		);
+	}
+});
+
 test('partial SDK messages are enabled only by an explicit recovery policy', () => {
   assert.equal(optionsFor(undefined).options.includePartialMessages, undefined);
   const events: AgentEvent[] = [];

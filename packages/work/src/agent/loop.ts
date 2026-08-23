@@ -649,7 +649,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     try {
       await adapter.stop(sessionRef);
     } catch (e) {
-      opts.err(`owenloop work agent-run: adapter stop failed: ${errMsg(e)} (ignored)`);
+	  opts.err(
+		recovery !== undefined
+		  ? 'owenloop work agent-run: adapter stop failed during recovery (details redacted; ignored)'
+		  : `owenloop work agent-run: adapter stop failed: ${errMsg(e)} (ignored)`,
+	  );
     }
   }
 
@@ -1269,6 +1273,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					const finishConfirmedOutcome = async (
 						outcome: Exclude<Awaited<ReturnType<typeof confirmOutcome>>, 'no-submit'>,
 					): Promise<AgentRunOutcome> => {
+						await teardown();
 						if (outcome === 'submitted') {
 							if (!recordRecovery('submitted')) {
 								opts.err('owenloop work agent-run: could not persist the submitted recovery diagnostic (hub outcome remains authoritative)');

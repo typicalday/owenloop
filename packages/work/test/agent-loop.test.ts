@@ -743,6 +743,76 @@ test('hub submit and claim loss stay authoritative across persistence failures i
 	}
 });
 
+test('direct submit and claim-loss confirmations stop every started recovery session exactly once', async () => {
+	const phases = [
+		{ phase: 'primary', confirmCall: 1, starts: 1, delivers: 0 },
+		{ phase: 'wake', confirmCall: 2, starts: 1, delivers: 1 },
+		{ phase: 'cold-restart', confirmCall: 3, starts: 2, delivers: 1 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const },
+	];
+
+	for (const phase of phases) {
+		for (const authority of authorities) {
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n !== phase.confirmCall) return agentOrder(common);
+					return authority.outcome === 'submitted'
+						? agentOrder({ ...common, claimed: false, outcome: 'green' })
+						: agentOrder({ ...common, claimed: false });
+				},
+			});
+			const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+			assert.equal(
+				await createAgentRunLoop(h.opts).run(),
+				authority.outcome,
+				`${authority.label} during ${phase.phase}`,
+			);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(
+				adapter.calls.filter((call) => call.kind === 'stop').length,
+				phase.starts,
+				`each session started through ${phase.phase} is stopped once`,
+			);
+			assert.equal(verbs(calls).includes('release'), false);
+		}
+	}
+});
+
+test('recovery teardown failures redact provider-controlled stop prose', async () => {
+	const sentinel = 'PROVIDER_STOP_FAILURE_MUST_NOT_REACH_WORKER_LOGS';
+	const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const stop = adapter.stop.bind(adapter);
+	adapter.stop = async (ref) => {
+		await stop(ref);
+		throw new Error(sentinel);
+	};
+	const { hub } = mockHub({
+		getOrder: [
+			agentOrder({ owes: [{ path: 'pr' }] }),
+			agentOrder({ owes: [{ path: 'pr' }], claimed: false, outcome: 'green' }),
+		],
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, 1);
+	const log = h.errs.join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /adapter stop failed during recovery \(details redacted; ignored\)/u);
+});
+
 test('a 2xx refusal from recovery ask is never recorded as held', async () => {
 	const adapter = createFakeAdapter({
 		start: { events: [{ kind: 'turn_ended' }] },
