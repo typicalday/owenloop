@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.23](https://github.com/typicalday/owenloop/compare/v0.5.22...v0.5.23) (2026-08-23)
+
+
+### Features
+
+* **work:** bound silent Claude turns with durable recovery ([#291](https://github.com/typicalday/owenloop/issues/291)) ([fc4db67](https://github.com/typicalday/owenloop/commit/fc4db67d3750f52bb6305208896abd75ce952f7e))
+
 ## [0.5.22](https://github.com/typicalday/owenloop/compare/v0.5.21...v0.5.22) (2026-08-22)
 
 
