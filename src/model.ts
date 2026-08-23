@@ -134,6 +134,25 @@ export function judgeNameOf(step: StepDef): string {
   return idx === -1 ? step.name : step.name.slice(idx + marker.length);
 }
 
+/**
+ * The sole lifecycle authority for native-judge activation. A scope matches
+ * only the instance's stored modifier; per-offer escalation routing never
+ * participates here. Unknown/non-singleton stems intentionally fail closed.
+ */
+export function activeJudgesForStem(
+  def: WorkflowDef,
+  stem: string,
+  modifier?: string,
+): NonNullable<ProducePattern['judges']> {
+  const owners = def.steps.flatMap((step) =>
+    step.produces.filter((produce) => produce.kind === 'singleton' && produce.stem === stem),
+  );
+  if (owners.length !== 1) return [];
+  return (owners[0]!.judges ?? []).filter((judge) =>
+    judge.modifiers === undefined || (modifier !== undefined && judge.modifiers.includes(modifier)),
+  );
+}
+
 export function mapProduce(step: StepDef): ProducePattern | undefined {
   return step.produces.find((p) => p.kind === 'map');
 }
@@ -826,7 +845,7 @@ export function eligibleFirings(
   def: WorkflowDef,
   arts: ArtifactMap,
   time?: TimeFacts,
-  opts?: { ignoreFreeze?: boolean },
+  opts?: { ignoreFreeze?: boolean; modifier?: string },
 ): Firing[] {
   const firings: Firing[] = [];
 
@@ -846,7 +865,9 @@ export function eligibleFirings(
     if (step.judges) {
       const judgedStem = step.judges;
       const judged = arts.get(judgedStem);
-      if (judged && judged.acceptance === 'submitted' && groupBlockingWinner(def, arts, judgedStem) === undefined) {
+      const active = activeJudgesForStem(def, judgedStem, opts?.modifier);
+      if (active.some((judge) => judge.name === judgeNameOf(step))
+	&& judged && judged.acceptance === 'submitted' && groupBlockingWinner(def, arts, judgedStem) === undefined) {
         const approvedVersion = judged.approvals?.[judgeNameOf(step)];
         if (approvedVersion !== judged.version) {
           firings.push({
@@ -1376,7 +1397,7 @@ export interface WorkflowStatus {
   /**
    * §24 §4.7: artifacts `submitted` (built, awaiting judge sign-off). Not a
    * producer debt — the producer already discharged it — but still outstanding
-   * for done-ness. `pendingJudges` lists the declared judge names that have not
+   * for done-ness. `pendingJudges` lists active judge names that have not
    * yet approved the current version.
    */
   pending: Array<{ path: string; version: number; pendingJudges: string[] }>;
@@ -1424,7 +1445,11 @@ export function workflowDone(def: WorkflowDef, arts: ArtifactMap): boolean {
 }
 
 /** Derive the operator view purely from artifact state (§17) — never stored. */
-export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowStatus {
+export function workflowStatus(
+  def: WorkflowDef,
+  arts: ArtifactMap,
+  opts: { modifier?: string } = {},
+): WorkflowStatus {
   const debts: WorkflowStatus['debts'] = [];
   for (const a of arts.values()) {
     if (!DEBT_STATES.has(a.acceptance)) continue;
@@ -1467,7 +1492,7 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   }
   debts.sort((x, y) => x.path.localeCompare(y.path));
 
-  const eligible = eligibleFirings(def, arts);
+  const eligible = eligibleFirings(def, arts, undefined, { modifier: opts.modifier });
   const eligibleSteps = new Set(eligible.map((f) => f.step));
 
   const blocked: Blocker[] = [];
@@ -1481,22 +1506,13 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   const pending: WorkflowStatus['pending'] = [];
   for (const a of arts.values()) {
     if (a.acceptance !== 'submitted') continue;
-    const judgeNames = declaredJudgeNames(def, a.path);
+    const judgeNames = activeJudgesForStem(def, a.path, opts.modifier).map((judge) => judge.name);
     const pendingJudges = judgeNames.filter((jn) => a.approvals?.[jn] !== a.version);
     pending.push({ path: a.path, version: a.version, pendingJudges });
   }
   pending.sort((x, y) => x.path.localeCompare(y.path));
 
   return { done: workflowDone(def, arts), debts, eligible, blocked, pending, inFlight: [] };
-}
-
-/** The declared judge names for a produce stem (empty if the stem has no judges). */
-function declaredJudgeNames(def: WorkflowDef, stem: string): string[] {
-  for (const step of def.steps) {
-    const p = step.produces.find((pp) => pp.stem === stem && pp.kind === 'singleton');
-    if (p?.judges) return p.judges.map((j) => j.name);
-  }
-  return [];
 }
 
 function stepOwesSomething(def: WorkflowDef, step: StepDef, arts: ArtifactMap): boolean {
@@ -2274,6 +2290,7 @@ function eligibleOutcomes(
   def: WorkflowDef,
   arts: Map<string, ArtifactData>,
   firing: Firing,
+  opts: { modifier?: string } = {},
 ): CheckStep['outcome'][] {
   if ((firing as Partial<MemberRetractFiring>).modelTransition === 'member-retract') {
     return ['retract'];
@@ -2296,7 +2313,7 @@ function eligibleOutcomes(
     if (judgedArt?.acceptance === 'submitted') {
       const jName = judgeNameOf(step);
       const approvals = { ...(judgedArt.approvals ?? {}), [jName]: judgedArt.version };
-      const judgeNames = declaredJudgeNames(def, judgedStem);
+      const judgeNames = activeJudgesForStem(def, judgedStem, opts.modifier).map((judge) => judge.name);
       const allApproved = judgeNames.every((jn) => approvals[jn] === judgedArt.version);
       if (allApproved && groupWouldReject(def, arts, judgedStem)) {
         return ['group-reject', 'judge-reject'];
@@ -2338,7 +2355,7 @@ function eligibleOutcomes(
   // checker explores the real refusal path rather than an impossible green.
   // A judged produce's actual green-moment is judge-approve (handled above),
   // so this only applies to a plain (non-judged) producer output.
-  const hasJudges = !!step.produces.find((p) => p.stem === outPath)?.judges?.length;
+  const hasJudges = activeJudgesForStem(def, outPath, opts.modifier).length > 0;
   if (!hasJudges && outPath && groupWouldReject(def, arts, outPath)) {
     outcomes.push('group-reject');
   } else {
@@ -2452,7 +2469,7 @@ export function applyOutcome(
   arts: Map<string, ArtifactData>,
   firing: Firing,
   outcome: CheckStep['outcome'],
-  opts: { maxCollectionSize: number },
+  opts: { maxCollectionSize: number; modifier?: string },
 ): Array<Map<string, ArtifactData>> {
   // emit-seal branches: return one map per element count 0..maxCollectionSize
   if (outcome === 'emit-seal') {
@@ -2514,7 +2531,7 @@ export function applyOutcome(
         });
       } else {
         const approvals = { ...(art.approvals ?? {}), [jName]: art.version };
-        const judgeNames = declaredJudgeNames(def, outPath);
+	const judgeNames = activeJudgesForStem(def, outPath, opts.modifier).map((judge) => judge.name);
         const allApproved = judgeNames.every((jn) => approvals[jn] === art.version);
         if (allApproved) {
           const producerStep = def.steps.find((l) =>
@@ -2537,7 +2554,7 @@ export function applyOutcome(
 
   if (outcome === 'green') {
     const fp = computeFingerprint(arts, firing.inputs);
-    const hasJudges = !!step?.produces.find((p) => p.stem === outPath)?.judges?.length;
+    const hasJudges = activeJudgesForStem(def, outPath, opts.modifier).length > 0;
     const updated: ArtifactData = {
       ...art,
       acceptance: hasJudges ? 'submitted' : 'green',
@@ -2713,7 +2730,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     report.stats.statesExplored++;
     if (node.depth > depthReached) depthReached = node.depth;
 
-    const status = workflowStatus(def, node.arts);
+    const status = workflowStatus(def, node.arts, { modifier: opts.modifier });
 
     // ---- invariant checking -------------------------------------------------
     // A state violates an invariant iff eval(when ?? ALWAYS_TRUE) && !eval(requires).
@@ -2785,7 +2802,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // EVENTUAL_TIME_FACTS is classification-only: the timeless BFS below does
     // not enqueue these future idle transitions or include time in its key.
     if (firings.length === 0 && !status.done) {
-      const eventualFirings = eligibleFirings(def, node.arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true });
+      const eventualFirings = eligibleFirings(def, node.arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier: opts.modifier });
       if (eventualFirings.length > 0) {
         report.stallStates.push({ path: node.path });
       } else {
@@ -2821,7 +2838,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       if ((firing as Partial<MemberRetractFiring>).modelTransition !== 'member-retract') {
         firedSteps.add(firing.step);
       }
-      const outcomes = eligibleOutcomes(def, node.arts, firing);
+      const outcomes = eligibleOutcomes(def, node.arts, firing, { modifier: opts.modifier });
 
       for (const outcome of outcomes) {
         // Check state count before expanding
@@ -2832,7 +2849,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
         const step: CheckStep = { step: firing.step, key: firing.key, outcome };
         if (outcome === 'emit-seal') report.collectionCapApplied = true;
-        const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize });
+	const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
 
         for (const suc of successors) {
           const key = canonicalKey(def, suc);
@@ -2858,6 +2875,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   // Compute the reachability fixpoint once, not per dead step.
   const reachable = reachableStems(def);
   for (const l of def.steps) {
+    if (l.judges && !activeJudgesForStem(def, l.judges, opts.modifier).some((judge) => judge.name === judgeNameOf(l))) {
+      continue;
+    }
     if (firedSteps.has(l.name)) continue;
     if (canEverFire(l, def, reachable)) {
       report.unreachedSteps.push(l.name);

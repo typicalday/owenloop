@@ -724,7 +724,7 @@ this version yet.
 - **Reads as OUTSTANDING for completion** — `OUTSTANDING_STATES = DEBT_STATES
   ∪ { submitted }` (§5). A workflow is not `done` while any artifact sits in
   `submitted`, even though the producer itself has no further debt.
-- Artifacts whose `produces` entry declares no `judges:` never enter
+- Artifacts whose `produces` entry declares no active `judges:` never enter
   `submitted` — a plain commit lands `green` exactly as before. This is fully
   backward compatible: no judges declared, zero behavior change.
 
@@ -744,6 +744,8 @@ named `${producerStep}.${producedStem}.judges.${judgeName}`. Each judge step:
 - `judges: <judgedStem>` — the marker field that makes it a judge (mirrors
   `calls:`'s marker-field pattern), read by both layers:
   `eligibleFirings`/`applyOutcome` (model.ts) and `green()` (engine.ts).
+- `judgeModifiers?: string[]` — the internal compiled carrier for the
+  authored judge's optional scope; it is not a general conditional-step key.
 - The producer step's complete parsed `x:` extension carrier is deep-cloned
   onto every synthesized judge. Judge entries do not author their own `x:`;
   inheritance happens after the producer has been fully parsed. Every judge
@@ -773,7 +775,7 @@ sign-off ledger, present only while relevant (`undefined` once an artifact is
 `green`/`rejected` cleanly, cleared on every reject/retry/fresh-submit).
 
 - **Judge approve**: `approvals[judgeName] = artifact.version`. If every
-  declared judge name now maps to the artifact's *current* version, the
+  active judge name now maps to the artifact's *current* version, the
   artifact transitions `submitted → green`. Otherwise it stays `submitted`
   with a partial ledger.
 - **Judge reject**: any single reject wins immediately —
@@ -913,6 +915,7 @@ steps:
             model: strong             # optional, per-judge model
             inputs: true              # optional, default false — judge also
                                       # reads the producer's inputs (question)
+	    modifiers: [deep]         # optional exact workflow-modifier scope
         maxAttempts: 8    # optional, §6 — overrides the step default below
                           # just for `report`; absent caps still inherit
     maxAttempts: 5    # producer's cap (default for every produce on this step)
@@ -933,6 +936,22 @@ steps:
   inputs, for criteria that need "what was asked for" as context.
 - `cadence:` / `maxRunsPerDay:` — optional throttles, same meaning as on
   steps; firing is event-driven (on submit), the throttles just cap the rate.
+- `modifiers:` — optional non-empty set of exact workflow modifier names. The
+  names must be declared in the workflow's top-level `modifiers:` vocabulary.
+  Unscoped judges stay unconditional; a scoped judge is inactive without a
+  matching stored instance modifier. `activeJudgesForStem(def, stem, modifier)`
+  is the shared derivation used by eligibility, pending status, producer and
+  verdict commits, rejection, groups, terminal timing, and model checking.
+  Inactive judges create no order, approval ledger slot, routing receipt, or
+  completion debt.
+
+When a definition binds `modifier` from a produced artifact, scoped-judge
+producers must be strictly downstream of that artifact under the same exact
+consume/produce matching used by routing lint. This rules out the binder itself
+and sibling branches, which might commit before the stored modifier is known.
+Definitions with no modifier bind remain valid: their instance modifier is
+chosen at create time (or absent), and active judge orders retain ordinary
+capability composition.
 
 See `examples/workflows/judged-research.yaml` for a runnable end-to-end
 example (mirrors this shape exactly, plus `examples/workflows/judges/rigor.md`
@@ -1146,6 +1165,12 @@ at `create` time. `CheckOptions.assumeProvided` (library level, when calling
 `modelCheck` directly) controls this and **defaults to `false`** — that
 library default is unchanged by the CLI change below, and is what the
 `modelCheck` unit tests calling it directly still rely on.
+
+`CheckOptions.modifier` selects one concrete stored-modifier variant for the
+pure checker. Call `modelCheck(def, { modifier: 'deep', assumeProvided: true })`
+for each declared variant; inactive synthesized judge steps are omitted from
+that variant's dead/unreached accounting, while active judges are checked
+normally.
 
 `owenloop check` (the CLI command), however, now defaults to
 `assumeProvided: true` — seedOwed inputs are seeded green by default,

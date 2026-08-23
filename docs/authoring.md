@@ -566,6 +566,27 @@ capability in the resulting judge list just as it does for an ordinary step
 producer nor judge supplies capabilities, the judge remains capability-silent,
 and there is nothing to compose.
 
+### Modifier-scoped judges
+
+Workflow `modifiers:` still controls routing for every step. A native judge
+may additionally opt into an exact subset of that declared vocabulary with
+`modifiers: [deep]` on the judge entry. Omitting the key is fully compatible:
+that judge is active for every run. A scoped judge is active only when the
+instance's stored modifier exactly matches one listed name; an instance with no
+current modifier activates no scoped judge. Per-step escalation does not change
+this decision.
+
+Every scope name must be a declared top-level modifier; empty, duplicate,
+whitespace-containing, `:`-containing, unknown, and unscoped-workflow lists
+are definition errors. A mixed panel is allowed: its unscoped judges remain
+required at every modifier while scoped judges join only on matching runs. An
+inactive judge creates no order, pending approval, receipt, or completion debt,
+but an active judge keeps normal capability composition (for example
+`review-rigor:deep`). If the workflow binds its modifier from an artifact,
+every producer with a scoped judge must consume a path strictly downstream of
+that binding artifact; a sibling output on the binder cannot safely use a
+scoped judge because it could commit before the binding settles.
+
 Author `x:` on the producer step, not on individual judge entries. Every native
 judge synthesized from that producer inherits the producer's complete parsed
 `x:` map. Each judge receives an independent deep clone, so runner-side
@@ -581,7 +602,7 @@ through the normal pipeline, with its own throttles (`cadence:`,
 `report`, it lands `submitted` (not `green`) instead — schema-valid, but
 waiting on sign-off. Each judge evaluates it and calls the *same*
 `green`/`reject` verbs you already use, targeted at `report` — no new CLI
-surface. Once every declared judge has approved the current version, `report`
+surface. Once every active judge has approved the current version, `report`
 goes `green`. A single reject sends it straight to `rejected` and re-arms
 `researcher`; a rebuild starts every judge's ledger fresh, so a sibling
 judge's earlier approval never carries over to a new version.

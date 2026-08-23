@@ -423,6 +423,104 @@ test('buildDef rejects judges: declared on a non-singleton (collection) produce'
   );
 });
 
+test('buildDef parses native judge modifier scopes and keeps their grammar fail-closed', () => {
+  const scoped = buildDef({
+    name: 'scoped-judge',
+    modifiers: ['express', 'deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'writer',
+      consumes: ['seed'],
+      produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'] }] }],
+    }],
+  });
+  assert.deepEqual(scoped.steps[0]!.produces[0]!.judges?.[0]?.modifiers, ['deep']);
+  assert.deepEqual(scoped.steps.find((step) => step.judges)?.judgeModifiers, ['deep']);
+  const standardScoped = parseDef({
+    name: 'scoped-judge',
+    modifiers: ['express', 'deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'writer',
+      consumes: ['seed'],
+      produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['express'] }] }],
+    }],
+  });
+  assert.notEqual(hashDef(scoped), hashDef(standardScoped));
+
+  const base = {
+    name: 'bad-scoped-judge',
+    modifiers: ['deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'writer',
+      consumes: ['seed'],
+      produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'] }] }],
+    }],
+  };
+  assert.throws(
+    () => parseDef({ ...base, modifiers: undefined }),
+    (e: unknown) => e instanceof DefError && /scopes modifiers but workflow 'bad-scoped-judge' declares no modifiers/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({ ...base, modifiers: ['express'] }),
+    (e: unknown) => e instanceof DefError && /modifier 'deep' is not in workflow/.test(e.message),
+  );
+  for (const values of [[], ['deep', 'deep'], ['deep review'], ['deep:review']]) {
+    assert.throws(
+      () => parseDef({
+	...base,
+	steps: [{
+	  ...base.steps[0]!,
+	  produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: values }] }],
+	}],
+      }),
+      DefError,
+    );
+  }
+  assert.throws(
+    () => parseDef({
+      ...base,
+      steps: [{
+	...base.steps[0]!,
+	produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'], unexpected: true }] }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /unknown key 'unexpected'/.test(e.message),
+  );
+});
+
+test('validateDef requires scoped judged producers to be strictly downstream of a modifier bind', () => {
+  const binder = {
+    name: 'choose',
+    consumes: ['seed'],
+    produces: [{ name: 'selection', bind: 'modifier' }],
+  };
+  const scoped = {
+    name: 'writer',
+    consumes: ['seed'],
+    produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'] }] }],
+  };
+  assert.throws(
+    () => parseDef({ name: 'parallel', modifiers: ['deep'], inputs: [{ name: 'seed' }], steps: [binder, scoped] }),
+    (e: unknown) => e instanceof DefError && /not strictly downstream of artifact 'selection'/.test(e.message),
+  );
+  const downstream = parseDef({
+    name: 'downstream',
+    modifiers: ['deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [binder, { ...scoped, consumes: ['selection'] }],
+  });
+  assert.deepEqual(validateDef(downstream), []);
+  const startBound = parseDef({
+    name: 'start-bound',
+    modifiers: ['deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [scoped],
+  });
+  assert.deepEqual(validateDef(startBound), []);
+});
+
 // ---- executor:/command:/spec: declarative executor dispatch ------------------
 
 test('parseDef rejects executor: command with no command:', () => {

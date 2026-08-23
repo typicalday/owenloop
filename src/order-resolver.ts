@@ -193,6 +193,7 @@ export function defInstructionDigest(def: WorkflowDef): string {
     ...(s.callsInterface !== undefined ? { callsInterface: s.callsInterface } : {}),
     ...(s.callsInputs !== undefined ? { callsInputs: s.callsInputs } : {}),
     ...(s.judges !== undefined ? { judges: s.judges } : {}),
+    ...(s.judgeModifiers !== undefined ? { judgeModifiers: s.judgeModifiers } : {}),
     ...(s.groups !== undefined ? { groups: s.groups } : {}),
     ...(s.x !== undefined ? { x: s.x } : {}),
     body: s.body,

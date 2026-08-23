@@ -18,6 +18,7 @@ import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { ArtifactData, WorkflowDef } from '../src/types.ts';
 import { buildDef, validateDef } from '../src/defs.ts';
+import { modelCheck } from '../src/model.ts';
 
 // ---- fixture def ---------------------------------------------------------------
 
@@ -41,6 +42,27 @@ function researcherDef(opts: { maxAttempts?: number } = {}): WorkflowDef {
         maxAttempts: opts.maxAttempts ?? 3,
       },
     ],
+  });
+}
+
+function scopedResearcherDef(mixed = false): WorkflowDef {
+  return buildDef({
+    name: mixed ? 'mixedScopedResearcherDef' : 'scopedResearcherDef',
+    modifiers: ['express', 'standard', 'deep'],
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      capabilities: ['review-rigor'],
+      produces: [{
+	name: 'report',
+	judges: [
+	  ...(mixed ? [{ name: 'reviewer', body: 'review every delivery' }] : []),
+	  { name: 'evidence', body: 'check evidence', modifiers: ['deep'] },
+	  { name: 'rigor', body: 'check rigor', modifiers: ['deep'] },
+	],
+      }],
+    }],
   });
 }
 
@@ -126,6 +148,62 @@ test('judges: buildDef synthesizes one StepDef per judge, validateDef is clean',
   }
   const errors = validateDef(d);
   assert.deepEqual(errors, []);
+});
+
+test('judges: modifier-scoped panels only gate their exact stored workflow modifier', () => {
+  const d = scopedResearcherDef();
+  const evidence = d.steps.find((step) => step.name.endsWith('.evidence'))!;
+  assert.deepEqual(d.steps[0]!.produces[0]!.judges?.[0]?.modifiers, ['deep']);
+  assert.deepEqual(evidence.judgeModifiers, ['deep']);
+
+  for (const modifier of ['express', 'standard']) {
+    const { engine, store } = makeEngine([d]);
+    const wf = engine.createInstance(d.name, { modifier, provide: { question: { text: modifier } } });
+    const producer = engine.tick(wf).orders[0]!;
+    assert.equal(engine.green(wf, producer.run, 'report', { text: modifier }).outcome, 'green');
+    engine.close(wf, producer.run);
+    assert.equal(store.getArtifact(wf, 'report')?.acceptance, 'green');
+    assert.deepEqual(engine.tick(wf).orders, []);
+    assert.deepEqual(engine.status(wf).pending, []);
+  }
+
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance(d.name, { modifier: 'deep', provide: { question: { text: 'deep' } } });
+  const producer = engine.tick(wf).orders[0]!;
+  assert.equal(engine.green(wf, producer.run, 'report', { text: 'deep' }).outcome, 'submitted');
+  engine.close(wf, producer.run);
+  assert.deepEqual(engine.status(wf).pending[0]?.pendingJudges, ['evidence', 'rigor']);
+  const judges = engine.tick(wf).orders.filter((order) => order.step.includes('.judges.'));
+  assert.deepEqual(judges.map((order) => order.step.split('.').at(-1)).sort(), ['evidence', 'rigor']);
+  assert.deepEqual(judges[0]!.capabilities, ['review-rigor:deep']);
+  assert.equal(engine.green(wf, judges.find((order) => order.step.endsWith('.evidence'))!.run, 'report', {}).outcome, 'approved');
+  assert.equal(engine.green(wf, judges.find((order) => order.step.endsWith('.rigor'))!.run, 'report', {}).outcome, 'green');
+  assert.equal(store.getArtifact(wf, 'report')?.acceptance, 'green');
+
+  for (const modifier of ['express', 'standard', 'deep']) {
+    const report = modelCheck(d, { modifier, assumeProvided: true });
+    assert.equal(report.completable, true, `${modifier} variant is completable`);
+    for (const step of d.steps.filter((candidate) => candidate.judges).map((candidate) => candidate.name)) {
+      if (modifier !== 'deep') {
+	assert.ok(!report.structurallyDeadSteps.includes(step));
+	assert.ok(!report.unreachedSteps.includes(step));
+      }
+    }
+  }
+});
+
+test('judges: a mixed panel requires its unconditional judge but rejects inactive scoped verdicts', () => {
+  const d = scopedResearcherDef(true);
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance(d.name, { modifier: 'standard', provide: { question: { text: 'standard' } } });
+  const producer = engine.tick(wf).orders[0]!;
+  assert.equal(engine.green(wf, producer.run, 'report', { text: 'standard' }).outcome, 'submitted');
+  engine.close(wf, producer.run);
+  assert.deepEqual(engine.status(wf).pending[0]?.pendingJudges, ['reviewer']);
+  assert.equal(engine.reject(wf, 'report', 'researcher.report.judges.evidence', 'stale verdict').outcome, 'born-rejected');
+  assert.deepEqual(store.getArtifact(wf, 'report')?.approvals, undefined);
+  const reviewer = engine.tick(wf).orders.find((order) => order.step.endsWith('.reviewer'))!;
+  assert.equal(engine.green(wf, reviewer.run, 'report', {}).outcome, 'green');
 });
 
 test('judges: synthesized steps inherit independent deep clones of the complete producer x carrier', () => {

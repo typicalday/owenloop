@@ -263,6 +263,28 @@ test('synthesized judge x carriers participate deterministically in definition i
   assert.notEqual(defInstructionDigest(judgeChanged), baseline, 'inherited judge x participates in the digest');
 });
 
+test('scoped synthesized judges participate in instruction identity', () => {
+  const raw = {
+    name: 'scopedJudgeDigestFixture',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{ name: 'report', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'] }] }],
+    }],
+  };
+  const deep = buildDef(raw);
+  const standard = buildDef({
+    ...raw,
+    steps: [{
+      ...raw.steps[0]!,
+      produces: [{ name: 'report', judges: [{ name: 'evidence', body: 'check', modifiers: ['standard'] }] }],
+    }],
+  });
+  assert.notEqual(defInstructionDigest(deep), defInstructionDigest(standard));
+});
+
 test('registered synthesized-judge instructions remain pinned after producer and judge mutation', () => {
   const mutable = buildDef({
     name: 'judgeSnapshotFixture',
