@@ -18,6 +18,7 @@ import {
 } from './paths.ts';
 import {
   collectionStem,
+  activeJudgesForStem,
   computeFingerprint,
   eligibleFirings,
   fingerprintMatches,
@@ -392,7 +393,7 @@ export interface CommitResult {
     // §24: a judge-step actor's `green()` call against a `submitted` stem
     // records its ledger slot but doesn't necessarily flip the artifact green
     // yet (other judges may still be pending) — 'approved' distinguishes that
-    // from 'green' (every declared judge has now signed the current version).
+    // from 'green' (every active judge has now signed the current version).
     | 'approved'
     // §26: refused because this commit would violate its produce-group's
     // exactlyOne/atMostOne exclusivity contract — a sibling already won. Like
@@ -2081,7 +2082,7 @@ export class Engine {
       // Compute time facts for idle eligibility (clock-read boundary).
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
-      const firings = eligibleFirings(def, arts, timeFacts);
+      const firings = eligibleFirings(def, arts, timeFacts, { modifier });
       const { selected, deferred } = this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityMappings, capabilityRewrites);
 
       const orders: Order[] = [];
@@ -2732,11 +2733,11 @@ export class Engine {
    *     not a produce of the judge step's own (it has none). Judge-variant CAS
    *     (§4.6): the judged stem must still be `submitted` at the version this
    *     judge's run fingerprinted at claim time. Records the ledger slot; only
-   *     flips `submitted → green` once every declared judge has signed the
+   *     flips `submitted → green` once every active judge has signed the
    *     current version. Terminal is applied here (§4.8), not at producer
    *     commit, when the produce has judges.
    *   - a real run whose step is the artifact's actual producer — today's
-   *     path, with one addition: if the produce declares `judges:`, the
+   *     path, with one addition: if the produce has active `judges:`, the
    *     commit lands `submitted` (not `green`), clears any stale `approvals`
    *     ledger from a prior submission (§4.4), and defers `terminal` to
    *     judge-approve time instead of applying it here.
@@ -2748,7 +2749,7 @@ export class Engine {
     value: Record<string, unknown>,
     opts: { terminal?: boolean } = {},
   ): CommitResult {
-    const def = this.defFor(workflow);
+    const { def, modifier } = this.instanceFor(workflow);
     if (run === 'human') {
       const result = this.store.tx((): CommitResult => {
         const arts = this.artMap(workflow);
@@ -2808,6 +2809,16 @@ export class Engine {
       if (runStep?.judges) {
         const judgedStem = runStep.judges;
         const judged = arts.get(judgedStem);
+	const activeJudges = activeJudgesForStem(def, judgedStem, modifier);
+	if (!activeJudges.some((judge) => judge.name === judgeNameOf(runStep))) {
+	  this.releaseLeaseOnBornReject(workflow, run);
+	  this.settle(workflow, def);
+	  return {
+	    path: judgedStem,
+	    outcome: 'born-rejected',
+	    reason: `judge '${judgeNameOf(runStep)}' is inactive for the current workflow modifier`,
+	  };
+	}
         const cas = this.judgeCasCheck(judged, judgedStem, r.fingerprint ?? {});
         if (cas.moved) {
           this.releaseLeaseOnBornReject(workflow, run);
@@ -2817,7 +2828,7 @@ export class Engine {
         const art = judged as ArtifactData; // judgeCasCheck guarantees submitted (non-null)
         const jName = judgeNameOf(runStep);
         const approvals = { ...(art.approvals ?? {}), [jName]: art.version };
-        const judgeNames = this.declaredJudgeNames(def, art);
+	const judgeNames = activeJudges.map((judge) => judge.name);
         const allApproved = judgeNames.every((jn) => approvals[jn] === art.version);
         if (allApproved) {
           // §26: the last judge's approve is the moment this stem would go
@@ -2852,7 +2863,7 @@ export class Engine {
       // human-bypass/judge-approve branches above): a losing sibling must be
       // refused as 'group-rejected' without bumping the schema-stall counter,
       // even when its value also happens to be schema-invalid.
-      const judgeNames = this.declaredJudgeNames(def, art);
+      const judgeNames = activeJudgesForStem(def, art.path, modifier).map((judge) => judge.name);
       const hasJudges = judgeNames.length > 0;
       if (!hasJudges) {
         const groupCas = this.groupCasCheck(def, arts, art);
@@ -2904,7 +2915,7 @@ export class Engine {
 				return { path, outcome: 'schema-rejected', reason: text };
       }
 
-      // §24 §4.4/§4.8: when this produce declares judges, the commit lands
+      // §24 §4.4/§4.8: when this produce has active judges, the commit lands
       // `submitted` (not `green`) and the version bumps here — CAS re-arms on
       // resubmission, not on judge-approve. `approvals` resets so a prior
       // submission's sign-offs never leak onto a fresh version. Terminal is
@@ -3113,7 +3124,7 @@ export class Engine {
     text: string,
     requested?: string,
   ): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
-    const def = this.defFor(workflow);
+    const { def, modifier } = this.instanceFor(workflow);
     this.assertAuthority(def, by, path, 'reject');
 
     // F4: a reject on an artifact produced by a `calls:` step is a verdict on
@@ -3150,10 +3161,21 @@ export class Engine {
       }
 
       if (judgedStem !== undefined) {
+	const task = this.store.getTask(workflow, by, '');
+	if (!activeJudgesForStem(def, judgedStem, modifier).some((judge) => judge.name === judgeNameOf(judgeStep!))) {
+	  if (task?.run) {
+	    this.releaseLeaseOnBornReject(workflow, task.run);
+	    releasedRun = task.run;
+	  }
+	  this.settle(workflow, def);
+	  return {
+	    outcome: 'born-rejected',
+	    reason: `judge '${judgeNameOf(judgeStep!)}' is inactive for the current workflow modifier`,
+	  };
+	}
         // A judge's reject targets the judged stem, mirroring green()'s
         // judge-approve branch (§24.4): CAS-guard against a stale verdict
         // before applying it.
-        const task = this.store.getTask(workflow, by, '');
         const run = task?.run ? this.store.getRun(task.run) : undefined;
         const cas = this.judgeCasCheck(art, judgedStem, run?.fingerprint ?? {});
         if (cas.moved) {
@@ -3625,9 +3647,9 @@ export class Engine {
   status(workflow: string): EngineWorkflowStatus {
     const wf = this.store.getWorkflow(workflow);
     if (!wf) throw new Error(`no such workflow instance: ${workflow}`);
-    const def = this.defFor(workflow);
+    const { def, modifier } = this.instanceFor(workflow);
     const arts = this.artMap(workflow);
-    const st: EngineWorkflowStatus = workflowStatus(def, arts);
+    const st: EngineWorkflowStatus = workflowStatus(def, arts, { modifier });
     // Enrich each debt with its producer's crash-step signal (the run log; the
     // pure layer has no store). A map-step producer fires once per element, its
     // run keyed by the consumed element path (e.g. "gather.source[0]"); a
@@ -3759,9 +3781,9 @@ export class Engine {
    */
   private fireSettled(workflow: string): void {
     if (this.listeners.size === 0) return;
-    const def = this.defFor(workflow);
+    const { def, modifier } = this.instanceFor(workflow);
     const arts = this.artMap(workflow);
-    const st = workflowStatus(def, arts);
+    const st = workflowStatus(def, arts, { modifier });
     this.fire({ type: 'settled', workflow, done: st.done, eligible: st.eligible.map((e) => e.step) });
   }
 
@@ -4116,13 +4138,16 @@ export class Engine {
   private childStatusSummary(childWf: string, visited: Set<string>): ChildStatusSummary | undefined {
     visited.add(childWf);
     let childDef: WorkflowDef;
+    let childModifier: string | undefined;
     try {
-      childDef = this.defFor(childWf);
+      const instance = this.instanceFor(childWf);
+      childDef = instance.def;
+      childModifier = instance.modifier;
     } catch {
       return undefined;
     }
     const childArts = this.artMap(childWf);
-    const cs = workflowStatus(childDef, childArts);
+    const cs = workflowStatus(childDef, childArts, { modifier: childModifier });
     let stalled = cs.debts.some((d) => d.stalled);
     if (!stalled) {
       for (const d of cs.debts) {
@@ -4282,18 +4307,6 @@ export class Engine {
     }
     const sp = step.produces.find((p) => p.kind === 'singleton' && p.stem === art.path);
     return sp?.schema;
-  }
-
-  /**
-   * §24: the declared judge names for `art`'s produce entry, or `[]` if none —
-   * `judges:` is only ever valid on a singleton produce (Q3, enforced at parse
-   * time), so unlike `produceSchema` there is no map-element case to handle.
-   */
-  private declaredJudgeNames(def: WorkflowDef, art: ArtifactData): string[] {
-    const step = def.steps.find((l) => l.name === art.producer);
-    if (!step) return [];
-    const sp = step.produces.find((p) => p.kind === 'singleton' && p.stem === art.path);
-    return sp?.judges?.map((j) => j.name) ?? [];
   }
 
   /**

@@ -18,6 +18,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
+import { buildDef } from '../src/defs.ts';
 import type { Store } from '../src/store.ts';
 import type { StepDef, WorkflowDef } from '../src/types.ts';
 import {
@@ -300,6 +301,35 @@ test('a modified run stamps the modifier on a capability-silent step, with no ca
   assert.equal(t.orders.length, 1);
   assert.equal(t.orders[0]!.capabilities, undefined, 'nothing to compose onto');
   assert.equal(t.orders[0]!.modifier, 'deep');
+});
+
+test('a scoped judge capability override is composed and claim-filtered as the active judge offer', () => {
+  const scopedJudge = buildDef({
+    name: 'scoped-judge-override',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal', seedOwed: true }],
+    steps: [{
+      name: 'builder',
+      consumes: ['proposal'],
+      capabilities: ['build'],
+      produces: [{
+	name: 'pr',
+	judges: [{ name: 'evidence', body: 'check evidence', capabilities: ['review'], modifiers: ['deep'] }],
+      }],
+    }],
+  });
+  const { engine } = makeEngine([scopedJudge]);
+  const wf = engine.createInstance(scopedJudge.name, { modifier: 'deep', provide: { proposal: { text: 'x' } } });
+  const producer = engine.tick(wf, { now: 0, capabilities: ['build:deep'] }).orders[0]!;
+  assert.equal(engine.green(wf, producer.run, 'pr', {}).outcome, 'submitted');
+  engine.close(wf, producer.run);
+
+  const judgeTick = engine.tick(wf, { now: 1, capabilities: ['review:deep'] });
+  const judge = judgeTick.orders.find((order) => order.step.endsWith('.evidence'));
+  assert.ok(judge, 'the active scoped judge is claimed by its override capability');
+  assert.deepEqual(judge!.capabilities, ['review:deep']);
+  assert.equal(judge!.modifier, 'deep');
+  assert.ok(!judgeTick.deferred.some((deferred) => deferred.step === judge!.step && deferred.reason === 'capability-mismatch'));
 });
 
 test('a crew bound to the bare capability is refused an exactly-bound compound', () => {

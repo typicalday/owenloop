@@ -85,8 +85,9 @@ interface RawJudge {
   command?: unknown;
   spec?: unknown;
   capabilities?: unknown;
+  modifiers?: unknown;
 }
-const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec', 'capabilities'] as const;
+const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec', 'capabilities', 'modifiers'] as const;
 
 interface RawStep {
   name?: unknown;
@@ -502,6 +503,10 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
       }
       for (const cap of caps) assertAuthoredCapability(cap, `judge '${name}'.capabilities`);
       judge.capabilities = caps;
+    }
+    if (raw.modifiers !== undefined) {
+      // Keep the raw YAML object isolated from the compiled definition.
+      judge.modifiers = [...parseModifiers(raw.modifiers, `judge '${name}'.modifiers`)];
     }
     return judge;
   });
@@ -932,7 +937,16 @@ function prefixStep(step: StepDef, prefix: string, defInputs: readonly string[] 
       // map
       raw = `${stem}[$${p.binder}]${p.suffix}`;
     }
-    return { ...p, stem, raw };
+    const result: ProducePattern = { ...p, stem, raw };
+    // Includes are independent materializations. Judge declarations carry
+    // optional scope arrays, which must not alias between child/aliases.
+    if (p.judges !== undefined) {
+      result.judges = p.judges.map((judge) => ({
+	...judge,
+	...(judge.modifiers !== undefined ? { modifiers: [...judge.modifiers] } : {}),
+      }));
+    }
+    return result;
   };
 
   const newProduces = step.produces.map(prefixProduce);
@@ -978,6 +992,7 @@ function prefixStep(step: StepDef, prefix: string, defInputs: readonly string[] 
   if (newGenerates !== undefined) result.generates = newGenerates;
   if (newEffect !== undefined) result.effect = newEffect;
   if (newJudges !== undefined) result.judges = newJudges;
+  if (step.judgeModifiers !== undefined) result.judgeModifiers = [...step.judgeModifiers];
   if (newOnCancel !== undefined) result.onCancel = newOnCancel;
   if (newWorkdirFrom !== undefined) result.workdirFrom = newWorkdirFrom;
   return result;
@@ -1202,6 +1217,7 @@ function synthesizeJudgeSteps(
     if (j.executor !== undefined) step.executor = j.executor;
     if (j.command !== undefined) step.command = j.command;
     if (j.spec !== undefined) step.spec = j.spec;
+    if (j.modifiers !== undefined) step.judgeModifiers = [...j.modifiers];
     return step;
   });
 }
@@ -1769,6 +1785,33 @@ export function validateDef(def: WorkflowDef): string[] {
     if (!l.consumes.some((c) => c.mode === 'plain' && c.stem === judgedStem)) {
       errors.push(`judge step '${l.name}' does not consume its judged stem '${judgedStem}'`);
     }
+    // A direct/in-memory WorkflowDef can bypass parse+synthesis, so keep the
+    // compiled carrier fail-closed: it must exactly mirror the authored judge
+    // declaration it represents (including true absence for unconditional).
+    const marker = '.judges.';
+    const markerIndex = l.name.lastIndexOf(marker);
+    const judgeName = markerIndex === -1 ? l.name : l.name.slice(markerIndex + marker.length);
+    const owner = def.steps
+      .flatMap((candidate) => candidate.produces)
+      .find((produce) => produce.kind === 'singleton' && produce.stem === judgedStem);
+    const authored = owner?.judges?.find((judge) => judge.name === judgeName);
+    if (authored === undefined) {
+      errors.push(`judge step '${l.name}' has no matching judge declaration on produce '${judgedStem}'`);
+    } else {
+      const expected = authored.modifiers;
+      const actual = l.judgeModifiers;
+      const sameScope = expected === undefined
+	? actual === undefined
+	: actual !== undefined && expected.length === actual.length && expected.every((value, i) => value === actual[i]);
+      if (!sameScope) {
+	errors.push(`judge step '${l.name}' judgeModifiers must match the scope declared for judge '${judgeName}' on '${judgedStem}'`);
+      }
+    }
+  }
+  for (const l of def.steps) {
+    if (l.judges === undefined && l.judgeModifiers !== undefined) {
+      errors.push(`step '${l.name}' sets judgeModifiers but is not a synthesized judge step`);
+    }
   }
 
   // G25-VALIDATE: declarative exclusive produce-groups per-def rules.
@@ -1832,6 +1875,36 @@ export function validateDef(def: WorkflowDef): string[] {
   //       "defs without `modifiers:` run exactly as today". Opting into the
   //       new routing vocabulary is what turns the stricter rule on.
   const declaredModifiers = new Set(def.modifiers ?? []);
+
+  // J24 modifier scopes are authored only on judge declarations. Validate the
+  // vocabulary here, where the complete definition is available, rather than
+  // letting an unknown scope silently make a gate disappear at runtime.
+  for (const step of def.steps) {
+    for (const produce of step.produces) {
+      for (const judge of produce.judges ?? []) {
+	if (judge.modifiers === undefined) continue;
+	if (judge.modifiers.length === 0) {
+	  errors.push(`judge '${judge.name}' on produce '${produce.stem}' has an empty modifiers list`);
+	}
+	const seen = new Set<string>();
+	for (const modifier of judge.modifiers) {
+	  if (modifier.trim().length === 0 || /\s/.test(modifier) || modifier.includes(MODIFIER_SEPARATOR)) {
+	    errors.push(`judge '${judge.name}' on produce '${produce.stem}' has malformed modifier '${modifier}'`);
+	  }
+	  if (seen.has(modifier)) {
+	    errors.push(`judge '${judge.name}' on produce '${produce.stem}' lists modifier '${modifier}' more than once`);
+	  }
+	  seen.add(modifier);
+	  if (declaredModifiers.size === 0) {
+	    errors.push(`judge '${judge.name}' on produce '${produce.stem}' scopes modifiers but workflow '${def.name}' declares no modifiers:`);
+	  } else if (!declaredModifiers.has(modifier)) {
+	    errors.push(`judge '${judge.name}' on produce '${produce.stem}' modifier '${modifier}' is not in workflow '${def.name}'.modifiers (${[...declaredModifiers].join(', ')})`);
+	  }
+	}
+      }
+    }
+  }
+
   const modifierBinds: Array<{ step: string; artifact: string }> = [];
   for (const l of def.steps) {
     for (const p of l.produces) {
@@ -1864,6 +1937,19 @@ export function validateDef(def: WorkflowDef): string[] {
     errors.push(
       `workflow '${def.name}' binds modifier more than once: ${modifierBinds.map((b) => `'${b.step}.${b.artifact}'`).join(', ')}`,
     );
+  }
+  if (modifierBinds.length === 1) {
+    const { boundArtifact, downstream } = modifierBoundDownstreamSteps(def);
+    for (const step of def.steps) {
+      const hasScopedJudge = step.produces.some((produce) =>
+	produce.judges?.some((judge) => judge.modifiers !== undefined),
+      );
+      if (hasScopedJudge && !downstream.has(step.name)) {
+	errors.push(
+	  `step '${step.name}' produces modifier-scoped judges but is not strictly downstream of artifact '${boundArtifact?.raw ?? modifierBinds[0]!.artifact}' bound to modifier`,
+	);
+      }
+    }
   }
   for (const l of def.steps) {
     if (l.escalation === undefined) continue;
@@ -2139,8 +2225,18 @@ function consumesProducedPattern(consume: ConsumePattern, produce: ProducePatter
   return consume.mode !== 'plain' && consume.suffix === produce.suffix;
 }
 
-/** Warn when routed work can run before the artifact that writes the modifier. */
-function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
+/**
+ * Find the one modifier-binding artifact (when present) and every step that
+ * is strictly downstream of it. The binding step itself is deliberately not
+ * in the result: a sibling output could otherwise commit before the bind.
+ *
+ * This preserves the exact map-suffix matching used by the routing lint.
+ */
+function modifierBoundDownstreamSteps(def: WorkflowDef): {
+  bindingStep?: StepDef;
+  boundArtifact?: ProducePattern;
+  downstream: Set<string>;
+} {
   let bindingStep: StepDef | undefined;
   let boundArtifact: ProducePattern | undefined;
   for (const step of def.steps) {
@@ -2151,28 +2247,33 @@ function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
       break;
     }
   }
-  if (bindingStep === undefined || boundArtifact === undefined) return [];
+  if (bindingStep === undefined || boundArtifact === undefined) return { downstream: new Set() };
 
-  // Forward graph closure from the bound artifact. The binding step itself is
-  // exempt, but its unbound sibling outputs must not make a branch downstream.
-  const reachedSteps = new Set<string>([bindingStep.name]);
+  const downstream = new Set<string>();
   const reachedArtifacts: ProducePattern[] = [boundArtifact];
   let changed = true;
   while (changed) {
     changed = false;
     for (const step of def.steps) {
-      if (reachedSteps.has(step.name)) continue;
+      if (step.name === bindingStep.name || downstream.has(step.name)) continue;
       if (!step.consumes.some((consume) => reachedArtifacts.some((produce) => consumesProducedPattern(consume, produce)))) continue;
-      reachedSteps.add(step.name);
+      downstream.add(step.name);
       reachedArtifacts.push(...step.produces);
       changed = true;
     }
   }
+  return { bindingStep, boundArtifact, downstream };
+}
+
+/** Warn when routed work can run before the artifact that writes the modifier. */
+function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
+  const { bindingStep, boundArtifact, downstream } = modifierBoundDownstreamSteps(def);
+  if (bindingStep === undefined || boundArtifact === undefined) return [];
 
   const warnings: string[] = [];
   for (const step of def.steps) {
     if (step.capabilities === undefined || step.capabilities.length === 0) continue;
-    if (reachedSteps.has(step.name)) continue;
+    if (step.name === bindingStep.name || downstream.has(step.name)) continue;
     warnings.push(
       `step '${step.name}' declares capabilities (${step.capabilities.join(', ')}) but is not downstream of artifact '${boundArtifact.raw}' bound to modifier`,
     );

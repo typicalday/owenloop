@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Store } from '../src/store.ts';
 import { Engine } from '../src/engine.ts';
+import { buildDef } from '../src/defs.ts';
 import { buildTrace } from '../src/model.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -126,5 +127,52 @@ test('buildTrace: empty history — no runs, no artifacts returns valid empty tr
   assert.equal(typeof trace.summary.done, 'boolean');
   assert.ok(trace.inferenceNote.length > 0);
 
+  store.close();
+});
+
+test('buildTrace: modifier-scoped judges appear only when their active deep runs were claimed', () => {
+  const scoped = buildDef({
+    name: 'scoped-trace',
+    modifiers: ['express', 'standard', 'deep'],
+    inputs: [{ name: 'proposal', seedOwed: true }],
+    steps: [{
+      name: 'builder',
+      consumes: ['proposal'],
+      produces: [{
+	name: 'pr',
+	judges: [
+	  { name: 'evidence', body: 'check evidence', modifiers: ['deep'] },
+	  { name: 'rigor', body: 'check rigor', modifiers: ['deep'] },
+	],
+      }],
+    }],
+  });
+
+  for (const modifier of ['express', 'standard']) {
+    const store = new Store(':memory:');
+    const engine = new Engine(store, () => scoped);
+    const wf = engine.createInstance(scoped.name, { modifier, provide: { proposal: { text: modifier } } });
+    const producer = engine.tick(wf).orders[0]!;
+    assert.equal(engine.green(wf, producer.run, 'pr', {}).outcome, 'green');
+    engine.close(wf, producer.run);
+    const trace = buildTrace(scoped, store.listArtifacts(wf), store.listRuns(wf));
+    assert.deepEqual(trace.timeline.filter((event) => event.step.includes('.judges.')), [], `${modifier} has no judge runs in its trace`);
+    store.close();
+  }
+
+  const store = new Store(':memory:');
+  const engine = new Engine(store, () => scoped);
+  const wf = engine.createInstance(scoped.name, { modifier: 'deep', provide: { proposal: { text: 'deep' } } });
+  const producer = engine.tick(wf).orders[0]!;
+  assert.equal(engine.green(wf, producer.run, 'pr', {}).outcome, 'submitted');
+  engine.close(wf, producer.run);
+  const claimed = engine.tick(wf).orders.filter((order) => order.step.includes('.judges.')).map((order) => order.step).sort();
+  assert.deepEqual(claimed, ['builder.pr.judges.evidence', 'builder.pr.judges.rigor']);
+  const trace = buildTrace(scoped, store.listArtifacts(wf), store.listRuns(wf));
+  assert.deepEqual(
+    trace.timeline.filter((event) => event.step.includes('.judges.')).map((event) => event.step).sort(),
+    claimed,
+    'the trace records exactly the active judge runs that were claimed',
+  );
   store.close();
 });

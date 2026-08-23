@@ -544,6 +544,9 @@ export interface ProducePattern {
      *  empty list is not accepted (it would reopen the def-silent hole
      *  deliberately, which no author means to do). */
     capabilities?: string[];
+    /** Optional exact-match workflow-modifier scope. An omitted scope keeps
+     * this native judge unconditional. */
+    modifiers?: string[];
   }>;
 }
 
@@ -705,6 +708,9 @@ export interface StepDef {
   callsInputs?: Record<string, string>;
   /** §24 judges: marker naming the produce stem this synthesized step judges. Mirrors `calls?`. */
   judges?: string;
+  /** §24 internal carrier for a synthesized native judge's modifier scope.
+   * Ordinary steps are never conditional on modifiers. */
+  judgeModifiers?: string[];
   /** §26: declarative exclusive produce-groups spanning two or more of this step's own produces. */
   groups?: GroupDef[];
   /** §27.3: opaque step-level extension map (`x:`). Validated as a plain map at
@@ -1002,6 +1008,8 @@ export interface CheckOptions {
    * to false, restoring the seedOwed-starts-owed behavior described above.
    */
   assumeProvided?: boolean;
+  /** Select the stored workflow modifier variant for this pure check. */
+  modifier?: string;
 }
 
 /** The structured report produced by modelCheck. */
