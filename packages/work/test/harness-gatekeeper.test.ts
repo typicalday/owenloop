@@ -20,12 +20,13 @@ import { test } from 'node:test';
 
 import {
   classifyToolCall,
+  EXACT_WORKDIR_DENIAL_MESSAGE,
   dangerousCommand,
   isInside,
   type GateCall,
   type GatePolicy,
 } from '../src/harness/gatekeeper.ts';
-import { buildClaudeOptions, gatePolicyFor } from '../src/harness/claude.ts';
+import { buildClaudeOptions, buildExactWorkdirPreToolUse, gatePolicyFor } from '../src/harness/claude.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import type { ApprovalRequest, ApprovalRequester, FilesystemPermission } from '../src/harness/contract.ts';
 
@@ -106,6 +107,49 @@ test('isInside resolves traversal rather than pattern-matching the string', () =
   // A sibling directory sharing a name PREFIX with the root is outside it. A
   // `startsWith` implementation passes this by accident.
   assert.equal(isInside(WORKDIR, `${WORKDIR}-other/file.ts`), false);
+});
+
+test('the exact work-root path decision allows contained paths and rejects malformed or outside input without leaking it', () => {
+  const outside = `${WORKDIR}-sibling/${'outside-sentinel'}`;
+  const cases: Array<{ toolName: string; input: Record<string, unknown> }> = [
+    { toolName: 'Read', input: { file_path: 'src/index.ts' } },
+    { toolName: 'Read', input: { file_path: join(WORKDIR, 'README.md') } },
+    { toolName: 'Glob', input: {} },
+    { toolName: 'Grep', input: {} },
+  ];
+  for (const c of cases) {
+    assert.equal(verdict({ ...c, exactWorkdir: true }, 'classifier').decision, 'allow', c.toolName);
+  }
+  for (const c of [
+    { toolName: 'Read', input: {} },
+    { toolName: 'Read', input: { file_path: '' } },
+    { toolName: 'Read', input: { file_path: 4 } },
+    { toolName: 'Read', input: { file_path: '../outside-sentinel' } },
+    { toolName: 'Read', input: { file_path: outside } },
+    { toolName: 'Glob', input: { path: '' } },
+    { toolName: 'Grep', input: { path: false } },
+  ]) {
+    const result = verdict({ ...c, exactWorkdir: true, filesystem: 'unrestricted' }, 'classifier');
+    assert.equal(result.decision, 'deny', c.toolName);
+    assert.equal(result.decision === 'deny' ? result.reason : '', EXACT_WORKDIR_DENIAL_MESSAGE);
+    assert.doesNotMatch(result.decision === 'deny' ? result.reason : '', /outside-sentinel|gatekeeper-fixture/u);
+  }
+});
+
+test('the exact work-root decision treats blockedPath and throwing input as final redacted denies', () => {
+  const hostile: Record<string, unknown> = {};
+  Object.defineProperty(hostile, 'file_path', {
+    enumerable: true,
+    get() { throw new Error('arbitrary-sentinel'); },
+  });
+  for (const c of [
+    { input: { file_path: 'README.md' }, blockedPath: '/sensitive/blocked-sentinel' },
+    { input: hostile },
+  ]) {
+    const result = verdict({ toolName: 'Read', ...c, exactWorkdir: true }, 'classifier');
+    assert.equal(result.decision, 'deny');
+    assert.doesNotMatch(result.decision === 'deny' ? result.reason : '', /blocked-sentinel|arbitrary-sentinel|gatekeeper-fixture/u);
+  }
 });
 
 test('a mutating call outside the working directory escalates under the classifier', () => {
@@ -406,6 +450,37 @@ test('the callback fails closed: an unjudgeable call denies rather than hanging'
   const result = await askCallback(optionsWith('auto-safe'), 'Write', hostile);
   assert.equal(result.behavior, 'deny');
   assert.match(result.behavior === 'deny' ? result.message : '', /could not judge this call/u);
+});
+
+test('the strict callback and PreToolUse hook deny outside paths without asking a human', async () => {
+  const approvals = requester(async () => ({ decision: 'approved' }));
+  const options = buildClaudeOptions(
+    {
+      cwd: WORKDIR,
+      owenloopMcp: { command: 'node', args: [] },
+      permissions: normalizeStepPermissions({ tools: ['Read', 'Glob', 'Grep'] }),
+      approvals: approvals.fn,
+      exactWorkdir: true,
+    },
+    { env: {}, abortController: new AbortController(), onEvent: () => {} },
+  );
+  const denied = await askCallback(options, 'Read', { file_path: `${WORKDIR}-sibling/outside` });
+  assert.deepEqual(denied, { behavior: 'deny', message: EXACT_WORKDIR_DENIAL_MESSAGE });
+  assert.deepEqual(approvals.seen, [], 'the final boundary never creates an approval request');
+
+  const hook = buildExactWorkdirPreToolUse(WORKDIR);
+  const allowed = await hook({
+    hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: 'README.md' }, tool_use_id: 'toolu_in',
+  } as never, undefined, { signal: new AbortController().signal });
+  const blocked = await hook({
+    hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: `${WORKDIR}-sibling/outside` }, tool_use_id: 'toolu_out',
+  } as never, undefined, { signal: new AbortController().signal });
+  assert.equal((allowed as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, 'allow');
+  assert.equal((blocked as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, 'deny');
+  assert.equal(
+    (blocked as { hookSpecificOutput?: { permissionDecisionReason?: string } }).hookSpecificOutput?.permissionDecisionReason,
+    EXACT_WORKDIR_DENIAL_MESSAGE,
+  );
 });
 
 // ---------------------------------------------------------------------------

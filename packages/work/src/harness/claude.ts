@@ -30,6 +30,7 @@ import { delimiter, join } from 'node:path';
 import type {
   CanUseTool,
   EffortLevel,
+  HookCallback,
   McpServerConfig,
   Options,
   PermissionMode,
@@ -40,7 +41,15 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources';
 
-import { classifyToolCall, READ_ONLY_TOOLS, type GatePolicy, type GateVerdict } from './gatekeeper.ts';
+import {
+  classifyExactWorkdirPath,
+  classifyToolCall,
+  EXACT_WORKDIR_DENIAL_MESSAGE,
+  PATH_BEARING_TOOL_NAMES,
+  READ_ONLY_TOOLS,
+  type GatePolicy,
+  type GateVerdict,
+} from './gatekeeper.ts';
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
@@ -108,6 +117,8 @@ const ALLOW_API_BILLING_VAR = 'OWENLOOP_ALLOW_API_BILLING';
 const BIN_OVERRIDE_VAR = 'OWENLOOP_CLAUDE_BIN';
 /** Host-only opt-in liveness controller. Never admitted to the child env. */
 export const CLAUDE_IDLE_TIMEOUT_VAR = 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS';
+/** Host-only opt-in for the exact snapshot-root Claude audit profile. */
+export const CLAUDE_EXACT_WORKDIR_VAR = 'OWENLOOP_CLAUDE_EXACT_WORKDIR';
 const MIN_IDLE_TIMEOUT_MS = 1_000;
 const MAX_IDLE_TIMEOUT_MS = 3_600_000;
 
@@ -134,6 +145,21 @@ export function parseClaudeIdleTimeout(value: string | undefined): HarnessRecove
 
 export function claudeRecoveryPolicy(env: Record<string, string | undefined> = process.env): HarnessRecoveryPolicy | undefined {
   return parseClaudeIdleTimeout(env[CLAUDE_IDLE_TIMEOUT_VAR]);
+}
+
+/** Parse the strict profile as a boolean rather than passing its host spelling onward. */
+export function parseClaudeExactWorkdir(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  if (value === '1') return true;
+  throw new HarnessTurnError(
+    'configuration',
+    true,
+    `${CLAUDE_EXACT_WORKDIR_VAR} must be exactly 1 when present`,
+  );
+}
+
+export function claudeExactWorkdir(env: Record<string, string | undefined> = process.env): boolean {
+  return parseClaudeExactWorkdir(env[CLAUDE_EXACT_WORKDIR_VAR]);
 }
 
 /**
@@ -470,18 +496,33 @@ function buildCanUseTool(
   filesystem: StepPermissions['filesystem'],
   onEvent: (e: AgentEvent) => void,
   approvals?: ApprovalRequester,
+  exactWorkdir = false,
 ): CanUseTool {
   return async (toolName, input, options) => {
     let verdict: GateVerdict;
     try {
       verdict = classifyToolCall(
-        { toolName, input, workdir: cwd, blockedPath: options.blockedPath, filesystem },
+	{
+	  toolName,
+	  input,
+	  workdir: cwd,
+	  blockedPath: options.blockedPath,
+	  filesystem,
+	  exactWorkdir,
+	},
         policy,
       );
     } catch (err) {
       verdict = { decision: 'escalate', reason: `the gatekeeper could not judge this call (${errText(err)})` };
     }
     if (verdict.decision === 'allow') return { behavior: 'allow' };
+
+    // This is a host boundary, not a legacy escalation. It never enters the
+    // approval channel and its fixed message cannot serialize a model path.
+    if (verdict.decision === 'deny') {
+      onEvent({ kind: 'progress', text: `exact work-root policy: ${toolName} denied` });
+      return { behavior: 'deny', message: verdict.reason };
+    }
 
     if (approvals !== undefined) {
       const title = approvalTitle(toolName, input, options.title);
@@ -563,6 +604,7 @@ const BORN_BOUND_OWENLOOP_TOOLS = BORN_BOUND_OWENLOOP_TOOL_NAMES.map(
   (name) => `mcp__owenloop__${name}`,
 );
 const RESTRICTED_OWENLOOP_DENIED_TOOLS = ['mcp__owenloop__reject'] as const;
+const EXACT_WORKDIR_BUILTINS = new Set(['Read', 'Glob', 'Grep']);
 const OWENLOOP_CONTROL_TOOLS = new Set([
   ...BORN_BOUND_OWENLOOP_TOOLS,
   'mcp__plugin_owenloop_owenloop__get_order',
@@ -577,8 +619,43 @@ const OWENLOOP_CONTROL_DENY_SPECS = new Set([
   'mcp__*',
 ]);
 
+function effectiveClaudeTools(permissions: StepPermissions): readonly string[] | undefined {
+  if (permissions.tools !== undefined) return permissions.tools;
+  if (permissions.filesystem === 'read-only') {
+    return permissions.network === 'owenloop-only'
+      ? READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS
+      : [...READ_ONLY_TOOLS];
+  }
+  if (permissions.network === 'owenloop-only') return [...OWENLOOP_ONLY_NETWORK_TOOLS];
+  return undefined;
+}
+
+function strictWorkdirToolIssue(permissions: StepPermissions): PermissionIssue | undefined {
+  const effective = effectiveClaudeTools(permissions);
+  if (effective === undefined) {
+    return {
+      field: 'tools',
+      message: `${CLAUDE_EXACT_WORKDIR_VAR}=1 requires an explicit or derived built-in surface containing only Read, Glob, and Grep`,
+    };
+  }
+  const unsafe = effective.filter(
+    (tool) => !EXACT_WORKDIR_BUILTINS.has(tool) && !BORN_BOUND_OWENLOOP_TOOLS.includes(tool as typeof BORN_BOUND_OWENLOOP_TOOLS[number]),
+  );
+  if (unsafe.length === 0) return undefined;
+  return {
+    field: 'tools',
+    message: `${CLAUDE_EXACT_WORKDIR_VAR}=1 permits only Read, Glob, Grep, and born-bound Owenloop controls; remove: ${unsafe.join(', ')}`,
+  };
+}
+
 function claudePreflight(permissions: StepPermissions): PermissionIssue[] {
   const issues: PermissionIssue[] = [];
+  let exactWorkdir = false;
+  try {
+    exactWorkdir = claudeExactWorkdir(process.env);
+  } catch (error) {
+    issues.push({ field: CLAUDE_EXACT_WORKDIR_VAR, message: errText(error) });
+  }
   const authoredMode = permissions.permissionMode;
   if (authoredMode !== undefined) {
     if (!ACCEPTED_PERMISSION_MODES.includes(authoredMode)) {
@@ -650,6 +727,10 @@ function claudePreflight(permissions: StepPermissions): PermissionIssue[] {
       message: `the born-bound Owenloop control plane must retain get_order/submit access; remove: ${deniedControl.join(', ')}`,
     });
   }
+  if (exactWorkdir) {
+    const strictIssue = strictWorkdirToolIssue(permissions);
+    if (strictIssue !== undefined) issues.push(strictIssue);
+  }
   return issues;
 }
 
@@ -666,6 +747,39 @@ function isPlainMap(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** Programmatic PreToolUse guard for every path-bearing exposed built-in. */
+export function buildExactWorkdirPreToolUse(cwd: string): HookCallback {
+  return async (input) => {
+    const deny = {
+      continue: true,
+      hookSpecificOutput: {
+	hookEventName: 'PreToolUse' as const,
+	permissionDecision: 'deny' as const,
+	permissionDecisionReason: EXACT_WORKDIR_DENIAL_MESSAGE,
+      },
+    };
+    try {
+      if (input.hook_event_name !== 'PreToolUse' || !PATH_BEARING_TOOL_NAMES.has(input.tool_name)) return deny;
+      if (!isPlainMap(input.tool_input)) return deny;
+      const verdict = classifyExactWorkdirPath({
+	toolName: input.tool_name,
+	input: input.tool_input,
+	workdir: cwd,
+      });
+      if (verdict.decision === 'deny') return deny;
+      return {
+	continue: true,
+	hookSpecificOutput: {
+	  hookEventName: 'PreToolUse' as const,
+	  permissionDecision: 'allow' as const,
+	},
+      };
+    } catch {
+      return deny;
+    }
+  };
+}
+
 /** The mount for owenloop's own work-holder MCP surface, built from the worker's
  *  verbatim argv. `alwaysLoad` forces its tools into the turn-1 prompt instead of
  *  deferring them behind tool search — a step agent that cannot see `submit` on
@@ -674,7 +788,7 @@ function owenloopMount(mount: { command: string; args: string[] }): McpServerCon
   return { type: 'stdio', command: mount.command, args: mount.args, alwaysLoad: true };
 }
 
-/** Restricted sessions register a positive two-tool subset. The selector is
+/** Restricted sessions register a positive born-bound subset. The selector is
  * derived from the same names used by `allowedTools`, so the declared exception
  * and the MCP server's actual `tools/list` cannot drift within this adapter. */
 function restrictedOwenloopMount(mount: { command: string; args: string[] }): McpServerConfig {
@@ -711,6 +825,8 @@ export interface ClaudeOptionInputs {
    *  refuse-and-route-to-`ask` behavior — see `buildCanUseTool`. */
   approvals?: ApprovalRequester;
   recoveryPolicy?: HarnessRecoveryPolicy;
+  /** Host-parsed policy bit. Its environment spelling never enters Options. */
+  exactWorkdir?: boolean;
 }
 
 /** The non-declarative bits a caller supplies per invocation. */
@@ -739,8 +855,15 @@ export function buildClaudeOptions(
   extra: ClaudeOptionExtras,
 ): Options {
   const { permissions } = inputs;
+	const exactWorkdir = inputs.exactWorkdir === true;
+	const effectiveTools = effectiveClaudeTools(permissions);
+	if (exactWorkdir) {
+		const issue = strictWorkdirToolIssue(permissions);
+		if (issue !== undefined) throw new HarnessTurnError('configuration', true, issue.message);
+	}
 	const diagnosticEvent = inputs.recoveryPolicy === undefined ? extra.onEvent : (_event: AgentEvent): void => {};
   const isolated =
+    exactWorkdir ||
     permissions.tools !== undefined ||
     permissions.filesystem === 'read-only' ||
     permissions.network === 'owenloop-only';
@@ -767,8 +890,15 @@ export function buildClaudeOptions(
       permissions.filesystem,
 	  diagnosticEvent,
       inputs.approvals,
+	  exactWorkdir,
     ),
   };
+
+	if (exactWorkdir) {
+		options.hooks = {
+			PreToolUse: [{ matcher: [...PATH_BEARING_TOOL_NAMES].join('|'), hooks: [buildExactWorkdirPreToolUse(inputs.cwd)] }],
+		};
+	}
 
   // Partial messages are provider transport only: they reset liveness below but
   // are never mapped into progress/evidence output.
@@ -832,18 +962,8 @@ export function buildClaudeOptions(
   // exception: the audited built-in list becomes explicit, and `allowedTools`
   // also auto-allows the born-bound get_order/submit MCP tools so the restricted
   // agent can inspect and finish its order without an unattended permission prompt.
-  // The restricted MCP child itself registers exactly those two tools; allowedTools
+  // The restricted MCP child itself registers exactly those born-bound tools; allowedTools
   // is permission automation, not an MCP visibility filter.
-  let effectiveTools = permissions.tools;
-  if (effectiveTools === undefined && permissions.filesystem === 'read-only') {
-    // Filesystem and network are independent. A read-only filesystem still gets
-    // audited network readers unless the step separately restricts the network.
-    effectiveTools = permissions.network === 'owenloop-only'
-      ? READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS
-      : [...READ_ONLY_TOOLS];
-  } else if (effectiveTools === undefined && permissions.network === 'owenloop-only') {
-    effectiveTools = [...OWENLOOP_ONLY_NETWORK_TOOLS];
-  }
   if (effectiveTools !== undefined) {
     options.tools = effectiveTools.filter((tool) => !OWENLOOP_CONTROL_TOOLS.has(tool));
     options.allowedTools = [
@@ -888,7 +1008,7 @@ export function buildClaudeOptions(
   // Outside isolation, `settingSources` and `strictMcpConfig` stay unset so the
   // SDK preserves its normal settings and MCP behavior, including the full
   // get_order/submit/reject work-holder server. Isolation sets `settingSources: []`
-  // and `strictMcpConfig: true` above, mounts the positive two-tool work-holder
+  // and `strictMcpConfig: true` above, mounts the positive born-bound work-holder
   // subset, and removes settings, hooks, skills, or external MCP that could bypass
   // the authored restriction.
   // `persistSession` always stays unset: its default is `true`, and disabling it
@@ -971,6 +1091,8 @@ export interface ConsumeTurnControl {
   now?: () => number;
   setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  /** Strict profile's literal provider identity check, never a public arg. */
+  expectedModel?: string;
 }
 
 /** Trim a progress line to something a log can hold. Mirrors the codex adapter's
@@ -1113,6 +1235,7 @@ export async function consumeTurn(
   control: ConsumeTurnControl = {},
 ): Promise<TurnOutcome> {
   let sessionId: string | undefined;
+  let sawInit = false;
   let finalResponse: string | undefined;
   let terminalFailure: HarnessTurnError | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1121,6 +1244,7 @@ export async function consumeTurn(
   let timerGeneration = 0;
   let controlledQueryClosed = false;
 	const recoveryEnabled = control.idleTimeoutMs !== undefined;
+	const strictModelIdentity = control.expectedModel !== undefined;
 	const sanitizeProviderTelemetry = control.sanitizeProviderTelemetry === true;
   const now = control.now ?? Date.now;
   const setTimer = control.setTimer ?? setTimeout;
@@ -1188,7 +1312,10 @@ export async function consumeTurn(
       const next = iterator.next();
       const item = timeout === undefined ? await next : await Promise.race([next, timeout]);
       if (item.done) {
-		if (recoveryEnabled && terminalFailure !== undefined) throw terminalFailure;
+		if (strictModelIdentity && !sawInit) {
+			throw new HarnessTurnError('model-unavailable', true, 'provider did not confirm the configured literal model');
+		}
+		if ((recoveryEnabled || strictModelIdentity) && terminalFailure !== undefined) throw terminalFailure;
 		return { sessionId, sawResult: false };
 	  }
       const message = item.value;
@@ -1196,6 +1323,7 @@ export async function consumeTurn(
       // proof of provider liveness.
       arm();
     if (message.type === 'system' && message.subtype === 'init') {
+	  sawInit = true;
       if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
 		if (sanitizeProviderTelemetry) {
 		  throw new HarnessTurnError('provider', false, 'provider session identity mismatch (details redacted)');
@@ -1204,6 +1332,9 @@ export async function consumeTurn(
 	  `provider session id mismatch: expected ${expectedSessionId}, received ${message.session_id}`,
 	);
       }
+	  if (strictModelIdentity && message.model !== control.expectedModel) {
+		throw new HarnessTurnError('model-unavailable', true, 'provider did not honor the configured literal model');
+	  }
       sessionId = message.session_id;
       // The ONLY place these are observable. The live smoke asserts on the
       // `apiKeySource` here (subscription OAuth vs. an API key), and a later
@@ -1220,8 +1351,13 @@ export async function consumeTurn(
 		});
 	  }
       onInit?.(sessionId);
+    } else if (message.type === 'system' && message.subtype === 'model_refusal_fallback' && strictModelIdentity) {
+		throw new HarnessTurnError('model-unavailable', true, 'provider attempted a model fallback');
     } else if (message.type === 'result') {
-	  const classified = recoveryEnabled ? terminalFailure ?? classifyResult(message) : undefined;
+	  if (strictModelIdentity && !sawInit) {
+		throw new HarnessTurnError('model-unavailable', true, 'provider did not confirm the configured literal model');
+	  }
+	  const classified = recoveryEnabled || strictModelIdentity ? terminalFailure ?? classifyResult(message) : undefined;
 	  if (!sanitizeProviderTelemetry && finalResponse !== undefined) {
 		onEvent({ kind: 'assistant_response', text: finalResponse });
 	  }
@@ -1238,15 +1374,15 @@ export async function consumeTurn(
         });
       }
       onEvent({ kind: 'turn_ended' });
-	  if (recoveryEnabled && classified !== undefined) throw classified;
+	  if ((recoveryEnabled || strictModelIdentity) && classified !== undefined) throw classified;
       return { sessionId, sawResult: true };
     } else if (message.type === 'assistant') {
 	  if (!sanitizeProviderTelemetry) {
 		emitAssistant(message, onEvent);
 		finalResponse = assistantResponse(message) ?? finalResponse;
 	  }
-	  if (recoveryEnabled) terminalFailure ??= classifyAssistantError(message.error);
-		} else if (recoveryEnabled && message.type === 'auth_status' && message.error !== undefined) {
+	  if (recoveryEnabled || strictModelIdentity) terminalFailure ??= classifyAssistantError(message.error);
+		} else if ((recoveryEnabled || strictModelIdentity) && message.type === 'auth_status' && message.error !== undefined) {
 			// `error` is a structured SDK field. Its prose is deliberately neither
 			// logged nor parsed for recovery decisions.
 			throw new HarnessTurnError('authentication', true, 'provider authentication status failed');
@@ -1263,7 +1399,7 @@ export async function consumeTurn(
     // routine CLI upgrade into a failed order.
     }
   } catch (error) {
-		if (!recoveryEnabled) throw error;
+		if (!recoveryEnabled && !strictModelIdentity) throw error;
 		if (terminalFailure?.terminal === true) throw terminalFailure;
 		if (idleTimeoutFailure !== undefined) throw idleTimeoutFailure;
 		if (isHarnessTurnError(error)) throw error;
@@ -1297,6 +1433,13 @@ export async function startClaude(
   onEvent: (e: AgentEvent) => void,
   dependencies: ClaudeStartDependencies = DEFAULT_START_DEPENDENCIES,
 ): Promise<HarnessSessionRef> {
+  // Parse and validate host policy before even emitting a start marker: a bad
+  // audit configuration must not construct a provider query or a resumable row.
+  const exactWorkdir = claudeExactWorkdir(process.env);
+  if (exactWorkdir) {
+    const issue = strictWorkdirToolIssue(args.permissions);
+    if (issue !== undefined) throw new HarnessTurnError('configuration', true, issue.message);
+  }
   // The provider token exists before any SDK work. `started` is synchronous by
   // contract, so the caller's fsynced active-row append must return before the
   // query factory can initialize a process or receive prompt bytes.
@@ -1315,7 +1458,7 @@ export async function startClaude(
 
   const env = buildChildEnv(process.env, { allowApiBilling: allowApiBillingFrom(process.env) });
   const abortController = new AbortController();
-  const options = buildClaudeOptions(args, { env, abortController, onEvent, sessionId });
+  const options = buildClaudeOptions({ ...args, exactWorkdir }, { env, abortController, onEvent, sessionId });
 
   let q: ClaudeQuery;
   try {
@@ -1382,6 +1525,7 @@ export async function startClaude(
 				sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
 				abortController,
 				close: closeExact,
+				...(exactWorkdir && options.model !== undefined ? { expectedModel: options.model } : {}),
 				onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
       },
     );
@@ -1419,6 +1563,13 @@ export async function deliverClaude(
   onEvent: (e: AgentEvent) => void,
   dependencies: ClaudeDeliverDependencies = DEFAULT_DELIVER_DEPENDENCIES,
 ): Promise<void> {
+  // This must precede the session-info preflight too: an incompatible strict
+  // profile is a configuration error, not a reason to ask the provider first.
+  const exactWorkdir = claudeExactWorkdir(process.env);
+  if (exactWorkdir) {
+    const issue = strictWorkdirToolIssue(args.permissions);
+    if (issue !== undefined) throw new HarnessTurnError('configuration', true, issue.message);
+  }
   // Session lookup is scoped to the PROJECT DIRECTORY, so a deleted worktree can
   // never resume no matter how good the token is. Distinct message on purpose —
   // the caller reads these to tell the two failures apart.
@@ -1469,7 +1620,7 @@ export async function deliverClaude(
   // A resumed turn does not inherit permission mode / tool lists / model from the
   // session — they are per-invocation flags — which is exactly why they must be
   // re-mapped here.
-  const options: Options = buildClaudeOptions(args, {
+  const options: Options = buildClaudeOptions({ ...args, exactWorkdir }, {
     env,
     abortController,
     onEvent,
@@ -1527,6 +1678,7 @@ export async function deliverClaude(
 	  sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
       abortController,
       close: closeExact,
+	  ...(exactWorkdir && options.model !== undefined ? { expectedModel: options.model } : {}),
       onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
     });
   } catch (err) {

@@ -28,9 +28,12 @@ import {
   allowApiBillingFrom,
   buildChildEnv,
   buildClaudeOptions,
+  CLAUDE_EXACT_WORKDIR_VAR,
   claudeAdapter,
+  claudeExactWorkdir,
   consumeTurn,
 	deliverClaude,
+  parseClaudeExactWorkdir,
   parseClaudeIdleTimeout,
   resolveExecutable,
   startClaude,
@@ -81,6 +84,7 @@ function optionsFor(
     step?: { model?: string };
     startModel?: string;
     startEffort?: string;
+    exactWorkdir?: boolean;
     env?: Record<string, string | undefined>;
     cwd?: string;
   } = {},
@@ -92,6 +96,7 @@ function optionsFor(
     permissions: normalizeStepPermissions(bag, opts.step),
     ...(opts.startModel !== undefined ? { model: opts.startModel } : {}),
     ...(opts.startEffort !== undefined ? { effort: opts.startEffort } : {}),
+    ...(opts.exactWorkdir === true ? { exactWorkdir: true } : {}),
   };
   const options = buildClaudeOptions(inputs, {
     env: opts.env ?? bareEnv(),
@@ -163,6 +168,43 @@ test('an empty bag leaves every optional key ABSENT, not empty', () => {
   // The owenloop mount is unconditional — it is how the agent reaches its order.
   assert.deepEqual(Object.keys(options.mcpServers as object), ['owenloop']);
   assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'reject', 'ask']);
+});
+
+test('the exact-work-root host setting is a fail-closed host-only boolean', () => {
+  assert.equal(parseClaudeExactWorkdir(undefined), false);
+  assert.equal(parseClaudeExactWorkdir('1'), true);
+  for (const value of ['', '0', 'true', '01']) {
+    assert.throws(() => parseClaudeExactWorkdir(value), (error: unknown) =>
+      error instanceof HarnessTurnError && error.category === 'configuration' && error.terminal === true,
+    );
+  }
+  assert.equal(claudeExactWorkdir({ [CLAUDE_EXACT_WORKDIR_VAR]: '1' }), true);
+});
+
+test('exact-work-root options force isolation, retain bare audited readers, and install only the host hook', () => {
+  const { options } = optionsFor({ tools: ['Read', 'Glob', 'Grep'] }, { exactWorkdir: true });
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
+  assert.deepEqual(options.allowedTools, [
+    'Read', 'Glob', 'Grep', 'mcp__owenloop__get_order', 'mcp__owenloop__submit', 'mcp__owenloop__ask',
+  ]);
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(options.skills, []);
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'ask']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
+  assert.equal(options.hooks?.PreToolUse?.length, 1);
+  assert.equal(options.hooks?.PreToolUse?.[0]?.matcher, 'Read|Write|Edit|NotebookRead|NotebookEdit|Glob|Grep');
+
+  const empty = optionsFor({ tools: [] }, { exactWorkdir: true }).options;
+  assert.deepEqual(empty.tools, []);
+  assert.deepEqual(empty.allowedTools, ['mcp__owenloop__get_order', 'mcp__owenloop__submit', 'mcp__owenloop__ask']);
+
+  for (const bag of [undefined, { tools: ['Read', 'Bash'] }, { tools: ['WebFetch'] }]) {
+    assert.throws(
+      () => optionsFor(bag, { exactWorkdir: true }),
+      (error: unknown) => error instanceof HarnessTurnError && error.category === 'configuration',
+    );
+  }
 });
 
 test('the owenloop mount overwrites a bag that declares its own owenloop server', () => {
@@ -569,6 +611,32 @@ test('the idle-timeout parser accepts bounded canonical decimals and rejects inv
   }
 });
 
+test('strict literal model identity accepts only the provider-confirmed configured model on cold or resume streams', async () => {
+  async function* stream(model: string): AsyncGenerator<SDKMessage> {
+    yield {
+      type: 'system', subtype: 'init', session_id: 'strict-session', mcp_servers: [],
+      claude_code_version: 'test', model, apiKeySource: 'test', permissionMode: 'default', cwd: '/tmp/work',
+    } as unknown as SDKMessage;
+    yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
+  }
+  await consumeTurn(stream('gpt-5.6-luna'), () => {}, undefined, undefined, { expectedModel: 'gpt-5.6-luna' });
+  await assert.rejects(
+    consumeTurn(stream('substituted-model'), () => {}, undefined, undefined, { expectedModel: 'gpt-5.6-luna' }),
+    (error: unknown) => error instanceof HarnessTurnError && error.category === 'model-unavailable' && error.terminal,
+  );
+  async function* fallback(): AsyncGenerator<SDKMessage> {
+    yield {
+      type: 'system', subtype: 'init', session_id: 'strict-session', mcp_servers: [],
+      claude_code_version: 'test', model: 'gpt-5.6-luna', apiKeySource: 'test', permissionMode: 'default', cwd: '/tmp/work',
+    } as unknown as SDKMessage;
+    yield { type: 'system', subtype: 'model_refusal_fallback' } as unknown as SDKMessage;
+  }
+  await assert.rejects(
+    consumeTurn(fallback(), () => {}, undefined, undefined, { expectedModel: 'gpt-5.6-luna' }),
+    (error: unknown) => error instanceof HarnessTurnError && error.category === 'model-unavailable' && error.terminal,
+  );
+});
+
 test('a silent SDK iterator aborts and closes its exact controlled query', async () => {
   let fire: (() => void) | undefined;
   let cleared = 0;
@@ -713,6 +781,35 @@ test('a terminal assistant error remains authoritative when the stream ends befo
 		};
 		await assert.rejects(
 			consumeTurn(stream, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
+			(error: unknown) =>
+				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
+			scenario.providerError,
+		);
+	}
+});
+
+test('strict model identity rejects initialized streams with terminal assistant errors that end without a result', async () => {
+	const cases = [
+		{ providerError: 'authentication_failed', category: 'authentication' },
+		{ providerError: 'model_not_found', category: 'model-unavailable' },
+	] as const;
+
+	for (const scenario of cases) {
+		const stream: AsyncIterable<SDKMessage> = {
+			async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+				yield {
+					type: 'system', subtype: 'init', session_id: 'strict-session', mcp_servers: [],
+					claude_code_version: 'test', model: 'gpt-5.6-luna', apiKeySource: 'test',
+					permissionMode: 'default', cwd: '/tmp/work',
+				} as unknown as SDKMessage;
+				yield {
+					type: 'assistant', parent_tool_use_id: null,
+					error: scenario.providerError, message: { content: [] },
+				} as unknown as SDKMessage;
+			},
+		};
+		await assert.rejects(
+			consumeTurn(stream, () => {}, undefined, undefined, { expectedModel: 'gpt-5.6-luna' }),
 			(error: unknown) =>
 				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
 			scenario.providerError,
@@ -1191,6 +1288,175 @@ test('resume refusal after a successful session preflight remains ResumeUnavaila
 	assert.equal(preflights, 1, 'the provider knew the session before the resume race');
 	assert.equal(closes, 1, 'the refused exact query is closed once');
 	assert.deepEqual(events, [], 'resume refusal is classified before generic provider telemetry');
+});
+
+test('the real SDK PreToolUse exchange gates bare allowed readers on cold start and resume', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-claude-pretool-'));
+  coldStartDirs.push(root);
+	const sibling = `${root}-sibling`;
+	coldStartDirs.push(sibling);
+	mkdirSync(sibling);
+	writeFileSync(join(root, 'inside-marker.txt'), 'inside marker from a regular file');
+	writeFileSync(join(sibling, 'outside-marker.txt'), 'outside marker must never be read');
+  const bin = join(root, 'bin');
+  mkdirSync(bin);
+  const child = fileURLToPath(new URL('./fixtures/claude-pretool-hook-child.mjs', import.meta.url));
+  const executable = join(bin, 'claude');
+  writeFileSync(executable, `#!/bin/sh\nexec '${process.execPath}' '${child}' "$@"\n`);
+  chmodSync(executable, 0o755);
+  const capture = join(root, 'capture.jsonl');
+  const envKeys = [
+	'PATH',
+	'PRETOOL_CAPTURE',
+	'PRETOOL_FIXTURE_MODE',
+	'PRETOOL_OUTSIDE_MARKER',
+	CLAUDE_EXACT_WORKDIR_VAR,
+  ] as const;
+  const prior = new Map(envKeys.map((key) => [key, process.env[key]]));
+  const token = '99999999-9999-4999-8999-999999999999';
+  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const realQuery: ClaudeQueryFactory = ({ prompt, options }) => query({ prompt, options });
+  try {
+    process.env.PATH = `${bin}${delimiter}${process.env.PATH ?? ''}`;
+    process.env.PRETOOL_CAPTURE = capture;
+	process.env.PRETOOL_FIXTURE_MODE = 'normal';
+	process.env.PRETOOL_OUTSIDE_MARKER = join(sibling, 'outside-marker.txt');
+    process.env[CLAUDE_EXACT_WORKDIR_VAR] = '1';
+    const args = {
+      ...coldStartArgs(root),
+      model: 'gpt-5.6-luna',
+      effort: 'max',
+      permissions: normalizeStepPermissions({ tools: ['Read', 'Glob', 'Grep'] }),
+    };
+    const ref = await startClaude(args, () => {}, {
+      createSessionId: () => token,
+      loadQuery: async () => realQuery,
+    });
+    await deliverClaude(ref, 'resume', {
+      cwd: root,
+      owenloopMcp: MOUNT,
+      model: 'gpt-5.6-luna',
+      effort: 'max',
+      permissions: normalizeStepPermissions({ tools: ['Read', 'Glob', 'Grep'] }),
+    }, () => {}, {
+      getSessionInfo: async () => ({}),
+      loadQuery: async () => realQuery,
+    });
+    await claudeAdapter.stop(ref);
+  } finally {
+    for (const key of envKeys) {
+      const value = prior.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  const records = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+  const initialized = records.filter((record) => record.kind === 'initialize');
+  assert.equal(initialized.length, 2, 'cold and resume initialize independently');
+	const expectedAllowedTools = [
+	  'Read',
+	  'Glob',
+	  'Grep',
+	  'mcp__owenloop__get_order',
+	  'mcp__owenloop__submit',
+	  'mcp__owenloop__ask',
+	].join(',');
+	for (const [index, record] of initialized.entries()) {
+		const argv = record.argv as string[];
+		const valueAfter = (flag: string): string | undefined => {
+			const offset = argv.indexOf(flag);
+			return offset < 0 ? undefined : argv[offset + 1];
+		};
+		assert.equal(valueAfter('--allowedTools'), expectedAllowedTools, 'bare audited reader allow-list reaches the CLI');
+		assert.equal(valueAfter('--tools'), 'Read,Glob,Grep', 'the strict built-in surface reaches the CLI');
+		assert.equal(valueAfter('--model'), 'gpt-5.6-luna', 'literal model reaches the CLI');
+		assert.equal(valueAfter('--effort'), 'max', 'literal effort reaches the CLI');
+		assert.equal(argv.some((arg) => arg.startsWith('--fallback-model')), false, 'strict mode never configures a fallback');
+		assert.equal(argv.includes(`--resume=${token}`), index === 1, 'only the second construction is the resumed turn');
+    assert.equal(JSON.stringify(record).includes('hook_'), true, 'the SDK registered the host PreToolUse callback');
+  }
+  const decisions = new Map(records.filter((record) => record.kind === 'hook').map((record) => [record.name, record.decision]));
+  for (const name of ['inside-read', 'inside-glob', 'inside-grep']) assert.equal(decisions.get(name), 'allow', name);
+  for (const name of ['outside-read', 'outside-glob', 'outside-grep']) assert.equal(decisions.get(name), 'deny', name);
+	assert.deepEqual(
+		records.find((record) => record.kind === 'read' && record.name === 'inside-read'),
+		{ kind: 'read', name: 'inside-read', content: 'inside marker from a regular file' },
+		'the allowed SDK callback reaches a real file read only after approval',
+	);
+	assert.deepEqual(
+		records.find((record) => record.kind === 'read-skipped' && record.name === 'outside-read'),
+		{ kind: 'read-skipped', name: 'outside-read', decision: 'deny' },
+		'the controlled sibling read reaches the hook but is never executed after denial',
+	);
+	assert.equal(
+		records.some((record) => record.kind === 'read' && record.name === 'outside-read'),
+		false,
+		'the outside marker cannot be read unless the strict hook incorrectly allowed it',
+	);
+});
+
+test('strict cold and resumed SDK lifecycles reject a substituted provider model or fallback', async () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-claude-strict-model-'));
+	coldStartDirs.push(root);
+	writeFileSync(join(root, 'inside-marker.txt'), 'inside marker');
+	const bin = join(root, 'bin');
+	mkdirSync(bin);
+	const child = fileURLToPath(new URL('./fixtures/claude-pretool-hook-child.mjs', import.meta.url));
+	const executable = join(bin, 'claude');
+	writeFileSync(executable, `#!/bin/sh\nexec '${process.execPath}' '${child}' "$@"\n`);
+	chmodSync(executable, 0o755);
+	const envKeys = ['PATH', 'PRETOOL_FIXTURE_MODE', CLAUDE_EXACT_WORKDIR_VAR] as const;
+	const prior = new Map(envKeys.map((key) => [key, process.env[key]]));
+	const token = '99999999-9999-4999-8999-999999999999';
+	const { query } = await import('@anthropic-ai/claude-agent-sdk');
+	const realQuery: ClaudeQueryFactory = ({ prompt, options }) => query({ prompt, options });
+	const strictArgs = {
+		...coldStartArgs(root),
+		model: 'gpt-5.6-luna',
+		effort: 'max',
+		permissions: normalizeStepPermissions({ tools: ['Read', 'Glob', 'Grep'] }),
+	};
+	const isModelUnavailable = (error: unknown): boolean =>
+		error instanceof HarnessTurnError && error.category === 'model-unavailable' && error.terminal;
+	try {
+		process.env.PATH = `${bin}${delimiter}${process.env.PATH ?? ''}`;
+		process.env[CLAUDE_EXACT_WORKDIR_VAR] = '1';
+		process.env.PRETOOL_FIXTURE_MODE = 'substituted';
+		await assert.rejects(
+			startClaude(strictArgs, () => {}, {
+				createSessionId: () => token,
+				loadQuery: async () => realQuery,
+			}),
+			isModelUnavailable,
+		);
+
+		process.env.PRETOOL_FIXTURE_MODE = 'normal';
+		const ref = await startClaude(strictArgs, () => {}, {
+			createSessionId: () => token,
+			loadQuery: async () => realQuery,
+		});
+		process.env.PRETOOL_FIXTURE_MODE = 'fallback';
+		await assert.rejects(
+			deliverClaude(ref, 'resume', {
+				cwd: root,
+				owenloopMcp: MOUNT,
+				model: 'gpt-5.6-luna',
+				effort: 'max',
+				permissions: normalizeStepPermissions({ tools: ['Read', 'Glob', 'Grep'] }),
+			}, () => {}, {
+				getSessionInfo: async () => ({}),
+				loadQuery: async () => realQuery,
+			}),
+			isModelUnavailable,
+		);
+		await claudeAdapter.stop(ref);
+	} finally {
+		for (const key of envKeys) {
+			const value = prior.get(key);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 });
 
 // ---------------------------------------------------------------------------

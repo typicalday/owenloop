@@ -87,6 +87,7 @@ test('inside the namespace the ten admitted inputs survive and everything else i
     OWENLOOP_SERVE_CREWS: 'first,second',
     OWENLOOP_CREDENTIAL_ORIGIN: 'https://helper.example',
     OWENLOOP_CREDENTIAL_SLOT: 'agent:holder',
+    OWENLOOP_CLAUDE_EXACT_WORKDIR: '1',
     // The case that matters most: a name nobody has thought of yet.
     OWENLOOP_INVENTED_NEXT_PHASE: 'surprise',
   });
@@ -102,6 +103,11 @@ test('inside the namespace the ten admitted inputs survive and everything else i
     OWENLOOP_SESSION: 'sess-1',
     OWENLOOP_WORKFLOW: 'wf-1',
   });
+  assert.equal(
+    'OWENLOOP_CLAUDE_EXACT_WORKDIR' in out,
+    false,
+    'the host-only exact work-root switch must never reach a harness child',
+  );
 });
 
 test('the filter copies rather than mutating, and uses delete rather than undefined', () => {
