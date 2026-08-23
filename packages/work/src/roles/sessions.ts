@@ -146,11 +146,38 @@ function recoverySummary(rec: SessionRecord): string {
   ].join(', ');
 }
 
-/** Recovery records are a safe projection, unlike legacy local-resume rows. */
-export function projectSession(rec: SessionRecord): Omit<SessionRecord, 'token'> | SessionRecord {
+/**
+ * Recovery records use an explicit allowlist, unlike legacy local-resume rows.
+ * The JSONL reader intentionally preserves forward fields, so exclusion-based
+ * redaction would disclose any future/stray prompt, credential, config, token,
+ * or failure-prose field that reached the machine-local store.
+ */
+export function projectSession(rec: SessionRecord): SessionRecord | Record<string, unknown> {
   if (rec.recovery === undefined) return rec;
-  const { token: _token, ...safe } = rec;
-  return safe;
+  const state = rec.recovery;
+  return {
+    workflow: rec.workflow,
+    run: rec.run,
+    step: rec.step,
+    order: rec.order,
+    ...(rec.key !== undefined ? { key: rec.key } : {}),
+    attempt: rec.attempt,
+    harness: rec.harness,
+    status: rec.status,
+    createdAt: rec.createdAt,
+    ...(rec.deliveredReasonAt !== undefined ? { deliveredReasonAt: rec.deliveredReasonAt } : {}),
+    updatedAt: rec.updatedAt,
+    recovery: {
+      generation: state.generation,
+      phase: state.phase,
+      wakeUsed: state.wakeUsed,
+      coldRestartUsed: state.coldRestartUsed,
+      ...(state.phaseStartedAt !== undefined ? { phaseStartedAt: state.phaseStartedAt } : {}),
+      ...(state.lastActivityAt !== undefined ? { lastActivityAt: state.lastActivityAt } : {}),
+      ...(state.deadlineAt !== undefined ? { deadlineAt: state.deadlineAt } : {}),
+      ...(state.lastFailure !== undefined ? { lastFailure: { category: state.lastFailure.category, at: state.lastFailure.at } } : {}),
+    },
+  };
 }
 
 /** Render the table. Exported for the unit test; `run` does the I/O. */

@@ -509,6 +509,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
   let signalled = false;
   let leaseSettled = false;
+  let settledLeaseOutcome: LeaseOutcome | undefined;
   let torndown = false;
   let leasePromise: Promise<LeaseOutcome> | undefined;
   let adapter: HarnessAdapter | undefined;
@@ -795,8 +796,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
   async function run(): Promise<AgentRunOutcome> {
     leasePromise = lease.run();
-    void leasePromise.then(() => {
+    void leasePromise.then((outcome) => {
       leaseSettled = true;
+      settledLeaseOutcome = outcome;
     });
 
     // First contact race: the order arrives (hold established), or the lease
@@ -1188,6 +1190,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						await teardown();
 						return releaseWith('session-store-failed', 'session-store-failed');
 					};
+					// A saved phase may have dispatched in a prior worker even though this
+					// process cannot distinguish that from a crash just after checkpointing.
+					// Treat it as post-dispatch so a late hub outcome is still confirmed.
+					let providerDispatchStarted = saved !== undefined && saved.generation === runId;
 
 					const setFailure = (failure: unknown): void => {
 					if (!isHarnessTurnError(failure)) return;
@@ -1238,8 +1244,40 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 				};
 
 				type PhaseResult = { failure?: unknown } | { outcome: AgentRunOutcome };
-				const confirmPhase = async (): Promise<'continue' | AgentRunOutcome> => {
-					const confirmed = await Promise.race([
+					const finishLeaseOutcome = async (outcome: LeaseOutcome): Promise<AgentRunOutcome> => {
+						await teardown();
+						if (outcome === 'completed') {
+							if (!recordRecovery('submitted')) {
+								opts.err('owenloop work agent-run: could not persist the submitted recovery diagnostic (hub outcome remains authoritative)');
+							}
+							return 'submitted';
+						}
+						if (!recordRecovery('dead')) {
+							opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (lease outcome remains authoritative)');
+						}
+						return signalled ? 'killed' : mapLeaseDuringTurn(outcome);
+					};
+					const finishConfirmedOutcome = async (
+						outcome: Exclude<Awaited<ReturnType<typeof confirmOutcome>>, 'no-submit'>,
+					): Promise<AgentRunOutcome> => {
+						if (outcome === 'submitted') {
+							if (!recordRecovery('submitted')) {
+								opts.err('owenloop work agent-run: could not persist the submitted recovery diagnostic (hub outcome remains authoritative)');
+							}
+							lease.stop('submitted', { release: false });
+							await leasePromise;
+							return 'submitted';
+						}
+						if (!recordRecovery('dead')) {
+							opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (claim loss remains authoritative)');
+						}
+						lease.stop('lease-lost', { release: false });
+						await leasePromise;
+						return 'lease-lost';
+					};
+					const confirmPhase = async (): Promise<'continue' | AgentRunOutcome> => {
+						if (settledLeaseOutcome !== undefined) return finishLeaseOutcome(settledLeaseOutcome);
+						const confirmed = await Promise.race([
 						confirmOutcome({
 							hub,
 							workflow,
@@ -1254,29 +1292,21 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						}).then((v) => ({ t: 'confirm' as const, v })),
 						leasePromise!.then((o) => ({ t: 'lease' as const, o })),
 					]);
-						if (confirmed.t === 'lease') {
-							await teardown();
-							if (confirmed.o === 'completed') {
-								if (!recordRecovery('submitted')) return sessionStoreFailed();
-								return 'submitted';
-							}
-							if (!recordRecovery('dead')) return sessionStoreFailed();
-						return signalled ? 'killed' : mapLeaseDuringTurn(confirmed.o);
-					}
-						if (confirmed.v === 'submitted') {
-							if (!recordRecovery('submitted')) return sessionStoreFailed();
-						lease.stop('submitted', { release: false });
-						await leasePromise;
-						return 'submitted';
-					}
-						if (confirmed.v === 'lease-lost') {
-							if (!recordRecovery('dead')) return sessionStoreFailed();
-						lease.stop('lease-lost', { release: false });
-						await leasePromise;
-						return 'lease-lost';
-					}
-					return 'continue';
-				};
+						if (confirmed.t === 'lease') return finishLeaseOutcome(confirmed.o);
+						if (confirmed.v !== 'no-submit') return finishConfirmedOutcome(confirmed.v);
+						return 'continue';
+					};
+					const sessionStoreFailedAfterDispatch = async (): Promise<AgentRunOutcome> => {
+						// Stop the exact provider query before relinquishing the claim, then give
+						// the hub one authoritative chance to report a submit or claim loss that
+						// raced the local diagnostic failure.
+						await stopCurrent();
+						const confirmed = await confirmPhase();
+						if (confirmed !== 'continue') return confirmed;
+						return releaseWith('session-store-failed', 'session-store-failed');
+					};
+					const persistenceFailureOutcome = (): Promise<AgentRunOutcome> =>
+						providerDispatchStarted ? sessionStoreFailedAfterDispatch() : sessionStoreFailed();
 
 					const dispatch = async (
 					phase: RecoveryPhase,
@@ -1284,8 +1314,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						perform: () => Promise<void>,
 					): Promise<PhaseResult> => {
 						if (!checkpoint(phase, changes)) {
-							return { outcome: await sessionStoreFailed() };
+							return { outcome: await persistenceFailureOutcome() };
 						}
+						providerDispatchStarted = true;
 						const turn = perform().then(
 						() => ({ t: 'turn' as const }),
 						(failure: unknown) => ({ t: 'turn' as const, failure }),
@@ -1296,23 +1327,17 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							recoveryPersistenceFailed.then(() => ({ t: 'persistence' as const })),
 						]);
 						if (raced.t === 'persistence') {
-							return { outcome: await sessionStoreFailed() };
+							return { outcome: await sessionStoreFailedAfterDispatch() };
 						}
 						if (raced.t === 'lease') {
-							await teardown();
-							if (raced.o === 'completed') {
-								if (!recordRecovery('submitted')) return { outcome: await sessionStoreFailed() };
-								return { outcome: 'submitted' };
-							}
-							if (!recordRecovery('dead')) return { outcome: await sessionStoreFailed() };
-						return { outcome: signalled ? 'killed' : mapLeaseDuringTurn(raced.o) };
+							return { outcome: await finishLeaseOutcome(raced.o) };
 					}
 						if (activePersistenceFailure !== undefined || recoveryPersistenceFailure !== undefined) {
-							return { outcome: await sessionStoreFailed() };
+							return { outcome: await sessionStoreFailedAfterDispatch() };
 					}
 					const failure = 'failure' in raced ? raced.failure : undefined;
 					if (failure !== undefined) setFailure(failure);
-						if (!recordRecovery('turn-ended')) return { outcome: await sessionStoreFailed() };
+						if (!recordRecovery('turn-ended')) return { outcome: await sessionStoreFailedAfterDispatch() };
 					const confirmed = await confirmPhase();
 					if (confirmed !== 'continue') return { outcome: confirmed };
 					return failure === undefined ? {} : { failure };
@@ -1335,16 +1360,20 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					for (let attemptAsk = 0; attemptAsk < 2; attemptAsk += 1) {
 						try {
 							const asked = await hub.ask({ workflow, run: runId, path: recoveryPath, question, context });
-							if (asked.ok === true && asked.closed === true) {
-								if (!recordRecovery('turn-ended')) return sessionStoreFailed();
-								lease.stop('recovery-held', { release: false });
+								if (asked.ok === true && asked.closed === true) {
+									if (!recordRecovery('turn-ended')) {
+										opts.err('owenloop work agent-run: could not persist the held recovery diagnostic (accepted ask remains authoritative)');
+									}
+									lease.stop('recovery-held', { release: false });
 									await leasePromise;
 									return 'held';
 								}
 								if (asked.ok !== true) {
 									opts.err(`owenloop work agent-run: recovery ask was refused: ${asked.text}`);
-								if (asked.closed === true) {
-									if (!recordRecovery('dead')) return sessionStoreFailed();
+									if (asked.closed === true) {
+										if (!recordRecovery('dead')) {
+											opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (closed ask refusal remains authoritative)');
+										}
 									lease.stop('recovery-ask-refused', { release: false });
 										await leasePromise;
 										return 'no-submit';
@@ -1360,10 +1389,20 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 								try {
 									const current = await hub.getOrder({ workflow, run: runId, holder: opts.holder });
 								if (current.lease.outcome !== undefined) {
-									if (!recordRecovery('submitted')) return sessionStoreFailed();
+									if (!recordRecovery('submitted')) {
+										opts.err('owenloop work agent-run: could not persist the submitted recovery diagnostic (hub outcome remains authoritative)');
+									}
 								lease.stop('submitted', { release: false });
 									await leasePromise;
 									return 'submitted';
+								}
+								if (current.lease.claimed === false) {
+									if (!recordRecovery('dead')) {
+										opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (claim loss remains authoritative)');
+									}
+									lease.stop('lease-lost', { release: false });
+									await leasePromise;
+									return 'lease-lost';
 								}
 							} catch {
 								// The second ask is still the only recoverable transport action.
@@ -1390,7 +1429,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							);
 							// Persist the terminal transition before stopping a query or attempting
 							// an ask. A process death can underspend recovery, never repeat it.
-							if (!checkpoint('held')) return sessionStoreFailed();
+							if (!checkpoint('held')) return persistenceFailureOutcome();
 							await stopCurrent();
 							return askHeld(heldAfter);
 						};
@@ -1463,7 +1502,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					if (next === 'cold-restart') {
 						// This includes the ResumeUnavailable skip. Both the skipped wake
 						// and the cold dispatch are durably consumed before any stop await.
-						if (!prepareColdRestart()) return sessionStoreFailed();
+							if (!prepareColdRestart()) return persistenceFailureOutcome();
 						await stopCurrent();
 						const cold = await dispatch('cold-restart', { wakeUsed: true, coldRestartUsed: true }, async () => {
 						activePersistenceFailure = undefined;

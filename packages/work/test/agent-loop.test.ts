@@ -617,6 +617,57 @@ test('a failed recovery checkpoint releases before provider work, and an activit
 	assert.equal(verbs(thirdHub.calls).includes('release'), true);
 });
 
+test('hub submit and claim loss stay authoritative across persistence failures in primary, wake, and cold phases', async () => {
+	const phases = [
+		{ phase: 'primary', confirmCall: 1, starts: 1, delivers: 0 },
+		{ phase: 'wake', confirmCall: 2, starts: 1, delivers: 1 },
+		{ phase: 'cold-restart', confirmCall: 3, starts: 2, delivers: 1 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const, status: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+
+	for (const phase of phases) {
+		for (const authority of authorities) {
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n !== phase.confirmCall) return agentOrder(common);
+					return authority.outcome === 'submitted'
+						? agentOrder({ ...common, claimed: false, outcome: 'green' })
+						: agentOrder({ ...common, claimed: false });
+				},
+			});
+			const h = buildOpts({
+				hub,
+				adapter,
+				submitGraceMs: 0,
+				appendSession: (record) => {
+					const isTargetPhase = record.recovery?.phase === phase.phase;
+					if (isTargetPhase && (record.status === 'turn-ended' || record.status === authority.status)) {
+						throw new Error(`${authority.label} ${phase.phase} diagnostic fsync failed`);
+					}
+				},
+			});
+
+			assert.equal(
+				await createAgentRunLoop(h.opts).run(),
+				authority.outcome,
+				`${authority.label} during ${phase.phase}`,
+			);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(verbs(calls).includes('release'), false, 'authoritative closure must never be released');
+		}
+	}
+});
+
 test('a 2xx refusal from recovery ask is never recorded as held', async () => {
 	const adapter = createFakeAdapter({
 		start: { events: [{ kind: 'turn_ended' }] },

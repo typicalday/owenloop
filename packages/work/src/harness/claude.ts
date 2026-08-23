@@ -1107,9 +1107,19 @@ export async function consumeTurn(
   let timeout: Promise<never> | undefined;
   let idleTimeoutFailure: HarnessIdleTimeoutError | undefined;
   let timerGeneration = 0;
+  let controlledQueryClosed = false;
   const now = control.now ?? Date.now;
   const setTimer = control.setTimer ?? setTimeout;
   const clearTimer = control.clearTimer ?? clearTimeout;
+  const closeControlledQuery = (): void => {
+    if (controlledQueryClosed) return;
+    controlledQueryClosed = true;
+    try {
+      control.close?.();
+    } catch {
+      // Turn classification is authoritative; exact-query cleanup is best effort.
+    }
+  };
 
   const arm = (): void => {
     const idleTimeoutMs = control.idleTimeoutMs;
@@ -1133,11 +1143,7 @@ export async function consumeTurn(
 				} catch {
 					// An already-aborted controller is an equivalent successful teardown.
 				}
-				try {
-					control.close?.();
-				} catch {
-					// The structured timeout remains the authoritative failure.
-				}
+					closeControlledQuery();
       }, idleTimeoutMs);
     });
   };
@@ -1238,6 +1244,10 @@ export async function consumeTurn(
   } finally {
     timerGeneration += 1;
     if (timer !== undefined) clearTimer(timer);
+    // Manual iterator driving does not perform AsyncIteratorClose when the
+    // result message returns from inside the loop. Close this exact query before
+    // a same-token recovery turn can replace it in SESSIONS.
+    closeControlledQuery();
   }
 }
 
@@ -1291,7 +1301,10 @@ export async function startClaude(
   }
 
   SESSIONS.set(sessionId, { query: q, abortController, options });
+  let exactClosed = false;
   const closeExact = (): void => {
+    if (exactClosed) return;
+    exactClosed = true;
     if (SESSIONS.get(sessionId)?.query === q) SESSIONS.delete(sessionId);
     try {
       abortController.abort();
@@ -1323,35 +1336,16 @@ export async function startClaude(
     );
   } catch (err) {
     // An init mismatch or pre-init failure must not leave the preselected token
-    // resumable. A post-init provider failure keeps the same registry behavior as
-    // before; `stop()` can still find and idempotently close that verified session.
+    // registered. `consumeTurn` closes every settled exact query; this explicit
+    // delete preserves the cold-start gate even if that cleanup seam changes.
     if (!initVerified) SESSIONS.delete(sessionId);
-    try {
-      abortController.abort();
-    } catch {
-      // An already-aborted controller is equivalent to success.
-    }
-    try {
-      q.close();
-    } catch {
-      // Preserve the provider or session-integrity error that caused the abort.
-    }
+    closeExact();
     onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
     throw err;
   }
 
   if (outcome.sessionId === undefined) {
-    SESSIONS.delete(sessionId);
-    try {
-      abortController.abort();
-    } catch {
-      // An already-aborted controller is equivalent to success.
-    }
-    try {
-      q.close();
-    } catch {
-      // The missing-init error below is authoritative.
-    }
+    closeExact();
     const why = outcome.sawResult
       ? 'the turn ended without confirming the supplied session id'
       : 'the stream ended before confirming the supplied session id';
@@ -1431,7 +1425,10 @@ export async function deliverClaude(
 		throw failure;
 	}
   SESSIONS.set(ref.token, { query: q, abortController, options });
+  let exactClosed = false;
   const closeExact = (): void => {
+    if (exactClosed) return;
+    exactClosed = true;
     if (SESSIONS.get(ref.token)?.query === q) SESSIONS.delete(ref.token);
     try {
       abortController.abort();

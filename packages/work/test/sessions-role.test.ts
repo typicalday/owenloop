@@ -235,8 +235,9 @@ test('a record with no session token renders a dash, not a command that cannot w
   }
 });
 
-test('recovery rows show safe control state and omit the provider token', () => {
-  const row = rec({
+test('recovery rows use an allowlist that omits provider tokens and secret-shaped forward fields', () => {
+  const row = {
+    ...rec({
     run: 'recovery-run',
     step: 'builder',
     status: 'turn-ended',
@@ -248,12 +249,50 @@ test('recovery rows show safe control state and omit the provider token', () => 
       lastActivityAt: NOW,
       lastFailure: { category: 'idle-timeout', at: NOW },
     },
-  });
+    }),
+    prompt: 'RAW_PROMPT_MUST_NOT_ESCAPE',
+    credential: 'CREDENTIAL_MUST_NOT_ESCAPE',
+    configDir: '/SECRET_CONFIG_DIRECTORY',
+    forwardToken: 'FORWARD_TOKEN_MUST_NOT_ESCAPE',
+    recovery: {
+      generation: 'recovery-run',
+      phase: 'held',
+      wakeUsed: true,
+      coldRestartUsed: true,
+      lastActivityAt: NOW,
+      lastFailure: { category: 'idle-timeout', at: NOW, prose: 'FAILURE_PROSE_MUST_NOT_ESCAPE', token: 'NESTED_TOKEN_MUST_NOT_ESCAPE' },
+      prompt: 'NESTED_PROMPT_MUST_NOT_ESCAPE',
+      config: { value: 'NESTED_CONFIG_MUST_NOT_ESCAPE' },
+    },
+  } as unknown as SessionRecord;
   assert.equal(resumeCommandFor(row), undefined);
   assert.match(renderTable([row], NOW), /held: action required/);
   const projection = projectSession(row);
-  assert.equal('token' in projection, false);
-  assert.equal(JSON.stringify(projection).includes('tok-recovery-run-builder'), false);
+  assert.deepEqual(Object.keys(projection).sort(), [
+    'attempt', 'createdAt', 'harness', 'order', 'recovery', 'run', 'status', 'step', 'updatedAt', 'workflow',
+  ]);
+  assert.deepEqual((projection as { recovery: unknown }).recovery, {
+    generation: 'recovery-run',
+    phase: 'held',
+    wakeUsed: true,
+    coldRestartUsed: true,
+    lastActivityAt: NOW,
+    lastFailure: { category: 'idle-timeout', at: NOW },
+  });
+  const json = JSON.stringify(projection);
+  for (const secret of [
+    'tok-recovery-run-builder',
+    'RAW_PROMPT_MUST_NOT_ESCAPE',
+    'CREDENTIAL_MUST_NOT_ESCAPE',
+    '/SECRET_CONFIG_DIRECTORY',
+    'FORWARD_TOKEN_MUST_NOT_ESCAPE',
+    'FAILURE_PROSE_MUST_NOT_ESCAPE',
+    'NESTED_TOKEN_MUST_NOT_ESCAPE',
+    'NESTED_PROMPT_MUST_NOT_ESCAPE',
+    'NESTED_CONFIG_MUST_NOT_ESCAPE',
+  ]) {
+    assert.equal(json.includes(secret), false, secret);
+  }
 });
 
 test('the resume command is shell-quoted so an operator can paste it', () => {

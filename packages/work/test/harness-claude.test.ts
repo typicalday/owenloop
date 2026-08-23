@@ -867,25 +867,31 @@ test('cold start fails closed when provider init does not confirm the supplied s
   assert.equal(probe.closes, 1, 'a mismatched init was removed from the session registry');
 });
 
-test('actual start and resume preserve dedicated Claude environment while keeping recovery config host-only', async () => {
-	const keys = ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS'] as const;
-	const prior = new Map(keys.map((key) => [key, process.env[key]]));
-	const token = '55555555-5555-4555-8555-555555555555';
-	const captured: Array<Record<string, string | undefined>> = [];
-	const factory: ClaudeQueryFactory = ({ options }) => ({
-		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
-			captured.push(options.env ?? {});
-			if (options.sessionId !== undefined) {
-				yield {
-					type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
-					claude_code_version: 'test', model: 'test', apiKeySource: 'test', permissionMode: 'default', cwd: process.cwd(),
-				} as unknown as SDKMessage;
-			}
-			yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
-		},
-		close() {},
-	});
-	try {
+test('primary, wake, and cold queries close exactly once while preserving environment and provider tokens', async () => {
+		const keys = ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS'] as const;
+		const prior = new Map(keys.map((key) => [key, process.env[key]]));
+		const token = '55555555-5555-4555-8555-555555555555';
+		const coldToken = '77777777-7777-4777-8777-777777777777';
+		const captured: Array<Record<string, string | undefined>> = [];
+		const queries: Array<{ closes: number; signal: AbortSignal }> = [];
+		const factory: ClaudeQueryFactory = ({ options }) => {
+			const queryState = { closes: 0, signal: options.abortController!.signal };
+			queries.push(queryState);
+			return {
+				async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+					captured.push(options.env ?? {});
+					if (options.sessionId !== undefined) {
+						yield {
+							type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+							claude_code_version: 'test', model: 'test', apiKeySource: 'test', permissionMode: 'default', cwd: process.cwd(),
+						} as unknown as SDKMessage;
+					}
+					yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
+				},
+				close() { queryState.closes += 1; },
+			};
+		};
+		try {
 		process.env.CLAUDE_CONFIG_DIR = '/dedicated/claude-config';
 		process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
 		process.env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS = '1000';
@@ -894,13 +900,20 @@ test('actual start and resume preserve dedicated Claude environment while keepin
 			createSessionId: () => token,
 			loadQuery: async () => factory,
 		});
-		await deliverClaude(ref, 'continue', {
-			cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy: { idleTimeoutMs: 1_000 },
-		}, () => {}, {
-			getSessionInfo: async () => ({}),
-			loadQuery: async () => factory,
-		});
-		await claudeAdapter.stop(ref);
+			await deliverClaude(ref, 'continue', {
+				cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy: { idleTimeoutMs: 1_000 },
+			}, () => {}, {
+				getSessionInfo: async () => ({}),
+				loadQuery: async () => factory,
+			});
+			const coldRef = await startClaude(args, () => {}, {
+				createSessionId: () => coldToken,
+				loadQuery: async () => factory,
+			});
+			assert.deepEqual(ref, { harness: 'claude-code', token });
+			assert.deepEqual(coldRef, { harness: 'claude-code', token: coldToken });
+			await claudeAdapter.stop(ref);
+			await claudeAdapter.stop(coldRef);
 	} finally {
 		for (const key of keys) {
 			const value = prior.get(key);
@@ -908,13 +921,18 @@ test('actual start and resume preserve dedicated Claude environment while keepin
 			else process.env[key] = value;
 		}
 	}
-	assert.equal(captured.length, 2);
-	for (const env of captured) {
+		assert.equal(captured.length, 3);
+		for (const env of captured) {
 		assert.equal(env.CLAUDE_CONFIG_DIR, '/dedicated/claude-config');
 		assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
-		assert.equal(env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS, undefined);
-	}
-});
+			assert.equal(env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS, undefined);
+		}
+		assert.equal(queries.length, 3);
+		for (const query of queries) {
+			assert.equal(query.closes, 1, 'each settled exact query is closed before its successor can replace it');
+			assert.equal(query.signal.aborted, true);
+		}
+	});
 
 // ---------------------------------------------------------------------------
 // Binary resolution
