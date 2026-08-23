@@ -425,6 +425,41 @@ test('groups: (f) a judged group member is refused at the judge-approve moment, 
   assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'skipped', 'urgent must remain skipped, not flip to green');
 });
 
+test('groups: scoped inactive judges commit at once, while an active scope delays atMostOne resolution until approval', () => {
+  const d = buildDef({
+    name: 'scopedJudgedGroupDef',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'ticket', seedOwed: false }],
+    steps: [{
+      name: 'triage',
+      consumes: ['ticket'],
+      produces: [
+	'simple',
+	{ name: 'urgent', judges: [{ name: 'sanity', body: 'check it', modifiers: ['deep'] }] },
+	{ group: 'route', mode: 'atMostOne', of: ['simple', 'urgent'] },
+      ],
+    }],
+  });
+
+  const standard = makeEngine([d]);
+  const standardWf = standard.engine.createInstance(d.name, { modifier: 'standard', provide: { ticket: { text: 'x' } } });
+  const standardRun = fire(standard.engine, standardWf, 'triage').run;
+  assert.equal(standard.engine.green(standardWf, standardRun, 'urgent', { ok: true }).outcome, 'green');
+  assert.equal(getArt(standard.store, standardWf, 'urgent')?.acceptance, 'green');
+  assert.equal(getArt(standard.store, standardWf, 'simple')?.acceptance, 'skipped', 'inactive scopes resolve the group in the producer commit');
+  assert.ok(standard.engine.tick(standardWf).orders.every((order) => !order.step.includes('.judges.')));
+
+  const deep = makeEngine([d]);
+  const deepWf = deep.engine.createInstance(d.name, { modifier: 'deep', provide: { ticket: { text: 'x' } } });
+  const deepRun = fire(deep.engine, deepWf, 'triage').run;
+  assert.equal(deep.engine.green(deepWf, deepRun, 'urgent', { ok: true }).outcome, 'submitted');
+  assert.equal(getArt(deep.store, deepWf, 'urgent')?.acceptance, 'submitted');
+  assert.equal(getArt(deep.store, deepWf, 'simple')?.acceptance, 'owed', 'the group has no winner until the active judge approves');
+  const judge = fire(deep.engine, deepWf, 'triage.urgent.judges.sanity');
+  assert.equal(deep.engine.green(deepWf, judge.run, 'urgent', {}).outcome, 'green');
+  assert.equal(getArt(deep.store, deepWf, 'simple')?.acceptance, 'skipped', 'the final active approval resolves the group');
+});
+
 // ---- (f3) §26.2: a submitted sibling still awaiting judgment auto-skips too ----
 
 test('groups: (f3) a submitted (judge-pending) losing sibling is auto-skipped by the same settle as the winner, reaching done', () => {

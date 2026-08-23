@@ -512,6 +512,66 @@ test('validateDef requires scoped judged producers to be strictly downstream of 
     steps: [binder, { ...scoped, consumes: ['selection'] }],
   });
   assert.deepEqual(validateDef(downstream), []);
+
+  assert.throws(
+    () => parseDef({
+      name: 'upstream',
+      modifiers: ['deep'],
+      inputs: [{ name: 'seed' }],
+      steps: [scoped, { ...binder, consumes: ['draft'] }],
+    }),
+    (e: unknown) => e instanceof DefError && /not strictly downstream of artifact 'selection'/.test(e.message),
+    'a binder that depends on the judged output is downstream, not a safe prerequisite',
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'same-step',
+      modifiers: ['deep'],
+      inputs: [{ name: 'seed' }],
+      steps: [{
+	name: 'choose-and-write',
+	consumes: ['seed'],
+	produces: [
+	  { name: 'selection', bind: 'modifier' },
+	  { name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'] }] },
+	],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /not strictly downstream of artifact 'selection'/.test(e.message),
+    'the binder step itself is not strictly downstream of its own bound artifact',
+  );
+
+  const mapSteps = (consumer: string) => [
+    { name: 'gather', consumes: ['seed'], produces: ['items[]'] },
+    {
+      name: 'assess',
+      consumes: ['items[$i]'],
+      produces: [
+	{ name: 'items[$i].selection', bind: 'modifier' },
+	{ name: 'items[$i].analysis' },
+      ],
+    },
+    {
+      name: 'writer',
+      consumes: [consumer],
+      produces: [{ name: 'draft', judges: [{ name: 'evidence', body: 'check', modifiers: ['deep'] }] }],
+    },
+  ];
+  const exactMapSuffix = parseDef({
+    name: 'exact-map-suffix',
+    modifiers: ['deep'],
+    inputs: [{ name: 'seed' }],
+    steps: mapSteps('items[*].selection'),
+  });
+  assert.deepEqual(validateDef(exactMapSuffix), [], 'the exact bound map suffix is downstream');
+  for (const [name, consumer] of [['sibling-map-lane', 'items[*].analysis'], ['bare-map-lane', 'items[*]']] as const) {
+    assert.throws(
+      () => parseDef({ name, modifiers: ['deep'], inputs: [{ name: 'seed' }], steps: mapSteps(consumer) }),
+      (e: unknown) => e instanceof DefError && /not strictly downstream of artifact 'items\[\$i\]\.selection'/.test(e.message),
+      `${name} must not be mistaken for the bound map suffix`,
+    );
+  }
+
   const startBound = parseDef({
     name: 'start-bound',
     modifiers: ['deep'],

@@ -160,6 +160,15 @@ test('expandIncludes: repeated child aliases deep-clone nested judge x carriers'
     expanded.steps.find((step) => step.name === 'left.producer')!.produces[0]!.judges?.[0]?.modifiers,
     ['deep'],
   );
+  const childJudgeScope = childDef.steps.find((step) => step.name === 'producer')!.produces[0]!.judges![0]!.modifiers!;
+  const leftJudgeScope = expanded.steps.find((step) => step.name === 'left.producer')!.produces[0]!.judges![0]!.modifiers!;
+  const rightJudgeScope = expanded.steps.find((step) => step.name === 'right.producer')!.produces[0]!.judges![0]!.modifiers!;
+  assert.notStrictEqual(leftJudgeScope, rightJudgeScope, 'include aliases own their authored judge scope arrays');
+  assert.notStrictEqual(leftJudgeScope, childJudgeScope, 'the child authored array stays independent too');
+  leftJudgeScope.push('express');
+  assert.deepEqual(rightJudgeScope, ['deep'], 'mutating one alias scope cannot reach the other alias');
+  assert.deepEqual(childJudgeScope, ['deep'], 'mutating an alias scope cannot reach the child definition');
+  leftJudgeScope.pop();
   assert.equal('x' in expanded.steps.find((step) => step.name === 'left.publisher')!, false);
 
   ((leftJudge.x!['vendor'] as { nested: { enabled: boolean } }).nested).enabled = false;
