@@ -44,13 +44,21 @@ import { classifyToolCall, READ_ONLY_TOOLS, type GatePolicy, type GateVerdict } 
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
-import { ResumeUnavailableError, NEUTRAL_PERMISSION_MODES, isNeutralPermissionMode } from './contract.ts';
+import {
+  HarnessIdleTimeoutError,
+  HarnessTurnError,
+  ResumeUnavailableError,
+  NEUTRAL_PERMISSION_MODES,
+	isHarnessTurnError,
+  isNeutralPermissionMode,
+} from './contract.ts';
 import type { ApprovalRequester } from './contract.ts';
 import type { LintFinding } from './types.ts';
 import type {
   AgentEvent,
   DeliverArgs,
   HarnessAdapter,
+  HarnessRecoveryPolicy,
   HarnessSessionRef,
   NeutralPermissionModeMap,
   PermissionIssue,
@@ -98,6 +106,35 @@ const ALLOW_API_BILLING_VAR = 'OWENLOOP_ALLOW_API_BILLING';
 
 /** Operator override for the CLI binary; see `resolveExecutable`. */
 const BIN_OVERRIDE_VAR = 'OWENLOOP_CLAUDE_BIN';
+/** Host-only opt-in liveness controller. Never admitted to the child env. */
+export const CLAUDE_IDLE_TIMEOUT_VAR = 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS';
+const MIN_IDLE_TIMEOUT_MS = 1_000;
+const MAX_IDLE_TIMEOUT_MS = 3_600_000;
+
+/** Parse the one adapter-owned recovery setting without silently opting out. */
+export function parseClaudeIdleTimeout(value: string | undefined): HarnessRecoveryPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/u.test(value)) {
+    throw new HarnessTurnError(
+      'configuration',
+      true,
+      `${CLAUDE_IDLE_TIMEOUT_VAR} must be a canonical decimal integer between ${MIN_IDLE_TIMEOUT_MS} and ${MAX_IDLE_TIMEOUT_MS}`,
+    );
+  }
+  const idleTimeoutMs = Number(value);
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < MIN_IDLE_TIMEOUT_MS || idleTimeoutMs > MAX_IDLE_TIMEOUT_MS) {
+    throw new HarnessTurnError(
+      'configuration',
+      true,
+      `${CLAUDE_IDLE_TIMEOUT_VAR} must be a canonical decimal integer between ${MIN_IDLE_TIMEOUT_MS} and ${MAX_IDLE_TIMEOUT_MS}`,
+    );
+  }
+  return { idleTimeoutMs };
+}
+
+export function claudeRecoveryPolicy(env: Record<string, string | undefined> = process.env): HarnessRecoveryPolicy | undefined {
+  return parseClaudeIdleTimeout(env[CLAUDE_IDLE_TIMEOUT_VAR]);
+}
 
 /**
  * Build the environment the harness child runs under.
@@ -673,6 +710,7 @@ export interface ClaudeOptionInputs {
   /** The human approval channel, when this deployment has one. Absent keeps the
    *  refuse-and-route-to-`ask` behavior — see `buildCanUseTool`. */
   approvals?: ApprovalRequester;
+  recoveryPolicy?: HarnessRecoveryPolicy;
 }
 
 /** The non-declarative bits a caller supplies per invocation. */
@@ -701,6 +739,7 @@ export function buildClaudeOptions(
   extra: ClaudeOptionExtras,
 ): Options {
   const { permissions } = inputs;
+	const diagnosticEvent = inputs.recoveryPolicy === undefined ? extra.onEvent : (_event: AgentEvent): void => {};
   const isolated =
     permissions.tools !== undefined ||
     permissions.filesystem === 'read-only' ||
@@ -714,8 +753,10 @@ export function buildClaudeOptions(
       : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
+	  // Recovery control state and worker logs are deliberately payload-free.
+	  // Legacy turns keep their established stderr telemetry verbatim.
       const line = data.trimEnd();
-      extra.onEvent({ kind: 'progress', text: `stderr: ${line}`, failure: cap(line) });
+	  diagnosticEvent({ kind: 'progress', text: `stderr: ${line}`, failure: cap(line) });
     },
     // Set here, before the `permissionMode` block below, because it is not
     // conditional on that block running: a step naming no mode at all is exactly
@@ -724,10 +765,14 @@ export function buildClaudeOptions(
       inputs.cwd,
       gatePolicyFor(permissions.permissionMode),
       permissions.filesystem,
-      extra.onEvent,
+	  diagnosticEvent,
       inputs.approvals,
     ),
   };
+
+  // Partial messages are provider transport only: they reset liveness below but
+  // are never mapped into progress/evidence output.
+  if (inputs.recoveryPolicy !== undefined) options.includePartialMessages = true;
 
   // Omit the key entirely when nothing resolves — see `resolveExecutable`.
   const executable = resolveExecutable(extra.env);
@@ -746,7 +791,7 @@ export function buildClaudeOptions(
       // Dropped rather than thrown or coerced — the same stance normalization
       // takes for a bad `maxTurns`. The linter only checks effort is a string,
       // so an unlintable-but-legal bag can carry an out-of-union value.
-      extra.onEvent({
+	  diagnosticEvent({
         kind: 'progress',
         text: `dropped out-of-range effort '${rawEffort}' (expected one of ${EFFORT_LEVELS.join('|')})`,
       });
@@ -768,7 +813,7 @@ export function buildClaudeOptions(
       // means the step stalls forever on a prompt no human will answer.
       if (mode === 'bypassPermissions') options.allowDangerouslySkipPermissions = true;
     } else {
-      extra.onEvent({
+	  diagnosticEvent({
         kind: 'progress',
         text: `dropped unknown permissionMode '${permissions.permissionMode}' (expected one of ${ACCEPTED_PERMISSION_MODES.join('|')})`,
       });
@@ -869,11 +914,27 @@ export interface ClaudeStartDependencies {
   loadQuery: () => Promise<ClaudeQueryFactory>;
 }
 
+export interface ClaudeDeliverDependencies {
+  loadQuery: () => Promise<ClaudeQueryFactory>;
+  getSessionInfo: (token: string, opts: { dir: string }) => Promise<unknown>;
+}
+
 const DEFAULT_START_DEPENDENCIES: ClaudeStartDependencies = {
   createSessionId: randomUUID,
   loadQuery: async () => {
     const { query } = await import('@anthropic-ai/claude-agent-sdk');
     return (args) => query(args);
+  },
+};
+
+const DEFAULT_DELIVER_DEPENDENCIES: ClaudeDeliverDependencies = {
+  loadQuery: async () => {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    return (args) => query(args);
+  },
+  getSessionInfo: async (token, opts) => {
+    const { getSessionInfo } = await import('@anthropic-ai/claude-agent-sdk');
+    return getSessionInfo(token, opts);
   },
 };
 
@@ -898,6 +959,20 @@ export interface TurnOutcome {
   sawResult: boolean;
 }
 
+/** Per-turn liveness machinery. All callbacks are payload-free by contract. */
+export interface ConsumeTurnControl {
+  idleTimeoutMs?: number;
+	/** Suppress provider-controlled payload telemetry while retaining liveness and
+	 * structured failure categories for a recovery-enabled turn. */
+	sanitizeProviderTelemetry?: boolean;
+  abortController?: AbortController;
+  close?: () => void;
+  onActivity?: (activity: { at: number; deadlineAt: number }) => void;
+  now?: () => number;
+  setTimer?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
 /** Trim a progress line to something a log can hold. Mirrors the codex adapter's
  *  convention deliberately — the two adapters' logs are read side by side, so
  *  they truncate the same way. Kept local because this adapter must stay in one
@@ -906,6 +981,12 @@ const PROGRESS_TEXT_CAP = 2_000;
 
 function cap(text: string): string {
   return text.length > PROGRESS_TEXT_CAP ? `${text.slice(0, PROGRESS_TEXT_CAP)}…` : text;
+}
+
+/** A payload-free failure line safe for recovery logs and durable telemetry. */
+function sanitizedFailureText(error: unknown): string {
+	const category = isHarnessTurnError(error) ? error.category : 'provider';
+	return `provider failure category=${category} (details redacted)`;
 }
 
 /** Mark messages produced inside a Task-tool subagent. A flat log cannot
@@ -1029,12 +1110,96 @@ export async function consumeTurn(
   onEvent: (e: AgentEvent) => void,
   onInit?: (sessionId: string) => void,
   expectedSessionId?: string,
+  control: ConsumeTurnControl = {},
 ): Promise<TurnOutcome> {
   let sessionId: string | undefined;
   let finalResponse: string | undefined;
-  for await (const message of q) {
+  let terminalFailure: HarnessTurnError | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timeout: Promise<never> | undefined;
+  let idleTimeoutFailure: HarnessIdleTimeoutError | undefined;
+  let timerGeneration = 0;
+  let controlledQueryClosed = false;
+	const recoveryEnabled = control.idleTimeoutMs !== undefined;
+	const sanitizeProviderTelemetry = control.sanitizeProviderTelemetry === true;
+  const now = control.now ?? Date.now;
+  const setTimer = control.setTimer ?? setTimeout;
+  const clearTimer = control.clearTimer ?? clearTimeout;
+  const closeControlledQuery = (): void => {
+    if (controlledQueryClosed) return;
+    controlledQueryClosed = true;
+    try {
+      control.close?.();
+    } catch {
+      // Turn classification is authoritative; exact-query cleanup is best effort.
+    }
+  };
+
+  const arm = (): void => {
+    const idleTimeoutMs = control.idleTimeoutMs;
+    if (idleTimeoutMs === undefined) return;
+    if (timer !== undefined) clearTimer(timer);
+    const generation = ++timerGeneration;
+    idleTimeoutFailure = undefined;
+    const at = now();
+    const deadlineAt = at + idleTimeoutMs;
+    control.onActivity?.({ at, deadlineAt });
+    timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimer(() => {
+					if (generation !== timerGeneration) return;
+					timer = undefined;
+					idleTimeoutFailure = new HarnessIdleTimeoutError(idleTimeoutMs);
+					// Latch and reject first so an iterator read that synchronously rejects
+					// during abort/close cannot win the race as a generic provider failure.
+					reject(idleTimeoutFailure);
+					try {
+						control.abortController?.abort();
+				} catch {
+					// An already-aborted controller is an equivalent successful teardown.
+				}
+					closeControlledQuery();
+      }, idleTimeoutMs);
+    });
+  };
+
+  const classifyAssistantError = (error: string | undefined): HarnessTurnError | undefined => {
+	if (error === undefined) return undefined;
+    if (error === 'authentication_failed' || error === 'oauth_org_not_allowed') {
+      return new HarnessTurnError('authentication', true, `provider authentication failure (${error})`);
+    }
+    if (error === 'model_not_found') {
+      return new HarnessTurnError('model-unavailable', true, 'provider model is unavailable');
+    }
+	return new HarnessTurnError('provider', false, 'provider reported an unclassified assistant failure');
+  };
+  const classifyResult = (message: SDKMessage): HarnessTurnError | undefined => {
+    if (message.type !== 'result' || message.subtype === 'success') return undefined;
+    const structured = message as unknown as { permission_denials?: unknown };
+    if (Array.isArray(structured.permission_denials) && structured.permission_denials.length > 0) {
+      return new HarnessTurnError('permission-policy', true, 'provider denied the configured permission policy');
+    }
+	return new HarnessTurnError('provider', false, 'provider returned an unclassified error result');
+  };
+
+  const iterator = q[Symbol.asyncIterator]();
+  arm(); // Must cover silence before the first iterator result.
+  try {
+    for (;;) {
+      const next = iterator.next();
+      const item = timeout === undefined ? await next : await Promise.race([next, timeout]);
+      if (item.done) {
+		if (recoveryEnabled && terminalFailure !== undefined) throw terminalFailure;
+		return { sessionId, sawResult: false };
+	  }
+      const message = item.value;
+      // Reset BEFORE mapping. A partial event stays transport-only but is still
+      // proof of provider liveness.
+      arm();
     if (message.type === 'system' && message.subtype === 'init') {
       if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
+		if (sanitizeProviderTelemetry) {
+		  throw new HarnessTurnError('provider', false, 'provider session identity mismatch (details redacted)');
+		}
 	throw new Error(
 	  `provider session id mismatch: expected ${expectedSessionId}, received ${message.session_id}`,
 	);
@@ -1043,47 +1208,83 @@ export async function consumeTurn(
       // The ONLY place these are observable. The live smoke asserts on the
       // `apiKeySource` here (subscription OAuth vs. an API key), and a later
       // phase's version-mismatch warning will want `claude_code_version`.
-      const servers = message.mcp_servers.map((s) => `${s.name}=${s.status}`).join(',');
-      onEvent({
-        kind: 'progress',
-        text:
-          `session ${message.session_id}: cliVersion=${message.claude_code_version} ` +
-          `model=${message.model} apiKeySource=${message.apiKeySource} ` +
-          `permissionMode=${message.permissionMode} cwd=${message.cwd} mcp=[${servers}]`,
-	model: cap(message.model),
-      });
+	  if (!sanitizeProviderTelemetry) {
+		const servers = message.mcp_servers.map((s) => `${s.name}=${s.status}`).join(',');
+		onEvent({
+		  kind: 'progress',
+		  text:
+			`session ${message.session_id}: cliVersion=${message.claude_code_version} ` +
+			`model=${message.model} apiKeySource=${message.apiKeySource} ` +
+			`permissionMode=${message.permissionMode} cwd=${message.cwd} mcp=[${servers}]`,
+		  model: cap(message.model),
+		});
+	  }
       onInit?.(sessionId);
     } else if (message.type === 'result') {
-      if (finalResponse !== undefined) onEvent({ kind: 'assistant_response', text: finalResponse });
-      if (message.subtype !== 'success') {
+	  const classified = recoveryEnabled ? terminalFailure ?? classifyResult(message) : undefined;
+	  if (!sanitizeProviderTelemetry && finalResponse !== undefined) {
+		onEvent({ kind: 'assistant_response', text: finalResponse });
+	  }
+      if (message.subtype !== 'success' || classified !== undefined) {
         // The contract's channel for "something went wrong that is not a resume
         // failure". Emitted BEFORE turn_ended so a caller reading events in
         // order sees the cause before the turn closes.
         onEvent({
           kind: 'exited',
           exitCode: null,
-          error: message.errors.join('; ') || message.subtype,
+		  error: sanitizeProviderTelemetry || message.subtype === 'success'
+			? sanitizedFailureText(classified)
+			: message.errors.join('; ') || message.subtype,
         });
       }
       onEvent({ kind: 'turn_ended' });
+	  if (recoveryEnabled && classified !== undefined) throw classified;
       return { sessionId, sawResult: true };
     } else if (message.type === 'assistant') {
-      emitAssistant(message, onEvent);
-      finalResponse = assistantResponse(message) ?? finalResponse;
+	  if (!sanitizeProviderTelemetry) {
+		emitAssistant(message, onEvent);
+		finalResponse = assistantResponse(message) ?? finalResponse;
+	  }
+	  if (recoveryEnabled) terminalFailure ??= classifyAssistantError(message.error);
+		} else if (recoveryEnabled && message.type === 'auth_status' && message.error !== undefined) {
+			// `error` is a structured SDK field. Its prose is deliberately neither
+			// logged nor parsed for recovery decisions.
+			throw new HarnessTurnError('authentication', true, 'provider authentication status failed');
     } else if (message.type === 'user') {
-      emitUser(message, onEvent);
+	  if (!sanitizeProviderTelemetry) emitUser(message, onEvent);
     }
     // `needs_input` is NEVER emitted: this SDK path has no blocking-question
     // channel that maps to it, and the contract has no reply channel by design.
-    // `stream_event` is deliberately NOT mapped. The SDK only emits it when
-    // `Options.includePartialMessages` is set, and `buildClaudeOptions` never
-    // sets it — so the branch would be unreachable today, and if it ever
-    // became reachable it would duplicate the text the `assistant` message
-    // already carries. Unrecognized types stay silent by design: the vendor
-    // adds message kinds between releases, and a mapping that threw on one
-    // would turn a routine CLI upgrade into a failed order.
+    // `stream_event` is deliberately NOT mapped. Recovery-enabled options opt
+    // into partial messages only to reset liveness; their payload would merely
+    // duplicate the eventual assistant message and must not escape telemetry.
+    // Other unrecognized types stay silent by design: the vendor adds message
+    // kinds between releases, and a mapping that threw on one would turn a
+    // routine CLI upgrade into a failed order.
+    }
+  } catch (error) {
+		if (!recoveryEnabled) throw error;
+		if (terminalFailure?.terminal === true) throw terminalFailure;
+		if (idleTimeoutFailure !== undefined) throw idleTimeoutFailure;
+		if (isHarnessTurnError(error)) throw error;
+	// This is our own session-integrity guard, not a provider failure. Preserve
+	// its actionable detail while normalizing all actual SDK failures below.
+	if (error instanceof Error && error.message.startsWith('provider session id mismatch:')) throw error;
+	// `deliverClaude` has a provider-specific, secondary resume-refusal fallback
+	// behind its deterministic session-info preflight. Keep the original refusal
+	// text intact until that boundary can translate it to ResumeUnavailableError;
+	// wrapping it here would make an opt-out resume race look like a generic turn
+	// failure and suppress the established same-firing cold replay.
+	if (RESUME_FAILURE_RE.test(errText(error))) throw error;
+	throw new HarnessTurnError('provider', false, 'provider SDK stream failed');
+  } finally {
+    timerGeneration += 1;
+    if (timer !== undefined) clearTimer(timer);
+    // Manual iterator driving does not perform AsyncIteratorClose when the
+    // result message returns from inside the loop. Close this exact query before
+    // a same-token recovery turn can replace it in SESSIONS.
+    closeControlledQuery();
   }
-  return { sessionId, sawResult: false };
 }
 
 /** The message text of an unknown thrown value, for an `exited` event. */
@@ -1129,53 +1330,79 @@ export async function startClaude(
     } catch {
       // An already-aborted controller is equivalent to success.
     }
-    onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
-    throw err;
+	if (args.recoveryPolicy === undefined) {
+	  onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+	  throw err;
+	}
+	const failure = isHarnessTurnError(err)
+	  ? err
+	  : new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
+	onEvent({
+	  kind: 'exited',
+	  exitCode: null,
+	  error: sanitizedFailureText(failure),
+	});
+	throw failure;
   }
 
   SESSIONS.set(sessionId, { query: q, abortController, options });
+  let exactClosed = false;
+	let failureEventEmitted = false;
+	const turnOnEvent = (event: AgentEvent): void => {
+		if (event.kind === 'exited') failureEventEmitted = true;
+		onEvent(event);
+	};
+  const closeExact = (): void => {
+    if (exactClosed) return;
+    exactClosed = true;
+    if (SESSIONS.get(sessionId)?.query === q) SESSIONS.delete(sessionId);
+    try {
+      abortController.abort();
+    } catch {
+      // Best-effort, idempotent teardown.
+    }
+    try {
+      q.close();
+    } catch {
+      // The timeout/failure remains authoritative.
+    }
+  };
   let initVerified = false;
   let outcome: TurnOutcome;
   try {
     outcome = await consumeTurn(
       q,
-      onEvent,
+		turnOnEvent,
       () => {
 	initVerified = true;
       },
       sessionId,
+      {
+				...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
+				sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
+				abortController,
+				close: closeExact,
+				onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
+      },
     );
   } catch (err) {
     // An init mismatch or pre-init failure must not leave the preselected token
-    // resumable. A post-init provider failure keeps the same registry behavior as
-    // before; `stop()` can still find and idempotently close that verified session.
+    // registered. `consumeTurn` closes every settled exact query; this explicit
+    // delete preserves the cold-start gate even if that cleanup seam changes.
     if (!initVerified) SESSIONS.delete(sessionId);
-    try {
-      abortController.abort();
-    } catch {
-      // An already-aborted controller is equivalent to success.
-    }
-    try {
-      q.close();
-    } catch {
-      // Preserve the provider or session-integrity error that caused the abort.
-    }
-    onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+    closeExact();
+		if (!failureEventEmitted) {
+			onEvent({
+				kind: 'exited',
+				exitCode: null,
+				error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : errText(err),
+			});
+		}
     throw err;
   }
 
   if (outcome.sessionId === undefined) {
-    SESSIONS.delete(sessionId);
-    try {
-      abortController.abort();
-    } catch {
-      // An already-aborted controller is equivalent to success.
-    }
-    try {
-      q.close();
-    } catch {
-      // The missing-init error below is authoritative.
-    }
+    closeExact();
     const why = outcome.sawResult
       ? 'the turn ended without confirming the supplied session id'
       : 'the stream ended before confirming the supplied session id';
@@ -1185,17 +1412,22 @@ export async function startClaude(
   return ref;
 }
 
-async function deliver(
+export async function deliverClaude(
   ref: HarnessSessionRef,
   message: string,
   args: DeliverArgs,
   onEvent: (e: AgentEvent) => void,
+  dependencies: ClaudeDeliverDependencies = DEFAULT_DELIVER_DEPENDENCIES,
 ): Promise<void> {
   // Session lookup is scoped to the PROJECT DIRECTORY, so a deleted worktree can
   // never resume no matter how good the token is. Distinct message on purpose —
   // the caller reads these to tell the two failures apart.
   if (!existsSync(args.cwd)) {
-    throw new ResumeUnavailableError(`resume cwd no longer exists: ${args.cwd}`);
+	throw new ResumeUnavailableError(
+	  args.recoveryPolicy !== undefined
+		? 'recovery resume cwd is unavailable (details redacted)'
+		: `resume cwd no longer exists: ${args.cwd}`,
+	);
   }
 
   // Deterministic pre-check, rather than parsing a failed query's error text
@@ -1207,13 +1439,16 @@ async function deliver(
   // hang and never a wrong-session resume — so it is the safe way to be wrong.
   let known = false;
   try {
-    const { getSessionInfo } = await import('@anthropic-ai/claude-agent-sdk');
-    known = (await getSessionInfo(ref.token, { dir: args.cwd })) !== undefined;
+    known = (await dependencies.getSessionInfo(ref.token, { dir: args.cwd })) !== undefined;
   } catch {
     known = false;
   }
   if (!known) {
-    throw new ResumeUnavailableError(`provider no longer knows session ${ref.token}`);
+	throw new ResumeUnavailableError(
+	  args.recoveryPolicy !== undefined
+		? 'provider no longer knows the recovery session (details redacted)'
+		: `provider no longer knows session ${ref.token}`,
+	);
   }
 
   const env = buildChildEnv(process.env, { allowApiBilling: allowApiBillingFrom(process.env) });
@@ -1243,20 +1478,74 @@ async function deliver(
 
   // `forkSession` is deliberately NOT set: a fork would mint a new session id the
   // caller does not know about, and resume must continue the SAME session.
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
-  const q = query({ prompt: message, options });
-  SESSIONS.set(ref.token, { query: q, abortController, options });
+	let q: ClaudeQuery;
+	try {
+		const query = await dependencies.loadQuery();
+		q = query({ prompt: message, options });
+	} catch (err) {
+		if (args.recoveryPolicy === undefined) {
+			onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+			throw err;
+		}
+			const failure = isHarnessTurnError(err)
+				? err
+				: new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
+			onEvent({
+				kind: 'exited',
+				exitCode: null,
+				error: sanitizedFailureText(failure),
+			});
+		throw failure;
+	}
+	  SESSIONS.set(ref.token, { query: q, abortController, options });
+	  let exactClosed = false;
+	let failureEventEmitted = false;
+	const turnOnEvent = (event: AgentEvent): void => {
+		if (event.kind === 'exited') failureEventEmitted = true;
+		onEvent(event);
+	};
+	  const closeExact = (): void => {
+    if (exactClosed) return;
+    exactClosed = true;
+    if (SESSIONS.get(ref.token)?.query === q) SESSIONS.delete(ref.token);
+    try {
+      abortController.abort();
+    } catch {
+      // Best-effort, idempotent teardown.
+    }
+    try {
+      q.close();
+    } catch {
+      // The timeout/failure remains authoritative.
+    }
+  };
 
   try {
     // Never emits `started` — the contract forbids re-emitting it on a resume.
-    await consumeTurn(q, onEvent);
+	    await consumeTurn(q, turnOnEvent, undefined, undefined, {
+      ...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
+	  sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
+      abortController,
+      close: closeExact,
+      onActivity: (activity) => onEvent({ kind: 'activity', ...activity }),
+    });
   } catch (err) {
     const text = errText(err);
     // Belt and braces behind the `getSessionInfo` pre-check.
     if (RESUME_FAILURE_RE.test(text)) {
-      throw new ResumeUnavailableError(`provider refused resume of session ${ref.token}: ${text}`);
+	  throw new ResumeUnavailableError(
+		args.recoveryPolicy !== undefined
+		  ? 'provider refused recovery resume (details redacted)'
+		  : `provider refused resume of session ${ref.token}: ${text}`,
+	  );
     }
-    onEvent({ kind: 'exited', exitCode: null, error: text });
+		if (!failureEventEmitted) {
+			onEvent({
+				kind: 'exited',
+				exitCode: null,
+				error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : text,
+			});
+		}
     throw err;
   }
 }
@@ -1413,9 +1702,10 @@ export const claudeAdapter: HarnessAdapter = {
   // The provider stores the session and resumes it from the opaque token this
   // adapter puts in `HarnessSessionRef.token`.
   resumeTier: 'native-token',
+  recoveryPolicy: () => claudeRecoveryPolicy(),
   preflight: claudePreflight,
   start: startClaude,
-  deliver,
+  deliver: deliverClaude,
   stop,
   lintStep,
   resumeCommand,

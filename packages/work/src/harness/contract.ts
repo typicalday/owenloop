@@ -78,6 +78,11 @@ export type AgentEvent =
   /** The harness surfaced a blocking question. Phase 1 defines the EVENT only —
    *  this contract has no reply channel, and adding one is Phase 3/4's call. */
   | { kind: 'needs_input'; question: string }
+  /**
+   * Sanitized liveness telemetry.  It intentionally carries no provider event
+   * or response bytes: callers may persist it as recovery control state.
+   */
+  | { kind: 'activity'; at: number; deadlineAt: number }
   /** The model turn completed (the SDK result message on an in-process SDK
    *  path; `turn/completed` on an app-server path). */
   | { kind: 'turn_ended' }
@@ -316,6 +321,8 @@ export interface StartArgs {
    * behavior stands — that is a supported deployment, not a degraded one.
    */
   approvals?: ApprovalRequester;
+  /** Optional, adapter-resolved provider-silence recovery policy for this firing. */
+  recoveryPolicy?: HarnessRecoveryPolicy;
 }
 
 /**
@@ -345,7 +352,55 @@ export interface StartArgs {
  * miss.
  */
 export type DeliverArgs = Pick<StartArgs, 'cwd' | 'owenloopMcp' | 'permissions'> &
-  Pick<StartArgs, 'model' | 'effort' | 'approvals'>;
+  Pick<StartArgs, 'model' | 'effort' | 'approvals' | 'recoveryPolicy'>;
+
+/** The neutral part of an adapter's opt-in silence recovery configuration. */
+export interface HarnessRecoveryPolicy {
+  /** Maximum interval with no raw provider message before a turn is interrupted. */
+  idleTimeoutMs: number;
+}
+
+export const HARNESS_FAILURE_CATEGORIES = [
+  'idle-timeout',
+  'authentication',
+  'permission-policy',
+  'model-unavailable',
+  'configuration',
+  'provider',
+] as const;
+
+export type HarnessFailureCategory = (typeof HARNESS_FAILURE_CATEGORIES)[number];
+
+/** A structured adapter failure whose category is safe to persist and render. */
+export class HarnessTurnError extends Error {
+  readonly category: HarnessFailureCategory;
+  readonly terminal: boolean;
+
+  constructor(category: HarnessFailureCategory, terminal: boolean, message: string) {
+    super(message);
+    this.name = 'HarnessTurnError';
+    this.category = category;
+    this.terminal = terminal;
+  }
+}
+
+/** Provider silence while a recovery-enabled turn was awaiting a raw message. */
+export class HarnessIdleTimeoutError extends HarnessTurnError {
+  constructor(idleTimeoutMs: number) {
+    super('idle-timeout', false, `provider emitted no SDK message for ${idleTimeoutMs}ms`);
+    this.name = 'HarnessIdleTimeoutError';
+  }
+}
+
+export function isHarnessTurnError(err: unknown): err is HarnessTurnError {
+  if (typeof err !== 'object' || err === null) return false;
+  const candidate = err as { category?: unknown; terminal?: unknown };
+  return (
+    typeof candidate.category === 'string' &&
+    (HARNESS_FAILURE_CATEGORIES as readonly string[]).includes(candidate.category) &&
+    typeof candidate.terminal === 'boolean'
+  );
+}
 
 /**
  * One harness implementation.
@@ -374,6 +429,12 @@ export interface HarnessAdapter {
   /** Registry key — the adapter's own harness id. Stable across versions. */
   id: string;
   resumeTier: ResumeTier;
+  /**
+   * Reads and validates adapter-owned recovery configuration.  The worker calls
+   * it exactly once per firing and passes the resulting neutral policy back to
+   * every provider dispatch.
+   */
+  recoveryPolicy?(): HarnessRecoveryPolicy | undefined;
   /**
    * Mandatory permission preflight. Returns every restriction this adapter cannot
    * enforce exactly. The worker calls this before start or resume; a non-empty

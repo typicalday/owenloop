@@ -672,3 +672,38 @@ export function renderReplayBrief(brief: string, spec: RejectionSpec): string {
   // budget. Return the brief: an agent with a task and no reasons can still work.
   return brief;
 }
+
+/** Durable facts permitted to cross a recovery boundary. */
+export interface RecoveryBriefFacts {
+  phase: 'primary' | 'wake' | 'cold-restart' | 'held';
+  wakeUsed: boolean;
+  coldRestartUsed: boolean;
+  lastFailure?: { category: string; at: number };
+  lastActivityAt?: number;
+  deadlineAt?: number;
+}
+
+/** A tiny same-session wake; it deliberately never repeats a brief or input. */
+export function renderRecoveryWake(path: string, facts: RecoveryBriefFacts): string {
+  const state = JSON.stringify({
+    phase: facts.phase,
+    wakeUsed: facts.wakeUsed,
+    coldRestartUsed: facts.coldRestartUsed,
+    ...(facts.lastFailure !== undefined ? { lastFailure: facts.lastFailure } : {}),
+    ...(facts.lastActivityAt !== undefined ? { lastActivityAt: facts.lastActivityAt } : {}),
+    ...(facts.deadlineAt !== undefined ? { deadlineAt: facts.deadlineAt } : {}),
+  });
+  return `Your prior turn produced no accepted submission. Continue the same assignment and submit the one unfinished output path \`${path}\`. Durable recovery state: ${state}`;
+}
+
+/** Safe appendix for a cold recovery replay; the original brief remains intact. */
+export function renderColdRecoveryAppendix(facts: RecoveryBriefFacts): string {
+  return `Recovery appendix (durable facts only): ${JSON.stringify({
+    phase: facts.phase,
+    wakeUsed: facts.wakeUsed,
+    coldRestartUsed: facts.coldRestartUsed,
+    ...(facts.lastFailure !== undefined ? { lastFailure: facts.lastFailure } : {}),
+    ...(facts.lastActivityAt !== undefined ? { lastActivityAt: facts.lastActivityAt } : {}),
+    ...(facts.deadlineAt !== undefined ? { deadlineAt: facts.deadlineAt } : {}),
+  })}`;
+}

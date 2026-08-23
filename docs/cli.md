@@ -3623,6 +3623,10 @@ child's `eligible` orders or wait on child completion. To block on a tree, wait
 on the instance that actually owes the work (often a child), or poll deep
 `tick`/`status` yourself.
 
+## Claude idle-recovery status
+
+For a Shift intentionally using `OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS=600000`, `owenloop work sessions` reports recovery phase (`primary`, `wake`, `cold-restart`, or `held`), wake/cold usage, durable activity/deadline, and typed failure category. `held: action required` means the worker has called the normal producer-side `ask` after an exhausted recovery budget or a terminal/configuration failure; answer/retry the held artifact in the usual way. Recovery applies only to an order with exactly one non-empty owed output. Recovery-enabled rows omit provider tokens and do not print a `RESUME` command; recovery worker logs likewise suppress provider session ids, cwd, stderr, result/init prose, and SDK payloads. The setting is host-only, must be a canonical decimal duration between 1000 and 3600000 ms, and is never copied into the agent child environment.
+
 ## Instance pinning — editing a workflow definition mid-flight
 
 `create` snapshots the fully-expanded definition (post `include:`/`calls:`) onto the

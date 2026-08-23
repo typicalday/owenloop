@@ -18,16 +18,27 @@ import {
   type AdapterResolution,
   type AgentRunLoopOptions,
 } from '../src/agent/loop.ts';
-import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
+import {
+  ACCOUNT_TOKEN,
+  SHIFT_TOKEN,
+  ORDER_TOKEN,
+  ORIGIN_TOKEN,
+  renderColdRecoveryAppendix,
+  renderRecoveryWake,
+} from '../src/agent/brief.ts';
 import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
+import { claudeAdapter, deliverClaude, startClaude, type ClaudeQueryFactory } from '../src/harness/claude.ts';
 import type { MergedRoster } from '../src/settings/roster.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
-import { ResumeUnavailableError } from '../src/harness/contract.ts';
+import { HarnessTurnError, ResumeUnavailableError } from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
-import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
+import { HubError, type ContactHolder, type GetOrderResponse, type ReasonEntry } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
+import type { LeaseLoop, LeaseOutcome } from '../src/lease/loop.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import { projectSession } from '../src/roles/sessions.ts';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 // ---- fakes ------------------------------------------------------------------
 
@@ -40,6 +51,7 @@ interface Call {
 }
 
 interface OrderOpts {
+  run?: string;
   step?: string;
   workdir?: string;
   model?: string;
@@ -54,6 +66,7 @@ interface OrderOpts {
     judgmentRejects?: number;
     schema?: unknown;
     schemaAppliesTo?: 'value' | 'member';
+    reasons?: ReasonEntry[];
   }>;
   /** Extension bag. */
   x?: Record<string, unknown>;
@@ -71,12 +84,13 @@ interface OrderOpts {
 
 /** A get_order response carrying an agent order packet. */
 function agentOrder(o: OrderOpts = {}): GetOrderResponse {
+  const run = o.run ?? 'run1';
   return {
     text: '',
     workflow: 'wf1',
-    run: 'run1',
+    run,
     order: {
-      run: 'run1',
+      run,
       workflow: 'wf1',
       step: o.step ?? 'builder',
       key: 'k',
@@ -100,7 +114,7 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
         path: w.path,
         judgmentRejects: w.judgmentRejects ?? 0,
         schemaRejects: 0,
-        reasons: [],
+		reasons: w.reasons ?? [],
         ...(w.schema !== undefined ? { schema: w.schema, schemaAppliesTo: w.schemaAppliesTo } : {}),
       })),
     },
@@ -116,6 +130,7 @@ function noHold(lease: GetOrderResponse['lease']): GetOrderResponse {
 interface MockCfg {
   getOrder: Array<GetOrderResponse | Error> | ((n: number) => GetOrderResponse | Error);
   heartbeat?: (n: number) => void;
+	ask?: { ok: boolean; closed?: boolean; text?: string } | Error;
 }
 
 function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
@@ -148,7 +163,12 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
-    async ask() { return { text: '', ok: true }; },
+    async ask(req) {
+      calls.push({ verb: 'ask', arg: req });
+		const response = cfg.ask ?? { text: '', ok: true, closed: true };
+		if (response instanceof Error) throw response;
+		return { text: response.text ?? '', ok: response.ok, ...(response.closed !== undefined ? { closed: response.closed } : {}) };
+    },
     // The tool-approval gate is not exercised by these tests; a fake that never
     // opens an approval, and a non-answer is a denial.
     async requestApproval() { return { text: '', ok: false }; },
@@ -242,6 +262,7 @@ interface Harnessed {
 }
 
 interface BuildOpts {
+  run?: string;
   allowedWorkdirRoots?: string[];
   hub: HubClient;
   adapter?: HarnessAdapter;
@@ -249,6 +270,8 @@ interface BuildOpts {
   spec?: NormalizedStepSpec | null;
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
+	sleep?: AgentRunLoopOptions['sleep'];
+	now?: AgentRunLoopOptions['now'];
   shiftId?: string;
   shiftName?: string;
   shiftOwner?: string;
@@ -256,7 +279,9 @@ interface BuildOpts {
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
+	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
   dirExists?: AgentRunLoopOptions['dirExists'];
+  leaseFactory?: AgentRunLoopOptions['leaseFactory'];
 }
 
 function buildOpts(b: BuildOpts): Harnessed {
@@ -268,7 +293,7 @@ function buildOpts(b: BuildOpts): Harnessed {
   const opts: AgentRunLoopOptions = {
     hub: b.hub,
     workflow: 'wf1',
-    run: 'run1',
+    run: b.run ?? 'run1',
     holder: HOLDER,
     origin: 'https://hub.example',
     account: 'acct-1',
@@ -284,15 +309,18 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
+		...(b.latestRunSession === undefined ? {} : { latestRunSession: b.latestRunSession }),
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
+		...(b.leaseFactory === undefined ? {} : { leaseFactory: b.leaseFactory }),
     nextAttempt: () => 3,
-    sleep: macrotaskSleep,
-    now: () => 1_000,
+    sleep: b.sleep ?? macrotaskSleep,
+	now: b.now ?? (() => 1_000),
     out: (l) => outs.push(l),
     err: (l) => errs.push(l),
     heartbeatIntervalMs: 60_000,
     confirmIntervalMs: 1,
     submitGraceMs: b.submitGraceMs ?? 0,
+	recoveryStopGraceMs: 0,
   };
   return { opts, records, errs, outs };
 }
@@ -322,6 +350,944 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
     adapter.calls.filter((c) => c.kind === 'stop').length,
     1,
   );
+});
+
+test('idle recovery is bounded to primary, one wake, one cold start, then one producer ask', async () => {
+  const adapter = createFakeAdapter({
+    start: { events: [{ kind: 'turn_ended' }] },
+    deliver: { events: [{ kind: 'turn_ended' }] },
+  });
+  adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+  const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+  const outcome = await createAgentRunLoop(h.opts).run();
+
+  assert.equal(outcome, 'held');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 2);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 1);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
+	assert.match(recoveryAsk, /Harness recovery held pr/u);
+	assert.match(recoveryAsk, /after cold-restart/u);
+	assert.doesNotMatch(recoveryAsk, /claude|codex|anthropic|openai/iu);
+	assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
+  assert.equal(verbs(calls).includes('release'), false);
+});
+
+test('recovery wake is delta-only and cold replay preserves only the assignment and verified rejection', async () => {
+	const assignment = 'ORIGINAL_ASSIGNMENT_MUST_SURVIVE_COLD_RECOVERY';
+	const rejection = 'VERIFIED_REJECTION_MUST_SURVIVE_COLD_RECOVERY';
+	const consumedPayload = 'CONSUMED_PAYLOAD_MUST_NOT_ENTER_RECOVERY_PROMPTS';
+	const credentialPayload = 'CREDENTIAL_MUST_NOT_ENTER_RECOVERY_PROMPTS';
+	const providerToken = 'PROVIDER_TOKEN_MUST_NOT_ENTER_RECOVERY_PROMPTS';
+	const configPath = '/CONFIG_PATH_MUST_NOT_ENTER_RECOVERY_PROMPTS';
+	const safeWakeFacts = {
+		phase: 'wake' as const,
+		wakeUsed: true,
+		coldRestartUsed: false,
+	};
+	const unsafeWakeFacts = {
+		...safeWakeFacts,
+		prompt: assignment,
+		consumes: consumedPayload,
+		credential: credentialPayload,
+		providerToken,
+		configPath,
+	};
+	assert.equal(
+		renderRecoveryWake('pr', unsafeWakeFacts),
+		renderRecoveryWake('pr', safeWakeFacts),
+		'unknown prompt/provider/config fields are not part of the wake allowlist',
+	);
+	assert.equal(
+		renderColdRecoveryAppendix({ ...unsafeWakeFacts, phase: 'cold-restart', coldRestartUsed: true }),
+		renderColdRecoveryAppendix({ phase: 'cold-restart', wakeUsed: true, coldRestartUsed: true }),
+		'unknown prompt/provider/config fields are not part of the cold appendix allowlist',
+	);
+
+	const rejectionReason: ReasonEntry = {
+		at: 2_000,
+		action: 'reject',
+		kind: 'judgment',
+		by: 'reviewer',
+		text: rejection,
+	};
+	const adapter = createFakeAdapter({
+		token: providerToken,
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({
+			workdir: configPath,
+			consumes: { plan: consumedPayload, credential: credentialPayload },
+			owes: [{ path: 'pr', judgmentRejects: 1, reasons: [rejectionReason] }],
+		})],
+	});
+	const h = buildOpts({
+		hub,
+		adapter,
+		spec: { step: 'builder', brief: `# recovery assignment\n${assignment}`, permissions: { extensions: {} } },
+		consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+		submitGraceMs: 0,
+	});
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const starts = adapter.calls.filter((call) => call.kind === 'start');
+	const deliveries = adapter.calls.filter((call) => call.kind === 'deliver');
+	assert.equal(starts.length, 2);
+	assert.equal(deliveries.length, 1);
+	const wake = deliveries[0]!.message;
+	const cold = starts[1]!.args.brief;
+	assert.equal(wake, renderRecoveryWake('pr', safeWakeFacts));
+	assert.equal(wake.includes(assignment), false);
+	assert.equal(wake.includes(rejection), false);
+	assert.match(cold, new RegExp(assignment, 'u'));
+	assert.match(cold, new RegExp(rejection, 'u'));
+	assert.ok(cold.endsWith(
+		`---\n\n${renderColdRecoveryAppendix({ phase: 'cold-restart', wakeUsed: true, coldRestartUsed: true })}`,
+	));
+	for (const secret of [consumedPayload, credentialPayload, providerToken, configPath]) {
+		assert.equal(wake.includes(secret), false, `wake omitted ${secret}`);
+		assert.equal(cold.includes(secret), false, `cold replay omitted ${secret}`);
+	}
+
+	const externallyVisible = JSON.stringify({
+		askHold: calls.find((call) => call.verb === 'ask')?.arg,
+		logs: [...h.outs, ...h.errs],
+		status: projectSession(h.records.at(-1)!),
+	});
+	for (const payload of [assignment, rejection, consumedPayload, credentialPayload, providerToken, configPath]) {
+		assert.equal(externallyVisible.includes(payload), false, `ask/log/status omitted ${payload}`);
+	}
+});
+
+test('a cold recovery token receives a fresh session birth timestamp', async () => {
+	let starts = 0;
+	const refs: HarnessSessionRef[] = [
+		{ harness: 'fake', token: 'primary-token' },
+		{ harness: 'fake', token: 'cold-token' },
+	];
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(_args, onEvent) {
+			const ref = refs[starts++]!;
+			onEvent({ kind: 'started', ref });
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver(_ref, _message, _args, onEvent) {
+			onEvent({ kind: 'turn_ended' });
+		},
+		async stop() {},
+	};
+	const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	let clock = 0;
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0, now: () => ++clock });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const primary = h.records.find((record) => record.token === 'primary-token');
+	const cold = h.records.find((record) => record.token === 'cold-token');
+	assert.ok(primary, 'the primary provider token is persisted');
+	assert.ok(cold, 'the cold provider token is persisted');
+	assert.ok(cold.createdAt > primary.createdAt, 'the cold provider token has its own birth time');
+});
+
+test('recovery-enabled Claude provider tokens and failure payloads never reach worker logs', async () => {
+	const sessionTokens = [
+		'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+		'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+	] as const;
+	const providerCwd = '/PROVIDER_CWD_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const stderrPayload = 'PROVIDER_STDERR_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const resultPayload = 'PROVIDER_RESULT_ERROR_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const assistantPayload = 'PROVIDER_ASSISTANT_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const wakeInitializationPayload = 'WAKE_INITIALIZATION_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	const coldInitializationPayload = 'COLD_INITIALIZATION_SENTINEL_MUST_NOT_REACH_WORKER_LOGS';
+	let queryCalls = 0;
+	let starts = 0;
+	const queryFactory: ClaudeQueryFactory = ({ options }) => {
+		queryCalls += 1;
+		if (queryCalls === 2) throw new Error(wakeInitializationPayload);
+		if (queryCalls === 3) throw new Error(coldInitializationPayload);
+		options.stderr?.(`${stderrPayload}\n`);
+		return {
+			async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+				yield {
+					type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+					claude_code_version: 'provider-version', model: 'provider-model', apiKeySource: 'provider-key-source',
+					permissionMode: 'provider-permission', cwd: providerCwd,
+				} as unknown as SDKMessage;
+				yield {
+					type: 'assistant', parent_tool_use_id: null,
+					message: { content: [{ type: 'text', text: assistantPayload }] },
+				} as unknown as SDKMessage;
+				yield {
+					type: 'result', subtype: 'error_during_execution', errors: [resultPayload],
+				} as unknown as SDKMessage;
+			},
+			close() {},
+		};
+	};
+	const adapter: HarnessAdapter = {
+		id: claudeAdapter.id,
+		resumeTier: 'native-token',
+		preflight: () => [],
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		start: (args, onEvent) => startClaude(args, onEvent, {
+			createSessionId: () => sessionTokens[starts++]!,
+			loadQuery: async () => queryFactory,
+		}),
+		deliver: (ref, message, args, onEvent) => deliverClaude(ref, message, args, onEvent, {
+			getSessionInfo: async () => ({}),
+			loadQuery: async () => queryFactory,
+		}),
+		stop: (ref) => claudeAdapter.stop(ref),
+	};
+	const { hub } = mockHub({
+		getOrder: [agentOrder({ workdir: process.cwd(), owes: [{ path: 'pr' }] })],
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(queryCalls, 3, 'primary, wake, and cold each reach one query-construction boundary');
+	const log = h.errs.join('\n');
+	for (const sentinel of [
+		...sessionTokens,
+		providerCwd,
+		stderrPayload,
+		resultPayload,
+		assistantPayload,
+		wakeInitializationPayload,
+		coldInitializationPayload,
+	]) {
+		assert.equal(log.includes(sentinel), false, sentinel);
+	}
+	assert.match(log, /recovery harness failure category=provider/u);
+});
+
+test('a valid policy is not forwarded when zero, multiple, or only empty output paths make recovery ineligible', async () => {
+	const scenarios: Array<{ label: string; owes: NonNullable<OrderOpts['owes']> }> = [
+		{ label: 'zero outputs', owes: [] },
+		{ label: 'multiple outputs', owes: [{ path: 'first' }, { path: 'second' }] },
+		{ label: 'only an empty path', owes: [{ path: '' }] },
+	];
+
+	for (const scenario of scenarios) {
+		const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+		adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+		const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: scenario.owes })] });
+		const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+		assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit', scenario.label);
+		const starts = adapter.calls.filter((call) => call.kind === 'start');
+		assert.equal(starts.length, 1, scenario.label);
+		assert.equal(starts[0]?.args.recoveryPolicy, undefined, scenario.label);
+		assert.equal(adapter.calls.some((call) => call.kind === 'deliver'), false, scenario.label);
+		assert.equal(verbs(calls).includes('ask'), false, scenario.label);
+		assert.equal(verbs(calls).includes('release'), true, scenario.label);
+	}
+});
+
+test('one non-empty path among empty entries enables recovery only for the real target', async () => {
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: '' }, { path: 'pr' }] })],
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	for (const call of adapter.calls) {
+		if (call.kind === 'start' || call.kind === 'deliver') {
+			assert.deepEqual(call.args.recoveryPolicy, { idleTimeoutMs: 1_000 });
+		}
+	}
+	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
+	assert.match(recoveryAsk, /"path":"pr"/u);
+	assert.doesNotMatch(recoveryAsk, /"path":""/u);
+});
+
+test('a clean wake and cold restart supersede an earlier primary timeout in the hold question', async () => {
+	const ref: HarnessSessionRef = { harness: 'fake', token: 'recovery-token' };
+	let starts = 0;
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(_args, onEvent) {
+			starts += 1;
+			onEvent({ kind: 'started', ref });
+			if (starts === 1) throw new HarnessTurnError('idle-timeout', false, 'primary timed out');
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver(_ref, _message, _args, onEvent) {
+			onEvent({ kind: 'turn_ended' });
+		},
+		async stop() {},
+	};
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const recoveryAsk = JSON.stringify(calls.find((call) => call.verb === 'ask')?.arg);
+	assert.match(recoveryAsk, /after cold-restart/u);
+	assert.doesNotMatch(recoveryAsk, /after idle-timeout/u);
+});
+
+test('an opted-in permission preflight holds immediately without starting a provider turn', async () => {
+	const sentinel = '/RECOVERY_PREFLIGHT_PATH_MUST_NOT_REACH_WORKER_LOGS';
+	const adapter = createFakeAdapter();
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	adapter.preflight = () => [{ field: sentinel, message: `policy refused for ${sentinel}` }];
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 0);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	assert.equal(h.records.at(-1)?.recovery?.phase, 'held');
+	assert.equal(h.records.at(-1)?.recovery?.lastFailure?.category, 'permission-policy');
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery harness failure category=permission-policy \(details redacted\)/u);
+});
+
+test('an invalid recovery setting stops a multi-output run before model delivery', async () => {
+	const adapter = createFakeAdapter();
+	adapter.recoveryPolicy = () => {
+		throw new HarnessTurnError('configuration', true, 'invalid host setting');
+	};
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: 'first' }, { path: 'second' }] })],
+	});
+	const h = buildOpts({ hub, adapter });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'incompatible-harness-policy');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 0);
+	assert.equal(verbs(calls).includes('ask'), false);
+  assert.equal(verbs(calls).includes('release'), true);
+});
+
+test('an invalid recovery setting on one output takes the same immediate durable hold as a terminal provider failure', async () => {
+	const adapter = createFakeAdapter();
+	adapter.recoveryPolicy = () => {
+		throw new HarnessTurnError('configuration', true, 'invalid host setting');
+	};
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 0);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	assert.equal(h.records.at(-1)?.recovery?.lastFailure?.category, 'configuration');
+});
+
+test('a primary resume-unavailable checkpoint consumes the skipped wake before cold restart', async () => {
+	const ref: HarnessSessionRef = { harness: 'fake', token: 'cold-token' };
+	let starts = 0;
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(_args, onEvent) {
+			starts += 1;
+			if (starts === 1) throw new ResumeUnavailableError('primary session disappeared');
+			onEvent({ kind: 'started', ref });
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver() {
+			throw new Error('the skipped wake must never be delivered');
+		},
+		async stop() {},
+	};
+	const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(starts, 2);
+	const cold = h.records.find((record) => record.recovery?.phase === 'cold-restart');
+	assert.equal(cold?.recovery?.wakeUsed, true);
+	assert.equal(cold?.recovery?.coldRestartUsed, true);
+});
+
+test('a terminal primary failure and a restarted terminal checkpoint both hold without extra dispatch', async () => {
+	const terminal = new HarnessTurnError('authentication', true, 'structured authentication failure');
+	const adapter = createFakeAdapter({ start: { dieWith: terminal.message } });
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let terminalStarts = 0;
+	adapter.start = async () => {
+		terminalStarts += 1;
+		throw terminal;
+	};
+	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(terminalStarts, 1);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+
+	const saved: SessionRecord = {
+		workflow: 'wf1', run: 'run1', step: 'builder', key: 'k', order: 'wf1/run1', attempt: 1,
+		harness: 'fake', token: 'prior-token', cwd: '/fallback/cwd', status: 'turn-ended', createdAt: 1, updatedAt: 1,
+		recovery: {
+			generation: 'run1', phase: 'primary', wakeUsed: false, coldRestartUsed: false,
+			lastFailure: { category: 'authentication', at: 1 },
+		},
+	};
+	const restarted = createFakeAdapter();
+	restarted.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const second = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const secondHarness = buildOpts({ hub: second.hub, adapter: restarted, latestRunSession: () => saved, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(secondHarness.opts).run(), 'held');
+	assert.equal(restarted.calls.filter((call) => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('restart consumption advances from every durable recovery phase without repeating a provider dispatch', async () => {
+	const scenarios: Array<{
+		phase: NonNullable<SessionRecord['recovery']>['phase'];
+		wakeUsed: boolean;
+		coldRestartUsed: boolean;
+		starts: number;
+		delivers: number;
+	}> = [
+		{ phase: 'primary', wakeUsed: false, coldRestartUsed: false, starts: 1, delivers: 1 },
+		{ phase: 'wake', wakeUsed: true, coldRestartUsed: false, starts: 1, delivers: 0 },
+		{ phase: 'cold-restart', wakeUsed: true, coldRestartUsed: true, starts: 0, delivers: 0 },
+		{ phase: 'held', wakeUsed: true, coldRestartUsed: true, starts: 0, delivers: 0 },
+	];
+	for (const scenario of scenarios) {
+		const adapter = createFakeAdapter({
+			start: { events: [{ kind: 'turn_ended' }] },
+			deliver: { events: [{ kind: 'turn_ended' }] },
+		});
+		adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+		const saved: SessionRecord = {
+			workflow: 'wf1', run: 'run1', step: 'builder', key: 'k', order: 'wf1/run1', attempt: 1,
+			harness: 'fake', token: 'persisted-token', cwd: '/fallback/cwd', status: 'turn-ended', createdAt: 1, updatedAt: 1,
+			recovery: {
+				generation: 'run1', phase: scenario.phase, wakeUsed: scenario.wakeUsed,
+				coldRestartUsed: scenario.coldRestartUsed,
+			},
+		};
+		const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+		const h = buildOpts({ hub, adapter, latestRunSession: () => saved, submitGraceMs: 0 });
+		assert.equal(await createAgentRunLoop(h.opts).run(), 'held', scenario.phase);
+		assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, scenario.starts, scenario.phase);
+		assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, scenario.delivers, scenario.phase);
+	}
+});
+
+test('a fresh run id ignores the prior run checkpoint and receives a new full recovery budget', async () => {
+	const stale: SessionRecord = {
+		workflow: 'wf1', run: 'run1', step: 'builder', key: 'k', order: 'wf1/run1', attempt: 4,
+		harness: 'fake', token: 'prior-run-token', cwd: '/fallback/cwd', status: 'turn-ended', createdAt: 1, updatedAt: 1,
+		recovery: {
+			generation: 'run1', phase: 'held', wakeUsed: true, coldRestartUsed: true,
+			lastFailure: { category: 'idle-timeout', at: 1 },
+		},
+	};
+	const adapter = createFakeAdapter({
+		token: 'fresh-run-token',
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ run: 'run2', owes: [{ path: 'pr' }] })],
+	});
+	const h = buildOpts({
+		hub,
+		run: 'run2',
+		adapter,
+		latestRunSession: (workflow, run, step) => {
+			assert.deepEqual([workflow, run, step], ['wf1', 'run2', 'builder']);
+			// Defensive regression: even if a reader hands back an old generation,
+			// the runner must not inherit its spent wake/cold budget.
+			return stale;
+		},
+		submitGraceMs: 0,
+	});
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 2, 'fresh primary and cold start');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 1, 'fresh same-session wake');
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
+	const recoveryRows = h.records.filter((record) => record.recovery !== undefined);
+	assert.ok(recoveryRows.length > 0);
+	assert.ok(recoveryRows.every((record) => record.run === 'run2' && record.recovery?.generation === 'run2'));
+	const primary = recoveryRows.find((record) => record.recovery?.phase === 'primary');
+	assert.equal(primary?.recovery?.wakeUsed, false);
+	assert.equal(primary?.recovery?.coldRestartUsed, false);
+	assert.equal(
+		adapter.calls.some((call) => call.kind === 'deliver' && call.ref.token === stale.token),
+		false,
+		'the prior generation provider session is not reused by recovery',
+	);
+});
+
+test('a failed recovery checkpoint releases before provider work, and an activity checkpoint cannot spend another phase', async () => {
+	const beforeDispatch = createFakeAdapter();
+	beforeDispatch.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const firstHub = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const first = buildOpts({
+		hub: firstHub.hub,
+		adapter: beforeDispatch,
+		appendSession: () => { throw new Error('fsync unavailable'); },
+	});
+	assert.equal(await createAgentRunLoop(first.opts).run(), 'session-store-failed');
+	assert.equal(beforeDispatch.calls.filter((call) => call.kind === 'start').length, 0);
+
+	const duringActivity = createFakeAdapter({ start: { events: [{ kind: 'activity', at: 6_000, deadlineAt: 7_000 }] } });
+	duringActivity.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let writes = 0;
+	const secondHub = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const second = buildOpts({
+		hub: secondHub.hub,
+		adapter: duringActivity,
+		appendSession: () => {
+			writes += 1;
+			if (writes === 3) throw new Error('activity fsync unavailable');
+		},
+	});
+	assert.equal(await createAgentRunLoop(second.opts).run(), 'session-store-failed');
+	assert.equal(duringActivity.calls.filter((call) => call.kind === 'deliver').length, 0);
+
+	const afterTurn = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+	afterTurn.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let terminalWrites = 0;
+	const thirdHub = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	const third = buildOpts({
+		hub: thirdHub.hub,
+		adapter: afterTurn,
+		appendSession: () => {
+			terminalWrites += 1;
+			if (terminalWrites === 3) throw new Error('turn-ended fsync unavailable');
+		},
+	});
+	assert.equal(await createAgentRunLoop(third.opts).run(), 'session-store-failed');
+	assert.equal(afterTurn.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(verbs(thirdHub.calls).includes('release'), true);
+});
+
+test('hub submit and claim loss stay authoritative across persistence failures in primary, wake, and cold phases', async () => {
+	const phases = [
+		{ phase: 'primary', confirmCall: 1, starts: 1, delivers: 0 },
+		{ phase: 'wake', confirmCall: 2, starts: 1, delivers: 1 },
+		{ phase: 'cold-restart', confirmCall: 3, starts: 2, delivers: 1 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const, status: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+
+	for (const phase of phases) {
+		for (const authority of authorities) {
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n !== phase.confirmCall) return agentOrder(common);
+					return authority.outcome === 'submitted'
+						? agentOrder({ ...common, claimed: false, outcome: 'green' })
+						: agentOrder({ ...common, claimed: false });
+				},
+			});
+			const h = buildOpts({
+				hub,
+				adapter,
+				submitGraceMs: 0,
+				appendSession: (record) => {
+					const isTargetPhase = record.recovery?.phase === phase.phase;
+					if (isTargetPhase && (record.status === 'turn-ended' || record.status === authority.status)) {
+						throw new Error(`${authority.label} ${phase.phase} diagnostic fsync failed`);
+					}
+				},
+			});
+
+			assert.equal(
+				await createAgentRunLoop(h.opts).run(),
+				authority.outcome,
+				`${authority.label} during ${phase.phase}`,
+			);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(verbs(calls).includes('release'), false, 'authoritative closure must never be released');
+		}
+	}
+});
+
+test('direct submit and claim-loss confirmations stop every started recovery session exactly once', async () => {
+	const phases = [
+		{ phase: 'primary', confirmCall: 1, starts: 1, delivers: 0 },
+		{ phase: 'wake', confirmCall: 2, starts: 1, delivers: 1 },
+		{ phase: 'cold-restart', confirmCall: 3, starts: 2, delivers: 1 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const },
+	];
+
+	for (const phase of phases) {
+		for (const authority of authorities) {
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n !== phase.confirmCall) return agentOrder(common);
+					return authority.outcome === 'submitted'
+						? agentOrder({ ...common, claimed: false, outcome: 'green' })
+						: agentOrder({ ...common, claimed: false });
+				},
+			});
+			const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+			assert.equal(
+				await createAgentRunLoop(h.opts).run(),
+				authority.outcome,
+				`${authority.label} during ${phase.phase}`,
+			);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(
+				adapter.calls.filter((call) => call.kind === 'stop').length,
+				phase.starts,
+				`each session started through ${phase.phase} is stopped once`,
+			);
+			assert.equal(verbs(calls).includes('release'), false);
+		}
+	}
+});
+
+test('hung recovery cleanup cannot keep authoritative wake or cold outcomes alive', async () => {
+	const phases = [
+		{ phase: 'wake', confirmCall: 2, starts: 1, delivers: 1, hungStop: 1 },
+		{ phase: 'cold-restart', confirmCall: 3, starts: 2, delivers: 1, hungStop: 2 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const, status: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+
+	for (const phase of phases) {
+		for (const authority of authorities) {
+			const causalOrder: string[] = [];
+			let settleLease: ((outcome: LeaseOutcome) => void) | undefined;
+			const leaseFactory: NonNullable<AgentRunLoopOptions['leaseFactory']> = (leaseOpts): LeaseLoop => {
+				const done = new Promise<LeaseOutcome>((resolve) => {
+					settleLease = resolve;
+				});
+				return {
+					async run() {
+						const first = await leaseOpts.hub.getOrder({
+							workflow: leaseOpts.workflow,
+							run: leaseOpts.run,
+							...(leaseOpts.holder === undefined ? {} : { holder: leaseOpts.holder }),
+						});
+						leaseOpts.onOrder?.(first);
+						return done;
+					},
+					stop(reason, options) {
+						causalOrder.push(`lease.stop:${reason ?? ''}:${options?.release === false ? 'no-release' : 'release'}`);
+						settleLease?.('stopped');
+					},
+				};
+			};
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const originalStop = adapter.stop.bind(adapter);
+			let stopCalls = 0;
+			let rejectLateStop: ((reason?: unknown) => void) | undefined;
+			adapter.stop = async (ref) => {
+				stopCalls += 1;
+				await originalStop(ref);
+				if (stopCalls === phase.hungStop) {
+					const expectedLeaseStop = `lease.stop:${authority.outcome === 'submitted' ? 'submitted' : 'lease-lost'}:no-release`;
+					assert.equal(
+						causalOrder.at(-1),
+						expectedLeaseStop,
+						`${phase.phase} cleanup starts only after the authoritative lease stop`,
+					);
+					causalOrder.push(`adapter.stop:${phase.phase}`);
+					await new Promise<void>((_resolve, reject) => {
+						rejectLateStop = reject;
+					});
+				}
+			};
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n !== phase.confirmCall) return agentOrder(common);
+					return authority.outcome === 'submitted'
+						? agentOrder({ ...common, claimed: false, outcome: 'green' })
+						: agentOrder({ ...common, claimed: false });
+				},
+			});
+			const h = buildOpts({ hub, adapter, leaseFactory, submitGraceMs: 0 });
+
+			assert.equal(await createAgentRunLoop(h.opts).run(), authority.outcome);
+			assert.deepEqual(causalOrder, [
+				`lease.stop:${authority.outcome === 'submitted' ? 'submitted' : 'lease-lost'}:no-release`,
+				`adapter.stop:${phase.phase}`,
+			]);
+			assert.equal(h.records.at(-1)?.status, authority.status);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, phase.starts);
+			assert.equal(verbs(calls).includes('release'), false);
+			const heartbeatCount = verbs(calls).filter((verb) => verb === 'heartbeat').length;
+			await macrotaskSleep();
+			assert.equal(verbs(calls).filter((verb) => verb === 'heartbeat').length, heartbeatCount);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(verbs(calls).includes('release'), false);
+			assert.match(h.errs.join('\n'), /recovery session stop timed out \(details redacted; ignored\)/u);
+			assert.ok(rejectLateStop, 'the bounded cleanup began before its timeout');
+			const sentinel = 'LATE_PROVIDER_STOP_REJECTION_MUST_NOT_REACH_WORKER_LOGS';
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+			process.on('unhandledRejection', onUnhandled);
+			try {
+				rejectLateStop?.(new Error(sentinel));
+				await macrotaskSleep();
+				await macrotaskSleep();
+				assert.deepEqual(unhandled, []);
+				assert.equal(h.errs.join('\n').includes(sentinel), false);
+			} finally {
+				process.off('unhandledRejection', onUnhandled);
+			}
+		}
+	}
+});
+
+test('lease outcomes that land between recovery phases prevent the next provider dispatch', async () => {
+	const transitions = [
+		{ nextPhase: 'wake', triggerConfirmCall: 1, starts: 1, delivers: 0 },
+		{ nextPhase: 'cold-restart', triggerConfirmCall: 2, starts: 1, delivers: 1 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const, status: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+
+	for (const transition of transitions) {
+		for (const authority of authorities) {
+			let wakeHeartbeat: (() => void) | undefined;
+			const sleep: AgentRunLoopOptions['sleep'] = async (ms) => {
+				if (ms === 60_000) {
+					await new Promise<void>((resolve) => { wakeHeartbeat = resolve; });
+					return;
+				}
+				await macrotaskSleep();
+			};
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n === transition.triggerConfirmCall) {
+						assert.ok(wakeHeartbeat, `heartbeat is parked before ${transition.nextPhase}`);
+						wakeHeartbeat();
+						return agentOrder(common);
+					}
+					if (n === transition.triggerConfirmCall + 1) {
+						return authority.outcome === 'submitted'
+							? agentOrder({ ...common, claimed: false, outcome: 'green' })
+							: agentOrder({ ...common, claimed: false });
+					}
+					return agentOrder(common);
+				},
+				heartbeat: () => { throw new Error('lease changed between phases'); },
+			});
+			const h = buildOpts({ hub, adapter, sleep, submitGraceMs: 0 });
+
+			assert.equal(
+				await createAgentRunLoop(h.opts).run(),
+				authority.outcome,
+				`${authority.label} before ${transition.nextPhase}`,
+			);
+			assert.equal(h.records.at(-1)?.status, authority.status);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, transition.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, transition.delivers);
+			assert.equal(verbs(calls).includes('release'), false);
+		}
+	}
+});
+
+test('a signal between primary confirmation and wake prevents another recovery dispatch', async () => {
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let loop: ReturnType<typeof createAgentRunLoop>;
+	const { hub, calls } = mockHub({
+		getOrder: (n) => {
+			if (n === 1) queueMicrotask(() => loop.stop('inter-phase signal'));
+			return agentOrder({ owes: [{ path: 'pr' }] });
+		},
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+	loop = createAgentRunLoop(h.opts);
+
+	assert.equal(await loop.run(), 'killed');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 1);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, 1);
+	assert.equal(verbs(calls).filter((verb) => verb === 'release').length, 1);
+});
+
+test('recovery teardown failures redact provider-controlled stop prose', async () => {
+	const sentinel = 'PROVIDER_STOP_FAILURE_MUST_NOT_REACH_WORKER_LOGS';
+	const authorities = [
+		{ outcome: 'submitted' as const, status: 'submitted' as const },
+		{ outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+	for (const authority of authorities) {
+		const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+		adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+		const stop = adapter.stop.bind(adapter);
+		adapter.stop = async (ref) => {
+			await stop(ref);
+			throw new Error(sentinel);
+		};
+		const { hub, calls } = mockHub({
+			getOrder: [
+				agentOrder({ owes: [{ path: 'pr' }] }),
+				authority.outcome === 'submitted'
+					? agentOrder({ owes: [{ path: 'pr' }], claimed: false, outcome: 'green' })
+					: agentOrder({ owes: [{ path: 'pr' }], claimed: false }),
+			],
+		});
+		const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+		assert.equal(await createAgentRunLoop(h.opts).run(), authority.outcome);
+		assert.equal(h.records.at(-1)?.status, authority.status);
+		assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, 1);
+		assert.equal(verbs(calls).includes('release'), false);
+		const log = h.errs.join('\n');
+		assert.equal(log.includes(sentinel), false);
+		assert.match(log, /recovery session stop failed \(details redacted; ignored\)/u);
+	}
+});
+
+test('recovery approval telemetry redacts blocked paths and gatekeeper reasons', async () => {
+	const sentinel = '/RECOVERY_BLOCKED_PATH_MUST_NOT_REACH_WORKER_LOGS';
+	const ref: HarnessSessionRef = { harness: 'fake', token: 'approval-token' };
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(args, onEvent) {
+			onEvent({ kind: 'started', ref });
+			assert.ok(args.approvals);
+			const controller = new AbortController();
+			const approval = args.approvals({
+				toolUseId: 'tool-recovery-approval',
+				toolName: 'Read',
+				toolInput: { path: sentinel },
+				reason: `the harness blocked ${sentinel}`,
+				signal: controller.signal,
+			});
+			await macrotaskSleep();
+			controller.abort();
+			void approval;
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver() {
+			throw new HarnessTurnError('permission-policy', true, 'approval gate stopped the recovery turn');
+		},
+		async stop() {},
+	};
+	const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	hub.requestApproval = async (req) => ({
+		text: '',
+		ok: true,
+		approval: {
+			workflow: 'wf1', run: 'run1', toolUseId: req.tool_use_id, step: 'builder',
+			toolName: req.tool_name, reason: req.reason, title: req.title ?? '', state: 'pending',
+			requestedAt: 1, decidedAt: null, decidedBy: null, note: null,
+		},
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery approval raised \(details redacted\)/u);
+});
+
+test('a 2xx refusal from recovery ask is never recorded as held', async () => {
+	const sentinel = 'RECOVERY_ASK_REFUSAL_PROSE_MUST_NOT_REACH_WORKER_LOGS';
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: 'pr' }] })],
+		ask: { ok: false, closed: false, text: sentinel },
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit');
+	assert.equal(h.records.at(-1)?.status, 'dead');
+	assert.equal(verbs(calls).includes('release'), true);
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery ask was refused \(details redacted\)/u);
+});
+
+test('a thrown recovery ask error is redacted before the order is released', async () => {
+	const sentinel = 'RECOVERY_ASK_TRANSPORT_PROSE_MUST_NOT_REACH_WORKER_LOGS';
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: 'pr' }] })],
+		ask: new Error(sentinel),
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'hub-unreachable');
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 2);
+	assert.equal(verbs(calls).includes('release'), true);
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery ask failed \(details redacted\)/u);
 });
 
 test('the additional unbounded final-response evidence event is redacted while progress remains logged', async () => {

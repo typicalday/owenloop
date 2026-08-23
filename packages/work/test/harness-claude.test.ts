@@ -29,11 +29,15 @@ import {
   buildChildEnv,
   buildClaudeOptions,
   claudeAdapter,
+  consumeTurn,
+	deliverClaude,
+  parseClaudeIdleTimeout,
   resolveExecutable,
   startClaude,
   type ClaudeOptionInputs,
   type ClaudeQueryFactory,
 } from '../src/harness/claude.ts';
+import { HarnessIdleTimeoutError, HarnessTurnError, isResumeUnavailable } from '../src/harness/contract.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import { adapterFor } from '../src/harness/registry.ts';
 import type { AgentEvent } from '../src/harness/contract.ts';
@@ -542,6 +546,383 @@ test('env and abortController are always set, and stderr preserves display text 
     text: `stderr: ${longLine}`,
     failure: `${longLine.slice(0, 2_000)}…`,
   });
+
+	const recoveryOptions = buildClaudeOptions(
+		{
+			cwd: '/tmp/work',
+			owenloopMcp: MOUNT,
+			permissions: { extensions: {} },
+			recoveryPolicy: { idleTimeoutMs: 1_000 },
+		},
+		{ env, abortController: new AbortController(), onEvent: (event) => events.push(event) },
+	);
+	recoveryOptions.stderr?.('RECOVERY_STDERR_PAYLOAD_MUST_NOT_ESCAPE\n');
+	assert.equal(events.length, 2, 'recovery stderr produces no provider-controlled telemetry');
+});
+
+test('the idle-timeout parser accepts bounded canonical decimals and rejects invalid values', () => {
+  assert.equal(parseClaudeIdleTimeout(undefined), undefined);
+  assert.deepEqual(parseClaudeIdleTimeout('1000'), { idleTimeoutMs: 1000 });
+  assert.deepEqual(parseClaudeIdleTimeout('3600000'), { idleTimeoutMs: 3_600_000 });
+  for (const value of ['0999', '999', '3600001', '1e3', '+1000', '1000 ']) {
+    assert.throws(() => parseClaudeIdleTimeout(value), { name: 'HarnessTurnError' });
+  }
+});
+
+test('a silent SDK iterator aborts and closes its exact controlled query', async () => {
+  let fire: (() => void) | undefined;
+  let cleared = 0;
+  let closed = 0;
+  const controller = new AbortController();
+  const silent: AsyncIterable<SDKMessage> = {
+    [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+      return { next: async () => new Promise<IteratorResult<SDKMessage>>(() => {}) };
+    },
+  };
+  const pending = consumeTurn(silent, () => {}, undefined, undefined, {
+    idleTimeoutMs: 1_000,
+    abortController: controller,
+    close: () => { closed++; },
+    setTimer: (callback) => {
+      fire = callback;
+      return {} as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: () => { cleared++; },
+  });
+  assert.ok(fire, 'the first read is covered before it settles');
+  fire!();
+  await assert.rejects(pending, HarnessIdleTimeoutError);
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(closed, 1);
+  assert.equal(cleared, 0, 'the timer already fired and is not cleared twice');
+});
+
+test('idle timeout remains authoritative when abort or close rejects the pending iterator read', async () => {
+	let fire: (() => void) | undefined;
+	let rejectNext: ((error: Error) => void) | undefined;
+	const controller = new AbortController();
+	const silent: AsyncIterable<SDKMessage> = {
+		[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+			return {
+				next: async () => new Promise<IteratorResult<SDKMessage>>((_resolve, reject) => {
+					rejectNext = reject;
+					controller.signal.addEventListener(
+						'abort',
+						() => reject(new Error('iterator rejected during abort')),
+						{ once: true },
+					);
+				}),
+			};
+		},
+	};
+	const pending = consumeTurn(silent, () => {}, undefined, undefined, {
+		idleTimeoutMs: 1_000,
+		abortController: controller,
+		close: () => rejectNext?.(new Error('iterator rejected during close')),
+		setTimer: (callback) => {
+			fire = callback;
+			return callback as unknown as ReturnType<typeof setTimeout>;
+		},
+		clearTimer: () => {},
+	});
+
+	assert.ok(fire, 'the idle deadline is armed before the pending read');
+	fire!();
+	await assert.rejects(
+		pending,
+		(error: unknown) => error instanceof HarnessIdleTimeoutError && error.category === 'idle-timeout',
+	);
+});
+
+test('a terminal assistant error remains authoritative when the provider then goes silent', async () => {
+	const cases = [
+		{ providerError: 'authentication_failed', category: 'authentication' },
+		{ providerError: 'model_not_found', category: 'model-unavailable' },
+	] as const;
+
+	for (const scenario of cases) {
+		let fire: (() => void) | undefined;
+		let rejectNext: ((error: Error) => void) | undefined;
+		let nextCalls = 0;
+		let announceSecondRead: (() => void) | undefined;
+		const controller = new AbortController();
+		const secondReadStarted = new Promise<void>((resolve) => { announceSecondRead = resolve; });
+		const stream: AsyncIterable<SDKMessage> = {
+			[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+				return {
+					next(): Promise<IteratorResult<SDKMessage>> {
+						nextCalls += 1;
+						if (nextCalls === 1) {
+							return Promise.resolve({
+								done: false,
+								value: {
+									type: 'assistant', parent_tool_use_id: null,
+									error: scenario.providerError, message: { content: [] },
+								} as unknown as SDKMessage,
+							});
+						}
+						announceSecondRead?.();
+						return new Promise<IteratorResult<SDKMessage>>((_resolve, reject) => {
+							rejectNext = reject;
+							controller.signal.addEventListener(
+								'abort',
+								() => reject(new Error('terminal iterator rejected during abort')),
+								{ once: true },
+							);
+						});
+					},
+				};
+			},
+		};
+		const pending = consumeTurn(stream, () => {}, undefined, undefined, {
+			idleTimeoutMs: 1_000,
+			abortController: controller,
+			close: () => rejectNext?.(new Error('terminal iterator rejected during close')),
+			setTimer: (callback) => {
+				fire = callback;
+				return callback as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimer: () => {},
+		});
+
+		await secondReadStarted;
+		assert.ok(fire, `${scenario.providerError} arms the post-assistant idle deadline`);
+		fire!();
+		await assert.rejects(
+			pending,
+			(error: unknown) =>
+				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
+			scenario.providerError,
+		);
+	}
+});
+
+test('a terminal assistant error remains authoritative when the stream ends before a result', async () => {
+	const cases = [
+		{ providerError: 'authentication_failed', category: 'authentication' },
+		{ providerError: 'model_not_found', category: 'model-unavailable' },
+	] as const;
+	for (const scenario of cases) {
+		const stream: AsyncIterable<SDKMessage> = {
+			async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+				yield {
+					type: 'assistant', parent_tool_use_id: null,
+					error: scenario.providerError, message: { content: [] },
+				} as unknown as SDKMessage;
+			},
+		};
+		await assert.rejects(
+			consumeTurn(stream, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
+			(error: unknown) =>
+				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
+			scenario.providerError,
+		);
+	}
+});
+
+test('partial SDK messages are enabled only by an explicit recovery policy', () => {
+  assert.equal(optionsFor(undefined).options.includePartialMessages, undefined);
+  const events: AgentEvent[] = [];
+  const options = buildClaudeOptions(
+    { cwd: '/tmp/work', owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy: { idleTimeoutMs: 1_000 } },
+    { env: bareEnv(), abortController: new AbortController(), onEvent: (event) => events.push(event) },
+  );
+  assert.equal(options.includePartialMessages, true);
+  assert.deepEqual(events, []);
+});
+
+test('raw partial SDK events reset liveness without exposing their payload, and timers are cleaned up', async () => {
+	const partialPayload = 'RAW_PARTIAL_PAYLOAD_MUST_NOT_ESCAPE';
+	const callbacks: Array<() => void> = [];
+	let cleared = 0;
+	const activities: Array<{ at: number; deadlineAt: number }> = [];
+	const events: AgentEvent[] = [];
+	const stream: AsyncIterable<SDKMessage> = {
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			yield { type: 'stream_event', event: { delta: partialPayload } } as unknown as SDKMessage;
+			yield { type: 'result', subtype: 'success' } as SDKMessage;
+		},
+	};
+	await consumeTurn(stream, (event) => events.push(event), undefined, undefined, {
+		idleTimeoutMs: 1_000,
+		now: (() => { let at = 10; return () => ++at; })(),
+		setTimer: (callback) => {
+			callbacks.push(callback);
+			return callback as unknown as ReturnType<typeof setTimeout>;
+		},
+		clearTimer: () => { cleared += 1; },
+		onActivity: (activity) => activities.push(activity),
+	});
+	assert.equal(activities.length, 3, 'initial read, partial event, and result each renew the deadline');
+	assert.equal(callbacks.length, 3);
+	assert.equal(cleared, 3);
+	assert.equal(JSON.stringify(events).includes(partialPayload), false);
+});
+
+test('recovery turn telemetry contains only structured categories, never provider payloads or tokens', async () => {
+	const sessionToken = 'RECOVERY_SESSION_TOKEN_MUST_NOT_ESCAPE';
+	const providerCwd = '/RECOVERY_PROVIDER_CWD_MUST_NOT_ESCAPE';
+	const assistantPayload = 'RECOVERY_ASSISTANT_PAYLOAD_MUST_NOT_ESCAPE';
+	const userPayload = 'RECOVERY_USER_PAYLOAD_MUST_NOT_ESCAPE';
+	const resultError = 'RECOVERY_RESULT_ERROR_MUST_NOT_ESCAPE';
+	const events: AgentEvent[] = [];
+	let initialized: string | undefined;
+	const stream: AsyncIterable<SDKMessage> = {
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			yield {
+				type: 'system', subtype: 'init', session_id: sessionToken, mcp_servers: [],
+				claude_code_version: 'provider-version', model: 'provider-model', apiKeySource: 'provider-key-source',
+				permissionMode: 'provider-permission', cwd: providerCwd,
+			} as unknown as SDKMessage;
+			yield {
+				type: 'assistant', parent_tool_use_id: null,
+				message: { content: [{ type: 'text', text: assistantPayload }] },
+			} as unknown as SDKMessage;
+			yield {
+				type: 'user', parent_tool_use_id: null, message: { content: userPayload },
+			} as unknown as SDKMessage;
+			yield {
+				type: 'result', subtype: 'error_during_execution', errors: [resultError],
+			} as unknown as SDKMessage;
+		},
+	};
+
+	await assert.rejects(
+		consumeTurn(stream, (event) => events.push(event), (token) => { initialized = token; }, undefined, {
+			idleTimeoutMs: 1_000,
+			sanitizeProviderTelemetry: true,
+		}),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider',
+	);
+
+	assert.equal(initialized, sessionToken, 'the internal session gate still receives the provider token');
+	assert.deepEqual(events, [
+		{ kind: 'exited', exitCode: null, error: 'provider failure category=provider (details redacted)' },
+		{ kind: 'turn_ended' },
+	]);
+	const rendered = JSON.stringify(events);
+	for (const sentinel of [sessionToken, providerCwd, assistantPayload, userPayload, resultError]) {
+		assert.equal(rendered.includes(sentinel), false, sentinel);
+	}
+});
+
+test('structured auth status and unclassified SDK failures normalize to typed recovery errors', async () => {
+	const one = (message: SDKMessage): AsyncIterable<SDKMessage> => ({
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> { yield message; },
+	});
+	await assert.rejects(
+		consumeTurn(
+			one({ type: 'auth_status', isAuthenticating: false, output: [], error: 'opaque' } as unknown as SDKMessage),
+			() => {}, undefined, undefined, { idleTimeoutMs: 1_000 },
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication' && error.terminal,
+	);
+	const assistantThenResult: AsyncIterable<SDKMessage> = {
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			yield {
+				type: 'assistant', parent_tool_use_id: null, error: 'rate_limit', message: { content: [] },
+			} as unknown as SDKMessage;
+			yield { type: 'result', subtype: 'success' } as SDKMessage;
+		},
+	};
+	await assert.rejects(
+		consumeTurn(assistantThenResult, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+	);
+	const broken: AsyncIterable<SDKMessage> = {
+		[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+			return { next: async () => { throw new Error('opaque SDK transport failure'); } };
+		},
+	};
+  await assert.rejects(
+    consumeTurn(broken, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
+    (error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+  );
+});
+
+test('SDK query construction preserves legacy errors and normalizes recovery failures', async () => {
+	const initializationProse = 'OPAQUE_QUERY_INITIALIZATION_PROSE_MUST_NOT_ESCAPE_RECOVERY';
+	const legacyEvents: AgentEvent[] = [];
+	await assert.rejects(
+		startClaude(coldStartArgs(process.cwd()), (event) => legacyEvents.push(event), {
+			createSessionId: () => '66666666-6666-4666-8666-666666666666',
+			loadQuery: async () => {
+				throw new Error(initializationProse);
+			},
+		}),
+		(error: unknown) => error instanceof Error && error.message === initializationProse && !(error instanceof HarnessTurnError),
+	);
+	assert.equal(JSON.stringify(legacyEvents).includes(initializationProse), true, 'opt-out telemetry remains unchanged');
+
+	const recoveryEvents: AgentEvent[] = [];
+	await assert.rejects(
+		startClaude(
+			{ ...coldStartArgs(process.cwd()), recoveryPolicy: { idleTimeoutMs: 1_000 } },
+			(event) => recoveryEvents.push(event),
+			{
+				createSessionId: () => '99999999-9999-4999-8999-999999999999',
+				loadQuery: async () => { throw new Error(initializationProse); },
+			},
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+	);
+	assert.equal(JSON.stringify(recoveryEvents).includes(initializationProse), false);
+	assert.ok(recoveryEvents.some(
+		(event) => event.kind === 'exited' && event.error === 'provider failure category=provider (details redacted)',
+	));
+});
+
+test('recovery start and deliver emit one classified failure before turn_ended', async () => {
+	const token = '12121212-1212-4212-8212-121212121212';
+	const queryFactory: ClaudeQueryFactory = ({ options }) => ({
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			if (options.sessionId !== undefined) {
+				yield {
+					type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+					claude_code_version: 'test', model: 'test', apiKeySource: 'test',
+					permissionMode: 'default', cwd: process.cwd(),
+				} as unknown as SDKMessage;
+			}
+			yield {
+				type: 'assistant', parent_tool_use_id: null,
+				error: 'authentication_failed', message: { content: [] },
+			} as unknown as SDKMessage;
+			yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
+		},
+		close() {},
+	});
+	const recoveryPolicy = { idleTimeoutMs: 1_000 };
+	const startEvents: AgentEvent[] = [];
+	await assert.rejects(
+		startClaude(
+			{ ...coldStartArgs(process.cwd()), recoveryPolicy },
+			(event) => startEvents.push(event),
+			{ createSessionId: () => token, loadQuery: async () => queryFactory },
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication',
+	);
+	assert.deepEqual(
+		startEvents.map((event) => event.kind),
+		['started', 'activity', 'activity', 'activity', 'activity', 'exited', 'turn_ended'],
+	);
+
+	const deliverEvents: AgentEvent[] = [];
+	await assert.rejects(
+		deliverClaude(
+			{ harness: 'claude-code', token },
+			'continue',
+			{
+				cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy,
+			},
+			(event) => deliverEvents.push(event),
+			{ getSessionInfo: async () => ({}), loadQuery: async () => queryFactory },
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication',
+	);
+	assert.deepEqual(
+		deliverEvents.map((event) => event.kind),
+		['activity', 'activity', 'activity', 'exited', 'turn_ended'],
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -705,6 +1086,111 @@ test('cold start fails closed when provider init does not confirm the supplied s
   assert.deepEqual(events.map((event) => event.kind), ['started', 'exited']);
   await claudeAdapter.stop({ harness: 'claude-code', token: supplied });
   assert.equal(probe.closes, 1, 'a mismatched init was removed from the session registry');
+});
+
+test('primary, wake, and cold queries close exactly once while preserving environment and provider tokens', async () => {
+		const keys = ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS'] as const;
+		const prior = new Map(keys.map((key) => [key, process.env[key]]));
+		const token = '55555555-5555-4555-8555-555555555555';
+		const coldToken = '77777777-7777-4777-8777-777777777777';
+		const captured: Array<Record<string, string | undefined>> = [];
+		const queries: Array<{ closes: number; signal: AbortSignal }> = [];
+		const factory: ClaudeQueryFactory = ({ options }) => {
+			const queryState = { closes: 0, signal: options.abortController!.signal };
+			queries.push(queryState);
+			return {
+				async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+					captured.push(options.env ?? {});
+					if (options.sessionId !== undefined) {
+						yield {
+							type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+							claude_code_version: 'test', model: 'test', apiKeySource: 'test', permissionMode: 'default', cwd: process.cwd(),
+						} as unknown as SDKMessage;
+					}
+					yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
+				},
+				close() { queryState.closes += 1; },
+			};
+		};
+		try {
+		process.env.CLAUDE_CONFIG_DIR = '/dedicated/claude-config';
+		process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
+		process.env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS = '1000';
+		const args = { ...coldStartArgs(process.cwd()), recoveryPolicy: { idleTimeoutMs: 1_000 } };
+		const ref = await startClaude(args, () => {}, {
+			createSessionId: () => token,
+			loadQuery: async () => factory,
+		});
+			await deliverClaude(ref, 'continue', {
+				cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy: { idleTimeoutMs: 1_000 },
+			}, () => {}, {
+				getSessionInfo: async () => ({}),
+				loadQuery: async () => factory,
+			});
+			const coldRef = await startClaude(args, () => {}, {
+				createSessionId: () => coldToken,
+				loadQuery: async () => factory,
+			});
+			assert.deepEqual(ref, { harness: 'claude-code', token });
+			assert.deepEqual(coldRef, { harness: 'claude-code', token: coldToken });
+			await claudeAdapter.stop(ref);
+			await claudeAdapter.stop(coldRef);
+	} finally {
+		for (const key of keys) {
+			const value = prior.get(key);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+		assert.equal(captured.length, 3);
+		for (const env of captured) {
+		assert.equal(env.CLAUDE_CONFIG_DIR, '/dedicated/claude-config');
+		assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
+			assert.equal(env.OWENLOOP_CLAUDE_IDLE_TIMEOUT_MS, undefined);
+		}
+		assert.equal(queries.length, 3);
+		for (const query of queries) {
+			assert.equal(query.closes, 1, 'each settled exact query is closed before its successor can replace it');
+			assert.equal(query.signal.aborted, true);
+		}
+	});
+
+test('resume refusal after a successful session preflight remains ResumeUnavailableError', async () => {
+	const ref = { harness: 'claude-code', token: '88888888-8888-4888-8888-888888888888' } as const;
+	let preflights = 0;
+	let closes = 0;
+	const events: AgentEvent[] = [];
+
+	await assert.rejects(
+		deliverClaude(
+			ref,
+			'continue',
+			{ cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} } },
+			(event) => events.push(event),
+			{
+				getSessionInfo: async () => {
+					preflights += 1;
+					return {};
+				},
+				loadQuery: async () => () => ({
+					async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+						throw new Error('No conversation found for --resume');
+					},
+					close() {
+						closes += 1;
+					},
+				}),
+			},
+		),
+		(error: unknown) =>
+			isResumeUnavailable(error) &&
+			error.message.includes(`provider refused resume of session ${ref.token}`) &&
+			error.message.includes('No conversation found for --resume'),
+	);
+
+	assert.equal(preflights, 1, 'the provider knew the session before the resume race');
+	assert.equal(closes, 1, 'the refused exact query is closed once');
+	assert.deepEqual(events, [], 'resume refusal is classified before generic provider telemetry');
 });
 
 // ---------------------------------------------------------------------------

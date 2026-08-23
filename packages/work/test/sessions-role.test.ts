@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { formatAge, newestPerKey, renderTable, resumeCommandFor } from '../src/roles/sessions.ts';
+import { formatAge, newestPerKey, projectSession, renderTable, resumeCommandFor } from '../src/roles/sessions.ts';
 import { orderId, sessionsPath, type SessionRecord, type SessionStatus } from '../src/harness/session-store.ts';
 import { register, unregister } from '../src/harness/registry.ts';
 import type { HarnessAdapter, HarnessSessionRef } from '../src/harness/contract.ts';
@@ -232,6 +232,66 @@ test('a record with no session token renders a dash, not a command that cannot w
     assert.equal(resumeCommandFor({ ...row, token: 'tok-1' }), 'cli resume tok-1');
   } finally {
     unregister('fake-willing');
+  }
+});
+
+test('recovery rows use an allowlist that omits provider tokens and secret-shaped forward fields', () => {
+  const row = {
+    ...rec({
+    run: 'recovery-run',
+    step: 'builder',
+    status: 'turn-ended',
+    recovery: {
+      generation: 'recovery-run',
+      phase: 'held',
+      wakeUsed: true,
+      coldRestartUsed: true,
+      lastActivityAt: NOW,
+      lastFailure: { category: 'idle-timeout', at: NOW },
+    },
+    }),
+    prompt: 'RAW_PROMPT_MUST_NOT_ESCAPE',
+    credential: 'CREDENTIAL_MUST_NOT_ESCAPE',
+    configDir: '/SECRET_CONFIG_DIRECTORY',
+    forwardToken: 'FORWARD_TOKEN_MUST_NOT_ESCAPE',
+    recovery: {
+      generation: 'recovery-run',
+      phase: 'held',
+      wakeUsed: true,
+      coldRestartUsed: true,
+      lastActivityAt: NOW,
+      lastFailure: { category: 'idle-timeout', at: NOW, prose: 'FAILURE_PROSE_MUST_NOT_ESCAPE', token: 'NESTED_TOKEN_MUST_NOT_ESCAPE' },
+      prompt: 'NESTED_PROMPT_MUST_NOT_ESCAPE',
+      config: { value: 'NESTED_CONFIG_MUST_NOT_ESCAPE' },
+    },
+  } as unknown as SessionRecord;
+  assert.equal(resumeCommandFor(row), undefined);
+  assert.match(renderTable([row], NOW), /held: action required/);
+  const projection = projectSession(row);
+  assert.deepEqual(Object.keys(projection).sort(), [
+    'attempt', 'createdAt', 'harness', 'order', 'recovery', 'run', 'status', 'step', 'updatedAt', 'workflow',
+  ]);
+  assert.deepEqual((projection as { recovery: unknown }).recovery, {
+    generation: 'recovery-run',
+    phase: 'held',
+    wakeUsed: true,
+    coldRestartUsed: true,
+    lastActivityAt: NOW,
+    lastFailure: { category: 'idle-timeout', at: NOW },
+  });
+  const json = JSON.stringify(projection);
+  for (const secret of [
+    'tok-recovery-run-builder',
+    'RAW_PROMPT_MUST_NOT_ESCAPE',
+    'CREDENTIAL_MUST_NOT_ESCAPE',
+    '/SECRET_CONFIG_DIRECTORY',
+    'FORWARD_TOKEN_MUST_NOT_ESCAPE',
+    'FAILURE_PROSE_MUST_NOT_ESCAPE',
+    'NESTED_TOKEN_MUST_NOT_ESCAPE',
+    'NESTED_PROMPT_MUST_NOT_ESCAPE',
+    'NESTED_CONFIG_MUST_NOT_ESCAPE',
+  ]) {
+    assert.equal(json.includes(secret), false, secret);
   }
 });
 
