@@ -1240,6 +1240,12 @@ export async function consumeTurn(
 	// This is our own session-integrity guard, not a provider failure. Preserve
 	// its actionable detail while normalizing all actual SDK failures below.
 	if (error instanceof Error && error.message.startsWith('provider session id mismatch:')) throw error;
+	// `deliverClaude` has a provider-specific, secondary resume-refusal fallback
+	// behind its deterministic session-info preflight. Keep the original refusal
+	// text intact until that boundary can translate it to ResumeUnavailableError;
+	// wrapping it here would make an opt-out resume race look like a generic turn
+	// failure and suppress the established same-firing cold replay.
+	if (RESUME_FAILURE_RE.test(errText(error))) throw error;
 	throw new HarnessTurnError('provider', false, 'provider SDK stream failed');
   } finally {
     timerGeneration += 1;

@@ -37,7 +37,7 @@ import {
   type ClaudeOptionInputs,
   type ClaudeQueryFactory,
 } from '../src/harness/claude.ts';
-import { HarnessIdleTimeoutError, HarnessTurnError } from '../src/harness/contract.ts';
+import { HarnessIdleTimeoutError, HarnessTurnError, isResumeUnavailable } from '../src/harness/contract.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import { adapterFor } from '../src/harness/registry.ts';
 import type { AgentEvent } from '../src/harness/contract.ts';
@@ -933,6 +933,44 @@ test('primary, wake, and cold queries close exactly once while preserving enviro
 			assert.equal(query.signal.aborted, true);
 		}
 	});
+
+test('resume refusal after a successful session preflight remains ResumeUnavailableError', async () => {
+	const ref = { harness: 'claude-code', token: '88888888-8888-4888-8888-888888888888' } as const;
+	let preflights = 0;
+	let closes = 0;
+	const events: AgentEvent[] = [];
+
+	await assert.rejects(
+		deliverClaude(
+			ref,
+			'continue',
+			{ cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} } },
+			(event) => events.push(event),
+			{
+				getSessionInfo: async () => {
+					preflights += 1;
+					return {};
+				},
+				loadQuery: async () => () => ({
+					async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+						throw new Error('No conversation found for --resume');
+					},
+					close() {
+						closes += 1;
+					},
+				}),
+			},
+		),
+		(error: unknown) =>
+			isResumeUnavailable(error) &&
+			error.message.includes(`provider refused resume of session ${ref.token}`) &&
+			error.message.includes('No conversation found for --resume'),
+	);
+
+	assert.equal(preflights, 1, 'the provider knew the session before the resume race');
+	assert.equal(closes, 1, 'the refused exact query is closed once');
+	assert.deepEqual(events, [], 'resume refusal is classified before generic provider telemetry');
+});
 
 // ---------------------------------------------------------------------------
 // Binary resolution
