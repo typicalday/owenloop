@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.25](https://github.com/typicalday/owenloop/compare/v0.5.24...v0.5.25) (2026-08-23)
+
+
+### Features
+
+* **engine:** scope native judges to workflow modifiers ([#295](https://github.com/typicalday/owenloop/issues/295)) ([d1cb9d5](https://github.com/typicalday/owenloop/commit/d1cb9d5f711b7ea5ed545202a0d2e37189ba1d06))
+
 ## [0.5.24](https://github.com/typicalday/owenloop/compare/v0.5.23...v0.5.24) (2026-08-23)
 
 
