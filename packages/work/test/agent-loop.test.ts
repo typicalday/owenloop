@@ -28,6 +28,7 @@ import { HarnessTurnError, ResumeUnavailableError } from '../src/harness/contrac
 import type { SessionRecord } from '../src/harness/session-store.ts';
 import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
+import type { LeaseLoop, LeaseOutcome } from '../src/lease/loop.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
@@ -268,6 +269,7 @@ interface BuildOpts {
   latestSession?: AgentRunLoopOptions['latestSession'];
 	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
   dirExists?: AgentRunLoopOptions['dirExists'];
+  leaseFactory?: AgentRunLoopOptions['leaseFactory'];
 }
 
 function buildOpts(b: BuildOpts): Harnessed {
@@ -297,6 +299,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
 		...(b.latestRunSession === undefined ? {} : { latestRunSession: b.latestRunSession }),
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
+		...(b.leaseFactory === undefined ? {} : { leaseFactory: b.leaseFactory }),
     nextAttempt: () => 3,
     sleep: b.sleep ?? macrotaskSleep,
 	now: b.now ?? (() => 1_000),
@@ -842,6 +845,28 @@ test('hung recovery cleanup cannot keep authoritative wake or cold outcomes aliv
 
 	for (const phase of phases) {
 		for (const authority of authorities) {
+			const causalOrder: string[] = [];
+			let settleLease: ((outcome: LeaseOutcome) => void) | undefined;
+			const leaseFactory: NonNullable<AgentRunLoopOptions['leaseFactory']> = (leaseOpts): LeaseLoop => {
+				const done = new Promise<LeaseOutcome>((resolve) => {
+					settleLease = resolve;
+				});
+				return {
+					async run() {
+						const first = await leaseOpts.hub.getOrder({
+							workflow: leaseOpts.workflow,
+							run: leaseOpts.run,
+							...(leaseOpts.holder === undefined ? {} : { holder: leaseOpts.holder }),
+						});
+						leaseOpts.onOrder?.(first);
+						return done;
+					},
+					stop(reason, options) {
+						causalOrder.push(`lease.stop:${reason ?? ''}:${options?.release === false ? 'no-release' : 'release'}`);
+						settleLease?.('stopped');
+					},
+				};
+			};
 			const adapter = createFakeAdapter({
 				start: { events: [{ kind: 'turn_ended' }] },
 				deliver: { events: [{ kind: 'turn_ended' }] },
@@ -849,10 +874,22 @@ test('hung recovery cleanup cannot keep authoritative wake or cold outcomes aliv
 			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
 			const originalStop = adapter.stop.bind(adapter);
 			let stopCalls = 0;
+			let rejectLateStop: ((reason?: unknown) => void) | undefined;
 			adapter.stop = async (ref) => {
 				stopCalls += 1;
 				await originalStop(ref);
-				if (stopCalls === phase.hungStop) await new Promise<void>(() => {});
+				if (stopCalls === phase.hungStop) {
+					const expectedLeaseStop = `lease.stop:${authority.outcome === 'submitted' ? 'submitted' : 'lease-lost'}:no-release`;
+					assert.equal(
+						causalOrder.at(-1),
+						expectedLeaseStop,
+						`${phase.phase} cleanup starts only after the authoritative lease stop`,
+					);
+					causalOrder.push(`adapter.stop:${phase.phase}`);
+					await new Promise<void>((_resolve, reject) => {
+						rejectLateStop = reject;
+					});
+				}
 			};
 			const { hub, calls } = mockHub({
 				getOrder: (n) => {
@@ -863,9 +900,13 @@ test('hung recovery cleanup cannot keep authoritative wake or cold outcomes aliv
 						: agentOrder({ ...common, claimed: false });
 				},
 			});
-			const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+			const h = buildOpts({ hub, adapter, leaseFactory, submitGraceMs: 0 });
 
 			assert.equal(await createAgentRunLoop(h.opts).run(), authority.outcome);
+			assert.deepEqual(causalOrder, [
+				`lease.stop:${authority.outcome === 'submitted' ? 'submitted' : 'lease-lost'}:no-release`,
+				`adapter.stop:${phase.phase}`,
+			]);
 			assert.equal(h.records.at(-1)?.status, authority.status);
 			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
 			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
@@ -878,6 +919,20 @@ test('hung recovery cleanup cannot keep authoritative wake or cold outcomes aliv
 			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
 			assert.equal(verbs(calls).includes('release'), false);
 			assert.match(h.errs.join('\n'), /recovery session stop timed out \(details redacted; ignored\)/u);
+			assert.ok(rejectLateStop, 'the bounded cleanup began before its timeout');
+			const sentinel = 'LATE_PROVIDER_STOP_REJECTION_MUST_NOT_REACH_WORKER_LOGS';
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+			process.on('unhandledRejection', onUnhandled);
+			try {
+				rejectLateStop?.(new Error(sentinel));
+				await macrotaskSleep();
+				await macrotaskSleep();
+				assert.deepEqual(unhandled, []);
+				assert.equal(h.errs.join('\n').includes(sentinel), false);
+			} finally {
+				process.off('unhandledRejection', onUnhandled);
+			}
 		}
 	}
 });

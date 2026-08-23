@@ -62,7 +62,7 @@ import { isWorkdirAllowed } from './workdir.ts';
 
 import { createApprovalRequester } from './approvals.ts';
 
-import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
+import { createLeaseLoop, type LeaseLoop, type LeaseLoopOptions, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
@@ -266,6 +266,11 @@ export interface AgentRunLoopOptions {
   submitGraceMs?: number;
   /** Recovery-only adapter cleanup bound. Test seam; production defaults to 5s. */
   recoveryStopGraceMs?: number;
+  /**
+   * Lease construction seam for lifecycle-order tests. Production always uses
+   * the shared lease loop; callers need not provide this.
+   */
+  leaseFactory?: (options: LeaseLoopOptions) => LeaseLoop;
 }
 
 export interface AgentRunLoop {
@@ -589,7 +594,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     resolveOrder = r;
   });
 
-  const lease = createLeaseLoop({
+  const lease = (opts.leaseFactory ?? createLeaseLoop)({
     hub,
     workflow,
     run: runId,
