@@ -642,8 +642,10 @@ test('a terminal assistant error remains authoritative when the provider then go
 
 	for (const scenario of cases) {
 		let fire: (() => void) | undefined;
+		let rejectNext: ((error: Error) => void) | undefined;
 		let nextCalls = 0;
 		let announceSecondRead: (() => void) | undefined;
+		const controller = new AbortController();
 		const secondReadStarted = new Promise<void>((resolve) => { announceSecondRead = resolve; });
 		const stream: AsyncIterable<SDKMessage> = {
 			[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
@@ -660,13 +662,22 @@ test('a terminal assistant error remains authoritative when the provider then go
 							});
 						}
 						announceSecondRead?.();
-						return new Promise<IteratorResult<SDKMessage>>(() => {});
+						return new Promise<IteratorResult<SDKMessage>>((_resolve, reject) => {
+							rejectNext = reject;
+							controller.signal.addEventListener(
+								'abort',
+								() => reject(new Error('terminal iterator rejected during abort')),
+								{ once: true },
+							);
+						});
 					},
 				};
 			},
 		};
 		const pending = consumeTurn(stream, () => {}, undefined, undefined, {
 			idleTimeoutMs: 1_000,
+			abortController: controller,
+			close: () => rejectNext?.(new Error('terminal iterator rejected during close')),
 			setTimer: (callback) => {
 				fire = callback;
 				return callback as unknown as ReturnType<typeof setTimeout>;
@@ -679,6 +690,29 @@ test('a terminal assistant error remains authoritative when the provider then go
 		fire!();
 		await assert.rejects(
 			pending,
+			(error: unknown) =>
+				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
+			scenario.providerError,
+		);
+	}
+});
+
+test('a terminal assistant error remains authoritative when the stream ends before a result', async () => {
+	const cases = [
+		{ providerError: 'authentication_failed', category: 'authentication' },
+		{ providerError: 'model_not_found', category: 'model-unavailable' },
+	] as const;
+	for (const scenario of cases) {
+		const stream: AsyncIterable<SDKMessage> = {
+			async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+				yield {
+					type: 'assistant', parent_tool_use_id: null,
+					error: scenario.providerError, message: { content: [] },
+				} as unknown as SDKMessage;
+			},
+		};
+		await assert.rejects(
+			consumeTurn(stream, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
 			(error: unknown) =>
 				error instanceof HarnessTurnError && error.category === scenario.category && error.terminal,
 			scenario.providerError,
@@ -755,6 +789,7 @@ test('recovery turn telemetry contains only structured categories, never provide
 
 	await assert.rejects(
 		consumeTurn(stream, (event) => events.push(event), (token) => { initialized = token; }, undefined, {
+			idleTimeoutMs: 1_000,
 			sanitizeProviderTelemetry: true,
 		}),
 		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider',
@@ -776,7 +811,10 @@ test('structured auth status and unclassified SDK failures normalize to typed re
 		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> { yield message; },
 	});
 	await assert.rejects(
-		consumeTurn(one({ type: 'auth_status', isAuthenticating: false, output: [], error: 'opaque' } as unknown as SDKMessage), () => {}),
+		consumeTurn(
+			one({ type: 'auth_status', isAuthenticating: false, output: [], error: 'opaque' } as unknown as SDKMessage),
+			() => {}, undefined, undefined, { idleTimeoutMs: 1_000 },
+		),
 		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication' && error.terminal,
 	);
 	const assistantThenResult: AsyncIterable<SDKMessage> = {
@@ -788,7 +826,7 @@ test('structured auth status and unclassified SDK failures normalize to typed re
 		},
 	};
 	await assert.rejects(
-		consumeTurn(assistantThenResult, () => {}),
+		consumeTurn(assistantThenResult, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
 		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
 	);
 	const broken: AsyncIterable<SDKMessage> = {
@@ -797,12 +835,12 @@ test('structured auth status and unclassified SDK failures normalize to typed re
 		},
 	};
   await assert.rejects(
-    consumeTurn(broken, () => {}),
+    consumeTurn(broken, () => {}, undefined, undefined, { idleTimeoutMs: 1_000 }),
     (error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
   );
 });
 
-test('SDK query construction failures are normalized as nonterminal provider failures', async () => {
+test('SDK query construction preserves legacy errors and normalizes recovery failures', async () => {
 	const initializationProse = 'OPAQUE_QUERY_INITIALIZATION_PROSE_MUST_NOT_ESCAPE_RECOVERY';
 	const legacyEvents: AgentEvent[] = [];
 	await assert.rejects(
@@ -812,7 +850,7 @@ test('SDK query construction failures are normalized as nonterminal provider fai
 				throw new Error(initializationProse);
 			},
 		}),
-		(error: unknown) => error instanceof HarnessTurnError && error.category === 'provider' && !error.terminal,
+		(error: unknown) => error instanceof Error && error.message === initializationProse && !(error instanceof HarnessTurnError),
 	);
 	assert.equal(JSON.stringify(legacyEvents).includes(initializationProse), true, 'opt-out telemetry remains unchanged');
 

@@ -174,6 +174,8 @@ export type CrewRosterResolver = (crews: readonly string[]) => CrewRosterResolut
 export const DEFAULT_CONFIRM_INTERVAL_MS = 1_000;
 /** Default confirm-phase bound: give the hub 15s to show the submit's outcome. */
 export const DEFAULT_SUBMIT_GRACE_MS = 15_000;
+/** Recovery cleanup is best-effort and must never hold a settled worker forever. */
+const DEFAULT_RECOVERY_STOP_GRACE_MS = 5_000;
 /** Keep capability-silent release diagnostics useful without growing worker logs without bound. */
 const HARNESS_FAILURE_TAIL_SIZE = 4;
 const HARNESS_FAILURE_FRAGMENT_CAP = 700;
@@ -262,6 +264,8 @@ export interface AgentRunLoopOptions {
   confirmIntervalMs?: number;
   /** Confirm-phase upper bound (default `DEFAULT_SUBMIT_GRACE_MS`). */
   submitGraceMs?: number;
+  /** Recovery-only adapter cleanup bound. Test seam; production defaults to 5s. */
+  recoveryStopGraceMs?: number;
 }
 
 export interface AgentRunLoop {
@@ -639,6 +643,37 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     });
   }
 
+  /** Stop one recovery session without allowing provider cleanup to hang the worker. */
+  async function stopRecoverySession(ref: HarnessSessionRef): Promise<void> {
+	if (adapter === undefined) return;
+	const activeAdapter = adapter;
+	let timedOut = false;
+	const stopping = Promise.resolve()
+	  .then(() => activeAdapter.stop(ref))
+	  .then(
+		() => 'stopped' as const,
+		() => {
+		  if (!timedOut) {
+			opts.err('owenloop work agent-run: recovery session stop failed (details redacted; ignored)');
+		  }
+		  return 'failed' as const;
+		},
+	  );
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<'timeout'>((resolve) => {
+	  timer = setTimeout(
+		() => resolve('timeout'),
+		opts.recoveryStopGraceMs ?? DEFAULT_RECOVERY_STOP_GRACE_MS,
+	  );
+	});
+	const result = await Promise.race([stopping, timeout]);
+	if (timer !== undefined) clearTimeout(timer);
+	if (result === 'timeout') {
+	  timedOut = true;
+	  opts.err('owenloop work agent-run: recovery session stop timed out (details redacted; ignored)');
+	}
+  }
+
   /**
    * Tear the harness session down. Guarded so the signal path and the normal
    * end-of-run path together still stop the session exactly once; never throws.
@@ -646,14 +681,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   async function teardown(): Promise<void> {
     if (adapter === undefined || sessionRef === undefined || torndown) return;
     torndown = true;
+	if (recovery !== undefined) {
+	  const ref = sessionRef;
+	  sessionRef = undefined;
+	  await stopRecoverySession(ref);
+	  return;
+	}
     try {
       await adapter.stop(sessionRef);
     } catch (e) {
-	  opts.err(
-		recovery !== undefined
-		  ? 'owenloop work agent-run: adapter stop failed during recovery (details redacted; ignored)'
-		  : `owenloop work agent-run: adapter stop failed: ${errMsg(e)} (ignored)`,
-	  );
+	  opts.err(`owenloop work agent-run: adapter stop failed: ${errMsg(e)} (ignored)`);
     }
   }
 
@@ -1132,7 +1169,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       client: opts.hub,
       workflow: opts.workflow,
       run: opts.run,
-      onEvent: (e) => opts.out(`owenloop work agent-run: approval ${e.kind} — ${e.text}`),
+	  onEvent: (e) => opts.out(
+		recoveryEnabled
+		  ? `owenloop work agent-run: recovery approval ${e.kind} (details redacted)`
+		  : `owenloop work agent-run: approval ${e.kind} — ${e.text}`,
+	  ),
     });
     // A resolved crew-roster candidate wins over the step's authored harness,
     // model, and effort. The harness was already selected above; these values
@@ -1249,44 +1290,43 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					if (sessionRef === undefined) return;
 					const ref = sessionRef;
 					sessionRef = undefined;
-					try {
-						await active.stop(ref);
-						} catch {
-							opts.err('owenloop work agent-run: recovery session stop failed (details redacted; ignored)');
-						}
+					await stopRecoverySession(ref);
 				};
 
 				type PhaseResult = { failure?: unknown } | { outcome: AgentRunOutcome };
 					const finishLeaseOutcome = async (outcome: LeaseOutcome): Promise<AgentRunOutcome> => {
-						await teardown();
 						if (outcome === 'completed') {
 							if (!recordRecovery('submitted')) {
 								opts.err('owenloop work agent-run: could not persist the submitted recovery diagnostic (hub outcome remains authoritative)');
 							}
+							await stopCurrent();
 							return 'submitted';
 						}
 						if (!recordRecovery('dead')) {
 							opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (lease outcome remains authoritative)');
 						}
-						return signalled ? 'killed' : mapLeaseDuringTurn(outcome);
+						const mapped = signalled ? 'killed' : mapLeaseDuringTurn(outcome);
+						await stopCurrent();
+						return mapped;
 					};
 					const finishConfirmedOutcome = async (
 						outcome: Exclude<Awaited<ReturnType<typeof confirmOutcome>>, 'no-submit'>,
 					): Promise<AgentRunOutcome> => {
-						await teardown();
 						if (outcome === 'submitted') {
+							lease.stop('submitted', { release: false });
+							await leasePromise;
 							if (!recordRecovery('submitted')) {
 								opts.err('owenloop work agent-run: could not persist the submitted recovery diagnostic (hub outcome remains authoritative)');
 							}
-							lease.stop('submitted', { release: false });
-							await leasePromise;
+							await stopCurrent();
 							return 'submitted';
-						}
-						if (!recordRecovery('dead')) {
-							opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (claim loss remains authoritative)');
 						}
 						lease.stop('lease-lost', { release: false });
 						await leasePromise;
+						if (!recordRecovery('dead')) {
+							opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (claim loss remains authoritative)');
+						}
+						await stopCurrent();
 						return 'lease-lost';
 					};
 					const confirmPhase = async (): Promise<'continue' | AgentRunOutcome> => {
@@ -1311,12 +1351,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						return 'continue';
 					};
 					const sessionStoreFailedAfterDispatch = async (): Promise<AgentRunOutcome> => {
-						// Stop the exact provider query before relinquishing the claim, then give
-						// the hub one authoritative chance to report a submit or claim loss that
-						// raced the local diagnostic failure.
-						await stopCurrent();
+						// Give the hub authority before cleanup: a hung provider stop can neither
+						// hide a submit nor delay recognition that the claim is already gone.
 						const confirmed = await confirmPhase();
 						if (confirmed !== 'continue') return confirmed;
+						await stopCurrent();
 						return releaseWith('session-store-failed', 'session-store-failed');
 					};
 					const persistenceFailureOutcome = (): Promise<AgentRunOutcome> =>
@@ -1329,6 +1368,24 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 					): Promise<PhaseResult> => {
 						if (!checkpoint(phase, changes)) {
 							return { outcome: await persistenceFailureOutcome() };
+						}
+						// Give the independently running lease one event-loop turn to publish an
+						// outcome that landed after the prior confirm. There is no await between
+						// this check and perform(), making the provider-dispatch boundary atomic
+						// with respect to this worker.
+						const beforeDispatch = await Promise.race([
+							leasePromise!.then((outcome) => ({ t: 'lease' as const, outcome })),
+							opts.sleep(0).then(() => ({ t: 'continue' as const })),
+						]);
+						if (beforeDispatch.t === 'lease') {
+							return { outcome: await finishLeaseOutcome(beforeDispatch.outcome) };
+						}
+						if (signalled || leaseSettled) {
+							const outcome = settledLeaseOutcome ?? await leasePromise!;
+							return { outcome: await finishLeaseOutcome(outcome) };
+						}
+						if (activePersistenceFailure !== undefined || recoveryPersistenceFailure !== undefined) {
+							return { outcome: await sessionStoreFailedAfterDispatch() };
 						}
 						providerDispatchStarted = true;
 						const turn = perform().then(

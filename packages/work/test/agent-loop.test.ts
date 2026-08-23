@@ -257,6 +257,7 @@ interface BuildOpts {
   spec?: NormalizedStepSpec | null;
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
+	sleep?: AgentRunLoopOptions['sleep'];
   shiftId?: string;
   shiftName?: string;
   shiftOwner?: string;
@@ -296,13 +297,14 @@ function buildOpts(b: BuildOpts): Harnessed {
 		...(b.latestRunSession === undefined ? {} : { latestRunSession: b.latestRunSession }),
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
     nextAttempt: () => 3,
-    sleep: macrotaskSleep,
+    sleep: b.sleep ?? macrotaskSleep,
     now: () => 1_000,
     out: (l) => outs.push(l),
     err: (l) => errs.push(l),
     heartbeatIntervalMs: 60_000,
     confirmIntervalMs: 1,
     submitGraceMs: b.submitGraceMs ?? 0,
+	recoveryStopGraceMs: 0,
   };
   return { opts, records, errs, outs };
 }
@@ -789,28 +791,218 @@ test('direct submit and claim-loss confirmations stop every started recovery ses
 	}
 });
 
+test('hung recovery cleanup cannot keep authoritative wake or cold outcomes alive', async () => {
+	const phases = [
+		{ phase: 'wake', confirmCall: 2, starts: 1, delivers: 1, hungStop: 1 },
+		{ phase: 'cold-restart', confirmCall: 3, starts: 2, delivers: 1, hungStop: 2 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const, status: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+
+	for (const phase of phases) {
+		for (const authority of authorities) {
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const originalStop = adapter.stop.bind(adapter);
+			let stopCalls = 0;
+			adapter.stop = async (ref) => {
+				stopCalls += 1;
+				await originalStop(ref);
+				if (stopCalls === phase.hungStop) await new Promise<void>(() => {});
+			};
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n !== phase.confirmCall) return agentOrder(common);
+					return authority.outcome === 'submitted'
+						? agentOrder({ ...common, claimed: false, outcome: 'green' })
+						: agentOrder({ ...common, claimed: false });
+				},
+			});
+			const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+			assert.equal(await createAgentRunLoop(h.opts).run(), authority.outcome);
+			assert.equal(h.records.at(-1)?.status, authority.status);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, phase.starts);
+			assert.equal(verbs(calls).includes('release'), false);
+			const heartbeatCount = verbs(calls).filter((verb) => verb === 'heartbeat').length;
+			await macrotaskSleep();
+			assert.equal(verbs(calls).filter((verb) => verb === 'heartbeat').length, heartbeatCount);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, phase.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, phase.delivers);
+			assert.equal(verbs(calls).includes('release'), false);
+			assert.match(h.errs.join('\n'), /recovery session stop timed out \(details redacted; ignored\)/u);
+		}
+	}
+});
+
+test('lease outcomes that land between recovery phases prevent the next provider dispatch', async () => {
+	const transitions = [
+		{ nextPhase: 'wake', triggerConfirmCall: 1, starts: 1, delivers: 0 },
+		{ nextPhase: 'cold-restart', triggerConfirmCall: 2, starts: 1, delivers: 1 },
+	] as const;
+	const authorities = [
+		{ label: 'accepted submit', outcome: 'submitted' as const, status: 'submitted' as const },
+		{ label: 'lost claim', outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+
+	for (const transition of transitions) {
+		for (const authority of authorities) {
+			let wakeHeartbeat: (() => void) | undefined;
+			const sleep: AgentRunLoopOptions['sleep'] = async (ms) => {
+				if (ms === 60_000) {
+					await new Promise<void>((resolve) => { wakeHeartbeat = resolve; });
+					return;
+				}
+				await macrotaskSleep();
+			};
+			const adapter = createFakeAdapter({
+				start: { events: [{ kind: 'turn_ended' }] },
+				deliver: { events: [{ kind: 'turn_ended' }] },
+			});
+			adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+			const { hub, calls } = mockHub({
+				getOrder: (n) => {
+					const common = { owes: [{ path: 'pr' }] };
+					if (n === transition.triggerConfirmCall) {
+						assert.ok(wakeHeartbeat, `heartbeat is parked before ${transition.nextPhase}`);
+						wakeHeartbeat();
+						return agentOrder(common);
+					}
+					if (n === transition.triggerConfirmCall + 1) {
+						return authority.outcome === 'submitted'
+							? agentOrder({ ...common, claimed: false, outcome: 'green' })
+							: agentOrder({ ...common, claimed: false });
+					}
+					return agentOrder(common);
+				},
+				heartbeat: () => { throw new Error('lease changed between phases'); },
+			});
+			const h = buildOpts({ hub, adapter, sleep, submitGraceMs: 0 });
+
+			assert.equal(
+				await createAgentRunLoop(h.opts).run(),
+				authority.outcome,
+				`${authority.label} before ${transition.nextPhase}`,
+			);
+			assert.equal(h.records.at(-1)?.status, authority.status);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, transition.starts);
+			assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, transition.delivers);
+			assert.equal(verbs(calls).includes('release'), false);
+		}
+	}
+});
+
+test('a signal between primary confirmation and wake prevents another recovery dispatch', async () => {
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	let loop: ReturnType<typeof createAgentRunLoop>;
+	const { hub, calls } = mockHub({
+		getOrder: (n) => {
+			if (n === 1) queueMicrotask(() => loop.stop('inter-phase signal'));
+			return agentOrder({ owes: [{ path: 'pr' }] });
+		},
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+	loop = createAgentRunLoop(h.opts);
+
+	assert.equal(await loop.run(), 'killed');
+	assert.equal(adapter.calls.filter((call) => call.kind === 'start').length, 1);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'deliver').length, 0);
+	assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, 1);
+	assert.equal(verbs(calls).filter((verb) => verb === 'release').length, 1);
+});
+
 test('recovery teardown failures redact provider-controlled stop prose', async () => {
 	const sentinel = 'PROVIDER_STOP_FAILURE_MUST_NOT_REACH_WORKER_LOGS';
-	const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
-	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
-	const stop = adapter.stop.bind(adapter);
-	adapter.stop = async (ref) => {
-		await stop(ref);
-		throw new Error(sentinel);
+	const authorities = [
+		{ outcome: 'submitted' as const, status: 'submitted' as const },
+		{ outcome: 'lease-lost' as const, status: 'dead' as const },
+	];
+	for (const authority of authorities) {
+		const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+		adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+		const stop = adapter.stop.bind(adapter);
+		adapter.stop = async (ref) => {
+			await stop(ref);
+			throw new Error(sentinel);
+		};
+		const { hub, calls } = mockHub({
+			getOrder: [
+				agentOrder({ owes: [{ path: 'pr' }] }),
+				authority.outcome === 'submitted'
+					? agentOrder({ owes: [{ path: 'pr' }], claimed: false, outcome: 'green' })
+					: agentOrder({ owes: [{ path: 'pr' }], claimed: false }),
+			],
+		});
+		const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+		assert.equal(await createAgentRunLoop(h.opts).run(), authority.outcome);
+		assert.equal(h.records.at(-1)?.status, authority.status);
+		assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, 1);
+		assert.equal(verbs(calls).includes('release'), false);
+		const log = h.errs.join('\n');
+		assert.equal(log.includes(sentinel), false);
+		assert.match(log, /recovery session stop failed \(details redacted; ignored\)/u);
+	}
+});
+
+test('recovery approval telemetry redacts blocked paths and gatekeeper reasons', async () => {
+	const sentinel = '/RECOVERY_BLOCKED_PATH_MUST_NOT_REACH_WORKER_LOGS';
+	const ref: HarnessSessionRef = { harness: 'fake', token: 'approval-token' };
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(args, onEvent) {
+			onEvent({ kind: 'started', ref });
+			assert.ok(args.approvals);
+			const controller = new AbortController();
+			const approval = args.approvals({
+				toolUseId: 'tool-recovery-approval',
+				toolName: 'Read',
+				toolInput: { path: sentinel },
+				reason: `the harness blocked ${sentinel}`,
+				signal: controller.signal,
+			});
+			await macrotaskSleep();
+			controller.abort();
+			void approval;
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver() {
+			throw new HarnessTurnError('permission-policy', true, 'approval gate stopped the recovery turn');
+		},
+		async stop() {},
 	};
-	const { hub } = mockHub({
-		getOrder: [
-			agentOrder({ owes: [{ path: 'pr' }] }),
-			agentOrder({ owes: [{ path: 'pr' }], claimed: false, outcome: 'green' }),
-		],
+	const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	hub.requestApproval = async (req) => ({
+		text: '',
+		ok: true,
+		approval: {
+			workflow: 'wf1', run: 'run1', toolUseId: req.tool_use_id, step: 'builder',
+			toolName: req.tool_name, reason: req.reason, title: req.title ?? '', state: 'pending',
+			requestedAt: 1, decidedAt: null, decidedBy: null, note: null,
+		},
 	});
 	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
 
-	assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
-	assert.equal(adapter.calls.filter((call) => call.kind === 'stop').length, 1);
-	const log = h.errs.join('\n');
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const log = [...h.outs, ...h.errs].join('\n');
 	assert.equal(log.includes(sentinel), false);
-	assert.match(log, /adapter stop failed during recovery \(details redacted; ignored\)/u);
+	assert.match(log, /recovery approval raised \(details redacted\)/u);
 });
 
 test('a 2xx refusal from recovery ask is never recorded as held', async () => {

@@ -1120,6 +1120,7 @@ export async function consumeTurn(
   let idleTimeoutFailure: HarnessIdleTimeoutError | undefined;
   let timerGeneration = 0;
   let controlledQueryClosed = false;
+	const recoveryEnabled = control.idleTimeoutMs !== undefined;
 	const sanitizeProviderTelemetry = control.sanitizeProviderTelemetry === true;
   const now = control.now ?? Date.now;
   const setTimer = control.setTimer ?? setTimeout;
@@ -1186,7 +1187,10 @@ export async function consumeTurn(
     for (;;) {
       const next = iterator.next();
       const item = timeout === undefined ? await next : await Promise.race([next, timeout]);
-      if (item.done) return { sessionId, sawResult: false };
+      if (item.done) {
+		if (recoveryEnabled && terminalFailure !== undefined) throw terminalFailure;
+		return { sessionId, sawResult: false };
+	  }
       const message = item.value;
       // Reset BEFORE mapping. A partial event stays transport-only but is still
       // proof of provider liveness.
@@ -1217,7 +1221,7 @@ export async function consumeTurn(
 	  }
       onInit?.(sessionId);
     } else if (message.type === 'result') {
-	  const classified = terminalFailure ?? classifyResult(message);
+	  const classified = recoveryEnabled ? terminalFailure ?? classifyResult(message) : undefined;
 	  if (!sanitizeProviderTelemetry && finalResponse !== undefined) {
 		onEvent({ kind: 'assistant_response', text: finalResponse });
 	  }
@@ -1234,15 +1238,15 @@ export async function consumeTurn(
         });
       }
       onEvent({ kind: 'turn_ended' });
-      if (classified !== undefined) throw classified;
+	  if (recoveryEnabled && classified !== undefined) throw classified;
       return { sessionId, sawResult: true };
     } else if (message.type === 'assistant') {
 	  if (!sanitizeProviderTelemetry) {
 		emitAssistant(message, onEvent);
 		finalResponse = assistantResponse(message) ?? finalResponse;
 	  }
-      terminalFailure ??= classifyAssistantError(message.error);
-		} else if (message.type === 'auth_status' && message.error !== undefined) {
+	  if (recoveryEnabled) terminalFailure ??= classifyAssistantError(message.error);
+		} else if (recoveryEnabled && message.type === 'auth_status' && message.error !== undefined) {
 			// `error` is a structured SDK field. Its prose is deliberately neither
 			// logged nor parsed for recovery decisions.
 			throw new HarnessTurnError('authentication', true, 'provider authentication status failed');
@@ -1259,6 +1263,7 @@ export async function consumeTurn(
     // routine CLI upgrade into a failed order.
     }
   } catch (error) {
+		if (!recoveryEnabled) throw error;
 		if (terminalFailure?.terminal === true) throw terminalFailure;
 		if (idleTimeoutFailure !== undefined) throw idleTimeoutFailure;
 		if (isHarnessTurnError(error)) throw error;
@@ -1325,13 +1330,17 @@ export async function startClaude(
     } catch {
       // An already-aborted controller is equivalent to success.
     }
+	if (args.recoveryPolicy === undefined) {
+	  onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+	  throw err;
+	}
 	const failure = isHarnessTurnError(err)
 	  ? err
 	  : new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
 	onEvent({
 	  kind: 'exited',
 	  exitCode: null,
-	  error: args.recoveryPolicy !== undefined ? sanitizedFailureText(failure) : errText(err),
+	  error: sanitizedFailureText(failure),
 	});
 	throw failure;
   }
@@ -1467,13 +1476,17 @@ export async function deliverClaude(
 		const query = await dependencies.loadQuery();
 		q = query({ prompt: message, options });
 	} catch (err) {
+		if (args.recoveryPolicy === undefined) {
+			onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+			throw err;
+		}
 			const failure = isHarnessTurnError(err)
 				? err
 				: new HarnessTurnError('provider', false, 'provider SDK query initialization failed');
 			onEvent({
 				kind: 'exited',
 				exitCode: null,
-				error: args.recoveryPolicy !== undefined ? sanitizedFailureText(failure) : failure.message,
+				error: sanitizedFailureText(failure),
 			});
 		throw failure;
 	}
