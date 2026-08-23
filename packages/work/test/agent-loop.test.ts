@@ -258,6 +258,7 @@ interface BuildOpts {
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
 	sleep?: AgentRunLoopOptions['sleep'];
+	now?: AgentRunLoopOptions['now'];
   shiftId?: string;
   shiftName?: string;
   shiftOwner?: string;
@@ -298,7 +299,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
     nextAttempt: () => 3,
     sleep: b.sleep ?? macrotaskSleep,
-    now: () => 1_000,
+	now: b.now ?? (() => 1_000),
     out: (l) => outs.push(l),
     err: (l) => errs.push(l),
     heartbeatIntervalMs: 60_000,
@@ -357,6 +358,40 @@ test('idle recovery is bounded to primary, one wake, one cold start, then one pr
 	assert.doesNotMatch(recoveryAsk, /claude|codex|anthropic|openai/iu);
 	assert.ok(h.records.some((record) => record.recovery?.phase === 'held'));
   assert.equal(verbs(calls).includes('release'), false);
+});
+
+test('a cold recovery token receives a fresh session birth timestamp', async () => {
+	let starts = 0;
+	const refs: HarnessSessionRef[] = [
+		{ harness: 'fake', token: 'primary-token' },
+		{ harness: 'fake', token: 'cold-token' },
+	];
+	const adapter: HarnessAdapter = {
+		id: 'fake',
+		resumeTier: 'native-token',
+		recoveryPolicy: () => ({ idleTimeoutMs: 1_000 }),
+		preflight: () => [],
+		async start(_args, onEvent) {
+			const ref = refs[starts++]!;
+			onEvent({ kind: 'started', ref });
+			onEvent({ kind: 'turn_ended' });
+			return ref;
+		},
+		async deliver(_ref, _message, _args, onEvent) {
+			onEvent({ kind: 'turn_ended' });
+		},
+		async stop() {},
+	};
+	const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+	let clock = 0;
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0, now: () => ++clock });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
+	const primary = h.records.find((record) => record.token === 'primary-token');
+	const cold = h.records.find((record) => record.token === 'cold-token');
+	assert.ok(primary, 'the primary provider token is persisted');
+	assert.ok(cold, 'the cold provider token is persisted');
+	assert.ok(cold.createdAt > primary.createdAt, 'the cold provider token has its own birth time');
 });
 
 test('recovery-enabled Claude provider tokens and failure payloads never reach worker logs', async () => {
@@ -507,9 +542,10 @@ test('a clean wake and cold restart supersede an earlier primary timeout in the 
 });
 
 test('an opted-in permission preflight holds immediately without starting a provider turn', async () => {
+	const sentinel = '/RECOVERY_PREFLIGHT_PATH_MUST_NOT_REACH_WORKER_LOGS';
 	const adapter = createFakeAdapter();
 	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
-	adapter.preflight = () => [{ field: 'tools', message: 'policy refused' }];
+	adapter.preflight = () => [{ field: sentinel, message: `policy refused for ${sentinel}` }];
 	const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
 	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
 
@@ -519,6 +555,9 @@ test('an opted-in permission preflight holds immediately without starting a prov
 	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 1);
 	assert.equal(h.records.at(-1)?.recovery?.phase, 'held');
 	assert.equal(h.records.at(-1)?.recovery?.lastFailure?.category, 'permission-policy');
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery harness failure category=permission-policy \(details redacted\)/u);
 });
 
 test('an invalid recovery setting stops a multi-output run before model delivery', async () => {
@@ -1006,6 +1045,7 @@ test('recovery approval telemetry redacts blocked paths and gatekeeper reasons',
 });
 
 test('a 2xx refusal from recovery ask is never recorded as held', async () => {
+	const sentinel = 'RECOVERY_ASK_REFUSAL_PROSE_MUST_NOT_REACH_WORKER_LOGS';
 	const adapter = createFakeAdapter({
 		start: { events: [{ kind: 'turn_ended' }] },
 		deliver: { events: [{ kind: 'turn_ended' }] },
@@ -1013,13 +1053,37 @@ test('a 2xx refusal from recovery ask is never recorded as held', async () => {
 	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
 	const { hub, calls } = mockHub({
 		getOrder: [agentOrder({ owes: [{ path: 'pr' }] })],
-		ask: { ok: false, closed: false, text: 'not accepted' },
+		ask: { ok: false, closed: false, text: sentinel },
 	});
 	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
 
 	assert.equal(await createAgentRunLoop(h.opts).run(), 'no-submit');
 	assert.equal(h.records.at(-1)?.status, 'dead');
 	assert.equal(verbs(calls).includes('release'), true);
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery ask was refused \(details redacted\)/u);
+});
+
+test('a thrown recovery ask error is redacted before the order is released', async () => {
+	const sentinel = 'RECOVERY_ASK_TRANSPORT_PROSE_MUST_NOT_REACH_WORKER_LOGS';
+	const adapter = createFakeAdapter({
+		start: { events: [{ kind: 'turn_ended' }] },
+		deliver: { events: [{ kind: 'turn_ended' }] },
+	});
+	adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+	const { hub, calls } = mockHub({
+		getOrder: [agentOrder({ owes: [{ path: 'pr' }] })],
+		ask: new Error(sentinel),
+	});
+	const h = buildOpts({ hub, adapter, submitGraceMs: 0 });
+
+	assert.equal(await createAgentRunLoop(h.opts).run(), 'hub-unreachable');
+	assert.equal(verbs(calls).filter((verb) => verb === 'ask').length, 2);
+	assert.equal(verbs(calls).includes('release'), true);
+	const log = [...h.outs, ...h.errs].join('\n');
+	assert.equal(log.includes(sentinel), false);
+	assert.match(log, /recovery ask failed \(details redacted\)/u);
 });
 
 test('the additional unbounded final-response evidence event is redacted while progress remains logged', async () => {

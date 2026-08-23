@@ -1044,12 +1044,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       ...preflightStepPermissions(permissions),
       ...active.preflight(permissions),
     ];
-    for (const issue of policyIssues) {
-	opts.err(
-	  `owenloop work agent-run: harness policy refusal for ${order} on '${resolution.id}'` +
-	    `${issue.field !== undefined ? ` (${issue.field})` : ''}: ${issue.message}`,
-	);
-    }
+	if (policyIssues.length > 0 && recoveryEnabled) {
+		opts.err('owenloop work agent-run: recovery harness failure category=permission-policy (details redacted)');
+	} else {
+		for (const issue of policyIssues) {
+			opts.err(
+				`owenloop work agent-run: harness policy refusal for ${order} on '${resolution.id}'` +
+					`${issue.field !== undefined ? ` (${issue.field})` : ''}: ${issue.message}`,
+			);
+		}
+	}
     let recoveryPreflightFailure: HarnessTurnError | undefined;
 	if (policyIssues.length > 0) {
 		recoveryPreflightFailure = new HarnessTurnError(
@@ -1445,7 +1449,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 									return 'held';
 								}
 								if (asked.ok !== true) {
-									opts.err(`owenloop work agent-run: recovery ask was refused: ${asked.text}`);
+									opts.err('owenloop work agent-run: recovery ask was refused (details redacted)');
 									if (asked.closed === true) {
 										if (!recordRecovery('dead')) {
 											opts.err('owenloop work agent-run: could not persist the dead recovery diagnostic (closed ask refusal remains authoritative)');
@@ -1460,8 +1464,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 								// `ask` is contractually closing. A success envelope that does not
 								// close is transport-ambiguous, so use the same authoritative
 								// outcome check/retry path as a thrown request below.
-								throw new Error('recovery ask was accepted without closing the run');
-							} catch (error) {
+									throw new Error('recovery ask was accepted without closing the run');
+								} catch {
 								try {
 									const current = await hub.getOrder({ workflow, run: runId, holder: opts.holder });
 								if (current.lease.outcome !== undefined) {
@@ -1484,7 +1488,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 								// The second ask is still the only recoverable transport action.
 							}
 							if (attemptAsk === 1) {
-								opts.err(`owenloop work agent-run: recovery ask failed: ${errMsg(error)}`);
+									opts.err('owenloop work agent-run: recovery ask failed (details redacted)');
 								if (!recordRecovery('dead')) return sessionStoreFailed();
 								return releaseWith('recovery-ask-failed', 'hub-unreachable');
 							}
@@ -1580,6 +1584,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						// and the cold dispatch are durably consumed before any stop await.
 							if (!prepareColdRestart()) return persistenceFailureOutcome();
 						await stopCurrent();
+						createdAt = 0;
 						const cold = await dispatch('cold-restart', { wakeUsed: true, coldRestartUsed: true }, async () => {
 						activePersistenceFailure = undefined;
 						const base = renderReplayBrief(renderBrief(step.brief, spec), {

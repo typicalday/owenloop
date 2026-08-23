@@ -872,6 +872,59 @@ test('SDK query construction preserves legacy errors and normalizes recovery fai
 	));
 });
 
+test('recovery start and deliver emit one classified failure before turn_ended', async () => {
+	const token = '12121212-1212-4212-8212-121212121212';
+	const queryFactory: ClaudeQueryFactory = ({ options }) => ({
+		async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+			if (options.sessionId !== undefined) {
+				yield {
+					type: 'system', subtype: 'init', session_id: options.sessionId, mcp_servers: [],
+					claude_code_version: 'test', model: 'test', apiKeySource: 'test',
+					permissionMode: 'default', cwd: process.cwd(),
+				} as unknown as SDKMessage;
+			}
+			yield {
+				type: 'assistant', parent_tool_use_id: null,
+				error: 'authentication_failed', message: { content: [] },
+			} as unknown as SDKMessage;
+			yield { type: 'result', subtype: 'success' } as unknown as SDKMessage;
+		},
+		close() {},
+	});
+	const recoveryPolicy = { idleTimeoutMs: 1_000 };
+	const startEvents: AgentEvent[] = [];
+	await assert.rejects(
+		startClaude(
+			{ ...coldStartArgs(process.cwd()), recoveryPolicy },
+			(event) => startEvents.push(event),
+			{ createSessionId: () => token, loadQuery: async () => queryFactory },
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication',
+	);
+	assert.deepEqual(
+		startEvents.map((event) => event.kind),
+		['started', 'activity', 'activity', 'activity', 'activity', 'exited', 'turn_ended'],
+	);
+
+	const deliverEvents: AgentEvent[] = [];
+	await assert.rejects(
+		deliverClaude(
+			{ harness: 'claude-code', token },
+			'continue',
+			{
+				cwd: process.cwd(), owenloopMcp: MOUNT, permissions: { extensions: {} }, recoveryPolicy,
+			},
+			(event) => deliverEvents.push(event),
+			{ getSessionInfo: async () => ({}), loadQuery: async () => queryFactory },
+		),
+		(error: unknown) => error instanceof HarnessTurnError && error.category === 'authentication',
+	);
+	assert.deepEqual(
+		deliverEvents.map((event) => event.kind),
+		['activity', 'activity', 'activity', 'exited', 'turn_ended'],
+	);
+});
+
 // ---------------------------------------------------------------------------
 // Cold-start durable gate
 // ---------------------------------------------------------------------------

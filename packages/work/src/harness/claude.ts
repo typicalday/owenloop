@@ -1225,14 +1225,14 @@ export async function consumeTurn(
 	  if (!sanitizeProviderTelemetry && finalResponse !== undefined) {
 		onEvent({ kind: 'assistant_response', text: finalResponse });
 	  }
-      if (message.subtype !== 'success') {
+      if (message.subtype !== 'success' || classified !== undefined) {
         // The contract's channel for "something went wrong that is not a resume
         // failure". Emitted BEFORE turn_ended so a caller reading events in
         // order sees the cause before the turn closes.
         onEvent({
           kind: 'exited',
           exitCode: null,
-		  error: sanitizeProviderTelemetry
+		  error: sanitizeProviderTelemetry || message.subtype === 'success'
 			? sanitizedFailureText(classified)
 			: message.errors.join('; ') || message.subtype,
         });
@@ -1347,6 +1347,11 @@ export async function startClaude(
 
   SESSIONS.set(sessionId, { query: q, abortController, options });
   let exactClosed = false;
+	let failureEventEmitted = false;
+	const turnOnEvent = (event: AgentEvent): void => {
+		if (event.kind === 'exited') failureEventEmitted = true;
+		onEvent(event);
+	};
   const closeExact = (): void => {
     if (exactClosed) return;
     exactClosed = true;
@@ -1367,7 +1372,7 @@ export async function startClaude(
   try {
     outcome = await consumeTurn(
       q,
-      onEvent,
+		turnOnEvent,
       () => {
 	initVerified = true;
       },
@@ -1386,11 +1391,13 @@ export async function startClaude(
     // delete preserves the cold-start gate even if that cleanup seam changes.
     if (!initVerified) SESSIONS.delete(sessionId);
     closeExact();
-	onEvent({
-	  kind: 'exited',
-	  exitCode: null,
-	  error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : errText(err),
-	});
+		if (!failureEventEmitted) {
+			onEvent({
+				kind: 'exited',
+				exitCode: null,
+				error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : errText(err),
+			});
+		}
     throw err;
   }
 
@@ -1490,9 +1497,14 @@ export async function deliverClaude(
 			});
 		throw failure;
 	}
-  SESSIONS.set(ref.token, { query: q, abortController, options });
-  let exactClosed = false;
-  const closeExact = (): void => {
+	  SESSIONS.set(ref.token, { query: q, abortController, options });
+	  let exactClosed = false;
+	let failureEventEmitted = false;
+	const turnOnEvent = (event: AgentEvent): void => {
+		if (event.kind === 'exited') failureEventEmitted = true;
+		onEvent(event);
+	};
+	  const closeExact = (): void => {
     if (exactClosed) return;
     exactClosed = true;
     if (SESSIONS.get(ref.token)?.query === q) SESSIONS.delete(ref.token);
@@ -1510,7 +1522,7 @@ export async function deliverClaude(
 
   try {
     // Never emits `started` — the contract forbids re-emitting it on a resume.
-    await consumeTurn(q, onEvent, undefined, undefined, {
+	    await consumeTurn(q, turnOnEvent, undefined, undefined, {
       ...(args.recoveryPolicy !== undefined ? { idleTimeoutMs: args.recoveryPolicy.idleTimeoutMs } : {}),
 	  sanitizeProviderTelemetry: args.recoveryPolicy !== undefined,
       abortController,
@@ -1527,11 +1539,13 @@ export async function deliverClaude(
 		  : `provider refused resume of session ${ref.token}: ${text}`,
 	  );
     }
-	onEvent({
-	  kind: 'exited',
-	  exitCode: null,
-	  error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : text,
-	});
+		if (!failureEventEmitted) {
+			onEvent({
+				kind: 'exited',
+				exitCode: null,
+				error: args.recoveryPolicy !== undefined ? sanitizedFailureText(err) : text,
+			});
+		}
     throw err;
   }
 }
