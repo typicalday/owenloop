@@ -232,8 +232,15 @@ test('runtime minVersion and features use AND semantics', () => {
   // `slice(1)`, not a literal index: the environment above advertises exactly
   // one feature, so EVERY other advertised feature must come back unsupported.
   // Pinning a single index would silently stop testing the tail the day a third
-  // feature is added.
-  assert.deepEqual(missingFeature.unsupportedFeatures, [...SUPPORTED_RUNTIME_FEATURES].slice(1));
+  // feature is added. Compared as sets because this assertion is about WHICH
+  // features come back, not their order — the evaluator's byte-sorted output
+  // order is pinned on its own, with literals, by the diagnostics test below.
+  // A list comparison here would instead pin the declaration order of
+  // SUPPORTED_RUNTIME_FEATURES, which nothing else requires to be sorted.
+  assert.deepEqual(
+    new Set(missingFeature.unsupportedFeatures),
+    new Set([...SUPPORTED_RUNTIME_FEATURES].slice(1)),
+  );
 
   const lowVersion = evaluateRuntimeCompatibility(requirements, {
     version: '0.4.9',

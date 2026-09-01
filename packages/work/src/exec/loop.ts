@@ -51,7 +51,7 @@ import type { HubClient } from '../hub/client.ts';
 import { HubError, type ContactHolder, type GetOrderResponse, type OrderPacket, type SubmitRequest } from '../hub/types.ts';
 import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
 import type { InstructionResolver } from './instructions.ts';
-import { parsePayloadLine } from './payload.ts';
+import { PAYLOAD_FILE_ENV, PAYLOAD_MAX_BYTES, readPayloadFile, resolvePayload } from './payload.ts';
 import { buildReceipt, type CommandReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
@@ -64,6 +64,15 @@ const SUBMIT_MAX_ATTEMPTS = 3;
 const SUBMIT_RETRY_WINDOW_MS = 30_000;
 const SUBMIT_FALLBACK_DELAYS_MS = [5_000, 10_000] as const;
 const SUBMIT_ERROR_DETAIL_MAX_CHARS = 160;
+
+/**
+ * The largest payload carried whole into a failed command's `hub.ask` context;
+ * see `escalationContext`. 8 KiB is the same order as the 4 KiB `outputTail`
+ * the runner already caps for the same reason — big enough that an ordinary
+ * structured result still arrives intact for triage, small enough that a run
+ * that escalates repeatedly cannot grow its own reason thread without bound.
+ */
+const ASK_CONTEXT_PAYLOAD_MAX_BYTES = 8 * 1024;
 
 /**
  * The largest serialized `consumes` payload delivered inline in
@@ -327,6 +336,57 @@ function deliverFeedback(
     removeConsumesDir(dir);
     throw e;
   }
+}
+
+/**
+ * Give the command a private path to write its payload to, and return both the
+ * path and the directory holding it.
+ *
+ * ALWAYS ASSIGNED, for the same reason the consumes and feedback names are:
+ * `childEnv` starts from `process.env`, and a shift can itself have been
+ * launched from inside another command step, so `OWENLOOP_PAYLOAD_FILE` may
+ * already carry the PARENT order's path. A conditional assignment would let a
+ * child write its result into its parent's file. There is no inline counterpart
+ * to `delete` here, because this channel runs the other way: the worker supplies
+ * a location, not a value.
+ *
+ * THE FILE IS NOT CREATED. Its absence after the command exits is exactly the
+ * signal that the command returned through stdout instead. The `0700` directory
+ * is created, so the command can write without owning a mkdir, and so the
+ * payload is unreadable by other users on the machine whatever umask the command
+ * writes it under — the worker cannot choose the file's mode when the command is
+ * the one creating it.
+ *
+ * A FAILURE TO CREATE THE DIRECTORY DEGRADES LOUDLY; IT DOES NOT FAIL THE STEP.
+ * This runs on every command spawn, where the two overflow directories are
+ * created only above 64 KiB, so a read-only rootfs or a full `/tmp` would
+ * otherwise turn every previously-working command step on the machine into an
+ * escalation carrying a raw ENOSPC — a total outage in exchange for a channel
+ * most commands do not use. Instead the variable is UNSET and the command falls
+ * back to the stdout marker, which is what it had before this channel existed.
+ * Unsetting is not optional: leaving the inherited parent value in place is the
+ * one outcome worse than having no channel, because the child would then write
+ * its result into its parent order's file.
+ */
+function deliverPayloadFile(
+  childEnv: Record<string, string | undefined>,
+  warn: (message: string) => void,
+): { dir?: string; file?: string } {
+  let dir: string;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'owenloop-payload-'));
+  } catch (e) {
+    delete childEnv[PAYLOAD_FILE_ENV];
+    warn(
+      `owenloop work exec: could not create a payload directory under ${tmpdir()}: ${errMsg(e)} — ` +
+        `${PAYLOAD_FILE_ENV} is unset for this command, so a payload larger than ` +
+        `${PAYLOAD_MAX_BYTES} bytes has no way to return`,
+    );
+    return {};
+  }
+  const file = join(dir, 'payload.json');
+  childEnv[PAYLOAD_FILE_ENV] = file;
+  return { dir, file };
 }
 
 /** Best-effort removal of an overflow directory; a cleanup failure never fails a step. */
@@ -603,6 +663,40 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   /**
+   * Serialize a failed command's receipt for `hub.ask`'s diagnostic context,
+   * with the payload summarised rather than carried whole.
+   *
+   * ASK CONTEXT IS PERMANENT RUN STATE, AND NOTHING ELSE BOUNDS IT. The hub
+   * concatenates this string into the question text, stores it as a reason entry
+   * on the artifact, and redelivers that reason thread inside every subsequent
+   * order packet for the run. Unlike `submit`, which refuses an oversized value
+   * by name, neither the worker nor the hub caps a question — so whatever goes
+   * in here is paid for on every later firing, forever.
+   *
+   * That was harmless while the only large field was `outputTail`, which the
+   * runner already caps at 4 KiB for exactly this reason. The payload file broke
+   * the assumption: a payload is read before the exit code is checked, so a
+   * command that writes a large report and THEN exits non-zero — a test runner
+   * emitting a full JSON report on failure is the ordinary case, not an
+   * adversarial one — would push megabytes of it into permanent state.
+   *
+   * Summarised, not dropped: its size and the fact that one arrived is what a
+   * human triaging the failure needs, and the value itself is not lost, because
+   * a failed command is re-run rather than resumed. `payloadError` is always
+   * kept whole — it is a diagnosis, and it is bounded by construction.
+   */
+  function escalationContext(receipt: CommandReceipt): string {
+    if (!('payload' in receipt)) return JSON.stringify(receipt);
+    const serialized = JSON.stringify(receipt.payload) ?? 'undefined';
+    const bytes = Buffer.byteLength(serialized, 'utf8');
+    if (bytes <= ASK_CONTEXT_PAYLOAD_MAX_BYTES) return JSON.stringify(receipt);
+    return JSON.stringify({
+      ...receipt,
+      payload: `[${bytes} bytes, omitted: over the ${ASK_CONTEXT_PAYLOAD_MAX_BYTES} byte cap on ask context]`,
+    });
+  }
+
+  /**
    * A failed command does not green anything. Raise a question on its own owed
    * path and retain the receipt as diagnostic context instead.
    */
@@ -636,7 +730,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 	run: runId,
 	path,
 	question: failureQuestion(receipt, path, resolvedCommand),
-	context: JSON.stringify(receipt),
+	context: escalationContext(receipt),
       });
     } catch (e) {
       opts.err(`owenloop work exec: ask on ${path} failed: ${errMsg(e)}`);
@@ -657,7 +751,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   /** Build the command receipt, then deliver, reject, or escalate it. */
-  async function deliverCommandResult(result: CommandResult, order: OrderPacket, resolvedCommand: string): Promise<ExecOutcome> {
+  async function deliverCommandResult(
+    result: CommandResult,
+    order: OrderPacket,
+    resolvedCommand: string,
+    payloadFile: string | undefined,
+  ): Promise<ExecOutcome> {
     if (signalled) {
       // The operator killed the work and the command settled before the lease
       // (the release HTTP round-trip is slower than a TERM'd child dying), so
@@ -673,7 +772,15 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // Every one of them is reachable with a useless log otherwise.
     relayChildOutput(result, order.step);
 
-    const parsedPayload = parsePayloadLine(result.payloadLine, result.payloadOverCap);
+    // Read AFTER the child exited, and only on this path. The lease-terminal
+    // path never reaches here (see the `finally` at the spawn site: it can unlink
+    // before the killed process group is fully reaped), so nothing in this read
+    // assumes the child is gone on a path where it might not be.
+    const parsedPayload = resolvePayload({
+      payloadLine: result.payloadLine,
+      payloadOverCap: result.payloadOverCap,
+      file: readPayloadFile(payloadFile),
+    });
     if (order.judge !== undefined) {
       if (result.exitCode === null) {
         // A signal or machinery failure is not a verdict. Leave the claim for
@@ -949,6 +1056,11 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // that assumes the child is gone.
     let consumesDir: string | undefined;
     let feedbackDir: string | undefined;
+    // The payload directory differs from the two above: it is created on EVERY
+    // command spawn, not only on overflow, because the command has to be told
+    // where it may write before anyone knows whether it will.
+    let payloadDir: string | undefined;
+    let payloadFile: string | undefined;
     try {
       let cmd: RunningCommand;
       try {
@@ -971,6 +1083,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         childEnv['OWENLOOP_WORKFLOW'] = workflow;
         childEnv['OWENLOOP_RUN'] = runId;
         consumesDir = deliverConsumes(childEnv, order.consumes);
+        ({ dir: payloadDir, file: payloadFile } = deliverPayloadFile(childEnv, opts.err));
 				const feedback = order.owes
 					.filter((owe) => owe.reasons.length > 0)
 					.map((owe) => ({ path: owe.path, reasons: owe.reasons }));
@@ -1015,7 +1128,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         const startOptions = { cwd, env: childEnv };
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
-	return deliverCommandResult(machineryFailure(e), order, resolvedCommand);
+	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
       }
       running = cmd;
       opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
@@ -1035,10 +1148,11 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return mapLeaseDuringRun(outcome.o);
       }
 
-      return deliverCommandResult(outcome.r, order, resolvedCommand);
+      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile);
     } finally {
       removeConsumesDir(consumesDir);
       removeConsumesDir(feedbackDir);
+      removeConsumesDir(payloadDir);
     }
   }
 

@@ -77,9 +77,18 @@ test('store ingestor: a compatible runtime declaration installs and verifies', a
     objectDir: installed.result.objectPath,
     digest: installed.result.digest,
   });
+  // The installed manifest is REWRITTEN canonically, and canonical form sorts
+  // features by UTF-8 bytes. Comparing against the source constant in its own
+  // declaration order would pass only for as long as that constant happens to
+  // be sorted, which is not a property anything maintains.
   assert.deepEqual(
     parseManifestBytes(readFileSync(join(installed.result.objectPath, 'bundle.yaml'))).runtime,
-    { minVersion: '0.5.0', features: [...SUPPORTED_RUNTIME_FEATURES] },
+    {
+      minVersion: '0.5.0',
+      features: [...SUPPORTED_RUNTIME_FEATURES].sort(
+        (a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')),
+      ),
+    },
   );
 });
 

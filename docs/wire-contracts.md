@@ -379,7 +379,10 @@ implemented at the consuming driver boundary and never delegated to the hub.
 
 ## Command payload and worker reject contracts
 
-A command worker may emit one payload marker line on stdout:
+A command worker returns a payload through one of two transports, and the
+receipt records exactly one of `payload` or `payloadError` either way.
+
+The first is a marker line on stdout:
 
 ```text
 ##owenloop:payload## {"...json..."}
@@ -390,6 +393,24 @@ beginning of the line. A marker in the middle of a line is not a match. The JSON
 text after the marker is capped at 64 KiB. A missing marker leaves `payload`
 out of the `CommandReceipt`; malformed or over-cap JSON produces
 `payloadError` and no `payload`, while leaving the command exit code unchanged.
+
+The second is a file. The worker sets `OWENLOOP_PAYLOAD_FILE` on every command
+spawn to an absolute path inside a private `0700` directory it creates and
+removes around the command's lifetime, and the command may write its JSON there
+instead. The file's size is taken from the open descriptor before any bytes are
+read and is capped at 24 MB, which is below the hub's artifact cap so that a
+payload the worker accepts is one the hub can store. A path that does not exist,
+holds nothing, or holds only whitespace is read as an absent payload — that is
+what keeps a marker-only command working with the variable set. Anything at the
+path that is not a regular file, and any read or parse failure, produces
+`payloadError` and no `payload`. The worker opens the path without following
+symbolic links and without blocking, so a path replaced mid-run cannot stall it.
+
+Supplying both transports in one run is a refusal, not a precedence rule: the
+receipt carries a `payloadError` naming the conflict and both byte counts, and
+no `payload`. A definition whose command writes the file must declare the
+`command-payload-file.v1` runtime feature, because an older worker leaves the
+variable unset and the payload is then written nowhere without any error.
 When the hub supplies authoritative output-version metadata and the driver can
 sign, the parsed payload is part of the receipt value covered by the DSSE
 submission proof. Current successful producer command receipts are unsigned

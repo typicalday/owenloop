@@ -6,7 +6,7 @@
  * non-zero judge exit uses `reject` instead, and signal-killed work submits
  * neither. Pure construction so it is trivially asserted in tests.
  */
-import { parsePayloadLine, type ParsedPayload } from './payload.ts';
+import type { ParsedPayload } from './payload.ts';
 import type { CommandResult } from './runner.ts';
 
 /** A command's artifact value on success, or failure diagnostics in `hub.ask` context. */
@@ -40,11 +40,20 @@ export interface ReceiptContext {
   step: string;
 }
 
-/** Fold a raw `CommandResult` and its order context into the submitted receipt. */
+/**
+ * Fold a raw `CommandResult` and its order context into the submitted receipt.
+ *
+ * `parsedPayload` is required rather than defaulted. A default could only parse
+ * the stdout marker, which stopped being the whole story when the payload file
+ * was added: it would silently drop a file payload, or publish the marker half
+ * of a conflict, and in both cases produce a receipt with no `payloadError` to
+ * show anything went wrong. Resolving both transports needs the file read, which
+ * only the caller holds, so the caller states the answer.
+ */
 export function buildReceipt(
   result: CommandResult,
   ctx: ReceiptContext,
-  parsedPayload: ParsedPayload = parsePayloadLine(result.payloadLine, result.payloadOverCap),
+  parsedPayload: ParsedPayload,
 ): CommandReceipt {
   return {
     kind: 'command-receipt',

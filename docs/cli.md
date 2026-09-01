@@ -739,8 +739,12 @@ be parsed or the resolved value was invalid.
 
 The helper prints the selected word as ordinary stdout. A command artifact is
 submitted as the full `CommandReceipt`; if a workflow binds a field inside a
-command payload, the command must emit the `##owenloop:payload##` JSON marker and
-the bind must name that field (for example, `from: payload.value`).
+command payload, the command must return that payload and the bind must name
+the field (for example, `from: payload.value`). A command returns a payload
+either by printing an `##owenloop:payload##` JSON marker line, capped at 64 KiB,
+or by writing the JSON to the path in `OWENLOOP_PAYLOAD_FILE`, capped at 24 MB.
+Doing both is refused by name rather than resolved by precedence. See
+[Returning a payload from a command step](bundles.md#returning-a-payload-from-a-command-step).
 
 ### `work agent-run` — the only Step Agent dispatcher
 

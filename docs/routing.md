@@ -564,8 +564,9 @@ from the run's stored value again — whatever the last accepted bind left there
 accepted artifact value is the whole `CommandReceipt`. The short form
 `bind: modifier` is shorthand for `{to: modifier, from: modifier}`. A
 `CommandReceipt` has no top-level `modifier` key, so that derived path does
-not resolve and the submit is refused. Have the command emit a payload marker —
-`##owenloop:payload##{"value":"deep"}` — and bind `from: payload.value`.
+not resolve and the submit is refused. Have the command return a payload —
+either the marker `##owenloop:payload##{"value":"deep"}` on stdout or the same
+JSON written to `$OWENLOOP_PAYLOAD_FILE` — and bind `from: payload.value`.
 
 > **Not shipped.** The routing plan also calls for a hub-side routing alert of
 > kind `modifier-changed`, raised on each sync so an operator sees it. It exists
