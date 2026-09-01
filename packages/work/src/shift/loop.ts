@@ -85,7 +85,7 @@ import {
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
 import { withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { sessionsPath } from '../harness/session-store.ts';
-import type { Spawner } from './spawn.ts';
+import type { Spawner, WorkerFailure } from './spawn.ts';
 import {
   stampShiftEvent,
   type OrderDroppedEvent,
@@ -318,11 +318,18 @@ export interface ShiftLoop {
   /**
    * Run-ended reap (metering condition (a)): drop the in-flight record for
    * `run` NOW, so its slot frees immediately instead of waiting for the next
-   * reconcile to notice the child exited. The shift's MCP `submit` tool calls
-   * an internal caller may use this when the hub reports a submit CLOSED the
-   * run — the one in-process end-of-run signal the shift sees. A run whose closing submit went through
-   * the child's own mount instead is not a problem: that child exits, and the
-   * next reconcile's pid probe frees the slot anyway.
+   * reconcile to notice the child exited.
+   *
+   * NOTHING IN `src/` CALLS THIS. It is reachable only from tests. The intended
+   * caller was a submit path that told the shift the hub had closed a run, and
+   * that wiring was never made, so the slot is always freed the slower way
+   * instead: the child exits, and the next reconcile's pid probe frees it.
+   *
+   * Stated plainly because the gap is invisible from the type — this is on the
+   * `ShiftLoop` interface, so it reads as live. Do not reason from its
+   * existence about when `runBrakeKey` entries are cleared; in production the
+   * per-sweep prune is the only clearer. Wire it or delete it, but do not build
+   * a guard on top of it.
    */
   noteRunEnded(run: string): void;
   /**
@@ -349,8 +356,44 @@ export interface ShiftLoop {
    * A failure for a run this loop never dispatched (a foreign or already-reaped
    * run) is ignored rather than guessed at: the fan-out key is not on the
    * failure record, so there is no sound way to pick a brake key for it.
+   *
+   * ALSO HANDS THE CLAIM BACK, with the failure as the reason. A worker that
+   * dies before it submits leaves its order INFLIGHT on the hub with a frozen
+   * heartbeat: no alert, no re-offer, and no other shift able to take it,
+   * because this shift still holds the claim. Measured once at 34 minutes,
+   * indistinguishable from work in progress, until an operator released it by
+   * hand. The failure is known here and already named precisely, so the name
+   * travels with the release instead of dying in a local log line.
+   *
+   * The brake-key guard scopes the release to runs THIS shift dispatched and
+   * has not yet pruned. It does NOT mean "the run is still open": the only
+   * production clearer is the per-sweep prune below, and a child's exit event
+   * always beats the next sweep. So this fires for ordinary worker failures
+   * too, on top of the specific release the child's own final breath sends.
+   *
+   * That redundancy is deliberate and it is cheap, because the hub answers a
+   * release on an unheld claim by returning BEFORE it normalizes the reason or
+   * publishes anything (`verbs/release.ts`: "Only a currently held targeted
+   * release gets a diagnostic side effect"). A worker whose own final breath
+   * reached the hub therefore costs exactly one no-op request here — it cannot
+   * overwrite the reason that worker already recorded.
+   *
+   * Covering the ordinary exit path is the point, not an accident. The
+   * incident this exists for exited 1 with no signal, killed by ENOSPC inside
+   * its own error logging, so a predicate keyed on "could not have released
+   * for itself" — a signal death, or a spawn that never started — would have
+   * missed it entirely. A supervisor cannot tell those apart from outside, so
+   * it reports what it saw and lets the hub deduplicate.
+   *
+   * One narrow race remains, and it is worth taking. `finalBreath` gives up
+   * after `RELEASE_CAP_MS` while its request is still in flight; if that
+   * request is slow enough for this one to overtake it, the supervisor's
+   * account is recorded and the worker's more specific one is dropped as
+   * not-held. The reason string names its own provenance so that outcome still
+   * reads honestly, and a slightly vaguer alert beats the alternative this
+   * replaces, which was no alert at all for 34 minutes.
    */
-  noteWorkerFailure(failure: { run: string }): void;
+  noteWorkerFailure(failure: WorkerFailure): void;
 }
 
 /** A dispatch candidate carried through classify → spawn. */
@@ -422,9 +465,12 @@ type CapacityReleaseReason = 'dispatch-cap-full' | 'agent-cap-full';
  * each other.
  *
  * WHAT IS COUNTED, AND WHY IT IS NOT DISPATCHES. The event counted against that
- * key is a WORKER FAILURE — a child that exited non-zero, reported into the
- * loop through `noteWorkerFailure` — never a dispatch. Counting dispatches
- * conflates a storm with legitimate concurrency: the hub can offer several
+ * key is a FAILED ATTEMPT TO RUN THE STEP, in either of the two shapes that
+ * exist: a child that started and exited non-zero, reported into the loop
+ * through `noteWorkerFailure`; or a dispatch that never produced a running
+ * child at all, which throws out of `dispatchCandidate` and is charged there.
+ * What is NOT counted is a dispatch that succeeds. Counting those would
+ * conflate a storm with legitimate concurrency: the hub can offer several
  * DISTINCT runs of one step in a single sweep, and metering the second through
  * fifth of those would throttle healthy work. A failure is direct evidence that
  * running this step again right now is unlikely to help; a dispatch is evidence
@@ -442,7 +488,7 @@ export const STEP_BRAKE_DELAYS_MS = [2_000, 8_000, 30_000, 60_000, 90_000] as co
  * decays out of it, while an isolated transient long after an old streak starts
  * again at the shortest delay instead of inheriting a stale penalty.
  */
-const STEP_BRAKE_DECAY_MS = 600_000;
+export const STEP_BRAKE_DECAY_MS = 600_000;
 
 /**
  * Forget a step's brake entry once this long has passed since its window
@@ -450,6 +496,19 @@ const STEP_BRAKE_DECAY_MS = 600_000;
  * `STEP_BRAKE_DECAY_MS` is what governs behaviour.
  */
 const STEP_BRAKE_FORGET_MS = 1_800_000;
+
+/**
+ * Longest release reason this shift will put on the wire, in code points.
+ *
+ * Mirrors the hub's own `MAX_RELEASE_REASON_CODE_POINTS`, which trims, treats
+ * blank as absent, and truncates without splitting a surrogate pair. Clamping
+ * on this side too means the reason we send is the reason an operator reads,
+ * with no silent server-side shortening in between.
+ *
+ * Exported so a test can assert the clamp against the constant rather than
+ * against a copy of the number, which would drift the day the hub's limit moves.
+ */
+export const MAX_RELEASE_REASON_POINTS = 1024;
 
 /**
  * How long to refuse the next dispatch of a step after `count` consecutive
@@ -692,6 +751,62 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   /**
+   * Bound a release reason to what the hub will actually store.
+   *
+   * Applied to EVERY reason this supervisor sends, not only the ones that look
+   * long. The two senders differ sharply in how bounded they are, which is
+   * exactly why the clamp belongs in one shared place rather than at whichever
+   * call site looked risky on the day:
+   *
+   * - `describeWorkerFailure` is provably short. Its longest constructible
+   *   output is under 100 code points, because every part is generated here or
+   *   is one of two literals in `spawn.ts`.
+   * - The dispatch catch interpolates `errMsg(e)`, which is NOT bounded. A
+   *   `FileLockTimeoutError` from `acquireDispatchLock` embeds a filesystem
+   *   path, and a path is bounded only by PATH_MAX.
+   *
+   * Slices by code point, never by UTF-16 unit, so a clamp cannot halve a
+   * surrogate pair and put a lone surrogate on the wire. The hub truncates at
+   * `MAX_RELEASE_REASON_CODE_POINTS` too; clamping here as well means the
+   * reason we send is the reason an operator reads, with no silent server-side
+   * shortening in between.
+   */
+  const clampReason = (reason: string): string => {
+    const points = Array.from(reason);
+    return points.length > MAX_RELEASE_REASON_POINTS
+      ? points.slice(0, MAX_RELEASE_REASON_POINTS).join('')
+      : reason;
+  };
+
+  /**
+   * The operator-facing account of a dead worker, for the release reason.
+   *
+   * It names the supervisor explicitly. A worker that fails through its own
+   * error path already sends a precise reason of its own, and in a narrow race
+   * this account can land first and take the slot the hub keeps for the first
+   * observation. Saying who is speaking keeps that outcome readable instead of
+   * looking like a worker's own vague self-report.
+   *
+   * `message` is the SPAWNER'S OWN bounded lifecycle string, never worker
+   * output: agent-run stderr is untrusted and is deliberately never quoted back
+   * (see `spawn.ts`), and the spawn error object is dropped there rather than
+   * interpolated, so no local path reaches the wire.
+   *
+   * The exit status or signal is what tells an operator which failure this was:
+   * a crash, an external kill, or a child that never launched at all. It is the
+   * difference between "this step is broken" and "this host is broken", so it
+   * travels with the message rather than staying in a local log line.
+   */
+  const describeWorkerFailure = (failure: WorkerFailure): string => {
+    const cause = failure.signal !== null
+      ? `signal ${failure.signal}`
+      : failure.exitStatus !== null
+	? `exitStatus ${failure.exitStatus}`
+	: 'no exit status';
+    return clampReason(`shift supervisor: ${failure.kind} ${failure.message} (${cause})`);
+  };
+
+  /**
    * Hand a claim back so another shift can be offered it immediately. This
    * deliberately stays off the dispatch critical path; a failed release falls
    * back to the existing pickup-window behavior and is observable.
@@ -767,6 +882,30 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   const stepBrake = new Map<string, { count: number; failedAt: number; nextAllowedAt: number }>();
 
   /**
+   * Charge one failure against a step's brake, extending the current streak or
+   * starting a new one.
+   *
+   * Shared by both places a dispatch can die: the worker failing after it
+   * started (`noteWorkerFailure`) and the spawn itself failing before it ever
+   * did (`dispatchCandidate`'s catch). Both now hand the claim back, and a
+   * released claim is re-offered immediately instead of lapsing after the
+   * 120s reap — so the brake, not the reap, is what throttles a step that
+   * keeps dying. Charging from only one of the two paths would leave the other
+   * free-running against the hub.
+   */
+  const chargeStepBrake = (brakeKey: string): void => {
+    const at = monotonicNow();
+    const prior = stepBrake.get(brakeKey);
+    // A failure long after the previous one starts a NEW streak rather than
+    // extending a stale one — see `STEP_BRAKE_DECAY_MS`.
+    const priorCount = prior !== undefined && at - prior.failedAt < STEP_BRAKE_DECAY_MS
+      ? prior.count
+      : 0;
+    const count = priorCount + 1;
+    stepBrake.set(brakeKey, { count, failedAt: at, nextAllowedAt: at + stepBrakeDelayMs(count) });
+  };
+
+  /**
    * Brake key of the step each dispatched run belongs to.
    *
    * A `WorkerFailure` carries the run id and the step name but NOT the fan-out
@@ -777,9 +916,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * precedes the child's `exit` event (that fires on a later tick), so a
    * failure can never arrive before its own entry exists.
    *
-   * Entries are removed when the run's failure is noted, when the run ends
-   * (`noteRunEnded`), and for any run no longer live at sweep time — so this
-   * map tracks live dispatches only and cannot grow without bound.
+   * Entries are removed when the run's failure is noted and, in production,
+   * for any run no longer live at sweep time — that prune is what bounds the
+   * map. (`noteRunEnded` also clears one, but nothing in `src/` calls it; see
+   * its declaration.) So an entry's presence means "this shift dispatched this
+   * run and has not pruned it yet", NOT "the run is still open".
    */
   const runBrakeKey = new Map<string, string>();
 
@@ -926,7 +1067,46 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	message,
       });
       const prefix = c.kind === 'command' ? 'spawn' : 'agent-run spawn';
+      // Two different failures reach this one catch, and an operator reading the
+      // release reason needs to know which. `cancel` is assigned only after
+      // `opts.spawner` returns, so it is the exact witness: undefined means the
+      // spawn itself threw and no child ever existed; defined means a child WAS
+      // running and something after it threw — the reservation write, the
+      // dispatch lock, or `opts.out` on a full disk — and `cancel()` above has
+      // just killed it. Calling both "failed" told an operator to look for a
+      // fork problem that never happened.
+      const startedThenAborted = cancel !== undefined;
       opts.err(`${prefix} for ${c.workflow}/${c.order.run} failed: ${message}`);
+      // Hand the claim back. `whats_next` took it before this function ran, and
+      // reaching here means no worker exists to hand it back for itself — either
+      // no child was ever started, or `cancel()` has just killed the one that
+      // was. Without this the order sits INFLIGHT with a heartbeat that will
+      // never tick again, which is the same invisible stall a dead worker
+      // leaves.
+      //
+      // No `WorkerFailure` is ever reported for this path — the spawn never
+      // returned, or the child was killed before it could report — so
+      // `noteWorkerFailure` cannot cover it.
+      //
+      // Charge the brake from here too. A released claim is re-offered at once
+      // rather than lapsing after the 120s reap, so on a host that cannot fork
+      // at all the brake is now the only thing standing between this shift and
+      // a claim-fail-release loop against the hub.
+      //
+      // Drop the run's brake-key mapping first. On the aborted-child arm
+      // `runBrakeKey` may already be set, and leaving it would let a later
+      // `noteWorkerFailure` for the same run release a second time and charge
+      // the brake twice for one logical failure. Nothing depends on the entry
+      // once the claim is released, so deleting it is unconditional.
+      releaseClaim(
+	c.workflow,
+	c.order.run,
+	clampReason(
+	  `shift supervisor: ${prefix} ${startedThenAborted ? 'started then aborted' : 'failed'} — ${message}`,
+	),
+      );
+      runBrakeKey.delete(c.order.run);
+      chargeStepBrake(brakeKey);
       return 'failed';
     }
   }
@@ -1024,8 +1204,18 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // exited CLEANLY reports no failure, so nothing else would ever remove its
     // entry. A non-zero exit is charged by `noteWorkerFailure`, which the
     // child's own `exit` event drives on the next event-loop tick — always well
-    // before the next sweep, which waits a whole poll interval. If that order
-    // ever did invert, the cost is one uncharged failure, never a wrong charge.
+    // before the next sweep, which waits a whole poll interval.
+    //
+    // This prune is the only clearer for a run that exits CLEANLY, and is
+    // therefore what bounds the map — a failing run is cleared by
+    // `noteWorkerFailure`, and an aborted dispatch clears its own entry. That
+    // makes the ordering matter more than it used to. `noteWorkerFailure` now also
+    // releases the claim, so an inversion here no longer costs one uncharged
+    // failure: it costs a claim nobody hands back, which is the stall this
+    // release exists to end. `iteration()` closes the window — `reconcile()`
+    // snapshots `live` and then awaits `hub.wake`, and a queued `exit` event is
+    // delivered during that await, so a child that died before the snapshot has
+    // already been charged and one that died after is still inside it.
     for (const [key, entry] of stepBrake) {
       if (monotonicNow() - entry.nextAllowedAt > STEP_BRAKE_FORGET_MS) stepBrake.delete(key);
     }
@@ -1386,7 +1576,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // 'braked' and 'failed' are deliberately NOT queued into pendingCandidates:
     // both mean this shift is not going to run that order now, and re-queuing a
     // braked candidate would just re-dispatch it on the next drain, defeating
-    // the brake. The claim lapses through the hub's pickup window instead.
+    // the brake.
+    //
+    // What happens to the claim differs between the two, and the difference is
+    // the point of this change. A BRAKED candidate was never dispatched, so its
+    // claim lapses through the hub's pickup window — the delay is deliberate,
+    // and shedding it is what the brake is for. A FAILED one hands its claim
+    // back explicitly in `dispatchCandidate`, so it is re-offered at once
+    // instead of sitting INFLIGHT behind a heartbeat that will never tick.
     for (const candidate of candidates) {
       if (discardExpiredCandidate(candidate, false)) continue;
       const result = dispatchCandidate(candidate);
@@ -1729,23 +1926,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	pid: exit.pid,
       });
     },
-    noteWorkerFailure: (failure: { run: string }) => {
+    noteWorkerFailure: (failure: WorkerFailure) => {
       const brakeKey = runBrakeKey.get(failure.run);
-      if (brakeKey === undefined) return; // not ours, or already accounted for
+      if (brakeKey === undefined) return; // not a run this shift still tracks
       runBrakeKey.delete(failure.run);
-      const at = monotonicNow();
-      const prior = stepBrake.get(brakeKey);
-      // A failure long after the previous one starts a NEW streak rather than
-      // extending a stale one — see `STEP_BRAKE_DECAY_MS`.
-      const priorCount = prior !== undefined && at - prior.failedAt < STEP_BRAKE_DECAY_MS
-	? prior.count
-	: 0;
-      const count = priorCount + 1;
-      stepBrake.set(brakeKey, {
-	count,
-	failedAt: at,
-	nextAllowedAt: at + stepBrakeDelayMs(count),
-      });
+      releaseClaim(failure.workflow, failure.run, describeWorkerFailure(failure));
+      chargeStepBrake(brakeKey);
     },
   };
 }
