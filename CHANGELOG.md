@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.26](https://github.com/typicalday/owenloop/compare/v0.5.25...v0.5.26) (2026-09-01)
+
+
+### Features
+
+* **work:** return a command step's payload through a file when stdout is too small ([#298](https://github.com/typicalday/owenloop/issues/298)) ([047313b](https://github.com/typicalday/owenloop/commit/047313bfff7ff188f4b3d9ec26ffcedaf6b6c42f))
+
+
+### Bug Fixes
+
+* **shift:** hand a dead worker's claim back instead of letting it sit INFLIGHT ([#297](https://github.com/typicalday/owenloop/issues/297)) ([995b15b](https://github.com/typicalday/owenloop/commit/995b15be4b7dbd286f32d70bdcb71a6401c92d48))
+
 ## [0.5.25](https://github.com/typicalday/owenloop/compare/v0.5.24...v0.5.25) (2026-08-23)
 
 
