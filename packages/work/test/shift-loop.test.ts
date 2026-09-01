@@ -11,6 +11,8 @@ import {
   createShiftLoop,
   HUB_PICKUP_WINDOW_MS,
   MAX_PENDING_CANDIDATE_AGE_MS,
+  MAX_RELEASE_REASON_POINTS,
+  STEP_BRAKE_DECAY_MS,
   STEP_BRAKE_DELAYS_MS,
   withDispatchLock,
   type ShiftLoop,
@@ -3616,6 +3618,7 @@ function stormLoop(
   errs: string[];
   calls: Call[];
   next: () => void;
+  fail: (run: string) => void;
 } {
   cacheCommandBundle();
   let i = 0;
@@ -3635,7 +3638,23 @@ function stormLoop(
     i += 1;
     orders[0] = wo(runs[i]!, step);
   };
-  return { loop, spawns, errs, calls, next };
+  // A WHOLE failure record, which is what the runtime actually hands over. The
+  // old `{ run }` shorthand let these cases drift from production: the loop now
+  // also releases the dead worker's claim, and a shorthand record would have
+  // hidden that this path has a hub effect at all.
+  const fail = (run: string): void => {
+    loop.noteWorkerFailure({
+      workflow: 'wf1',
+      run,
+      step,
+      kind: 'exec',
+      executable: '/usr/bin/node /bin/owenloop.mjs',
+      exitStatus: 1,
+      signal: null,
+      message: 'worker exited without completing successfully',
+    });
+  };
+  return { loop, spawns, errs, calls, next, fail };
 }
 
 test('every brake delay remains inside the hub pickup window', () => {
@@ -3645,14 +3664,14 @@ test('every brake delay remains inside the hub pickup window', () => {
 test('a step whose worker keeps failing is braked instead of respawned forever', async () => {
   let monotonic = 0;
   const runs = ['run_storm01', 'run_storm02', 'run_storm03'];
-  const { loop, spawns, errs, next } = stormLoop(runs, () => monotonic);
+  const { loop, spawns, errs, next, fail } = stormLoop(runs, () => monotonic);
 
   // The first dispatch is free — nothing has failed yet.
   await loop.iterate();
   assert.deepEqual(spawns.map((s) => s.run), ['run_storm01']);
 
   // Its child exits non-zero. That first failure arms the 2s window.
-  loop.noteWorkerFailure({ run: 'run_storm01' });
+  fail('run_storm01');
   next();
   await loop.iterate();
   assert.deepEqual(
@@ -3675,15 +3694,15 @@ test('a step whose worker keeps failing is braked instead of respawned forever',
 test('consecutive failures lengthen the window; the delay is not flat', async () => {
   let monotonic = 0;
   const runs = ['run_b1', 'run_b2', 'run_b3', 'run_b4'];
-  const { loop, spawns, next } = stormLoop(runs, () => monotonic);
+  const { loop, spawns, next, fail } = stormLoop(runs, () => monotonic);
 
   await loop.iterate();                              // run_b1 spawns
-  loop.noteWorkerFailure({ run: 'run_b1' });         // failure 1 → 2s window
+  fail('run_b1');         // failure 1 → 2s window
 
   monotonic = 2_000;
   next();
   await loop.iterate();                              // run_b2 spawns
-  loop.noteWorkerFailure({ run: 'run_b2' });         // failure 2 → 8s window
+  fail('run_b2');         // failure 2 → 8s window
 
   // 2s past the second failure would have been enough after the FIRST one.
   monotonic = 4_000;
@@ -3721,10 +3740,10 @@ test('concurrent runs of one step are never braked — only failures count', asy
 test('a braked candidate is not queued for local dispatch', async () => {
   const monotonic = 0;
   const runs = ['run_q01', 'run_q02'];
-  const { loop, spawns, calls, next } = stormLoop(runs, () => monotonic);
+  const { loop, spawns, calls, next, fail } = stormLoop(runs, () => monotonic);
 
   await loop.iterate();
-  loop.noteWorkerFailure({ run: 'run_q01' });
+  fail('run_q01');
   next();
   await loop.iterate(); // braked
 
@@ -3732,12 +3751,37 @@ test('a braked candidate is not queued for local dispatch', async () => {
   // next drain, with no window elapsed — which would defeat the brake entirely.
   await loop.iterate();
   assert.deepEqual(spawns.map((s) => s.run), ['run_q01']);
-  assert.equal(count(calls, 'release'), 0, 'the brake deliberately leaves claims to lapse');
+
+  // Exactly ONE release: the dead worker's own, handed back at the moment of
+  // failure. This assertion used to read `0`, with the comment "the brake
+  // deliberately leaves claims to lapse" — that lapse is the defect. A claim
+  // left held sits INFLIGHT on the hub with a frozen heartbeat, so the order is
+  // neither running nor re-offerable and nothing distinguishes it from work in
+  // progress; measured once at 34 minutes before an operator released it by
+  // hand.
+  //
+  // The count matters as much as the fact, and the reason it stays at one is
+  // NOT that the brake runs before the claim — it does not. `whats_next` claims
+  // first and the brake check sits inside `dispatchCandidate`, which is why its
+  // own log line says it is "leaving this claim to lapse". A braked candidate
+  // therefore still costs a claim; it just never reaches a spawn.
+  //
+  // That is what bounds this: a release is only ever emitted downstream of a
+  // spawn or a failed spawn attempt, and both are gated by the brake ladder
+  // (2s, 8s, 30s, 60s, 90s). So there is no claim-fail-release hot loop — two
+  // further drains follow this release and neither adds another.
+  //
+  // What does rise is re-claiming. A released order is re-offered immediately
+  // instead of lapsing after the hub's 120s reap, so a braked shift can pick it
+  // up and idle on it once per sweep until the window expires. That is a real
+  // cost against the org Durable Object, taken deliberately: the alternative is
+  // the order staying invisible for the whole reap window.
+  assert.equal(count(calls, 'release'), 1, 'the dead worker hands its claim back, once');
 });
 
 test('a brake expiry sweeps again even when wake reports no change', async () => {
   let monotonic = 0;
-  const { loop, spawns, calls, next } = stormLoop(
+  const { loop, spawns, calls, next, fail } = stormLoop(
     ['run_alarm_a', 'run_alarm_b'],
     () => monotonic,
     'cmd',
@@ -3749,7 +3793,7 @@ test('a brake expiry sweeps again even when wake reports no change', async () =>
   );
 
   await loop.iterate();
-  loop.noteWorkerFailure({ run: 'run_alarm_a' });
+  fail('run_alarm_a');
   next();
   await loop.iterate(); // run_alarm_b is braked and arms the 2s re-sweep.
   assert.deepEqual(spawns.map((spec) => spec.run), ['run_alarm_a']);
@@ -3768,10 +3812,10 @@ test('a brake expiry sweeps again even when wake reports no change', async () =>
 test('a run that ends clears its step’s failure streak', async () => {
   let monotonic = 0;
   const runs = ['run_e1', 'run_e2', 'run_e3'];
-  const { loop, spawns, next } = stormLoop(runs, () => monotonic);
+  const { loop, spawns, next, fail } = stormLoop(runs, () => monotonic);
 
   await loop.iterate();
-  loop.noteWorkerFailure({ run: 'run_e1' }); // 2s window armed
+  fail('run_e1'); // 2s window armed
 
   monotonic = 2_000;
   next();
@@ -3800,12 +3844,228 @@ test('fanned-out keys of one step do not brake each other', async () => {
 
   await loop.iterate();
   // 'alpha' fails; 'beta' and 'gamma' are unrelated orders of the same step.
-  loop.noteWorkerFailure({ run: 'run_k1' });
+  // This case builds its own loop rather than using `stormLoop`, because the
+  // fan-out keys are the point — so it reports the failure directly.
+  loop.noteWorkerFailure({
+    workflow: 'wf1',
+    run: 'run_k1',
+    step: 'cmd',
+    kind: 'exec',
+    executable: '/usr/bin/node /bin/owenloop.mjs',
+    exitStatus: 1,
+    signal: null,
+    message: 'worker exited without completing successfully',
+  });
   await loop.iterate();
 
   // Keying the brake on the step alone would have braked beta and gamma too.
   assert.deepEqual(
     spawns.map((s) => s.run).slice(0, 3).sort(),
     ['run_k1', 'run_k2', 'run_k3'],
+  );
+});
+
+test('a dead worker hands its claim back naming the failure', async () => {
+  const { loop, calls, fail } = stormLoop(['run_r01'], () => 0);
+
+  await loop.iterate();
+  fail('run_r01');
+
+  const releases = calls.filter((call) => call.verb === 'release').map((call) => call.arg);
+  assert.deepEqual(releases, [{
+    workflow: 'wf1',
+    run: 'run_r01',
+    // The reason is what makes the release worth anything to an operator, and
+    // it names the supervisor because the supervisor is who is speaking. A
+    // worker that fails through its own error path sends a more specific reason
+    // first and the hub keeps that one; this account is what an operator gets
+    // when no such reason ever arrived, which is the case worth fixing.
+    //
+    // `message` is the spawner's own bounded lifecycle string, never worker
+    // output: agent-run stderr is untrusted and is deliberately never quoted
+    // back. The exit status is the half that separates "this step is broken"
+    // from "this host is broken", so it travels with the message.
+    reason: 'shift supervisor: exec worker exited without completing successfully (exitStatus 1)',
+  }]);
+});
+
+test('a spawn that never starts hands its claim back and charges the brake', async () => {
+  // The other half of the same hole, and the arm that matters most. The claim
+  // is taken by `whats_next` BEFORE any spawn is attempted, so a spawn that
+  // throws strands it exactly as a dead worker does — except no `WorkerFailure`
+  // is ever reported for a child that never existed, so the failure path above
+  // cannot cover this one. `spawn.ts` names what lands here: EMFILE from too
+  // many concurrent children, ENOMEM from a host out of memory. That is
+  // precisely when an order most needs to reach a shift that can still fork.
+  cacheCommandBundle();
+  const orders = [wo('run_x01', 'cmd')];
+  const { hub, calls } = mockHub({ perWf: cmdWf(orders) });
+  const spawner: Spawner = () => {
+    throw new Error('ENOMEM: fork failed');
+  };
+  const errs: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    monotonicNow: () => 0,
+    isAlive: () => false,
+    err: (line) => errs.push(line),
+  }));
+
+  await loop.iterate();
+
+  assert.deepEqual(
+    calls.filter((call) => call.verb === 'release').map((call) => call.arg),
+    [{
+      workflow: 'wf1',
+      run: 'run_x01',
+      // `spawn` is the command prefix; an agent-run reads 'agent-run spawn'.
+      // The spawner's own message travels with it because the difference
+      // between EMFILE and a missing executable is the difference between
+      // "wait" and "this shift is misconfigured".
+      reason: 'shift supervisor: spawn failed — ENOMEM: fork failed',
+    }],
+  );
+
+  // Charging the brake is not decoration here, it is what keeps the release
+  // safe. A released claim is re-offered at once instead of lapsing after the
+  // hub's pickup window, so on a host that cannot fork at all the brake is the
+  // only thing standing between this shift and a claim-fail-release loop.
+  orders[0] = wo('run_x02', 'cmd');
+  await loop.iterate();
+  assert.ok(
+    errs.some((line) => line.includes("step 'cmd' has failed") && line.includes('braking')),
+    `a spawn failure must arm the brake; got ${JSON.stringify(errs)}`,
+  );
+  assert.equal(
+    count(calls, 'release'),
+    1,
+    'the braked sweep leaves its claim to lapse, so it adds no second release',
+  );
+});
+
+test('a dispatch that aborts a started child says so instead of blaming the spawn', async () => {
+  // The catch covers two different failures and an operator has to be able to
+  // tell them apart. This is the arm where the spawn SUCCEEDED and something
+  // after it threw — and it is not hypothetical: `out` is wired to
+  // `process.stdout.write`, which on a detached daemon writing to a log file is
+  // synchronous and throws on ENOSPC. That is the exact host condition that
+  // produced the stall this whole change exists to end, so the release reason
+  // must not send an operator hunting a fork failure that never happened.
+  cacheCommandBundle();
+  const orders = [wo('run_y01', 'cmd')];
+  const { hub, calls } = mockHub({ perWf: cmdWf(orders) });
+  let killed = 0;
+  const spawner: Spawner = () => ({ pid: 4242, cancel: () => { killed += 1; } });
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    monotonicNow: () => 0,
+    isAlive: () => false,
+    out: () => { throw new Error('ENOSPC: no space left on device, write'); },
+  }));
+
+  await loop.iterate();
+
+  // The child really was running, so the release is only honest if it was also
+  // killed. Exactly once: a double kill would mean the catch and the reservation
+  // cleanup are both terminating it.
+  assert.equal(killed, 1, 'an aborted dispatch must kill the child it started');
+  assert.deepEqual(
+    calls.filter((call) => call.verb === 'release').map((call) => call.arg),
+    [{
+      workflow: 'wf1',
+      run: 'run_y01',
+      reason: 'shift supervisor: spawn started then aborted — ENOSPC: no space left on device, write',
+    }],
+  );
+});
+
+test('an unbounded dispatch error is clamped before it reaches the hub', async () => {
+  // The dispatch catch interpolates the raw error message, and that message is
+  // NOT bounded: `acquireDispatchLock` throws a `FileLockTimeoutError` carrying
+  // a filesystem path, and a path is bounded only by PATH_MAX. The hub truncates
+  // at the same limit anyway, so the reason for clamping here is that the reason
+  // we SEND is then the reason an operator reads, with no silent server-side
+  // shortening in between.
+  cacheCommandBundle();
+  const { hub, calls } = mockHub({ perWf: cmdWf([wo('run_w01', 'cmd')]) });
+  const spawner: Spawner = () => {
+    throw new Error('x'.repeat(4096));
+  };
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    monotonicNow: () => 0,
+    isAlive: () => false,
+  }));
+
+  await loop.iterate();
+
+  const release = calls.find((call) => call.verb === 'release')?.arg as { reason: string };
+  // Count code points, not UTF-16 units: a clamp that sliced by unit could halve
+  // a surrogate pair and put a lone surrogate on the wire.
+  assert.equal(Array.from(release.reason).length, MAX_RELEASE_REASON_POINTS);
+  assert.ok(release.reason.startsWith('shift supervisor: spawn failed — xxx'));
+});
+
+test('a worker failure for a run this shift never dispatched releases nothing', () => {
+  // `noteWorkerFailure` is driven by a child `exit` event, and a shift only
+  // learns about children it started. Reaching it with an unknown run means the
+  // bookkeeping is already wrong, and the wrong thing to do is guess: releasing
+  // a claim this shift does not hold would hand back another shift's live work.
+  // The guard that prevents that is otherwise untested — deleting it leaves the
+  // whole suite green.
+  cacheCommandBundle();
+  const { hub, calls } = mockHub({ perWf: cmdWf([wo('run_z01', 'cmd')]) });
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    monotonicNow: () => 0,
+    isAlive: () => false,
+  }));
+
+  loop.noteWorkerFailure({
+    workflow: 'wf1',
+    run: 'run_never_dispatched',
+    step: 'cmd',
+    kind: 'exec',
+    executable: '/usr/bin/node /bin/owenloop.mjs',
+    exitStatus: 1,
+    signal: null,
+    message: 'worker exited without completing successfully',
+  });
+
+  assert.equal(count(calls, 'release'), 0);
+});
+
+test('a step that goes long enough without failing starts its next brake from the shortest delay', async () => {
+  // The streak is reset two ways: by a run that ends cleanly, and — here — by
+  // simply not failing for long enough. Without the decay, a step that fails
+  // once a day climbs to the longest delay and stays there on the strength of
+  // failures nobody remembers.
+  //
+  // Read through spawns rather than log lines, exactly as the ladder test above
+  // does: 2s past the second failure is enough only if that failure was treated
+  // as the FIRST of a new streak. If the streak had carried over, the second
+  // failure would arm 8s and nothing would spawn here.
+  let monotonic = 0;
+  const { loop, spawns, next, fail } = stormLoop(['run_d1', 'run_d2', 'run_d3'], () => monotonic);
+
+  await loop.iterate();                                  // run_d1 spawns
+  fail('run_d1');                                        // failure 1 → 2s window
+
+  // Past the decay window, so failure 1 is forgotten — but well inside
+  // STEP_BRAKE_FORGET_MS, so the row itself still exists. The reset has to come
+  // from the decay check, not from the sweep having pruned the entry.
+  monotonic = STEP_BRAKE_DECAY_MS + 1_000;
+  next();
+  await loop.iterate();                                  // run_d2 spawns
+  fail('run_d2');
+
+  monotonic += STEP_BRAKE_DELAYS_MS[0]!;
+  next();
+  await loop.iterate();
+  assert.deepEqual(
+    spawns.map((s) => s.run),
+    ['run_d1', 'run_d2', 'run_d3'],
+    'a failure long after the previous one must start the ladder over, not extend it',
   );
 });
