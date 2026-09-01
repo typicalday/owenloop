@@ -320,6 +320,15 @@ modifier through `OWENLOOP_FEEDBACK`/`OWENLOOP_FEEDBACK_FILE` and
 steps](bundles.md#consumed-inputs-for-command-steps) for the reader snippet and
 the omitted-key rule.
 
+The result travels the same way. A command step's accepted artifact is its whole
+`CommandReceipt`; to put a value of its own inside it — the thing a downstream
+`from: payload.value` bind reads — the command either prints an
+`##owenloop:payload##` marker line on stdout, capped at 64 KiB, or writes the
+same JSON to the path in `OWENLOOP_PAYLOAD_FILE`, capped at 24 MB. A definition
+whose command writes that file must declare the `command-payload-file.v1`
+runtime feature. See [`docs/bundles.md` § Returning a payload from a command
+step](bundles.md#returning-a-payload-from-a-command-step).
+
 ## `capabilities:` — logical capability tags
 
 `capabilities:` is an optional list of strings on a step naming what that step

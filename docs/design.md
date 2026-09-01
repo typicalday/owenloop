@@ -1003,9 +1003,15 @@ with code `0`. A nonzero exit sends the worker's `reject` request for
 `order.judge` and submits no receipt. A signal or machinery failure has no
 verdict, so the worker issues neither verb and the reap path re-offers the order.
 
-Command receipts may also carry a bounded JSON payload emitted by a stdout line
-beginning with `##owenloop:payload##`. The last marker line wins, and the 64 KiB
-JSON-text cap protects the runner because the runner does not buffer full stdout.
+Command receipts may also carry a bounded JSON payload, returned either by a
+stdout line beginning with `##owenloop:payload##` or by writing the JSON to the
+path the worker offers in `OWENLOOP_PAYLOAD_FILE`. The last marker line wins,
+and the marker's 64 KiB JSON-text cap protects the runner because the runner
+does not buffer full stdout. That cap is a property of the transport rather than
+of the result, which is why the file exists: it carries up to 24 MB, below the
+hub's own artifact cap. Returning a payload through both transports in one run
+is refused by name instead of resolved by precedence, because two statements of
+the result are an error in the command rather than a choice for the worker.
 A valid plain-step payload reject is delivered BEFORE any owed receipt is
 submitted. The hub refuses a reject from a run whose claim has closed, and a
 step's last owed submit is what closes it — so the reverse order made every

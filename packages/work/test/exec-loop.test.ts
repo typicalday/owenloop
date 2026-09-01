@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { dsseVerifySubmission, valueDigestHex } from '../../../src/crypto/index.ts';
@@ -14,6 +14,7 @@ import {
   type ExecLoopOptions,
   type ExecOutcome,
 } from '../src/exec/loop.ts';
+import { PAYLOAD_FILE_ENV, PAYLOAD_MAX_BYTES } from '../src/exec/payload.ts';
 import { resetSubmitProofWarningForTests, type SubmissionKeyManager } from '../src/submit-proof.ts';
 import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
@@ -428,6 +429,256 @@ test('a malformed reject directive stays in the receipt but never issues a rejec
   assert.deepEqual(receipt.payload, { reject: { path: '', text: 'bad' } });
   assert.match(receipt.payloadError ?? '', /non-empty string/);
   assert.equal(only(calls, 'reject').length, 0);
+});
+
+// ---- the payload file: the other way home for a command's result ------------
+//
+// These assert the WIRING — that exec always offers the channel, reads it back
+// on the receipt path, and cleans up after itself. What the bytes in the file
+// mean is exec-payload.test.ts's job.
+//
+// Every test here that touches the file BEFORE the command exits does that work
+// inside a `try` whose `finally` settles the fake runner. Without it a tripped
+// assertion leaves the loop waiting on a command that will never finish, and a
+// sub-second suite becomes a wall-clock timeout with no failure message.
+
+test('every command spawn is told where it may write a payload, and the file is not created for it', async () => {
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  const file = fr.starts[0]!.env?.[PAYLOAD_FILE_ENV];
+  try {
+    assert.equal(typeof file, 'string', 'the variable is set on EVERY command spawn, not only on overflow');
+    assert.equal(existsSync(dirname(file!)), true, 'the directory must exist before the command can write into it');
+    assert.equal(existsSync(file!), false, 'its ABSENCE after exit is the signal that stdout was used');
+  } finally {
+    fr.resolve(result(0));
+  }
+  assert.equal(await p, 'submitted');
+});
+
+test('each command spawn gets its own private payload directory', async () => {
+  // Two properties, one test, because they fail together. A single shared path
+  // would let two exec loops on one host overwrite each other's results and let
+  // the first loop to finish delete the directory out from under the second;
+  // a group- or world-writable directory would let any local process plant a
+  // payload that exec then publishes as the step's own result.
+  const { env: first } = await envForOrder(commandOrder());
+  const { env: second } = await envForOrder(commandOrder());
+  assert.notEqual(
+    first[PAYLOAD_FILE_ENV],
+    second[PAYLOAD_FILE_ENV],
+    'two spawns must never be handed the same path',
+  );
+
+  // The mode has to be read while the command is still running: the loop's
+  // cleanup takes the directory away as soon as it settles.
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  try {
+    const dir = dirname(fr.starts[0]!.env![PAYLOAD_FILE_ENV]!);
+    assert.equal(statSync(dir).mode & 0o777, 0o700, 'owner-only, and umask cannot loosen it');
+  } finally {
+    fr.resolve(result(0));
+  }
+  assert.equal(await p, 'submitted');
+});
+
+test('a payload written to the file lands in the receipt, far above the stdout cap', async () => {
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  // A value with no way home through the marker line: the scanner drops it and
+  // the step produces nothing. That gap is what this channel closes.
+  const big = { note: 'x'.repeat(PAYLOAD_MAX_BYTES * 2) };
+  try {
+    writeFileSync(fr.starts[0]!.env![PAYLOAD_FILE_ENV]!, JSON.stringify(big));
+  } finally {
+    fr.resolve(result(0));
+  }
+
+  assert.equal(await p, 'submitted');
+  const receipt = submits[0]!.value as CommandReceipt;
+  assert.deepEqual(receipt.payload, big);
+  assert.equal('payloadError' in receipt, false);
+});
+
+test('a payload through both transports submits a receipt that names the conflict', async () => {
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  try {
+    writeFileSync(fr.starts[0]!.env![PAYLOAD_FILE_ENV]!, '{"from":"file"}');
+  } finally {
+    fr.resolve(result(0, { payloadLine: '{"from":"stdout"}' }));
+  }
+
+  assert.equal(await p, 'submitted');
+  const receipt = submits[0]!.value as CommandReceipt;
+  assert.equal('payload' in receipt, false, 'neither statement may be published as the result');
+  assert.match(receipt.payloadError ?? '', /exactly one of them/);
+});
+
+test('a reject directive written to the file issues the reject', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    reject: [{ ok: true, closed: true }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  try {
+    writeFileSync(
+      fr.starts[0]!.env![PAYLOAD_FILE_ENV]!,
+      '{"reject":{"path":"input","text":"upstream is invalid"}}',
+    );
+  } finally {
+    fr.resolve(result(1));
+  }
+
+  assert.equal(await p, 'rejected');
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'reject').length, 1);
+});
+
+test('a judge verdict delivered through the file is what the DSSE proof covers', async () => {
+  // The highest-stakes consumer of this channel. On a judge order the payload
+  // IS the verdict, and the submission proof commits to the receipt's digest.
+  // A judge path that resolved only the stdout marker would sign a proof over
+  // a verdict-less receipt and look, from the hub, exactly like a valid one.
+  const fr = fakeRunner();
+  const response = commandOrder({ command: 'emit-payload', judge: 'input', owes: ['input'] });
+  response.order!.consumedFingerprint = { input: 4 };
+  const { hub, submits } = mockHub({ getOrder: [response], submit: ['green'] });
+  const sshCalls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(sshCalls),
+  }));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  // Past the marker cap on purpose: a verdict that reasons at this length has
+  // no other way home, which is the whole reason a judge would reach for the
+  // file in the first place.
+  const verdict = { accept: true, why: 'x'.repeat(PAYLOAD_MAX_BYTES * 2) };
+  try {
+    writeFileSync(fr.starts[0]!.env![PAYLOAD_FILE_ENV]!, JSON.stringify(verdict));
+  } finally {
+    fr.resolve(result(0));
+  }
+  assert.equal(await p, 'submitted');
+
+  const receipt = submits[0]!.value as CommandReceipt;
+  assert.deepEqual(receipt.payload, verdict);
+  assert.equal('payloadError' in receipt, false);
+  const proof = submits[0]!.proof;
+  assert.ok(proof !== undefined);
+  const verified = await dsseVerifySubmission(JSON.parse(proof), {
+    async verify(_bytes, signature) {
+      return signature.toString('utf8') === ARMOR
+        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+        : null;
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ valueDigest: string }>;
+  };
+  assert.equal(record.produced[0]!.valueDigest, valueDigestHex(receipt));
+});
+
+test('a zero-exit judge ignores a reject directive from the file, exactly as from stdout', async () => {
+  // The refusal is a property of the judge path, not of the transport. Two
+  // transports resolved by two code paths is how a rule ends up enforced on
+  // one of them, letting a judge reject an input while reporting success.
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder({ judge: 'input' })],
+    submit: ['green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  try {
+    writeFileSync(
+      fr.starts[0]!.env![PAYLOAD_FILE_ENV]!,
+      '{"reject":{"path":"other","text":"do not send"}}',
+    );
+  } finally {
+    fr.resolve(result(0));
+  }
+
+  assert.equal(await p, 'submitted');
+  assert.equal(submits.length, 1);
+  assert.equal(only(calls, 'reject').length, 0);
+  assert.equal(only(calls, 'ask').length, 0);
+});
+
+test('the payload directory is removed after the command exits', async () => {
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+
+  const file = fr.starts[0]!.env![PAYLOAD_FILE_ENV]!;
+  try {
+    writeFileSync(file, '{"answer":42}');
+    assert.equal(existsSync(file), true, 'it must survive for as long as the command runs');
+  } finally {
+    fr.resolve(result(0));
+  }
+  assert.equal(await p, 'submitted');
+
+  assert.equal(existsSync(file), false);
+  assert.equal(existsSync(dirname(file)), false, 'the whole temp directory goes, not just the file');
+});
+
+test('the payload directory is removed even when the spawn itself fails', async () => {
+  // The directory is created before the spawn is attempted, so the path that
+  // never gets a child process still has to leave nothing behind.
+  const fr = fakeRunner({ throwOnStart: new Error('spawn ENOENT') });
+  const { hub, submits } = mockHub({ getOrder: [commandOrder()] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  // A spawn that never happened is a machinery failure: it escalates rather
+  // than submitting. The cleanup obligation is the same either way.
+  assert.equal(await loop.run(), 'command-failed');
+  assert.equal(submits.length, 0);
+
+  const file = fr.starts[0]!.env![PAYLOAD_FILE_ENV]!;
+  assert.equal(existsSync(dirname(file)), false);
+});
+
+test('a stale parent payload file path is never inherited', async () => {
+  // `childEnv` starts from `process.env`, and a shift can itself have been
+  // launched from inside another command step. Reading the PARENT's payload
+  // file would attribute one step's result to another.
+  const saved = process.env[PAYLOAD_FILE_ENV];
+  process.env[PAYLOAD_FILE_ENV] = '/parent/run/payload.json';
+  try {
+    const { env } = await envForOrder(commandOrder());
+    assert.notEqual(env[PAYLOAD_FILE_ENV], '/parent/run/payload.json');
+    assert.equal(typeof env[PAYLOAD_FILE_ENV], 'string');
+  } finally {
+    if (saved === undefined) delete process.env[PAYLOAD_FILE_ENV];
+    else process.env[PAYLOAD_FILE_ENV] = saved;
+  }
 });
 
 test('exec passes bundle provenance with the parent environment and removes it without provenance', async () => {
@@ -1662,6 +1913,14 @@ test('a lost lease (heartbeat fails, classify shows unclaimed) mid-run ⇒ kill,
   assert.equal(await loop.run(), 'lease-lost');
   assert.equal(fr.state.kills, 1);
   assert.equal(submits.length, 0);
+
+  // Not a duplicate of the exit-path cleanup test. This is the branch that
+  // kills the child and returns WITHOUT awaiting its exit, so the removal
+  // cannot be hung off the child's completion. It also repeats in production
+  // on every lost-lease re-offer, which is what turns a leak here into one
+  // abandoned temp directory per re-offer on a long-lived worker host.
+  const file = fr.starts[0]!.env![PAYLOAD_FILE_ENV]!;
+  assert.equal(existsSync(dirname(file)), false, 'the temp directory goes, killed child or not');
 });
 
 // ---- first contact terminal (no command) ------------------------------------

@@ -23,6 +23,19 @@ export const SUPPORTED_RUNTIME_FEATURES = Object.freeze([
   // than about an old runtime. Requiring the id moves the diagnosis to the
   // bundle check, before any order is offered.
   'neutral-approval-modes.v1',
+  // A command step may return its payload by writing JSON to the path in
+  // `$OWENLOOP_PAYLOAD_FILE` instead of printing an `##owenloop:payload##` line
+  // on stdout, which lifts the result ceiling from the 64 KiB stdout marker to
+  // the hub's artifact cap. A def whose command writes that file MUST require
+  // this id, because a CLI that predates it fails in the worst available way:
+  // it leaves the variable unset, and the natural defensive spelling
+  // `> "${OWENLOOP_PAYLOAD_FILE:-/dev/null}"` then EXITS ZERO having written the
+  // payload to /dev/null. There is no error anywhere — the step submits a
+  // receipt with no payload, and the first sign of trouble is a downstream
+  // `from: payload.value` bind failing at the hub, one step away from the cause.
+  // Requiring the id moves the diagnosis to the bundle check, before any order
+  // is offered.
+  'command-payload-file.v1',
 ] as const);
 
 export interface RuntimeCompatibilityEnvironment {

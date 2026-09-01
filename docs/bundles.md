@@ -107,6 +107,8 @@ This Owenloop release advertises exactly these feature identifiers:
 
 - `harness-policy-enforcement.v1`
 - `native-judge-policy-inheritance.v1`
+- `neutral-approval-modes.v1`
+- `command-payload-file.v1`
 
 The running version comes from Owenloop's production `packageVersion()` source. A production build that cannot read a valid package version uses the `0.0.0` sentinel. The sentinel fails every declared `minVersion`, including `minVersion: "0.0.0"`, and the refusal tells the operator to install or upgrade Owenloop. The sentinel may still satisfy a feature-only declaration because feature support is evaluated independently.
 
@@ -297,6 +299,70 @@ run; only an accepted artifact with a declared bind can do that.
 
 An agent prompt can read the same value as `${MODIFIER}`. Unknown placeholders
 remain unchanged; when an order has no modifier, `${MODIFIER}` remains literal.
+
+## Returning a payload from a command step
+
+A command step's accepted artifact is its whole `CommandReceipt`. To put a value
+of its own inside that receipt — the thing a downstream `from: payload.value`
+bind reads — a command has two ways to say it, and it must pick exactly one.
+
+| Transport | How | Ceiling |
+| --- | --- | --- |
+| stdout marker | print one line beginning `##owenloop:payload## ` followed by JSON | 64 KiB of JSON text (`PAYLOAD_MAX_BYTES`) |
+| payload file | write JSON to the path in `OWENLOOP_PAYLOAD_FILE` | 24 MB (`PAYLOAD_FILE_MAX_BYTES`) |
+
+The marker is the older channel and is unchanged. The file exists because the
+marker's ceiling is a *transport* limit on a single stdout line, while the hub
+has always stored an artifact above 64 KiB in object storage up to its own
+25 MB cap. A result between those two numbers had nowhere to go: the runner
+dropped the marker line and the step submitted a receipt with no payload.
+
+`OWENLOOP_PAYLOAD_FILE` is set on **every** command spawn, not only when a
+result is expected to be large, and it is always resolved rather than inherited
+— a shift launched from inside another command step already carries its parent
+order's value, and reading it would attribute one step's result to another. The
+runner creates the private `0700` directory but **not** the file; the command
+creates it, or leaves it absent.
+
+```sh
+# Either of these is a complete producer.
+echo "##owenloop:payload## $(jq -nc '{value:"deep"}')"
+jq -nc '{value:"deep"}' > "$OWENLOOP_PAYLOAD_FILE"
+```
+
+Rules a script can rely on:
+
+- **Absent or empty means no payload.** A path that was never written, an empty
+  file, and a file holding only whitespace are all read as "this command
+  returned nothing", not as an error. That is what lets every existing
+  marker-only command keep working with the variable set.
+- **Using both transports is refused by name.** If the file holds anything and a
+  marker line was also printed, neither is published: the receipt carries a
+  `payloadError` naming the conflict and both byte counts, and no `payload`.
+  Two statements of the result are a bug in the command, and picking one of them
+  would publish a value the author did not choose.
+- **The reject directive works identically through either transport.** A payload
+  of the shape `{"reject":{"path":"...","text":"..."}}` sends the worker's
+  reject, from the file exactly as from the marker.
+- **Over the cap is an error, not a truncation.** The size is taken from the
+  open descriptor before any bytes are read; over-cap produces a `payloadError`
+  naming the size and the cap, and no `payload`.
+- **Anything that is not a regular file is an error.** A directory, a symbolic
+  link, or a device at that path produces a `payloadError` rather than being
+  read through. Only ENOENT is the ordinary absence.
+- **The file lives only as long as the command.** It is in a private temp
+  directory that owenloop removes after the command exits, including when the
+  command is killed because the lease was lost. Write it during the run; do not
+  stash the path.
+
+A definition whose command writes that file **must** declare the
+`command-payload-file.v1` runtime feature. On a CLI that predates it the
+variable is simply unset, and the natural defensive spelling
+`> "${OWENLOOP_PAYLOAD_FILE:-/dev/null}"` then exits zero having written the
+result to `/dev/null`. Nothing reports an error; the first sign of trouble is a
+downstream bind failing at the hub, one step away from the cause. The feature
+declaration moves that diagnosis to the bundle compatibility check, before any
+order is offered.
 
 ## Working directory for command steps
 
