@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.29](https://github.com/typicalday/owenloop/compare/v0.5.28...v0.5.29) (2026-09-05)
+
+
+### Bug Fixes
+
+* **work:** accept a relayed child proof for a calls-produced consumed artifact ([#310](https://github.com/typicalday/owenloop/issues/310)) ([7a185f6](https://github.com/typicalday/owenloop/commit/7a185f6cc42ba712db675d6c14f1d9ef1fdd9e8a))
+
 ## [0.5.28](https://github.com/typicalday/owenloop/compare/v0.5.27...v0.5.28) (2026-09-05)
 
 
