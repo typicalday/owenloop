@@ -84,10 +84,12 @@ interface RawJudge {
   executor?: unknown;
   command?: unknown;
   spec?: unknown;
+  workdir?: unknown;
+  workdirFrom?: unknown;
   capabilities?: unknown;
   modifiers?: unknown;
 }
-const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec', 'capabilities', 'modifiers'] as const;
+const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec', 'workdir', 'workdirFrom', 'capabilities', 'modifiers'] as const;
 
 interface RawStep {
   name?: unknown;
@@ -494,6 +496,13 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
     if (raw.executor !== undefined) judge.executor = asString(raw.executor, `judge '${name}'.executor`);
     if (raw.command !== undefined) judge.command = asString(raw.command, `judge '${name}'.command`);
     if (raw.spec !== undefined) judge.spec = asExtension(raw.spec, `judge '${name}'.spec`);
+    if (raw.workdir !== undefined) judge.workdir = asString(raw.workdir, `judge '${name}'.workdir`);
+    if (raw.workdirFrom !== undefined) {
+      judge.workdirFrom = asString(raw.workdirFrom, `judge '${name}'.workdirFrom`);
+    }
+    if (raw.workdir !== undefined && raw.workdirFrom !== undefined) {
+      throw new DefError(`judge '${name}' may not declare both workdir and workdirFrom`);
+    }
     if (raw.capabilities !== undefined) {
       const caps = asStringArray(raw.capabilities, `judge '${name}'.capabilities`);
       if (caps.length === 0) {
@@ -1162,16 +1171,34 @@ export function parseDef(raw: unknown, source?: string, baseDir?: string): Workf
 }
 
 /**
+ * The stem half of a `workdirFrom` expression, resolved against a list of
+ * consumed stems. Mirrors `parseWorkdirFrom`'s boundary walk (longest stem
+ * first, because a stem may itself contain dots) but takes bare names, since a
+ * synthesized judge has not built its consume patterns yet. Returns null when
+ * no consumed stem matches — the expression then names a definition input,
+ * which validateDef resolves without a consume edge.
+ */
+function workdirFromStem(raw: string, stems: readonly string[]): string | null {
+  const r = raw.trim();
+  for (let boundary = r.lastIndexOf('.'); boundary > 0; boundary = r.lastIndexOf('.', boundary - 1)) {
+    if (r.length - boundary - 1 === 0) continue;
+    const stem = r.slice(0, boundary);
+    if (stems.includes(stem)) return stem;
+  }
+  return null;
+}
+
+/**
  * Synthesize one full StepDef per declared `judges:` entry on a produce
  * pattern (§24 §3.2, §7.2). Shape mirrors the `calls:` template above, with
  * exactly three deltas from a hand-written step: the `judges: <stem>` marker
  * (eligibility trigger, replacing inputsGreen — see model.ts), `produces: []`
  * (a judge emits a verdict against the judged stem, not a new artifact), and
- * `consumes: [stem, ...(inputs ? producerConsumeStems : [])]` so authority
- * flows from the existing consume-edge check (`assertAuthority`) with no
- * special-casing. Everything else (cadence, maxRunsPerDay, model, body,
- * maxAttempts/maxSchemaFailures defaults) is inherited exactly like
- * an ordinary step, because judge orders flow through the normal
+ * `consumes: [stem, ...(inputs ? producerConsumeStems : []), ...workdirFromStem]`
+ * so authority flows from the existing consume-edge check (`assertAuthority`)
+ * with no special-casing. Everything else (cadence, maxRunsPerDay, model, body,
+ * workdir/workdirFrom, maxAttempts/maxSchemaFailures defaults) is inherited
+ * exactly like an ordinary step, because judge orders flow through the normal
  * eligibleFirings → applySchedule → claim → buildOrder pipeline (§7.1).
  */
 function synthesizeJudgeSteps(
@@ -1180,10 +1207,31 @@ function synthesizeJudgeSteps(
   producerConsumeStems: string[],
   producerX?: Record<string, unknown>,
   producerCapabilities?: string[],
+  producerWorkdir?: string,
+  producerWorkdirFrom?: string,
 ): StepDef[] {
   if (!pat.judges || pat.judges.length === 0) return [];
   return pat.judges.map((j): StepDef => {
+    // A judge with no workdir of its own INHERITS the producer's, so it reads
+    // the same tree the work it judges was produced in. Declaring either key
+    // opts out of both halves of the inheritance: producer and judge each carry
+    // at most one, and silently pairing an authored `workdir` with an inherited
+    // `workdirFrom` would trip validateDef's mutual-exclusion check on a
+    // definition the author never wrote that way.
+    const authoredWorkdir = j.workdir !== undefined || j.workdirFrom !== undefined;
+    const workdir = authoredWorkdir ? j.workdir : producerWorkdir;
+    const workdirFrom = authoredWorkdir ? j.workdirFrom : producerWorkdirFrom;
     const consumeStems = j.inputs ? [pat.stem, ...producerConsumeStems] : [pat.stem];
+    // A workdirFrom value is resolved from a CONSUMED artifact, so the stem it
+    // names must be on this step's consume list or validateDef rejects the whole
+    // definition. `inputs: false` is the case that needs this: the judge sees
+    // only the judged stem, which is never the stem the producer resolved its
+    // workdir from. Deduplicated, so `inputs: true` (where the stem is already
+    // carried) stays byte-identical to the pre-inheritance shape.
+    if (workdirFrom !== undefined) {
+      const stem = workdirFromStem(workdirFrom, producerConsumeStems);
+      if (stem !== null && !consumeStems.includes(stem)) consumeStems.push(stem);
+    }
     const consumes = consumeStems.map((stem) => parseConsume(stem));
     const cadence = j.cadence ?? DEFAULTS.cadence;
     const step: StepDef = {
@@ -1217,6 +1265,8 @@ function synthesizeJudgeSteps(
     if (j.executor !== undefined) step.executor = j.executor;
     if (j.command !== undefined) step.command = j.command;
     if (j.spec !== undefined) step.spec = j.spec;
+    if (workdir !== undefined) step.workdir = workdir;
+    if (workdirFrom !== undefined) step.workdirFrom = workdirFrom;
     if (j.modifiers !== undefined) step.judgeModifiers = [...j.modifiers];
     return step;
   });
@@ -1401,7 +1451,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   }
   const producerConsumeStems = consumes.map((c) => c.stem);
   const judgeSteps = producesPatterns.flatMap((p) =>
-    synthesizeJudgeSteps(name, p, producerConsumeStems, step.x, step.capabilities),
+    synthesizeJudgeSteps(name, p, producerConsumeStems, step.x, step.capabilities, step.workdir, step.workdirFrom),
   );
   return [step, ...judgeSteps];
 }

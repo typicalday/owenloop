@@ -537,6 +537,19 @@ export interface ProducePattern {
      *  (or additionally alongside `command`). Shape-checked as a plain map
      *  only (mirrors `x:`'s asExtension contract) — contents never read. */
     spec?: Record<string, unknown>;
+    /** opaque location hint passed through on the judge's synthesized order.
+     *  Omitted = INHERIT the producing step's `workdir`/`workdirFrom`, so a
+     *  judge reads the same tree the work it judges was produced in. Mutually
+     *  exclusive with workdirFrom, same as StepDef. */
+    workdir?: string;
+    /**
+     * Resolve the judge order's workdir from `<consumedStem>.<dotted.path>` in a
+     * consumed artifact value. Mutually exclusive with workdir. Omitted =
+     * INHERIT the producer's. The named stem is added to the synthesized step's
+     * consumes when it is not already there, so the value passes the engine's
+     * consume-side verification gate.
+     */
+    workdirFrom?: string;
     /** Routing capabilities for this judge's synthesized step. Omitted =
      *  INHERIT the producing step's `capabilities`, so a judge routes to the
      *  same grade of crew as the work it judges instead of being claimable by
