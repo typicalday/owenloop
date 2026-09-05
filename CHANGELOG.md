@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.28](https://github.com/typicalday/owenloop/compare/v0.5.27...v0.5.28) (2026-09-05)
+
+
+### Features
+
+* **shift:** refuse new work when the disk is nearly full ([#307](https://github.com/typicalday/owenloop/issues/307)) ([fa5ab16](https://github.com/typicalday/owenloop/commit/fa5ab1662e797af1a0715cdac498ecd4018cc330))
+* **work:** let a step store a file as an artifact ([#308](https://github.com/typicalday/owenloop/issues/308)) ([9972635](https://github.com/typicalday/owenloop/commit/997263516b4b3998b28ab7fd58cda139d6454ead))
+* **work:** tell a step up front when its sandbox grants it nowhere to write ([#309](https://github.com/typicalday/owenloop/issues/309)) ([9c0c109](https://github.com/typicalday/owenloop/commit/9c0c10903a9cb37bdb4f1638fd4e036d07c4c573))
+
+
+### Bug Fixes
+
+* **work:** stop a shift whose host is broken instead of wedging silently ([#305](https://github.com/typicalday/owenloop/issues/305)) ([594f0d8](https://github.com/typicalday/owenloop/commit/594f0d8a290e768ee16385d6c55b3d046c44b5cd))
+
 ## [0.5.27](https://github.com/typicalday/owenloop/compare/v0.5.26...v0.5.27) (2026-09-05)
 
 
