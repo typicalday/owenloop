@@ -51,6 +51,28 @@
   },
   "additionalValid": [
     {
+      "run": "run-build-10",
+      "workflow": "build-instance",
+      "step": "builder",
+      "key": "builder",
+      "defDigest": "injected-digest",
+      "inputs": ["plan"],
+      "outputs": ["pr"],
+      "consumes": { "plan": { "text": "land it" } },
+      "owes": [
+        {
+          "path": "pr",
+          "version": 2,
+          "judgmentRejects": 1,
+          "schemaRejects": 0,
+          "reasons": [
+            { "at": 1700, "action": "reject", "kind": "judgment", "by": "reviewer", "text": "tests fail on CI" }
+          ],
+          "previousValue": { "pr": "https://example.test/pr/1", "notes": "keep me" }
+        }
+      ]
+    },
+    {
       "run": "run-build-8",
       "workflow": "build-instance",
       "step": "builder",

@@ -296,6 +296,23 @@ export interface OrderPacket {
     schemaRejects: number;
     reasons: ReasonEntry[];
     /**
+     * The value this path already holds, projected by a hub new enough to send
+     * it and ONLY on a re-offer whose reason thread is non-empty. Absent on a
+     * first offer, absent from an older hub, and absent when the refusal never
+     * committed a value.
+     *
+     * It is the REFUSED value only after a judgment or human reject, which
+     * follow a commit. A schema reject refuses the write, so after one this
+     * carries the last value that did commit, or nothing. Read `reasons` when
+     * the distinction matters; the engine's contract is on `Order.owes[]` in
+     * `src/types.ts`.
+     *
+     * Used on the COLD-REPLAY path only — see `renderReplayBrief`. A resumed
+     * session still holds its own prior submission, so sending it back there
+     * would spend tokens re-stating what the model already has.
+     */
+    previousValue?: unknown;
+    /**
      * The JSON Schema the engine will enforce on this output at commit time,
      * projected off the owning produce entry by a schema-aware hub. Absent
      * when the produce declares none (the common case — any JSON is accepted),

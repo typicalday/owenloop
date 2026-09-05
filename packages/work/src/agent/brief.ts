@@ -655,6 +655,62 @@ export function renderRejection(spec: RejectionSpec): RejectionDelta {
 }
 
 /**
+ * Render what the refused submission actually SAID, for the paths the cold
+ * replay is about to show reasons for.
+ *
+ * WHY ONLY THE COLD PATH NEEDS THIS. A resumed session still holds its own
+ * prior submission, so `renderRejection` alone is enough there. A cold replay
+ * has no session: `renderReplayBrief`'s own contract is that without the
+ * reasons "the fresh agent repeats the rejected submission verbatim" -- but a
+ * fresh agent given only reasons cannot repeat it either. It has to rebuild the
+ * whole value from the brief to change the one part that was called out, and
+ * the rebuild quietly loses everything the reader did not object to. Sending
+ * the value back is what makes "keep everything you already have that was not
+ * called out above", which the rejection body already says, a thing the agent
+ * is able to do.
+ *
+ * SCOPE. Only paths that both carry a `previousValue` and have fresh reasons in
+ * this delta -- a value shown next to no reason is material with no correction
+ * attached, and the agent cannot tell what to do with it.
+ *
+ * HONESTY. The heading does not call this "the rejected value". After a schema
+ * reject nothing was committed, so what the hub sends is the last value that
+ * did commit, which may be older than the refusal or absent entirely. The
+ * wording says what the engine can actually promise.
+ */
+function renderPreviousValues(spec: RejectionSpec): string {
+  const since = spec.deliveredReasonAt;
+  const wanted = spec.paths === undefined ? undefined : new Set(spec.paths);
+  const sections: string[] = [];
+
+  for (const owed of spec.packet.owes) {
+    if (wanted !== undefined && !wanted.has(owed.path)) continue;
+    if (owed.previousValue === undefined) continue;
+    const fresh = owed.reasons.filter((r) => since === undefined || r.at > since);
+    if (fresh.length === 0) continue;
+
+    let body: string;
+    try {
+      body = JSON.stringify(owed.previousValue, null, 2) ?? String(owed.previousValue);
+    } catch {
+      // A value that arrived as JSON cannot cycle, but a projecting layer is
+      // free to hand us anything. Dropping the section beats failing the replay.
+      continue;
+    }
+    sections.push(`The value \`${owed.path}\` currently holds:\n\n\`\`\`json\n${body}\n\`\`\``);
+  }
+
+  if (sections.length === 0) return '';
+  return [
+    'What is already on the owed paths, so you can revise it rather than rebuild it:',
+    ...sections,
+    'This is what the path holds now, which is the value that was refused when the'
+      + ' refusal came from a reader. When it came from the schema check the value was'
+      + ' never committed, so what you see is the last one that was.',
+  ].join('\n\n');
+}
+
+/**
  * Assemble a COLD-REPLAY brief: the ordinary rendered brief plus the same
  * rejection body as a trailing section.
  *
@@ -680,16 +736,29 @@ export function renderReplayBrief(brief: string, spec: RejectionSpec): string {
   const full = renderRejection(spec);
   if (full.message === '') return brief;
 
-  const join = (body: string, dropped: number): string => {
+  const join = (body: string, dropped: number, values: string): string => {
     const note =
       dropped > 0
         ? `\n\n(${dropped} older rejection reason${dropped === 1 ? '' : 's'} omitted to fit the context budget.)`
         : '';
-    return `${brief}\n\n---\n\n${body}${note}`;
+    const prior = values === '' ? '' : `${values}\n\n---\n\n`;
+    return `${brief}\n\n---\n\n${prior}${body}${note}`;
   };
 
-  let assembled = join(full.message, 0);
+  const values = renderPreviousValues(spec);
+
+  let assembled = join(full.message, 0, values);
   if (estimateTokens(assembled) <= REPLAY_TOKEN_BUDGET) return assembled;
+
+  // First thing over budget: the previous values, whole. They are MATERIAL,
+  // and the reasons are the INSTRUCTION -- an agent holding the corrections
+  // can still rebuild the value, while one holding the value and no correction
+  // cannot know what to change. Same ordering principle as the brief itself,
+  // which is never trimmed: keep whatever the agent cannot work without.
+  if (values !== '') {
+    assembled = join(full.message, 0, '');
+    if (estimateTokens(assembled) <= REPLAY_TOKEN_BUDGET) return assembled;
+  }
 
   // Over budget: re-render with progressively fewer reasons, oldest dropped
   // first. `ordered` is every candidate entry in ascending `at`, so slicing off
@@ -714,7 +783,7 @@ export function renderReplayBrief(brief: string, spec: RejectionSpec): string {
       ...(since !== undefined ? { deliveredReasonAt: since } : {}),
     });
     if (trimmed.message === '') break;
-    assembled = join(trimmed.message, drop);
+    assembled = join(trimmed.message, drop, '');
     if (estimateTokens(assembled) <= REPLAY_TOKEN_BUDGET) return assembled;
   }
 

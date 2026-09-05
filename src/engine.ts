@@ -2513,6 +2513,7 @@ export class Engine {
     const owes = f.outputs.map((p) => {
       const a = arts.get(p);
       const declared = owedSchema(step, p);
+      const reasons = a?.reasons ?? [];
       return {
         path: p,
         ...(declared !== undefined
@@ -2536,7 +2537,18 @@ export class Engine {
         version: (a?.version ?? 0) + 1,
         judgmentRejects: a?.judgmentRejects ?? 0,
         schemaRejects: a?.schemaRejects ?? 0,
-        reasons: a?.reasons ?? [],
+        reasons,
+        // The value the path already holds, but ONLY on a re-offer that
+        // follows a refusal. With an empty reason thread there is no feedback
+        // for a previous value to be feedback ON, so projecting it would put
+        // an artifact-sized payload on every ordinary first offer and buy
+        // nothing. `undefined` is "no value" here, the same reading `consumes`
+        // above gives it. See the field's contract in `types.ts` -- in
+        // particular that this is the REFUSED value only after a judgment or
+        // human reject, since a schema reject never committed one.
+        ...(reasons.length > 0 && a?.value !== undefined
+          ? { previousValue: a.value }
+          : {}),
       };
     });
     const order: Order = {
