@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.30](https://github.com/typicalday/owenloop/compare/v0.5.29...v0.5.30) (2026-09-05)
+
+
+### Features
+
+* **engine:** send a refused path's previous value back with the re-offer ([#312](https://github.com/typicalday/owenloop/issues/312)) ([d697b6e](https://github.com/typicalday/owenloop/commit/d697b6ebb08538fa3a79f9eee0bd648fa13620a5))
+
 ## [0.5.29](https://github.com/typicalday/owenloop/compare/v0.5.28...v0.5.29) (2026-09-05)
 
 
