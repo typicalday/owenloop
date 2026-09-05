@@ -441,13 +441,23 @@ test('Shift verified Codex selection refuses maxTurns before provider startup an
 
   try {
     await dispatchOne(daemon);
+    // Two releases reach the hub for this one claim, and both are deliberate:
+    // the policy refusal hands the claim back, and the shift supervisor
+    // independently releases on the child's non-zero exit as its safety net for
+    // a worker that dies without releasing itself. Waiting for *any* release and
+    // then asserting the total is still one asserts the transient window between
+    // them, so the test failed whenever the supervisor won the race. Select the
+    // refusal by its reason instead: the order is claimable once, so exactly one
+    // policy release exists and that count is stable at every later moment.
+    const isPolicyRelease = (request: { verb: string; body?: Record<string, unknown> }): boolean =>
+      request.verb === 'release' && request.body?.reason === 'incompatible-harness-policy';
     await until(
-      () => reqs.some((request) => request.verb === 'release'),
+      () => reqs.some(isPolicyRelease),
       'the incompatible Codex policy to release the claim',
     );
     assert.equal(existsSync(claude.marker), false, 'cached claude-code metadata must not start Claude');
     assert.equal(existsSync(codex.marker), false, 'Codex preflight must refuse maxTurns before app-server startup');
-    assert.equal(reqs.filter((request) => request.verb === 'release').length, 1);
+    assert.equal(reqs.filter(isPolicyRelease).length, 1, 'the refusal releases the claim once, not in a retry loop');
   } finally {
     server.close();
     stopDaemonAndChildren(daemon);
