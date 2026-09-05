@@ -35,6 +35,7 @@ import { type Roster, validateRoster } from '../agent/capability-model.ts';
  *     and `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`, above the 14-day default.
  *   - `commandRouting` — who runs `executor: 'command'` steps this machine sees.
  *   - `execReserve`    — slots within dispatch cap reserved from agent work.
+ *   - `diskFloorBytes` — free bytes required before starting new work.
  *   - `defPolicy`      — local publication trust policy (`warn` by default).
  */
 export interface Settings {
@@ -96,6 +97,16 @@ export interface Settings {
    * `--exec-reserve`; default 1.
    */
   execReserve?: number;
+  /**
+   * Free bytes the shift insists on, on the volume holding `workRoot`, before
+   * it will START another order. A full disk kills children mid-step with a
+   * bare ENOSPC, so the shift declines new work rather than feeding orders to a
+   * disk that cannot hold them; it keeps polling and resumes by itself when
+   * space returns. `0` disables the check. Fallback below `--disk-floor`;
+   * default 1 GiB. This is a floor for STARTING work, not a promise that any
+   * particular step will fit.
+   */
+  diskFloorBytes?: number;
   /**
    * How long a shift may retain an undispatchable claim locally before
    * returning it to the hub. Default 0: never retain it locally.
@@ -170,6 +181,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'artifactPolicy',
   'maxConcurrentAgents',
   'execReserve',
+  'diskFloorBytes',
   'localQueueHoldMs',
   'workRoot',
   'workRepo',
@@ -280,6 +292,12 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     const v = obj['execReserve'];
     if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
       throw bad('execReserve', 'a non-negative integer', v);
+    }
+  }
+  if ('diskFloorBytes' in obj) {
+    const v = obj['diskFloorBytes'];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw bad('diskFloorBytes', 'a non-negative integer', v);
     }
   }
   if ('localQueueHoldMs' in obj) {

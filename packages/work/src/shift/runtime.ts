@@ -17,6 +17,7 @@ import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { computeServeCapabilities } from '../settings/serving.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
+import { checkDiskFloor, resolveDiskFloorBytes } from './disk-floor.ts';
 import { createLockedRemovalCallbacks, createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createShiftLogSink } from './logsink.ts';
@@ -105,6 +106,7 @@ const FILE_ONLY_EVENTS: ReadonlySet<ShiftEventBody['type']> = new Set([
   'capacity',
   'hub-error',
   'event-queue-overflow',
+  'low-disk',
 ]);
 
 /**
@@ -175,6 +177,8 @@ export interface ParsedArgs {
   once?: boolean;
   maxAgents?: number;
   execReserve?: number;
+  /** `--disk-floor <bytes>` — free space required to start new work. `0` disables. */
+  diskFloorBytes?: number;
   localQueueHoldMs?: number;
   cacheDir?: string;
   stateDir?: string;
@@ -224,6 +228,7 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--cap':
       case '--max-agents':
       case '--exec-reserve':
+      case '--disk-floor':
       case '--local-queue-hold':
       case '--workflow':
       case '--poll-interval':
@@ -262,6 +267,10 @@ export function parseArgs(args: string[]): ParsedArgs {
 	  const n = intFlag(r.value, '--exec-reserve');
 	  if (typeof n !== 'number') return { error: n.error };
 	  parsed.execReserve = n;
+        } else if (name === '--disk-floor') {
+          const n = intFlag(r.value, '--disk-floor');
+          if (typeof n !== 'number') return { error: n.error };
+          parsed.diskFloorBytes = n;
 		} else if (name === '--local-queue-hold') {
 	  const n = intFlag(r.value, '--local-queue-hold');
 	  if (typeof n !== 'number') return { error: n.error };
@@ -480,6 +489,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const maxConcurrentAgents = resolveMaxConcurrentAgents(parsed.maxAgents, settings.maxConcurrentAgents);
   const execReserve = resolveExecReserve(parsed.execReserve, settings.execReserve);
   const localQueueHoldMs = resolveLocalQueueHoldMs(parsed.localQueueHoldMs, settings.localQueueHoldMs);
+  const diskFloorBytes = resolveDiskFloorBytes(parsed.diskFloorBytes, settings.diskFloorBytes);
   const workRoot = resolveWorkRoot(env, settings.workRoot, cacheDir);
   const workRepo = resolveWorkRepo(env, settings.workRepo);
   /**
@@ -678,6 +688,13 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     execReserve,
     localQueueHoldMs,
     workRoot,
+    /*
+     * Resolved here, not in the loop: `runtime.ts` owns flag/settings/default
+     * precedence for every other tunable, and the loop consumes a decision. A
+     * loop built without this closure has no disk gate at all, which is the
+     * right default for a caller that never told it where work lands.
+     */
+    diskSpace: () => checkDiskFloor(workRoot, diskFloorBytes),
     ...(workRepo !== undefined ? { workRepo } : {}),
     shiftId,
     startedAt,

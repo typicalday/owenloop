@@ -124,6 +124,31 @@ export interface CapacityEvent {
   cap: number;
 }
 
+/**
+ * The shift declined to start new work because the volume holding its work root
+ * is nearly full.
+ *
+ * EDGE-TRIGGERED, like `CapacityEvent`: one record per low-disk EPISODE, not one
+ * per tick. A shift that sits on a full disk for an hour writes this once, and
+ * the recovery is legible from the timestamp of whatever it dispatches next.
+ *
+ * FILE-ONLY, for the same reason as `CapacityEvent` and `ParkedEvent`: a parked
+ * `shift next` must not be woken by news that nothing happened. In the file it
+ * is the only thing separating "this shift had no work" from "this shift had
+ * work and could not safely take it".
+ *
+ * `freeBytes` and `floorBytes` are both carried so the record is self-contained.
+ * A reader must be able to tell an operator who set an unreachable floor from a
+ * genuinely full disk without knowing what the shift was configured with.
+ */
+export interface LowDiskEvent {
+  type: 'low-disk';
+  /** The measured directory: the work root, or its nearest existing ancestor. */
+  path: string;
+  freeBytes: number;
+  floorBytes: number;
+}
+
 /** A hub call failed. `workflow` is present for per-workflow whats_next and release calls. */
 export interface HubErrorEvent {
   type: 'hub-error';
@@ -228,7 +253,8 @@ export type ShiftEventBody =
   | BundleMissEvent
   | OrderDroppedEvent
   | EventQueueOverflowEvent
-  | WedgedEvent;
+  | WedgedEvent
+  | LowDiskEvent;
 
 /**
  * The identity every event carries, added once on a shared envelope rather than

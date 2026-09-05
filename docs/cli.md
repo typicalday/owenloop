@@ -305,6 +305,7 @@ holds `credentials.json`, `allowed_signers`, `org-root.pub`, `grants/`, and
 ```text
 owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
 [--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--local-queue-hold <ms>] [--poll-interval <ms>] [--once]
+[--disk-floor <bytes>]
 [--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
 [--work-root <dir>]...
 ```
@@ -323,6 +324,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--cap <n>` | dispatch capacity; precedence is flag, then `settings.dispatchCap`, then `3` |
 | `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
 | `--exec-reserve <n>` | slots inside `--cap` that `agent-run` children may never occupy, so an exec/command order always has room; precedence is flag, then `settings.execReserve`, then `1`. Clamped to `cap - 1`, so a `--cap 1` shift gets no reserve. `0` disables the reserve and lets agents fill the whole cap. This does not raise the total child ceiling — `--cap` still bounds every child. |
+| `--disk-floor <bytes>` | free space the shift requires on the volume holding its work root before it will START another order; precedence is flag, then `settings.diskFloorBytes`, then `1073741824` (1 GiB). A shift below the floor keeps polling and declines new work, writing one `low-disk` record per episode, and resumes by itself when space returns; children already running are left alone. `0` disables the check. This is a floor for starting work, not a promise that a particular step will fit. |
 | `--local-queue-hold <ms>` | how long to retain a claim this shift cannot dispatch before returning it to the hub; precedence is flag, then `settings.localQueueHoldMs`, then `0`. The value is clamped to 90 seconds. `0` means the shift never holds an undispatchable claim locally, so another daemon can be offered it immediately. |
 | `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
 | `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
@@ -590,14 +592,14 @@ either `exec` or `agent-run`:
 - `wedged`: `{ "type": "wedged", "faults": [{ "kind": "missing", "role": "temp-dir", "path": "...", "message": "..." }], "streak": 3 }` — the shift stopped because the MACHINE it runs on is broken, and the process exits non-zero straight after. `faults` is never empty; display each `message`, which names the path and the operator fix. `streak` is how many consecutive hub calls failed before the check ran, and is `0` for the check a shift makes at start. A shift that cannot reach the hub does NOT produce this — a hub outage or a rate-limit ban recovers on its own, and the shift keeps polling through it. This record means a human must change something on the host.
 
 Every event above is also appended to `<log-dir>/shift.log` as JSON Lines, which
-is how they survive the daemon. **Four further record types exist in
+is how they survive the daemon. **Five further record types exist in
 `shift.log` and are never delivered over the socket** — `parked`, `capacity`,
-`hub-error`, and `event-queue-overflow`.
+`hub-error`, `event-queue-overflow`, and `low-disk`.
 
 An idle `shift next` must block until there is work to report, and each of those
-four would satisfy it with news that no work moved: a startup record, a report
-that the shift is full, a failed call to the hub, or a record about the socket
-queue itself. `parked` and `capacity` are also redundant on the wire — the
+five would satisfy it with news that no work moved: a startup record, a report
+that the shift is full, a failed call to the hub, a record about the socket
+queue itself, or a report that the disk is too full to start anything. `parked` and `capacity` are also redundant on the wire — the
 response above already carries live `cap`, `free`, and `running`, which is
 exactly what a `capacity` record restates. `hub-error` is level-triggered at the
 poll interval, so an unreachable hub would otherwise fill the 1000-slot socket
