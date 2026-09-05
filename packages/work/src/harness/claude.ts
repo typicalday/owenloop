@@ -630,6 +630,28 @@ function effectiveClaudeTools(permissions: StepPermissions): readonly string[] |
   return undefined;
 }
 
+/**
+ * Whether this step is left with no way to write anything.
+ *
+ * This adapter has no path sandbox: `filesystem: 'read-only'` is enforced by
+ * NARROWING THE TOOL SET, so the honest test is whether a write-capable tool
+ * survives. `preflight` already refuses `read-only` alongside an authored
+ * non-read-only tool, but this recomputes the condition rather than trusting
+ * that it ran -- a brief that states containment must not rest on a check
+ * happening somewhere else.
+ */
+function deniesAllWrites(permissions: StepPermissions): boolean {
+  if (permissions.filesystem !== 'read-only') return false;
+  const effective = effectiveClaudeTools(permissions);
+  // The `undefined` arm is a type guard, not a case: `read-only` always resolves
+  // to a concrete set. It is spelled out so the write-capability test below is
+  // the only thing deciding the answer.
+  return (
+    effective !== undefined &&
+    effective.every((tool) => READ_ONLY_TOOLS.has(tool) || OWENLOOP_CONTROL_TOOLS.has(tool))
+  );
+}
+
 function strictWorkdirToolIssue(permissions: StepPermissions): PermissionIssue | undefined {
   const effective = effectiveClaudeTools(permissions);
   if (effective === undefined) {
@@ -1860,6 +1882,7 @@ export const claudeAdapter: HarnessAdapter = {
   deliver: deliverClaude,
   stop,
   lintStep,
+  deniesAllWrites,
   resumeCommand,
 };
 

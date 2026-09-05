@@ -1770,3 +1770,46 @@ test('lintStep never throws — a malformed bag produces findings, not an except
     assert.doesNotThrow(() => lintOf(bag as Record<string, unknown>));
   }
 });
+
+// ---- containment: does this step have anywhere to write? --------------------
+
+/**
+ * Presence-asserting, not convenience. Reaching the member through `?.` would
+ * let every assertion below pass with the member DELETED, which is exactly how
+ * a sibling suite's first draft managed to be vacuous.
+ */
+const deniesAllWrites = (bag: Record<string, unknown>): boolean => {
+  assert.equal(
+    typeof claudeAdapter.deniesAllWrites,
+    'function',
+    'the claude adapter must implement deniesAllWrites',
+  );
+  return claudeAdapter.deniesAllWrites!(normalizeStepPermissions(bag));
+};
+
+test('a read-only step is shut out, because read-only leaves it no write-capable tool', () => {
+  // This adapter has no path sandbox. `read-only` is enforced by NARROWING THE
+  // TOOL SET, so "nowhere to write" here means "nothing left that can write".
+  assert.equal(deniesAllWrites({ filesystem: 'read-only' }), true);
+  assert.equal(deniesAllWrites({ filesystem: 'read-only', network: 'owenloop-only' }), true);
+});
+
+test('a step that keeps a write-capable tool is not shut out', () => {
+  assert.equal(deniesAllWrites({}), false, 'an empty bag keeps the SDK defaults');
+  assert.equal(deniesAllWrites({ filesystem: 'unrestricted' }), false);
+  assert.equal(deniesAllWrites({ tools: ['Read', 'Write'] }), false);
+});
+
+test('an authored writer alongside read-only is not reported as containment', () => {
+  // `preflight` refuses this bag, and a refused bag is one the adapter cannot
+  // reason about. Answering `true` would assert a containment it never
+  // established, so the honest answer is the same silence a refusal gets.
+  const bag = { filesystem: 'read-only', tools: ['Read', 'Write'] };
+  assert.ok(
+    claudeAdapter
+      .preflight(normalizeStepPermissions(bag))
+      .some((issue) => issue.message.includes("filesystem 'read-only' cannot allow non-read-only tool")),
+    'the premise of this test: preflight really does refuse this bag',
+  );
+  assert.equal(deniesAllWrites(bag), false);
+});

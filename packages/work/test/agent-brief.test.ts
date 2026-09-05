@@ -412,3 +412,62 @@ test('a `false` schema is stated rather than suppressed', () => {
   assert.match(out, /The value you submit to `pr` must satisfy this JSON Schema/);
   assert.match(out, /```json\nfalse\n```/);
 });
+
+/**
+ * THE WORKSPACE LINE. Three states, and the difference between two of them is
+ * the whole point of the block, so each is pinned separately.
+ *
+ * The measured failure this closes: read-only steps discovering their own
+ * containment one `EPERM` at a time and then filing the checks they could not
+ * run as failures OF THE SUBJECT they were reviewing. "Not executed" and
+ * "failed" are different findings; the brief now says which one applies before
+ * the agent has to guess.
+ */
+
+test('renderBrief warns a step that its sandbox grants it nowhere to write', () => {
+  const out = renderBrief('body', spec({ deniesAllWrites: true }));
+  assert.match(out, /Workspace: this step's sandbox grants it no writable location/);
+  // All three of the locations a step would otherwise assume, named explicitly.
+  // The measured failure was an agent trying each of them in turn.
+  assert.match(out, /not your working directory/);
+  assert.match(out, /not the system temp directory/);
+  assert.match(out, /not \/tmp/);
+  // Creating a temporary directory is the specific operation behind 87 EPERM
+  // refusals on a live fleet, so it is called out by name.
+  assert.match(out, /creating a temporary directory fails/);
+});
+
+test('the nowhere-to-write line tells the agent how to REPORT an unrunnable check', () => {
+  // This is the half that changes the artifact. Without it, a step that cannot
+  // run a check files the unrun check as a failure of the subject it is judging.
+  const out = renderBrief('body', spec({ deniesAllWrites: true }));
+  assert.match(out, /NOT EXECUTED/);
+  assert.match(out, /Do NOT report it as a failure of the thing you are examining/);
+  assert.match(out, /missing evidence, not adverse evidence/);
+});
+
+test('the nowhere-to-write line does not overstate a refusal a person can override', () => {
+  // A human can approve one specific write mid-turn, so an unconditional "every
+  // write fails" would be false and would steer an agent away from that path.
+  const out = renderBrief('body', spec({ deniesAllWrites: true }));
+  assert.match(out, /unless a person separately approves that one action/);
+  assert.doesNotMatch(out, /Every write fails/);
+});
+
+test('renderBrief says nothing about the workspace unless the step is shut out', () => {
+  // Absent and `false` are both silence. Neither is a claim that the step MAY
+  // write: this brief makes no positive containment claim at all, because no
+  // such claim would stay true across a vendor's configuration layers.
+  assert.equal(renderBrief('body', spec()), 'body');
+  assert.equal(renderBrief('body', spec({ deniesAllWrites: false })), 'body');
+});
+
+test('the workspace line follows the routing line and precedes the order body', () => {
+  const out = renderBrief('body', spec({ deniesAllWrites: true, modifier: 'deep' }));
+  const routing = out.indexOf('Routing: this run');
+  const workspace = out.indexOf('Workspace: this step');
+  const body = out.indexOf('body');
+  assert.ok(routing >= 0 && workspace >= 0 && body >= 0, 'all three blocks render');
+  assert.ok(routing < workspace, 'routing precedes workspace');
+  assert.ok(workspace < body, 'containment is stated before the work is described');
+});

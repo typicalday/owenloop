@@ -1813,3 +1813,68 @@ test('D4 isResumeMiss ignores non-JsonRpc errors and wrong codes', () => {
   assert.equal(isResumeMiss(new JsonRpcError(-32600, 'no rollout found for thread id x')), true);
   assert.equal(isResumeMiss(undefined), false);
 });
+
+// ---------------------------------------------------------------------------
+// workspaceWritableRoots — the adapter's answer to "what may this step write?"
+//
+// The brief renders this list verbatim and must never learn a sandbox mode
+// name, so every distinction the agent needs has to survive the reduction to
+// paths. These pin that it does, in both directions: a read-only step gets an
+// EMPTY list (which the brief states loudly), and a refused or unbounded
+// permissions bag gets `undefined` (which the brief states not at all).
+// ---------------------------------------------------------------------------
+
+// A helper, not a convenience: calling the member through `?.` would let every
+// assertion below pass with the member DELETED, which is exactly how the first
+// draft of these tests was vacuous. This asserts presence on every call.
+const deniesAllWrites = (bag: Record<string, unknown>): boolean => {
+  assert.equal(
+    typeof codexAdapter.deniesAllWrites,
+    'function',
+    'the codex adapter must implement deniesAllWrites',
+  );
+  return codexAdapter.deniesAllWrites!(normalizeStepPermissions(bag));
+};
+
+test('deniesAllWrites is true for a read-only step, which grants no writable root', () => {
+  assert.equal(deniesAllWrites({ sandbox: 'read-only' }), true);
+});
+
+test('deniesAllWrites is false wherever the sandbox grants at least one root', () => {
+  // The adapter deliberately makes no positive claim about WHICH roots these
+  // are -- the vendor composes that set from configuration layers this process
+  // cannot see, and it already names them to the model itself.
+  assert.equal(deniesAllWrites({}), false, 'default sandbox grants a root');
+  assert.equal(deniesAllWrites({ sandbox: 'workspace-write' }), false);
+  assert.equal(deniesAllWrites({ sandbox: 'danger-full-access' }), false);
+  assert.equal(deniesAllWrites({ filesystem: 'unrestricted' }), false);
+});
+
+test('deniesAllWrites is false for a bag this adapter refuses to resolve', () => {
+  // A refused bag is one the adapter cannot reason about. Answering `true` would
+  // assert containment it never established, so the answer is silence.
+  assert.equal(deniesAllWrites({ filesystem: 'read-only' }), false);
+  assert.equal(deniesAllWrites({ sandbox: 'nonsense-mode' }), false);
+});
+
+test('deniesAllWrites ignores authored workspace-write configuration entirely', () => {
+  // Regression guard for the removed root-listing half. Whatever a step authors
+  // here changes WHICH roots exist, never WHETHER any exists, so it must not
+  // move this answer in either direction.
+  const authored = {
+    sandbox: 'workspace-write',
+    codexConfig: {
+      sandbox_workspace_write: {
+        exclude_tmpdir_env_var: true,
+        exclude_slash_tmp: true,
+        writable_roots: ['/operator/root'],
+      },
+    },
+  };
+  assert.equal(deniesAllWrites(authored), false);
+  assert.equal(
+    deniesAllWrites({ ...authored, sandbox: 'read-only' }),
+    true,
+    'read-only stays shut out regardless of workspace-write configuration',
+  );
+});
