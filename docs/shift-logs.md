@@ -216,15 +216,16 @@ Two properties an uploader can rely on:
 | `bundle-miss` | `workflow`, `def` | a legacy order named a def with no cached bundle |
 | `order-dropped` | `workflow`, `run`, `step`, `reason`, `message` | the shift refused one order; capacity and expiry reasons return the claim to the hub while malformed and unsupported reasons leave it for pickup |
 | `event-queue-overflow` | `dropped` | the socket FIFO evicted events; see below |
+| `low-disk` | `path`, `freeBytes`, `floorBytes` | the volume holding the work root is below the floor, so the shift declined to start new work. It keeps polling and resumes by itself when space returns; children already running are left alone. **Edge-triggered** (one record per low-disk episode) and **file-only** — see below |
 | `ended` | — | an operator ran `owenloop shift end` |
 | `wedged` | `faults[]` (`kind`, `role`, `path`, `message`), `streak` | the shift stopped because the **machine** it runs on is broken, and the process exited non-zero — see below |
 | `gate` | optional `workflow`, `run`, `name`, `question` | reserved; not emitted today |
 
 `kind` is `'exec' | 'agent-run'`.
 
-**Four of these are file-only.** `parked`, `capacity`, `hub-error`, and
-`event-queue-overflow` are written to `shift.log` and are never delivered over
-the daemon's Unix socket to `owenloop shift next`. Every other type goes to
+**Five of these are file-only.** `parked`, `capacity`, `hub-error`,
+`event-queue-overflow`, and `low-disk` are written to `shift.log` and are never
+delivered over the daemon's Unix socket to `owenloop shift next`. Every other type goes to
 both. The routing rule is `FILE_ONLY_EVENTS` in
 `packages/work/src/shift/runtime.ts`, applied at the one point where an event
 fans out to its two sinks.
@@ -277,12 +278,35 @@ queue that just overflowed would evict another event, overflow again, and
 recurse under exactly the load that produced it. It is handed straight to the
 log sink and never enters the fan-out at all.
 
+`low-disk` is the shift reporting that it *could* have taken work and chose not
+to, because the volume holding its work root is below the configured floor. A
+shift's children are the heaviest writers on the machine — a clone, a dependency
+install, a build tree, a transcript per agent turn — and a full disk kills them
+mid-step with a bare non-zero exit that names nothing, which the shift then
+re-offers onto the same full disk. Declining is the safe move because a full
+disk **self-heals**: a file is deleted, a cache is pruned, another process
+finishes, and the shift starts dispatching again on its own without an operator
+restarting anything. Work already in flight is deliberately left running, since
+killing a nearly-finished child frees little and destroys everything it had
+done.
+
+It is **edge-triggered**, like `capacity`: one record per low-disk episode, not
+one per tick, so an hour spent on a full disk costs one line rather than 720.
+Both `freeBytes` and `floorBytes` are carried so the record stands alone — a
+reader can tell an operator who set an unreachable floor from a genuinely full
+disk without knowing how the shift was configured. It is file-only for the
+`parked`/`capacity` reason: a parked `shift next` must not be woken by news that
+nothing happened. The floor is `--disk-floor <bytes>`, then
+`settings.diskFloorBytes`, then 1 GiB; `0` switches the check off, and a disk
+that cannot be measured at all is treated as permission to dispatch rather than
+as a refusal.
+
 Nothing is lost, because the file is the consumer with no envelope and no
 context. `shift.log` has no per-response `cap`/`free`/`running`, so without
-these four records a reader cannot tell an **idle** shift (no orders offered)
+these five records a reader cannot tell an **idle** shift (no orders offered)
 from a **saturated** one (orders offered, no slots) from a **stranded** one (hub
-unreachable, so nothing was ever offered), nor tell a quiet log from a lossy
-one.
+unreachable, so nothing was ever offered) from one **refusing work on a full
+disk**, nor tell a quiet log from a lossy one.
 
 `order-dropped.reason` is the stable machine discriminator and is one of
 `malformed-digest`, `malformed-worker`, `unsupported-worker`,
@@ -730,4 +754,5 @@ friends) carry their built-in default into that listing.
 | line-size bounding | `packages/work/src/shift/truncate.ts` |
 | worker stdio wiring | `packages/work/src/shift/spawn.ts` |
 | where the emitters are wired together | `packages/work/src/shift/runtime.ts` |
+| free-space measurement and the floor | `packages/work/src/shift/disk-floor.ts` |
 | the socket FIFO and its overflow | `packages/work/src/shift/server.ts` |

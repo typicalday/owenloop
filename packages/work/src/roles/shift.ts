@@ -53,7 +53,7 @@ function parseStartArgs(args: string[]): StartArgs {
   const parsed: StartArgs = { crews: [] };
   const valueFlags = new Set([
     '--origin', '--as', '--name', '--cap', '--max-agents', '--exec-reserve', '--local-queue-hold', '--poll-interval',
-    '--cache-dir', '--state-dir', '--log-dir', '--log-max-age', '--work-root',
+    '--cache-dir', '--state-dir', '--log-dir', '--log-max-age', '--work-root', '--disk-floor',
   ]);
   for (let i = 0; i < args.length; i++) {
     const raw = args[i]!;
@@ -98,6 +98,10 @@ function parseStartArgs(args: string[]): StartArgs {
 	const n = intValue(value, '--local-queue-hold');
 	if (typeof n !== 'number') return { crews: parsed.crews, error: n };
 	parsed.localQueueHoldMs = n;
+      } else if (name === '--disk-floor') {
+        const n = intValue(value, '--disk-floor');
+        if (typeof n !== 'number') return { crews: parsed.crews, error: n };
+        parsed.diskFloorBytes = n;
       } else if (name === '--poll-interval') {
         const n = intValue(value, '--poll-interval');
         if (typeof n !== 'number') return { crews: parsed.crews, error: n };

@@ -86,6 +86,7 @@ import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../
 import { withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import { checkHost, type HostFault } from './host-preflight.ts';
+import { formatBytes, type DiskSpace } from './disk-floor.ts';
 import type { Spawner, WorkerFailure } from './spawn.ts';
 import {
   stampShiftEvent,
@@ -200,6 +201,14 @@ export interface ShiftLoopOptions {
    * fault", never "healthy" — see `host-preflight.ts`.
    */
   hostPreflight?: () => HostFault[];
+  /**
+   * Is there room on this disk to start another order? Injected in tests so a
+   * full volume can be presented without filling one. Defaults to a real
+   * `statfs` of `workRoot` (or its nearest existing ancestor) against the
+   * resolved floor. `unknown` means "could not measure, or switched off" and is
+   * treated as permission to dispatch — see `disk-floor.ts`.
+   */
+  diskSpace?: () => DiskSpace;
 }
 
 export interface LockedRemovalOptions {
@@ -690,6 +699,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * deliberately NOT edge-triggered.
    */
   let atCapReported = false;
+  /**
+   * EDGE flag for the low-disk refusal, paired with `atCapReported` because the
+   * two gates have the same shape: a condition that persists across many ticks
+   * but is worth exactly one record per episode. Cleared the moment the disk
+   * measures healthy again, so a machine that fills and drains twice writes two
+   * records rather than one.
+   */
+  let lowDiskReported = false;
   /** Earliest server-approved time for the next polling iteration. */
   let backoffUntil = Number.NEGATIVE_INFINITY;
   /**
@@ -813,6 +830,19 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * host is broken" is not evidence that it is, and killing a working shift over
    * an unreadable `stat` would be a worse failure than the one being detected.
    */
+  /**
+   * Free space for the volume the shift's children will write into.
+   *
+   * Defaults to `unknown` — never a refusal — when no probe was injected and no
+   * work root was resolved: the floor and the work root are both RUNTIME
+   * configuration, and a loop constructed without them has no basis to decline
+   * anything. `runtime.ts` supplies the real closure.
+   */
+  function diskSpace(): DiskSpace {
+    if (opts.diskSpace !== undefined) return opts.diskSpace();
+    return { state: 'unknown', path: opts.workRoot ?? '' };
+  }
+
   function runHostPreflight(streak: number): boolean {
     let faults: HostFault[];
     try {
@@ -1892,7 +1922,40 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // can actually make the targeted decision.
     const capacityCooldownDue = capacityCooldownDueAt !== undefined && monotonicNow() >= capacityCooldownDueAt;
     const capacityBecameReady = capacityCooldownReady(k, agentRoom);
-    if (wakeSucceeded && (changed || sweepOwed || brakeDue || capacityCooldownDue || capacityBecameReady) && k > 0) {
+    const wantSweep =
+      wakeSucceeded && (changed || sweepOwed || brakeDue || capacityCooldownDue || capacityBecameReady) && k > 0;
+    /*
+     * Measured ONLY when a sweep would otherwise happen, so a parked or
+     * saturated shift pays no syscall for a question it is not about to act on.
+     * That placement is also what makes recovery automatic: refusing sets
+     * `sweepOwed`, `sweepOwed` makes the next tick want to sweep, and wanting to
+     * sweep re-measures the disk. No timer and no separate recovery path.
+     */
+    const disk = wantSweep ? diskSpace() : undefined;
+    if (wantSweep && disk?.state === 'low') {
+      /*
+       * REFUSE NEW WORK, DO NOT STOP. Unlike the vanished temp directory that
+       * `runHostPreflight` exits for, a full disk clears on its own, so the
+       * shift stays up and keeps polling. In-flight children are deliberately
+       * left running: killing one frees little and destroys all of its work.
+       */
+      sweepOwed = true;
+      opts.out(
+        `low disk: ${formatBytes(disk.freeBytes)} free at ${disk.path}, below the ${formatBytes(disk.floorBytes)} floor — ` +
+          `deferring whats_next until space is free`,
+      );
+      // EDGE-TRIGGERED, exactly as the at-capacity record below: one per
+      // low-disk EPISODE. The console line above stays level-triggered because
+      // a live tail is watched by someone who wants to see it is still stuck.
+      if (!lowDiskReported) {
+        lowDiskReported = true;
+        emit({ type: 'low-disk', path: disk.path, freeBytes: disk.freeBytes, floorBytes: disk.floorBytes });
+      }
+    } else if (wantSweep) {
+      if (lowDiskReported) {
+        lowDiskReported = false;
+        opts.out('disk space recovered — resuming dispatch');
+      }
       // Clear before awaiting: a new brake armed during sweep must survive.
       if (brakeDue) brakeSweepDueAt = undefined;
       swept = await sweep(k, live, reserved);
