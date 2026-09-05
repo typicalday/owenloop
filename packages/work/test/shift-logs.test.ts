@@ -681,7 +681,7 @@ test('sweepShiftLogs reports an unreadable directory and returns empty', () => {
 const ALL_EVENT_TYPES = [
   'parked', 'capacity', 'event-queue-overflow',
   'dispatched', 'reaped', 'failed', 'gate', 'ended',
-  'hub-error', 'bundle-miss', 'order-dropped',
+  'hub-error', 'bundle-miss', 'order-dropped', 'wedged',
 ] as const;
 
 /** Fails to compile if the list above names a type that is not a variant. */
