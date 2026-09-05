@@ -17,7 +17,7 @@ import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { ArtifactData, WorkflowDef } from '../src/types.ts';
-import { buildDef, hashDef, validateDef } from '../src/defs.ts';
+import { DefError, buildDef, hashDef, validateDef } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
 
 // ---- fixture def ---------------------------------------------------------------
@@ -951,4 +951,141 @@ test('judges: (k) a judge with inputs:true cannot reject a stem it only consumes
   const reportRejected = getArt(store, wf, 'report');
   assert.equal(reportRejected?.acceptance, 'rejected');
   assert.equal(reportRejected?.judgmentRejects, 1);
+});
+
+// ---- F29: a judge inherits the producer's working directory ---------------------
+//
+// `synthesizeJudgeSteps`'s docstring has always claimed "everything else ... is
+// inherited exactly like an ordinary step". `workdir`/`workdirFrom` were the
+// exception, so every judge ran in the throwaway per-run directory and could not
+// open the tree it was judging. These tests assert the built StepDef, not prose,
+// because the failure mode they guard is silent: a workdir-blind judge still
+// runs, still renders a verdict, and still greens.
+
+type JudgeWorkdirOpts = {
+  name?: string;
+  producerWorkdir?: string;
+  producerWorkdirFrom?: string;
+  judgeWorkdir?: string;
+  judgeWorkdirFrom?: string;
+  judgeInputs?: boolean;
+};
+
+function workdirDef(opts: JudgeWorkdirOpts = {}): WorkflowDef {
+  return buildDef({
+    name: opts.name ?? 'workdirJudgeDef',
+    inputs: [{ name: 'question', seedOwed: true }, { name: 'workspace', seedOwed: true }],
+    steps: [
+      {
+        name: 'researcher',
+        consumes: ['question', 'workspace'],
+        ...(opts.producerWorkdir !== undefined ? { workdir: opts.producerWorkdir } : {}),
+        ...(opts.producerWorkdirFrom !== undefined ? { workdirFrom: opts.producerWorkdirFrom } : {}),
+        produces: [
+          {
+            name: 'report',
+            judges: [
+              {
+                name: 'rigor',
+                body: 'evaluate rigor',
+                ...(opts.judgeInputs !== undefined ? { inputs: opts.judgeInputs } : {}),
+                ...(opts.judgeWorkdir !== undefined ? { workdir: opts.judgeWorkdir } : {}),
+                ...(opts.judgeWorkdirFrom !== undefined ? { workdirFrom: opts.judgeWorkdirFrom } : {}),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+}
+
+const judgeStep = (d: WorkflowDef) => d.steps.find((s) => s.name.endsWith('.rigor'))!;
+
+test('judges: (F29.1) a synthesized judge inherits the producer workdirFrom resolution', () => {
+  const d = workdirDef({ producerWorkdirFrom: 'workspace.payload.rootPath', judgeInputs: true });
+  assert.deepEqual(validateDef(d), []);
+  assert.equal(judgeStep(d).workdirFrom, 'workspace.payload.rootPath');
+  assert.equal(judgeStep(d).workdir, undefined);
+});
+
+test('judges: (F29.2) a synthesized judge inherits a literal producer workdir', () => {
+  const d = workdirDef({ producerWorkdir: '/srv/subject' });
+  assert.deepEqual(validateDef(d), []);
+  assert.equal(judgeStep(d).workdir, '/srv/subject');
+  assert.equal(judgeStep(d).workdirFrom, undefined);
+});
+
+test('judges: (F29.3) an explicit judge workdir overrides the producer, and does not pair with an inherited workdirFrom', () => {
+  const d = workdirDef({ producerWorkdirFrom: 'workspace.payload.rootPath', judgeWorkdir: '/srv/judge' });
+  // Both halves of the inheritance are dropped together. Pairing an authored
+  // workdir with an inherited workdirFrom would fail validateDef's mutual
+  // exclusion on a definition nobody wrote that way.
+  assert.deepEqual(validateDef(d), []);
+  assert.equal(judgeStep(d).workdir, '/srv/judge');
+  assert.equal(judgeStep(d).workdirFrom, undefined);
+});
+
+test('judges: (F29.4) an inherited workdirFrom stem the judge does not otherwise consume is added exactly once', () => {
+  // inputs is unset, so the judge's default consumes are [report] alone and the
+  // inherited stem resolves through neither arm of validateDef's check. Without
+  // the consumes extension this definition would HARD-REFUSE to load, which is
+  // why the assertion is on the built step rather than on the absence of a throw.
+  const d = workdirDef({ producerWorkdirFrom: 'workspace.payload.rootPath' });
+  assert.deepEqual(validateDef(d), []);
+  const judge = judgeStep(d);
+  assert.equal(judge.workdirFrom, 'workspace.payload.rootPath');
+  assert.deepEqual(judge.consumes.map((c) => c.stem), ['report', 'workspace']);
+});
+
+test('judges: (F29.4b) inputs:true already carries the stem, so the extension stays a no-op', () => {
+  const d = workdirDef({ producerWorkdirFrom: 'workspace.payload.rootPath', judgeInputs: true });
+  const stems = judgeStep(d).consumes.map((c) => c.stem);
+  assert.deepEqual(stems, ['report', 'question', 'workspace']);
+  assert.equal(stems.filter((stem) => stem === 'workspace').length, 1);
+});
+
+test('judges: (F29.5) workdir and workdirFrom are authorable on a judge', () => {
+  const literal = workdirDef({ judgeWorkdir: '/srv/judge' });
+  assert.deepEqual(validateDef(literal), []);
+  assert.equal(judgeStep(literal).workdir, '/srv/judge');
+
+  const resolved = workdirDef({ judgeWorkdirFrom: 'workspace.payload.rootPath', judgeInputs: true });
+  assert.deepEqual(validateDef(resolved), []);
+  assert.equal(judgeStep(resolved).workdirFrom, 'workspace.payload.rootPath');
+
+  assert.throws(
+    () => workdirDef({ judgeWorkdir: '/srv/judge', judgeWorkdirFrom: 'workspace.payload.rootPath' }),
+    (e: unknown) => e instanceof DefError && /may not declare both workdir and workdirFrom/.test(e.message),
+  );
+});
+
+test('judges: (F29.6) the docstring inheritance guarantee now holds for every judge on the producer', () => {
+  const d = buildDef({
+    name: 'multiJudgeWorkdirDef',
+    inputs: [{ name: 'question', seedOwed: true }, { name: 'workspace', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question', 'workspace'],
+      workdirFrom: 'workspace.payload.rootPath',
+      produces: [{
+        name: 'report',
+        judges: [
+          { name: 'completeness', body: 'evaluate completeness' },
+          { name: 'rigor', body: 'evaluate rigor', inputs: true },
+        ],
+      }],
+    }],
+  });
+  assert.deepEqual(validateDef(d), []);
+  const producer = d.steps.find((s) => s.name === 'researcher')!;
+  const judges = d.steps.filter((s) => s.judges !== undefined);
+  assert.equal(judges.length, 2);
+  for (const judge of judges) {
+    assert.equal(judge.workdirFrom, producer.workdirFrom, `judge '${judge.name}' is workdir-blind`);
+    assert.ok(
+      judge.consumes.some((c) => c.stem === 'workspace'),
+      `judge '${judge.name}' cannot resolve its inherited workdirFrom stem`,
+    );
+  }
 });
