@@ -303,8 +303,8 @@ Required fields are `run`, `workflow`, `step`, `key`, `defDigest`, `inputs`,
 `outputs`, `consumes`, and `owes`.
 
 Optional fields are `index`, `workdir`, `model`, `worker`, `judge`, `spec`, `x`,
-`consumedFingerprint`, `consumesProof`, `cause`, `capabilities`, `crews`,
-`reroutedFrom`, `modifier`, and `escalated`. `workdir` may be authored as a
+`consumedFingerprint`, `consumesProof`, `consumesProofRelay`, `cause`,
+`capabilities`, `crews`, `reroutedFrom`, `modifier`, and `escalated`. `workdir` may be authored as a
 literal `workdir:` or resolved by the engine from a step's `workdirFrom:`, whose
 stem names either a consumed artifact or a declared input; the Order wire shape
 remains unchanged. No proof field covers `workdir` in any case.
@@ -353,6 +353,19 @@ entries. The current production service does not provide that persistence or
 projection. A consuming driver treats a missing entry as the `absent` verdict
 and applies the configured artifact policy rather than stripping that artifact
 from the order.
+
+`consumesProofRelay` is a plain (not serialized) map from a consumed artifact
+path to `{ childDefDigest, childVersion, childOutcome }`. It is present only
+for a path a `calls:` step produced: the engine folds the child workflow's
+outcome into that path without a `submit`, so no submission record exists for
+the path itself, and a relay-aware hub places the CHILD's own signed record
+under the parent path in `consumesProof` while this map names the child it came
+from — the child definition digest the parent pins, the pinned child outcome
+version (the parent artifact's `__child_outcome_version__` fingerprint), and the
+child outcome stem. The hints are corroborated by the consumer against its own
+verified definition bytes before the record is examined; they never admit a path
+that carries no record, and a driver that does not understand the field ignores
+it. Details in `docs/crypto.md` under "Calls boundary".
 
 `owes[].proof`, when present, uses the same serialized DSSE envelope format. The
 signed `submission.v1` record contains one `produced[]` entry for the owed path;

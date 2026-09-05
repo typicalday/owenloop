@@ -24,6 +24,18 @@ export type ConsumedVerdict =
   | { kind: 'unverifiable'; reason: string }
   | { kind: 'invalid'; reason: string };
 
+/** The calls-boundary facts a relayed child submission record is checked
+ *  against. Both values come from the consumer's verified local definition
+ *  bytes — the parent's pinned child digest and the child's outcome stem —
+ *  never from the order that carried the record. */
+export interface CallsRelayExpectation {
+  /** Exact definition digest the verified parent pins its `calls:` child at. */
+  childDefDigest: string;
+  /** The child definition's single outcome stem (`outputs[0]`), the artifact
+   *  the child's record must cover; the engine folds it into `path`. */
+  childOutcome: string;
+}
+
 export interface VerifyConsumedInput {
   /** Artifact path being consumed. */
   path: string;
@@ -31,8 +43,12 @@ export interface VerifyConsumedInput {
   value: unknown;
   /** Serialized DSSE submission envelope for this artifact. */
   proof?: string;
-  /** Consumer claim-time version, when available. */
+  /** Consumer claim-time version, when available. For a relayed record this
+   *  is the pinned CHILD outcome version, not the parent path's counter. */
   expectedVersion?: number;
+  /** Present when `path` was produced by a `calls:` step and `proof` is the
+   *  child's own relayed submission record rather than one for `path`. */
+  relay?: CallsRelayExpectation;
   /** Local organization-root public key anchor. */
   orgRootPublicKey: string;
   /** Raw enrollment-grant envelope bytes. */
@@ -246,8 +262,24 @@ export async function verifyConsumed(
     signer.dispose?.();
   }
 
-  const produced = record.produced.find((entry) => entry.artifact === input.path);
-  if (produced === undefined) return invalid(`signature: signed submission record does not cover artifact '${input.path}'`);
+  // Calls boundary: a relayed record was signed by the CHILD for its own
+  // outcome. It is admitted for the parent path only when it was signed for
+  // exactly the child definition the verified parent pins, and only under the
+  // child's outcome stem. Both expectations are the consumer's own bytes.
+  const relay = input.relay;
+  if (relay !== undefined && record.defDigest !== relay.childDefDigest) {
+    return invalid(`calls: relayed submission record for artifact '${input.path}' was signed for definition digest '${record.defDigest}', but the verified parent definition pins its calls child at '${relay.childDefDigest}'`);
+  }
+  const coveredArtifact = relay === undefined ? input.path : relay.childOutcome;
+  const produced = record.produced.find((entry) => entry.artifact === coveredArtifact);
+  if (produced === undefined) {
+    return relay === undefined
+      ? invalid(`signature: signed submission record does not cover artifact '${input.path}'`)
+      : invalid(`calls: relayed submission record does not cover child outcome '${relay.childOutcome}', which the calls boundary folds into artifact '${input.path}'`);
+  }
+  const boundary = relay === undefined
+    ? ''
+    : ` (relayed across the calls boundary from child outcome '${relay.childOutcome}' of definition '${relay.childDefDigest}')`;
 
   let deliveredDigest: string;
   try {
@@ -256,10 +288,10 @@ export async function verifyConsumed(
     return invalid(`value-digest: delivered artifact '${input.path}' cannot be canonically represented: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (deliveredDigest !== produced.valueDigest) {
-    return invalid(`value-digest: delivered artifact '${input.path}' has digest '${deliveredDigest}', signed digest is '${produced.valueDigest}'`);
+    return invalid(`value-digest: delivered artifact '${input.path}' has digest '${deliveredDigest}', signed digest is '${produced.valueDigest}'${boundary}`);
   }
   if (input.expectedVersion !== undefined && produced.version !== input.expectedVersion) {
-    return invalid(`version: artifact '${input.path}' has signed version ${produced.version}, expected version ${input.expectedVersion}`);
+    return invalid(`version: artifact '${input.path}' has signed version ${produced.version}, expected version ${input.expectedVersion}${boundary}`);
   }
   if (record.timestamp > input.at) {
     options.warn?.(`producer-claimed timestamp for artifact '${input.path}' is ${record.timestamp - input.at} ms ahead of local clock; timestamp is not used for revocation`);
@@ -287,7 +319,7 @@ export async function verifyConsumed(
   }
   if (input.expectedVersion === undefined) {
     return unverifiable(
-      `version: artifact '${input.path}' has a valid historical proof, but the claim omitted its authoritative expected version`,
+      `version: artifact '${input.path}' has a valid historical proof, but the claim omitted its authoritative expected version${boundary}`,
     );
   }
   return { kind: 'verified', producerKeyId: verifiedKeyId, principal: chain.principal, version: produced.version };

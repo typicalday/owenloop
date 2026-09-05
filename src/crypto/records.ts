@@ -337,6 +337,7 @@ export const ORDER_FIELDS = {
   consumedFingerprint: 'optional',
   owes: 'required',
   consumesProof: 'optional',
+  consumesProofRelay: 'optional',
   cause: 'optional',
   // Routing snapshot of the offer this order was claimed from. `capabilities`
   // is the COMPOSED list (authored capability + `:<modifier>` where a modifier

@@ -18,7 +18,7 @@ import type {
   OrderInstructionRef,
   OrderInstructionSource,
 } from '../order-resolver.ts';
-import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile } from '../defs.ts';
+import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile, resolveCallsTarget } from '../defs.ts';
 import type { StepDef, WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import {
@@ -64,12 +64,24 @@ export class StoreInstructionSourceError extends Error {
   }
 }
 
+/** A verified `calls:` child: the finalized child definition and the exact
+ *  bundle digest the parent's verified bytes pin it at. Validation context
+ *  only — a child is never an instruction lookup target of its own. */
+export interface VerifiedCallsChild {
+  definition: WorkflowDef;
+  bundleDigest: DefDigest;
+  /** The `calls:` target as authored on the parent step. */
+  target: string;
+}
+
 interface CachedDefinition {
   def: WorkflowDef;
   bundleDigest: DefDigest;
   objectPath: string;
   /** Every object whose verified bytes supported this parent definition. */
   support: readonly SupportingObject[];
+  /** The verified `calls:` child each `calls:` step of `def` invokes, keyed by step name. */
+  callsChildren: ReadonlyMap<string, VerifiedCallsChild>;
 }
 
 interface SupportingObject {
@@ -94,6 +106,12 @@ export interface StoreInstructionSource extends OrderInstructionSource {
   getVerifiedDefinition(defDigest: string, step?: string): WorkflowDef | undefined;
   /** Return the installed bundle identity and object path cached by `prime`. */
   getVerifiedObject(defDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined;
+  /** Return the verified `calls:` child that step `callsStep` of the definition
+   *  serving `step` invokes, resolved in the same finalized closure the
+   *  definition was verified in. Optional so a source without a dependency
+   *  closure still type-checks; a consumer treats its absence as "no
+   *  calls-boundary context", never as permission. */
+  getVerifiedCallsChild?(defDigest: string, step: string, callsStep: string): VerifiedCallsChild | undefined;
 }
 
 function indexedBundleDigests(root: string): DefDigest[] {
@@ -335,6 +353,8 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	      break;
 	    } catch (error) {
 	      if (error instanceof StoreIntegrityError && error.code === 'object-missing') continue;
+	      // A child whose own lock target is missing names THAT digest; keep it.
+	      if (error instanceof StoreIntegrityError && error.code === 'dependency-missing') throw error;
 	      const verified = error instanceof StoreIntegrityError
 		&& error.message.includes('object failed verification');
 	      throw new StoreIntegrityError(
@@ -346,10 +366,13 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	    }
 	  }
 	  if (child === undefined) {
+	    // Not corruption: the parent verified, it merely pins a child this
+	    // store never received. `prime` hands the CHILD digest to recovery.
 	    throw new StoreIntegrityError(
-	      'object-corrupt',
+	      'dependency-missing',
 	      childDigest,
-	      `locked calls target '${target}' digest ${childDigest} is absent from every configured workflow store root`,
+	      `locked calls target '${target}' digest ${childDigest} pinned by parent bundle ${object.bundleDigest} ` +
+		'is absent from every configured workflow store root',
 	    );
 	  }
 	  const selected = selectLockedTarget(target, childDigest, child);
@@ -367,6 +390,23 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     const finalized = finalizeDefs(validation);
     const parentDefinitions = [...parent.defs.keys()].map((name) => finalized.get(name)!);
     const cachedSupport = [...support.values()];
+    // The same scope-aware rule finalizeDefs validated and the engine runs:
+    // a qualified target resolves through the parent's lock, a bare one to
+    // the sibling inside the parent's own bundle. Recorded per calls step so
+    // a consumer can corroborate a relayed child proof from verified bytes.
+    const callsChildrenOf = (def: WorkflowDef): ReadonlyMap<string, VerifiedCallsChild> => {
+      const children = new Map<string, VerifiedCallsChild>();
+      for (const step of def.steps) {
+	if (step.calls === undefined) continue;
+	const child = resolveCallsTarget(finalized, step.calls, def);
+	const rawDigest = child?.bundleDigest;
+	if (child === undefined || rawDigest === undefined) continue;
+	const childDigest = asDefDigest(rawDigest);
+	if (childDigest === undefined) continue;
+	children.set(step.name, { definition: child, bundleDigest: childDigest, target: step.calls });
+      }
+      return children;
+    };
 
     // Hub-backed orders use the immutable bundle digest as their execution
     // identity. Dependencies are validation-only: never cache or publish them
@@ -377,6 +417,7 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	bundleDigest,
 	objectPath: parent.objectPath,
 	support: cachedSupport,
+	callsChildren: callsChildrenOf(def),
       })));
       return true;
     }
@@ -390,6 +431,7 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	  bundleDigest,
 	  objectPath: parent.objectPath,
 	  support: cachedSupport,
+	  callsChildren: callsChildrenOf(def),
 	}]);
 	return true;
       }
@@ -553,15 +595,42 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     return 'unknown-digest';
   };
 
+  /**
+   * Prime one digest, recovering a lock-pinned child that the verified
+   * closure needs but no configured store root holds. A worker that pulled
+   * the parent alone has exactly this shape, so recovery is asked for the
+   * CHILD digest (never the requested one) and the parent is re-resolved once
+   * the pull supplies it. Each missing child is requested at most once per
+   * prime; a child recovery cannot supply surfaces as the named
+   * `dependency-missing` error, not as `unknown-digest` (that would re-offer
+   * the order forever) and not as corruption.
+   */
+  const primeRecoveringDependencies = async (
+    requestedDigest: string,
+  ): Promise<'resolved' | 'unknown-digest'> => {
+    const requestedChildren = new Set<string>();
+    for (;;) {
+      try {
+	return await primeOnce(requestedDigest);
+      } catch (error) {
+	if (!(error instanceof StoreIntegrityError) || error.code !== 'dependency-missing') throw error;
+	if (args.onMissing === undefined || requestedChildren.has(error.digest)) throw error;
+	requestedChildren.add(error.digest);
+	const action = await args.onMissing.onMissing(error.digest);
+	if (action !== 'retry') throw error;
+      }
+    }
+  };
+
   const prime = (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
     const existing = inFlight.get(requestedDigest);
     if (existing !== undefined) return existing;
 
     const operation = (async (): Promise<'resolved' | 'unknown-digest'> => {
-      let result = await primeOnce(requestedDigest);
+      let result = await primeRecoveringDependencies(requestedDigest);
       if (result === 'unknown-digest' && args.onMissing !== undefined) {
 	const action = await args.onMissing.onMissing(requestedDigest);
-	if (action === 'retry') result = await primeOnce(requestedDigest);
+	if (action === 'retry') result = await primeRecoveringDependencies(requestedDigest);
       }
       return result;
     })();
@@ -625,6 +694,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     getVerifiedObject: (requestedDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined => {
       const cached = cache.get(requestedDigest)?.[0];
       return cached === undefined ? undefined : { bundleDigest: cached.bundleDigest, objectPath: cached.objectPath };
+    },
+    getVerifiedCallsChild: (requestedDigest: string, stepName: string, callsStep: string): VerifiedCallsChild | undefined => {
+      const cached = cache.get(requestedDigest)?.filter((entry) => entry.def.steps.some((step) => step.name === stepName));
+      return cached?.length === 1 ? cached[0]!.callsChildren.get(callsStep) : undefined;
     },
   };
 }

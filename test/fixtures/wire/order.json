@@ -46,6 +46,7 @@
       }
     ],
     "consumesProof": "serialized-consume-proof",
+    "consumesProofRelay": { "question": { "childDefDigest": "child-bundle-digest", "childVersion": 3, "childOutcome": "result" } },
     "cause": "inputsGreen"
   },
   "additionalValid": [
@@ -92,6 +93,23 @@
     }
   ],
   "invalid": [
+    {
+      "name": "relay-missing-child-outcome",
+      "value": {
+	"run": "run-build-11",
+	"workflow": "build-instance",
+	"step": "integrate",
+	"key": "integrate",
+	"defDigest": "injected-digest",
+	"inputs": ["u1"],
+	"outputs": ["out"],
+	"consumes": { "u1": { "text": "folded from a calls child" } },
+	"consumesProof": "serialized-consume-proof",
+	"consumesProofRelay": { "u1": { "childDefDigest": "child-bundle-digest", "childVersion": 1 } },
+	"owes": [{ "path": "out", "judgmentRejects": 0, "schemaRejects": 0, "reasons": [] }]
+      },
+      "keyword": "required"
+    },
     {
       "name": "empty-crew-entry",
       "value": {

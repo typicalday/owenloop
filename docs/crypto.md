@@ -843,6 +843,52 @@ scope-checked signer. The gate runs before the floor-derived policy value is
 read and fails closed regardless of local policy, including `off`, and
 regardless of any floor. A floor cannot relax this rule.
 
+### Calls boundary
+
+An artifact a `calls:` step produces has no submission record of its own: the
+engine folds the child workflow's outcome into the parent path without a
+`submit`, so the parent path is `absent` by construction and a command consumer
+of it could never run. A relay-aware hub places the CHILD's own signed
+submission record under the parent path in `consumesProof` and names the child
+in `consumesProofRelay` (keyed by the parent path: `childDefDigest`,
+`childVersion`, `childOutcome`). The command worker admits that record only when
+every hint is corroborated by bytes it verified itself:
+
+- **Corroborated from local bytes.** The verified parent definition — selected
+  by the order's `defDigest` from the local workflow store, never hub-supplied
+  step text — must produce the path through a `calls:` step. The child that step
+  resolves to in the same verified closure (the bundle lock for a qualified
+  target, the sibling inside the parent's own bundle for a bare one) must carry
+  exactly the relayed `childDefDigest`, and its declared outcome (`outputs[0]`)
+  must equal the relayed `childOutcome`.
+- **Verified on the record.** The record's signed `defDigest` must equal that
+  child digest and the record must cover the child outcome stem. The consumed
+  value's digest, the expected version, the producer's enrollment chain, and the
+  scope demand are then checked exactly as for a directly produced artifact.
+  The expected version is the relayed `childVersion`, the pinned child outcome
+  version; the parent's `consumedFingerprint` entry counts the parent artifact
+  and is a different number, so a coincidental match is never relied on. Like
+  `consumedFingerprint`, the pin is hub data; the trust anchor stays the
+  signature plus the verified definition bytes.
+
+Any mismatch is `invalid` under the `calls` link and refuses under the hard
+rule. The boundary is exclusive in both directions: a path the verified
+definition produces through a `calls:` step accepts only the relay contract, so
+an order carrying no `consumesProofRelay` entry for it is `invalid` under the
+`calls` link and never falls through to ordinary verification (which does not
+check a record's signed definition digest, so any trusted record covering the
+parent path with a matching value and version could otherwise stand in for the
+child's outcome). A relay offered for a path the verified definition does not
+produce through a `calls:` step is likewise `invalid`, record or no record.
+Hints without a record on a calls-produced path leave it `absent`. A relay
+reaching a consumer that holds no verified definition (an agent worker) is
+`unverifiable` and follows the configured artifact policy like any other
+non-verified verdict.
+Nothing in the relay relaxes the hard rule for a non-calls path, and no policy,
+floor, or environment variable can. Unchanged residual: a relayed record, like
+every submission record, is bound to the producing run and artifact version,
+not to the consuming order.
+
 ## Out of scope (future work)
 
 Publish-time author-side DSSE signing is implemented by `owenloop publish`.

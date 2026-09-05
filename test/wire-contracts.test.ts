@@ -179,6 +179,8 @@ function assertManifestMatchesSchema(schema: JsonSchema, manifest: Manifest, lab
 
 const OPEN_OBJECT_POINTERS = new Set([
   '#/properties/consumedFingerprint',
+  // Keyed by artifact path like consumedFingerprint; each entry is closed.
+  '#/properties/consumesProofRelay',
   '#/properties/spec',
   '#/properties/x',
   '#/properties/consumes',

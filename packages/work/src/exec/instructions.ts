@@ -30,7 +30,7 @@ import {
   resolveOriginRules,
 } from '../../../../src/store/pre-commit-verifier.ts';
 import type { OrderPacket } from '../hub/types.ts';
-import type { ConsumedVerifier } from '../consumed-verifier.ts';
+import type { ConsumedVerifier, VerifiedCallsProducer } from '../consumed-verifier.ts';
 
 export type InstructionRefusalKind =
   | 'unknown-digest'
@@ -369,7 +369,55 @@ export function createStoreInstructionResolver(
     })),
   });
 
-  const gateConsumed = async (order: OrderPacket, hardRule: boolean): Promise<InstructionRefusal | undefined> => {
+  /**
+   * Calls boundary. For every consumed path the VERIFIED definition produces
+   * through a `calls:` step, read the facts a relayed child record is checked
+   * against — the pinned child definition digest and the child's outcome stem
+   * — from the same verified store closure the definition came from. Nothing
+   * here consults hub-supplied step text. A source without a dependency
+   * closure yields no context, and the verifier then treats any relay as
+   * unverifiable rather than guessing.
+   */
+  const verifiedCallsProducers = (
+    order: OrderPacket,
+    resolved: ResolvedDefinition,
+  ): { ok: true; producers: Record<string, VerifiedCallsProducer> | undefined } | InstructionRefusal => {
+    if (source.getVerifiedCallsChild === undefined) return { ok: true, producers: undefined };
+    const producers: Record<string, VerifiedCallsProducer> = {};
+    for (const path of Object.keys(order.consumes)) {
+      const callsStep = resolved.definition.steps.find(
+        (step) => step.calls !== undefined && step.produces.some((produce) => produce.stem === path),
+      );
+      if (callsStep?.calls === undefined) continue;
+      const relayed = order.consumesProofRelay?.[path] !== undefined;
+      const child = source.getVerifiedCallsChild(order.defDigest, order.step, callsStep.name);
+      if (child === undefined) {
+        if (!relayed) continue;
+        return refusal(
+          'integrity',
+          order,
+          `the verified definition produces artifact '${path}' through calls: step '${callsStep.name}' (${callsStep.calls}), but its child definition could not be resolved from the verified store closure`,
+        );
+      }
+      const childOutcome = child.definition.outputs?.[0];
+      if (childOutcome === undefined) {
+        if (!relayed) continue;
+        return refusal(
+          'integrity',
+          order,
+          `the verified definition produces artifact '${path}' through calls: step '${callsStep.name}' (${callsStep.calls}), but the verified child definition '${child.definition.name}' declares no outcome`,
+        );
+      }
+      producers[path] = { step: callsStep.name, target: callsStep.calls, childDefDigest: child.bundleDigest, childOutcome };
+    }
+    return { ok: true, producers };
+  };
+
+  const gateConsumed = async (
+    order: OrderPacket,
+    hardRule: boolean,
+    resolved: ResolvedDefinition,
+  ): Promise<InstructionRefusal | undefined> => {
     if (!hasConsumedData(order)) return undefined;
     if (options.consumedVerifier === undefined) {
       return refusal(
@@ -378,8 +426,13 @@ export function createStoreInstructionResolver(
         'consume-side verifier is not configured; dynamic values cannot be admitted to a command worker',
       );
     }
+    const callsContext = verifiedCallsProducers(order, resolved);
+    if (!callsContext.ok) return callsContext;
     try {
-      const checked = await options.consumedVerifier(commandConsumedOrder(order), { hardRule });
+      const checked = await options.consumedVerifier(commandConsumedOrder(order), {
+        hardRule,
+        ...(callsContext.producers === undefined ? {} : { callsProducers: callsContext.producers }),
+      });
       if (!checked.ok) return refusal('unverified-consumed', order, checked.reason);
       for (const warning of checked.warnings) warn(warning);
       return undefined;
@@ -421,7 +474,7 @@ export function createStoreInstructionResolver(
       // absent, unverifiable, or invalid dynamic evidence under
       // artifactPolicy=off; otherwise a future command interpolation could
       // carry an unverified value into `/bin/sh -c`.
-      const consumedRefusal = await gateConsumed(order, true);
+      const consumedRefusal = await gateConsumed(order, true, resolved);
       if (consumedRefusal !== undefined) return consumedRefusal;
 
       const originRefusal = await checkOrigin(order, resolved);

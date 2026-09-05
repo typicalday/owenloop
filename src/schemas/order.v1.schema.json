@@ -111,6 +111,20 @@
       }
     },
     "consumesProof": { "type": "string" },
+    "consumesProofRelay": {
+      "type": "object",
+      "description": "Calls-boundary relay hints keyed by the parent artifact path. For a consumed path a 'calls:' step produced, the entry names the child definition digest the parent pins, the pinned child outcome version, and the child outcome stem whose signed submission record 'consumesProof' carries under the parent path.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["childDefDigest", "childVersion", "childOutcome"],
+        "properties": {
+          "childDefDigest": { "type": "string", "minLength": 1 },
+          "childVersion": { "type": "integer", "minimum": 0 },
+          "childOutcome": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
     "cause": { "type": "string", "enum": ["inputsGreen", "allGreen", "idle"] },
     "capabilities": {
       "type": "array",

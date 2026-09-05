@@ -124,6 +124,7 @@ export type {
   MissingObjectHandler,
   StoreInstructionSource,
   StoreInstructionSourceArgs,
+  VerifiedCallsChild,
 } from './instruction-source.ts';
 export type {
   BundleInstallResult,
