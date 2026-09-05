@@ -323,6 +323,46 @@ export interface Order {
     schemaRejects: number;
     reasons: ReasonEntry[];
     /**
+     * The value this owed path already holds, projected ONLY when the reason
+     * thread above is non-empty -- that is, only on a re-offer that follows a
+     * refusal.
+     *
+     * WHY IT IS ON THE ORDER. The same argument as `schema` below, for content
+     * instead of shape. `reasons` already tells a re-offered producer THAT its
+     * last submission was refused and why. It does not tell it WHAT it
+     * submitted. A producer reading "your plan was rejected because phase 3
+     * cites no artifact", with no sight of the plan it wrote, has to rebuild
+     * the whole value from memory to change one phase, and the rebuild
+     * silently drops the parts nobody objected to. That is the same rework
+     * `schema` exists to prevent, arriving through a different door: feedback
+     * is actionable only against the thing it is feedback ON.
+     *
+     * WHAT IT ACTUALLY HOLDS, which is NOT always the refused value:
+     *
+     * - After a judgment or human reject, it IS the refused value. Those
+     *   rejects FOLLOW a commit -- `green()` had already written the artifact
+     *   and bumped `version` -- so what stands here is what the judge read.
+     * - After a schema reject or an artifact-bind reject, it is NOT. Those
+     *   refuse the write itself, so nothing was committed, and this carries
+     *   the last value that DID commit, or is absent when none ever did.
+     *
+     * It is deliberately not named `rejectedValue`. Half the refusal kinds
+     * that put a reason on this thread never commit the value they refused,
+     * and a name asserting otherwise would be read as a guarantee the engine
+     * cannot make. A layer that needs the distinction reads `reasons`, which
+     * records each refusal's kind.
+     *
+     * Absent on a first firing, which has no artifact at all, and absent on
+     * any re-offer whose reason thread is empty. Gating on the thread is what
+     * keeps an artifact-sized payload off the ordinary offer and confines it
+     * to the rework path, the only path able to use it.
+     *
+     * It is a COPY taken at claim time, under the same contract as `schema`:
+     * `Store.restampOrderTarget`, the one post-claim writer of a persisted
+     * order, touches only `owes[].version`.
+     */
+    previousValue?: unknown;
+    /**
      * The JSON Schema the engine will enforce on this output at commit time,
      * copied verbatim off the owning produce entry. Absent when that produce
      * declares none — the common case, and the engine then accepts any JSON.

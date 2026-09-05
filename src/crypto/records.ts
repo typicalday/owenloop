@@ -366,6 +366,17 @@ export const ORDER_OWED_FIELDS = {
   judgmentRejects: 'required',
   schemaRejects: 'required',
   reasons: 'required',
+  // The value the owed path already holds, sent back only on a re-offer whose
+  // reason thread is non-empty. Optional because most offers are first offers
+  // and carry no such thread, so every order emitted before this field existed
+  // still validates unchanged.
+  //
+  // Unlike `schema` below this is DYNAMIC, not derived: it is committed engine
+  // state read inside the claim transaction, exactly like `version`,
+  // `judgmentRejects` and `reasons`, all of which the signature already covers.
+  // Covering it too is what stops a re-offer from being replayed with a
+  // different prior value substituted under the same claim.
+  previousValue: 'optional',
   // The declared JSON Schema for this owed path and what it governs, projected
   // off the owning produce entry. Optional because most produces declare no
   // schema, so every order emitted before this field existed still validates

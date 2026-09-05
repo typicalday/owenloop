@@ -801,6 +801,66 @@ test('knock-back: a judgment reject re-arms the producer and carries feedback', 
   assert.equal(engine.status(wf).done, true);
 });
 
+test('knock-back: the re-offer carries the value the owed path already holds', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+
+  // A first firing has no artifact at all, so there is nothing to send back and
+  // the field must be absent rather than present-and-undefined: an ordinary
+  // offer must not grow an artifact-sized payload it cannot use.
+  const builder1 = fire(engine, wf, 'builder', 2000);
+  const first = builder1.owes.find((w) => w.path === 'pr')!;
+  assert.equal(Object.hasOwn(first, 'previousValue'), false, 'a first offer carries no previous value');
+  engine.green(wf, builder1.run, 'pr', { pr: 'v1', notes: 'keep me' });
+  engine.close(wf, builder1.run);
+
+  const reviewer = fire(engine, wf, 'reviewer', 3000);
+  engine.reject(wf, 'pr', 'reviewer', 'tests fail on CI');
+  engine.close(wf, reviewer.run, 'no_work');
+
+  // A judgment reject FOLLOWS the commit, so what the re-offered producer gets
+  // back is exactly the value the reviewer read. Reasons alone would tell it
+  // that its submission was refused and why, but not what it submitted.
+  const builder2 = fire(engine, wf, 'builder', 4000);
+  const owed = builder2.owes.find((w) => w.path === 'pr')!;
+  assert.ok(owed.reasons.some((r) => r.text.includes('tests fail on CI')));
+  assert.deepEqual(owed.previousValue, { pr: 'v1', notes: 'keep me' });
+});
+
+test('knock-back: a schema reject sends back the last committed value, never the refused one', () => {
+  const { engine } = makeEngine([schemaOut()]);
+  const wf = engine.createInstance('schemad');
+
+  // Nothing has ever committed, so a schema reject leaves nothing to send.
+  const o1 = fire(engine, wf, 'planner', 1000);
+  assert.equal(engine.green(wf, o1.run, 'plan', { wrong: 1 } as Record<string, unknown>).outcome, 'schema-rejected');
+  engine.close(wf, o1.run, 'no_work');
+
+  const o2 = fire(engine, wf, 'planner', 2000);
+  const owedAfterFirstRefusal = o2.owes.find((w) => w.path === 'plan')!;
+  assert.ok(owedAfterFirstRefusal.reasons.some((r) => r.action === 'schema-reject'));
+  assert.equal(
+    Object.hasOwn(owedAfterFirstRefusal, 'previousValue'),
+    false,
+    'a schema reject refuses the write, so there is no value to send back',
+  );
+
+  // Commit one, then refuse the next. `green()` never wrote the refused value,
+  // so what stands on the path -- and what travels -- is the older green one.
+  // This is why the field is `previousValue` and not `rejectedValue`.
+  assert.equal(engine.green(wf, o2.run, 'plan', { plan: 'committed' }).outcome, 'green');
+  engine.close(wf, o2.run);
+  engine.reject(wf, 'plan', 'human', 'wrong direction');
+  const o3 = fire(engine, wf, 'planner', 3000);
+  assert.equal(engine.green(wf, o3.run, 'plan', { wrong: 2 } as Record<string, unknown>).outcome, 'schema-rejected');
+  engine.close(wf, o3.run, 'no_work');
+
+  const o4 = fire(engine, wf, 'planner', 4000);
+  assert.deepEqual(o4.owes.find((w) => w.path === 'plan')!.previousValue, { plan: 'committed' });
+});
+
 // ---- §6 liveness: stall at the cap, cleared by retry ------------------------
 
 test('§6 stall: a judgment-rejected output stops re-arming at the cap, until retry', () => {

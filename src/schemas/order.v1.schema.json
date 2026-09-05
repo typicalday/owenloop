@@ -97,6 +97,9 @@
               }
             }
           },
+          "previousValue": {
+            "description": "The value this owed path already holds, sent only on a re-offer whose reason thread is non-empty. Absent on a first offer, and absent when the refusal never committed a value. It is the REFUSED value only after a judgment or human reject, which follow a commit; a schema reject refuses the write, so after one this carries the last value that did commit. Any JSON, because it is a def author's artifact value and not a shape this wire contract controls."
+          },
           "schema": {
             "description": "The JSON Schema the engine will enforce on this owed path at commit time, copied verbatim off the owning produce entry. Absent when that produce declares none, which is the common case and means any JSON is accepted. A JSON Schema is either a keyword object or a bare boolean, so both forms are admitted here.",
             "oneOf": [{ "type": "object" }, { "type": "boolean" }]
