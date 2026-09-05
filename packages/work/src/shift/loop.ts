@@ -85,6 +85,7 @@ import {
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
 import { withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { sessionsPath } from '../harness/session-store.ts';
+import { checkHost, type HostFault } from './host-preflight.ts';
 import type { Spawner, WorkerFailure } from './spawn.ts';
 import {
   stampShiftEvent,
@@ -191,6 +192,14 @@ export interface ShiftLoopOptions {
   /** PHASE 4 — injected in tests so the reaper can be exercised without a
    *  filesystem. Defaults to `sweepWorkDirs` from `src/agent/workdir.ts`. */
   sweepWorkDirs?: typeof sweepWorkDirsImpl;
+  /**
+   * Does this machine still have the directories the shift needs? Injected in
+   * tests so a vanished temp directory can be presented without one, and so the
+   * check itself can be made to throw. Defaults to `checkHost`, which is
+   * `stat`-only and issues no hub traffic. An empty array means "no LOCAL
+   * fault", never "healthy" — see `host-preflight.ts`.
+   */
+  hostPreflight?: () => HostFault[];
 }
 
 export interface LockedRemovalOptions {
@@ -522,13 +531,53 @@ function stepBrakeDelayMs(count: number): number {
   return STEP_BRAKE_DELAYS_MS[index] ?? 0;
 }
 
+/** How many links of an error's `cause` chain `errMsg` renders. */
+const MAX_CAUSE_DEPTH = 4;
+
+/**
+ * Consecutive failed hub polls before the shift asks whether the fault is local.
+ *
+ * NOT a timeout and not a health threshold — nothing is declared broken at this
+ * number. Crossing it only makes the shift run `checkHost`, which is a handful
+ * of `stat` calls and is free of hub traffic; if the host is fine the shift
+ * keeps polling and the streak keeps climbing. So the number only has to be
+ * large enough that a single transient failure does not pay for the check, and
+ * small enough that an operator is not left guessing for long. At the shipped
+ * 30s poll interval three failures is about a minute and a half.
+ */
+const HOST_PREFLIGHT_STREAK = 3;
+
 /** The identity a storm repeats on. `key` is '' for an unfanned step. */
 function stepBrakeKey(workflow: string, step: string, key: string | undefined): string {
   return `${workflow}\u0000${step}\u0000${key ?? ''}`;
 }
 
+/**
+ * An error's message, with its cause chain appended.
+ *
+ * THE CHAIN IS THE POINT. Node's fetch reports every transport failure as the
+ * bare string `fetch failed` and puts the real reason — `ENOENT`, `ECONNREFUSED`,
+ * `EAI_AGAIN`, a TLS error — on `cause`. Dropping it makes a dead local host, an
+ * unreachable hub and a DNS failure produce byte-identical records, which is
+ * precisely how a wedged shift stayed unattributed for 42 minutes.
+ *
+ * Bounded by construction: the walk follows at most `MAX_CAUSE_DEPTH` links and
+ * refuses to revisit a cause it has already rendered, so a self-referential or
+ * mutually-referential chain terminates instead of hanging the emitter.
+ */
 function errMsg(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+  if (!(e instanceof Error)) return String(e);
+  const parts = [e.message];
+  const seen = new Set<unknown>([e]);
+  let cause: unknown = (e as { cause?: unknown }).cause;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && cause !== undefined && cause !== null; depth += 1) {
+    if (seen.has(cause)) break;
+    seen.add(cause);
+    const text = cause instanceof Error ? cause.message : String(cause);
+    if (text !== '' && !parts.includes(text)) parts.push(text);
+    cause = cause instanceof Error ? (cause as { cause?: unknown }).cause : undefined;
+  }
+  return parts.join(': ');
 }
 
 /** The explicit hub refusal produced when an inbox row becomes terminal after
@@ -643,6 +692,24 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let atCapReported = false;
   /** Earliest server-approved time for the next polling iteration. */
   let backoffUntil = Number.NEGATIVE_INFINITY;
+  /**
+   * Consecutive hub polls that failed for a reason the hub did not sanction.
+   *
+   * RATE LIMITING IS EXCLUDED, and that exclusion is the whole design. A 429 is
+   * the server saying "come back later", and a Cloudflare 1015 ban is the same
+   * answer at the edge: both are recoverable degradation that clears on its own,
+   * and a shift that killed itself over one would take the whole fleet down for
+   * a condition the fleet itself caused. `noteServerBackoff` already returns
+   * exactly that discrimination, so the streak counts only the failures nobody
+   * promised would end.
+   *
+   * Reset by any SUCCESSFUL wake, which is the loop's one unconditional hub call
+   * per unbackoffed tick and therefore the cheapest honest proof that the hub is
+   * reachable and this host can reach it.
+   */
+  let hubFailureStreak = 0;
+  /** Set once the shift has stopped for a named local fault, so `run` exits non-zero. */
+  let wedged = false;
   /** Bumped whenever a ping starts or is forced due, so a ping that completes
    *  after a force does not stamp the cadence over that force. */
   let presenceGeneration = 0;
@@ -724,6 +791,43 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     if (!(error instanceof HubError) || error.status !== 429) return false;
     const delay = error.retryAfterMs ?? opts.pollIntervalMs;
     backoffUntil = Math.max(backoffUntil, monotonicNow() + delay);
+    return true;
+  }
+
+  /**
+   * Ask whether a LOCAL fault is the reason this shift cannot work, and stop if
+   * one is. Returns true when the shift has been wedged.
+   *
+   * STOPPING IS THE POINT, and it is the opposite of what every other failure
+   * path here does. Everything else in this loop is built to survive: a failed
+   * wake retries next tick, a failed roster sync degrades and continues, a
+   * rate-limited poll backs off. All of that is correct for a REMOTE fault,
+   * which ends without anyone doing anything. It is exactly wrong for a local
+   * one, where continuing means an operator watching a live process that will
+   * never dispatch again — the measured shape of this defect was a shift that
+   * looked alive to `pgrep`, answered `shift end`, and did nothing for 42
+   * minutes while attributing a vanished temp directory to `fetch failed`.
+   *
+   * A PRE-FLIGHT THAT ITSELF FAILS IS NOT A FAULT. If the probe throws, this
+   * reports it and returns false, because "I could not determine whether the
+   * host is broken" is not evidence that it is, and killing a working shift over
+   * an unreadable `stat` would be a worse failure than the one being detected.
+   */
+  function runHostPreflight(streak: number): boolean {
+    let faults: HostFault[];
+    try {
+      faults = opts.hostPreflight !== undefined
+        ? opts.hostPreflight()
+        : checkHost({});
+    } catch (e) {
+      opts.err(`host pre-flight failed to run: ${errMsg(e)} (continuing)`);
+      return false;
+    }
+    if (faults.length === 0) return false;
+    for (const fault of faults) opts.err(`shift cannot continue: ${fault.message}`);
+    wedged = true;
+    stopped = true;
+    emit({ type: 'wedged', faults, streak });
     return true;
   }
 
@@ -1758,10 +1862,23 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       changed = w.changed;
       cursor = w.cursor;
       wakeSucceeded = true;
+      // The loop's one unconditional hub call per unbackoffed tick, so its
+      // success is the cheapest honest proof that this host can reach the hub.
+      hubFailureStreak = 0;
     } catch (e) {
-      noteServerBackoff(e);
+      const rateLimited = noteServerBackoff(e);
       opts.err(`wake failed: ${errMsg(e)} (retrying next tick)`);
       emit({ type: 'hub-error', op: 'wake', message: errMsg(e) });
+      if (!rateLimited) {
+        hubFailureStreak += 1;
+        // Every HOST_PREFLIGHT_STREAK-th failure, not only the first crossing:
+        // a work root can be unmounted at failure seven, and a shift that
+        // checked once at failure three would never see it. The check is
+        // `stat`-only and adds no hub traffic, so repeating it is nearly free.
+        if (hubFailureStreak % HOST_PREFLIGHT_STREAK === 0 && runHostPreflight(hubFailureStreak)) {
+          return dispatched;
+        }
+      }
     }
 
     // A changed cursor is not sufficient by itself: if the prior changed tick
@@ -1833,19 +1950,26 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   async function run(): Promise<number> {
     ensureStateDir(opts.stateDir);
 
+    // BEFORE THE FIRST HUB CALL. A shift started into a broken host — the usual
+    // way being a supervisor that restarts it across a reboot with the old
+    // environment — must say so at once. Making it wait for three failed polls
+    // would buy nothing and spend the operator's attention on network theories.
+    // `streak: 0` marks this record as the boot check rather than a poll one.
+    if (runHostPreflight(0)) return 1;
+
     if (opts.once === true) {
       await iteration();
-      return 0;
+      return wedged ? 1 : 0;
     }
 
     for (;;) {
-      if (stopped) return 0;
+      if (stopped) return wedged ? 1 : 0;
       await iteration();
-      if (stopped) return 0;
+      if (stopped) return wedged ? 1 : 0;
       const delay = Math.max(opts.pollIntervalMs, backoffUntil - monotonicNow());
       await opts.sleep(delay);
       // Re-check after the park so a stop during sleep makes no further hub call.
-      if (stopped) return 0;
+      if (stopped) return wedged ? 1 : 0;
     }
   }
 

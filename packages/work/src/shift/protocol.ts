@@ -7,6 +7,8 @@
  * attendance commands between the CLI and one daemon process.
  */
 
+import type { HostFault } from './host-preflight.ts';
+
 export const SHIFT_SOCKET_NAME = 'shift.sock';
 export const DEFAULT_NEXT_WAIT_MS = 90_000;
 export const MAX_REQUEST_LINE_BYTES = 64 * 1024;
@@ -162,6 +164,43 @@ export interface OrderDroppedEvent {
 }
 
 /**
+ * The shift STOPPED because the machine underneath it is broken, and named the
+ * fault. The last record a wedged shift writes; the process exits non-zero
+ * immediately after.
+ *
+ * WHY THIS EXISTS AS ITS OWN RECORD, rather than one more `hub-error`. A shift
+ * whose host temp directory vanished — which a macOS reboot does to any process
+ * that survives it — keeps polling forever, and every hub call fails with
+ * undici's generic `fetch failed`. From the outside that is indistinguishable
+ * from a hub outage: `pgrep` shows the process, `shift end` answers, and the
+ * log fills with records that attribute a LOCAL fault to the network. This
+ * record is the one that says the cause is here, on this machine, and that no
+ * amount of waiting will fix it.
+ *
+ * `faults` is never empty. That invariant is what separates this record from
+ * every retryable failure: a hub outage, a rate-limit ban and an expired
+ * credential all self-heal, so the shift keeps working through them and emits
+ * nothing here. A record exists only when a human must change something on the
+ * host.
+ *
+ * `streak` is how many consecutive hub calls failed before the check ran, and
+ * is 0 for the pre-flight the shift runs at start, before any hub call. It is
+ * evidence, not a cause: the streak is only what PROMPTED the check, and the
+ * `faults` are why the shift stopped.
+ *
+ * ON THE SOCKET AS WELL AS IN THE FILE, unlike `parked` and `capacity`. A
+ * parked `owenloop shift next` must block until there is something to report,
+ * and "the shift you are waiting on is dead" is the most report-worthy thing
+ * that can happen to it — a client that stays parked on a socket whose server
+ * is about to close waits for work that will never come.
+ */
+export interface WedgedEvent {
+  type: 'wedged';
+  faults: HostFault[];
+  streak: number;
+}
+
+/**
  * The socket event FIFO overflowed and discarded its oldest event. Written
  * STRAIGHT to the file sink, never through the loop's `emit()` — `emit()` feeds
  * the very queue that overflowed, so routing this through it would recurse
@@ -188,7 +227,8 @@ export type ShiftEventBody =
   | HubErrorEvent
   | BundleMissEvent
   | OrderDroppedEvent
-  | EventQueueOverflowEvent;
+  | EventQueueOverflowEvent
+  | WedgedEvent;
 
 /**
  * The identity every event carries, added once on a shared envelope rather than

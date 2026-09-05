@@ -217,6 +217,7 @@ Two properties an uploader can rely on:
 | `order-dropped` | `workflow`, `run`, `step`, `reason`, `message` | the shift refused one order; capacity and expiry reasons return the claim to the hub while malformed and unsupported reasons leave it for pickup |
 | `event-queue-overflow` | `dropped` | the socket FIFO evicted events; see below |
 | `ended` | — | an operator ran `owenloop shift end` |
+| `wedged` | `faults[]` (`kind`, `role`, `path`, `message`), `streak` | the shift stopped because the **machine** it runs on is broken, and the process exited non-zero — see below |
 | `gate` | optional `workflow`, `run`, `name`, `question` | reserved; not emitted today |
 
 `kind` is `'exec' | 'agent-run'`.
@@ -232,7 +233,9 @@ The split is not importance. It is what each consumer is:
 
 - A record about a **unit of work that moved** — `dispatched`, `reaped`,
   `failed`, `order-dropped`, `bundle-miss`, `ended` — tells a socket client
-  something it cannot otherwise learn. Both sinks get it.
+  something it cannot otherwise learn. Both sinks get it. `wedged` joins them
+  for the same reason `ended` does: a client parked on a shift that is about to
+  exit is waiting for work that will never arrive.
 - A record about the **shift's own condition** is redundant or harmful on the
   socket, and load-bearing in the file.
 
@@ -358,6 +361,35 @@ that stopped on purpose. A `shift.log` with no trailing `ended` describes a
 shift that is still running, or one that stopped some other way. Those are two
 different questions and the file answers both; do not treat a missing `ended` as
 corruption.
+
+`wedged` is the other deliberate ending, and it says something `ended` does not:
+the shift stopped **itself** because this machine can no longer host it. A shift
+resolves its temp directory once, at start, and that path is not stable for the
+life of a long-running process — macOS gives each boot a fresh per-user temp
+directory, so a shift that survives a reboot holds a path that no longer exists.
+
+Only the temp directory is checked. A shift also holds a state directory, a
+bundle cache and a work root, and it creates all three on demand, so their
+absence is a fresh install rather than a fault — checking them would refuse to
+start every clean shift.
+
+Without this record that fault is invisible and misattributed. Every hub call
+fails with Node's generic `fetch failed`, `pgrep` still shows the process, and
+`shift end` still answers, so the log fills with `hub-error` records blaming the
+network for a local fault. One shift was measured in that state for 42 minutes.
+
+The distinction the record encodes is **local and non-self-healing** versus
+**remote**. A hub outage, a rate-limit ban, an expired credential and a flaky
+network all end without anyone doing anything, so the shift keeps polling and
+emits no `wedged` at all — `faults` is never empty, and its presence means a
+human must change something on the host. Each `message` names the path and the
+fix; for a vanished temp directory the fix is to stop the shift and start a new
+one from a fresh shell, so it inherits the current `TMPDIR`.
+
+`streak` is how many consecutive non-rate-limited hub calls failed before the
+check ran, and is `0` for the check every shift makes at start, before its first
+hub call. It is evidence of what prompted the check, not the reason the shift
+stopped; the `faults` are that.
 
 ### Line size
 
