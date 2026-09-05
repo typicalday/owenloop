@@ -273,6 +273,16 @@ export interface OrderPacket {
    *  proof-aware hub. Absent from any hub that does not store submit proofs;
    *  consume-side verification then reports the artifact as unproven. */
   consumesProof?: string;
+  /** Calls-boundary relay hints, keyed by the PARENT artifact path. When a
+   *  consumed path was produced by a `calls:` step, no submission record can
+   *  exist for the parent path: the engine folds the child's outcome into it
+   *  without a `submit`. A relay-aware hub places the CHILD's own signed
+   *  submission record under the parent path in `consumesProof` and names
+   *  here the child it came from: the child definition digest the parent pins,
+   *  the pinned child outcome version, and the child outcome stem. A worker
+   *  corroborates every hint against its verified local definition bytes
+   *  before trusting the record; the hints never admit a proof-less path. */
+  consumesProofRelay?: Record<string, { childDefDigest: string; childVersion: number; childOutcome: string }>;
   /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;

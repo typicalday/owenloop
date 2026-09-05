@@ -366,6 +366,13 @@ export interface Order {
   /** Opaque proof/signature placeholder for future WP-A4-signed dynamic
    *  consume values. Data-only today — same contract as `owes[].proof`. */
   consumesProof?: string;
+  /** Calls-boundary relay hints keyed by the parent artifact path: for a
+   *  consumed path a `calls:` step produced, the child definition digest the
+   *  parent pins, the pinned child outcome version, and the child outcome stem
+   *  whose signed submission record `consumesProof` carries under the parent
+   *  path. Data-only for the engine — a relay-aware hub projects it and the
+   *  consuming worker verifies it against local definition bytes. */
+  consumesProofRelay?: Record<string, { childDefDigest: string; childVersion: number; childOutcome: string }>;
   /** The trigger that woke this firing (§21). Absent = 'inputsGreen'. */
   cause?: FiringTrigger;
 }

@@ -57,9 +57,33 @@ export interface CreateConsumedVerifierArgs {
   warn?: (line: string) => void;
 }
 
+/** The calls-boundary facts for one consumed path, read by the caller from
+ *  its VERIFIED local definition bytes: the parent's `calls:` step that
+ *  produces the path, the exact child definition digest the parent pins, and
+ *  the child's outcome stem. Never derived from the order. */
+export interface VerifiedCallsProducer {
+  /** The parent step whose `calls:` produces the consumed path. */
+  step: string;
+  /** The `calls:` target as authored on that step. */
+  target: string;
+  /** Exact definition digest the verified parent pins the child at. */
+  childDefDigest: string;
+  /** The verified child definition's single outcome stem (`outputs[0]`). */
+  childOutcome: string;
+}
+
+export interface ConsumedVerifierOptions {
+  hardRule: boolean;
+  /** Calls-boundary context keyed by consumed path. Present only when the
+   *  caller holds the verified definition (the command resolver). Without it
+   *  a relayed record is `unverifiable`, never admitted: the hub's hints alone
+   *  cannot say which child a parent pins. */
+  callsProducers?: Readonly<Record<string, VerifiedCallsProducer>>;
+}
+
 export type ConsumedVerifier = (
   order: OrderPacket,
-  opts: { hardRule: boolean },
+  opts: ConsumedVerifierOptions,
 ) => Promise<ConsumedGateResult | ConsumedGateRefusal>;
 
 function errorText(error: unknown): string {
@@ -67,7 +91,7 @@ function errorText(error: unknown): string {
 }
 
 function linkFor(verdict: Exclude<ConsumedVerdict, { kind: 'verified' | 'absent' }>): string {
-  const match = verdict.reason.match(/^(no-proof|signature|value-digest|version|chain|scope|prerequisite):/);
+  const match = verdict.reason.match(/^(no-proof|signature|value-digest|version|chain|scope|prerequisite|calls):/);
   if (match !== null) return match[1]!;
   return verdict.kind === 'invalid' ? 'signature' : 'prerequisite';
 }
@@ -137,6 +161,82 @@ function parseProofMap(order: OrderPacket):
   return { kind: 'ok', proofs };
 }
 
+interface RelayHint {
+  childDefDigest: string;
+  childVersion: number;
+  childOutcome: string;
+}
+
+function parseRelayMap(order: OrderPacket):
+  | { kind: 'ok'; relays: Record<string, RelayHint> }
+  | { kind: 'unverifiable'; reason: string } {
+  const raw: unknown = order.consumesProofRelay;
+  if (raw === undefined) return { kind: 'ok', relays: {} };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { kind: 'unverifiable', reason: 'prerequisite: consumesProofRelay is not a JSON object' };
+  }
+  const relays: Record<string, RelayHint> = {};
+  for (const [path, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return { kind: 'unverifiable', reason: `prerequisite: consumesProofRelay entry for artifact '${path}' is not an object` };
+    }
+    const entry = value as Record<string, unknown>;
+    if (typeof entry.childDefDigest !== 'string' || entry.childDefDigest === '') {
+      return { kind: 'unverifiable', reason: `prerequisite: consumesProofRelay entry for artifact '${path}' has no non-empty string 'childDefDigest'` };
+    }
+    if (typeof entry.childVersion !== 'number' || !Number.isInteger(entry.childVersion) || entry.childVersion < 0) {
+      return { kind: 'unverifiable', reason: `prerequisite: consumesProofRelay entry for artifact '${path}' has no non-negative integer 'childVersion'` };
+    }
+    if (typeof entry.childOutcome !== 'string' || entry.childOutcome === '') {
+      return { kind: 'unverifiable', reason: `prerequisite: consumesProofRelay entry for artifact '${path}' has no non-empty string 'childOutcome'` };
+    }
+    relays[path] = { childDefDigest: entry.childDefDigest, childVersion: entry.childVersion, childOutcome: entry.childOutcome };
+  }
+  return { kind: 'ok', relays };
+}
+
+/**
+ * Calls boundary. A path a `calls:` step produced has no submission record of
+ * its own: the engine folds the child's outcome into it without a `submit`.
+ * The hub may relay the CHILD's record under the parent path together with
+ * hints naming the child. Every hint is corroborated against the caller's
+ * verified definition bytes before the record is examined; the record itself
+ * must have been signed for exactly the pinned child definition and cover the
+ * child's outcome stem. Nothing here admits a path that carries no record.
+ */
+function relayVerdict(
+  path: string,
+  relay: RelayHint,
+  producers: ConsumedVerifierOptions['callsProducers'],
+): ConsumedVerdict | { kind: 'ok'; producer: VerifiedCallsProducer } {
+  if (producers === undefined) {
+    return {
+      kind: 'unverifiable',
+      reason: `prerequisite: artifact '${path}' carries a calls-boundary relay, but this consumer holds no verified definition to corroborate the calls child against`,
+    };
+  }
+  const producer = producers[path];
+  if (producer === undefined) {
+    return {
+      kind: 'invalid',
+      reason: `calls: artifact '${path}' carries a calls-boundary relay, but the verified definition does not produce it through a calls: step`,
+    };
+  }
+  if (relay.childDefDigest !== producer.childDefDigest) {
+    return {
+      kind: 'invalid',
+      reason: `calls: relay for artifact '${path}' names child definition digest '${relay.childDefDigest}', but the verified definition pins calls: step '${producer.step}' (${producer.target}) at '${producer.childDefDigest}'`,
+    };
+  }
+  if (relay.childOutcome !== producer.childOutcome) {
+    return {
+      kind: 'invalid',
+      reason: `calls: relay for artifact '${path}' names child outcome '${relay.childOutcome}', but the verified child definition for calls: step '${producer.step}' declares outcome '${producer.childOutcome}'`,
+    };
+  }
+  return { kind: 'ok', producer };
+}
+
 /** Create a verifier bound to one injected local environment and clock. */
 export function createConsumedVerifier(args: CreateConsumedVerifierArgs): ConsumedVerifier {
   const policy = mergePolicyFloorWithLocal(
@@ -146,7 +246,7 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
     resolveArtifactPolicy(args.env, args.artifactPolicy),
   ).artifactPolicy;
 
-  return async (order: OrderPacket, opts: { hardRule: boolean }): Promise<ConsumedGateResult | ConsumedGateRefusal> => {
+  return async (order: OrderPacket, opts: ConsumedVerifierOptions): Promise<ConsumedGateResult | ConsumedGateRefusal> => {
     if (Object.keys(order.consumes).length === 0 && order.owes.every((owed) => owed.reasons.length === 0 && owed.proof === undefined)) {
       return { ok: true, order, warnings: [] };
     }
@@ -175,6 +275,7 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
       : undefined;
     const rootPublicKey = root.kind === 'present' ? root.publicKey : '';
     const proofs = parseProofMap(order);
+    const relays = parseRelayMap(order);
     const warnings: string[] = [];
     const chainCache = new Map<string, Promise<ChainVerdict>>();
     const chainValidator = (
@@ -204,6 +305,31 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
         verdict = { kind: 'unverifiable', reason: prerequisite };
       } else if (proofs.kind === 'unverifiable') {
         verdict = { kind: 'unverifiable', reason: proofs.reason };
+      } else if (relays.kind === 'unverifiable') {
+        verdict = { kind: 'unverifiable', reason: relays.reason };
+      } else if (relays.relays[path] !== undefined && proofs.proofs[path] === undefined) {
+        // Hints without a record prove nothing: the path stays unproven.
+        verdict = { kind: 'absent' };
+      } else if (relays.relays[path] !== undefined) {
+        const relay = relays.relays[path];
+        const checked = relayVerdict(path, relay, opts.callsProducers);
+        verdict = checked.kind !== 'ok'
+          ? checked
+          : await verifyConsumed({
+            path,
+            value,
+            proof: proofs.proofs[path]!,
+            // The pinned CHILD outcome version. The parent's
+            // consumedFingerprint[path] counts the parent artifact and is a
+            // different number; a coincidental match must never be relied on.
+            expectedVersion: relay.childVersion,
+            relay: { childDefDigest: checked.producer.childDefDigest, childOutcome: checked.producer.childOutcome },
+            orgRootPublicKey: rootPublicKey,
+            grants,
+            revocations,
+            at,
+            demand: args.demand ?? {},
+          }, verifierOptions);
       } else {
         verdict = await verifyConsumed({
           path,
