@@ -479,6 +479,33 @@ export interface HarnessAdapter {
    * NOT throw from here — a lint pass over a malformed bag returns findings.
    */
   lintStep?(bag: Record<string, unknown>, step: string): LintFinding[];
+
+  /**
+   * Whether this step's sandbox grants it NO writable location at all.
+   *
+   * DELIBERATELY NARROW, AND THE NARROWNESS IS THE POINT. An earlier draft of
+   * this member returned the list of writable roots. That could not be made
+   * true: a vendor composes its writable set from sources this process cannot
+   * see -- on-disk configuration layers, roots granted by a human mid-turn, and
+   * read-only carve-outs the vendor keeps INSIDE each writable root (a `.git`
+   * pointer to an external gitdir, for one). Every one of those makes a list
+   * either overstate or understate what the step may touch, and a brief that
+   * misstates containment is worse than one that says nothing. The vendor also
+   * already tells the model its writable roots when it has any.
+   *
+   * The negative has none of those problems. "No writable root was granted" is
+   * decidable from the step's own resolved permissions, it is the case the
+   * vendor says NOTHING about (it has no roots to name), and it is the case that
+   * cost real work: measured on a live fleet, read-only steps discovered their
+   * own containment one `EPERM` at a time and then filed the resulting unrun
+   * checks as failures of the subject under review rather than as checks that
+   * never ran.
+   *
+   * `false` is not a promise that a write will succeed -- it means only that
+   * this adapter cannot say the step is shut out. An adapter that does not model
+   * a sandbox omits the member entirely.
+   */
+  deniesAllWrites?(permissions: StepPermissions): boolean;
   /**
    * OPTIONAL — the command a HUMAN would run to open this session interactively,
    * for `owenloop work sessions` to print.

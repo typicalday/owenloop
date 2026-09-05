@@ -85,6 +85,16 @@ export interface BriefSpec {
    * were written to close.
    */
   owes?: readonly OwedBrief[];
+  /**
+   * Whether this step's sandbox grants it no writable location at all, as
+   * resolved by the harness adapter from the step's own permissions.
+   *
+   * ONLY `true` RENDERS. Absent or `false` both mean "not known to be shut out",
+   * which is not the same as "may write freely" — this brief deliberately makes
+   * no positive claim about where a step may write, because no claim it could
+   * make would stay true (see `renderWorkspaceLine`).
+   */
+  deniesAllWrites?: boolean;
 }
 
 /**
@@ -148,6 +158,7 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     .join(spec.shiftId ?? '');
   const blocks = [
     renderRoutingLine(spec),
+    renderWorkspaceLine(spec),
     renderInputContract(spec),
     renderSubmitContract(spec),
     renderShapeContract(spec),
@@ -438,6 +449,45 @@ function renderRoutingLine(spec: BriefSpec): string {
         ' it is a recovery attempt, not a first pass.'
       : '';
   return `Routing: this run was started at the '${spec.modifier}' depth modifier.${escalated}`;
+}
+
+/**
+ * That this step cannot write anywhere, stated before it tries.
+ *
+ * WHY THIS EXISTS. Measured on a live fleet: read-only steps discovered their
+ * own containment one denial at a time -- 87 `EPERM` refusals inside a single
+ * step family, every one of them a temporary directory the subject repository's
+ * OWN test helpers create. The cost is not the wasted attempts. It is what the
+ * agent then reported: one grounding step wrote that "34 file tests were not
+ * executed because mkdtemp is blocked by the read-only sandbox", and other
+ * attempts filed the same unrun checks as failures OF THE SUBJECT. A step that
+ * does not know it cannot write will eventually blame the thing it is judging.
+ *
+ * ONLY THE NEGATIVE IS STATED. An earlier draft also named the writable roots
+ * when there were some. That half was removed: a vendor composes its writable
+ * set from sources this process cannot see, so any list would eventually lie,
+ * and a vendor with roots to name already names them itself. The silence worth
+ * breaking is the other one -- a vendor that grants nothing says nothing.
+ *
+ * "Not executed" and "failed" are different findings, and only the agent can
+ * tell them apart at the moment of the denial. That distinction is the whole
+ * point of the line.
+ *
+ * Vendor-neutral by construction: no sandbox mode or vendor name appears here,
+ * only the fact the adapter resolved.
+ */
+function renderWorkspaceLine(spec: BriefSpec): string {
+  if (spec.deniesAllWrites !== true) return '';
+  return (
+    "Workspace: this step's sandbox grants it no writable location — not your" +
+    ' working directory, not the system temp directory, not /tmp. A write is' +
+    ' refused unless a person separately approves that one action, so treat' +
+    ' writing as unavailable: creating a temporary directory fails, and any check' +
+    ' that cannot run without writing will not run here. Report such a check as' +
+    ' NOT EXECUTED and say why. Do NOT report it as a failure of the thing you' +
+    ' are examining, and do not count it against the subject — an unrun check is' +
+    ' missing evidence, not adverse evidence.'
+  );
 }
 
 /**

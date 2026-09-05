@@ -27,10 +27,16 @@ import {
   renderRecoveryWake,
 } from '../src/agent/brief.ts';
 import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
-import { createFakeAdapter } from '../src/harness/fake.ts';
+import { createFakeAdapter, type FakeAdapter } from '../src/harness/fake.ts';
 import { claudeAdapter, deliverClaude, startClaude, type ClaudeQueryFactory } from '../src/harness/claude.ts';
 import type { MergedRoster } from '../src/settings/roster.ts';
-import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
+import type {
+  AgentEvent,
+  HarnessAdapter,
+  HarnessSessionRef,
+  StartArgs,
+  StepPermissions,
+} from '../src/harness/contract.ts';
 import { HarnessTurnError, ResumeUnavailableError } from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
 import { HubError, type ContactHolder, type GetOrderResponse, type ReasonEntry } from '../src/hub/types.ts';
@@ -1652,6 +1658,64 @@ test('the run modifier reaches the brief, and an engine escalation says so', asy
   // without one is not "at the default depth", it is depth-less.
   const none = await startArgsFor({ capabilities: ['build:deep'] });
   assert.ok(!none.brief.includes('Routing:'));
+});
+
+/**
+ * Run one order under a caller-supplied adapter and return the brief the harness
+ * was started with.
+ *
+ * `startArgsFor` builds its own bare fake, and a bare fake cannot answer the
+ * containment question at all -- which is the whole subject of the tests below.
+ */
+async function briefUnder(adapter: FakeAdapter, spec?: NormalizedStepSpec): Promise<string> {
+  const { hub } = mockHub({ getOrder: [agentOrder({}), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter, ...(spec !== undefined ? { spec } : {}) });
+  await createAgentRunLoop(h.opts).run();
+  const start = adapter.calls.find((c) => c.kind === 'start');
+  assert.ok(start !== undefined && start.kind === 'start');
+  return start.args.brief;
+}
+
+test("a step that cannot write is told so, and the ADAPTER decides on the step's own permissions", async () => {
+  // Two claims in one test because they are one mechanism: the loop must not
+  // decide containment itself -- only the adapter knows what its own sandbox
+  // grants -- and the answer it gives must be the one that reaches the brief.
+  const asked: StepPermissions[] = [];
+  const base = createFakeAdapter();
+  const adapter: FakeAdapter = {
+    ...base,
+    deniesAllWrites: (permissions) => {
+      asked.push(permissions);
+      return true;
+    },
+  };
+  const spec: NormalizedStepSpec = {
+    step: 'builder',
+    brief: TEMPLATE,
+    permissions: { extensions: { marker: 'this-step' } },
+  };
+
+  const brief = await briefUnder(adapter, spec);
+
+  assert.match(brief, /^Workspace: this step's sandbox grants it no writable location/mu);
+  assert.equal(asked.length, 1, 'asked exactly once, for this turn');
+  assert.equal(
+    asked[0]?.extensions?.['marker'],
+    'this-step',
+    "the adapter is asked about THIS step's permissions, not some ambient default",
+  );
+});
+
+test('a step not known to be shut out is told nothing about its workspace', async () => {
+  // Both silences, because they must stay the same silence. `false` is not a
+  // claim that writing is permitted, and an adapter that does not model a
+  // sandbox at all must not be read as either answer.
+  const answered: FakeAdapter = { ...createFakeAdapter(), deniesAllWrites: () => false };
+  assert.ok(!(await briefUnder(answered)).includes('Workspace:'), 'a false answer renders nothing');
+
+  const silent = createFakeAdapter();
+  assert.equal(silent.deniesAllWrites, undefined, 'the bare fake models no sandbox');
+  assert.ok(!(await briefUnder(silent)).includes('Workspace:'), 'an absent member renders nothing');
 });
 
 // ---- the invariant: the hub decides, never the harness -----------------------

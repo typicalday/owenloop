@@ -1009,6 +1009,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       ...(packet.modifier !== undefined ? { modifier: packet.modifier } : {}),
       ...(packet.escalated === true ? { escalated: true } : {}),
       owes: briefOwes(packet),
+      // Only the adapter knows whether its own sandbox leaves this step a place
+      // to write. `false`/absent render nothing, so a `false` here is silence,
+      // not a claim that writing is permitted.
+      deniesAllWrites: active.deniesAllWrites?.(step.permissions) === true,
     };
     const permissions = step.permissions;
 

@@ -1309,11 +1309,40 @@ function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
   return findings;
 }
 
+/**
+ * What this sandbox lets the step write, as plain paths.
+ *
+ * The three modes map cleanly: `read-only` writes nowhere; `danger-full-access`
+ * writes everywhere, which no finite list describes, so it answers `undefined`
+ * rather than a list that would read as a restriction; `workspace-write` writes
+ * to the working directory plus the two temp roots this vendor grants by
+ * default, minus whichever of those two the step excluded itself.
+ *
+ * A permissions bag this adapter would refuse at preflight answers `undefined`
+ * too: `resolveSandbox` throws on it, and a brief line is not the place to
+ * surface a configuration error that `preflight` already reports properly.
+ */
+function deniesAllWrites(permissions: StepPermissions): boolean {
+  let sandbox: string;
+  try {
+    sandbox = resolveSandbox(permissions);
+  } catch {
+    // A bag this adapter refuses is a bag it cannot reason about. Claiming the
+    // step is shut out would be a guess, and the honest answer to a guess here
+    // is silence.
+    return false;
+  }
+  // Only `read-only` grants no writable root. The other two modes grant at
+  // least one, and the vendor names those itself, so this adapter does not.
+  return sandbox === 'read-only';
+}
+
 export const codexAdapter: HarnessAdapter = {
   id: HARNESS_ID,
   resumeTier: 'native-token',
   preflight: codexPreflight,
   lintStep,
+  deniesAllWrites,
 
   /**
    * The command a human runs to re-open this thread in an interactive terminal.
