@@ -29,6 +29,10 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 function mockHub(wakeChanged = false): { hub: HubClient; pings: Array<Record<string, unknown>> } {
   const pings: Array<Record<string, unknown>> = [];
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async wake() { return { text: '', cursor: 1, changed: wakeChanged }; },
     async presencePing(req) { pings.push({ ...req }); return { text: '', ok: true, name: req.name, lastSeen: 1 }; },
     async whatsNext() { return { text: '', workflow: 'wf1', def: 'demo', orders: [] }; },
@@ -135,6 +139,10 @@ test('attendance recorded DURING an in-flight ping still forces the very next pi
   const pings: Array<Record<string, unknown>> = [];
   let releasePing: (() => void) | undefined;
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async wake() { return { text: '', cursor: 1, changed: false }; },
     async presencePing(req) {
       pings.push({ ...req });

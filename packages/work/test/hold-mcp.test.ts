@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -26,6 +26,7 @@ interface HubCfg {
   submit?: { outcome?: string; closed?: boolean } | Error | Array<{ outcome?: string; closed?: boolean } | Error>;
   reject?: { ok?: boolean; closed?: boolean } | Error;
   ask?: { ok?: boolean; closed?: boolean } | Error;
+  putFileArtifact?: Error;
 }
 
 const PUB_TEXT = readFileSync(new URL('../../../test/fixtures/crypto/fixture-key.pub', import.meta.url), 'utf8');
@@ -86,6 +87,23 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
       if (s instanceof Error) throw s;
       return { text: 'ok', ok: s.ok ?? true, closed: s.closed };
     },
+    async putFileArtifact(req: { bytes: Uint8Array; contentType: string; filename?: string }) {
+      calls.push({
+        verb: 'put_file_artifact',
+        // The bytes themselves are not a useful assertion target; their LENGTH
+        // is, because it proves the tool read the file rather than the path.
+        arg: { byteLength: req.bytes.byteLength, contentType: req.contentType, filename: req.filename },
+      });
+      if (cfg.putFileArtifact instanceof Error) throw cfg.putFileArtifact;
+      return {
+        text: 'stored',
+        __file: true,
+        hash: 'a'.repeat(64),
+        size: req.bytes.byteLength,
+        contentType: req.contentType,
+        filename: req.filename,
+      };
+    },
     async heartbeat() {
       return { text: '' };
     },
@@ -144,10 +162,16 @@ function producerOrderResponse(): GetOrderResponse {
 
 // ---- shape ------------------------------------------------------------------
 
-test('the mount exposes exactly ask, get_order, reject, and submit, plus the lease loop', () => {
+test('the mount exposes exactly ask, get_order, put_file_artifact, reject, and submit, plus the lease loop', () => {
   const { hub } = mockHub({});
   const mount = createHoldMcp(deps(hub));
-  assert.deepEqual(mount.tools.map((t) => t.name).sort(), ['ask', 'get_order', 'reject', 'submit']);
+  assert.deepEqual(mount.tools.map((t) => t.name).sort(), [
+    'ask',
+    'get_order',
+    'put_file_artifact',
+    'reject',
+    'submit',
+  ]);
   const reject = tool(mount.tools, 'reject');
   assert.deepEqual(reject.inputSchema, {
     type: 'object',
@@ -748,4 +772,158 @@ test('after a closing submit ends the hold, further tool calls fast-fail (double
   const r = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad' }, ctx);
   assert.equal((r as { isError?: boolean }).isError, true);
   assert.equal(calls.length, before);
+});
+
+
+// ---- put_file_artifact ------------------------------------------------------
+//
+// The file channel exists because an artifact VALUE lives in the org database
+// and is size-capped, while a step's real output is sometimes a rendered video
+// or a screenshot. These tests pin the two properties that make the channel
+// safe to hand a model: it reads only from inside the run's own working
+// directory, and what it hands back is exactly the envelope the step then
+// submits — nothing the artifact schema would reject.
+
+function fileFixture(): { dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'hold-mcp-file-'));
+  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test('put_file_artifact uploads a contained file and returns the submittable envelope', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    writeFileSync(join(dir, 'render.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]));
+    const { hub, calls } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: dir }));
+    const res = await tool(mount.tools, 'put_file_artifact').handler({ file: 'render.png' }, ctx);
+    assert.notEqual((res as { isError?: boolean }).isError, true);
+    const body = parse(res);
+    assert.deepEqual(body.pointer, {
+      __file: true,
+      hash: 'a'.repeat(64),
+      size: 5,
+      contentType: 'image/png',
+      filename: 'render.png',
+    });
+    // The content type came from the extension, and the size came from the
+    // bytes actually read off disk.
+    assert.deepEqual(calls.at(-1), {
+      verb: 'put_file_artifact',
+      arg: { byteLength: 5, contentType: 'image/png', filename: 'render.png' },
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test('put_file_artifact honours an explicit contentType and filename over the extension guess', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    writeFileSync(join(dir, 'clip.bin'), Buffer.from('mp4-ish'));
+    const { hub, calls } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: dir }));
+    const res = await tool(mount.tools, 'put_file_artifact').handler(
+      { file: 'clip.bin', contentType: 'video/mp4', filename: 'walkthrough.mp4' },
+      ctx,
+    );
+    assert.equal(parse(res).pointer.contentType, 'video/mp4');
+    assert.equal(parse(res).pointer.filename, 'walkthrough.mp4');
+    assert.equal((calls.at(-1)!.arg as { contentType: string }).contentType, 'video/mp4');
+  } finally {
+    cleanup();
+  }
+});
+
+test('put_file_artifact guesses application/octet-stream for an unknown extension', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    writeFileSync(join(dir, 'thing.qqq'), Buffer.from('x'));
+    const { hub } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: dir }));
+    const res = await tool(mount.tools, 'put_file_artifact').handler({ file: 'thing.qqq' }, ctx);
+    assert.equal(parse(res).pointer.contentType, 'application/octet-stream');
+  } finally {
+    cleanup();
+  }
+});
+
+test('put_file_artifact refuses a path outside the run workdir, and never calls the hub', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    const inner = join(dir, 'work');
+    mkdirSync(inner);
+    writeFileSync(join(dir, 'secret.pem'), Buffer.from('private'));
+    const { hub, calls } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: inner }));
+    const res = await tool(mount.tools, 'put_file_artifact').handler({ file: '../secret.pem' }, ctx);
+    assert.equal((res as { isError?: boolean }).isError, true);
+    assert.match(parse(res).error, /file-artifact-outside-workdir/);
+    assert.equal(calls.filter((c) => c.verb === 'put_file_artifact').length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test('put_file_artifact refuses a symlink that points out of the run workdir', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    const inner = join(dir, 'work');
+    mkdirSync(inner);
+    writeFileSync(join(dir, 'secret.pem'), Buffer.from('private'));
+    // Lexically inside, canonically outside — the case a traversal check alone
+    // would happily read.
+    symlinkSync(join(dir, 'secret.pem'), join(inner, 'evidence.png'));
+    const { hub, calls } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: inner }));
+    const res = await tool(mount.tools, 'put_file_artifact').handler({ file: 'evidence.png' }, ctx);
+    assert.equal((res as { isError?: boolean }).isError, true);
+    assert.match(parse(res).error, /file-artifact-outside-workdir/);
+    assert.equal(calls.filter((c) => c.verb === 'put_file_artifact').length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test('put_file_artifact names a missing file and an empty file distinctly', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    writeFileSync(join(dir, 'empty.png'), Buffer.alloc(0));
+    const { hub } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: dir }));
+    const missing = await tool(mount.tools, 'put_file_artifact').handler({ file: 'gone.png' }, ctx);
+    assert.match(parse(missing).error, /file-artifact-read-failed.*gone\.png/u);
+    const empty = await tool(mount.tools, 'put_file_artifact').handler({ file: 'empty.png' }, ctx);
+    assert.match(parse(empty).error, /file-artifact-empty/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('put_file_artifact validates its arguments before touching the filesystem', async () => {
+  const { hub, calls } = mockHub({});
+  const mount = createHoldMcp(deps(hub));
+  for (const args of [{}, { file: '' }, { file: 'a.png', contentType: '' }, { file: 'a.png', filename: 42 }]) {
+    const res = await tool(mount.tools, 'put_file_artifact').handler(args, ctx);
+    assert.equal((res as { isError?: boolean }).isError, true, JSON.stringify(args));
+    assert.match(parse(res).error, /file-artifact-invalid/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('put_file_artifact refuses once the hold is terminal', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    writeFileSync(join(dir, 'render.png'), Buffer.from('x'));
+    const { hub, calls } = mockHub({ submit: { outcome: 'green', closed: true } });
+    const mount = createHoldMcp(deps(hub, { workdir: dir }));
+    await tool(mount.tools, 'submit').handler({ path: 'pr', value: 1, done: true }, ctx);
+    assert.equal(await mount.loop.run(), 'stopped');
+    const before = calls.length;
+    const res = await tool(mount.tools, 'put_file_artifact').handler({ file: 'render.png' }, ctx);
+    assert.equal((res as { isError?: boolean }).isError, true);
+    assert.match(parse(res).error, /no longer held/);
+    assert.equal(calls.length, before);
+  } finally {
+    cleanup();
+  }
 });

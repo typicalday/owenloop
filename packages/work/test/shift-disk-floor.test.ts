@@ -137,6 +137,10 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 /** A hub that always reports a changed cursor, so every tick wants to sweep. */
 function mockHub(onWhatsNext: () => void): HubClient {
   return {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async wake() { return { text: '', cursor: 1, changed: true }; },
     async presencePing(req) { return { text: '', ok: true, name: req.name, lastSeen: 1 }; },
     async whatsNext() {

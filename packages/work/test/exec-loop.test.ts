@@ -157,6 +157,10 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
   let askIdx = 0;
 
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async getOrder(req) {
       calls.push({ verb: 'get_order', arg: req });
       const s = cfg.getOrder;

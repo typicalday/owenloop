@@ -99,6 +99,10 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
   let wakeIdx = 0;
   let presenceIdx = 0;
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async wake(cursor) {
       calls.push({ verb: 'wake', arg: cursor });
       const seq = cfg.wake ?? [{ changed: true, cursor: 1 }];
@@ -2237,6 +2241,10 @@ test('e2e: iterate() dispatches an agent order, parks quiet, and re-sweeps only 
   let openOrders: WorkOrder[] = [wo('run_deadbeef', 'builder')];
   let cursor: number | undefined;
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async wake(c) {
       cursor = c;
       const changed = c === undefined || c < events;
