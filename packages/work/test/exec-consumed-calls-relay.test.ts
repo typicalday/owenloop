@@ -239,14 +239,16 @@ test('calls relay e2e: a relayed child record admits a calls-produced consumed a
   if (result.ok) assert.match(result.command, /integrate-ran/);
 });
 
-test('calls relay e2e: no record for the calls-produced path is still absent and refused (agent-produced child, old hub)', async () => {
+const NO_RELAY_REASON = /\(calls\) .* artifact 'u1': artifact 'u1' is produced by calls: step 'unit1' \(dep\/change-unit@1\.0\.0\), so only a relayed child proof can prove it, but the order carries no consumesProofRelay entry for it/;
+
+test('calls relay e2e: a calls-produced path with neither record nor relay is refused at the calls boundary (agent-produced child, old hub)', async () => {
   const fixtureData = await fixture('qualified');
   const { consumesProofRelay: _relay, ...noRelay } = order(fixtureData);
   const reason = await refusalReason(fixtureData, {
     ...noRelay,
     consumesProof: JSON.stringify({ plan: planProof(PLAN_VALUE, fixtureData.parentDigest) }),
   });
-  assert.match(reason, /consumed artifact refusal \(no-proof\) .* artifact 'u1'/);
+  assert.match(reason, NO_RELAY_REASON);
 });
 
 test('calls relay e2e: relay hints without a record prove nothing', async () => {
@@ -257,11 +259,72 @@ test('calls relay e2e: relay hints without a record prove nothing', async () => 
   assert.match(reason, /\(no-proof\) .* artifact 'u1'/);
 });
 
-test('calls relay e2e: the child record without the relay is refused as a record for the wrong artifact', async () => {
+test('calls relay e2e: the child record without the relay is refused at the calls boundary, not by ordinary verification', async () => {
   const fixtureData = await fixture('qualified');
   const { consumesProofRelay: _relay, ...noRelay } = order(fixtureData);
   const reason = await refusalReason(fixtureData, noRelay);
-  assert.match(reason, /\(signature\) .* artifact 'u1': signed submission record does not cover artifact 'u1'/);
+  assert.match(reason, NO_RELAY_REASON);
+  assert.doesNotMatch(reason, /\(signature\)/);
+});
+
+/**
+ * The record a hostile hub would replay: validly signed by a trusted producer,
+ * covering the PARENT path `u1` itself with the consumed value's digest and the
+ * parent's own fingerprint version, but signed for an unrelated definition.
+ * Ordinary verification never looks at `defDigest`, so it would admit this.
+ */
+function replayedParentPathProof(fixtureData: Fixture): string {
+  return childProof(U1_VALUE, fixtureData.childDigest, { defDigest: OTHER_DIGEST, artifact: 'u1', version: 1 });
+}
+
+test('calls relay e2e: a trusted record covering the parent path under an unrelated definition is refused without a relay', async () => {
+  const fixtureData = await fixture('qualified');
+  const { consumesProofRelay: _relay, ...noRelay } = order(fixtureData);
+  const packet: OrderPacket = {
+    ...noRelay,
+    consumesProof: JSON.stringify({
+      plan: planProof(PLAN_VALUE, fixtureData.parentDigest),
+      u1: replayedParentPathProof(fixtureData),
+    }),
+  };
+
+  // Control: with no verified definition in hand (no callsProducers), the
+  // very same record passes ordinary verification under the hard rule. That
+  // is the hole the boundary closes for a consumer that DOES hold the def.
+  const ordinary = await verifierFor(fixtureData, 'enforce')(packet, { hardRule: true });
+  assert.equal(ordinary.ok, true, JSON.stringify(ordinary));
+
+  const reason = await refusalReason(fixtureData, packet);
+  assert.match(reason, NO_RELAY_REASON);
+  assert.doesNotMatch(reason, /\(signature\)|\(value-digest\)|\(version\)|\(no-proof\)/);
+});
+
+test('calls relay e2e: a trusted record covering the parent path under an unrelated definition is refused when the relay names the pinned child', async () => {
+  const fixtureData = await fixture('qualified');
+  const reason = await refusalReason(fixtureData, order(fixtureData, {
+    consumesProof: JSON.stringify({
+      plan: planProof(PLAN_VALUE, fixtureData.parentDigest),
+      u1: replayedParentPathProof(fixtureData),
+    }),
+    // The hint corroborates against the verified parent; the record does not.
+    consumesProofRelay: { u1: { childDefDigest: fixtureData.childDigest, childVersion: 1, childOutcome: 'result' } },
+  }));
+  assert.match(reason, /\(calls\) .* artifact 'u1': relayed submission record for artifact 'u1' was signed for definition digest 'd{64}', but the verified parent definition pins its calls child at '/);
+});
+
+test('calls relay e2e: a relay on a non-calls path is refused before the record shortcut, even with no record for that path', async () => {
+  const fixtureData = await fixture('qualified');
+  const reason = await refusalReason(fixtureData, order(fixtureData, {
+    // No record for `plan` at all: without the boundary rule this would be
+    // the `absent` shortcut, not a named calls refusal.
+    consumesProof: JSON.stringify({ u1: childProof(U1_VALUE, fixtureData.childDigest) }),
+    consumesProofRelay: {
+      plan: { childDefDigest: fixtureData.childDigest, childVersion: 1, childOutcome: 'result' },
+      u1: { childDefDigest: fixtureData.childDigest, childVersion: CHILD_VERSION, childOutcome: 'result' },
+    },
+  }));
+  assert.match(reason, /\(calls\) .* artifact 'plan': artifact 'plan' carries a calls-boundary relay, but the verified definition does not produce it through a calls: step/);
+  assert.doesNotMatch(reason, /\(no-proof\)/);
 });
 
 test('calls relay e2e: a relay naming a child digest the verified parent does not pin is refused at the calls boundary', async () => {

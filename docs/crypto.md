@@ -872,9 +872,18 @@ every hint is corroborated by bytes it verified itself:
   signature plus the verified definition bytes.
 
 Any mismatch is `invalid` under the `calls` link and refuses under the hard
-rule. Hints without a record leave the path `absent`. A relay reaching a
-consumer that holds no verified definition (an agent worker) is `unverifiable`
-and follows the configured artifact policy like any other non-verified verdict.
+rule. The boundary is exclusive in both directions: a path the verified
+definition produces through a `calls:` step accepts only the relay contract, so
+an order carrying no `consumesProofRelay` entry for it is `invalid` under the
+`calls` link and never falls through to ordinary verification (which does not
+check a record's signed definition digest, so any trusted record covering the
+parent path with a matching value and version could otherwise stand in for the
+child's outcome). A relay offered for a path the verified definition does not
+produce through a `calls:` step is likewise `invalid`, record or no record.
+Hints without a record on a calls-produced path leave it `absent`. A relay
+reaching a consumer that holds no verified definition (an agent worker) is
+`unverifiable` and follows the configured artifact policy like any other
+non-verified verdict.
 Nothing in the relay relaxes the hard rule for a non-calls path, and no policy,
 floor, or environment variable can. Unchanged residual: a relayed record, like
 every submission record, is bound to the producing run and artifact version,

@@ -203,38 +203,79 @@ function parseRelayMap(order: OrderPacket):
  * verified definition bytes before the record is examined; the record itself
  * must have been signed for exactly the pinned child definition and cover the
  * child's outcome stem. Nothing here admits a path that carries no record.
+ *
+ * The boundary is exclusive in both directions. A path the verified
+ * definition produces through a `calls:` step accepts ONLY the relay contract:
+ * ordinary verification never compares a record's signed definition digest
+ * with anything, so letting a calls-produced path fall through to it would let
+ * any trusted record covering the parent path with a matching value and
+ * version stand in for the child's outcome. And a relay offered for a path the
+ * verified definition does not produce through a `calls:` step is refused
+ * outright, with or without a record.
  */
-function relayVerdict(
+type CallsBoundary =
+  | { kind: 'ordinary' }
+  | { kind: 'relay'; relay: RelayHint; producer: VerifiedCallsProducer }
+  | { kind: 'uncorroborated'; verdict: ConsumedVerdict }
+  | { kind: 'refused'; verdict: ConsumedVerdict };
+
+function callsBoundary(
   path: string,
-  relay: RelayHint,
+  relay: RelayHint | undefined,
   producers: ConsumedVerifierOptions['callsProducers'],
-): ConsumedVerdict | { kind: 'ok'; producer: VerifiedCallsProducer } {
+): CallsBoundary {
   if (producers === undefined) {
+    // A consumer with no verified definition (an agent worker) can neither
+    // confirm nor deny that the path is calls-produced: without a relay the
+    // path is an ordinary one to it, and with one it cannot corroborate.
+    if (relay === undefined) return { kind: 'ordinary' };
     return {
-      kind: 'unverifiable',
-      reason: `prerequisite: artifact '${path}' carries a calls-boundary relay, but this consumer holds no verified definition to corroborate the calls child against`,
+      kind: 'uncorroborated',
+      verdict: {
+        kind: 'unverifiable',
+        reason: `prerequisite: artifact '${path}' carries a calls-boundary relay, but this consumer holds no verified definition to corroborate the calls child against`,
+      },
     };
   }
   const producer = producers[path];
   if (producer === undefined) {
+    if (relay === undefined) return { kind: 'ordinary' };
     return {
-      kind: 'invalid',
-      reason: `calls: artifact '${path}' carries a calls-boundary relay, but the verified definition does not produce it through a calls: step`,
+      kind: 'refused',
+      verdict: {
+        kind: 'invalid',
+        reason: `calls: artifact '${path}' carries a calls-boundary relay, but the verified definition does not produce it through a calls: step`,
+      },
+    };
+  }
+  if (relay === undefined) {
+    return {
+      kind: 'refused',
+      verdict: {
+        kind: 'invalid',
+        reason: `calls: artifact '${path}' is produced by calls: step '${producer.step}' (${producer.target}), so only a relayed child proof can prove it, but the order carries no consumesProofRelay entry for it`,
+      },
     };
   }
   if (relay.childDefDigest !== producer.childDefDigest) {
     return {
-      kind: 'invalid',
-      reason: `calls: relay for artifact '${path}' names child definition digest '${relay.childDefDigest}', but the verified definition pins calls: step '${producer.step}' (${producer.target}) at '${producer.childDefDigest}'`,
+      kind: 'refused',
+      verdict: {
+        kind: 'invalid',
+        reason: `calls: relay for artifact '${path}' names child definition digest '${relay.childDefDigest}', but the verified definition pins calls: step '${producer.step}' (${producer.target}) at '${producer.childDefDigest}'`,
+      },
     };
   }
   if (relay.childOutcome !== producer.childOutcome) {
     return {
-      kind: 'invalid',
-      reason: `calls: relay for artifact '${path}' names child outcome '${relay.childOutcome}', but the verified child definition for calls: step '${producer.step}' declares outcome '${producer.childOutcome}'`,
+      kind: 'refused',
+      verdict: {
+        kind: 'invalid',
+        reason: `calls: relay for artifact '${path}' names child outcome '${relay.childOutcome}', but the verified child definition for calls: step '${producer.step}' declares outcome '${producer.childOutcome}'`,
+      },
     };
   }
-  return { kind: 'ok', producer };
+  return { kind: 'relay', relay, producer };
 }
 
 /** Create a verifier bound to one injected local environment and clock. */
@@ -307,41 +348,47 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
         verdict = { kind: 'unverifiable', reason: proofs.reason };
       } else if (relays.kind === 'unverifiable') {
         verdict = { kind: 'unverifiable', reason: relays.reason };
-      } else if (relays.relays[path] !== undefined && proofs.proofs[path] === undefined) {
-        // Hints without a record prove nothing: the path stays unproven.
-        verdict = { kind: 'absent' };
-      } else if (relays.relays[path] !== undefined) {
-        const relay = relays.relays[path];
-        const checked = relayVerdict(path, relay, opts.callsProducers);
-        verdict = checked.kind !== 'ok'
-          ? checked
-          : await verifyConsumed({
+      } else {
+        // The calls boundary is settled before any record is consulted: a
+        // calls-produced path without a relay, or a relay on a non-calls
+        // path, is refused here and never reaches ordinary verification.
+        const boundary = callsBoundary(path, relays.relays[path], opts.callsProducers);
+        if (boundary.kind === 'refused') {
+          verdict = boundary.verdict;
+        } else if (boundary.kind !== 'ordinary' && proofs.proofs[path] === undefined) {
+          // Hints without a record prove nothing: the path stays unproven.
+          verdict = { kind: 'absent' };
+        } else if (boundary.kind === 'uncorroborated') {
+          verdict = boundary.verdict;
+        } else if (boundary.kind === 'relay') {
+          verdict = await verifyConsumed({
             path,
             value,
             proof: proofs.proofs[path]!,
             // The pinned CHILD outcome version. The parent's
             // consumedFingerprint[path] counts the parent artifact and is a
             // different number; a coincidental match must never be relied on.
-            expectedVersion: relay.childVersion,
-            relay: { childDefDigest: checked.producer.childDefDigest, childOutcome: checked.producer.childOutcome },
+            expectedVersion: boundary.relay.childVersion,
+            relay: { childDefDigest: boundary.producer.childDefDigest, childOutcome: boundary.producer.childOutcome },
             orgRootPublicKey: rootPublicKey,
             grants,
             revocations,
             at,
             demand: args.demand ?? {},
           }, verifierOptions);
-      } else {
-        verdict = await verifyConsumed({
-          path,
-          value,
-          ...(proofs.proofs[path] === undefined ? {} : { proof: proofs.proofs[path] }),
-          ...(order.consumedFingerprint?.[path] === undefined ? {} : { expectedVersion: order.consumedFingerprint[path] }),
-          orgRootPublicKey: rootPublicKey,
-          grants,
-          revocations,
-          at,
-          demand: args.demand ?? {},
-        }, verifierOptions);
+        } else {
+          verdict = await verifyConsumed({
+            path,
+            value,
+            ...(proofs.proofs[path] === undefined ? {} : { proof: proofs.proofs[path] }),
+            ...(order.consumedFingerprint?.[path] === undefined ? {} : { expectedVersion: order.consumedFingerprint[path] }),
+            orgRootPublicKey: rootPublicKey,
+            grants,
+            revocations,
+            at,
+            demand: args.demand ?? {},
+          }, verifierOptions);
+        }
       }
       const result = policyOutcome(order, opts.hardRule, policy, path, verdict, warnings);
       if (result !== undefined) return result;
