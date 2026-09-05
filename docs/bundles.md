@@ -172,7 +172,11 @@ Using that worker's scoped bearer, it reads raw canonical bytes from
 `GET /api/publications/<digest>`, and optional origin evidence from
 `GET /api/origins/<digest>`, then installs only into the global store. The
 original store lookup is retried once after a successful install; a store hit
-does no hub I/O.
+does no hub I/O. The same recovery serves a lock-pinned `calls:` child that a
+verified parent needs but neither store holds: the worker asks the hub for the
+CHILD's digest, installs it, and re-resolves the parent, and a child the hub
+cannot supply is the named `dependency-missing` store refusal, not a
+corrupt-object verdict.
 
 Recovery is fail-closed. The installer compares the ingested canonical digest
 with the order digest before any object or index mutation, and the required

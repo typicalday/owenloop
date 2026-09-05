@@ -274,7 +274,11 @@ test('store instruction source: locked dependency failures are target-specific a
   });
   await assert.rejects(
     missingSource.prime(missing.parent.result.digest),
-    new RegExp(`locked calls target '${missing.target}' digest ${missing.child.result.digest} is absent from every configured workflow store root`),
+    (error: unknown) =>
+      error instanceof StoreIntegrityError
+      && error.code === 'dependency-missing'
+      && error.digest === missing.child.result.digest
+      && new RegExp(`locked calls target '${missing.target}' digest ${missing.child.result.digest} pinned by parent bundle ${missing.parent.result.digest} is absent from every configured workflow store root`).test(error.message),
   );
 
   const corrupt = await installLockedPair();

@@ -138,10 +138,14 @@ export class StoreNotFoundError extends WorkflowStoreError {
   }
 }
 
-/** An index entry names a digest whose object is missing or failed verification. */
+/**
+ * An index entry names a digest whose object is missing or failed verification,
+ * or a verified object pins a lock target (`dependency-missing`, carrying the
+ * CHILD digest) that no configured store root holds.
+ */
 export class StoreIntegrityError extends WorkflowStoreError {
   readonly digest: string;
-  constructor(code: 'object-missing' | 'object-corrupt', digest: string, detail: string) {
+  constructor(code: 'object-missing' | 'object-corrupt' | 'dependency-missing', digest: string, detail: string) {
     super(code, `object ${digest}: ${detail}`);
     this.name = 'StoreIntegrityError';
     this.digest = digest;

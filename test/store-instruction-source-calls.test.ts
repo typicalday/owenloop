@@ -5,6 +5,7 @@ import {
   createBundleIngestor,
   createStoreInstructionSource,
   readWorkflowStoreIndex,
+  StoreIntegrityError,
   storeIndexPath,
   writeWorkflowStoreIndex,
 } from '../src/store/index.ts';
@@ -124,4 +125,88 @@ test('store instruction source: a bare sibling calls target resolves to the pare
   assert.equal(resolved.target, 'change-unit');
   assert.equal(resolved.definition.name, 'change-unit');
   assert.deepEqual(resolved.definition.outputs, ['result']);
+});
+
+// A worker store that holds the parent alone. The parent's install-time lock
+// revalidation needs the child callable somewhere, so the child lives in a
+// separate publisher store that the worker's source never configures — the
+// shape a worker is in after authenticated recovery pulled the parent bundle.
+async function parentOnlyStore() {
+  const target = 'dep/change-unit@1.0.0';
+  const publisher = tempDir('owenloop-calls-publisher-');
+  const worker = tempDir('owenloop-calls-worker-');
+  const childSource = writeBundleSource({ name: 'change-unit', workflow: CHILD });
+  const child = await installBundleFixture({ root: publisher, sourceDir: childSource });
+  addIndexEntry(publisher, target, child.result.digest);
+  const installed = await installBundleFixture({
+    root: worker,
+    level: 'global',
+    projectRoot: publisher,
+    globalRoot: worker,
+    sourceDir: writeBundleSource({
+      name: 'parent',
+      workflow: parent('parent', target),
+      lock: { [target]: child.result.digest },
+    }),
+  });
+  return { worker, childSource, target, childDigest: child.result.digest, parentDigest: installed.result.digest };
+}
+
+function workerSource(root: string, onMissing?: (defDigest: string) => Promise<'retry' | 'refuse'>) {
+  return createStoreInstructionSource({
+    projectRoot: tempDir('owenloop-calls-worker-project-'),
+    globalRoot: root,
+    verifier: createBundleIngestor(),
+    ...(onMissing === undefined ? {} : { onMissing: { onMissing } }),
+  });
+}
+
+test('a lock-pinned child absent from every store root is recovered through onMissing with the CHILD digest', async () => {
+  const store = await parentOnlyStore();
+  const requested: string[] = [];
+  const source = workerSource(store.worker, async (defDigest) => {
+    requested.push(defDigest);
+    // The pull supplies the child; only then does the parent re-resolve.
+    await installBundleFixture({ root: store.worker, sourceDir: store.childSource });
+    return 'retry';
+  });
+
+  assert.equal(await source.prime(store.parentDigest), 'resolved');
+  assert.deepEqual(requested, [store.childDigest]);
+  assert.ok(source.getVerifiedCallsChild !== undefined);
+  const resolved = source.getVerifiedCallsChild(store.parentDigest, 'integrate', 'unit1');
+  assert.ok(resolved !== undefined);
+  assert.equal(resolved.bundleDigest, store.childDigest);
+  assert.equal(resolved.target, store.target);
+});
+
+test('a lock-pinned child still absent after recovery is the named dependency-missing refusal, asked for once', async () => {
+  const store = await parentOnlyStore();
+  const isNamedMissingChild = (error: unknown): boolean =>
+    error instanceof StoreIntegrityError
+    && error.code === 'dependency-missing'
+    && error.digest === store.childDigest
+    && new RegExp(`locked calls target '${store.target.replace(/[.\/]/g, '\\$&')}' digest ${store.childDigest} pinned by parent bundle ${store.parentDigest} is absent from every configured workflow store root`).test(error.message);
+
+  // Recovery answers `retry` without supplying the object: one ask, then the
+  // named outcome — never `unknown-digest` (which would re-offer the order),
+  // never `object-corrupt` (nothing failed verification).
+  const requested: string[] = [];
+  const retrying = workerSource(store.worker, async (defDigest) => {
+    requested.push(defDigest);
+    return 'retry';
+  });
+  await assert.rejects(retrying.prime(store.parentDigest), isNamedMissingChild);
+  assert.deepEqual(requested, [store.childDigest]);
+
+  const refusing: string[] = [];
+  const refused = workerSource(store.worker, async (defDigest) => {
+    refusing.push(defDigest);
+    return 'refuse';
+  });
+  await assert.rejects(refused.prime(store.parentDigest), isNamedMissingChild);
+  assert.deepEqual(refusing, [store.childDigest]);
+
+  // No recovery configured at all: the same named outcome.
+  await assert.rejects(workerSource(store.worker).prime(store.parentDigest), isNamedMissingChild);
 });

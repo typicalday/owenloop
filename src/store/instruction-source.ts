@@ -353,6 +353,8 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	      break;
 	    } catch (error) {
 	      if (error instanceof StoreIntegrityError && error.code === 'object-missing') continue;
+	      // A child whose own lock target is missing names THAT digest; keep it.
+	      if (error instanceof StoreIntegrityError && error.code === 'dependency-missing') throw error;
 	      const verified = error instanceof StoreIntegrityError
 		&& error.message.includes('object failed verification');
 	      throw new StoreIntegrityError(
@@ -364,10 +366,13 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	    }
 	  }
 	  if (child === undefined) {
+	    // Not corruption: the parent verified, it merely pins a child this
+	    // store never received. `prime` hands the CHILD digest to recovery.
 	    throw new StoreIntegrityError(
-	      'object-corrupt',
+	      'dependency-missing',
 	      childDigest,
-	      `locked calls target '${target}' digest ${childDigest} is absent from every configured workflow store root`,
+	      `locked calls target '${target}' digest ${childDigest} pinned by parent bundle ${object.bundleDigest} ` +
+		'is absent from every configured workflow store root',
 	    );
 	  }
 	  const selected = selectLockedTarget(target, childDigest, child);
@@ -590,15 +595,42 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     return 'unknown-digest';
   };
 
+  /**
+   * Prime one digest, recovering a lock-pinned child that the verified
+   * closure needs but no configured store root holds. A worker that pulled
+   * the parent alone has exactly this shape, so recovery is asked for the
+   * CHILD digest (never the requested one) and the parent is re-resolved once
+   * the pull supplies it. Each missing child is requested at most once per
+   * prime; a child recovery cannot supply surfaces as the named
+   * `dependency-missing` error, not as `unknown-digest` (that would re-offer
+   * the order forever) and not as corruption.
+   */
+  const primeRecoveringDependencies = async (
+    requestedDigest: string,
+  ): Promise<'resolved' | 'unknown-digest'> => {
+    const requestedChildren = new Set<string>();
+    for (;;) {
+      try {
+	return await primeOnce(requestedDigest);
+      } catch (error) {
+	if (!(error instanceof StoreIntegrityError) || error.code !== 'dependency-missing') throw error;
+	if (args.onMissing === undefined || requestedChildren.has(error.digest)) throw error;
+	requestedChildren.add(error.digest);
+	const action = await args.onMissing.onMissing(error.digest);
+	if (action !== 'retry') throw error;
+      }
+    }
+  };
+
   const prime = (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
     const existing = inFlight.get(requestedDigest);
     if (existing !== undefined) return existing;
 
     const operation = (async (): Promise<'resolved' | 'unknown-digest'> => {
-      let result = await primeOnce(requestedDigest);
+      let result = await primeRecoveringDependencies(requestedDigest);
       if (result === 'unknown-digest' && args.onMissing !== undefined) {
 	const action = await args.onMissing.onMissing(requestedDigest);
-	if (action === 'retry') result = await primeOnce(requestedDigest);
+	if (action === 'retry') result = await primeRecoveringDependencies(requestedDigest);
       }
       return result;
     })();
