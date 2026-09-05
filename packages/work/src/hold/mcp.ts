@@ -4,7 +4,7 @@
  * A born-bound work-holder: the D2 stamped Step Agent's frontmatter declares
  * `mcpServers.owenloop = owenloop work hold --order <wf>/<run> --origin <url> --mcp`,
  * so when the Step Agent session boots it launches THIS as a stdio MCP server. The
- * server exposes four bare tools the model uses to do its order:
+ * server exposes five bare tools the model uses to do its order:
  *   - `get_order` → the order packet (prompt, inputs, owed outputs) for the run
  *     this holder is bound to. No ids are arguments — they came in on argv, never
  *     through the model.
@@ -23,6 +23,13 @@
  *     until the stall cap). `ask` holds the artifact with no counter movement
  *     and surfaces the question to an operator, who answers with
  *     `owenloop retry <workflow> <path> --text "<answer>"`.
+ *   - `put_file_artifact` → store a file the step produced and get back the small
+ *     JSON envelope that names it. An artifact value lives in the org's database
+ *     and is size-capped for good reason, but a rendered video or a screenshot is
+ *     an artifact too. Rather than let a step choose between truncating its own
+ *     output and base64-inflating it past the cap, the bytes go to blob storage
+ *     and the envelope — hash, size, content type — goes in the value, where a
+ *     def's ordinary JSON Schema can still constrain it.
  *
  * Underneath the tools, the SAME lease loop the CLI `hold` runs keeps the order's
  * lease warm: `createHoldMcp` builds the loop with `onOrder` wired to capture the
@@ -35,18 +42,22 @@
  * its own — so a unit test drives the tools with a fake hub and a scriptable
  * clock. The role (`src/roles/hold.ts`) owns the real stdin/stdout pump.
  */
+import { readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
+
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
+import { resolveContainedPath } from '../contained-path.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
-export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask'] as const;
+export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
 export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number];
 
 export interface HoldMcpDeps {
@@ -55,7 +66,7 @@ export interface HoldMcpDeps {
   run: string;
   /** Sole containment root for submit value files. */
   workdir: string;
-  /** Positive registration list. Absent exposes the full three-tool server. */
+  /** Positive registration list. Absent exposes every tool in `HOLD_MCP_TOOL_NAMES`. */
   tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
   origin?: string;
@@ -77,7 +88,7 @@ export interface HoldMcpDeps {
 }
 
 export interface HoldMcpMount {
-  /** Exactly the selected registrations; full mode has all three tools. */
+  /** Exactly the selected registrations; full mode has every tool. */
   tools: ToolRegistration[];
   /** The lease loop kept warm underneath — the role runs and stops it. */
   loop: HoldLoop;
@@ -85,6 +96,45 @@ export interface HoldMcpMount {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Extension-to-MIME map for `put_file_artifact`'s optional `contentType`.
+ *
+ * Deliberately short. This is a convenience for the common case, not a content
+ * sniffer: the map covers what a step actually renders — images, video, audio,
+ * documents, archives, text — and everything else falls through to
+ * `application/octet-stream`, which is the honest answer for bytes whose type
+ * this process did not determine. A step that knows better passes `contentType`
+ * explicitly and this map is never consulted.
+ */
+const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.avif': 'image/avif',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
+  '.json': 'application/json',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.html': 'text/html',
+  '.log': 'text/plain',
+};
+
+function guessContentType(path: string): string {
+  return CONTENT_TYPE_BY_EXTENSION[extname(path).toLowerCase()] ?? 'application/octet-stream';
 }
 
 /** A lean, model-facing view of the order packet. */
@@ -382,11 +432,86 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
   };
 
+  const putFileArtifactTool: ToolRegistration = {
+    name: 'put_file_artifact',
+    description:
+      'Store a FILE you produced (image, video, PDF, archive, log, any bytes) and get back a small JSON envelope that names it. Use this whenever an owed output IS a file, or CONTAINS one: upload the file, then call submit with the envelope as the value, or embedded inside your value, e.g. {"summary": "...", "render": <envelope>}. The bytes are stored outside the database, so a large asset does not count against the artifact value size limit — the envelope is what the workflow stores, schema-checks and shows a judge. Do NOT base64 a file into a submit value; upload it here instead.',
+    inputSchema: {
+      type: 'object',
+      required: ['file'],
+      properties: {
+        file: {
+          type: 'string',
+          description:
+            'Path to the file to store. Relative paths resolve against the run working directory, and the file must be inside it.',
+        },
+        contentType: {
+          type: 'string',
+          description:
+            'MIME type of the bytes, e.g. image/png or video/mp4. Inferred from the file extension when omitted.',
+        },
+        filename: {
+          type: 'string',
+          description: 'Optional display name recorded in the envelope. Defaults to the file name.',
+        },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      const gone = terminalGuard();
+      if (gone !== undefined) return gone;
+      const file = args['file'];
+      if (typeof file !== 'string' || file.trim() === '') {
+        return textResult({ error: 'file-artifact-invalid: file must be a non-empty string' }, true);
+      }
+      const contentTypeArg = args['contentType'];
+      if (contentTypeArg !== undefined && (typeof contentTypeArg !== 'string' || contentTypeArg.trim() === '')) {
+        return textResult({ error: 'file-artifact-invalid: contentType must be a non-empty string when present' }, true);
+      }
+      const filenameArg = args['filename'];
+      if (filenameArg !== undefined && (typeof filenameArg !== 'string' || filenameArg.trim() === '')) {
+        return textResult({ error: 'file-artifact-invalid: filename must be a non-empty string when present' }, true);
+      }
+      try {
+        // Same two-phase containment as a submit value file, under this tool's
+        // own error family: the working directory is the only root a step's
+        // outputs may come from, and a symlink out of it is an exfiltration
+        // path, not a convenience.
+        const resolved = await resolveContainedPath(deps.workdir, file, 'file-artifact');
+        const bytes = new Uint8Array(await readFile(resolved));
+        if (bytes.byteLength === 0) {
+          return textResult({ error: `file-artifact-empty: ${file} is zero bytes` }, true);
+        }
+        const contentType =
+          typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
+        const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
+        const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
+        // Hand back the envelope EXACTLY as it must be submitted. The hub's
+        // `text` is dropped from the pointer so the model cannot paste a field
+        // the artifact schema does not know about.
+        const pointer = {
+          __file: res.__file,
+          hash: res.hash,
+          size: res.size,
+          contentType: res.contentType,
+          ...(res.filename !== undefined ? { filename: res.filename } : {}),
+        };
+        return textResult({
+          pointer,
+          text: `Stored ${String(bytes.byteLength)} bytes as ${contentType}. Submit this pointer as your value, or embed it in one.`,
+        });
+      } catch (e) {
+        return textResult({ error: errMsg(e) }, true);
+      }
+    },
+  };
+
   const registrations: Record<HoldMcpToolName, ToolRegistration> = {
     get_order: getOrderTool,
     submit: submitTool,
     reject: rejectTool,
     ask: askTool,
+    put_file_artifact: putFileArtifactTool,
   };
   const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
   return { tools: selected.map((name) => registrations[name]), loop };

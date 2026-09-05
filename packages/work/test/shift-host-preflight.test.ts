@@ -43,6 +43,10 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 /** A hub whose `wake` is the only interesting call; everything else is inert. */
 function mockHub(wake: () => Promise<{ text: string; cursor: number; changed: boolean }>): HubClient {
   return {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     wake,
     async presencePing(req) { return { text: '', ok: true, name: req.name, lastSeen: 1 }; },
     async whatsNext() { return { text: '', instances: [] }; },

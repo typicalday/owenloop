@@ -9,6 +9,11 @@
  * for `whoami`), and parses the `{ text, ...data }` envelope. Non-2xx becomes a
  * `HubError`.
  *
+ * `putFileArtifact` is the single exception to the JSON rule: its body is the
+ * asset's raw bytes under the asset's own content type. Base64 in a JSON field
+ * would inflate every upload by a third and force a multi-megabyte file through
+ * a JavaScript string, so the bytes travel as bytes.
+ *
  * PRESENCE (B4) + WAKE (B5): the C1 client deliberately omitted these because
  * their hub surface did not exist yet. Both are merged now, so C3 adds
  * `presencePing` (POST `/api/presence_ping`) and `wake` (GET `/api/wake`,
@@ -34,6 +39,8 @@ import type {
   HeartbeatResponse,
   PresencePingRequest,
   PresencePingResponse,
+  PutFileArtifactRequest,
+  PutFileArtifactResponse,
   ReleaseRequest,
   ReleaseResponse,
   RejectRequest,
@@ -111,6 +118,15 @@ export interface HubClient {
   wake(cursor?: number): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
   presencePing(req: PresencePingRequest): Promise<PresencePingResponse>;
+  /**
+   * Store opaque bytes as a file artifact and return the envelope naming them.
+   *
+   * The only byte-bodied call on this client. Everything else sends JSON, so
+   * this one bypasses `post` rather than teaching `post` a second body mode:
+   * one call site with an explicit content type is easier to audit than a
+   * shared helper that silently means two different things.
+   */
+  putFileArtifact(req: PutFileArtifactRequest): Promise<PutFileArtifactResponse>;
 }
 
 export function createHubClient(opts: HubClientOptions): HubClient {
@@ -173,6 +189,23 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     return parse<T>(res);
   }
 
+  async function postBytes<T>(path: string, req: PutFileArtifactRequest): Promise<T> {
+    const token = await opts.getToken();
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      'content-type': req.contentType,
+    };
+    // The name rides a header rather than the body because the body IS the
+    // bytes. It is a display label only; the hub never resolves it as a path.
+    if (req.filename !== undefined) headers['x-file-name'] = req.filename;
+    const res = await fetchImpl(`${base}${path}?workflow=${encodeURIComponent(req.workflow)}`, {
+      method: 'POST',
+      headers,
+      body: req.bytes,
+    });
+    return parse<T>(res);
+  }
+
   return {
     whatsNext: (req) => post<WhatsNextResponse>('whats_next', req),
     getOrder: (req) => post<GetOrderResponse>('get_order', req),
@@ -194,5 +227,6 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     wake: (cursor) =>
       get<WakeResponse>('wake', typeof cursor === 'number' ? `cursor=${encodeURIComponent(String(cursor))}` : undefined),
     presencePing: (req) => post<PresencePingResponse>('presence_ping', req),
+    putFileArtifact: (req) => postBytes<PutFileArtifactResponse>('/api/file-artifacts', req),
   };
 }

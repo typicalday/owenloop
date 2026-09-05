@@ -445,6 +445,41 @@ export interface SubmitResponse extends HubResponse {
   closed?: boolean;
 }
 
+// ---- file artifacts ---------------------------------------------------------
+
+/**
+ * Upload opaque bytes and get back the small JSON envelope that names them.
+ *
+ * This is the one hub call that does NOT send JSON. The bytes go up as the raw
+ * request body with their own content type, because a base64 round-trip would
+ * inflate a large asset by a third and force the whole file through a string.
+ */
+export interface PutFileArtifactRequest {
+  /** Workflow the blob belongs to — it scopes the R2 key and its retention. */
+  workflow: string;
+  bytes: Uint8Array;
+  /** MIME type recorded in the envelope and served back on download. */
+  contentType: string;
+  /** Optional display name; the hub records it verbatim and never trusts it as a path. */
+  filename?: string;
+}
+
+/**
+ * The envelope, which IS the artifact value. `__file` is the discriminator the
+ * hub's pointer walk looks for; `hash` is the content address (so re-uploading
+ * identical bytes is free); `size` and `contentType` describe bytes a def can
+ * constrain with ordinary JSON Schema even though it can never see them.
+ */
+export interface FileArtifactPointer {
+  __file: true;
+  hash: string;
+  size: number;
+  contentType: string;
+  filename?: string;
+}
+
+export interface PutFileArtifactResponse extends HubResponse, FileArtifactPointer {}
+
 // ---- reject -----------------------------------------------------------------
 
 /**

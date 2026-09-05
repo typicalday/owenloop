@@ -201,6 +201,10 @@ function probeHub(cfg: {
   let idx = 0;
   let hb = 0;
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async getOrder(req) {
       getOrderArgs.push(req as unknown as Record<string, unknown>);
       const at = idx < cfg.responses.length ? idx : cfg.responses.length - 1;

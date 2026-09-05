@@ -1,7 +1,6 @@
-import { readFile, realpath } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
 
-import { isInside } from './harness/gatekeeper.ts';
+import { resolveContainedPath } from './contained-path.ts';
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -10,38 +9,21 @@ function errorMessage(error: unknown): string {
 /**
  * Read a submit value from a JSON document contained in a run worktree.
  *
- * The lexical check rejects traversal before probing the filesystem. The
- * canonical check rejects symlinks whose target leaves the worktree.
+ * Containment is `resolveContainedPath`'s job — lexical traversal check first,
+ * then a canonical symlink check. This function owns only what is specific to
+ * a submit value: the argument shape and the JSON decode.
  */
 export async function readSubmitValueFile(workdir: string, valueFile: unknown): Promise<unknown> {
   if (typeof valueFile !== 'string' || valueFile.trim() === '') {
     throw new Error(`submit-value-file-invalid: valueFile must be a non-empty string: ${String(valueFile)}`);
   }
-
-  const candidate = resolve(workdir, valueFile);
-  if (!isInside(workdir, candidate)) {
-    throw new Error(`submit-value-file-outside-workdir: ${valueFile} is outside the run workdir`);
-  }
-
-  let canonicalCandidate: string;
-  try {
-    const canonicalWorkdir = await realpath(workdir);
-    canonicalCandidate = await realpath(candidate);
-    if (!isInside(canonicalWorkdir, canonicalCandidate)) {
-      throw new Error(`submit-value-file-outside-workdir: ${valueFile} is outside the run workdir`);
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith('submit-value-file-outside-workdir:')) throw error;
-    throw new Error(`submit-value-file-read-failed: could not read ${valueFile}: ${errorMessage(error)}`);
-  }
-
+  const canonicalCandidate = await resolveContainedPath(workdir, valueFile, 'submit-value-file');
   let text: string;
   try {
     text = await readFile(canonicalCandidate, 'utf8');
   } catch (error) {
     throw new Error(`submit-value-file-read-failed: could not read ${valueFile}: ${errorMessage(error)}`);
   }
-
   try {
     return JSON.parse(text);
   } catch (error) {

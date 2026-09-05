@@ -79,6 +79,10 @@ test('resolveSession prefers --session, falls back to env, empty = missing', () 
 function fakeHub(reply: ReleaseResponse | Error): { hub: HubClient; releases: ReleaseRequest[] } {
   const releases: ReleaseRequest[] = [];
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async release(req) {
       releases.push(req);
       if (reply instanceof Error) throw reply;

@@ -82,7 +82,7 @@ test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing subm
 
     const list = await mcp.request('tools/list');
     const names = (list.result.tools as Array<{ name: string }>).map((t) => t.name).sort();
-    assert.deepEqual(names, ['ask', 'get_order', 'reject', 'submit']);
+    assert.deepEqual(names, ['ask', 'get_order', 'put_file_artifact', 'reject', 'submit']);
 
     // Heartbeats from BIRTH: the lease loop runs under the mount with zero
     // tool calls issued — first contact plus renewals appear on the wire.

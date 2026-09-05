@@ -109,6 +109,10 @@ function rejectedOrder(o: OrderOpts = {}): GetOrderResponse {
 function mockHub(responses: GetOrderResponse[]): HubClient {
   let i = 0;
   return {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async getOrder() {
       return responses[Math.min(i++, responses.length - 1)]!;
     },

@@ -274,6 +274,10 @@ function roleHub(cfg: { getOrder: GetOrderResponse; onHeartbeat?: (n: number) =>
   const releases: unknown[] = [];
   let hbIdx = 0;
   const hub: HubClient = {
+    // Not exercised here: the byte-bodied upload has its own tests.
+    async putFileArtifact() {
+      throw new Error('putFileArtifact is not exercised by this test');
+    },
     async getOrder() {
       return cfg.getOrder;
     },
