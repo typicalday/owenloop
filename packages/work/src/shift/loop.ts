@@ -84,6 +84,7 @@ import {
 } from './state.ts';
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
 import { withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
+import { withHubCallTimeout } from '../hub/deadline.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import { checkHost, type HostFault } from './host-preflight.ts';
 import { formatBytes, type DiskSpace } from './disk-floor.ts';
@@ -146,6 +147,36 @@ export interface ShiftLoopOptions {
   rosterSyncTimeoutMs?: number;
   /** Daemon-owned cache write, injected so failure cannot kill the loop. */
   syncRosters?: (signal: AbortSignal) => Promise<void>;
+  /**
+   * Deadline for each poll-loop hub call (`wake`, `presence_ping`, both
+   * `whats_next` forms). Default `DEFAULT_HUB_CALL_TIMEOUT_MS`. Issue #300:
+   * without one, a call that never settles hangs the loop forever with no
+   * error, no log line and no hub traffic. A call that hits it fails on the
+   * same terms as a connection reset: logged, and recorded as `hub-error`
+   * where the call already reports one. Only a `wake` failure advances
+   * `hubFailureStreak`, exactly as before this change.
+   */
+  hubCallTimeoutMs?: number;
+  /**
+   * WATCHDOG threshold: how long since the loop last made PROGRESS — a hub
+   * call settled, or a cycle completed — before the shift reports itself
+   * `stalled`. Default `3 * pollIntervalMs + hubCallTimeoutMs` — three missed
+   * ticks plus the longest a single call may legitimately take. Every settled
+   * call moves the reference, so a long cycle of many slow-but-answered calls
+   * never trips it; only one call that never settles can.
+   */
+  stallThresholdMs?: number;
+  /**
+   * Cadence of the file-only `heartbeat` record. Default
+   * `DEFAULT_HEARTBEAT_INTERVAL_MS` (5 minutes); `0` disables it.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * Repeating-timer seam for the watchdog and heartbeat, so tests can fire
+   * them by hand. Returns the cancel function. Defaults to an UNREF'd
+   * `setInterval`: neither timer may keep the process alive on its own.
+   */
+  schedule?: (fn: () => void, everyMs: number) => () => void;
   /**
    * Compute the serving set for the live serve crews. Kept injectable so the
    * loop does no filesystem work; absent means the legitimate empty set.
@@ -412,6 +443,13 @@ export interface ShiftLoop {
    * replaces, which was no alert at all for 34 minutes.
    */
   noteWorkerFailure(failure: WorkerFailure): void;
+  /**
+   * Issue #300 liveness facts for `shift status`. A cycle counts once
+   * `iterate()` RETURNS, whichever entry point ran it; `getLastPollAt` is the
+   * wall clock at that moment, or undefined before the first completes.
+   */
+  getCyclesCompleted(): number;
+  getLastPollAt(): number | undefined;
 }
 
 /** A dispatch candidate carried through classify → spawn. */
@@ -556,6 +594,45 @@ const MAX_CAUSE_DEPTH = 4;
  */
 const HOST_PREFLIGHT_STREAK = 3;
 
+/**
+ * Default per-call deadline for the poll loop's hub verbs (issue #300).
+ *
+ * 30 seconds, because: (1) none of these verbs long-polls — `wake` is the
+ * "cheap wake pre-check" the client documents, `presence_ping` and
+ * `whats_next` are single Durable Object round trips, and the hub answers a
+ * busy DO with an immediate "retry in 1s" error rather than by holding the
+ * request; so a legitimate call finishes in well under a second and 30s is a
+ * generous multiple of the slowest plausible one; (2) the failure this bounds
+ * lasted HOURS with no traffic at all, so any finite value fixes the bug and
+ * the question is only how much a tick may cost while it does — 30s is
+ * six default poll intervals, cheap next to the alternative; (3) it is
+ * deliberately longer than the 10s roster-sync deadline, which guards a
+ * low-priority refresh that may simply be skipped; these calls are the
+ * loop's whole purpose and deserve more patience before being counted as
+ * failed. Trade-off accepted: a `whats_next` that the hub committed but this
+ * side timed out leaves that claim to lapse through the hub's pickup window,
+ * exactly as a dropped connection after commit would.
+ */
+export const DEFAULT_HUB_CALL_TIMEOUT_MS = 30_000;
+/** Default cadence of the file-only `heartbeat` record: every five minutes. */
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+/** Floor for the watchdog's own check cadence. */
+const MIN_WATCHDOG_CHECK_MS = 1_000;
+
+/** The later of two optional monotonic timestamps; undefined only when both are. */
+function latestDefined(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.max(a, b);
+}
+
+/** Production `schedule`: an interval that never keeps the process alive. */
+function scheduleWithInterval(fn: () => void, everyMs: number): () => void {
+  const timer = setInterval(fn, everyMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
 /** The identity a storm repeats on. `key` is '' for an unfanned step. */
 function stepBrakeKey(workflow: string, step: string, key: string | undefined): string {
   return `${workflow}\u0000${step}\u0000${key ?? ''}`;
@@ -630,6 +707,22 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
   const isAlive = opts.isAlive;
   const monotonicNow = opts.monotonicNow ?? performance.now.bind(performance);
+  const hubCallTimeoutMs = opts.hubCallTimeoutMs ?? DEFAULT_HUB_CALL_TIMEOUT_MS;
+  const heartbeatIntervalMs = opts.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  const schedule = opts.schedule ?? scheduleWithInterval;
+  // Issue #300 liveness. Two clocks on purpose: the wall clock is what
+  // `shift status` and the records show, the monotonic one is what the
+  // watchdog measures staleness with (a wall-clock jump must not fake a stall).
+  let cyclesCompleted = 0;
+  let lastPollAt: number | undefined;
+  let lastCycleMono: number | undefined;
+  /** Last settled hub call, success or failure: one cycle may serialise many. */
+  let lastProgressMono: number | undefined;
+  let runStartedMono: number | undefined;
+  /** Edge trigger for `stalled`: one record per episode, re-armed by a completed cycle. */
+  let stalledReported = false;
+  let cancelWatchdog: (() => void) | undefined;
+  let cancelHeartbeat: (() => void) | undefined;
   // Live shift identity (MCP `clock_in`, D3-D7 of the plan). Seeded from opts,
   // which are now INITIAL values only. Arrays are copied so neither the loop
   // nor a caller of getShift/setShift can mutate the other's state afterward.
@@ -875,6 +968,96 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * as free text and stays free text: it is the sink's own failure report, and
    * turning it into an event would write it to the sink that just failed.
    */
+  /**
+   * One poll-loop hub call under the per-call deadline (issue #300). Every
+   * settlement — success, failure, or the deadline itself — is progress for
+   * the watchdog: a cycle serialises roster sync, presence, wake, the inbox
+   * and one targeted `whats_next` per workflow, so a slow-but-alive hub can
+   * legitimately take longer than the stall threshold per cycle.
+   */
+  async function hubCall<T>(label: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    try {
+      return await withHubCallTimeout(label, run, hubCallTimeoutMs);
+    } finally {
+      lastProgressMono = monotonicNow();
+    }
+  }
+
+  /**
+   * One poll cycle, accounted. Wraps `iteration()` so BOTH entry points — the
+   * daemon's `run` and the exported `iterate` — feed the same liveness facts
+   * and re-arm the watchdog. A cycle counts only when `iteration()` RETURNS:
+   * one that never settles is exactly what the watchdog below is for.
+   */
+  async function cycle(): Promise<number> {
+    const dispatched = await iteration();
+    cyclesCompleted += 1;
+    lastPollAt = opts.now();
+    lastCycleMono = monotonicNow();
+    stalledReported = false;
+    return dispatched;
+  }
+
+  function stallThresholdMs(): number {
+    return opts.stallThresholdMs ?? 3 * opts.pollIntervalMs + hubCallTimeoutMs;
+  }
+
+  /**
+   * WATCHDOG (issue #300). Runs from its own timer, so it does not depend on
+   * `iteration()` ever returning — that dependency is the whole bug: a loop
+   * awaiting a call that never settles cannot report its own hang.
+   *
+   * Staleness is measured from the loop's last PROGRESS — the later of the
+   * last settled hub call and the last completed cycle (or the start of
+   * `run`, so a FIRST call that hangs is caught too). A cycle is many serial
+   * calls, so measuring from the cycle alone would report a slow-but-alive
+   * hub as a stall on every sweep. A Retry-After backoff parks the loop on
+   * the hub's instruction, so the reference is the later of that and the
+   * backoff's end: an honest, hub-instructed pause never reads as a stall.
+   * Edge-triggered: one record per episode.
+   */
+  function checkStall(): void {
+    if (stopped) return;
+    const progressAt = latestDefined(lastProgressMono, lastCycleMono) ?? runStartedMono;
+    if (progressAt === undefined) return;
+    const threshold = stallThresholdMs();
+    const now = monotonicNow();
+    if (now - Math.max(progressAt, backoffUntil) < threshold) return;
+    if (stalledReported) return;
+    stalledReported = true;
+    const sinceMs = Math.round(now - progressAt);
+    const last = lastPollAt === undefined ? 'never' : new Date(lastPollAt).toISOString();
+    opts.err(
+      `poll loop stalled: no progress for ${sinceMs}ms (threshold ${threshold}ms; last completed cycle ${last})`,
+    );
+    emit({ type: 'stalled', lastPollAt: lastPollAt ?? null, sinceMs });
+  }
+
+  /** Periodic proof of life; file-only by the runtime's routing (issue #300). */
+  function heartbeat(): void {
+    if (stopped) return;
+    emit({
+      type: 'heartbeat',
+      cyclesCompleted,
+      lastPollAt: lastPollAt ?? null,
+      hubFailureStreak,
+      stalled: stalledReported,
+    });
+  }
+
+  /** Daemon mode only: `once` runs one cycle and returns, so has nothing to watch. */
+  function startTimers(): void {
+    cancelWatchdog = schedule(checkStall, Math.max(MIN_WATCHDOG_CHECK_MS, opts.pollIntervalMs));
+    if (heartbeatIntervalMs > 0) cancelHeartbeat = schedule(heartbeat, heartbeatIntervalMs);
+  }
+
+  function stopTimers(): void {
+    cancelWatchdog?.();
+    cancelWatchdog = undefined;
+    cancelHeartbeat?.();
+    cancelHeartbeat = undefined;
+  }
+
   function emit(body: ShiftEventBody): void {
     if (opts.onEvent === undefined) return;
     try {
@@ -1405,7 +1588,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       instances = [{ workflow: opts.workflow }];
     } else {
       try {
-	const inbox = await opts.hub.whatsNext({ serve_capabilities: [...serveCapabilities] });
+	const inbox = await hubCall('inbox whats_next', (signal) =>
+	  opts.hub.whatsNext({ serve_capabilities: [...serveCapabilities] }, signal));
 	instances = (inbox.instances ?? []).map((inbox) => ({ workflow: inbox.workflow, inbox }));
       } catch (e) {
 	noteServerBackoff(e);
@@ -1484,11 +1668,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       let res;
       const requestStartedAt = monotonicNow();
       try {
-	res = await opts.hub.whatsNext({
-	  workflow: wf,
-	  serve_crews: serveCrews,
-	  serve_capabilities: [...serveCapabilities],
-	});
+	res = await hubCall(`whats_next ${wf}`, (signal) =>
+	  opts.hub.whatsNext({
+	    workflow: wf,
+	    serve_crews: serveCrews,
+	    serve_capabilities: [...serveCapabilities],
+	  }, signal));
       } catch (e) {
 	if (isNonServableRace(e)) {
 	  // Treat the targeted call as a successful empty observation for the
@@ -1839,14 +2024,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       // identity by a full presenceIntervalMs.
       const generation = ++presenceGeneration;
       try {
-        await opts.hub.presencePing({
-          name: shiftName,
-          serve_crews: serveCrews,
-	  serve_capabilities: [...serveCapabilities],
-          ...(opts.shiftId !== undefined ? { shift_id: opts.shiftId } : {}),
-          ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
-          ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
-        });
+        await hubCall('presence ping', (signal) =>
+          opts.hub.presencePing({
+            name: shiftName,
+            serve_crews: serveCrews,
+            serve_capabilities: [...serveCapabilities],
+            ...(opts.shiftId !== undefined ? { shift_id: opts.shiftId } : {}),
+            ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
+            ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
+          }, signal));
 	if (generation === presenceGeneration) lastPresence = monotonicNow();
       } catch (e) {
 	rateLimitedThisIteration = noteServerBackoff(e);
@@ -1888,7 +2074,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let changed = false;
     let wakeSucceeded = false;
     try {
-      const w = await opts.hub.wake(cursor);
+      // Under the per-call deadline: a timeout lands in the catch below on the
+      // same terms as any other non-rate-limited failure (issue #300).
+      const w = await hubCall('wake', (signal) => opts.hub.wake(cursor, signal));
       changed = w.changed;
       cursor = w.cursor;
       wakeSucceeded = true;
@@ -2021,29 +2209,39 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     if (runHostPreflight(0)) return 1;
 
     if (opts.once === true) {
-      await iteration();
+      await cycle();
       return wedged ? 1 : 0;
     }
 
-    for (;;) {
-      if (stopped) return wedged ? 1 : 0;
-      await iteration();
-      if (stopped) return wedged ? 1 : 0;
-      const delay = Math.max(opts.pollIntervalMs, backoffUntil - monotonicNow());
-      await opts.sleep(delay);
-      // Re-check after the park so a stop during sleep makes no further hub call.
-      if (stopped) return wedged ? 1 : 0;
+    // The watchdog and heartbeat live OUTSIDE this loop (issue #300): they must
+    // keep firing when `cycle()` never returns, which is the case they exist
+    // for. Cleared on every exit path, including a throw out of `cycle()`.
+    runStartedMono = monotonicNow();
+    startTimers();
+    try {
+      for (;;) {
+        if (stopped) return wedged ? 1 : 0;
+        await cycle();
+        if (stopped) return wedged ? 1 : 0;
+        const delay = Math.max(opts.pollIntervalMs, backoffUntil - monotonicNow());
+        await opts.sleep(delay);
+        // Re-check after the park so a stop during sleep makes no further hub call.
+        if (stopped) return wedged ? 1 : 0;
+      }
+    } finally {
+      stopTimers();
     }
   }
 
   function stop(): void {
     stopped = true;
+    stopTimers();
   }
 
   return {
     run,
     stop,
-    iterate: iteration,
+    iterate: cycle,
     freeCapacity: () => {
       const current = reconcile();
       return cap - current.live.length - current.reserved.length;
@@ -2071,6 +2269,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       presenceGeneration++; // survive an in-flight ping completing after this
     },
     getAttendedAt: () => attendedAt,
+    getCyclesCompleted: () => cyclesCompleted,
+    getLastPollAt: () => lastPollAt,
     noteRunEnded: (run: string) => {
       pendingCandidates.delete(run);
       // A run that ENDED is a run that progressed — the shift's MCP `submit`

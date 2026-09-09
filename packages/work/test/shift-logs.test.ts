@@ -682,7 +682,7 @@ const ALL_EVENT_TYPES = [
   'parked', 'capacity', 'event-queue-overflow',
   'dispatched', 'reaped', 'failed', 'gate', 'ended',
   'hub-error', 'bundle-miss', 'order-dropped', 'wedged',
-  'low-disk',
+  'low-disk', 'stalled', 'heartbeat',
 ] as const;
 
 /** Fails to compile if the list above names a type that is not a variant. */
@@ -692,15 +692,18 @@ const _noMissingEventTypes: [Exclude<ShiftEventBody['type'], (typeof ALL_EVENT_T
   ? true
   : false = true;
 
-test('parked, capacity, hub-error, overflow and low-disk are FILE-ONLY; every other event reaches the socket', () => {
+test('parked, capacity, hub-error, overflow, low-disk and heartbeat are FILE-ONLY; every other event reaches the socket', () => {
   // Load-bearing and otherwise proven only indirectly, through a timing race in
   // `shift-blocking-acceptance.test.ts`. The rule: a parked `owenloop shift
   // next` BLOCKS on an idle shift, so a record that is NOT a unit of work
   // moving — it parked, it is at capacity, it could not reach the hub, its
-  // queue overflowed, it declined an order because the disk is nearly full —
-  // must not be what wakes the client. All five still reach `shift.log`, which
-  // is the durable consumer they were promoted for.
-  const fileOnly = ['parked', 'capacity', 'hub-error', 'event-queue-overflow', 'low-disk'] as const;
+  // queue overflowed, it declined an order because the disk is nearly full,
+  // it is merely still alive (`heartbeat`, issue #300) — must not be what
+  // wakes the client. All six still reach `shift.log`, which is the durable
+  // consumer they were promoted for. `stalled`, the heartbeat's edge-triggered
+  // sibling, is deliberately NOT here: "the loop you are parked on stopped
+  // polling" is report-worthy for the reason `wedged` is.
+  const fileOnly = ['parked', 'capacity', 'hub-error', 'event-queue-overflow', 'low-disk', 'heartbeat'] as const;
   for (const type of fileOnly) {
     assert.equal(reachesSocketConsumer(type), false, `${type} must not wake a parked next`);
   }

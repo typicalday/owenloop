@@ -67,7 +67,14 @@ export interface HubClientOptions {
 }
 
 export interface HubClient {
-  whatsNext(req: WhatsNextRequest): Promise<WhatsNextResponse>;
+  /**
+   * `signal` on this and the other poll-loop verbs (`wake`, `presencePing`)
+   * is the shift loop's per-call deadline (issue #300): a hub call that never
+   * settles used to hang the poll loop forever while the control socket kept
+   * answering. Optional and trailing so every existing fake keeps compiling;
+   * a fake that ignores it simply cannot be cut short.
+   */
+  whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
   getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
@@ -115,9 +122,9 @@ export interface HubClient {
   /** Read the hub's known harness/model registry. */
   listHarnessModels?(): Promise<ListHarnessModelsResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
-  wake(cursor?: number): Promise<WakeResponse>;
+  wake(cursor?: number, signal?: AbortSignal): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
-  presencePing(req: PresencePingRequest): Promise<PresencePingResponse>;
+  presencePing(req: PresencePingRequest, signal?: AbortSignal): Promise<PresencePingResponse>;
   /**
    * Store opaque bytes as a file artifact and return the envelope naming them.
    *
@@ -170,11 +177,12 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     return JSON.parse(raw) as T;
   }
 
-  async function post<T>(verb: string, body: unknown): Promise<T> {
+  async function post<T>(verb: string, body: unknown, signal?: AbortSignal): Promise<T> {
     const res = await fetchImpl(`${base}/api/${verb}`, {
       method: 'POST',
       headers: await authHeaders(),
       body: JSON.stringify(body),
+      ...(signal === undefined ? {} : { signal }),
     });
     return parse<T>(res);
   }
@@ -207,7 +215,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   return {
-    whatsNext: (req) => post<WhatsNextResponse>('whats_next', req),
+    whatsNext: (req, signal) => post<WhatsNextResponse>('whats_next', req, signal),
     getOrder: (req) => post<GetOrderResponse>('get_order', req),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
@@ -224,9 +232,9 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).
-    wake: (cursor) =>
-      get<WakeResponse>('wake', typeof cursor === 'number' ? `cursor=${encodeURIComponent(String(cursor))}` : undefined),
-    presencePing: (req) => post<PresencePingResponse>('presence_ping', req),
+    wake: (cursor, signal) =>
+      get<WakeResponse>('wake', typeof cursor === 'number' ? `cursor=${encodeURIComponent(String(cursor))}` : undefined, signal),
+    presencePing: (req, signal) => post<PresencePingResponse>('presence_ping', req, signal),
     putFileArtifact: (req) => postBytes<PutFileArtifactResponse>('/api/file-artifacts', req),
   };
 }

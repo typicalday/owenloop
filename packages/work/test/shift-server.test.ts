@@ -100,6 +100,8 @@ function fixture(options: {
     },
     noteAttended: (at: number) => { state.attended = at; },
     getAttendedAt: () => state.attended,
+    getCyclesCompleted: () => 7,
+    getLastPollAt: () => 4321,
     noteRunEnded: () => {},
   } as unknown as ShiftLoop;
   const socketPath = options.socketPath ?? join(root, 'shift.sock');
@@ -193,6 +195,7 @@ test('fragmented JSON, malformed requests, and oversized requests receive struct
   await waitForSocketMode(f.socketPath, 0o600);
   assert.deepEqual(await rawResponse(f.socketPath, ['{"op":"sta', 'tus"}\n']), {
     name: 'box', serve_crews: ['alpha'], cap: 3, free: 3, running: 0, agent_ceiling: 4, attended_at: null, started_at: 99,
+    last_poll_at: 4321, cycles_completed: 7,
   });
   assert.deepEqual(await rawResponse(f.socketPath, ['not-json\n']), { error: 'malformed JSON request' });
   assert.deepEqual(await rawResponse(f.socketPath, ['{"op":"wat"}\n']), { error: "unknown operation 'wat'" });
@@ -376,6 +379,7 @@ test('a throwing log sink cannot kill the overflow path or the daemon', async ()
     // `attended_at` is 1234, not null: the `next` above was served, which is
     // itself the proof the daemon survived the throwing sink.
     name: 'box', serve_crews: ['alpha'], cap: 3, free: 3, running: 0, agent_ceiling: 4, attended_at: 1234, started_at: 99,
+    last_poll_at: 4321, cycles_completed: 7,
   });
   await stop(f);
 });
@@ -464,6 +468,8 @@ test('end lets the daemon process exit while a responded client stops reading', 
     "  setShift: () => ({ name: 'box', serveCrews: ['alpha'] }),",
     "  noteAttended: () => {},",
     "  getAttendedAt: () => undefined,",
+    "  getCyclesCompleted: () => 0,",
+    "  getLastPollAt: () => undefined,",
     "};",
     "const hub = { presencePing: async () => ({ text: '', ok: true, name: 'box', lastSeen: 1 }) };",
     "const daemon = createShiftDaemon({ socketPath, stateDir: socketPath.slice(0, socketPath.lastIndexOf('/')), loop, hub, now: () => 1, startedAt: 1, err: console.error });",

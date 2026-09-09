@@ -43,6 +43,7 @@ import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
 import { exitCodeFor } from '../src/roles/agent-run.ts';
 import type { HubClient } from '../src/hub/client.ts';
+import { reachesSocketConsumer } from '../src/shift/runtime.ts';
 import { HubError, type InboxInstance, type WorkOrder } from '../src/hub/types.ts';
 
 // ---- fixtures ---------------------------------------------------------------
@@ -4076,4 +4077,386 @@ test('a step that goes long enough without failing starts its next brake from th
     ['run_d1', 'run_d2', 'run_d3'],
     'a failure long after the previous one must start the ladder over, not extend it',
   );
+});
+
+// ── issue #300: a hung hub call must not hang the shift silently ─────────────
+
+type ShiftEventRecord = import('../src/shift/protocol.ts').ShiftEvent;
+type WakeResponse = Awaited<ReturnType<HubClient['wake']>>;
+
+/** Yield to the event loop until `cond` holds (bounded, so a wrong test fails instead of hanging). */
+async function settle(cond: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (cond()) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`never settled: ${what}`);
+}
+
+/** A `schedule` seam that hands the timer callbacks to the test instead of a clock. */
+function fakeSchedule(): {
+  schedule: NonNullable<ShiftLoopOptions['schedule']>;
+  timers: Array<{ fn: () => void; everyMs: number; cancelled: boolean }>;
+} {
+  const timers: Array<{ fn: () => void; everyMs: number; cancelled: boolean }> = [];
+  return {
+    timers,
+    schedule: (fn, everyMs) => {
+      const entry = { fn, everyMs, cancelled: false };
+      timers.push(entry);
+      return () => {
+        entry.cancelled = true;
+      };
+    },
+  };
+}
+
+test('#300: a wake that never settles is cut short by hubCallTimeoutMs and counted like any other failure', async () => {
+  // The incident: the loop awaited one hub call for hours. The fake below never
+  // resolves AND ignores the abort signal, which is the worst case the deadline
+  // has to cover (a transport that honours the signal only makes it easier).
+  const { hub } = mockHub({});
+  const hanging: HubClient = { ...hub, wake: () => new Promise<WakeResponse>(() => {}) };
+  const { spawner } = fakeSpawner();
+  const errs: string[] = [];
+  const events: ShiftEventRecord[] = [];
+  let preflights = 0;
+  const loop = createShiftLoop(baseOpts(hanging, spawner, {
+    hubCallTimeoutMs: 20,
+    err: (line) => errs.push(line),
+    onEvent: (event) => events.push(event),
+    hostPreflight: () => {
+      preflights += 1;
+      return [];
+    },
+  }));
+
+  await loop.iterate();
+  assert.equal(loop.getCyclesCompleted(), 1, 'the tick completed instead of hanging');
+  assert.match(errs.join('\n'), /^wake failed: wake timed out after 20ms \(retrying next tick\)$/mu);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'hub-error').map(({ ts: _ts, shift: _shift, shiftId: _id, ...body }) => body),
+    [{ type: 'hub-error', op: 'wake', message: 'wake timed out after 20ms' }],
+    'a timeout is recorded on the SAME terms as any other failed wake',
+  );
+
+  // #305's preflight runs on every HOST_PREFLIGHT_STREAK-th (3rd) NON-rate-limited
+  // failure. A timeout is not a 429, so three of them must reach it — the
+  // proof that the streak advanced exactly as three connection resets would.
+  assert.equal(preflights, 0);
+  await loop.iterate();
+  await loop.iterate();
+  assert.equal(preflights, 1, 'three consecutive timeouts advance hubFailureStreak to the preflight');
+  assert.equal(loop.getCyclesCompleted(), 3);
+});
+
+test('#300: the deadline covers whats_next and presence_ping too, and each failure keeps its own report', async () => {
+  const { hub } = mockHub({});
+  const { spawner } = fakeSpawner();
+  const errs: string[] = [];
+  const events: ShiftEventRecord[] = [];
+
+  // Inbox `whats_next` hangs: the sweep is abandoned on the usual terms.
+  const hangingInbox: HubClient = { ...hub, whatsNext: () => new Promise<never>(() => {}) };
+  const inboxLoop = createShiftLoop(baseOpts(hangingInbox, spawner, {
+    hubCallTimeoutMs: 20,
+    err: (line) => errs.push(line),
+    onEvent: (event) => events.push(event),
+  }));
+  await inboxLoop.iterate();
+  assert.match(errs.join('\n'), /^inbox whats_next failed: inbox whats_next timed out after 20ms$/mu);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'hub-error').map((event) => [event.op, event.message]),
+    [['whats_next', 'inbox whats_next timed out after 20ms']],
+  );
+
+  // Presence hangs: logged and continued, exactly as a thrown ping is today.
+  errs.length = 0;
+  const hangingPresence: HubClient = { ...hub, presencePing: () => new Promise<never>(() => {}) };
+  const presenceLoop = createShiftLoop(baseOpts(hangingPresence, spawner, {
+    hubCallTimeoutMs: 20,
+    err: (line) => errs.push(line),
+  }));
+  await presenceLoop.iterate();
+  assert.match(errs.join('\n'), /^presence ping failed: presence ping timed out after 20ms \(continuing\)$/mu);
+  assert.equal(presenceLoop.getCyclesCompleted(), 1);
+});
+
+test('#300: cycles_completed and last_poll_at move only when a cycle actually completes', async () => {
+  const { hub } = mockHub({});
+  const { spawner } = fakeSpawner();
+  let now = 1_000;
+  const loop = createShiftLoop(baseOpts(hub, spawner, { now: () => now }));
+
+  assert.equal(loop.getCyclesCompleted(), 0);
+  assert.equal(loop.getLastPollAt(), undefined, 'nothing has completed yet, and status must say so (null), not 0');
+
+  await loop.iterate();
+  assert.equal(loop.getCyclesCompleted(), 1);
+  assert.equal(loop.getLastPollAt(), 1_000);
+
+  now = 2_000;
+  await loop.iterate();
+  assert.equal(loop.getCyclesCompleted(), 2);
+  assert.equal(loop.getLastPollAt(), 2_000);
+});
+
+test('#300: the watchdog reports `stalled` once per episode, from a timer the hung loop cannot block', async () => {
+  const { hub } = mockHub({});
+  const wakes: Array<(w: WakeResponse) => void> = [];
+  const hanging: HubClient = {
+    ...hub,
+    wake: () => new Promise<WakeResponse>((resolve) => {
+      wakes.push(resolve);
+    }),
+  };
+  const { spawner } = fakeSpawner();
+  const { schedule, timers } = fakeSchedule();
+  let monotonic = 0;
+  const errs: string[] = [];
+  const events: ShiftEventRecord[] = [];
+  const stalled = (): Array<{ lastPollAt: number | null; sinceMs: number }> =>
+    events.flatMap((event) => (event.type === 'stalled' ? [{ lastPollAt: event.lastPollAt, sinceMs: event.sinceMs }] : []));
+  const loop = createShiftLoop(baseOpts(hanging, spawner, {
+    now: () => 500_000 + monotonic,
+    monotonicNow: () => monotonic,
+    pollIntervalMs: 5_000,
+    // The real deadline is far longer than this test, which resolves every
+    // wake by hand; the threshold below is 3 × 5 000 + 30 000 = 45 000.
+    hubCallTimeoutMs: 30_000,
+    heartbeatIntervalMs: 0,
+    schedule,
+    err: (line) => errs.push(line),
+    onEvent: (event) => events.push(event),
+  }));
+
+  const running = loop.run();
+  try {
+    await settle(() => wakes.length === 1, 'first wake in flight');
+    assert.equal(timers.length, 1, 'heartbeat disabled, so the watchdog is the only timer');
+    const watchdog = timers[0]!;
+    assert.equal(watchdog.everyMs, 5_000, 'the watchdog checks once per poll interval');
+
+    // Just under the threshold: healthy, even though no cycle has EVER completed.
+    monotonic = 44_999;
+    watchdog.fn();
+    assert.deepEqual(stalled(), []);
+
+    // Over it: one record, measured from the start of `run`, with no cycle to name.
+    monotonic = 45_000;
+    watchdog.fn();
+    assert.deepEqual(stalled(), [{ lastPollAt: null, sinceMs: 45_000 }]);
+    assert.match(
+      errs.join('\n'),
+      /^poll loop stalled: no progress for 45000ms \(threshold 45000ms; last completed cycle never\)$/mu,
+    );
+
+    // Still stalled: EDGE-triggered, so no second record for the same episode.
+    monotonic = 90_000;
+    watchdog.fn();
+    assert.equal(stalled().length, 1, 'one record per stall episode');
+
+    // Recovery: the hung call finally answers, the cycle completes, and the
+    // loop parks the next wake. The completed cycle re-arms the watchdog.
+    wakes[0]!({ text: '', cursor: 1, changed: false });
+    await settle(() => wakes.length === 2, 'second wake in flight');
+    assert.equal(loop.getCyclesCompleted(), 1);
+    assert.equal(loop.getLastPollAt(), 590_000);
+    watchdog.fn();
+    assert.equal(stalled().length, 1, 'a fresh cycle is not a stall');
+
+    // A NEW episode, measured from that completed cycle, gets its own record.
+    monotonic = 90_000 + 45_000;
+    watchdog.fn();
+    assert.deepEqual(stalled(), [
+      { lastPollAt: null, sinceMs: 45_000 },
+      { lastPollAt: 590_000, sinceMs: 45_000 },
+    ]);
+  } finally {
+    loop.stop();
+    for (const resolve of wakes) resolve({ text: '', cursor: 1, changed: false });
+  }
+  assert.equal(await running, 0);
+  assert.equal(timers.every((timer) => timer.cancelled), true, 'stop() clears the watchdog');
+});
+
+test('#300: a hub-instructed Retry-After pause is not a stall', async () => {
+  // The loop sleeps out a 429's Retry-After on the hub's own instruction. The
+  // watchdog measures from the END of that pause, so an honest 100s backoff
+  // produces no `stalled`, but a loop that then fails to wake up does.
+  const { hub } = mockHub({
+    presence: [{ error: new HubError(429, 'slow down', 'rate_limited', 100_000) }],
+  });
+  const { spawner } = fakeSpawner();
+  const { schedule, timers } = fakeSchedule();
+  let monotonic = 0;
+  let releaseSleep: (() => void) | undefined;
+  const events: ShiftEventRecord[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    monotonicNow: () => monotonic,
+    pollIntervalMs: 5_000,
+    hubCallTimeoutMs: 30_000,
+    heartbeatIntervalMs: 0,
+    schedule,
+    sleep: () => new Promise<void>((resolve) => {
+      releaseSleep = resolve;
+    }),
+    onEvent: (event) => events.push(event),
+  }));
+
+  const running = loop.run();
+  try {
+    await settle(() => releaseSleep !== undefined, 'loop parked in its backoff sleep');
+    const watchdog = timers[0]!;
+    monotonic = 45_000;
+    watchdog.fn();
+    assert.deepEqual(events.filter((event) => event.type === 'stalled'), [], 'inside the backoff: healthy');
+    monotonic = 100_000 + 45_000;
+    watchdog.fn();
+    assert.equal(events.filter((event) => event.type === 'stalled').length, 1, 'past the backoff with no cycle: stalled');
+  } finally {
+    loop.stop();
+    releaseSleep?.();
+  }
+  assert.equal(await running, 0);
+});
+
+test('#300: a long cycle of many settled calls is not a stall; one call that never settles is', async () => {
+  // A cycle serialises wake, the inbox, one targeted whats_next per workflow,
+  // and more. Against a slow-but-alive hub those can sum past the threshold
+  // while each one answers. The watchdog must measure from the last SETTLED
+  // call, not the last completed cycle, or it reports every such sweep.
+  const { hub } = mockHub({});
+  type InboxResponse = Awaited<ReturnType<HubClient['whatsNext']>>;
+  const wakes: Array<(w: WakeResponse) => void> = [];
+  const inboxes: Array<(r: InboxResponse) => void> = [];
+  const slow: HubClient = {
+    ...hub,
+    wake: () => new Promise<WakeResponse>((resolve) => {
+      wakes.push(resolve);
+    }),
+    whatsNext: () => new Promise<InboxResponse>((resolve) => {
+      inboxes.push(resolve);
+    }),
+  };
+  const { spawner } = fakeSpawner();
+  const { schedule, timers } = fakeSchedule();
+  let monotonic = 0;
+  const events: ShiftEventRecord[] = [];
+  const stalled = (): Array<{ lastPollAt: number | null; sinceMs: number }> =>
+    events.flatMap((event) => (event.type === 'stalled' ? [{ lastPollAt: event.lastPollAt, sinceMs: event.sinceMs }] : []));
+  const loop = createShiftLoop(baseOpts(slow, spawner, {
+    now: () => 500_000 + monotonic,
+    monotonicNow: () => monotonic,
+    pollIntervalMs: 5_000,
+    hubCallTimeoutMs: 30_000, // threshold 3 × 5 000 + 30 000 = 45 000
+    heartbeatIntervalMs: 0,
+    schedule,
+    err: () => {},
+    onEvent: (event) => events.push(event),
+  }));
+
+  const running = loop.run();
+  try {
+    await settle(() => wakes.length === 1, 'first wake in flight');
+    const watchdog = timers[0]!;
+
+    // Wake answers after 30 s (under the deadline) with news, so the cycle
+    // goes on to the inbox — which is now the call in flight.
+    monotonic = 30_000;
+    wakes[0]!({ text: '', cursor: 1, changed: true });
+    await settle(() => inboxes.length === 1, 'inbox whats_next in flight');
+
+    // 60 s since `run` started and no cycle has completed, but the last call
+    // settled 30 s ago: the loop is slow, not hung. Measured from the cycle
+    // alone this would already be a (false) stall.
+    monotonic = 60_000;
+    watchdog.fn();
+    assert.deepEqual(stalled(), [], 'a cycle of settled calls summing past the threshold is not a stall');
+    assert.equal(loop.getCyclesCompleted(), 0, 'and that verdict did not need a completed cycle');
+
+    // The inbox answers too; the cycle completes and the next wake parks.
+    inboxes[0]!({ text: '', instances: [] });
+    await settle(() => wakes.length === 2, 'second wake in flight');
+    assert.equal(loop.getCyclesCompleted(), 1);
+
+    // Now ONE call that never settles: nothing moves the reference, so the
+    // threshold after the last progress (the completed cycle at 60 s) trips.
+    monotonic = 60_000 + 44_999;
+    watchdog.fn();
+    assert.deepEqual(stalled(), []);
+    monotonic = 60_000 + 45_000;
+    watchdog.fn();
+    assert.deepEqual(stalled(), [{ lastPollAt: 560_000, sinceMs: 45_000 }]);
+  } finally {
+    loop.stop();
+    for (const resolve of wakes) resolve({ text: '', cursor: 1, changed: false });
+    for (const resolve of inboxes) resolve({ text: '', instances: [] });
+  }
+  assert.equal(await running, 0);
+});
+
+test('#300: the heartbeat fires on its own cadence, never under `once`, and is file-only', async () => {
+  const { hub } = mockHub({});
+  const { spawner } = fakeSpawner();
+
+  // `once` runs one cycle and returns: nothing to watch, so no timers at all.
+  const onceTimers = fakeSchedule();
+  const onceLoop = createShiftLoop(baseOpts(hub, spawner, { once: true, schedule: onceTimers.schedule }));
+  assert.equal(await onceLoop.run(), 0);
+  assert.deepEqual(onceTimers.timers, [], '`once` mode starts neither watchdog nor heartbeat');
+
+  // Daemon mode: the heartbeat is the second timer, on the default five-minute cadence.
+  const wakes: Array<(w: WakeResponse) => void> = [];
+  const hanging: HubClient = {
+    ...hub,
+    wake: () => new Promise<WakeResponse>((resolve) => {
+      wakes.push(resolve);
+    }),
+  };
+  const { schedule, timers } = fakeSchedule();
+  const events: ShiftEventRecord[] = [];
+  let now = 7_000;
+  const loop = createShiftLoop(baseOpts(hanging, spawner, {
+    now: () => now,
+    hubCallTimeoutMs: 30_000,
+    schedule,
+    onEvent: (event) => events.push(event),
+  }));
+  const running = loop.run();
+  try {
+    await settle(() => wakes.length === 1, 'first wake in flight');
+    assert.deepEqual(timers.map((timer) => timer.everyMs), [5_000, 5 * 60_000], 'watchdog, then heartbeat at 5 minutes');
+    const heartbeat = timers[1]!;
+    const beats = (): unknown[] =>
+      events.filter((event) => event.type === 'heartbeat').map(({ ts: _ts, shift: _shift, shiftId: _id, ...body }) => body);
+
+    // Before any cycle completes the record still says so: this is what makes a
+    // silent daemon readable — a heartbeat with a frozen count IS the diagnosis.
+    heartbeat.fn();
+    assert.deepEqual(beats(), [
+      { type: 'heartbeat', cyclesCompleted: 0, lastPollAt: null, hubFailureStreak: 0, stalled: false },
+    ]);
+
+    wakes[0]!({ text: '', cursor: 1, changed: false });
+    await settle(() => wakes.length === 2, 'second wake in flight');
+    // The clock moves only after the first cycle completed, so the heartbeat's
+    // lastPollAt is the completion time (7_000), not the current time.
+    now = 8_000;
+    heartbeat.fn();
+    assert.deepEqual(beats(), [
+      { type: 'heartbeat', cyclesCompleted: 0, lastPollAt: null, hubFailureStreak: 0, stalled: false },
+      { type: 'heartbeat', cyclesCompleted: 1, lastPollAt: 7_000, hubFailureStreak: 0, stalled: false },
+    ]);
+  } finally {
+    loop.stop();
+    for (const resolve of wakes) resolve({ text: '', cursor: 1, changed: false });
+  }
+  assert.equal(await running, 0);
+  assert.equal(timers.every((timer) => timer.cancelled), true, 'stop() clears both timers');
+
+  // FILE-ONLY: proof of life must not wake a parked `owenloop shift next`; the
+  // watchdog's `stalled` is the record that does.
+  assert.equal(reachesSocketConsumer('heartbeat'), false);
+  assert.equal(reachesSocketConsumer('stalled'), true);
 });
