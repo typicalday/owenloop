@@ -390,7 +390,7 @@ directories under. `--work-root` / `allowedWorkdirRoots` is the SET of
 directories an order is **allowed to name**. Neither derives from the other.
 
 ```bash
-owenloop shift start build --work-root ~/code --work-root /srv/work
+owenloop shift start openai --work-root ~/code --work-root /srv/work
 ```
 
 **Crew roster selection.** A selected roster candidate decides
