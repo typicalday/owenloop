@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import { dsseVerifySubmission, valueDigestHex } from '../../../src/crypto/index.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
@@ -978,7 +979,7 @@ test('an order with no workdir warns, naming the step, the run, and the resolved
 test('an order that carries a workdir spawns there and warns about nothing', async () => {
   const warnings: string[] = [];
   const { cwd, outcome } = await envForOrder(commandOrder({ workdir: '/wt/flow-1' }), {
-    extra: { err: (line) => warnings.push(line) },
+    extra: { err: (line) => warnings.push(line), dirExists: () => true },
   });
   assert.equal(outcome, 'submitted');
   assert.equal(cwd, '/wt/flow-1');
@@ -1104,7 +1105,7 @@ for (const kind of ['unknown-digest', 'unknown-step', 'integrity', 'no-digest', 
 test('uses the order workdir as the command cwd when the packet carries one', async () => {
   const fr = fakeRunner();
   const { hub } = mockHub({ getOrder: [commandOrder({ workdir: '/repo/wt' })] });
-  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { dirExists: () => true }));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(0));
@@ -1512,7 +1513,7 @@ test('no declared roots means no restriction — an order workdir anywhere runs'
     getOrder: [commandOrder({ workdir: '/somewhere/else' })],
     submit: ['green'],
   });
-  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { dirExists: () => true }));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(0));
@@ -1537,7 +1538,7 @@ test('an order workdir inside a declared root runs normally', async () => {
     getOrder: [commandOrder({ workdir: '/allowed/proj/wt/x' })],
     submit: ['green'],
   });
-  const loop = createExecLoop(baseOpts(hub, fr.runner, { allowedWorkdirRoots: ['/allowed'] }));
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { allowedWorkdirRoots: ['/allowed'], dirExists: () => true }));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(0));
@@ -1558,6 +1559,112 @@ test('an order that names NO workdir is never denied, whatever the roots are', a
   fr.resolve(result(0));
   assert.equal(await p, 'submitted');
   assert.equal(fr.starts[0]!.cwd, '/work');
+});
+
+// ---- a hub-named workdir that no longer exists (#301) -----------------------
+//
+// The hub resolves `workdirFrom:` from an artifact VALUE, which can outlive the
+// directory it names: a cleanup step reclaims a worktree, then a rejection
+// re-arms an earlier step whose workdir was that worktree. Spawning there fails
+// with `spawn /bin/sh ENOENT` — a message about the shell, not the cwd. The
+// worker must refuse BEFORE spawning and release with a reason that names the
+// path, because that reason is what the hub surfaces in `routing alerts`.
+// These tests use real directories under the OS temp root: the DEFAULT
+// existence check is the thing under test, not an injected fake.
+
+let workdirRoot: string | undefined;
+afterEach(() => {
+  if (workdirRoot !== undefined) rmSync(workdirRoot, { recursive: true, force: true });
+  workdirRoot = undefined;
+});
+
+test('an order workdir that does not exist is released with a reason naming the path — never spawned', async () => {
+  workdirRoot = mkdtempSync(join(tmpdir(), 'owenloop-exec-workdir-'));
+  const reclaimed = join(workdirRoot, 'wt', 'flow-reclaimed');
+  assert.equal(existsSync(reclaimed), false);
+  const fr = fakeRunner();
+  const errs: string[] = [];
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ workdir: reclaimed })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+
+  assert.equal(await loop.run(), 'workdir-missing');
+  assert.equal(fr.starts.length, 0, 'nothing was spawned');
+  assert.equal(submits.length, 0, 'nothing was submitted');
+  const releases = only(calls, 'release');
+  assert.equal(releases.length, 1, 'exactly one targeted release');
+  assert.deepEqual(releases[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    reason: `step workdir no longer exists: ${reclaimed}`,
+  });
+  const line = errs.find((l) => /no longer exists/.test(l));
+  assert.ok(line !== undefined, errs.join('\n'));
+  assert.match(line, /step 'builder'/);
+  assert.match(line, /wf1\/run1/);
+  assert.ok(line.includes(reclaimed), line);
+});
+
+test('an order workdir that is a plain FILE is released the same way — a file is not a directory', async () => {
+  workdirRoot = mkdtempSync(join(tmpdir(), 'owenloop-exec-workdir-'));
+  const file = join(workdirRoot, 'not-a-dir');
+  writeFileSync(file, '');
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ workdir: file })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+
+  assert.equal(await loop.run(), 'workdir-missing');
+  assert.equal(fr.starts.length, 0);
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'release').length, 1);
+  assert.equal((only(calls, 'release')[0]!.arg as { reason?: string }).reason, `step workdir no longer exists: ${file}`);
+});
+
+test('an order workdir that exists spawns there with no release and no warning — behaviour unchanged', async () => {
+  workdirRoot = mkdtempSync(join(tmpdir(), 'owenloop-exec-workdir-'));
+  const present = join(workdirRoot, 'wt', 'flow-present');
+  mkdirSync(present, { recursive: true });
+  const fr = fakeRunner();
+  const errs: string[] = [];
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ workdir: present })], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+
+  assert.equal(await p, 'submitted');
+  assert.equal(fr.starts[0]!.cwd, present);
+  assert.equal(submits.length, 1);
+  assert.equal(only(calls, 'release').length, 0);
+  assert.deepEqual(errs.filter((l) => /no longer exists/.test(l)), []);
+});
+
+test('the roots check runs first: a workdir that is both outside the roots and missing is workdir-denied', async () => {
+  // Policy before existence. A machine that was never configured to host the
+  // tree should say so; whether the tree happens to exist on THIS machine is
+  // irrelevant to that answer, and reporting "missing" would send the operator
+  // looking at the wrong thing.
+  const fr = fakeRunner();
+  const { hub, calls } = mockHub({ getOrder: [commandOrder({ workdir: '/elsewhere/definitely/missing' })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { allowedWorkdirRoots: ['/allowed'] }));
+
+  assert.equal(await loop.run(), 'workdir-denied');
+  assert.equal(fr.starts.length, 0);
+  assert.equal((only(calls, 'release')[0]!.arg as { reason?: string }).reason, 'workdir-denied');
+});
+
+test('an order that names NO workdir is never existence-checked: opts.cwd is the fallback, not a claim', async () => {
+  // `opts.cwd` is this worker's own launch directory. It is not hub-supplied,
+  // so it is out of scope for the #301 check even when it does not exist.
+  const fr = fakeRunner();
+  const { hub, calls } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { cwd: '/launch/dir/that/does/not/exist' }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+
+  assert.equal(await p, 'submitted');
+  assert.equal(fr.starts[0]!.cwd, '/launch/dir/that/does/not/exist');
+  assert.equal(only(calls, 'release').length, 0);
 });
 
 // ---- misroute (not exec's to fail) ------------------------------------------
