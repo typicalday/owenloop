@@ -56,9 +56,9 @@
  * cold replay WITHIN THE SAME FIRING — the order is still leased, so handing it
  * back would waste a whole re-offer cycle to learn something already known.
  */
-import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
-import { isWorkdirAllowed } from './workdir.ts';
+import { isExistingDirectory, isWorkdirAllowed } from './workdir.ts';
 
 import { createApprovalRequester } from './approvals.ts';
 
@@ -109,6 +109,7 @@ export type AgentRunOutcome =
   | 'completed' // the order had already finished at first contact (exit 0)
   | 'misroute' // null packet, or a command order — released, not ours (exit 1)
   | 'workdir-denied' // the order named a cwd outside this machine's declared roots — released (exit 1)
+  | 'workdir-missing' // the order named a cwd that no longer exists on this machine — released (exit 1)
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
   | 'incompatible-harness-policy' // selected adapter cannot enforce the restrictions (exit 1)
@@ -248,8 +249,10 @@ export interface AgentRunLoopOptions {
   /**
    * Does this directory still exist? Injected for the same reason every other
    * side effect here is: a unit test drives the "the work dir was reaped, so the
-   * session cannot resume" branch without touching a filesystem. Defaults to
-   * `node:fs` `existsSync`.
+   * session cannot resume" branch — and the "the order-named workdir was
+   * reclaimed, so the order cannot be served" branch — without touching a
+   * filesystem. Defaults to `isExistingDirectory` (`./workdir.ts`): an
+   * existing DIRECTORY, so a path that became a plain file answers false.
    */
   dirExists?: (path: string) => boolean;
   sleep: (ms: number) => Promise<void>;
@@ -932,6 +935,30 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       return releaseWith('workdir-denied', 'workdir-denied');
     }
 
+    // EXISTENCE. The hub resolved `workdirFrom:` from an artifact VALUE, and a
+    // value can outlive the directory it names: a cleanup step reclaims the
+    // worktree, then a rejection re-arms an earlier step whose workdir was that
+    // worktree (owenloop #301). Opening a session there fails inside the
+    // harness with an error that never names the cwd, burns an attempt, and
+    // leaves nothing in `routing alerts` naming the cause.
+    //
+    // RELEASED, not failed, BEFORE the step spec is loaded or any provider
+    // session opens, through the same `releaseWith` the roots check above
+    // uses — but with a reason that NAMES THE PATH. `releaseWith` hands the
+    // reason to `lease.stop`, the lease loop forwards it as the release
+    // request's `reason`, and the hub records it as an `unservable-release`
+    // routing alert, so `owenloop routing alerts --workflow <wf>` shows the
+    // vanished directory. Only an order-NAMED workdir is checked: the fallback
+    // `<workRoot>/<workflow>/<run>/` is created by this worker on first use.
+    if (packet.workdir !== undefined && !(opts.dirExists ?? isExistingDirectory)(packet.workdir)) {
+      const missing = resolve(packet.workdir);
+      opts.err(
+        `owenloop work agent-run: step '${packet.step}' (${order}) names workdir '${missing}', ` +
+          'which no longer exists on this machine — releasing for the pickup window',
+      );
+      return releaseWith(`step workdir no longer exists: ${missing}`, 'workdir-missing');
+    }
+
     // The step spec. No bundle / no spec ⇒ we cannot brief anybody; release so
     // the order lapses back through the hub's pickup window.
     let material: NormalizedStepSpec | null;
@@ -1102,7 +1129,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     // filtered to `at > prev.deliveredReasonAt` — the packet's `owes` IS the set
     // of paths being re-armed, so no extra path filter is needed here.
     const prev = opts.latestSession?.(task) ?? null;
-    const dirExists = opts.dirExists ?? existsSync;
+    const dirExists = opts.dirExists ?? isExistingDirectory;
     const delta = renderRejection({
       packet,
       ...(prev?.deliveredReasonAt !== undefined ? { deliveredReasonAt: prev.deliveredReasonAt } : {}),

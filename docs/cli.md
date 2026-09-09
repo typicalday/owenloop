@@ -385,6 +385,24 @@ Only a workdir the ORDER names is checked. A step that declares neither
 controls — the shift's own launch directory for a command step, or
 `<workRoot>/<workflow>/<run>/` for an agent step — and is never denied.
 
+The same two workers make one more check on an order-named workdir, right after
+the roots check: the directory must still **exist** on this machine and be a
+directory. A `workdirFrom:` value can outlive what it names — a cleanup step
+reclaims a worktree, then a rejection re-arms an earlier step whose workdir was
+that worktree — and spawning there used to fail inside the command or the
+harness with a message that never mentioned the cwd. Now `owenloop work exec`
+and `owenloop work agent-run` refuse before anything is spawned or any session
+opens. The shape is the same as the roots refusal: a **release**, not a
+failure. The worker releases its claim with the reason
+`step workdir no longer exists: <absolute path>`, exits non-zero (outcome
+`workdir-missing`, exit 1), and writes one line to `<log-dir>/<run>.log` naming
+the path. The step stays eligible and the order returns to the pickup window;
+the hub records the reason as a routing alert (`owenloop routing alerts
+--workflow <wf>`), keeping only the first observation per workflow and step. The
+roots check runs first, so a workdir that is both outside the roots and missing
+is reported as denied, not missing. A step that names no workdir is never
+existence-checked — its fallback directory is one owenloop itself controls.
+
 `--work-root` is not `--work-root`'s neighbour `workRoot`. `workRoot` (settings,
 `OWENLOOP_WORK_ROOT`) is the ONE directory owenloop **creates** per-run
 directories under. `--work-root` / `allowedWorkdirRoots` is the SET of

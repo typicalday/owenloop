@@ -137,6 +137,7 @@ export function exitCodeFor(outcome: ExecOutcome): number {
       return 0;
     case 'misroute':
     case 'workdir-denied':
+    case 'workdir-missing':
     case 'unresolved-instructions':
     case 'killed':
     case 'lease-lost':

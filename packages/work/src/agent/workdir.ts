@@ -178,6 +178,30 @@ export function isWorkdirAllowed(workdir: string, roots: string[]): boolean {
   });
 }
 
+/**
+ * Is `path` an existing DIRECTORY right now?
+ *
+ * The default behind the `dirExists` seam of both worker loops. `statSync`
+ * follows symlinks, so a link to a directory counts; a plain file does not, and
+ * neither does a path whose stat fails for any reason (ENOENT, ENOTDIR on a
+ * component that became a file, EACCES) — a directory this process cannot stat
+ * is one it cannot spawn in either.
+ *
+ * Why the loops check at all: the hub resolves `workdirFrom:` from an artifact
+ * VALUE, and that value can outlive the directory it names — a cleanup step
+ * reclaims a worktree, then a rejection re-arms an earlier step whose workdir
+ * was that worktree (owenloop #301). Spawning there fails with an opaque
+ * `spawn /bin/sh ENOENT` that reads as a missing shell. The loops refuse
+ * before spawning instead and release with a reason that names the path.
+ */
+export function isExistingDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 export interface EnsureWorkDirOptions {
   workRoot: string;
   workflow: string;

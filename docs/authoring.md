@@ -258,6 +258,18 @@ unresolvable path remains deferred until a valid value arrives.
 produced it. What bounds where a worker may actually run is machine-side and
 belongs to the operator running the shift, not to the definition.
 
+The resolved value can also outlive the directory it names: a cleanup step
+reclaims a worktree, then a rejection re-arms an earlier step whose workdir was
+that worktree. A worker that is handed such an order does not spawn or open a
+session there. It releases the order with the reason
+`step workdir no longer exists: <absolute path>`, which the hub records as a
+routing alert (`owenloop routing alerts --workflow <wf>`). The hub keeps only
+the first such observation per workflow and step, so a worker that is offered
+the same order again and releases it again adds no further rows. The release
+is not a failure: the step stays eligible, and the fix is to supply a workdir
+that exists (re-run the provisioning step, or provide a fresh path) rather
+than to retry the order as-is.
+
 ## `executor:` — declaring the executor
 
 Every step in every def written before this feature dispatches to an LLM

@@ -218,6 +218,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
       return 0;
     case 'misroute':
     case 'workdir-denied':
+    case 'workdir-missing':
     case 'no-template':
     case 'no-harness':
     case 'incompatible-harness-policy':

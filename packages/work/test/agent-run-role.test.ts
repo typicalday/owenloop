@@ -99,7 +99,7 @@ test('exitCodeFor maps every outcome to the documented code', () => {
   const one: AgentRunOutcome[] = [
     'misroute', 'no-template', 'no-harness', 'incompatible-harness-policy', 'unverified-consumed',
     'unstamped-order', 'unresolvable-crew', 'session-store-failed', 'no-submit', 'killed', 'lease-lost',
-    'ownership-error', 'hub-unreachable', 'stopped',
+    'ownership-error', 'hub-unreachable', 'stopped', 'workdir-denied', 'workdir-missing',
   ];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
   for (const o of one) assert.equal(exitCodeFor(o), 1);

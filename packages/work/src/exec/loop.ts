@@ -45,7 +45,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { isWorkdirAllowed } from '../agent/workdir.ts';
+import { isExistingDirectory, isWorkdirAllowed } from '../agent/workdir.ts';
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import { HubError, type ContactHolder, type GetOrderResponse, type OrderPacket, type SubmitRequest } from '../hub/types.ts';
@@ -98,6 +98,7 @@ export type ExecOutcome =
   | 'completed' // the order already finished at first contact (exit 0)
   | 'misroute' // null / non-command packet — released, not our failure (exit 1)
   | 'workdir-denied' // the order named a cwd outside this machine's declared roots — released (exit 1)
+  | 'workdir-missing' // the order named a cwd that no longer exists on this machine — released (exit 1)
   | 'unresolved-instructions' // local-store instruction refusal — released, never spawned (exit 1)
   | 'killed' // a signal aimed at exec killed the command + released (exit 1)
   | 'lease-lost' // the lease went terminal while the command ran (exit 1)
@@ -142,6 +143,13 @@ export interface ExecLoopOptions {
    * only default that does not break every shift already running.
    */
   allowedWorkdirRoots?: string[];
+  /**
+   * Is this path an existing directory? Consulted only for an order-NAMED
+   * workdir, before the command is resolved or spawned. Injected so a unit test
+   * can drive the "the worktree was reclaimed" branch without a filesystem.
+   * Defaults to `isExistingDirectory` (`agent/workdir.ts`).
+   */
+  dirExists?: (path: string) => boolean;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   random?: () => number;
@@ -1017,6 +1025,32 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       lease.stop('workdir-denied'); // targeted release — local policy, not a failure
       await leasePromise;
       return 'workdir-denied';
+    }
+
+    // EXISTENCE. The hub resolved `workdirFrom:` from an artifact VALUE, and a
+    // value can outlive the directory it names: a cleanup step reclaims the
+    // worktree, then a rejection re-arms an earlier step whose workdir was that
+    // worktree (owenloop #301). Spawning there fails with `spawn /bin/sh
+    // ENOENT`, which reads as a missing shell, burns an attempt, and leaves
+    // nothing in `routing alerts` naming the cause.
+    //
+    // RELEASED, not failed, through the same targeted release the roots check
+    // above uses — but with a reason that NAMES THE PATH. The lease loop
+    // forwards `stop(reason)` as the release request's `reason`, and the hub
+    // records it as an `unservable-release` routing alert, so `owenloop
+    // routing alerts --workflow <wf>` shows the vanished directory instead of a
+    // generic worker failure. Only an order-NAMED workdir is checked, for the
+    // same reason as above: the `opts.cwd` fallback is this worker's own
+    // launch directory.
+    if (order.workdir !== undefined && !(opts.dirExists ?? isExistingDirectory)(order.workdir)) {
+      const missing = resolve(order.workdir);
+      opts.err(
+        `owenloop work exec: step '${order.step}' (${workflow}/${runId}) names workdir ` +
+          `'${missing}', which no longer exists on this machine — releasing for the pickup window`,
+      );
+      lease.stop(`step workdir no longer exists: ${missing}`); // targeted release, reason names the path
+      await leasePromise;
+      return 'workdir-missing';
     }
 
     let resolvedCommand: string;

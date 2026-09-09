@@ -10,7 +10,10 @@
  * ended cleanly with no hub outcome is a FAILURE. The harness never votes.
  */
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, test } from 'node:test';
 
 import {
   confirmOutcome,
@@ -442,6 +445,7 @@ test('recovery wake is delta-only and cold replay preserves only the assignment 
 		spec: { step: 'builder', brief: `# recovery assignment\n${assignment}`, permissions: { extensions: {} } },
 		consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
 		submitGraceMs: 0,
+		dirExists: () => true, // the sentinel workdir is a secret-leak probe, not a real directory
 	});
 
 	assert.equal(await createAgentRunLoop(h.opts).run(), 'held');
@@ -1325,7 +1329,7 @@ test('the additional unbounded final-response evidence event is redacted while p
 test('the session record carries the resolved harness, its token, the packet cwd, and the injected attempt', async () => {
   const adapter = createFakeAdapter({ id: 'fake', token: 'tok-77' });
   const { hub } = mockHub({ getOrder: [agentOrder({ workdir: '/repo/wt' }), agentOrder({ claimed: false, outcome: 'green' })] });
-  const h = buildOpts({ hub, adapter, shiftId: 'shf_test', shiftName: 'shift-A', shiftOwner: '/state/shift-a' });
+  const h = buildOpts({ hub, adapter, shiftId: 'shf_test', shiftName: 'shift-A', shiftOwner: '/state/shift-a', dirExists: () => true });
 
   await createAgentRunLoop(h.opts).run();
 
@@ -1350,6 +1354,7 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
     hub,
     adapter,
     shiftId: 'shf_1',
+    dirExists: () => true,
     spec: {
       step: 'builder',
       brief: TEMPLATE,
@@ -2095,7 +2100,7 @@ test('a packet workdir inside a declared root proceeds normally', async () => {
   const { hub } = mockHub({
     getOrder: [agentOrder({ workdir: '/allowed/proj/wt' }), agentOrder({ claimed: false, outcome: 'green' })],
   });
-  const h = buildOpts({ hub, adapter, allowedWorkdirRoots: ['/allowed'] });
+  const h = buildOpts({ hub, adapter, allowedWorkdirRoots: ['/allowed'], dirExists: () => true });
 
   await createAgentRunLoop(h.opts).run();
   assert.equal(h.records[0]!.cwd, '/allowed/proj/wt');
@@ -2111,6 +2116,114 @@ test('a packet that names NO workdir is never denied, whatever the roots are', a
 
   await createAgentRunLoop(h.opts).run();
   assert.equal(h.records[0]!.cwd, '/fallback/cwd');
+});
+
+// ---- a hub-named workdir that no longer exists (#301) -----------------------
+//
+// The hub resolves `workdirFrom:` from an artifact VALUE, which can outlive the
+// directory it names: a cleanup step reclaims a worktree, then a rejection
+// re-arms an earlier step whose workdir was that worktree. Opening a harness
+// session there fails inside the harness with a message that says nothing
+// about the cwd. The loop must refuse BEFORE the step spec is loaded and
+// before any session opens, and release with a reason that names the path —
+// that reason is what the hub surfaces in `routing alerts`. These tests use
+// real directories under the OS temp root so the DEFAULT existence check is
+// the thing under test.
+
+let workdirRoot: string | undefined;
+afterEach(() => {
+  if (workdirRoot !== undefined) rmSync(workdirRoot, { recursive: true, force: true });
+  workdirRoot = undefined;
+});
+
+test('a packet workdir that does not exist is released with a reason naming the path — no spec load, no session', async () => {
+  workdirRoot = mkdtempSync(join(tmpdir(), 'owenloop-agent-workdir-'));
+  const reclaimed = join(workdirRoot, 'wt', 'flow-reclaimed');
+  assert.equal(existsSync(reclaimed), false);
+  const adapter = createFakeAdapter();
+  let specLoads = 0;
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ workdir: reclaimed })] });
+  const h = buildOpts({
+    hub,
+    adapter,
+    loadStep: async () => {
+      specLoads += 1;
+      return baseSpec();
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'workdir-missing');
+  assert.deepEqual(adapter.calls, [], 'no harness session opened');
+  assert.equal(h.records.length, 0, 'no session record written');
+  assert.equal(specLoads, 0, 'the step spec was never loaded');
+  const releases = calls.filter((c) => c.verb === 'release');
+  assert.equal(releases.length, 1, 'exactly one targeted release');
+  assert.deepEqual(releases[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    reason: `step workdir no longer exists: ${reclaimed}`,
+  });
+  const line = h.errs.find((l) => /no longer exists/.test(l));
+  assert.ok(line !== undefined, h.errs.join('\n'));
+  assert.match(line, /step 'builder'/);
+  assert.match(line, /wf1\/run1/);
+  assert.ok(line.includes(reclaimed), line);
+});
+
+test('a packet workdir that is a plain FILE is released the same way — a file is not a directory', async () => {
+  workdirRoot = mkdtempSync(join(tmpdir(), 'owenloop-agent-workdir-'));
+  const file = join(workdirRoot, 'not-a-dir');
+  writeFileSync(file, '');
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ workdir: file })] });
+  const h = buildOpts({ hub, adapter });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'workdir-missing');
+  assert.deepEqual(adapter.calls, []);
+  assert.equal(h.records.length, 0);
+  const releases = calls.filter((c) => c.verb === 'release');
+  assert.equal(releases.length, 1);
+  assert.equal((releases[0]!.arg as { reason?: string }).reason, `step workdir no longer exists: ${file}`);
+});
+
+test('a packet workdir that exists opens the session there with no release and no warning — behaviour unchanged', async () => {
+  workdirRoot = mkdtempSync(join(tmpdir(), 'owenloop-agent-workdir-'));
+  const present = join(workdirRoot, 'wt', 'flow-present');
+  mkdirSync(present, { recursive: true });
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ workdir: present }), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.equal(h.records[0]!.cwd, present);
+  assert.equal(calls.filter((c) => c.verb === 'release').length, 0);
+  assert.deepEqual(h.errs.filter((l) => /no longer exists/.test(l)), []);
+});
+
+test('the roots check runs first: a workdir that is both outside the roots and missing is workdir-denied', async () => {
+  // Policy before existence: a machine never configured to host the tree says
+  // so, and "missing" would send the operator looking at the wrong thing.
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ workdir: '/elsewhere/definitely/missing' })] });
+  const h = buildOpts({ hub, adapter, allowedWorkdirRoots: ['/allowed'] });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'workdir-denied');
+  assert.deepEqual(adapter.calls, []);
+  const releases = calls.filter((c) => c.verb === 'release');
+  assert.equal((releases[0]!.arg as { reason?: string }).reason, 'workdir-denied');
+});
+
+test('a packet that names NO workdir is never existence-checked: opts.cwd is the fallback, not a claim', async () => {
+  // `opts.cwd` is the worker's own fallback directory, not hub-supplied, so it
+  // is out of scope for the #301 check — the existing '/fallback/cwd' tests
+  // above already run against a path that does not exist on disk.
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder(), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.equal(h.records[0]!.cwd, '/fallback/cwd');
+  assert.equal(calls.filter((c) => c.verb === 'release').length, 0);
 });
 
 // ---- release-and-hand-back paths --------------------------------------------
