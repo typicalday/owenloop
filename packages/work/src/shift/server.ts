@@ -355,6 +355,8 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       agent_ceiling: opts.loop.agentCeiling(),
       attended_at: opts.loop.getAttendedAt() ?? null,
       started_at: opts.startedAt,
+      last_poll_at: opts.loop.getLastPollAt() ?? null,
+      cycles_completed: opts.loop.getCyclesCompleted(),
     };
   };
 

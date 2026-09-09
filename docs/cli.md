@@ -290,7 +290,8 @@ that field a **crew**: `serve_crews` contains the selected crew names. Passing
 the Scoped Identity. Do not treat `attended_at` as a liveness signal: every
 accepted `shift next` records attendance and makes the next presence ping due,
 but attendance is advisory and observability-only. Attendance never changes
-routing, dispatch, or lease behavior.
+routing, dispatch, or lease behavior. The liveness signal is `last_poll_at` on
+`shift status` — see [`shift status`](#shift-status---state-dir-path).
 
 <a id="config-dir"></a>
 By default, the execution settings file is `$HOME/.owenloop/settings.json`.
@@ -590,24 +591,28 @@ either `exec` or `agent-run`:
 - `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`, `agent-lane-closed`, `dispatch-cap-full`, `agent-cap-full`, `claim-expired`); display `message`. The capacity, expiry, and `agent-lane-closed` reasons return the claim to the hub; malformed and unsupported reasons leave it for the pickup window.
 - `ended`: `{ "type": "ended" }`, delivered to a parked `next` when `shift end` explicitly shuts down the daemon
 - `wedged`: `{ "type": "wedged", "faults": [{ "kind": "missing", "role": "temp-dir", "path": "...", "message": "..." }], "streak": 3 }` — the shift stopped because the MACHINE it runs on is broken, and the process exits non-zero straight after. `faults` is never empty; display each `message`, which names the path and the operator fix. `streak` is how many consecutive hub calls failed before the check ran, and is `0` for the check a shift makes at start. A shift that cannot reach the hub does NOT produce this — a hub outage or a rate-limit ban recovers on its own, and the shift keeps polling through it. This record means a human must change something on the host.
+- `stalled`: `{ "type": "stalled", "lastPollAt": 1738000000000, "sinceMs": 45000 }` — the poll loop has made no progress (no hub call settled, no cycle completed) for longer than the stall threshold (three poll intervals plus the per-call hub deadline, 45 s at the defaults). It is written by a watchdog timer that does not depend on the loop, so it is the one record a hung loop cannot suppress. `lastPollAt` is the last completed cycle (epoch ms, `null` if none completed since start) and `sinceMs` is how long the loop has made no progress. A hub that stops answering does not produce this: every poll-loop hub call settles within its deadline and is reported as `hub-error` records and the `wedged` streak; `stalled` is the backstop for a hang that is not under a deadline (local dispatch, the filesystem, a spawn, or any other non-hub await inside the iteration). **Edge-triggered**: one record per stall episode, re-armed when a cycle completes. A hub-instructed `Retry-After` pause is not a stall and produces none. Compare `last_poll_at` on `shift status` to confirm.
 
 Every event above is also appended to `<log-dir>/shift.log` as JSON Lines, which
-is how they survive the daemon. **Five further record types exist in
+is how they survive the daemon. **Six further record types exist in
 `shift.log` and are never delivered over the socket** — `parked`, `capacity`,
-`hub-error`, `event-queue-overflow`, and `low-disk`.
+`hub-error`, `event-queue-overflow`, `low-disk`, and `heartbeat`.
 
 An idle `shift next` must block until there is work to report, and each of those
-five would satisfy it with news that no work moved: a startup record, a report
+six would satisfy it with news that no work moved: a startup record, a report
 that the shift is full, a failed call to the hub, a record about the socket
-queue itself, or a report that the disk is too full to start anything. `parked` and `capacity` are also redundant on the wire — the
+queue itself, a report that the disk is too full to start anything, or the
+periodic heartbeat (every five minutes) that says only that the daemon is still
+alive and how many poll cycles it has completed. `parked` and `capacity` are also redundant on the wire — the
 response above already carries live `cap`, `free`, and `running`, which is
 exactly what a `capacity` record restates. `hub-error` is level-triggered at the
 poll interval, so an unreachable hub would otherwise fill the 1000-slot socket
 FIFO and evict the `dispatched`, `failed` and `reaped` records a parked client
 is actually waiting for. In `shift.log`, which is append-only and unbounded, all
-four are load-bearing: they are the only way to tell an idle shift from a
-saturated one, and the only record of every failed hub call. See
-[`docs/shift-logs.md`](shift-logs.md).
+of them are load-bearing: they are the only way to tell an idle shift from a
+saturated one, the only record of every failed hub call, and — through
+`heartbeat` — the only way to tell a daemon that is alive but no longer polling
+from one that is merely quiet. See [`docs/shift-logs.md`](shift-logs.md).
 
 `gate` is a reserved protocol shape for a future local representation of a
 pending hub gate. Production code does not construct live hub gate events yet;
@@ -633,13 +638,18 @@ owenloop shift status [--state-dir <p>]
 With a daemon, status exits `0` and prints:
 
 ```json
-{ "name": "host/project#abc123", "serve_crews": ["alpha"], "cap": 3, "free": 3, "running": 0, "agent_ceiling": 2, "attended_at": null, "started_at": 1738000000000 }
+{ "name": "host/project#abc123", "serve_crews": ["alpha"], "cap": 3, "free": 3, "running": 0, "agent_ceiling": 2, "attended_at": null, "started_at": 1738000000000, "last_poll_at": 1738000005000, "cycles_completed": 1 }
 ```
 
 `agent_ceiling` is the effective maximum number of `agent-run` children after
 applying `--max-agents`, `--cap`, and `--exec-reserve`; command and exec work
 may still use any free slot inside `cap`. `attended_at` remains `null` until the
-first accepted `next` request. Without a daemon, status is still a successful question: it exits `0` and prints
+first accepted `next` request. `last_poll_at` (epoch ms) and `cycles_completed`
+are the liveness facts: they move only when the poll loop completes a full
+cycle, so a daemon that still answers `status` but whose `last_poll_at` is
+minutes old and whose `cycles_completed` no longer climbs has a loop that is
+hung or wedged, not merely idle. `last_poll_at` is `null` until the first cycle
+completes. Without a daemon, status is still a successful question: it exits `0` and prints
 `{ "status": "no daemon", "socket": "<path>" }`. Invalid arguments exit `2`;
 other client/runtime errors exit `1`.
 

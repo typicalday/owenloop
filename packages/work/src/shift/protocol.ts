@@ -226,6 +226,51 @@ export interface WedgedEvent {
 }
 
 /**
+ * The poll loop has made no progress — no hub call settled and no cycle
+ * completed — for longer than the shift's stall threshold. WATCHDOG-EMITTED, from a timer that does not depend on the loop:
+ * issue #300 was a daemon whose loop sat awaiting one hub call for hours,
+ * writing nothing, while `shift status` still answered — the loop cannot
+ * report its own hang, so something outside it must.
+ *
+ * EDGE-TRIGGERED like `capacity` and `low-disk`: one record per stall episode,
+ * re-armed by the next completed cycle. `lastPollAt` is the wall-clock time
+ * of the last completed cycle (`null` if none has completed since start) —
+ * the same fact `shift status` reports as `last_poll_at`, so a reader can
+ * line the two up. `sinceMs` is how long the loop has made NO progress: no
+ * hub call settled and no cycle completed. A cycle serialises many calls, so
+ * it is measured from the last settled call, not the last cycle.
+ *
+ * ON THE SOCKET AS WELL AS IN THE FILE, for the reason `wedged` is: a parked
+ * `owenloop shift next` is waiting on a loop that is no longer polling, and
+ * that is the most report-worthy thing that can happen to it.
+ */
+export interface StalledEvent {
+  type: 'stalled';
+  lastPollAt: number | null;
+  sinceMs: number;
+}
+
+/**
+ * Periodic proof of life. FILE-ONLY (see `ParkedEvent`): it carries nothing
+ * an operator has to act on, so it must not wake a parked `shift next`.
+ *
+ * Issue #300's daemon was silent for hours and NOTHING distinguished "idle and
+ * healthy" from "hung": an idle loop writes no lines either. This record makes
+ * the silence readable — a `shift.log` whose heartbeats stopped names the
+ * minute the process stopped doing anything, and one whose heartbeats
+ * continue with a frozen `cyclesCompleted` names a loop that is alive but not
+ * polling. `hubFailureStreak` is the same counter the host preflight reads,
+ * and `stalled` mirrors whether a `stalled` record is currently outstanding.
+ */
+export interface HeartbeatEvent {
+  type: 'heartbeat';
+  cyclesCompleted: number;
+  lastPollAt: number | null;
+  hubFailureStreak: number;
+  stalled: boolean;
+}
+
+/**
  * The socket event FIFO overflowed and discarded its oldest event. Written
  * STRAIGHT to the file sink, never through the loop's `emit()` — `emit()` feeds
  * the very queue that overflowed, so routing this through it would recurse
@@ -254,7 +299,9 @@ export type ShiftEventBody =
   | OrderDroppedEvent
   | EventQueueOverflowEvent
   | WedgedEvent
-  | LowDiskEvent;
+  | LowDiskEvent
+  | StalledEvent
+  | HeartbeatEvent;
 
 /**
  * The identity every event carries, added once on a shared envelope rather than
@@ -319,6 +366,15 @@ export interface ShiftStatus {
   agent_ceiling: number;
   attended_at: number | null;
   started_at: number;
+  /**
+   * Issue #300 liveness facts. `last_poll_at` is the wall-clock time the poll
+   * loop last COMPLETED a cycle (`null` before the first), and
+   * `cycles_completed` the running count. A status whose `started_at` is hours
+   * old and whose `last_poll_at` is also hours old names a hung loop — which a
+   * status made only of capacity numbers never could.
+   */
+  last_poll_at: number | null;
+  cycles_completed: number;
 }
 
 export interface ShiftError {

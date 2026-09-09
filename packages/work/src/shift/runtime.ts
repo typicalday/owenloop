@@ -18,7 +18,13 @@ import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSy
 import { computeServeCapabilities } from '../settings/serving.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { checkDiskFloor, resolveDiskFloorBytes } from './disk-floor.ts';
-import { createLockedRemovalCallbacks, createShiftLoop, type ShiftLoop } from './loop.ts';
+import {
+  createLockedRemovalCallbacks,
+  createShiftLoop,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HUB_CALL_TIMEOUT_MS,
+  type ShiftLoop,
+} from './loop.ts';
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createShiftLogSink } from './logsink.ts';
 import { prepareShiftLogDir, shiftLogFile } from './logretention.ts';
@@ -100,6 +106,12 @@ const DEFAULT_ROSTER_SYNC_MS = 15 * 60_000;
  * `event-queue-overflow` never reaches `consumeEvent` at all — `server.ts`
  * hands it straight to the log sink through `onSynthesized`, because the queue
  * is what overflowed. It is listed here so the category is stated in one place.
+ *
+ * `heartbeat` (issue #300) is periodic proof of life on a fixed cadence. It
+ * carries nothing to act on, so the blocking contract of `shift next` applies:
+ * a client parked for work must not be woken every five minutes by a record
+ * that says only "still here". `stalled`, the watchdog's edge-triggered
+ * counterpart, is NOT in this set for the reason `wedged` is not.
  */
 const FILE_ONLY_EVENTS: ReadonlySet<ShiftEventBody['type']> = new Set([
   'parked',
@@ -107,6 +119,7 @@ const FILE_ONLY_EVENTS: ReadonlySet<ShiftEventBody['type']> = new Set([
   'hub-error',
   'event-queue-overflow',
   'low-disk',
+  'heartbeat',
 ]);
 
 /**
@@ -677,6 +690,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     presenceIntervalMs: DEFAULT_PRESENCE_MS,
     rosterSyncIntervalMs: DEFAULT_ROSTER_SYNC_MS,
     rosterSyncTimeoutMs: DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS,
+    hubCallTimeoutMs: DEFAULT_HUB_CALL_TIMEOUT_MS,
+    heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
     syncRosters: (signal) => syncHubRosterCache({ client: hub, env, origin, account, signal }),
     computeServeCapabilities: (crews) => computeServeCapabilities({
       env,

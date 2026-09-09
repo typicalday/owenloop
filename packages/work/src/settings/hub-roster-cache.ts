@@ -12,6 +12,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { type Roster, validateRoster } from '../agent/capability-model.ts';
 import type { HubClient } from '../hub/client.ts';
+import { withHubCallTimeout } from '../hub/deadline.ts';
 import { owenloopConfigDir } from '../../../../src/config-dir.ts';
 import { normalizeOrigin } from '../../../../src/hub.ts';
 import type { RosterLayer } from './roster.ts';
@@ -87,26 +88,10 @@ export async function withHubRosterSyncTimeout<T>(
   run: (signal: AbortSignal) => Promise<T>,
   timeoutMs = DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS,
 ): Promise<T> {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      const error = new Error(`hub roster sync timed out after ${timeoutMs}ms`);
-      // Abort carries the same terminal error so an abort-aware transport and
-      // the explicit race report one stable, useful timeout outcome.
-      controller.abort(error);
-      reject(error);
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([run(controller.signal), timeout]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    // A composite refresh can reject as soon as one request fails while a
-    // sibling fetch is still waiting. Always cancel on settlement so that
-    // sibling cannot outlive this refresh (and accumulate across polls).
-    if (!controller.signal.aborted) controller.abort(new Error('hub roster sync finished'));
-  }
+  // The general form lives in `hub/deadline.ts` (issue #300 gave the poll
+  // loop's other hub calls the same deadline); this keeps the roster-specific
+  // default and error text callers already match on.
+  return withHubCallTimeout('hub roster sync', run, timeoutMs);
 }
 
 export function hubRosterCacheDir(env: Env): string {

@@ -219,12 +219,14 @@ Two properties an uploader can rely on:
 | `low-disk` | `path`, `freeBytes`, `floorBytes` | the volume holding the work root is below the floor, so the shift declined to start new work. It keeps polling and resumes by itself when space returns; children already running are left alone. **Edge-triggered** (one record per low-disk episode) and **file-only** — see below |
 | `ended` | — | an operator ran `owenloop shift end` |
 | `wedged` | `faults[]` (`kind`, `role`, `path`, `message`), `streak` | the shift stopped because the **machine** it runs on is broken, and the process exited non-zero — see below |
+| `stalled` | `lastPollAt`, `sinceMs` | the poll loop has made no progress — no hub call settled, no cycle completed — for longer than the stall threshold; written by a watchdog timer the loop cannot block. **Edge-triggered** (one record per stall episode, re-armed on the next completed cycle) — see below |
+| `heartbeat` | `cyclesCompleted`, `lastPollAt`, `hubFailureStreak`, `stalled` | periodic proof of life (every five minutes by default) carrying the loop's counters, so a silent file can be told apart from a silent daemon. **File-only** — see below |
 | `gate` | optional `workflow`, `run`, `name`, `question` | reserved; not emitted today |
 
 `kind` is `'exec' | 'agent-run'`.
 
-**Five of these are file-only.** `parked`, `capacity`, `hub-error`,
-`event-queue-overflow`, and `low-disk` are written to `shift.log` and are never
+**Six of these are file-only.** `parked`, `capacity`, `hub-error`,
+`event-queue-overflow`, `low-disk`, and `heartbeat` are written to `shift.log` and are never
 delivered over the daemon's Unix socket to `owenloop shift next`. Every other type goes to
 both. The routing rule is `FILE_ONLY_EVENTS` in
 `packages/work/src/shift/runtime.ts`, applied at the one point where an event
@@ -236,7 +238,9 @@ The split is not importance. It is what each consumer is:
   `failed`, `order-dropped`, `bundle-miss`, `ended` — tells a socket client
   something it cannot otherwise learn. Both sinks get it. `wedged` joins them
   for the same reason `ended` does: a client parked on a shift that is about to
-  exit is waiting for work that will never arrive.
+  exit is waiting for work that will never arrive. `stalled` joins them for the
+  same reason again: a client parked on a shift whose loop has hung is waiting
+  for work that will not arrive until someone restarts it.
 - A record about the **shift's own condition** is redundant or harmful on the
   socket, and load-bearing in the file.
 
@@ -303,7 +307,7 @@ as a refusal.
 
 Nothing is lost, because the file is the consumer with no envelope and no
 context. `shift.log` has no per-response `cap`/`free`/`running`, so without
-these five records a reader cannot tell an **idle** shift (no orders offered)
+these six records a reader cannot tell an **idle** shift (no orders offered)
 from a **saturated** one (orders offered, no slots) from a **stranded** one (hub
 unreachable, so nothing was ever offered) from one **refusing work on a full
 disk**, nor tell a quiet log from a lossy one.
@@ -414,6 +418,51 @@ one from a fresh shell, so it inherits the current `TMPDIR`.
 check ran, and is `0` for the check every shift makes at start, before its first
 hub call. It is evidence of what prompted the check, not the reason the shift
 stopped; the `faults` are that.
+
+### `stalled` and `heartbeat` — when the loop itself is the fault
+
+`wedged` and `hub-error` both need a hub call to **fail**. A hub call that never
+settles fails nothing: the loop awaits it forever, writes no line, makes no
+further hub traffic, and the daemon still answers `shift status` over its
+socket because that is served by a separate task. One shift was observed in
+this state for hours, indistinguishable in the file from an idle one.
+
+Two things close that gap. First, every hub call the loop makes — `wake`,
+`whats_next`, `presence_ping` — now runs under a per-call deadline (30 s by
+default), so a call that hangs is cut short and fails exactly like a call that
+failed outright: it is logged, and recorded as a `hub-error` where that call
+already reports one. Only a `wake` failure advances the `wedged` streak, as
+before. Second, a **watchdog timer** that does not depend on the loop returning
+checks when the loop last made progress — the later of the last hub call that
+settled (success or failure) and the last completed cycle. If that is older
+than the stall threshold (three poll intervals plus the per-call deadline, 45 s
+at the defaults) it writes a `stalled` record: `lastPollAt` is the last
+completed cycle (epoch ms, `null` if none has completed since start) and
+`sinceMs` is how long the loop has made no progress. Progress is per call, not
+per cycle, on purpose: one cycle serialises roster sync, presence, wake, the
+inbox and one targeted `whats_next` per workflow, so a slow-but-alive hub with
+a dozen workflows can legitimately take longer than the threshold per cycle
+without being hung. A hung hub is therefore not what `stalled` reports: every
+poll-loop hub call settles within its deadline, so a hub that stops answering
+shows up as `hub-error` records and the `wedged` streak. `stalled` is the
+backstop for a hang that is NOT under a deadline — local dispatch, the
+filesystem, a spawn, or any other non-hub await inside the iteration. It is
+**edge-triggered** like `capacity` and `low-disk` — one
+record per stall episode, re-armed when a cycle next completes — and a
+hub-instructed `Retry-After` pause is deliberately not a stall, since the shift
+is idle on instruction rather than hung. It reaches both sinks, for the reason
+`wedged` does.
+
+`heartbeat` is the complement: proof of life on a fixed cadence (five minutes by
+default) regardless of whether anything happened. It carries `cyclesCompleted`,
+`lastPollAt`, `hubFailureStreak`, and `stalled`, so a reader of the file can
+tell a daemon that is alive and idle (heartbeats arrive, `cyclesCompleted`
+climbs) from one that is alive and stuck (heartbeats arrive, `cyclesCompleted`
+frozen, `stalled: true`) from one that is dead (no heartbeats). It is
+**file-only** for the `parked`/`capacity` reason: a parked `shift next` must
+not be woken every five minutes by news that nothing happened. Both timers are
+started only by a long-running shift — `--once` starts neither — and are
+cleared when the shift stops.
 
 ### Line size
 
