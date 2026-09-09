@@ -32,8 +32,11 @@ export async function withHubCallTimeout<T>(
       controller.abort(error);
       reject(error);
     }, timeoutMs);
-    // A pending deadline must never be what keeps the process alive.
-    timer.unref?.();
+    // Deliberately NOT unref'd: this timer is the guarantee that the awaited
+    // call settles. An unref'd deadline lets the event loop drain while the
+    // call is still pending, so the timeout never fires (Node 22 cancels the
+    // awaiting test as "Promise resolution is still pending"). The watchdog's
+    // periodic timers are the ones that must not pin the process, not this.
   });
   try {
     return await Promise.race([run(controller.signal), timeout]);
