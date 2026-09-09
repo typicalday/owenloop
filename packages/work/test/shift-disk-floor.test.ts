@@ -107,9 +107,27 @@ test('the real probe reports bavail, the space an unprivileged writer can use', 
   // `bfree` counts blocks reserved for root, which no shift child can write
   // into. Reading it would report hundreds of megabytes of headroom that does
   // not exist, on precisely the full disk this gate exists to catch.
+  //
+  // The reference reading below and the probe's own `statfs` are two separate
+  // calls, and free space moves between them whenever anything else on the
+  // machine writes or frees a block — CI has seen the two differ by exactly one
+  // block. So this is a tolerance around the reference, not strict equality.
+  // The tolerance is far smaller than any root reserve, so a probe that read
+  // `bfree` would still land well outside it wherever the two differ (Linux
+  // CI). On a filesystem with no reserve, such as APFS, `bfree` equals `bavail`
+  // and no reading can tell them apart; that was already true of the strict
+  // comparison this replaces.
   const dir = tmpdir();
   const stat = statfsSync(dir);
-  assert.equal(realStatfsProbe.freeBytes(dir), Number(stat.bavail) * Number(stat.bsize));
+  const bsize = Number(stat.bsize);
+  const bavailBytes = Number(stat.bavail) * bsize;
+  const toleranceBytes = 256 * bsize;
+  const probed = realStatfsProbe.freeBytes(dir);
+  assert.ok(probed !== undefined, 'a real temp directory is measurable');
+  assert.ok(
+    Math.abs(probed - bavailBytes) <= toleranceBytes,
+    `probe ${probed} is not within ${toleranceBytes} bytes of bavail ${bavailBytes}`,
+  );
   assert.equal(realStatfsProbe.exists(dir), true);
   assert.equal(realStatfsProbe.exists(join(dir, 'owenloop-no-such-path-9d3f')), false);
   assert.equal(realStatfsProbe.freeBytes(join(dir, 'owenloop-no-such-path-9d3f')), undefined);
