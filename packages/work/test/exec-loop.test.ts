@@ -2219,13 +2219,14 @@ test('a successful command that printed nothing records the silence', async () =
 
 import { readdirSync } from 'node:fs';
 import { runtimeFixture, ready } from '../../../test/helpers/runtime-selection.ts';
-import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
+import { createDefaultStoreInstructionResolver } from '../src/exec/instructions.ts';
 import { createBundleIngestor } from '../../../src/store/index.ts';
 import type { InvocationBindingSource } from '../../../src/types.ts';
 
-for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable'] as const) {
-  test(`invocation pre-launch ${movement}: real Store/CAS read after payload preparation`, async () => {
-    const f = await runtimeFixture();
+for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable', 'omitted'] as const) {
+  test(`invocation pre-launch ${movement}: default factory reads real Store/CAS after payload preparation`, async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'owenloop-default-launch-'));
+    const f = await runtimeFixture(':memory:', join(cwd, 'workflows'));
     const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { v: 1 } } });
     for (const [i, path] of ['one', 'two'].entries()) {
       assert.equal(f.engine.applyChoice(ready(f.engine, workflow, path, f.candidates), f.candidates[i]!).kind, 'bound');
@@ -2262,12 +2263,12 @@ for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable'] as
       }
       return source.read(key);
     } };
-    const instructions = createStoreInstructionResolver({ globalRoot: f.root, verifier: createBundleIngestor(),
+    const instructions = createDefaultStoreInstructionResolver({ cwd, env: { HOME: cwd }, verifier: createBundleIngestor(),
       definitionVerifier: () => ({ kind: 'verified', publisherKeyId: 'fixture', principal: 'fixture' }),
       // Cryptographic relay corroboration is independently exercised in
       // exec-consumed-calls-relay; this test isolates the real launch window.
       consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
-      invocationBindingSource: trusted,
+      ...(movement === 'omitted' ? {} : { invocationBindingSource: trusted }),
     });
     const fr = fakeRunner();
     fr.resolve(result(0));
@@ -2280,7 +2281,8 @@ for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable'] as
       assert.equal(outcome, 'unresolved-instructions'); assert.equal(fr.starts.length, 0); assert.equal(submits.length, 0);
       assert.equal(only(calls, 'release').length, 1); assert.equal(only(calls, 'ask').length, 0);
     }
-    assert.ok(readCount >= 3);
+    if (movement === 'omitted') assert.equal(readCount, 0);
+    else assert.ok(readCount >= 3);
     for (const dir of preparedDirs) assert.equal(existsSync(dir), false, `${dir} was cleaned`);
     f.store.close();
   });

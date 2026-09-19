@@ -15,7 +15,7 @@ import {
 } from '../../../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
-import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
+import { createDefaultStoreInstructionResolver, createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import type { OrderPacket } from '../src/hub/types.ts';
 
 // Calls boundary, end to end through the command resolver. The parent's
@@ -409,8 +409,10 @@ test('calls relay: a consumer without a verified definition in hand cannot corro
 import { runtimeFixture, ready } from '../../../test/helpers/runtime-selection.ts';
 import type { InvocationBindingSource } from '../../../src/types.ts';
 
-test('invocation relay: trusted SQLite/CAS receipt corroborates signed workflow, digest, outcome, version and value', async () => {
-  const f = await runtimeFixture();
+for (const factory of ['store', 'default'] as const) {
+test(`invocation relay (${factory} factory): trusted SQLite/CAS receipt corroborates signed workflow, digest, outcome, version and value`, async () => {
+  const cwd = tempDir('owenloop-default-relay-');
+  const f = await runtimeFixture(':memory:', join(cwd, 'workflows'));
   const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
   for (const [i, path] of ['one', 'two'].entries()) f.engine.applyChoice(ready(f.engine, workflow, path, f.candidates), f.candidates[i]!);
   const children = f.engine.tick(workflow, { deep: true }).orders;
@@ -436,13 +438,23 @@ test('invocation relay: trusted SQLite/CAS receipt corroborates signed workflow,
     inputs: ['one', 'two'], consumes: finish.consumes, consumedFingerprint: finish.consumedFingerprint,
     consumesProof: JSON.stringify(proofs), consumesProofRelay: relays };
   const source = f.engine.invocationBindingSource();
-  const resolver = (invocationBindingSource?: InvocationBindingSource) => createStoreInstructionResolver({ globalRoot: f.root,
-    verifier: createBundleIngestor(), definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
-    consumedVerifier: verifierFor(fixtureData, 'enforce'), invocationBindingSource });
-  const passed = await resolver(source).resolveCommand(packet);
+  const resolver = (invocationBindingSource?: InvocationBindingSource) => {
+    const options = {
+      verifier: createBundleIngestor(),
+      definitionVerifier: () => ({ kind: 'verified' as const, publisherKeyId: '', principal: '' }),
+      consumedVerifier: verifierFor(fixtureData, 'enforce'), invocationBindingSource,
+    };
+    return factory === 'default'
+      ? createDefaultStoreInstructionResolver({ ...options, cwd, env: fixtureData.env })
+      : createStoreInstructionResolver({ ...options, globalRoot: f.root });
+  };
+  const reads: Parameters<InvocationBindingSource['read']>[0][] = [];
+  const passed = await resolver({ read: key => { reads.push(key); return source.read(key); } }).resolveCommand(packet);
   assert.equal(passed.ok, true, JSON.stringify(passed));
-
+  assert.deepEqual(reads.map(key => key.callPath), ['one', 'two']);
+  assert.equal(typeof passed.revalidate, 'function');
   assert.equal(await passed.revalidate!(), undefined);
+  assert.deepEqual(reads.slice(2), reads.slice(0, 2), 'final revalidation rereads both trusted receipts');
   const refused = async (p: OrderPacket, src: InvocationBindingSource | undefined = source) => {
     const r = await resolver(src).resolveCommand(p);
     assert.equal(r.ok, false, JSON.stringify(r));
@@ -466,3 +478,4 @@ test('invocation relay: trusted SQLite/CAS receipt corroborates signed workflow,
   assert.equal((await passed.revalidate!())?.ok, false);
   f.store.close();
 });
+}

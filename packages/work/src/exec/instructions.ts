@@ -564,6 +564,7 @@ export function createDefaultStoreInstructionResolver(args: {
     definitionVerifier: args.definitionVerifier ?? createExecutionDefinitionVerifier({ env: args.env }),
     originVerifier: args.originVerifier ?? createExecutionOriginVerifier({ env: args.env }),
     ...(args.consumedVerifier !== undefined ? { consumedVerifier: args.consumedVerifier } : {}),
+    ...(args.invocationBindingSource !== undefined ? { invocationBindingSource: args.invocationBindingSource } : {}),
     ...(args.defPolicy !== undefined ? { defPolicy: args.defPolicy } : {}),
     ...(args.originPolicy !== undefined ? { originPolicy: args.originPolicy } : {}),
     ...(args.originRules !== undefined ? { originRules: args.originRules } : {}),

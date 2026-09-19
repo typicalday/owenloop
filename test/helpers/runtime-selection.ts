@@ -4,7 +4,7 @@ import type { Engine } from '../../src/engine.ts';
 import { loadCasDefs } from '../../src/store/def-source.ts';
 import { installBundleFixture, writeBundleSource } from './store-fixture.ts';
 import type { DecisionSnapshot, InvocationCandidate } from '../../src/types.ts';
-export async function runtimeFixture(db = ':memory:') {
+export async function runtimeFixture(db = ':memory:', root?: string) {
   const child = (name: string) => `name: ${name}
 x:
   implements: [{name: report, version: '1'}]
@@ -16,7 +16,7 @@ steps:
     terminal: true
 outputs: [result]
 `;
-  const left = await installBundleFixture({ sourceDir: writeBundleSource({ name: 'left', workflow: child('left') }) });
+  const left = await installBundleFixture({ root, sourceDir: writeBundleSource({ name: 'left', workflow: child('left') }) });
   const right = await installBundleFixture({ sourceDir: writeBundleSource({ name: 'right', workflow: child('right') }), root: left.root });
   const call = (name: string) => `  - name: ${name}
     callsInterface:
