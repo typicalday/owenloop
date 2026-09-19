@@ -2680,6 +2680,7 @@ test('runtime selection: durable real CAS two-site demo, replay, restart, invali
 
 import { reloadRuntimeEngine } from './helpers/runtime-selection.ts';
 import { valueDigestHex } from '../src/crypto/canonical.ts';
+import { candidateSetDigest, validSnapshot } from '../src/invocation.ts';
 import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
 
 test('runtime selection: exhaustive snapshot/refusal precedence, fresh policy and no-write failures', async () => {
@@ -3005,4 +3006,81 @@ test('runtime selection: CAS parent adoption creates a new generation and histor
   assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
   assert.equal(f.store.listChildrenByParent(workflow).length, 2);
   f.store.close();
+});
+
+test('runtime selection: malformed JSON candidates have total snapshot ordering and cannot be selected', async (t) => {
+  const { engine, store, candidates } = await runtimeFixture();
+  t.after(() => store.close());
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const valid = candidates[0]!;
+  const malformed = [
+    { ...valid, target: { toString: null } },
+    { ...valid, target: [{ toString: null }] },
+    { ...valid, target: { other: 1 } },
+    { ...valid, target: { other: 2 } },
+    { ...valid, DefRef: { ...valid.DefRef, bundleDigest: { toString: null } } },
+    { ...valid, DefRef: { ...valid.DefRef, workflowName: { toString: null } } },
+    { ...valid, DefRef: null },
+    { ...valid, target: null },
+    { ...valid, unexpected: 1 },
+    { ...valid, unexpected: 2 },
+    {},
+  ];
+  const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  const result = engine.decisionSnapshot(workflow, 'one', [...malformed, valid]);
+  assert.equal(result.kind, 'ready');
+  if (result.kind !== 'ready') throw new Error('expected ready snapshot');
+  assert.deepEqual(result.snapshot.candidates.map(c => c.assessment), [
+    ...malformed.map(() => ({ kind: 'invalid', code: 'malformed-ref' })), { kind: 'eligible' },
+  ]);
+  const reversed = engine.decisionSnapshot(workflow, 'one', [...malformed, valid].reverse());
+  assert.equal(reversed.kind, 'ready');
+  if (reversed.kind !== 'ready') throw new Error('expected ready snapshot');
+  assert.equal(reversed.snapshot.candidateSetDigest, result.snapshot.candidateSetDigest);
+  const transported: DecisionSnapshot = JSON.parse(JSON.stringify(result.snapshot));
+  assert.equal(validSnapshot(transported), true);
+  for (const selected of malformed) {
+    assert.deepEqual(engine.applyChoice(transported, selected as InvocationCandidate), {
+      kind: 'invalid-decision', code: 'shape-or-digest',
+    });
+  }
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before);
+  assert.deepEqual(store.listInvocations(workflow), []);
+  assert.deepEqual(store.listChildrenByParent(workflow), []);
+  assert.equal(engine.applyChoice(transported, valid).kind, 'bound');
+  assert.equal(store.listInvocations(workflow).length, 1, 'mixed candidate snapshot survives durable decoding');
+});
+
+test('runtime selection: strict snapshot transport refuses malformed assessments and tampering without writes', async (t) => {
+  const { engine, store, candidates } = await runtimeFixture();
+  t.after(() => store.close());
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const snapshot = ready(engine, workflow, 'one', candidates);
+  const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  for (const assessment of [
+    { kind: 'invalid', code: { toString: null } },
+    { kind: 'ineligible', code: ['implements'] },
+    { kind: 'invalid', code: 1 },
+    { kind: 'invalid', code: null },
+    { kind: 'invalid', code: 'unknown' },
+    { kind: 'eligible', code: 'malformed-ref' },
+  ]) {
+    const bad = JSON.parse(JSON.stringify(snapshot));
+    bad.candidates[0].assessment = assessment;
+    bad.candidateSetDigest = candidateSetDigest(bad.candidates);
+    assert.equal(validSnapshot(bad), false);
+    assert.deepEqual(engine.applyChoice(bad, candidates[0]!), { kind: 'invalid-decision', code: 'shape-or-digest' });
+  }
+  for (const bad of [
+    { ...snapshot, unexpected: true },
+    { ...snapshot, candidateSetDigest: '0'.repeat(64) },
+    { ...snapshot, candidates: [...snapshot.candidates, snapshot.candidates[0]] },
+    { ...snapshot, evidence: [{ ...snapshot.evidence[0], childInput: { toString: null } }] },
+  ]) {
+    assert.equal(validSnapshot(bad), false);
+    assert.deepEqual(engine.applyChoice(bad as DecisionSnapshot, candidates[0]!), { kind: 'invalid-decision', code: 'shape-or-digest' });
+  }
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before);
+  assert.deepEqual(store.listInvocations(workflow), []);
+  assert.deepEqual(store.listChildrenByParent(workflow), []);
 });

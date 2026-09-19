@@ -17,7 +17,13 @@ test('canonical invocation fixed vectors preserve algorithm and explicit orderin
   assert.equal(evidenceDigest(evidence), evidenceDigest([...evidence].reverse()));
   const candidates: AssessedCandidate[] = ['b', 'a'].map(n => ({ candidate: { target: `${n}/${n}@1.0.0`,
     DefRef: { bundleDigest: n.repeat(64), workflowName: n } }, assessment: { kind: 'eligible' } }));
+  assert.equal(candidateSetDigest(candidates), '357e08d09223cf9e22a9def604ecd1f0a9f476ebb5b8d01a7cae95d5d0cd2284');
   assert.equal(candidateSetDigest(candidates), candidateSetDigest([...candidates].reverse()));
+  const ordered: AssessedCandidate[] = [
+    ['a', 'a', 'a'], ['a', 'a', 'b'], ['a', 'b', 'a'], ['b', 'a', 'a'],
+  ].map(([target, digest, workflowName]) => ({ candidate: { target: `${target}/${target}@1.0.0`,
+    DefRef: { bundleDigest: digest!.repeat(64), workflowName: workflowName! } }, assessment: { kind: 'eligible' } }));
+  assert.equal(candidateSetDigest([...ordered].reverse()), valueDigestHex(ordered), 'preserve all three typed sort fields');
   const moved = structuredClone(candidates);
   moved[0]!.assessment = { kind: 'ineligible', code: 'legacy-binding-missing' };
   assert.notEqual(candidateSetDigest(candidates), candidateSetDigest(moved));

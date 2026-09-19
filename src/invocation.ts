@@ -53,10 +53,17 @@ export function validCandidate(v: unknown): v is InvocationCandidate {
 export const evidenceDigest = (evidence: readonly InvocationEvidence[]): string => valueDigestHex(
   [...evidence].sort((a, b) => compare(a.childInput, b.childInput) || compare(a.parentPath, b.parentPath)));
 function compare(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }
+// Snapshot candidates are JSON records, including malformed references. Never
+// invoke their coercion hooks; retain string ordering and canonicalize other
+// field values. The full-entry tie-break also orders equal malformed field keys.
+function candidateFieldKey(value: unknown): string {
+  return typeof value === 'string' ? `s:${value}` : `j:${value === undefined ? '' : valueDigestHex(value)}`;
+}
 export const candidateSetDigest = (candidates: readonly AssessedCandidate[]): string => valueDigestHex(
-  [...candidates].sort((a, b) => compare(String(a.candidate.target), String(b.candidate.target))
-    || compare(String(a.candidate.DefRef?.bundleDigest), String(b.candidate.DefRef?.bundleDigest))
-    || compare(String(a.candidate.DefRef?.workflowName), String(b.candidate.DefRef?.workflowName))));
+  [...candidates].sort((a, b) => compare(candidateFieldKey(a.candidate.target), candidateFieldKey(b.candidate.target))
+    || compare(candidateFieldKey(a.candidate.DefRef?.bundleDigest), candidateFieldKey(b.candidate.DefRef?.bundleDigest))
+    || compare(candidateFieldKey(a.candidate.DefRef?.workflowName), candidateFieldKey(b.candidate.DefRef?.workflowName))
+    || compare(valueDigestHex(a), valueDigestHex(b))));
 export const invocationId = (b: Pick<InvocationBinding, 'key' | 'candidateSetDigest' | 'policyDigest' | 'selected'>): string =>
   valueDigestHex({ key: b.key, candidateSetDigest: b.candidateSetDigest, policyDigest: b.policyDigest, selected: b.selected });
 
@@ -101,9 +108,9 @@ export function validSnapshot(v: unknown): v is DecisionSnapshot {
   if (!v.candidates.every(c => {
     if (!exact(c, ['candidate', 'assessment']) || !record(c.candidate) || !record(c.assessment)) return false;
     const a = c.assessment;
-    if (!(exact(a, ['kind']) && a.kind === 'eligible') && !(exact(a, ['kind', 'code']) && (
-      (a.kind === 'invalid' && ['malformed-ref', 'unresolved', 'digest-mismatch', 'name-mismatch'].includes(String(a.code)))
-      || (a.kind === 'ineligible' && ['implements', 'wiring', 'output', 'signature', 'legacy-binding-missing', 'legacy-binding-wiring'].includes(String(a.code)))))) return false;
+    if (!(exact(a, ['kind']) && a.kind === 'eligible') && !(exact(a, ['kind', 'code']) && typeof a.code === 'string' && (
+      (a.kind === 'invalid' && ['malformed-ref', 'unresolved', 'digest-mismatch', 'name-mismatch'].includes(a.code))
+      || (a.kind === 'ineligible' && ['implements', 'wiring', 'output', 'signature', 'legacy-binding-missing', 'legacy-binding-wiring'].includes(a.code))))) return false;
     const identity = valueDigestHex(c.candidate);
     if (identities.has(identity)) return false;
     identities.add(identity);
