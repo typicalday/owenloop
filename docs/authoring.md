@@ -968,3 +968,132 @@ the definition snapshot instead, so instruction text is retained once, in the
 definition, not duplicated per firing. A secret that flowed through an input
 therefore lives on in the database until the file itself is disposed of — see
 [Storage](../README.md#storage) for the operator's disposal responsibility.
+
+## Per-invocation interface selection
+
+The opt-in `selection: invocation` form lets two call sites choose different exact
+implementations of the same interface. The existing `{name, version}` form continues
+to require immutable `CreateOpts.interfaceBindings` at start. Concrete `calls:` is
+unchanged.
+
+```yaml
+- name: choose
+  callsInterface:
+    name: report
+    version: '1'
+    selection: invocation
+    signature:
+      inputs: [{name: data, schema: true}]
+      outputs: [{name: result, schema: true}]
+    policy:
+      name: local-selector
+      version: '1'
+      config: {strategy: prefer-reviewed}
+  inputs: {data: evidence}
+  produces: [report]
+```
+
+Both the parent and every eligible candidate must come from verified CAS bytes.
+`DefRef` is exactly `{bundleDigest, workflowName}`. The bundle digest is lowercase
+SHA-256, and `workflowName` is the manifest workflow name, not an instance id.
+Candidates are `{target, DefRef}`; `target` is an exact installed
+`namespace/name@version` coordinate. An embedded definition with a fabricated
+`bundleDigest` is not sufficient provenance.
+
+The host calls `engine.decisionSnapshot(parentWorkflow, callPath, candidates)`;
+`callPath` is the artifact the call produces. A ready snapshot includes the
+parent-authored interface signature and policy, mapped values and versions,
+assessments for all supplied candidates, canonical digests and root admission
+epoch. It may contain zero eligible candidates. Reading a snapshot performs no
+selection, scheduling, provider request, or database mutation.
+
+The host selects an eligible candidate outside the engine, then calls
+`engine.applyChoice(snapshot, candidate)`. The engine independently rechecks the
+choice and returns a typed result. A successful `bound` commit precedes child
+creation; a later `engine.tick(parentWorkflow, {deep: true})` provisions and drives
+that child. `replayed` means the identical immutable choice was already committed.
+The host must obtain a new snapshot after a stale result. It must never replace
+root-wide bindings to make a runtime candidate eligible.
+
+The policy is parent-definition data. Changes require publishing and adopting a
+new CAS parent generation. Caller-supplied policy, signatures, digests, or decision
+identifiers confer no authority. `valueDigestHex` hashes canonical key-sorted JSON;
+evidence is sorted by child input and parent path, and assessed candidates by
+target, bundle digest and workflow name. Candidate assessment codes participate in
+the candidate-set digest. Invocation ids hash
+`{key, candidateSetDigest, policyDigest, selected}`; the unique key is
+`{parentWorkflow, parentDefRef, callPath, evidenceDigest}`.
+
+Snapshot refusals, in precedence order, are `workflow-missing`, `call-missing`,
+`not-invocation-call`, `parent-unverified`, `admission-unmanaged`, `canceled`
+(with epoch), `evidence-not-ready` (with paths), `already-bound` (with binding),
+and `invalid-candidate-set` (`not-array`, `not-object`, or `duplicate`). Otherwise
+the result is `ready` with a snapshot.
+
+Apply outcomes, in precedence order, are `invalid-decision` (shape/digest or
+contract authority), `admission-unmanaged`, `canceled`, `stale-parent` (expected
+and actual DefRefs), `stale-policy` and `stale-evidence` (expected and actual
+digests), `candidate-missing`, `candidate-invalid`, `candidate-ineligible`,
+`depth-exceeded`, `cycle-detected`, `divergent-race` (existing binding), `replayed`,
+and `bound`. Candidate outcomes include the selected candidate; invalid/ineligible
+outcomes include their stable assessment code. Storage/CAS I/O and detected
+corruption are operational exceptions, not successful decisions.
+
+Assessment precedence is `malformed-ref`, `unresolved`, `digest-mismatch`,
+`name-mismatch` (invalid identity), then `implements`, `wiring`, `output`,
+`signature`, `legacy-binding-missing`, `legacy-binding-wiring` (ineligible exact
+bytes). The same inherited legacy prerequisite runs at snapshot, fresh apply, and
+provision. All missing legacy bindings precede all wiring errors. A child inherits
+the identical parent binding array; invocation-mode nested calls need no start
+binding. Structural compatibility remains the existing conservative schema subset
+check and requires one singleton public output.
+
+Call `engine.cancelRun(workflow)` to durably revoke the root's admission and
+increment its epoch once. Repeated cancellation is idempotent. Execute the returned
+cleanup declarations in the control plane after the transaction commits. A process
+that bypasses this API has not revoked invocation admission. New roots start active
+at epoch zero; old unmanaged roots remain unmanaged after migration. No canceled
+state is guessed for old rows.
+
+`engine.status(workflow).invocations` and `engine.invocationStatus(workflow, path)`
+report `unresolved`, `stale`, or `bound`, including the exact binding and optional
+child id. Bound without a child is a valid crash/restart state. Input or definition
+movement needs a new invocation; historical children remain audit data and cannot
+claim, descend, relay, or publish into the new generation. Selection spends no
+worker attempt, cadence, parallel, or daily budget. Child work keeps those budgets
+and the existing depth bound. Return requires a value-defined green child output
+and whole-child completion.
+
+For dynamic proof relay, inject `engine.invocationBindingSource()` into the local
+command resolver's `invocationBindingSource` option. This trusted capability joins
+current SQLite admission, binding, parent artifact, invocation child and child
+outcome, and re-verifies CAS identity. The data-only order relay is merely a hint.
+Verification requires the signed child's instance identity, bundle digest, outcome,
+version and value, plus enrollment chain, revocation and scope checks. The command
+executor repeats receipt and proof verification after preparing consumes, feedback
+and payload files, immediately before `runner.start`. Missing, moved or throwing
+sources refuse execution, release the lease and clean those files without a command
+receipt. The final engine consumed-fingerprint CAS still protects later movement.
+Remote dynamic relay without this trusted source fails closed; this feature does
+not invent hosted authentication or claim hosted end-to-end support.
+
+The model checker reports `external-selection-wait`, with no proof of completion
+and no false deadlock for the unresolved selection itself. It does not rank candidates
+or model their execution. Concrete and legacy call discharge retain their existing
+opaque child-completion transition.
+
+Run `node --test test/calls.test.ts` or `npm run check` to regenerate the deterministic
+no-provider proof under `.owenloop/proofs/runtime-selection/`. The producer drives
+real installed CAS workflows and SQLite state, including two exact choices, replay,
+restart, actual green/done completion, invalidation, both cancellation commit orders,
+and inherited legacy refusal/completion. It closes/checkpoints SQLite before hashing
+its final bytes into `receipt.json`. CI validates and uploads the SQLite/JSON pair.
+
+Decision log (recorded at the timestamp below from this session’s executed checks):
+
+| ts | phase | decision | why | evidence | result |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-19T23:04:38Z | contract | Use a strict opt-in parent-owned contract | Preserve legacy starts while rejecting non-JSON policy coercion | test/defs.test.ts | red/green verified |
+| 2026-09-19T23:04:38Z | persistence | Separate admission, immutable binding and provisioning | Cancellation must survive processes; binding must retain CAS before spawn | src/store.ts | deterministic SQLite proof green |
+| 2026-09-19T23:04:38Z | relay | Re-read trusted state after payload preparation | Resolution-time verification cannot protect the launch window | packages/work/test/exec-loop.test.ts | zero starts and cleanup verified |
+| 2026-09-19T23:04:38Z | verification | Keep full-suite sandbox failures visible | Localhost and Unix socket EPERM cannot be reported as tested success | .owenloop/check-progress.log | full check blocked by environment |

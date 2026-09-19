@@ -2216,3 +2216,72 @@ test('a successful command that printed nothing records the silence', async () =
   );
   assert.deepEqual(errs.filter((l) => l.startsWith('  ')), [], 'silence is a record, not a diagnosis');
 });
+
+import { readdirSync } from 'node:fs';
+import { runtimeFixture, ready } from '../../../test/helpers/runtime-selection.ts';
+import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
+import { createBundleIngestor } from '../../../src/store/index.ts';
+import type { InvocationBindingSource } from '../../../src/types.ts';
+
+for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable'] as const) {
+  test(`invocation pre-launch ${movement}: real Store/CAS read after payload preparation`, async () => {
+    const f = await runtimeFixture();
+    const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { v: 1 } } });
+    for (const [i, path] of ['one', 'two'].entries()) {
+      assert.equal(f.engine.applyChoice(ready(f.engine, workflow, path, f.candidates), f.candidates[i]!).kind, 'bound');
+    }
+    for (const o of f.engine.tick(workflow, { deep: true }).orders) {
+      f.engine.green(o.workflow, o.run, 'result', { text: 'x'.repeat(CONSUMES_INLINE_MAX_BYTES) });
+      f.engine.close(o.workflow, o.run);
+    }
+    const o = f.engine.tick(workflow, { deep: true }).orders[0]!;
+    const base = commandOrder({ reasons: [{ at: 0, action: 'reject', kind: 'judgment', by: 'human',
+      text: 'f'.repeat(CONSUMES_INLINE_MAX_BYTES) }] });
+    const response: GetOrderResponse = { ...base, workflow, run: o.run, order: {
+      ...base.order!, workflow, run: o.run, step: 'finish', defDigest: f.store.getWorkflow(workflow)!.defSnapshot!.bundleDigest!,
+      consumes: o.consumes, consumedFingerprint: o.consumedFingerprint,
+    } };
+    const source = f.engine.invocationBindingSource();
+    let readCount = 0;
+    const before = new Set(readdirSync(tmpdir()));
+    const preparedDirs: string[] = [];
+    const trusted: InvocationBindingSource = { read: async key => {
+      readCount++;
+      // Initial resolution reads two receipts. The third read must occur only
+      // after consumes/feedback/payload preparation and immediately before start.
+      if (readCount === 3) {
+        preparedDirs.push(...readdirSync(tmpdir()).filter(n => !before.has(n) && /^(owenloop-consumes-|owenloop-payload-)/.test(n)).map(n => join(tmpdir(), n)));
+        assert.equal(preparedDirs.length, 3, 'all three payload directories exist before revalidation');
+        if (movement === 'admission') f.engine.cancelRun(workflow);
+        if (movement === 'receipt') {
+          const a = f.store.getArtifact(workflow, 'one')!;
+          f.store.tx(() => f.store.putArtifact({ ...a, version: a.version + 1 }));
+        }
+        if (movement === 'missing') return undefined;
+        if (movement === 'throw') throw new Error('binding reader unavailable');
+      }
+      return source.read(key);
+    } };
+    const instructions = createStoreInstructionResolver({ globalRoot: f.root, verifier: createBundleIngestor(),
+      definitionVerifier: () => ({ kind: 'verified', publisherKeyId: 'fixture', principal: 'fixture' }),
+      // Cryptographic relay corroboration is independently exercised in
+      // exec-consumed-calls-relay; this test isolates the real launch window.
+      consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+      invocationBindingSource: trusted,
+    });
+    const fr = fakeRunner();
+    fr.resolve(result(0));
+    const { hub, calls, submits } = mockHub({ getOrder: [response], submit: ['green'] });
+    const loop = createExecLoop(baseOpts(hub, fr.runner, { workflow, run: o.run, instructions }));
+    const outcome = await loop.run();
+    if (movement === 'stable') {
+      assert.equal(outcome, 'submitted'); assert.equal(fr.starts.length, 1); assert.equal(submits.length, 1);
+    } else {
+      assert.equal(outcome, 'unresolved-instructions'); assert.equal(fr.starts.length, 0); assert.equal(submits.length, 0);
+      assert.equal(only(calls, 'release').length, 1); assert.equal(only(calls, 'ask').length, 0);
+    }
+    assert.ok(readCount >= 3);
+    for (const dir of preparedDirs) assert.equal(existsSync(dir), false, `${dir} was cleaned`);
+    f.store.close();
+  });
+}

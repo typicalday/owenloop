@@ -1,3 +1,4 @@
+import { valueDigestHex } from '../crypto/canonical.ts';
 /**
  * WS-6: the content-addressed workflow store → `WorkflowDef` bridge.
  *
@@ -14,7 +15,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import type { BundleManifest } from '../bundle/types.ts';
-import { digestScopedCallsTargetKey, loadDefFile } from '../defs.ts';
+import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile } from '../defs.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
@@ -591,4 +592,15 @@ export function loadCasDefsWithRepairReplacement(
 /** Tolerant read-only inspection. Never use this result for execution. */
 export function inspectCasDefs(args: LoadCasDefsArgs): CasDefInspectionResult {
 	return discoverCasDefs(args, true);
+}
+
+/** Re-read exact CAS bytes and compare the compiled definition, including its call policy. */
+export function verifyInvocationDefinition(def: WorkflowDef, target?: string): boolean {
+  if (!def.bundleDigest || !def.bundleStoreRoots?.length) return false;
+  const registrations = def.bundleStoreRoots.flatMap(root => loadCasDefs({ globalRoot: root, warn: () => {} }));
+  if (target !== undefined && !registrations.some(r => r.kind === 'coordinate' && r.coordinate === target
+    && r.bundleDigest === def.bundleDigest && r.def.name === def.name)) return false;
+  const defs = finalizeDefs(new Map(registrations.map(r => [r.key, r.def])));
+  const exact = [...defs.values()].find(d => d.bundleDigest === def.bundleDigest && d.name === def.name);
+  return exact !== undefined && valueDigestHex(exact) === valueDigestHex(def);
 }
