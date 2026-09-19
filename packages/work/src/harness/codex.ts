@@ -299,6 +299,8 @@ export interface McpServerSpec {
   command: string;
   args: string[];
   env?: Record<string, string>;
+  enabled_tools?: string[];
+  tools?: Record<string, { approval_mode: 'approve' }>;
 }
 
 /**
@@ -359,9 +361,62 @@ function mountEnv(): Record<string, string> {
   return out;
 }
 
-/** The mount for owenloop's own work-holder MCP surface, verbatim from the worker. */
+// Deliberately explicit rather than imported from holder registration: a new
+// holder tool must not silently acquire exposure or approval in this adapter.
+// Tests compare this contract to HOLD_MCP_TOOL_NAMES and the holder argv parser.
+const OWN_MCP_TOOLS = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
+const HOLD_VALUE_FLAGS = new Set([
+  '--order', '--workflow', '--session', '--origin', '--as', '--shift',
+  '--heartbeat-interval', '--jump-tolerance',
+]);
+
+/** Read only the holder's tool selector; preserve the entire launch argv. */
+function ownMcpTools(args: readonly string[]): string[] {
+  let selected: string[] = [...OWN_MCP_TOOLS];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    // Match hold.parseArgs consumption: a separate value belongs to its flag,
+    // even if that value looks like a selector. Executable/prefix args are opaque.
+    if (HOLD_VALUE_FLAGS.has(arg)) {
+      i++;
+      continue;
+    }
+    if (!arg.startsWith('--mcp-tools')) continue;
+    let value: string | undefined;
+    if (arg === '--mcp-tools') value = args[++i];
+    else if (arg.startsWith('--mcp-tools=')) value = arg.slice('--mcp-tools='.length);
+    else throw new Error('malformed --mcp-tools selector');
+    if (value === undefined) throw new Error('missing value for --mcp-tools');
+    const names = value.split(',');
+    if (names.some((name) => name === '')) {
+      throw new Error('--mcp-tools must be a comma-separated list with no empty names');
+    }
+    if (names.some((name) => !(OWN_MCP_TOOLS as readonly string[]).includes(name))) {
+      throw new Error(`--mcp-tools must name only supported own tools: ${OWN_MCP_TOOLS.join(',')}`);
+    }
+    if (new Set(names).size !== names.length) {
+      throw new Error('--mcp-tools must not contain duplicate names');
+    }
+    // Validate EVERY occurrence; like the holder, the last valid value wins,
+    // but a later valid selector cannot repair an earlier invalid one.
+    selected = names;
+  }
+  return selected;
+}
+
+/** Own mount identity from the worker, with per-thread named MCP policy. */
 function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec {
-  return { command: mcp.command, args: [...mcp.args], env: mountEnv() };
+  const enabledTools = ownMcpTools(mcp.args);
+  return {
+    command: mcp.command,
+    args: [...mcp.args],
+    env: mountEnv(),
+    // Exposure and approval are separate boundaries. In the supplied 0.154
+    // diagnostic, `never` rejects before the legacy elicitation callback; these
+    // named approvals let only the selected holder tools proceed on that path.
+    enabled_tools: enabledTools,
+    tools: Object.fromEntries(enabledTools.map((name) => [name, { approval_mode: 'approve' as const }])),
+  };
 }
 
 /**

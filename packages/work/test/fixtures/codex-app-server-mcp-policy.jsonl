@@ -1,0 +1,9 @@
+{"kind":"provenance","synthetic":true,"description":"Offline contract model of supplied 0.154.0-alpha.6.2 named MCP policy evidence. Not a recording or a live runtime compatibility claim."}
+{"server":"owenloop","tool":"get_order"}
+{"server":"owenloop","tool":"submit"}
+{"server":"owenloop","tool":"reject"}
+{"server":"owenloop","tool":"ask"}
+{"server":"owenloop","tool":"put_file_artifact"}
+{"server":"owenloop","tool":"future_tool"}
+{"server":"owenloop","tool":"__proto__"}
+{"server":"foreign","tool":"get_order"}
