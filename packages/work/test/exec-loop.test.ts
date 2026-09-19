@@ -2224,7 +2224,7 @@ import { createBundleIngestor } from '../../../src/store/index.ts';
 import type { InvocationBindingSource } from '../../../src/types.ts';
 
 for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable', 'omitted'] as const) {
-  test(`invocation pre-launch ${movement}: default factory reads real Store/CAS after payload preparation`, async () => {
+  test(`invocation pre-launch ${movement}: default factory reads real Store/CAS after payload preparation`, async (t) => {
     const cwd = mkdtempSync(join(tmpdir(), 'owenloop-default-launch-'));
     const f = await runtimeFixture(':memory:', join(cwd, 'workflows'));
     const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { v: 1 } } });
@@ -2244,14 +2244,35 @@ for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable', 'o
     } };
     const source = f.engine.invocationBindingSource();
     let readCount = 0;
-    const before = new Set(readdirSync(tmpdir()));
+    const ambientTempRoot = tmpdir();
+    let unrelatedPayloadDir: string | undefined;
+    t.after(() => {
+      if (unrelatedPayloadDir) rmSync(unrelatedPayloadDir, { recursive: true, force: true });
+    });
+    // node:test runs these cases serially in this file's isolated process;
+    // other test files retain their own environment and run in parallel.
+    const launchTempRoot = mkdtempSync(join(cwd, 'launch-temp-'));
+    const tempVariables = ['TMPDIR', 'TMP', 'TEMP'] as const;
+    const savedTemp = tempVariables.map(name => [name, process.env[name]] as const);
+    t.after(() => {
+      for (const [name, value] of savedTemp) {
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+      }
+      rmSync(launchTempRoot, { recursive: true, force: true });
+    });
+    for (const name of tempVariables) process.env[name] = launchTempRoot;
+    assert.equal(tmpdir(), launchTempRoot);
     const preparedDirs: string[] = [];
     const trusted: InvocationBindingSource = { read: async key => {
       readCount++;
+      // Reproduce another test process creating a similarly named directory
+      // during resolution. Its files are outside this invocation's ownership.
+      if (readCount === 1) unrelatedPayloadDir = mkdtempSync(join(ambientTempRoot, 'owenloop-payload-test-'));
       // Initial resolution reads two receipts. The third read must occur only
       // after consumes/feedback/payload preparation and immediately before start.
       if (readCount === 3) {
-        preparedDirs.push(...readdirSync(tmpdir()).filter(n => !before.has(n) && /^(owenloop-consumes-|owenloop-payload-)/.test(n)).map(n => join(tmpdir(), n)));
+	preparedDirs.push(...readdirSync(launchTempRoot).map(n => join(launchTempRoot, n)));
         assert.equal(preparedDirs.length, 3, 'all three payload directories exist before revalidation');
         if (movement === 'admission') f.engine.cancelRun(workflow);
         if (movement === 'receipt') {
@@ -2283,7 +2304,10 @@ for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable', 'o
     }
     if (movement === 'omitted') assert.equal(readCount, 0);
     else assert.ok(readCount >= 3);
+    assert.equal(preparedDirs.length, movement === 'omitted' ? 0 : 3);
     for (const dir of preparedDirs) assert.equal(existsSync(dir), false, `${dir} was cleaned`);
+    assert.deepEqual(readdirSync(launchTempRoot), [], 'all invocation payload directories were removed');
+    if (unrelatedPayloadDir) assert.equal(existsSync(unrelatedPayloadDir), true, 'unrelated fixture remains untouched');
     f.store.close();
   });
 }
