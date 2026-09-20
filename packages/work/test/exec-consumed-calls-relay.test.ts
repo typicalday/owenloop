@@ -426,7 +426,7 @@ test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted 
       .replace('steps:\n', 'steps:\n  - name: concrete\n    calls: left/left@1.0.0\n    inputs: {data: seed}\n    produces: [concrete]\n');
     await installBundleFixture({ root: projectRoot, projectRoot, globalRoot,
       sourceDir: writeBundleSource({ name: 'hybrid', workflow: yaml,
-        lock: { 'left/left@1.0.0': f.candidates[0]!.DefRef.bundleDigest } }) });
+      lock: { 'left/left@1.0.0': f.candidates[0]!.DefRef.bundleDigest } }) });
     f.store.close();
     Object.assign(f, createEngine({ db: ':memory:', defs: new Map(
       loadCasDefs({ projectRoot, globalRoot, warn: () => {} }).map(r => [r.key, r.def])) }));
