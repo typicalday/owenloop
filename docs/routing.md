@@ -802,7 +802,8 @@ these native tests do not establish a deployed service or observed model launch.
 5. Native schema 14 adds `dispatch_lane` and append-only `dispatch_slot` records.
    The slot links to its real run; occupied capacity is derived from open runs
    still owning claimed tasks across the shared database. Slot insertion and
-   the run/task/Order claim share one write transaction. Close/release, cancel,
+   the run/task/Order claim share one write transaction. A database trigger also
+   enforces actual run ownership and capacity for low-level slot writers. Close/release, cancel,
    reap and cleanup free actual occupancy, while consumed identities survive
    restart and run/workflow deletion. Replaying a consumed slot refuses; it never
    assigns a different run. Legacy runs consume no negotiated native slot.
@@ -859,3 +860,4 @@ amendment. This log describes implementation choices, not a ship verdict.
 | 2026-09-20T02:22:54.330Z | storage | Use schema14 native lane rows and append-only slot receipts joined to actual run/task ownership. | Single-use identity must survive lifecycle release, restart, and run cleanup without extending Order. | `src/store.ts` | Focused migration, rollback, replay and overlapping connection diagnostics pass |
 | 2026-09-20T02:27:25.562Z | engine | Retain exact firing checks and separate maintenance from conditional claim effects. | Reaping, cadence, budget, parallel and idle guards must remain authoritative while stale advice stays read-only. | `test/engine.test.ts` | Persisted-state scheduler and race diagnostics pass |
 | 2026-09-20T02:27:25.562Z | proof | Export pure proof schema/case IDs and label U2 launch cases unexecuted. | Synthetic fixtures and native test success cannot establish service authorization or observed launches. | `test/boundaries.test.ts` | Seven contract tests pass; final confined verification pending |
+| 2026-09-20T02:30:40.603Z | storage-constraints | Enforce actual run ownership and capacity at slot INSERT as well as in the typed Store helper. | The database must prevent low-level writers or reentrant callbacks from bypassing native admission invariants. | `test/store.test.ts` | direct-write regression passed after the fix |

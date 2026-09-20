@@ -3240,3 +3240,30 @@ test('U1-scheduler: frozen debt and changed leases invalidate advice without cla
   assert.deepEqual(dispatchState(store, workflow), leased);
   store.close();
 });
+
+test('U1-currentness: malformed plans and changed verified DefRefs cannot mutate claim state', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const plan = claimPlan(choices(engine, workflow)[1]!);
+  const before = dispatchState(store, workflow);
+  for (const bad of [null, {}, { ...plan, policyDigest: 'unknown' },
+    { ...plan, lane: { ...plan.lane, capacity: 0 } },
+    { ...plan, lane: { ...plan.lane, revision: 'different' } }]) {
+    assert.equal(engine.claimReady(bad as ReadyClaimPlan, readyOpts).kind, 'invalid-plan');
+    assert.deepEqual(dispatchState(store, workflow), before);
+  }
+  for (const firing of [{ ...plan.firing, DefRef: { ...plan.firing.DefRef, bundleDigest: 'f'.repeat(64) } },
+    { ...plan.firing, admissionEpoch: 99 }, { ...plan.firing, frameId: 'different-frame' },
+    { ...plan.firing, inputFingerprint: { seed: 99 } }]) {
+    assert.equal(engine.claimReady({ ...plan, firing }, readyOpts).kind, 'stale');
+    assert.deepEqual(dispatchState(store, workflow), before);
+  }
+  // A changed persisted snapshot is unverified even if the selector still
+  // names the old CAS digest. The guard compares the actual stored bytes.
+  const row = store.getWorkflow(workflow)!;
+  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?')
+    .run(JSON.stringify({ ...row.defSnapshot, description: 'tampered' }), workflow);
+  const tampered = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(plan, readyOpts).kind, 'unverified');
+  assert.deepEqual(dispatchState(store, workflow), tampered);
+  store.close();
+});

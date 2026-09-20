@@ -939,6 +939,19 @@ export class Store {
       consumed_at INTEGER NOT NULL CHECK(typeof(consumed_at) = 'integer' AND consumed_at BETWEEN 0 AND 9007199254740991),
       PRIMARY KEY (lane_id, slot)
     );
+    CREATE TRIGGER IF NOT EXISTS dispatch_slot_admission BEFORE INSERT ON dispatch_slot
+      BEGIN
+	SELECT CASE WHEN NOT EXISTS (
+	  SELECT 1 FROM run r JOIN task t ON t.workflow = r.workflow AND t.step = r.step AND t.key = r.key
+	    AND t.run = r.id AND t.status = 'claimed' WHERE r.id = NEW.run_id AND r.outcome IS NULL
+	) THEN RAISE(ABORT, 'dispatch slot requires an actual active run') END;
+	SELECT CASE WHEN (
+	  SELECT COUNT(*) FROM dispatch_slot s JOIN run r ON r.id = s.run_id
+	  JOIN task t ON t.workflow = r.workflow AND t.step = r.step AND t.key = r.key
+	    AND t.run = r.id AND t.status = 'claimed' WHERE s.lane_id = NEW.lane_id AND r.outcome IS NULL
+	) >= (SELECT capacity FROM dispatch_lane WHERE id = NEW.lane_id)
+	  THEN RAISE(ABORT, 'dispatch lane capacity exhausted') END;
+      END;
     CREATE TRIGGER IF NOT EXISTS dispatch_slot_immutable BEFORE UPDATE ON dispatch_slot
       BEGIN SELECT RAISE(ABORT, 'dispatch slot is immutable'); END;
     CREATE TRIGGER IF NOT EXISTS dispatch_slot_append_only BEFORE DELETE ON dispatch_slot

@@ -1810,3 +1810,20 @@ test('invalid and corrupt native dispatch authority refuses without spending a s
   assert.throws(() => new Store(path), /corrupt native dispatch state/);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test('dispatch storage refuses direct oversubscription and synthetic active-run identities', () => {
+  const s = mem();
+  s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1')));
+  // A low-level writer cannot bypass the same lane bound using a different
+  // Store method. Both a synthetic identity and an extra genuine run refuse.
+  const insert = s.db.prepare('INSERT INTO dispatch_slot(lane_id,slot,run_id,plan_digest,consumed_at) VALUES (?,?,?,?,?)');
+  assert.throws(() => insert.run('lane', 'fake', 'missing', 'b'.repeat(64), 10), /active run/);
+  assert.throws(() => s.tx(() => {
+    dispatchRun(s, 'r2', 'wf2');
+    insert.run('lane', 'slot-2', 'r2', 'b'.repeat(64), 10);
+  }), /lane capacity/);
+  assert.equal(s.getRun('r2'), undefined);
+  assert.equal(s.getDispatchSlot('lane', 'slot-2'), undefined);
+  assert.equal(s.dispatchLaneUsage('lane'), 1);
+  s.close();
+});
