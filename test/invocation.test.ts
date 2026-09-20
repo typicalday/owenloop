@@ -43,7 +43,20 @@ class LogicalViewStore extends Store {
 
 async function logicalViewFixture() {
   const schema = '{type: object, required: [n], properties: {n: {type: integer}}, additionalProperties: false}';
-  const installed = await installBundleFixture({ sourceDir: writeBundleSource({
+  const child = await installBundleFixture({ sourceDir: writeBundleSource({
+    name: 'child', workflow: `name: child
+x:
+  implements: [{name: report, version: '1'}]
+inputs: [{name: data, seedOwed: true, schema: ${schema}}]
+steps:
+  - name: work
+    consumes: [data]
+    produces: [{name: result, schema: true}]
+    terminal: true
+outputs: [result]
+`,
+  }) });
+  const installed = await installBundleFixture({ root: child.root, sourceDir: writeBundleSource({
     name: 'hydration',
     workflow: `name: hydration
 inputs: [{name: seed, seedOwed: true}]
@@ -59,33 +72,25 @@ steps:
       policy: {name: deterministic, version: '1', config: {}}
     inputs: {data: seed}
     produces: [chosen]
+  - name: finish
+    consumes: [chosen]
+    produces: [done]
     terminal: true
-outputs: [chosen]
+outputs: [done]
 `,
-    workflows: { child: `name: child
-x:
-  implements: [{name: report, version: '1'}]
-inputs: [{name: data, seedOwed: true, schema: ${schema}}]
-steps:
-  - name: work
-    consumes: [data]
-    produces: [{name: result, schema: true}]
-    terminal: true
-outputs: [result]
-` },
   }) });
   const db = join(tempDir('invocation-hydration-'), 'store.db');
   const store = new LogicalViewStore(db);
   const { engine } = reloadRuntimeEngine(store, installed.root);
   const workflow = engine.createInstance('hydration/hydration@1.0.0', { provide: { seed: opaqueSeed } });
-  const candidate = { target: 'hydration/child@1.0.0',
-    DefRef: { bundleDigest: installed.result.digest, workflowName: 'child' } };
+  const candidate = { target: 'child/child@1.0.0',
+    DefRef: { bundleDigest: child.result.digest, workflowName: 'child' } };
   return { store, engine, workflow, candidate, db, root: installed.root };
 }
 
 test('durable invocation identity survives logical brackets, strict child lifecycle, and reopen', async (t) => {
   const f = await logicalViewFixture();
-  t.after(() => f.store.close());
+  t.after(() => { if (f.store.db.isOpen) f.store.close(); });
   const snapshot = ready(f.engine, f.workflow, 'chosen', [f.candidate]);
   assert.deepEqual(snapshot.evidence, [{ childInput: 'data', parentPath: 'seed', version: 1, value: opaqueSeed }]);
   f.store.withLogicalValue(logicalSeed, () => {
@@ -120,6 +125,7 @@ test('durable invocation identity survives logical brackets, strict child lifecy
   assert.ok(receipt);
   assert.equal(receipt.receipt.evidenceDigest, snapshot.key.evidenceDigest);
   assert.deepEqual(f.store.getArtifactEvidence(f.workflow, 'seed')!.value, opaqueSeed);
+  f.store.close();
   const reopened = new LogicalViewStore(f.db);
   t.after(() => reopened.close());
   const { engine } = reloadRuntimeEngine(reopened, f.root);
@@ -132,6 +138,13 @@ test('durable invocation identity survives logical brackets, strict child lifecy
   });
   assert.equal(reopened.listInvocations(f.workflow).length, 1);
   assert.equal(reopened.listWorkflows().length, 2);
+  const seed = reopened.getArtifactEvidence(f.workflow, 'seed')!;
+  reopened.putArtifact({ ...seed, version: seed.version + 1 });
+  assert.equal(engine.invocationStatus(f.workflow, 'chosen').kind, 'stale');
+  assert.equal(engine.applyChoice(snapshot, f.candidate).kind, 'stale-evidence');
+  assert.equal(await engine.invocationBindingSource().read(key), undefined);
+  assert.equal(engine.tick(order.workflow).orders.length, 0, 'historical child loses ancestor authority');
+  assert.equal(reopened.listWorkflows().length, 2);
 });
 
 test('strict child schemas reject opaque and invalid logical seeds without orphan children', async (t) => {
@@ -141,15 +154,44 @@ test('strict child schemas reject opaque and invalid logical seeds without orpha
   assert.equal(f.engine.applyChoice(snapshot, f.candidate).kind, 'bound');
   assert.equal(f.engine.tick(f.workflow).orders.length, 0, 'opaque durable value cannot satisfy the child schema');
   assert.equal(f.store.listWorkflows().length, 1);
+  assert.equal(f.store.getArtifact(f.workflow, 'chosen')!.schemaRejects, 1);
+  f.engine.retry(f.workflow, 'chosen');
   assert.equal(f.store.withLogicalValue({ n: 'invalid' }, () => f.engine.tick(f.workflow).orders.length), 0);
   assert.equal(f.store.listWorkflows().length, 1);
+  assert.equal(f.store.getArtifact(f.workflow, 'chosen')!.acceptance, 'rejected');
   assert.equal(f.store.listInvocations(f.workflow).length, 1, 'schema refusal cannot create another binding');
   assert.equal(f.engine.invocationStatus(f.workflow, 'chosen').kind, 'bound');
 });
 
+test('logical child synchronization keeps strict validation and stable durable binding', async (t) => {
+  const f = await logicalViewFixture();
+  t.after(() => f.store.close());
+  const snapshot = ready(f.engine, f.workflow, 'chosen', [f.candidate]);
+  assert.equal(f.engine.applyChoice(snapshot, f.candidate).kind, 'bound');
+  f.store.withLogicalValue(logicalSeed, () => f.engine.tick(f.workflow, { deep: false }));
+  const bound = f.engine.invocationStatus(f.workflow, 'chosen');
+  assert.equal(bound.kind, 'bound');
+  if (bound.kind !== 'bound' || !bound.childWorkflow) throw new Error('missing child');
+  const initial = f.store.getArtifact(bound.childWorkflow, 'data')!;
+  assert.deepEqual(initial.value, logicalSeed);
+  f.store.withLogicalValue({ n: 2 }, () => f.engine.tick(f.workflow, { deep: false }));
+  const updated = f.store.getArtifact(bound.childWorkflow, 'data')!;
+  assert.deepEqual(updated.value, { n: 2 });
+  assert.equal(updated.version, initial.version + 1);
+  f.store.withLogicalValue({ n: 'invalid' }, () => f.engine.tick(f.workflow, { deep: false }));
+  assert.deepEqual(f.store.getArtifact(bound.childWorkflow, 'data'), updated, 'invalid sync cannot partially overwrite child');
+  assert.equal(f.store.getArtifact(f.workflow, 'chosen')!.acceptance, 'rejected');
+  assert.equal(f.store.getArtifact(f.workflow, 'chosen')!.schemaRejects, 1);
+  assert.deepEqual(f.engine.invocationStatus(f.workflow, 'chosen'), bound);
+  assert.equal(f.engine.applyChoice(snapshot, f.candidate).kind, 'replayed');
+  assert.deepEqual(f.store.getArtifactEvidence(f.workflow, 'seed')!.value, opaqueSeed);
+  assert.equal(f.store.listWorkflows().length, 2);
+  assert.equal(f.store.listInvocations(f.workflow).length, 1);
+});
+
 for (const movement of ['version', 'value', 'acceptance', 'missing', 'non-json'] as const) {
   for (const alreadyBound of [false, true]) {
-    test(`durable ${movement} movement refuses ${alreadyBound ? 'replay' : 'apply'} despite unchanged logical value`, async (t) => {
+    test(`durable ${movement} movement refuses ${alreadyBound ? 'replay' : 'apply'} inside a logical bracket`, async (t) => {
       const f = await logicalViewFixture();
       t.after(() => f.store.close());
       const snapshot = f.store.withLogicalValue(logicalSeed, () => ready(f.engine, f.workflow, 'chosen', [f.candidate]));
