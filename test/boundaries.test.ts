@@ -39,21 +39,21 @@ test('Engine runtime import graph excludes local invocation authority defaults',
     function walk(node: ts.Node) {
       let specifier: ts.Expression | undefined;
       if (ts.isImportDeclaration(node)) {
-        const clause = node.importClause;
-        if (clause?.isTypeOnly) return;
-        if (clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
-          && clause.namedBindings.elements.every(e => e.isTypeOnly)) return;
-        specifier = node.moduleSpecifier;
+	const clause = node.importClause;
+	if (clause?.isTypeOnly) return;
+	if (clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
+	  && clause.namedBindings.elements.every(e => e.isTypeOnly)) return;
+	specifier = node.moduleSpecifier;
       } else if (ts.isExportDeclaration(node) && !node.isTypeOnly) {
-        if (node.exportClause && ts.isNamedExports(node.exportClause)
-          && node.exportClause.elements.every(e => e.isTypeOnly)) return;
-        specifier = node.moduleSpecifier;
+	if (node.exportClause && ts.isNamedExports(node.exportClause)
+	  && node.exportClause.elements.every(e => e.isTypeOnly)) return;
+	specifier = node.moduleSpecifier;
       } else if (ts.isCallExpression(node)
-        && (node.expression.kind === ts.SyntaxKind.ImportKeyword || node.expression.getText(source) === 'require')) {
-        specifier = node.arguments[0];
+	&& (node.expression.kind === ts.SyntaxKind.ImportKeyword || node.expression.getText(source) === 'require')) {
+	specifier = node.arguments[0];
       }
       if (specifier && ts.isStringLiteral(specifier) && specifier.text.startsWith('.')) {
-        visit(new URL(specifier.text, url), [...via, relative]);
+	visit(new URL(specifier.text, url), [...via, relative]);
       }
       ts.forEachChild(node, walk);
     }

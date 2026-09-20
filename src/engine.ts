@@ -1,9 +1,7 @@
 import { valueDigestHex } from './crypto/canonical.ts';
 import { assessContract, candidateSetDigest, evidenceDigest, inheritedBindingAssessment, invocationId, jsonOnly, record, validCandidate, validSnapshot } from './invocation.ts';
-import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
-import { verifyInvocationDefinition } from './store/def-source.ts';
 import { cancelCleanupSteps } from './defs.ts';
-import type { ApplyChoiceResult, AssessedCandidate, CandidateAssessment, DecisionSnapshot, DecisionSnapshotResult, DefRef, InvocationBinding, InvocationCandidate, InvocationEvidence, InvocationKey, InvocationStatus, InvocationBindingSource, InvocationRelayKey, VerifiedInvocationReceipt } from './types.ts';
+import type { InvocationHostAuthority, ApplyChoiceResult, AssessedCandidate, CandidateAssessment, DecisionSnapshot, DecisionSnapshotResult, DefRef, InvocationBinding, InvocationCandidate, InvocationEvidence, InvocationKey, InvocationStatus, InvocationBindingSource, InvocationRelayKey, VerifiedInvocationReceipt } from './types.ts';
 /**
  * The engine — the stateful layer that turns model decisions (model.ts) into
  * writes, under the store's `BEGIN IMMEDIATE` transactions.
@@ -559,6 +557,7 @@ export interface ReapDetail {
 export class Engine {
   readonly store: Store;
   private readonly resolveDef: DefResolver;
+  private readonly invocationAuthority?: InvocationHostAuthority;
   /**
    * The reference-mode instruction boundary (WP-B1): where an order's
    * `defDigest` turns back into exact authored instructions. Injected when a
@@ -580,6 +579,8 @@ export class Engine {
     store: Store,
     resolveDef: DefResolver,
     opts: {
+      /** Trusted per-instance authority; absent raw engines refuse invocation/CAS readiness. */
+      invocationAuthority?: InvocationHostAuthority;
       reapTtlMs?: number;
       /** A3 (REL-8): OPT-IN hard cap on total lease lifetime (claimedAt +
        *  maxLease), enforced regardless of heartbeats. Unset (the default) means
@@ -607,6 +608,7 @@ export class Engine {
   ) {
     this.store = store;
     this.resolveDef = resolveDef;
+    this.invocationAuthority = opts.invocationAuthority;
     this.instructionSource = opts.instructionSource ?? createDefInstructionSource();
     this.resolver = new OrderResolver(this.instructionSource);
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
@@ -614,6 +616,38 @@ export class Engine {
     this.maxCallDepth = opts.maxCallDepth ?? DEFAULT_MAX_CALL_DEPTH;
     if (opts.onEvent) this.listeners.add(opts.onEvent);
     this.onListenerError = opts.onListenerError;
+  }
+
+  /** An incomplete or non-boolean host cannot grant definition authority. */
+  private verifyInvocationDefinition(def: WorkflowDef, target?: string): boolean {
+    const authority = this.invocationAuthority;
+    return typeof authority?.verifyDefinition === 'function'
+      && typeof authority.withDefinitions === 'function'
+      && authority.verifyDefinition(def, target) === true;
+  }
+
+  private withInvocationDefinitions<T>(defs: readonly WorkflowDef[], operation: () => T): T {
+    const authority = this.invocationAuthority;
+    if (typeof authority?.verifyDefinition !== 'function' || typeof authority.withDefinitions !== 'function') {
+      throw new Error('invocation host authority unavailable');
+    }
+    // Only the synchronous guarded operation can supply the result. A malformed
+    // host cannot manufacture a receipt/claim result or defer a write until after
+    // its guard has exited. The host is trusted to establish the actual guard.
+    let active = true;
+    let completed: { value: T } | undefined;
+    let called = false;
+    try {
+      authority.withDefinitions(defs, () => {
+	if (!active || called) throw new Error('invocation host guard must execute once synchronously');
+	called = true;
+	const value = operation();
+	completed = { value };
+	return value;
+      });
+      if (!completed) throw new Error('invocation host guard did not complete the operation');
+      return completed.value;
+    } finally { active = false; }
   }
 
   /**
@@ -1204,7 +1238,7 @@ export class Engine {
     const transact = (): ProvisionResult | typeof needsSnapshot => snapshotDef === undefined
       ? this.store.tx(transactionBody)
       : this.store.txWithWorkflowSnapshots(snapshotDef, transactionBody, () => {
-        if (invocation && !verifyInvocationDefinition(snapshotDef!, invocation.selected.target)) snapshotDef = undefined;
+	if (invocation && !this.verifyInvocationDefinition(snapshotDef!, invocation.selected.target)) snapshotDef = undefined;
       });
     const run = (): ProvisionResult => {
       let result = transact();
@@ -1295,7 +1329,7 @@ export class Engine {
     catch { return { assessment: { kind: 'invalid', code: 'unresolved' } }; }
     if (def.bundleDigest !== candidate.DefRef.bundleDigest) return { assessment: { kind: 'invalid', code: 'digest-mismatch' } };
     if (def.name !== candidate.DefRef.workflowName) return { assessment: { kind: 'invalid', code: 'name-mismatch' } };
-    if (!verifyInvocationDefinition(def, candidate.target)) return { assessment: { kind: 'invalid', code: 'unresolved' } };
+    if (!this.verifyInvocationDefinition(def, candidate.target)) return { assessment: { kind: 'invalid', code: 'unresolved' } };
     if (step.callsInterface?.selection !== 'invocation') throw new Error('expected invocation call');
     return { def, assessment: assessContract(step.callsInterface, step.callsInputs ?? {}, def, bindings) };
   }
@@ -1314,7 +1348,7 @@ export class Engine {
     let verified: WorkflowDef;
     try { verified = this.resolveDef(row.def, parent, ref.bundleDigest); }
     catch { return { kind: 'parent-unverified' }; }
-    if (!verifyInvocationDefinition(verified) || valueDigestHex(verified) !== valueDigestHex(parent)) return { kind: 'parent-unverified' };
+    if (!this.verifyInvocationDefinition(verified) || valueDigestHex(verified) !== valueDigestHex(parent)) return { kind: 'parent-unverified' };
     const admission = this.store.getAdmission(this.store.rootWorkflow(workflow));
     if (!admission) return { kind: 'admission-unmanaged' };
     if (!admission.active) return { kind: 'canceled', epoch: admission.epoch };
@@ -1343,7 +1377,7 @@ export class Engine {
     let verifiedParent: WorkflowDef | undefined;
     if (row && parent?.bundleDigest) {
       try { verifiedParent = this.resolveDef(row.def, parent, parent.bundleDigest); } catch { /* fresh transaction reports stale parent */ }
-      if (verifiedParent && !verifyInvocationDefinition(verifiedParent)) verifiedParent = undefined;
+      if (verifiedParent && !this.verifyInvocationDefinition(verifiedParent)) verifiedParent = undefined;
     }
     const resolved = parent && step?.callsInterface?.selection === 'invocation'
       ? this.assessCandidate(selected, parent, step, row?.interfaceBindings) : undefined;
@@ -1390,8 +1424,8 @@ export class Engine {
       return { kind: 'bound', binding };
     };
     return resolved?.def ? this.store.txWithWorkflowSnapshots([resolved.def, ...(verifiedParent ? [verifiedParent] : [])], tx, () => {
-      if (!verifyInvocationDefinition(resolved.def!, selected.target)) resolved.assessment = { kind: 'invalid', code: 'unresolved' };
-      if (verifiedParent && !verifyInvocationDefinition(verifiedParent)) verifiedParent = undefined;
+      if (!this.verifyInvocationDefinition(resolved.def!, selected.target)) resolved.assessment = { kind: 'invalid', code: 'unresolved' };
+      if (verifiedParent && !this.verifyInvocationDefinition(verifiedParent)) verifiedParent = undefined;
     }) : this.store.tx(tx);
   }
   /** Trusted local Store/CAS seam for a command executor. Never serialize this capability. */
@@ -1409,10 +1443,10 @@ export class Engine {
     if (!child) return undefined;
     const parentDef = this.resolveDef(parent.def, parent.defSnapshot, key.parentDefRef.bundleDigest);
     const childDef = this.resolveDef(binding.selected.target, parentDef, binding.selected.DefRef.bundleDigest);
-    if (!verifyInvocationDefinition(parentDef) || !verifyInvocationDefinition(childDef, binding.selected.target)
+    if (!this.verifyInvocationDefinition(parentDef) || !this.verifyInvocationDefinition(childDef, binding.selected.target)
       || valueDigestHex(parentDef) !== valueDigestHex(parent.defSnapshot)
       || valueDigestHex(childDef) !== valueDigestHex(child.defSnapshot)) return undefined;
-    return withWorkflowSnapshotStoreGuard([parentDef, childDef], () => this.store.readTx(() => {
+    return this.withInvocationDefinitions([parentDef, childDef], () => this.store.readTx(() => {
       if (!this.invocationCurrent(parent.id) || this.currentInvocation(parent.id, step)?.id !== binding.id) return undefined;
       const currentChild = this.store.findChildByInvocation(binding.id);
       if (currentChild?.id !== child.id || valueDigestHex(currentChild.defSnapshot) !== valueDigestHex(childDef)) return undefined;
@@ -2198,7 +2232,7 @@ export class Engine {
 	  const ref = this.pinnedRef(row.id);
 	  if (!ref || !row.defSnapshot) return { frameId: row.id };
 	  const def = this.resolveDef(row.def, row.defSnapshot, ref.bundleDigest);
-	  if (!verifyInvocationDefinition(def) || valueDigestHex(def) !== valueDigestHex(row.defSnapshot)) return { frameId: row.id };
+	  if (!this.verifyInvocationDefinition(def) || valueDigestHex(def) !== valueDigestHex(row.defSnapshot)) return { frameId: row.id };
 	  verified.set(row.id, def);
 	} catch { return { frameId: row.id }; }
       }
@@ -2259,7 +2293,7 @@ export class Engine {
     this.tickInternal(workflow, opts.now, opts.deep ?? true, undefined, new Set(), 0, undefined, {}, {}, {}, {}, true);
     const verified = this.verifiedReadyDefinitions(workflow, opts.deep ?? true);
     if (!(verified instanceof Map)) return { kind: 'unverified', ...verified };
-    return withWorkflowSnapshotStoreGuard([...verified.values()], () => this.store.readTx(() => {
+    return this.withInvocationDefinitions([...verified.values()], () => this.store.readTx(() => {
       const result = this.collectReady(workflow, opts, verified);
       return result.kind === 'ready' ? immutable({ kind: 'ready' as const, firings: result.entries.map(e => e.ready) }) : result;
     }));
@@ -2281,7 +2315,7 @@ export class Engine {
     const opts = immutable(structuredClone({ ...options, now: options.now ?? nowMs() }));
     const verified = this.verifiedReadyDefinitions(chosen.firing.workflow, opts.deep ?? true);
     if (!(verified instanceof Map)) return { kind: 'unverified', ...verified };
-    return withWorkflowSnapshotStoreGuard([...verified.values()], () => this.store.tx(() => {
+    return this.withInvocationDefinitions([...verified.values()], () => this.store.tx(() => {
       const result = this.collectReady(chosen.firing.workflow, opts, verified);
       if (result.kind === 'unverified') return result;
       if (result.kind !== 'ready') return { kind: 'stale' };

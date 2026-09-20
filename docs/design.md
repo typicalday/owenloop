@@ -2042,6 +2042,34 @@ embedding API is `decisionSnapshot`, `applyChoice`, `cancelRun`,
 `invocationStatus`, and `invocationBindingSource` on `Engine`; the complete
 contract and result precedence are in [authoring.md](authoring.md#per-invocation-interface-selection).
 
+`Engine` receives an optional, typed `InvocationHostAuthority` through its
+`invocationAuthority` constructor option. This trusted per-instance capability
+verifies an exact `WorkflowDef` and optional target synchronously, and runs a
+generic synchronous operation under a definition guard. The operation may own
+either a Store read transaction (readiness or relay) or the complete conditional
+claim write transaction. A host must establish authority before calling it once,
+hold the guard through its return, and refuse before calling it. The capability
+is never serialized, inferred from snapshot provenance, or globally registered.
+Malformed verification results cannot grant authority; omitted or deferred guard
+callbacks cannot manufacture a successful result or execute a later write.
+
+The native factory and CLI supply the existing local CAS verifier and snapshot
+guard. Raw `new Engine` has no local fallback: without a complete capability,
+invocation snapshots report `parent-unverified`, choices refuse, selected children
+cannot be provisioned, CAS readiness/claims report `unverified`, and relay reads
+cannot return trusted receipts. Throwing local verification/guards still refuse
+by throwing. Legacy non-invocation construction and execution remain supported.
+The CAS runtime test helper explicitly supplies the same local authority; other
+raw legacy callers retain their concrete/start-bound calls semantics.
+
+Store still owns `txWithWorkflowSnapshots`, including guarded revalidation before
+its SQLite commit callback. Its native CAS locks, combined project/global
+resolution, lane/slot transactions, release/replay and schema migration remain
+unchanged. The Engine runtime import graph excludes the local invocation verifier
+and snapshot guard; this does not remove the older filesystem helpers in `defs.ts`.
+A future host must implement its own real authority and Store transaction
+contract; this seam does not supply a service trust adapter.
+
 Schema v13 adds root `run_admission` and append-only `call_invocation`. Unique
 invocation keys select one immutable body; children link through
 `producedByInvocation`. Parent/path uniqueness remains for legacy NULL-linked

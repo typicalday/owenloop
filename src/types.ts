@@ -107,6 +107,18 @@ export interface InterfaceCallBinding {
   signature: WorkflowInterfaceSignature;
 }
 
+/** Trusted, non-serialized host capability supplied to one Engine instance.
+ * Verification checks exact definition bytes and, when supplied, the target.
+ * withDefinitions establishes authority before calling operation exactly once,
+ * synchronously, holding it until the operation returns. Refuse by throwing
+ * before the callback. The operation can own a Store read OR write transaction;
+ * this is not a read-only port. Store retains snapshot-commit/revalidate ownership.
+ */
+export interface InvocationHostAuthority {
+  verifyDefinition(def: WorkflowDef, target?: string): boolean;
+  withDefinitions<T>(defs: readonly WorkflowDef[], operation: () => T): T;
+}
+
 /** Exact identity from a verified CAS bundle; never a definition projection hash. */
 export interface DefRef { bundleDigest: string; workflowName: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };

@@ -44,6 +44,29 @@ import {
 import type { BundleIngestor, BundleSource, DefDigest, PreCommitVerifier, WorkflowCoordinate } from '../src/store/index.ts';
 import { exampleDefNames } from './helpers.ts';
 import { installBundleFixture, writeBundleSource } from './helpers/store-fixture.ts';
+import { runtimeFixture, ready } from './helpers/runtime-selection.ts';
+
+test('CLI raw constructor supplies local authority when provisioning a selected invocation', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'cli-invocation-home-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'cli-invocation-project-'));
+  const db = join(cwd, 'state.db');
+  const f = await runtimeFixture(db, globalStoreRoot(home));
+  t.after(() => f.store.close());
+  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const snapshot = ready(f.engine, workflow, 'one', f.candidates);
+  assert.equal(f.engine.applyChoice(snapshot, f.candidates[0]!).kind, 'bound');
+  assert.equal(f.store.listChildrenByParent(workflow).length, 0);
+  const out: string[] = [], err: string[] = [];
+  const code = main(['tick', workflow], { cwd, env: { HOME: home, OWENLOOP_DB: db },
+    out: s => out.push(s), err: s => err.push(s) });
+  assert.equal(code, 0, err.join('\n'));
+  const result = JSON.parse(out.join('\n'));
+  assert.equal(result.orders.length, 1);
+  const child = f.store.findChildByInvocation(f.store.listInvocations(workflow)[0]!.id)!;
+  assert.equal(result.orders[0].workflow, child.id);
+  assert.equal(child.defSnapshot!.bundleDigest, f.candidates[0]!.DefRef.bundleDigest);
+  assert.equal(f.store.listRuns(child.id).length, 1);
+});
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
 
