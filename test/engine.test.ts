@@ -2821,3 +2821,449 @@ test('ask refuses an artifact that is already built — a delivered version is r
 
   assert.throws(() => engine.ask(wf, 'plan', 'planner', 'too late'), /cannot ask about 'plan' in state 'green'/);
 });
+
+// U1 bounded dispatch uses real CAS definitions and persisted SQLite orders.
+import { installBundleFixture, writeBundleSource, tempDir } from './helpers/store-fixture.ts';
+import { reloadRuntimeEngine } from './helpers/runtime-selection.ts';
+import type { ReadyFiring, ReadyClaimPlan, ReadyOptions } from '../src/types.ts';
+import { join } from 'node:path';
+
+async function boundedFixture(extra = '') {
+  const installed = await installBundleFixture({ sourceDir: writeBundleSource({ name: 'bounded', workflow: `name: bounded
+inputs: [{name: seed, seedOwed: true}]
+steps:
+  - name: A
+    consumes: [seed]
+    produces: [a]
+    capabilities: [work]
+  - name: B
+    consumes: [seed]
+    produces: [b]
+    capabilities: [work]
+${extra}` }) });
+  const db = join(tempDir('bounded-db-'), 'state.db');
+  const store = openStore(db);
+  const { engine } = reloadRuntimeEngine(store, installed.root);
+  const workflow = engine.createInstance('bounded/bounded@1.0.0');
+  engine.provideInput(workflow, 'seed', { value: 1 });
+  return { engine, store, workflow, db, root: installed.root };
+}
+const readyOpts: ReadyOptions = { now: 10, revision: 'routing-1' };
+function choices(engine: Engine, workflow: string, opts = readyOpts): readonly ReadyFiring[] {
+  const result = engine.snapshotReady(workflow, opts);
+  assert.equal(result.kind, 'ready', JSON.stringify(result));
+  if (result.kind !== 'ready') throw new Error('not ready');
+  return result.firings;
+}
+function claimPlan(firing: ReadyFiring, slot = 'slot-1', capacity = 1): ReadyClaimPlan {
+  return { firing, lane: { id: 'executor-lane', slot, executorKind: firing.executorKind,
+    capacity, revision: 'authority-1', expiresAt: 1000 }, candidateDigest: 'a'.repeat(64),
+    evidenceDigest: 'b'.repeat(64), policyDigest: 'c'.repeat(64), authorityRevision: 'authority-1' };
+}
+
+test('U1-capacity-one: B alone persists; resolved scoped filter/stamp and crew isolation', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const initial = choices(engine, workflow);
+  assert.deepEqual(initial.map(f => f.step), ['A', 'B']);
+  assert.equal(store.listRuns(workflow).length, 0);
+  assert.equal(store.listTasks(workflow).filter(t => t.status === 'claimed').length, 0);
+  const b = initial.find(f => f.step === 'B')!;
+  const opts: ReadyOptions = { ...readyOpts, capabilities: ['special'], scopedMappings: [{
+    DefRef: b.DefRef, step: b.step, authored: 'work', meaningDigest: b.meaningDigest,
+    evidenceGeneration: b.evidenceGeneration, target: 'special',
+  }], crewStamps: { special: ['crew-b'], work: ['crew-a'] } };
+  const filtered = choices(engine, workflow, opts);
+  assert.deepEqual(filtered.map(f => f.step), ['B']);
+  assert.ok(Object.isFrozen(filtered[0]!.resolved));
+  const result = engine.claimReady(claimPlan(filtered[0]!), opts);
+  assert.equal(result.kind, 'claimed', JSON.stringify(result));
+  if (result.kind !== 'claimed') return;
+  assert.deepEqual(result.order.capabilities, ['special']);
+  assert.deepEqual(result.order.crews, ['crew-b']);
+  assert.deepEqual(store.listRuns(workflow).map(r => r.step), ['B']);
+  assert.deepEqual(store.getRun(result.order.run)!.order, result.order);
+  assert.equal(store.getTask(workflow, 'A', ''), undefined);
+  assert.equal(store.getTask(workflow, 'B', '')!.run, result.order.run);
+});
+
+test('U1-stale-fallback: no stale claim mutation, then a separate fresh scan can claim A', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const b = choices(engine, workflow).find(f => f.step === 'B')!;
+  engine.provideInput(workflow, 'seed', { value: 2 });
+  const before = { runs: store.listRuns(workflow), tasks: store.listTasks(workflow), arts: store.listArtifacts(workflow) };
+  assert.equal(engine.claimReady(claimPlan(b), readyOpts).kind, 'stale');
+  assert.deepEqual({ runs: store.listRuns(workflow), tasks: store.listTasks(workflow), arts: store.listArtifacts(workflow) }, before);
+  const a = choices(engine, workflow).find(f => f.step === 'A')!;
+  const result = engine.claimReady(claimPlan(a), readyOpts);
+  assert.equal(result.kind, 'claimed', JSON.stringify(result));
+  assert.deepEqual(store.listRuns(workflow).map(r => r.step), ['A']);
+});
+
+test('U1-lane-race: independent connections and roots cannot oversubscribe a lane; slots survive release', async () => {
+  const { engine, store, workflow, db, root } = await boundedFixture();
+  const store2 = openStore(db);
+  const other = reloadRuntimeEngine(store2, root).engine;
+  const wf2 = other.createInstance('bounded/bounded@1.0.0');
+  other.provideInput(wf2, 'seed', {});
+  const first = choices(engine, workflow)[1]!;
+  const second = choices(other, wf2)[0]!;
+  const won = engine.claimReady(claimPlan(first), readyOpts);
+  assert.equal(won.kind, 'claimed');
+  assert.equal(other.claimReady(claimPlan(second, 'slot-2'), readyOpts).kind, 'lane-unavailable');
+  assert.equal(store2.listRuns(wf2).length, 0);
+  if (won.kind !== 'claimed') return;
+  engine.close(workflow, won.order.run, 'released');
+  assert.equal(other.claimReady(claimPlan(second), readyOpts).kind, 'lane-unavailable');
+  assert.equal(other.claimReady(claimPlan(second, 'slot-2'), readyOpts).kind, 'claimed');
+  assert.equal(store.listRuns(workflow).length + store.listRuns(wf2).length, 2);
+});
+
+test('U1-child: prefer one exact child; parent movement invalidates direct child claims', async () => {
+  const child = await installBundleFixture({ sourceDir: writeBundleSource({ name: 'child', workflow: `name: child
+inputs: [{name: data, seedOwed: true}]
+steps:
+  - name: work
+    consumes: [data]
+    produces: [result]
+    capabilities: [work]
+outputs: [result]
+` }) });
+  await installBundleFixture({ root: child.root, sourceDir: writeBundleSource({ name: 'parent',
+    lock: { 'child/child@1.0.0': child.result.digest }, workflow: `name: parent
+inputs: [{name: seed, seedOwed: true}]
+steps:
+  - name: A
+    consumes: [seed]
+    produces: [a]
+    capabilities: [work]
+  - name: child
+    calls: child/child@1.0.0
+    inputs: {data: seed}
+    produces: [child]
+` }) });
+  const store = openStore(':memory:');
+  const { engine } = reloadRuntimeEngine(store, child.root);
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { version: 1 } } });
+  const all = choices(engine, workflow);
+  assert.equal(all.length, 2);
+  const preferred = all.find(f => f.frameId !== workflow)!;
+  assert.equal(preferred.step, 'work');
+  const opts = { ...readyOpts, scopedMappings: [{ DefRef: preferred.DefRef, step: preferred.step,
+    authored: 'work', meaningDigest: preferred.meaningDigest, evidenceGeneration: preferred.evidenceGeneration,
+    target: 'child-work' }], crewStamps: { 'child-work': ['child-crew'], work: ['parent-crew'] } };
+  const scoped = choices(engine, workflow, opts);
+  assert.deepEqual(scoped.find(f => f.frameId === workflow)!.resolved.capabilities, ['work']);
+  const selected = scoped.find(f => f.frameId === preferred.frameId)!;
+  const won = engine.claimReady(claimPlan(selected), opts);
+  assert.equal(won.kind, 'claimed');
+  assert.equal(store.listRuns(workflow).length, 0);
+  assert.equal(store.listRuns(preferred.frameId).length, 1);
+  if (won.kind !== 'claimed') return;
+  assert.deepEqual(won.order.capabilities, ['child-work']);
+  assert.deepEqual(won.order.crews, ['child-crew']);
+  engine.close(preferred.frameId, won.order.run, 'released');
+  const direct = choices(engine, preferred.frameId)[0]!;
+  engine.provideInput(workflow, 'seed', { version: 2 });
+  const before = store.listRuns(preferred.frameId);
+  assert.equal(engine.claimReady(claimPlan(direct, 'slot-2'), readyOpts).kind, 'stale');
+  assert.deepEqual(store.listRuns(preferred.frameId), before);
+});
+
+test('U1-currentness: routing revision, lane kind/expiry, debt and cancellation refuse without a claim', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const b = choices(engine, workflow)[1]!;
+  assert.equal(engine.claimReady(claimPlan(b), { ...readyOpts, revision: 'routing-2' }).kind, 'stale');
+  const wrong = claimPlan(b);
+  assert.equal(engine.claimReady({ ...wrong, lane: { ...wrong.lane, executorKind: 'command' } }, readyOpts).kind, 'lane-unavailable');
+  assert.equal(engine.claimReady({ ...wrong, lane: { ...wrong.lane, expiresAt: 10 } }, readyOpts).kind, 'lane-unavailable');
+  assert.equal(store.listRuns(workflow).length, 0);
+  engine.skip(workflow, 'b', 'human', 'no longer owed');
+  assert.equal(engine.claimReady(wrong, readyOpts).kind, 'stale');
+  const a = choices(engine, workflow)[0]!;
+  engine.cancelRun(workflow);
+  assert.equal(engine.claimReady(claimPlan(a), readyOpts).kind, 'stale');
+  assert.equal(store.listRuns(workflow).length, 0);
+});
+
+test('U1-legacy: unverified definitions retain legacy tick and cannot enter bounded claims', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const workflow = engine.createInstance('delivery');
+  assert.equal(engine.snapshotReady(workflow, readyOpts).kind, 'unverified');
+  assert.equal(store.listRuns(workflow).length, 0);
+  assert.equal(engine.tick(workflow).orders.length, 1);
+});
+
+import { Worker } from 'node:worker_threads';
+
+/** Barrier releases two independent SQLite connections into real claimReady
+ * concurrently. Workers import production Engine/Store, never a mock claim. */
+async function raceReady(db: string, root: string, plans: ReadyClaimPlan[]) {
+  const barrier = new SharedArrayBuffer(4);
+  const workers = plans.map(plan => new Worker(`
+    const { parentPort, workerData } = require('node:worker_threads');
+    (async () => {
+      const { openStore } = await import(workerData.storeUrl);
+      const { reloadRuntimeEngine } = await import(workerData.engineUrl);
+      const store = openStore(workerData.db);
+      const engine = reloadRuntimeEngine(store, workerData.root).engine;
+      parentPort.postMessage({ ready: true });
+      Atomics.wait(new Int32Array(workerData.barrier), 0, 0, 10000);
+      const result = engine.claimReady(workerData.plan, workerData.opts);
+      store.close();
+      parentPort.postMessage({ result });
+    })().catch(error => { throw error; });
+  `, { eval: true, workerData: { db, root, plan, opts: readyOpts, barrier,
+    storeUrl: new URL('../src/store.ts', import.meta.url).href,
+    engineUrl: new URL('./helpers/runtime-selection.ts', import.meta.url).href } }));
+  try {
+    const results = workers.map(worker => new Promise<import('../src/types.ts').ClaimReadyResult>((resolve, reject) => {
+      worker.on('message', message => { if (message.result) resolve(message.result); });
+      worker.on('error', reject);
+      worker.on('exit', code => { if (code !== 0) reject(new Error(`claim worker exit ${code}`)); });
+    }));
+    await Promise.all(workers.map(worker => new Promise<void>((resolve, reject) => {
+      worker.on('message', message => { if (message.ready) resolve(); });
+      worker.on('error', reject);
+    })));
+    Atomics.store(new Int32Array(barrier), 0, 1);
+    Atomics.notify(new Int32Array(barrier), 0);
+    return await Promise.all(results);
+  } finally {
+    await Promise.all(workers.map(worker => worker.terminate()));
+  }
+}
+
+for (const sameSlot of [true, false]) test(`U1-overlapping-race: ${sameSlot ? 'same slot' : 'distinct slots'} across roots`, async () => {
+  const { engine, store, workflow, db, root } = await boundedFixture();
+  const second = engine.createInstance('bounded/bounded@1.0.0', { provide: { seed: {} } });
+  const plans = [claimPlan(choices(engine, workflow)[1]!),
+    claimPlan(choices(engine, second)[0]!, sameSlot ? 'slot-1' : 'slot-2')];
+  const results = await raceReady(db, root, plans);
+  assert.deepEqual(results.map(r => r.kind).sort(), ['claimed', 'lane-unavailable']);
+  const runs = [...store.listRuns(workflow), ...store.listRuns(second)];
+  assert.equal(runs.length, 1);
+  const claimed = results.find(r => r.kind === 'claimed')!;
+  assert.equal(claimed.kind, 'claimed');
+  if (claimed.kind !== 'claimed') return;
+  assert.deepEqual(runs[0]!.order, claimed.order);
+  assert.deepEqual(claimed.order.capabilities, ['work']);
+  assert.equal('readyClaim' in claimed.order, false);
+  assert.equal(store.dispatchLaneUsage('executor-lane'), 1);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM dispatch_slot').get()!.n, 1);
+  store.close();
+});
+
+function dispatchState(store: Store, workflow: string) {
+  return { runs: store.listRuns(workflow), tasks: store.listTasks(workflow), arts: store.listArtifacts(workflow),
+    lanes: store.db.prepare('SELECT * FROM dispatch_lane').all(), slots: store.db.prepare('SELECT * FROM dispatch_slot').all() };
+}
+
+test('U1-rollback: real claim fails before and after slot insertion without spending lane or slot', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const plan = claimPlan(choices(engine, workflow)[1]!);
+  const before = dispatchState(store, workflow);
+  for (const [timing, table] of [['BEFORE', 'run'], ['AFTER', 'dispatch_slot']] as const) {
+    store.db.exec(`CREATE TRIGGER injected_failure ${timing} INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'injected failure'); END`);
+    assert.throws(() => engine.claimReady(plan, readyOpts), /injected failure/);
+    assert.deepEqual(dispatchState(store, workflow), before);
+    store.db.exec('DROP TRIGGER injected_failure');
+  }
+  const claimed = engine.claimReady(plan, readyOpts);
+  assert.equal(claimed.kind, 'claimed');
+  assert.equal(store.listRuns(workflow).length, 1);
+  assert.equal(store.getDispatchSlot(plan.lane.id, plan.lane.slot)?.run,
+    claimed.kind === 'claimed' ? claimed.order.run : undefined);
+  store.close();
+});
+
+for (const transition of ['released', 'ok', 'cancel', 'reap', 'cleanup'] as const) {
+  test(`U1-lifecycle: ${transition} frees actual capacity once without reopening the slot across restart`, async () => {
+    const fixture = await boundedFixture();
+    let { engine, store } = fixture;
+    const { workflow, db, root } = fixture;
+    const first = claimPlan(choices(engine, workflow)[1]!);
+    const claimed = engine.claimReady(first, readyOpts);
+    assert.equal(claimed.kind, 'claimed');
+    if (claimed.kind !== 'claimed') return;
+    const receipt = store.getDispatchSlot(first.lane.id, first.lane.slot);
+    store.close();
+    store = openStore(db);
+    engine = reloadRuntimeEngine(store, root).engine;
+    assert.equal(store.dispatchLaneUsage(first.lane.id), 1);
+    if (transition === 'cancel') engine.cancelRun(workflow);
+    else if (transition === 'reap') engine.reapWithDetails(workflow, 11, undefined, { ttlOverride: 0 });
+    else if (transition === 'cleanup') store.tx(() => store.deleteWorkflow(workflow));
+    else engine.close(workflow, claimed.order.run, transition);
+    assert.equal(store.dispatchLaneUsage(first.lane.id), 0);
+    assert.deepEqual(store.getDispatchSlot(first.lane.id, first.lane.slot), receipt);
+    store.close();
+    store = openStore(db);
+    engine = reloadRuntimeEngine(store, root).engine;
+    const next = engine.createInstance('bounded/bounded@1.0.0', { provide: { seed: {} } });
+    const firing = choices(engine, next)[0]!;
+    const before = dispatchState(store, next);
+    assert.equal(engine.claimReady(claimPlan(firing), readyOpts).kind, 'lane-unavailable');
+    assert.deepEqual(dispatchState(store, next), before);
+    const fresh = engine.claimReady(claimPlan(firing, 'slot-2'), readyOpts);
+    assert.equal(fresh.kind, 'claimed');
+    assert.equal(store.dispatchLaneUsage(first.lane.id), 1);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM dispatch_slot').get()!.n, 2);
+    store.close();
+  });
+}
+
+async function readyWorkflow(yaml: string) {
+  const installed = await installBundleFixture({ sourceDir: writeBundleSource({ name: 'scheduler', workflow: yaml }) });
+  const store = openStore(':memory:');
+  const { engine } = reloadRuntimeEngine(store, installed.root);
+  const workflow = engine.createInstance('scheduler/scheduler@1.0.0', { provide: { seed: {} } });
+  return { engine, store, workflow };
+}
+
+for (const [gate, config] of [['cadence', 'cadence: 60s'], ['budget', 'maxRunsPerDay: 1']] as const) {
+  test(`U1-scheduler: ${gate} is rechecked against persisted real runs`, async () => {
+    const { engine, store, workflow } = await readyWorkflow(`name: scheduler
+inputs: [{name: seed, seedOwed: true}]
+steps:
+  - name: work
+    consumes: [seed]
+    produces: [out]
+    ${config}
+`);
+    const firing = choices(engine, workflow)[0]!;
+    const won = engine.claimReady(claimPlan(firing), readyOpts);
+    assert.equal(won.kind, 'claimed');
+    if (won.kind !== 'claimed') return;
+    engine.close(workflow, won.order.run, 'no_work');
+    const before = dispatchState(store, workflow);
+    assert.equal(engine.claimReady(claimPlan(firing, 'slot-2'), readyOpts).kind, 'stale');
+    assert.deepEqual(dispatchState(store, workflow), before);
+    assert.deepEqual(choices(engine, workflow), []);
+    const opts = { ...readyOpts, now: gate === 'cadence' ? 60_010 : 86_400_010 };
+    assert.equal(choices(engine, workflow, opts).length, 1);
+    store.close();
+  });
+}
+
+test('U1-scheduler: map preference exposes every key, rechecks parallel occupancy, and maintenance reaps before snapshot', async () => {
+  const { engine, store, workflow } = await readyWorkflow(`name: scheduler
+inputs: [{name: seed, seedOwed: true}]
+steps:
+  - name: list
+    consumes: [seed]
+    produces: ['items[]']
+  - name: work
+    consumes: ['items[$i]']
+    produces: ['items[$i].result']
+    parallel: 1
+    reapTtl: 1s
+`);
+  const list = engine.tick(workflow, { now: 1 }).orders[0]!;
+  engine.emit(workflow, list.run, [{ value: { n: 1 } }, { value: { n: 2 } }]);
+  engine.close(workflow, list.run);
+  const options = { ...readyOpts, now: 10 };
+  const firings = choices(engine, workflow, options).filter(f => f.step === 'work');
+  assert.equal(firings.length, 2);
+  const preferred = firings[1]!;
+  const won = engine.claimReady(claimPlan(preferred, 'slot-1', 2), options);
+  assert.equal(won.kind, 'claimed');
+  if (won.kind !== 'claimed') return;
+  assert.equal(won.order.key, preferred.key);
+  assert.equal(choices(engine, workflow, options).filter(f => f.step === 'work').length, 0);
+  const before = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(claimPlan(firings[0]!, 'slot-2', 2), options).kind, 'stale');
+  assert.deepEqual(dispatchState(store, workflow), before);
+  const later = { ...options, now: 1011 };
+  const fresh = choices(engine, workflow, later).filter(f => f.step === 'work');
+  assert.equal(fresh.length, 2);
+  assert.equal(store.getTask(workflow, 'work', preferred.key)!.attempts, 1, 'snapshot ran required reap maintenance');
+  assert.equal(store.dispatchLaneUsage('executor-lane'), 0);
+  const afterMaintenance = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(claimPlan(preferred, 'slot-2', 2), later).kind, 'stale');
+  assert.deepEqual(dispatchState(store, workflow), afterMaintenance, 'stale advice adds no claim effects to separate maintenance');
+  assert.equal(engine.claimReady({ ...claimPlan(fresh[0]!, 'slot-2', 2),
+    lane: { ...claimPlan(fresh[0]!, 'slot-2', 2).lane, expiresAt: 2000 } }, later).kind, 'claimed');
+  store.close();
+});
+
+test('U1-scheduler: idle alarms survive refusal and rollback and clear only after successful claim', async () => {
+  const { engine, store, workflow } = await readyWorkflow(`name: scheduler
+inputs: [{name: seed, seedOwed: true}]
+steps:
+  - name: work
+    consumes: [seed]
+    produces: [pending]
+  - name: idle
+    produces: [out]
+    on: [allGreen, idle]
+    idleAfter: 1h
+`);
+  engine.setAlarm(workflow, 'idle', 10);
+  assert.equal(choices(engine, workflow, { ...readyOpts, now: 9 }).filter(f => f.step === 'idle').length, 0);
+  const firing = choices(engine, workflow).find(f => f.step === 'idle')!;
+  const plan = claimPlan(firing);
+  const before = dispatchState(store, workflow);
+  assert.equal(engine.claimReady({ ...plan, lane: { ...plan.lane, expiresAt: 10 } }, readyOpts).kind, 'lane-unavailable');
+  assert.deepEqual(dispatchState(store, workflow), before);
+  engine.setAlarm(workflow, 'idle', 11);
+  const moved = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(plan, readyOpts).kind, 'stale');
+  assert.deepEqual(dispatchState(store, workflow), moved);
+  engine.setAlarm(workflow, 'idle', 10);
+  const fresh = claimPlan(choices(engine, workflow).find(f => f.step === 'idle')!);
+  store.db.exec("CREATE TRIGGER fail_idle AFTER INSERT ON dispatch_slot BEGIN SELECT RAISE(ABORT, 'idle rollback'); END");
+  assert.throws(() => engine.claimReady(fresh, readyOpts), /idle rollback/);
+  assert.equal(store.getAlarm(workflow, 'idle'), 10);
+  assert.equal(store.listRuns(workflow).length, 0);
+  store.db.exec('DROP TRIGGER fail_idle');
+  const won = engine.claimReady(fresh, readyOpts);
+  assert.equal(won.kind, 'claimed');
+  if (won.kind === 'claimed') assert.equal(won.order.cause, 'idle');
+  assert.equal(store.getAlarm(workflow, 'idle'), undefined);
+  store.close();
+});
+
+test('U1-scheduler: frozen debt and changed leases invalidate advice without claim effects', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const b = choices(engine, workflow)[1]!;
+  engine.ask(workflow, 'b', 'B', 'human decision required');
+  const held = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(claimPlan(b), readyOpts).kind, 'stale');
+  assert.deepEqual(dispatchState(store, workflow), held);
+  assert.deepEqual(choices(engine, workflow).map(f => f.step), ['A']);
+  const a = choices(engine, workflow)[0]!;
+  const legacy = engine.tick(workflow, { now: 10 }).orders[0]!;
+  assert.equal(legacy.step, 'A');
+  engine.heartbeat(workflow, legacy.run, 11);
+  const leased = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(claimPlan(a), readyOpts).kind, 'stale');
+  assert.deepEqual(dispatchState(store, workflow), leased);
+  store.close();
+});
+
+test('U1-currentness: malformed plans and changed verified DefRefs cannot mutate claim state', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const plan = claimPlan(choices(engine, workflow)[1]!);
+  const before = dispatchState(store, workflow);
+  for (const bad of [null, {}, { ...plan, policyDigest: 'unknown' },
+    { ...plan, lane: { ...plan.lane, capacity: 0 } },
+    { ...plan, lane: { ...plan.lane, revision: 'different' } }]) {
+    assert.equal(engine.claimReady(bad as ReadyClaimPlan, readyOpts).kind, 'invalid-plan');
+    assert.deepEqual(dispatchState(store, workflow), before);
+  }
+  for (const firing of [{ ...plan.firing, DefRef: { ...plan.firing.DefRef, bundleDigest: 'f'.repeat(64) } },
+    { ...plan.firing, admissionEpoch: 99 }, { ...plan.firing, frameId: 'different-frame' },
+    { ...plan.firing, inputFingerprint: { seed: 99 } }]) {
+    assert.equal(engine.claimReady({ ...plan, firing }, readyOpts).kind, 'stale');
+    assert.deepEqual(dispatchState(store, workflow), before);
+  }
+  // A changed persisted snapshot is unverified even if the selector still
+  // names the old CAS digest. The guard compares the actual stored bytes.
+  const row = store.getWorkflow(workflow)!;
+  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?')
+    .run(JSON.stringify({ ...row.defSnapshot, description: 'tampered' }), workflow);
+  const tampered = dispatchState(store, workflow);
+  assert.equal(engine.claimReady(plan, readyOpts).kind, 'unverified');
+  assert.deepEqual(dispatchState(store, workflow), tampered);
+  store.close();
+});
