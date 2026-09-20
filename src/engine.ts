@@ -47,7 +47,8 @@ import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { checkInterfaceCompatibility } from './implements.ts';
 import { isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
-import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
+import { claimMatches, resolveStepCapabilities } from './capabilities.ts';
+import type { ClaimReadyResult, ReadyClaimPlan, ReadyFiring, ReadyOptions, ResolvedStepContext, SnapshotReadyResult } from './types.ts';
 import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
@@ -1439,6 +1440,7 @@ export class Engine {
       const admission = this.store.revokeAdmission(root);
       const cleanup = this.store.listWorkflows().filter(w => this.store.rootWorkflow(w.id) === root)
         .map(w => ({ workflow: w.id, steps: w.defSnapshot ? cancelCleanupSteps(w.defSnapshot) : [] }));
+      for (const frame of cleanup) this.store.releaseDispatchRuns(frame.workflow);
       return { admission, cleanup };
     });
   }
@@ -2132,6 +2134,179 @@ export class Engine {
     this.fireSettled(parentWf);
   }
 
+  private resolveFiring(workflow: string, def: WorkflowDef, f: Firing, arts: ArtifactMap,
+    modifier: string | undefined, opts: ReadyOptions): ResolvedStepContext {
+    return resolveStepCapabilities({ ...opts,
+      DefRef: { bundleDigest: def.bundleDigest ?? '', workflowName: def.name }, step: f.step,
+      authored: this.step(def, f.step).capabilities,
+      meaningDigest: valueDigestHex(this.step(def, f.step)),
+      evidenceGeneration: valueDigestHex(computeFingerprint(arts, f.inputs)),
+      modifier: this.routingFor(this.step(def, f.step), f, arts, modifier).modifier,
+    });
+  }
+
+  private taskFresh(workflow: string, step: string, key: string, now: number, def: WorkflowDef): boolean {
+    const task = this.store.getTask(workflow, step, key);
+    if (task?.status !== 'claimed' || !task.run) return false;
+    const run = this.store.getRun(task.run);
+    const sd = this.step(def, step);
+    return !!run && run.outcome === undefined && (task.claimedAt === undefined
+      || this.isClaimFresh(task, now, this.effectiveTtl(sd), this.effectiveMaxLease(sd)));
+  }
+
+  /** Verify every ancestor edge, also for callers scanning a child directly. */
+  private readyAncestry(workflow: string): WorkflowRow[] | null {
+    const rows: WorkflowRow[] = [];
+    let row = this.store.getWorkflow(workflow);
+    while (row) {
+      if (rows.some(r => r.id === row!.id) || rows.length > this.maxCallDepth) return null;
+      rows.push(row);
+      if (!this.invocationCurrent(row.id)) return null;
+      if (!row.producedBy) return rows;
+      const parent = this.store.getWorkflow(row.producedBy.parentWf);
+      const step = parent?.defSnapshot?.steps.find(s => isCallStep(s) && s.produces[0]?.stem === row!.producedBy!.parentPath);
+      if (!parent || !step || this.currentCallsChild(parent.id, row.producedBy.parentPath)?.id !== row.id) return null;
+      const arts = this.artMap(parent.id);
+      if (arts.get(row.producedBy.parentPath)?.acceptance !== 'owed' || !this.callsGateReady(arts, step)
+	|| !this.childConsistentWithGate(arts, this.artMap(row.id), step)) return null;
+      row = parent;
+    }
+    return null;
+  }
+
+  private readyFrames(workflow: string, deep: boolean): WorkflowRow[] {
+    const frames: WorkflowRow[] = [];
+    const visit = (id: string, depth: number): void => {
+      if (depth > this.maxCallDepth) throw new Error('calls depth limit exceeded during ready scan');
+      if (frames.some(f => f.id === id) || !this.readyAncestry(id)) return;
+      const row = this.store.getWorkflow(id)!;
+      frames.push(row);
+      if (deep) for (const { child } of this.callsDescendTargets(id, this.instanceFor(id).def)) visit(child.id, depth + 1);
+    };
+    visit(workflow, 0);
+    return frames;
+  }
+
+  /** CAS I/O completes before SQLite evaluation. Keep the same store guard
+   * through the final read/claim so definition removal cannot race the write. */
+  private verifiedReadyDefinitions(workflow: string, deep: boolean): Map<string, WorkflowDef> | { frameId: string } {
+    const verified = new Map<string, WorkflowDef>();
+    for (const frame of this.readyFrames(workflow, deep)) {
+      for (const row of this.readyAncestry(frame.id) ?? []) {
+	if (verified.has(row.id)) continue;
+	try {
+	  const ref = this.pinnedRef(row.id);
+	  if (!ref || !row.defSnapshot) return { frameId: row.id };
+	  const def = this.resolveDef(row.def, row.defSnapshot, ref.bundleDigest);
+	  if (!verifyInvocationDefinition(def) || valueDigestHex(def) !== valueDigestHex(row.defSnapshot)) return { frameId: row.id };
+	  verified.set(row.id, def);
+	} catch { return { frameId: row.id }; }
+      }
+    }
+    return verified;
+  }
+
+  private collectReady(workflow: string, opts: ReadyOptions, verified: Map<string, WorkflowDef>):
+    | { kind: 'ready'; entries: Array<{ ready: ReadyFiring; firing: Firing; def: WorkflowDef; arts: ArtifactMap; modifier?: string }> }
+    | { kind: 'unverified'; frameId: string } | { kind: 'inactive' } {
+    if (!this.readyAncestry(workflow)) return { kind: 'inactive' };
+    const entries: Array<{ ready: ReadyFiring; firing: Firing; def: WorkflowDef; arts: ArtifactMap; modifier?: string }> = [];
+    const now = opts.now!;
+    for (const row of this.readyFrames(workflow, opts.deep ?? true)) {
+      const ancestry = this.readyAncestry(row.id)!;
+      for (const ancestor of ancestry) {
+	if (!verified.has(ancestor.id) || valueDigestHex(ancestor.defSnapshot) !== valueDigestHex(verified.get(ancestor.id))) {
+	  return { kind: 'unverified', frameId: ancestor.id };
+	}
+      }
+      const def = verified.get(row.id)!;
+      const arts = this.artMap(row.id);
+      const contexts = new Map<Firing, ResolvedStepContext>();
+      const firings = eligibleFirings(def, arts, this.computeTimeFacts(def, row.id, arts, now), { modifier: row.modifier });
+      const { selected } = this.applySchedule(row.id, def, firings, now, arts, opts.capabilities ? [...opts.capabilities] : undefined,
+	row.modifier, {}, {}, {}, contexts, {}, opts);
+      const stateDigest = valueDigestHex(ancestry.map(a => ({ row: a, artifacts: this.store.listArtifacts(a.id),
+	tasks: this.store.listTasks(a.id), runs: this.store.listRuns(a.id).map(r => ({ id: r.id, outcome: r.outcome ?? null,
+	  createdAt: r.createdAt, updatedAt: r.updatedAt })),
+	admission: this.store.getAdmission(this.store.rootWorkflow(a.id)) ?? null,
+	alarms: a.defSnapshot!.steps.map(s => [s.name, this.store.getAlarm(a.id, s.name) ?? null]),
+      })));
+      for (const f of selected) {
+	const resolved = contexts.get(f)!;
+	const routing = this.routingFor(this.step(def, f.step), f, arts, row.modifier);
+	// buildOrder is read-only. A workdir refusal is not an eligible choice.
+	const preview = this.buildOrder(def, row.id, 'ready-preview', f, arts, computeFingerprint(arts, f.inputs), routing, resolved);
+	if ('deferred' in preview) continue;
+	const ready: ReadyFiring = immutable({ workflow, frameId: row.id,
+	  DefRef: { bundleDigest: def.bundleDigest!, workflowName: def.name }, step: f.step, key: f.key,
+	  inputFingerprint: computeFingerprint(arts, f.inputs),
+	  admissionEpoch: this.store.getAdmission(this.store.rootWorkflow(row.id))?.epoch ?? null,
+	  executorKind: this.step(def, f.step).executor ?? 'agent',
+	  meaningDigest: valueDigestHex(this.step(def, f.step)),
+	  evidenceGeneration: valueDigestHex(computeFingerprint(arts, f.inputs)), stateDigest, resolved,
+	});
+	entries.push({ ready, firing: f, def, arts, modifier: row.modifier });
+      }
+    }
+    return { kind: 'ready', entries };
+  }
+
+  /** Maintain the tree, then read actual eligible choices without leases or
+   * attempts. Evaluate preference/inference after this method returns. */
+  snapshotReady(workflow: string, options: ReadyOptions): SnapshotReadyResult {
+    const opts = immutable(structuredClone({ ...options, now: options.now ?? nowMs() }));
+    if (!this.store.getWorkflow(workflow) || !this.invocationCurrent(workflow)) return { kind: 'inactive' };
+    this.tickInternal(workflow, opts.now, opts.deep ?? true, undefined, new Set(), 0, undefined, {}, {}, {}, {}, true);
+    const verified = this.verifiedReadyDefinitions(workflow, opts.deep ?? true);
+    if (!(verified instanceof Map)) return { kind: 'unverified', ...verified };
+    return withWorkflowSnapshotStoreGuard([...verified.values()], () => this.store.readTx(() => {
+      const result = this.collectReady(workflow, opts, verified);
+      return result.kind === 'ready' ? immutable({ kind: 'ready' as const, firings: result.entries.map(e => e.ready) }) : result;
+    }));
+  }
+
+  /** One exact conditional write; there is deliberately no implicit fallback.
+   * On stale advice call snapshotReady again and submit a fresh plan. External
+   * authority revisions are trusted projections, revalidated by the service. */
+  claimReady(plan: ReadyClaimPlan, options: ReadyOptions): ClaimReadyResult {
+    if (!jsonOnly(plan) || !record(plan) || !record(plan.firing) || !record(plan.lane)
+      || ![plan.candidateDigest, plan.evidenceDigest, plan.policyDigest].every(v => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v))
+      || typeof plan.authorityRevision !== 'string' || !plan.authorityRevision
+      || typeof plan.firing.workflow !== 'string' || typeof plan.firing.frameId !== 'string'
+      || typeof plan.lane.id !== 'string' || !plan.lane.id || typeof plan.lane.slot !== 'string' || !plan.lane.slot
+      || typeof plan.lane.executorKind !== 'string' || !plan.lane.executorKind
+      || !Number.isSafeInteger(plan.lane.capacity) || plan.lane.capacity < 1 || !Number.isFinite(plan.lane.expiresAt)
+      || plan.lane.revision !== plan.authorityRevision) return { kind: 'invalid-plan' };
+    const chosen = immutable(structuredClone(plan));
+    const opts = immutable(structuredClone({ ...options, now: options.now ?? nowMs() }));
+    const verified = this.verifiedReadyDefinitions(chosen.firing.workflow, opts.deep ?? true);
+    if (!(verified instanceof Map)) return { kind: 'unverified', ...verified };
+    return withWorkflowSnapshotStoreGuard([...verified.values()], () => this.store.tx(() => {
+      const result = this.collectReady(chosen.firing.workflow, opts, verified);
+      if (result.kind === 'unverified') return result;
+      if (result.kind !== 'ready') return { kind: 'stale' };
+      const entry = result.entries.find(e => valueDigestHex(e.ready) === valueDigestHex(chosen.firing));
+      if (!entry) return { kind: 'stale' };
+      const lane = chosen.lane;
+      if (lane.expiresAt <= opts.now || lane.executorKind !== entry.ready.executorKind) return { kind: 'lane-unavailable' };
+      // No lane/slot field is written to the signed Order. Store admission,
+      // the real claim, and single-use consumption share this write lock.
+      const order = this.store.withDispatchSlot(lane, valueDigestHex(chosen), opts.now, () => {
+	const claimed = this.claim(entry.ready.frameId, entry.def, entry.firing, entry.arts, opts.now,
+	  entry.modifier, entry.ready.resolved);
+	if (!claimed || claimed === 'in-flight' || 'deferred' in claimed) {
+	  // Preview/currentness already checked this exact firing. Fail closed
+	  // and roll back if a future writer makes the claim disagree.
+	  throw new Error('ready firing changed during atomic claim');
+	}
+	return claimed;
+      });
+      if (!order) return { kind: 'lane-unavailable' };
+      if (entry.firing.cause === 'idle') this.store.clearAlarm(entry.ready.frameId, entry.firing.step);
+      return { kind: 'claimed', order };
+    }));
+  }
+
   // ---- the tick (maintain → reap → eligible → cadence/budget → claim) --------
 
   /**
@@ -2272,6 +2447,7 @@ export class Engine {
     capabilityMappings: CapabilityMappings = {},
     capabilityRewrites: CapabilityRewrites = {},
     crewStamps: CrewStamps = {},
+    maintenanceOnly = false,
   ): TickResult {
     if (depth > this.maxCallDepth) {
       throw new Error(
@@ -2330,12 +2506,14 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts, { modifier });
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityMappings, capabilityRewrites);
+      const contexts = new Map<Firing, ResolvedStepContext>();
+      const { selected, deferred } = maintenanceOnly ? { selected: [], deferred: [] }
+	: this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityMappings, capabilityRewrites, contexts, crewStamps);
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
-      for (const f of selected) {
-				const claimed = this.claim(workflow, def, f, arts, now, modifier, capabilityMappings, capabilityRewrites, crewStamps);
+      for (const f of maintenanceOnly ? [] : selected) {
+	const claimed = this.claim(workflow, def, f, arts, now, modifier, contexts.get(f));
         if (claimed === 'in-flight') {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
@@ -2368,7 +2546,7 @@ export class Engine {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
-		}, matchModes, capabilityMappings, capabilityRewrites, crewStamps);
+		}, matchModes, capabilityMappings, capabilityRewrites, crewStamps, maintenanceOnly);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -2468,6 +2646,9 @@ export class Engine {
     matchModes: Record<string, MatchMode>,
     capabilityMappings: CapabilityMappings,
     capabilityRewrites: CapabilityRewrites,
+    contexts: Map<Firing, ResolvedStepContext>,
+    crewStamps: CrewStamps,
+    readyOptions?: ReadyOptions,
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
@@ -2492,12 +2673,11 @@ export class Engine {
       // in the same order, so what is matched is always what gets stamped.
       const stepFirings: Firing[] = [];
       for (const f of all) {
-        const composed = composeCapabilities(
-          applyCapabilityMappings(step.capabilities, capabilityMappings),
-          this.routingFor(step, f, arts, modifier).modifier,
-        );
-        const { offered } = applyCapabilityRewrites(composed, capabilityRewrites);
-        if (claimMatches(offered, capabilities, matchModes)) stepFirings.push(f);
+	const context = this.resolveFiring(workflow, def, f, arts, modifier, readyOptions ?? {
+	  revision: 'legacy', legacyMappings: capabilityMappings, rewrites: capabilityRewrites, crewStamps, matchModes,
+	});
+	contexts.set(f, context);
+	if (claimMatches(context.capabilities, capabilities, context.matchModes)) stepFirings.push(f);
         else defer(f, 'capability-mismatch');
       }
       if (stepFirings.length === 0) continue;
@@ -2516,8 +2696,20 @@ export class Engine {
       // budget === 0) → daily-budget; otherwise the concurrency cap → parallel-cap.
       const beyondReason: DeferredReason = budget < step.parallel ? 'daily-budget' : 'parallel-cap';
 
-      for (const f of stepFirings.slice(0, slots)) selected.push(f);
-      for (const f of stepFirings.slice(slots)) defer(f, beyondReason);
+      if (readyOptions) {
+	// A bounded scan exposes every individually claimable choice. It must
+	// not reserve the first map key while suppressing a preferred sibling.
+	const active = this.store.listTasks(workflow).filter(t => t.step === step.name && this.taskFresh(workflow, t.step, t.key, now, def)).length;
+	for (const f of stepFirings) {
+	  if (this.taskFresh(workflow, f.step, f.key, now, def)) defer(f, 'in-flight');
+	  else if (budget === 0) defer(f, 'daily-budget');
+	  else if (active >= step.parallel) defer(f, 'parallel-cap');
+	  else selected.push(f);
+	}
+      } else {
+	for (const f of stepFirings.slice(0, slots)) selected.push(f);
+	for (const f of stepFirings.slice(slots)) defer(f, beyondReason);
+      }
     }
 
     return { selected, deferred };
@@ -2597,9 +2789,7 @@ export class Engine {
     arts: ArtifactMap,
     now: number,
     modifier?: string,
-    capabilityMappings: CapabilityMappings = {},
-    capabilityRewrites: CapabilityRewrites = {},
-    crewStamps: CrewStamps = {},
+    resolved?: ResolvedStepContext,
   ): Order | 'in-flight' | DeferredClaim | null {
     const existing = this.store.getTask(workflow, f.step, f.key);
     if (existing && existing.status === 'claimed') {
@@ -2629,7 +2819,7 @@ export class Engine {
     // `applySchedule` so the offer and the filter read the same function on the
     // same in-tx `arts` snapshot; nothing between them can move.
     const routing = this.routingFor(this.step(def, f.step), f, arts, modifier);
-    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing, capabilityMappings, capabilityRewrites, crewStamps);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing, resolved);
     if (typeof order === 'object' && 'deferred' in order) return order;
     // One history record per rejection episode. Written HERE, not in
     // `buildOrder` (which is store-pure) and not on the deferred path (an offer
@@ -2670,9 +2860,7 @@ export class Engine {
     arts: ArtifactMap,
     consumedFingerprint: Fingerprint,
     routing: { modifier?: string; escalation?: EscalationRecord } = {},
-    capabilityMappings: CapabilityMappings = {},
-    capabilityRewrites: CapabilityRewrites = {},
-    crewStamps: CrewStamps = {},
+    resolved?: ResolvedStepContext,
   ): Order | DeferredClaim {
     const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
@@ -2825,26 +3013,14 @@ export class Engine {
     // have to diff it against the run record. A claimed order is never
     // recomposed: composition happens per offer, and this record is what the
     // shift resolved against.
-    const { offered, reroutedFrom } = applyCapabilityRewrites(
-      composeCapabilities(
-        applyCapabilityMappings(step.capabilities, capabilityMappings),
-        routing.modifier,
-      ),
-      capabilityRewrites,
-    );
-    if (offered.length > 0) order.capabilities = offered;
-    const crews: string[] = [];
-    for (const capability of offered) {
-      if (!Object.prototype.hasOwnProperty.call(crewStamps, capability)) continue;
-      for (const crew of crewStamps[capability] ?? []) {
-				if (!crews.includes(crew)) crews.push(crew);
-      }
-    }
-    if (crews.length > 0) order.crews = crews;
+    const context = resolved ?? this.resolveFiring(workflow, def, f, arts, routing.modifier, { revision: 'legacy' });
+    const { capabilities: offered, reroutedFrom, crews } = context;
+    if (offered.length > 0) order.capabilities = [...offered];
+    if (crews.length > 0) order.crews = [...crews];
     // Only when a rewrite actually fired. `reroutedFrom` is absent on every
     // ordinary offer, so its presence alone tells a reader the order is not
     // running on the capability its def asked for.
-    if (reroutedFrom !== undefined) order.reroutedFrom = reroutedFrom;
+    if (reroutedFrom !== undefined) order.reroutedFrom = [...reroutedFrom];
     if (routing.modifier !== undefined) order.modifier = routing.modifier;
     if (routing.escalation !== undefined) order.escalated = true;
     if (step.model !== undefined) order.model = step.model;
@@ -4683,4 +4859,13 @@ function deepEqual(a: unknown, b: unknown): boolean {
   const bKeys = Object.keys(bObj);
   if (aKeys.length !== bKeys.length) return false;
   return aKeys.every((k) => Object.prototype.hasOwnProperty.call(bObj, k) && deepEqual(aObj[k], bObj[k]));
+}
+
+/** Copy at public entry points first; never freeze caller-owned inputs. */
+function immutable<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) immutable(child);
+    Object.freeze(value);
+  }
+  return value;
 }

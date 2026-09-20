@@ -674,10 +674,23 @@ Prefer to **react** instead of poll? `engine.subscribe(listener)` (or
 you can re-`tick` only when there's new work, or resolve a promise when the workflow is
 `done`. See [`examples/events.ts`](examples/events.ts).
 
-The `engine`/`store` pair is meant to be long-lived (one per database). Concurrency is
-the store's job: `node:sqlite` is synchronous and single-writer-per-process, and
-cross-process safety comes from a commit fingerprint check (described under
-[Storage](#how-its-built)). See [`docs/embedding.md`](docs/embedding.md) for the full
+The opt-in native bounded-dispatch API separates readiness from claiming:
+`engine.snapshotReady` performs maintenance and exposes exact eligible firings;
+the caller evaluates preference outside transactions; `engine.claimReady`
+conditionally commits one selected firing per negotiated lane slot. Capability
+resolution is synchronous and shared by eligibility filtering and committed
+Order stamps. Stale advice has no claim effect; fallback requires a separate
+fresh snapshot and bounded attempt. Existing `tick` callers keep their current
+behavior. See [the native protocol and proof contract](docs/routing.md#native-bounded-dispatch-u1).
+
+The `engine`/`store` pair is meant to be long-lived. SQLite `BEGIN IMMEDIATE`
+serializes claim writes across connections and processes sharing the database.
+Native schema 14 stores internal lane capacity and single-use slots tied to real
+run/task lifecycle; release, completion, cancellation, reap and cleanup free
+occupied capacity without reissuing consumed slots, including after restart.
+The signed Order contract is unchanged. These library seams do not implement
+service authorization, willing shift offers or worker final launch enforcement;
+those are the separate U2 handoff. See [Storage](#how-its-built). See [`docs/embedding.md`](docs/embedding.md) for the full
 surface, lifecycle, and trade-offs.
 
 ---

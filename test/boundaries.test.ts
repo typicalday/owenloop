@@ -30,6 +30,7 @@ const SRC_DIR = new URL('../src/', import.meta.url);
 /** Engine core — the host/hub-agnostic heart of the package. */
 const CORE = [
   'engine.ts',
+  'capabilities.ts',
   'model.ts',
   'store.ts',
   'defs.ts',
@@ -140,4 +141,68 @@ test('boundary C: hashDefForHub is gone from src/defs.ts (re-homed into src/hub.
     if (/\bhashDefForHub\b/.test(line)) hits.push(`src/defs.ts:${i + 1}: ${line.trim()}`);
   });
   assert.equal(hits.length, 0, `hashDefForHub must live in src/hub.ts, not core src/defs.ts:\n${hits.join('\n')}`);
+});
+
+
+import { ROUTING_PROOF_CASE_IDS, ROUTING_PROOF_SCHEMA } from '../src/types.ts';
+import type { ClaimReadyResult, ReadyFiring, RoutingProof, SnapshotReadyResult } from '../src/index.ts';
+import { validateValue } from '../src/schema.ts';
+import { createHash } from 'node:crypto';
+
+// Explicitly synthetic schema fixtures. These do not claim a real execution,
+// reviewed ref, launch or passing acceptance case.
+function proofFixture(): RoutingProof {
+  return { schema: 'routing-proof-v1', refs: { engine: 'a'.repeat(40), service: null, worker: null },
+    artifacts: [{ path: 'fixture.json', sha256: createHash('sha256').update('{}').digest('hex') }],
+    cases: ROUTING_PROOF_CASE_IDS.map(id => ({ id, executed: false, assertions: [], join: null })) };
+}
+
+test('routing proof schema freezes case IDs, refs, byte hashes, assertion results and joins', () => {
+  const fixture = proofFixture();
+  assert.equal(validateValue(ROUTING_PROOF_SCHEMA, fixture).valid, true);
+  assert.equal(fixture.artifacts[0]!.sha256, '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a');
+  const executed = { ...fixture, cases: fixture.cases.map((c, i) => i === 0
+    ? { ...c, executed: true, assertions: [{ name: 'fixture assertion', passed: false }],
+      join: { decision: 'fixture-decision', claim: 'fixture-claim', order: 'fixture-order', attempt: 'fixture-attempt' } } : c) };
+  assert.equal(validateValue(ROUTING_PROOF_SCHEMA, executed).valid, true, 'a recorded failure is valid evidence, not a pass');
+  const bad = [
+    { ...fixture, refs: { ...fixture.refs, engine: 'main' } },
+    { ...fixture, artifacts: [{ path: 'fixture.json', sha256: 'unknown' }] },
+    { ...fixture, cases: fixture.cases.slice(1) },
+    { ...fixture, cases: fixture.cases.map(() => fixture.cases[0]) },
+    { ...fixture, cases: fixture.cases.map((c, i) => i === 0 ? { ...c, id: 'invented' } : c) },
+    { ...fixture, cases: fixture.cases.map((c, i) => i === 0 ? { ...c, assertions: [{ name: 'unrun', passed: true }] } : c) },
+    { ...executed, cases: executed.cases.map((c, i) => i === 0 ? { ...c, assertions: [] } : c) },
+    { ...executed, cases: executed.cases.map((c, i) => i === 0 ? { ...c, join: { decision: 'd', claim: 'c', order: 'o' } } : c) },
+  ];
+  for (const value of bad) assert.equal(validateValue(ROUTING_PROOF_SCHEMA, value).valid, false, JSON.stringify(value));
+});
+
+test('native ready identity and outcomes stay exhaustive through the pure public barrel', () => {
+  const exactIdentity = {
+    workflow: 'root', frameId: 'child', DefRef: { bundleDigest: 'a'.repeat(64), workflowName: 'work' },
+    step: 'B', key: '', inputFingerprint: { seed: 2 }, admissionEpoch: 0, executorKind: 'agent',
+    meaningDigest: 'b'.repeat(64), evidenceGeneration: 'c'.repeat(64), stateDigest: 'd'.repeat(64),
+    resolved: { capabilities: ['scoped'], crews: ['crew'], matchModes: { scoped: 'exact' }, revision: 'r1' },
+  } as const satisfies ReadyFiring;
+  function outcome(result: ClaimReadyResult | SnapshotReadyResult): string {
+    switch (result.kind) {
+      case 'claimed': return result.order.run;
+      case 'ready': return result.firings[0]?.frameId ?? 'empty';
+      case 'unverified': return result.frameId;
+      case 'inactive': case 'stale': case 'lane-unavailable': case 'invalid-plan': return result.kind;
+      case 'deferred': return result.reason;
+      default: { const exhaustive: never = result; return exhaustive; }
+    }
+  }
+  assert.equal(outcome({ kind: 'ready', firings: [exactIdentity] }), 'child');
+  for (const kind of ['inactive', 'stale', 'lane-unavailable', 'invalid-plan'] as const) assert.equal(outcome({ kind }), kind);
+  assert.equal(outcome({ kind: 'unverified', frameId: 'child' }), 'child');
+  assert.equal(outcome({ kind: 'deferred', reason: 'workdir-unresolved' }), 'workdir-unresolved');
+  const index = readCore('index.ts').join('\n');
+  for (const name of ['ReadyFiring', 'ClaimReadyResult', 'SnapshotReadyResult', 'ROUTING_PROOF_CASE_IDS', 'ROUTING_PROOF_SCHEMA']) {
+    assert.ok(index.includes(name), `${name} must be exported`);
+  }
+  const order = readCore('types.ts').join('\n').split('export interface Order {')[1]!.split('\n}')[0]!;
+  assert.equal(order.includes('readyClaim'), false, 'internal authority never extends the frozen Order');
 });
