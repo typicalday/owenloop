@@ -2946,6 +2946,89 @@ test('runtime selection: both cross-connection apply/cancel commit orders and re
   reopened.close();
 });
 
+for (const movement of ['generation', 'cancellation'] as const) {
+  test(`runtime selection: forwarded rejection refuses ${movement} movement under the write lock without writes`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'invocation-reject-race-'));
+    const db = join(dir, 'state.sqlite');
+    const f = await runtimeFixture(db);
+    const other = openStore(db);
+    const second = reloadRuntimeEngine(other, f.root).engine;
+    t.after(() => { other.close(); f.store.close(); rmSync(dir, { recursive: true, force: true }); });
+    const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { generation: 1 } } });
+    assert.equal(f.engine.applyChoice(ready(f.engine, workflow, 'one', f.candidates), f.candidates[0]!).kind, 'bound');
+    const old = f.engine.tick(workflow, { deep: true }).orders[0]!;
+    f.engine.green(old.workflow, old.run, 'result', { generation: 1 });
+    f.engine.close(old.workflow, old.run);
+    assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
+
+    let currentChild = old.workflow;
+    const state = () => ({
+      parent: other.getArtifact(workflow, 'one'),
+      oldChild: other.getArtifact(old.workflow, 'result'),
+      currentChild: other.getArtifact(currentChild, 'result'),
+      admission: other.getAdmission(workflow),
+      invocations: other.listInvocations(workflow),
+      children: other.listChildrenByParent(workflow),
+    });
+    let before: ReturnType<typeof state> | undefined;
+    let interleaved = false;
+    const original = f.store.tx.bind(f.store);
+    f.store.tx = (fn) => {
+      if (!interleaved) {
+        interleaved = true;
+        // X has selected generation 1's child but has not acquired BEGIN IMMEDIATE.
+        // Y commits the movement using a separate SQLite connection.
+        if (movement === 'generation') {
+          second.provideInput(workflow, 'seed', { generation: 2 });
+          assert.equal(second.applyChoice(ready(second, workflow, 'one', f.candidates), f.candidates[1]!).kind, 'bound');
+          const next = second.tick(workflow, { deep: true }).orders[0]!;
+          currentChild = next.workflow;
+          assert.notEqual(currentChild, old.workflow);
+          second.green(next.workflow, next.run, 'result', { generation: 2 });
+          second.close(next.workflow, next.run);
+        } else {
+          second.cancelRun(workflow);
+        }
+        before = state();
+        assert.equal(before.parent!.acceptance, 'green');
+        assert.equal(before.currentChild!.acceptance, 'green');
+      }
+      return original(fn);
+    };
+    const changes = f.store.db.prepare('SELECT total_changes() AS n').get()!.n;
+    try {
+      assert.equal(f.engine.reject(workflow, 'one', 'human', 'stale verdict').outcome, 'born-rejected');
+    } finally {
+      f.store.tx = original;
+    }
+    assert.equal(interleaved, true, 'movement happened after child selection, before the write lock');
+    assert.equal(f.store.db.prepare('SELECT total_changes() AS n').get()!.n, changes, 'stale rejection made no SQLite writes');
+    assert.deepEqual(state(), before, 'neither generation nor admission/binding state changed');
+    second.tick(workflow, { deep: true });
+    assert.deepEqual(state(), before, 'a subsequent tick preserves the green current parent and child');
+  });
+}
+
+test('runtime selection: a current forwarded rejection reopens and rebuilds the selected child', async (t) => {
+  const f = await runtimeFixture();
+  t.after(() => f.store.close());
+  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { generation: 1 } } });
+  assert.equal(f.engine.applyChoice(ready(f.engine, workflow, 'one', f.candidates), f.candidates[0]!).kind, 'bound');
+  const order = f.engine.tick(workflow, { deep: true }).orders[0]!;
+  f.engine.green(order.workflow, order.run, 'result', { revision: 1 });
+  f.engine.close(order.workflow, order.run);
+  assert.equal(f.engine.reject(workflow, 'one', 'human', 'revise current result').outcome, 'rejected');
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'owed');
+  assert.equal(f.store.getArtifact(order.workflow, 'result')!.judgmentRejects, 1);
+  const retry = f.engine.tick(workflow, { deep: true }).orders[0]!;
+  assert.equal(retry.workflow, order.workflow);
+  f.engine.green(retry.workflow, retry.run, 'result', { revision: 2 });
+  f.engine.close(retry.workflow, retry.run);
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
+  assert.deepEqual(f.store.getArtifact(workflow, 'one')!.value, { revision: 2 });
+  assert.equal(f.store.listInvocations(workflow).length, 1);
+});
+
 import { collectWorkflowStoreGarbage } from '../src/store/gc.ts';
 import { existsSync } from 'node:fs';
 import { objectDirForDigest, defDigest } from '../src/store/types.ts';

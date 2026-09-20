@@ -3534,7 +3534,14 @@ export class Engine {
     const childDef = this.defFor(child.id);
     const childOutcomeStem = childDef.outputs![0]!;
 
-    this.store.tx(() => {
+    const result = this.store.tx((): { outcome: 'rejected' | 'born-rejected'; reason?: string } => {
+      // Child resolution happens before BEGIN IMMEDIATE. Another connection may
+      // replace the current invocation or revoke admission in that window. Check
+      // both the parent's ancestry/admission and the exact selected child while
+      // holding the write lock, before touching either generation's artifacts.
+      if (!this.invocationCurrent(parentWf) || this.currentCallsChild(parentWf, callsStem)?.id !== child.id) {
+        return { outcome: 'born-rejected', reason: 'historical invocation or canceled run' };
+      }
       const parentArt = this.store.getArtifact(parentWf, callsStem);
       if (!parentArt) throw new Error(`cannot reject unknown artifact: ${callsStem}`);
       if (parentArt.acceptance !== 'green' && parentArt.acceptance !== 'submitted') {
@@ -3580,15 +3587,19 @@ export class Engine {
         ],
       });
       this.settle(parentWf, def);
+      return { outcome: 'rejected' };
     });
-    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject',
+      ...(result.outcome === 'born-rejected' ? { outcome: 'born-rejected' as const } : {}) });
+    // No settle or maintenance writes may follow a stale rejection.
+    if (result.outcome === 'born-rejected') return result;
     this.fireSettled(parentWf);
     // The child's own firings (re-arming its producer with the feedback on
     // its owes thread) need tick(child) — not driven from here; see docs/design.md
     // M2/M2B "sweeping" note. Prompt maintainCalls now so the parent's own
     // state (owed/pin) is visible immediately, mirroring provideInput's cascade.
     this.maintainCalls(parentWf, def);
-    return { outcome: 'rejected' };
+    return result;
   }
 
   /** Retract a collection member (§11.3): drop it, terminally; abandon the index. */
