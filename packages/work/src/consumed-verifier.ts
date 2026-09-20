@@ -70,6 +70,8 @@ export interface VerifiedCallsProducer {
   childDefDigest: string;
   /** The verified child definition's single outcome stem (`outputs[0]`). */
   childOutcome: string;
+  childWorkflow?: string;
+  childVersion?: number;
 }
 
 export interface ConsumedVerifierOptions {
@@ -275,6 +277,9 @@ function callsBoundary(
       },
     };
   }
+  if (producer.childVersion !== undefined && relay.childVersion !== producer.childVersion) {
+    return { kind: 'refused', verdict: { kind: 'invalid', reason: `calls: relay for '${path}' has moved child version` } };
+  }
   return { kind: 'relay', relay, producer };
 }
 
@@ -369,7 +374,7 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
             // consumedFingerprint[path] counts the parent artifact and is a
             // different number; a coincidental match must never be relied on.
             expectedVersion: boundary.relay.childVersion,
-            relay: { childDefDigest: boundary.producer.childDefDigest, childOutcome: boundary.producer.childOutcome },
+            relay: { childDefDigest: boundary.producer.childDefDigest, childOutcome: boundary.producer.childOutcome, ...(boundary.producer.childWorkflow ? { childWorkflow: boundary.producer.childWorkflow } : {}) },
             orgRootPublicKey: rootPublicKey,
             grants,
             revocations,

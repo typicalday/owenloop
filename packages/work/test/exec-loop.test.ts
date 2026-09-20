@@ -2216,3 +2216,98 @@ test('a successful command that printed nothing records the silence', async () =
   );
   assert.deepEqual(errs.filter((l) => l.startsWith('  ')), [], 'silence is a record, not a diagnosis');
 });
+
+import { readdirSync } from 'node:fs';
+import { runtimeFixture, ready } from '../../../test/helpers/runtime-selection.ts';
+import { createDefaultStoreInstructionResolver } from '../src/exec/instructions.ts';
+import { createBundleIngestor } from '../../../src/store/index.ts';
+import type { InvocationBindingSource } from '../../../src/types.ts';
+
+for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable', 'omitted'] as const) {
+  test(`invocation pre-launch ${movement}: default factory reads real Store/CAS after payload preparation`, async (t) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'owenloop-default-launch-'));
+    const f = await runtimeFixture(':memory:', join(cwd, 'workflows'));
+    const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { v: 1 } } });
+    for (const [i, path] of ['one', 'two'].entries()) {
+      assert.equal(f.engine.applyChoice(ready(f.engine, workflow, path, f.candidates), f.candidates[i]!).kind, 'bound');
+    }
+    for (const o of f.engine.tick(workflow, { deep: true }).orders) {
+      f.engine.green(o.workflow, o.run, 'result', { text: 'x'.repeat(CONSUMES_INLINE_MAX_BYTES) });
+      f.engine.close(o.workflow, o.run);
+    }
+    const o = f.engine.tick(workflow, { deep: true }).orders[0]!;
+    const base = commandOrder({ reasons: [{ at: 0, action: 'reject', kind: 'judgment', by: 'human',
+      text: 'f'.repeat(CONSUMES_INLINE_MAX_BYTES) }] });
+    const response: GetOrderResponse = { ...base, workflow, run: o.run, order: {
+      ...base.order!, workflow, run: o.run, step: 'finish', defDigest: f.store.getWorkflow(workflow)!.defSnapshot!.bundleDigest!,
+      consumes: o.consumes, consumedFingerprint: o.consumedFingerprint,
+    } };
+    const source = f.engine.invocationBindingSource();
+    let readCount = 0;
+    const ambientTempRoot = tmpdir();
+    let unrelatedPayloadDir: string | undefined;
+    t.after(() => {
+      if (unrelatedPayloadDir) rmSync(unrelatedPayloadDir, { recursive: true, force: true });
+    });
+    // node:test runs these cases serially in this file's isolated process;
+    // other test files retain their own environment and run in parallel.
+    const launchTempRoot = mkdtempSync(join(cwd, 'launch-temp-'));
+    const tempVariables = ['TMPDIR', 'TMP', 'TEMP'] as const;
+    const savedTemp = tempVariables.map(name => [name, process.env[name]] as const);
+    t.after(() => {
+      for (const [name, value] of savedTemp) {
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+      }
+      rmSync(launchTempRoot, { recursive: true, force: true });
+    });
+    for (const name of tempVariables) process.env[name] = launchTempRoot;
+    assert.equal(tmpdir(), launchTempRoot);
+    const preparedDirs: string[] = [];
+    const trusted: InvocationBindingSource = { read: async key => {
+      readCount++;
+      // Reproduce another test process creating a similarly named directory
+      // during resolution. Its files are outside this invocation's ownership.
+      if (readCount === 1) unrelatedPayloadDir = mkdtempSync(join(ambientTempRoot, 'owenloop-payload-test-'));
+      // Initial resolution reads two receipts. The third read must occur only
+      // after consumes/feedback/payload preparation and immediately before start.
+      if (readCount === 3) {
+	preparedDirs.push(...readdirSync(launchTempRoot).map(n => join(launchTempRoot, n)));
+        assert.equal(preparedDirs.length, 3, 'all three payload directories exist before revalidation');
+        if (movement === 'admission') f.engine.cancelRun(workflow);
+        if (movement === 'receipt') {
+          const a = f.store.getArtifact(workflow, 'one')!;
+          f.store.tx(() => f.store.putArtifact({ ...a, version: a.version + 1 }));
+        }
+        if (movement === 'missing') return undefined;
+        if (movement === 'throw') throw new Error('binding reader unavailable');
+      }
+      return source.read(key);
+    } };
+    const instructions = createDefaultStoreInstructionResolver({ cwd, env: { HOME: cwd }, verifier: createBundleIngestor(),
+      definitionVerifier: () => ({ kind: 'verified', publisherKeyId: 'fixture', principal: 'fixture' }),
+      // Cryptographic relay corroboration is independently exercised in
+      // exec-consumed-calls-relay; this test isolates the real launch window.
+      consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+      ...(movement === 'omitted' ? {} : { invocationBindingSource: trusted }),
+    });
+    const fr = fakeRunner();
+    fr.resolve(result(0));
+    const { hub, calls, submits } = mockHub({ getOrder: [response], submit: ['green'] });
+    const loop = createExecLoop(baseOpts(hub, fr.runner, { workflow, run: o.run, instructions }));
+    const outcome = await loop.run();
+    if (movement === 'stable') {
+      assert.equal(outcome, 'submitted'); assert.equal(fr.starts.length, 1); assert.equal(submits.length, 1);
+    } else {
+      assert.equal(outcome, 'unresolved-instructions'); assert.equal(fr.starts.length, 0); assert.equal(submits.length, 0);
+      assert.equal(only(calls, 'release').length, 1); assert.equal(only(calls, 'ask').length, 0);
+    }
+    if (movement === 'omitted') assert.equal(readCount, 0);
+    else assert.ok(readCount >= 3);
+    assert.equal(preparedDirs.length, movement === 'omitted' ? 0 : 3);
+    for (const dir of preparedDirs) assert.equal(existsSync(dir), false, `${dir} was cleaned`);
+    assert.deepEqual(readdirSync(launchTempRoot), [], 'all invocation payload directories were removed');
+    if (unrelatedPayloadDir) assert.equal(existsSync(unrelatedPayloadDir), true, 'unrelated fixture remains untouched');
+    f.store.close();
+  });
+}

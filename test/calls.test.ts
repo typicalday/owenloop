@@ -1,3 +1,4 @@
+import { DatabaseSync } from 'node:sqlite';
 /**
  * PR5b — Mode 2 `calls:` runtime integration tests.
  *
@@ -2594,4 +2595,575 @@ test('calls: B2 — a schema refusal recorded after a concurrent valid gate adva
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Runtime-selection proof is deliberately part of the ordinary test suite.
+import { createHash } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { createEngine } from '../src/factory.ts';
+import { loadCasDefs } from '../src/store/def-source.ts';
+import { installBundleFixture, writeBundleSource } from './helpers/store-fixture.ts';
+import { modelCheck } from '../src/model.ts';
+import type { DecisionSnapshot, InvocationCandidate } from '../src/types.ts';
+
+import { runtimeFixture, ready } from './helpers/runtime-selection.ts';
+
+test('runtime selection: durable real CAS two-site demo, replay, restart, invalidation and cancel', async () => {
+  const proof = join(process.cwd(), '.owenloop/proofs/runtime-selection');
+  mkdirSync(proof, { recursive: true });
+  const db = join(proof, 'state.sqlite');
+  for (const suffix of ['', '-wal', '-shm']) rmSync(db + suffix, { force: true });
+  const f = await runtimeFixture(db);
+  let engine = f.engine, store = f.store;
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { revision: 1 } } });
+  assert.equal(engine.status(workflow).invocations?.one?.kind, 'unresolved');
+  assert.equal(engine.tick(workflow, { deep: true }).orders.length, 0);
+  const report = modelCheck(f.defs.get('parent/parent@1.0.0')!, { assumeProvided: true });
+  assert.equal(report.completable, false);
+  assert.equal(report.deadlocks.length, 0);
+  assert.ok(report.externalSelectionWait?.length);
+  const one = ready(engine, workflow, 'one', f.candidates);
+  const two = ready(engine, workflow, 'two', f.candidates);
+  assert.deepEqual(one.candidates.map(c => c.assessment.kind), ['eligible', 'eligible'], JSON.stringify(one.candidates));
+  assert.equal(engine.applyChoice(one, f.candidates[0]!).kind, 'bound');
+  assert.equal(engine.applyChoice(one, f.candidates[0]!).kind, 'replayed');
+  assert.equal(engine.applyChoice(one, f.candidates[1]!).kind, 'divergent-race');
+  assert.equal(engine.applyChoice(two, f.candidates[1]!).kind, 'bound');
+  assert.equal(store.listChildrenByParent(workflow).length, 0, 'binding commit precedes spawning');
+  assert.equal(store.listInvocations(workflow).length, 2);
+  store.close();
+  ({ engine, store } = createEngine({ db, defs: f.defs }));
+  const orders = engine.tick(workflow, { deep: true }).orders;
+  assert.equal(orders.length, 2);
+  assert.equal(new Set(orders.map(o => store.getWorkflow(o.workflow)!.def)).size, 2);
+  for (const order of orders) {
+    assert.equal(engine.green(order.workflow, order.run, 'result', { selected: store.getWorkflow(order.workflow)!.def }).outcome, 'green');
+    engine.close(order.workflow, order.run, 'ok');
+  }
+  const finish = engine.tick(workflow, { deep: true }).orders[0]!;
+  assert.equal(finish.step, 'finish');
+  engine.green(workflow, finish.run, 'done', { complete: true });
+  engine.close(workflow, finish.run, 'ok');
+  assert.equal(engine.status(workflow).done, true);
+  const firstChildren = store.listChildrenByParent(workflow).map(c => c.id);
+  engine.provideInput(workflow, 'seed', { revision: 2 });
+  assert.equal(engine.status(workflow).invocations?.one?.kind, 'stale');
+  for (const child of firstChildren) assert.equal(engine.tick(child, { deep: true }).orders.length, 0);
+  assert.equal(engine.applyChoice(one, f.candidates[0]!).kind, 'stale-evidence');
+  const next = ready(engine, workflow, 'one', f.candidates);
+  assert.equal(engine.applyChoice(next, f.candidates[1]!).kind, 'bound');
+  const beforeCancel = store.listInvocations(workflow).length;
+  const canceled = engine.cancelRun(workflow);
+  assert.equal(canceled.admission?.epoch, 1);
+  assert.equal(engine.cancelRun(workflow).admission?.epoch, 1);
+  assert.equal(engine.applyChoice(next, f.candidates[1]!).kind, 'canceled');
+  assert.equal(store.listInvocations(workflow).length, beforeCancel);
+  assert.equal(engine.tick(workflow, { deep: true }).orders.length, 0);
+  const inherited = await exerciseInherited({ ...f, engine, store });
+  const cancelOrders = exerciseCancelOrders({ ...f, engine, store }, db);
+  const totalInvocationCount = Number(store.db.prepare('SELECT count(*) AS n FROM call_invocation').get()!.n);
+  store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  store.close();
+  const sqliteSha256 = createHash('sha256').update(readFileSync(db)).digest('hex');
+  writeFileSync(join(proof, 'receipt.json'), JSON.stringify({ ok: true, sqliteSha256, workflow,
+    assertions: ['two compatible exact choices', 'binding before spawn', 'idempotent replay', 'divergent refusal',
+      'restart', 'actual green-done', 'input invalidation', 'historical child suppression', 'durable cancellation',
+      'both cross-connection cancel/apply orders', 'inherited missing/wiring no-write refusals', 'fresh inherited recheck', 'inherited legacy completion'],
+    firstChildren, rootInvocationCount: beforeCancel, totalInvocationCount, inherited, cancelOrders }, null, 2) + '\n');
+  const receipt = JSON.parse(readFileSync(join(proof, 'receipt.json'), 'utf8'));
+  assert.equal(receipt.sqliteSha256, createHash('sha256').update(readFileSync(db)).digest('hex'));
+  const retained = new DatabaseSync(db, { readOnly: true });
+  assert.equal(Number(retained.prepare('SELECT count(*) AS n FROM call_invocation').get()!.n), receipt.totalInvocationCount);
+  assert.equal(retained.prepare('SELECT acceptance FROM artifact WHERE workflow = ? AND path = ?').get(inherited.successfulRoot, 'one')!.acceptance, 'green');
+  retained.close();
+});
+
+import { reloadRuntimeEngine } from './helpers/runtime-selection.ts';
+import { valueDigestHex } from '../src/crypto/canonical.ts';
+import { candidateSetDigest, validSnapshot } from '../src/invocation.ts';
+import { readRuntimeSnapshotBundlePins } from '../src/store.ts';
+
+test('runtime selection: exhaustive snapshot/refusal precedence, fresh policy and no-write failures', async () => {
+  const f = await runtimeFixture();
+  const { engine, store, candidates } = f;
+  assert.equal(engine.decisionSnapshot('missing', 'one', null).kind, 'workflow-missing');
+  const workflow = engine.createInstance('parent/parent@1.0.0');
+  assert.equal(engine.decisionSnapshot(workflow, 'absent', null).kind, 'call-missing');
+  assert.equal(engine.decisionSnapshot(workflow, 'done', null).kind, 'not-invocation-call');
+  assert.deepEqual(engine.decisionSnapshot(workflow, 'one', null), { kind: 'evidence-not-ready', paths: ['seed'] });
+  const saved = store.getWorkflow(workflow)!.defSnapshot!;
+  store.db.prepare('UPDATE workflow SET def_snapshot = NULL WHERE id = ?').run(workflow);
+  assert.equal(engine.decisionSnapshot(workflow, 'one', []).kind, 'parent-unverified');
+  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?').run(JSON.stringify(saved), workflow);
+  store.db.prepare('DELETE FROM run_admission WHERE root_workflow = ?').run(workflow);
+  assert.equal(engine.decisionSnapshot(workflow, 'one', []).kind, 'admission-unmanaged');
+  store.insertAdmission(workflow);
+  engine.provideInput(workflow, 'seed', { n: 1 });
+  for (const [bad, code] of [[null, 'not-array'], [[null], 'not-object'], [[candidates[0], candidates[0]], 'duplicate']] as const) {
+    assert.deepEqual(engine.decisionSnapshot(workflow, 'one', bad), { kind: 'invalid-candidate-set', code });
+  }
+  const empty = ready(engine, workflow, 'one', []);
+  assert.equal(empty.candidates.length, 0);
+  const s = ready(engine, workflow, 'one', candidates);
+  const noWrite = (kind: string, snapshot = s, selected = candidates[0]!) => {
+    const before = { bindings: store.listInvocations(workflow), children: store.listChildrenByParent(workflow) };
+    const result = engine.applyChoice(snapshot, selected);
+    assert.equal(result.kind, kind, JSON.stringify(result));
+    assert.deepEqual({ bindings: store.listInvocations(workflow), children: store.listChildrenByParent(workflow) }, before);
+  };
+  noWrite('invalid-decision', { ...s, policyDigest: 'f'.repeat(64) });
+  noWrite('candidate-missing', empty);
+  const malformed = ready(engine, workflow, 'one', [{ target: 'not-exact', DefRef: candidates[0]!.DefRef }]);
+  assert.deepEqual(malformed.candidates[0]!.assessment, { kind: 'invalid', code: 'malformed-ref' });
+  for (const [candidate, code] of [
+    [{ target: 'absent/absent@1.0.0', DefRef: candidates[0]!.DefRef }, 'unresolved'],
+    [{ ...candidates[0]!, DefRef: { ...candidates[0]!.DefRef, bundleDigest: 'f'.repeat(64) } }, 'digest-mismatch'],
+    [{ ...candidates[0]!, DefRef: { ...candidates[0]!.DefRef, workflowName: 'wrong' } }, 'name-mismatch'],
+  ] as const) {
+    const snapshot = ready(engine, workflow, 'one', [candidate]);
+    assert.deepEqual(snapshot.candidates[0]!.assessment, { kind: 'invalid', code });
+    noWrite('candidate-invalid', snapshot, candidate);
+  }
+  store.db.prepare('DELETE FROM run_admission WHERE root_workflow = ?').run(workflow);
+  noWrite('admission-unmanaged');
+  store.insertAdmission(workflow);
+  const altered = structuredClone(saved);
+  altered.bundleDigest = 'a'.repeat(64);
+  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?').run(JSON.stringify(altered), workflow);
+  noWrite('stale-parent');
+  const alteredPolicy = structuredClone(saved);
+  const policyCall = alteredPolicy.steps[0]!.callsInterface!;
+  if (policyCall.selection !== 'invocation') throw new Error('expected invocation');
+  policyCall.policy.config = { moved: true };
+  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?').run(JSON.stringify(alteredPolicy), workflow);
+  noWrite('stale-policy');
+  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?').run(JSON.stringify(saved), workflow);
+  engine.provideInput(workflow, 'seed', { n: 2 });
+  noWrite('stale-evidence');
+  const fresh = ready(engine, workflow, 'one', candidates);
+  const depthEngine = reloadRuntimeEngine(store, f.root, 0).engine;
+  assert.equal(depthEngine.applyChoice(fresh, candidates[0]!).kind, 'depth-exceeded');
+  assert.equal(engine.applyChoice(fresh, candidates[0]!).kind, 'bound');
+  assert.equal(engine.decisionSnapshot(workflow, 'one', null).kind, 'already-bound');
+  engine.cancelRun(workflow);
+  assert.equal(engine.decisionSnapshot(workflow, 'one', null).kind, 'canceled');
+  noWrite('canceled', fresh);
+  store.close();
+});
+
+async function exerciseInherited(f: Awaited<ReturnType<typeof runtimeFixture>>) {
+  const legacySource = writeBundleSource({ name: 'legacy', workflow: `name: legacy
+x: {implements: [{name: legacy, version: '1'}]}
+inputs: [{name: data, seedOwed: true, schema: true}]
+steps:
+  - name: work
+    consumes: [data]
+    produces: [{name: result, schema: true}]
+    terminal: true
+outputs: [result]
+` });
+  const legacy = await installBundleFixture({ root: f.root, sourceDir: legacySource });
+  const candidates: InvocationCandidate[] = [];
+  for (const [name, mapped] of [['nested', 'data'], ['miswired', 'wrong']] as const) {
+    const installed = await installBundleFixture({ root: f.root, sourceDir: writeBundleSource({ name, workflow: `name: ${name}
+x: {implements: [{name: report, version: '1'}]}
+inputs: [{name: data, seedOwed: true, schema: true}]
+steps:
+  - name: inner
+    callsInterface: {name: legacy, version: '1'}
+    inputs: {${mapped}: data}
+    produces: [{name: result, schema: true}]
+outputs: [result]
+` }) });
+    candidates.push({ target: `${name}/${name}@1.0.0`, DefRef: { bundleDigest: installed.result.digest, workflowName: name } });
+  }
+  const { engine } = reloadRuntimeEngine(f.store, f.root);
+  const binding: InterfaceCallBinding = { interface: { name: 'legacy', version: '1' }, target: 'legacy/legacy@1.0.0',
+    digest: legacy.result.digest, signature: { inputs: [{ name: 'data', schema: true }], outputs: [{ name: 'result', schema: true }] } };
+  const missing = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const m = ready(engine, missing, 'one', candidates);
+  assert.deepEqual(m.candidates.map(c => c.assessment), candidates.map(() => ({ kind: 'ineligible', code: 'legacy-binding-missing' })));
+  assert.deepEqual(engine.applyChoice(m, candidates[0]!), { kind: 'candidate-ineligible', selected: candidates[0], code: 'legacy-binding-missing' });
+  assert.equal(f.store.listInvocations(missing).length, 0); assert.equal(f.store.listChildrenByParent(missing).length, 0);
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } }, interfaceBindings: [binding] });
+  const s = ready(engine, workflow, 'one', candidates);
+  assert.deepEqual(s.candidates.map(c => c.assessment), [{ kind: 'eligible' }, { kind: 'ineligible', code: 'legacy-binding-wiring' }]);
+  assert.deepEqual(engine.applyChoice(s, candidates[1]!), { kind: 'candidate-ineligible', selected: candidates[1], code: 'legacy-binding-wiring' });
+  assert.equal(f.store.listInvocations(workflow).length, 0); assert.equal(f.store.listChildrenByParent(workflow).length, 0);
+  // Controlled interleave: SQLite mutation is test-only. There is intentionally
+  // no engine API for replacing an instance's inherited immutable bindings.
+  const tx = f.store.txWithWorkflowSnapshots.bind(f.store);
+  let moved = false;
+  f.store.txWithWorkflowSnapshots = (defs, fn, revalidate) => {
+    if (!moved) { moved = true; f.store.db.prepare('UPDATE workflow SET interface_bindings = NULL WHERE id = ?').run(workflow); }
+    return tx(defs, fn, revalidate);
+  };
+  assert.deepEqual(engine.applyChoice(s, candidates[0]!), { kind: 'candidate-ineligible', selected: candidates[0], code: 'legacy-binding-missing' });
+  assert.equal(f.store.listInvocations(workflow).length, 0); assert.equal(f.store.listChildrenByParent(workflow).length, 0);
+  f.store.txWithWorkflowSnapshots = tx;
+  f.store.db.prepare('UPDATE workflow SET interface_bindings = ? WHERE id = ?').run(JSON.stringify([binding]), workflow);
+  assert.equal(engine.applyChoice(s, candidates[0]!).kind, 'bound');
+  f.store.db.prepare('UPDATE workflow SET interface_bindings = NULL WHERE id = ?').run(workflow);
+  assert.equal(engine.tick(workflow, { deep: true }).orders.length, 0);
+  assert.equal(f.store.listChildrenByParent(workflow).length, 0, 'provision repeats inherited eligibility');
+  f.store.db.prepare('UPDATE workflow SET interface_bindings = ? WHERE id = ?').run(JSON.stringify([binding]), workflow);
+  const order = engine.tick(workflow, { deep: true }).orders[0]!;
+  assert.equal(f.store.getWorkflow(order.workflow)!.def, 'legacy/legacy@1.0.0');
+  const selectedChild = f.store.listChildrenByParent(workflow)[0]!;
+  assert.deepEqual(selectedChild.interfaceBindings, [binding]);
+  engine.green(order.workflow, order.run, 'result', { actual: 'legacy completed' });
+  engine.close(order.workflow, order.run);
+  engine.tick(workflow, { deep: true });
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
+  assert.deepEqual(f.store.getArtifact(workflow, 'one')!.value, { actual: 'legacy completed' });
+  return { missingRoot: missing, successfulRoot: workflow, selectedChild: selectedChild.id };
+}
+
+test('runtime selection: inherited legacy prerequisites at snapshot, fresh apply and provision', async () => {
+  const f = await runtimeFixture();
+  try { await exerciseInherited(f); } finally { f.store.close(); }
+});
+
+test('runtime selection: exact CAS structural refusals and ancestry cycle leave SQLite unchanged', async () => {
+  const f = await runtimeFixture();
+  const variants = [
+    { name: 'nominal', claim: '{}', data: 'data', outputs: '[result]', inputSchema: 'true', code: 'implements' },
+    { name: 'wire', claim: '{implements: [{name: report, version: "1"}]}', data: 'other', outputs: '[result]', inputSchema: 'true', code: 'wiring' },
+    { name: 'output', claim: '{implements: [{name: report, version: "1"}]}', data: 'data', outputs: '[result, extra]', inputSchema: 'true', code: 'output' },
+    { name: 'signature', claim: '{implements: [{name: report, version: "1"}]}', data: 'data', outputs: '[result]', inputSchema: '{type: string}', code: 'signature' },
+  ];
+  const choices: InvocationCandidate[] = [];
+  for (const v of variants) {
+    const installed = await installBundleFixture({ root: f.root, sourceDir: writeBundleSource({ name: v.name, workflow: `name: ${v.name}
+x: ${v.claim}
+inputs: [{name: ${v.data}, seedOwed: true, schema: ${v.inputSchema}}]
+steps:
+  - name: work
+    consumes: [${v.data}]
+    produces: [{name: result, schema: true}${v.code === 'output' ? ', {name: extra, schema: true}' : ''}]
+    terminal: true
+outputs: ${v.outputs}
+` }) });
+    choices.push({ target: `${v.name}/${v.name}@1.0.0`, DefRef: { bundleDigest: installed.result.digest, workflowName: v.name } });
+  }
+  const self = await installBundleFixture({ root: f.root, sourceDir: writeBundleSource({ name: 'self', workflow: `name: self
+x: {implements: [{name: report, version: '1'}]}
+inputs: [{name: data, seedOwed: true, schema: true}]
+steps:
+  - name: recurse
+    callsInterface:
+      name: report
+      version: '1'
+      selection: invocation
+      signature: {inputs: [{name: data, schema: true}], outputs: [{name: result, schema: true}]}
+      policy: {name: local, version: '1', config: {}}
+    inputs: {data: data}
+    produces: [{name: result, schema: true}]
+outputs: [result]
+` }) });
+  const { engine } = reloadRuntimeEngine(f.store, f.root);
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { v: 1 } } });
+  const s = ready(engine, workflow, 'one', choices);
+  for (const [i, c] of choices.entries()) {
+    assert.deepEqual(s.candidates[i]!.assessment, { kind: 'ineligible', code: variants[i]!.code });
+    const changes = f.store.db.prepare('SELECT total_changes() AS n').get()!.n;
+    assert.deepEqual(engine.applyChoice(s, c), { kind: 'candidate-ineligible', selected: c, code: variants[i]!.code });
+    assert.equal(f.store.db.prepare('SELECT total_changes() AS n').get()!.n, changes);
+  }
+  const own = engine.createInstance('self/self@1.0.0', { provide: { data: { v: 1 } } });
+  const candidate = { target: 'self/self@1.0.0', DefRef: { bundleDigest: self.result.digest, workflowName: 'self' } };
+  const snap = ready(engine, own, 'result', [candidate]);
+  assert.equal(snap.candidates[0]!.assessment.kind, 'eligible');
+  assert.equal(engine.applyChoice(snap, candidate).kind, 'cycle-detected');
+  assert.equal(f.store.listInvocations(own).length, 0);
+  f.store.close();
+});
+
+test('runtime selection: immutable/corrupt rows, migration admission, unique children and cascade cleanup', async () => {
+  const f = await runtimeFixture();
+  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { v: 1 } } });
+  const s = ready(f.engine, workflow, 'one', f.candidates);
+  const result = f.engine.applyChoice(s, f.candidates[0]!);
+  assert.equal(result.kind, 'bound');
+  if (result.kind !== 'bound') throw new Error('expected binding');
+  assert.throws(() => f.store.db.prepare('UPDATE call_invocation SET body = body WHERE id = ?').run(result.binding.id), /immutable/);
+  assert.throws(() => f.store.db.prepare('DELETE FROM call_invocation WHERE id = ?').run(result.binding.id), /append-only/);
+  f.engine.tick(workflow, { deep: true });
+  const child = f.store.findChildByInvocation(result.binding.id)!;
+  assert.throws(() => f.store.insertWorkflow('duplicate', { def: child.def, defSnapshot: child.defSnapshot }, child.producedBy, result.binding.id), /UNIQUE/);
+  assert.throws(() => f.store.insertWorkflow('wrong-parent', { def: child.def }, { parentWf: workflow, parentPath: 'two' }, result.binding.id), /linkage/);
+  f.store.db.exec('DROP TRIGGER call_invocation_immutable');
+  f.store.db.prepare('UPDATE call_invocation SET body = ? WHERE id = ?').run('{}', result.binding.id);
+  assert.throws(() => f.store.getInvocation(result.binding.id), /corrupt call_invocation/);
+  f.store.db.prepare('UPDATE call_invocation SET body = ? WHERE id = ?').run(JSON.stringify(result.binding), result.binding.id);
+  f.store.tx(() => f.store.deleteWorkflowCascade(workflow));
+  assert.equal(f.store.getWorkflow(child.id), undefined);
+  assert.equal(f.store.getAdmission(workflow), undefined);
+  assert.equal(f.store.getInvocation(result.binding.id), undefined);
+  const parentDef = f.defs.get('parent/parent@1.0.0')!;
+  const legacy = f.store.txWithWorkflowSnapshots(parentDef, () => f.store.insertWorkflow('unmanaged', { def: 'parent', defSnapshot: parentDef }));
+  assert.equal(f.store.getAdmission(legacy.id), undefined, 'low-level legacy rows never invent admission');
+  f.store.close();
+});
+
+function exerciseCancelOrders(f: Awaited<ReturnType<typeof runtimeFixture>>, db: string) {
+  const other = openStore(db);
+  const second = reloadRuntimeEngine(other, f.root).engine;
+  try {
+    const firstRoot = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { order: 'cancel-first' } } });
+    const first = ready(f.engine, firstRoot, 'one', f.candidates);
+    const original = f.store.txWithWorkflowSnapshots.bind(f.store);
+    let interleaved = false;
+    f.store.txWithWorkflowSnapshots = (defs, fn, revalidate) => {
+      if (!interleaved) { interleaved = true; second.cancelRun(firstRoot); }
+      return original(defs, fn, revalidate);
+    };
+    try { assert.equal(f.engine.applyChoice(first, f.candidates[0]!).kind, 'canceled'); }
+    finally { f.store.txWithWorkflowSnapshots = original; }
+    assert.equal(other.listInvocations(firstRoot).length, 0);
+    assert.equal(other.listChildrenByParent(firstRoot).length, 0);
+    const secondRoot = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { order: 'apply-first' } } });
+    const next = ready(f.engine, secondRoot, 'one', f.candidates);
+    assert.equal(f.engine.applyChoice(next, f.candidates[0]!).kind, 'bound');
+    assert.equal(second.applyChoice(next, f.candidates[0]!).kind, 'replayed');
+    assert.equal(second.applyChoice(next, f.candidates[1]!).kind, 'divergent-race');
+    second.cancelRun(secondRoot);
+    assert.equal(f.engine.applyChoice(next, f.candidates[0]!).kind, 'canceled');
+    assert.equal(f.engine.tick(secondRoot, { deep: true }).orders.length, 0);
+    assert.equal(other.listInvocations(secondRoot).length, 1);
+    assert.equal(other.listChildrenByParent(secondRoot).length, 0);
+    return { cancelFirst: firstRoot, applyFirst: secondRoot, epochs: [other.getAdmission(firstRoot)!.epoch, other.getAdmission(secondRoot)!.epoch] };
+  } finally { other.close(); }
+}
+
+test('runtime selection: both cross-connection apply/cancel commit orders and restart', async () => {
+  const db = join(mkdtempSync(join(tmpdir(), 'invocation-races-')), 'state.sqlite');
+  const f = await runtimeFixture(db);
+  const roots = exerciseCancelOrders(f, db);
+  f.store.close();
+  const reopened = openStore(db);
+  for (const root of [roots.cancelFirst, roots.applyFirst]) assert.deepEqual(reopened.getAdmission(root), { rootWorkflow: root, epoch: 1, active: false });
+  reopened.close();
+});
+
+for (const movement of ['generation', 'cancellation'] as const) {
+  test(`runtime selection: forwarded rejection refuses ${movement} movement under the write lock without writes`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'invocation-reject-race-'));
+    const db = join(dir, 'state.sqlite');
+    const f = await runtimeFixture(db);
+    const other = openStore(db);
+    const second = reloadRuntimeEngine(other, f.root).engine;
+    t.after(() => { other.close(); f.store.close(); rmSync(dir, { recursive: true, force: true }); });
+    const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { generation: 1 } } });
+    assert.equal(f.engine.applyChoice(ready(f.engine, workflow, 'one', f.candidates), f.candidates[0]!).kind, 'bound');
+    const old = f.engine.tick(workflow, { deep: true }).orders[0]!;
+    f.engine.green(old.workflow, old.run, 'result', { generation: 1 });
+    f.engine.close(old.workflow, old.run);
+    assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
+
+    let currentChild = old.workflow;
+    const state = () => ({
+      parent: other.getArtifact(workflow, 'one'),
+      oldChild: other.getArtifact(old.workflow, 'result'),
+      currentChild: other.getArtifact(currentChild, 'result'),
+      admission: other.getAdmission(workflow),
+      invocations: other.listInvocations(workflow),
+      children: other.listChildrenByParent(workflow),
+    });
+    let before: ReturnType<typeof state> | undefined;
+    let interleaved = false;
+    const original = f.store.tx.bind(f.store);
+    f.store.tx = (fn) => {
+      if (!interleaved) {
+        interleaved = true;
+        // X has selected generation 1's child but has not acquired BEGIN IMMEDIATE.
+        // Y commits the movement using a separate SQLite connection.
+        if (movement === 'generation') {
+          second.provideInput(workflow, 'seed', { generation: 2 });
+          assert.equal(second.applyChoice(ready(second, workflow, 'one', f.candidates), f.candidates[1]!).kind, 'bound');
+          const next = second.tick(workflow, { deep: true }).orders[0]!;
+          currentChild = next.workflow;
+          assert.notEqual(currentChild, old.workflow);
+          second.green(next.workflow, next.run, 'result', { generation: 2 });
+          second.close(next.workflow, next.run);
+        } else {
+          second.cancelRun(workflow);
+        }
+        before = state();
+        assert.equal(before.parent!.acceptance, 'green');
+        assert.equal(before.currentChild!.acceptance, 'green');
+      }
+      return original(fn);
+    };
+    const changes = f.store.db.prepare('SELECT total_changes() AS n').get()!.n;
+    try {
+      assert.equal(f.engine.reject(workflow, 'one', 'human', 'stale verdict').outcome, 'born-rejected');
+    } finally {
+      f.store.tx = original;
+    }
+    assert.equal(interleaved, true, 'movement happened after child selection, before the write lock');
+    assert.equal(f.store.db.prepare('SELECT total_changes() AS n').get()!.n, changes, 'stale rejection made no SQLite writes');
+    assert.deepEqual(state(), before, 'neither generation nor admission/binding state changed');
+    second.tick(workflow, { deep: true });
+    assert.deepEqual(state(), before, 'a subsequent tick preserves the green current parent and child');
+  });
+}
+
+test('runtime selection: a current forwarded rejection reopens and rebuilds the selected child', async (t) => {
+  const f = await runtimeFixture();
+  t.after(() => f.store.close());
+  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { generation: 1 } } });
+  assert.equal(f.engine.applyChoice(ready(f.engine, workflow, 'one', f.candidates), f.candidates[0]!).kind, 'bound');
+  const order = f.engine.tick(workflow, { deep: true }).orders[0]!;
+  f.engine.green(order.workflow, order.run, 'result', { revision: 1 });
+  f.engine.close(order.workflow, order.run);
+  assert.equal(f.engine.reject(workflow, 'one', 'human', 'revise current result').outcome, 'rejected');
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'owed');
+  assert.equal(f.store.getArtifact(order.workflow, 'result')!.judgmentRejects, 1);
+  const retry = f.engine.tick(workflow, { deep: true }).orders[0]!;
+  assert.equal(retry.workflow, order.workflow);
+  f.engine.green(retry.workflow, retry.run, 'result', { revision: 2 });
+  f.engine.close(retry.workflow, retry.run);
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
+  assert.deepEqual(f.store.getArtifact(workflow, 'one')!.value, { revision: 2 });
+  assert.equal(f.store.listInvocations(workflow).length, 1);
+});
+
+import { collectWorkflowStoreGarbage } from '../src/store/gc.ts';
+import { existsSync } from 'node:fs';
+import { objectDirForDigest, defDigest } from '../src/store/types.ts';
+
+test('runtime selection: committed binding retains exact CAS bytes through GC before child exists', async () => {
+  const db = join(mkdtempSync(join(tmpdir(), 'invocation-gc-')), 'state.sqlite');
+  const f = await runtimeFixture(db);
+  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const selected = f.candidates[0]!;
+  const s = ready(f.engine, workflow, 'one', f.candidates);
+  assert.equal(f.engine.applyChoice(s, selected).kind, 'bound');
+  assert.equal(f.store.listChildrenByParent(workflow).length, 0);
+  const oldDef = f.defs.get(selected.target)!;
+  await installBundleFixture({ root: f.root, sourceDir: writeBundleSource({ name: 'left', version: '2.0.0', workflow: readFileSync(oldDef.dir!, 'utf8') }) });
+  const args = { projectRoot: f.root, globalRoot: f.root, level: 'project' as const, keep: 1,
+    readSnapshotPins: () => readRuntimeSnapshotBundlePins(db) };
+  const baseline = await collectWorkflowStoreGarbage({ ...args, yes: false, readSnapshotPins: () => [] });
+  assert.ok(baseline.coordinates.includes(selected.target), 'without a binding pin GC would collect the old version');
+  assert.ok(readRuntimeSnapshotBundlePins(db).some(p => p.bundleDigest === selected.DefRef.bundleDigest));
+  const applied = await collectWorkflowStoreGarbage({ ...args, yes: true });
+  assert.equal(applied.coordinates.includes(selected.target), false);
+  assert.equal(existsSync(objectDirForDigest(f.root, defDigest(selected.DefRef.bundleDigest))), true);
+  f.engine.tick(workflow, { deep: true });
+  assert.equal(f.store.listChildrenByParent(workflow).length, 1);
+  f.store.tx(() => f.store.deleteWorkflowCascade(workflow));
+  const collected = await collectWorkflowStoreGarbage({ ...args, yes: true });
+  assert.ok(collected.coordinates.includes(selected.target));
+  assert.equal(existsSync(objectDirForDigest(f.root, defDigest(selected.DefRef.bundleDigest))), false);
+  f.store.close();
+});
+
+test('runtime selection: CAS parent adoption creates a new generation and historical work cannot publish', async () => {
+  const f = await runtimeFixture();
+  const workflow = f.engine.createInstance('parent/parent', { provide: { seed: { n: 1 } } });
+  const s = ready(f.engine, workflow, 'one', f.candidates);
+  assert.equal(f.engine.applyChoice(s, f.candidates[0]!).kind, 'bound');
+  const old = f.engine.tick(workflow, { deep: true }).orders[0]!;
+  const parentDef = f.defs.get('parent/parent')!;
+  const yaml = readFileSync(parentDef.dir!, 'utf8').replaceAll('config: {}', 'config: {generation: 2}');
+  await installBundleFixture({ root: f.root, sourceDir: writeBundleSource({ name: 'parent', version: '2.0.0', workflow: yaml }) });
+  const { engine } = reloadRuntimeEngine(f.store, f.root);
+  engine.adopt(workflow);
+  assert.equal(engine.applyChoice(s, f.candidates[0]!).kind, 'stale-parent');
+  assert.equal(engine.invocationStatus(workflow, 'one').kind, 'stale');
+  assert.equal(engine.tick(old.workflow, { deep: true }).orders.length, 0);
+  const before = f.store.getArtifact(old.workflow, 'data');
+  assert.equal(engine.reject(old.workflow, 'data', 'work', 'obsolete').outcome, 'born-rejected');
+  assert.deepEqual(f.store.getArtifact(old.workflow, 'data'), before);
+  engine.green(old.workflow, old.run, 'result', { from: 'historical' });
+  engine.close(old.workflow, old.run);
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'owed');
+  assert.equal(engine.applyChoice(ready(engine, workflow, 'one', f.candidates), f.candidates[1]!).kind, 'bound');
+  const current = engine.tick(workflow, { deep: true }).orders[0]!;
+  assert.notEqual(current.workflow, old.workflow);
+  engine.green(current.workflow, current.run, 'result', { from: 'current' });
+  engine.close(current.workflow, current.run);
+  assert.deepEqual(f.store.getArtifact(workflow, 'one')!.value, { from: 'current' });
+  assert.equal(f.store.getArtifact(workflow, 'one')!.acceptance, 'green');
+  assert.equal(f.store.listChildrenByParent(workflow).length, 2);
+  f.store.close();
+});
+
+test('runtime selection: malformed JSON candidates have total snapshot ordering and cannot be selected', async (t) => {
+  const { engine, store, candidates } = await runtimeFixture();
+  t.after(() => store.close());
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const valid = candidates[0]!;
+  const malformed = [
+    { ...valid, target: { toString: null } },
+    { ...valid, target: [{ toString: null }] },
+    { ...valid, target: { other: 1 } },
+    { ...valid, target: { other: 2 } },
+    { ...valid, DefRef: { ...valid.DefRef, bundleDigest: { toString: null } } },
+    { ...valid, DefRef: { ...valid.DefRef, workflowName: { toString: null } } },
+    { ...valid, DefRef: null },
+    { ...valid, target: null },
+    { ...valid, unexpected: 1 },
+    { ...valid, unexpected: 2 },
+    {},
+  ];
+  const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  const result = engine.decisionSnapshot(workflow, 'one', [...malformed, valid]);
+  assert.equal(result.kind, 'ready');
+  if (result.kind !== 'ready') throw new Error('expected ready snapshot');
+  assert.deepEqual(result.snapshot.candidates.map(c => c.assessment), [
+    ...malformed.map(() => ({ kind: 'invalid', code: 'malformed-ref' })), { kind: 'eligible' },
+  ]);
+  const reversed = engine.decisionSnapshot(workflow, 'one', [...malformed, valid].reverse());
+  assert.equal(reversed.kind, 'ready');
+  if (reversed.kind !== 'ready') throw new Error('expected ready snapshot');
+  assert.equal(reversed.snapshot.candidateSetDigest, result.snapshot.candidateSetDigest);
+  const transported: DecisionSnapshot = JSON.parse(JSON.stringify(result.snapshot));
+  assert.equal(validSnapshot(transported), true);
+  for (const selected of malformed) {
+    assert.deepEqual(engine.applyChoice(transported, selected as InvocationCandidate), {
+      kind: 'invalid-decision', code: 'shape-or-digest',
+    });
+  }
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before);
+  assert.deepEqual(store.listInvocations(workflow), []);
+  assert.deepEqual(store.listChildrenByParent(workflow), []);
+  assert.equal(engine.applyChoice(transported, valid).kind, 'bound');
+  assert.equal(store.listInvocations(workflow).length, 1, 'mixed candidate snapshot survives durable decoding');
+});
+
+test('runtime selection: strict snapshot transport refuses malformed assessments and tampering without writes', async (t) => {
+  const { engine, store, candidates } = await runtimeFixture();
+  t.after(() => store.close());
+  const workflow = engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const snapshot = ready(engine, workflow, 'one', candidates);
+  const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  for (const assessment of [
+    { kind: 'invalid', code: { toString: null } },
+    { kind: 'ineligible', code: ['implements'] },
+    { kind: 'invalid', code: 1 },
+    { kind: 'invalid', code: null },
+    { kind: 'invalid', code: 'unknown' },
+    { kind: 'eligible', code: 'malformed-ref' },
+  ]) {
+    const bad = JSON.parse(JSON.stringify(snapshot));
+    bad.candidates[0].assessment = assessment;
+    bad.candidateSetDigest = candidateSetDigest(bad.candidates);
+    assert.equal(validSnapshot(bad), false);
+    assert.deepEqual(engine.applyChoice(bad, candidates[0]!), { kind: 'invalid-decision', code: 'shape-or-digest' });
+  }
+  for (const bad of [
+    { ...snapshot, unexpected: true },
+    { ...snapshot, candidateSetDigest: '0'.repeat(64) },
+    { ...snapshot, candidates: [...snapshot.candidates, snapshot.candidates[0]] },
+    { ...snapshot, evidence: [{ ...snapshot.evidence[0], childInput: { toString: null } }] },
+  ]) {
+    assert.equal(validSnapshot(bad), false);
+    assert.deepEqual(engine.applyChoice(bad as DecisionSnapshot, candidates[0]!), { kind: 'invalid-decision', code: 'shape-or-digest' });
+  }
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before);
+  assert.deepEqual(store.listInvocations(workflow), []);
+  assert.deepEqual(store.listChildrenByParent(workflow), []);
 });

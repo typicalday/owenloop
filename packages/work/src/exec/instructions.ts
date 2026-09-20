@@ -1,3 +1,5 @@
+import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
+import type { InvocationBindingSource, VerifiedInvocationReceipt } from '../../../../src/types.ts';
 /**
  * Driver-side instruction resolution.
  *
@@ -50,6 +52,8 @@ export interface InstructionRefusal {
 }
 
 export interface ResolvedCommand {
+  /** Trusted capability, called after payload preparation immediately before start. */
+  revalidate?: () => Promise<InstructionRefusal | undefined>;
   ok: true;
   command: string;
   /** Verified installed bundle root, when resolution has bundle provenance. */
@@ -106,6 +110,7 @@ export interface StoreInstructionResolverOptions {
   originVerifier?: OriginVerifier;
   /** Gate dynamic consumed values before a command can reach the shell. */
   consumedVerifier?: ConsumedVerifier;
+  invocationBindingSource?: InvocationBindingSource;
   /** Explicit publication policy override; otherwise env > settings file > warn. */
   defPolicy?: DefPolicy;
   /** Explicit origin policy override; otherwise env > settings file > warn. */
@@ -378,19 +383,39 @@ export function createStoreInstructionResolver(
    * closure yields no context, and the verifier then treats any relay as
    * unverifiable rather than guessing.
    */
-  const verifiedCallsProducers = (
+  const verifiedCallsProducers = async (
     order: OrderPacket,
     resolved: ResolvedDefinition,
-  ): { ok: true; producers: Record<string, VerifiedCallsProducer> | undefined } | InstructionRefusal => {
-    if (source.getVerifiedCallsChild === undefined) return { ok: true, producers: undefined };
+  ): Promise<{ ok: true; producers: Record<string, VerifiedCallsProducer>; receipts: VerifiedInvocationReceipt[] } | InstructionRefusal> => {
+    const receipts: VerifiedInvocationReceipt[] = [];
     const producers: Record<string, VerifiedCallsProducer> = {};
     for (const path of Object.keys(order.consumes)) {
       const callsStep = resolved.definition.steps.find(
-        (step) => step.calls !== undefined && step.produces.some((produce) => produce.stem === path),
+        (step) => (step.calls !== undefined || step.callsInterface !== undefined) && step.produces.some((produce) => produce.stem === path),
       );
+      if (callsStep?.callsInterface?.selection === 'invocation') {
+        if (!options.invocationBindingSource) return refusal('unverified-consumed', order, 'dynamic relay requires a trusted InvocationBindingSource');
+        const version = order.consumedFingerprint?.[path];
+        if (version === undefined) return refusal('unverified-consumed', order, 'dynamic relay requires the parent artifact version');
+        const key = { parentWorkflow: order.workflow, parentDefRef: { bundleDigest: resolved.bundleDigest, workflowName: resolved.definition.name },
+          callPath: path, parentArtifactVersion: version };
+        let trusted: VerifiedInvocationReceipt | undefined;
+        try { trusted = await options.invocationBindingSource.read(key); }
+        catch (error) { return refusal('unverified-consumed', order, `trusted invocation read failed: ${errorText(error)}`); }
+        if (!trusted || valueDigestHex(trusted.receipt) !== trusted.receiptDigest
+          || valueDigestHex(trusted.receipt.parentDefRef) !== valueDigestHex(key.parentDefRef)
+          || trusted.receipt.callPath !== path || trusted.receipt.parentArtifactVersion !== version) {
+          return refusal('unverified-consumed', order, 'trusted invocation receipt is missing or moved');
+        }
+        receipts.push(trusted);
+        producers[path] = { step: callsStep.name, target: trusted.receipt.childDefRef.workflowName,
+          childDefDigest: trusted.receipt.childDefRef.bundleDigest, childWorkflow: trusted.receipt.childWorkflow,
+          childOutcome: trusted.receipt.childOutcome, childVersion: trusted.receipt.childOutcomeVersion };
+        continue;
+      }
       if (callsStep?.calls === undefined) continue;
       const relayed = order.consumesProofRelay?.[path] !== undefined;
-      const child = source.getVerifiedCallsChild(order.defDigest, order.step, callsStep.name);
+      const child = source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
       if (child === undefined) {
         if (!relayed) continue;
         return refusal(
@@ -410,15 +435,15 @@ export function createStoreInstructionResolver(
       }
       producers[path] = { step: callsStep.name, target: callsStep.calls, childDefDigest: child.bundleDigest, childOutcome };
     }
-    return { ok: true, producers };
+    return { ok: true, producers, receipts };
   };
 
   const gateConsumed = async (
     order: OrderPacket,
     hardRule: boolean,
     resolved: ResolvedDefinition,
-  ): Promise<InstructionRefusal | undefined> => {
-    if (!hasConsumedData(order)) return undefined;
+  ): Promise<InstructionRefusal | { ok: true; receipts: VerifiedInvocationReceipt[] }> => {
+    if (!hasConsumedData(order)) return { ok: true, receipts: [] };
     if (options.consumedVerifier === undefined) {
       return refusal(
         'unverified-consumed',
@@ -426,7 +451,7 @@ export function createStoreInstructionResolver(
         'consume-side verifier is not configured; dynamic values cannot be admitted to a command worker',
       );
     }
-    const callsContext = verifiedCallsProducers(order, resolved);
+    const callsContext = await verifiedCallsProducers(order, resolved);
     if (!callsContext.ok) return callsContext;
     try {
       const checked = await options.consumedVerifier(commandConsumedOrder(order), {
@@ -435,7 +460,7 @@ export function createStoreInstructionResolver(
       });
       if (!checked.ok) return refusal('unverified-consumed', order, checked.reason);
       for (const warning of checked.warnings) warn(warning);
-      return undefined;
+      return { ok: true, receipts: callsContext.receipts };
     } catch (error) {
       return refusal('unverified-consumed', order, `consume-side verification failed: ${errorText(error)}`);
     }
@@ -475,7 +500,7 @@ export function createStoreInstructionResolver(
       // artifactPolicy=off; otherwise a future command interpolation could
       // carry an unverified value into `/bin/sh -c`.
       const consumedRefusal = await gateConsumed(order, true, resolved);
-      if (consumedRefusal !== undefined) return consumedRefusal;
+      if (!consumedRefusal.ok) return consumedRefusal;
 
       const originRefusal = await checkOrigin(order, resolved);
       if (originRefusal !== undefined) return originRefusal;
@@ -485,7 +510,14 @@ export function createStoreInstructionResolver(
       }
       // Deliberately return the authored bytes exactly. Runtime substitutions
       // belong to prompts only; this string is passed to `/bin/sh -c`.
-      return { ok: true, command: resolved.step.command, ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
+      return { ok: true, command: resolved.step.command, ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
+        ...(consumedRefusal.receipts.length ? { revalidate: async () => {
+          const fresh = await gateConsumed(order, true, resolved);
+          if (!fresh.ok) return fresh;
+          if (valueDigestHex(fresh.receipts) !== valueDigestHex(consumedRefusal.receipts)) return refusal('unverified-consumed', order, 'invocation receipt moved before launch');
+          return undefined;
+        } } : {}),
+      };
     },
 
     resolveStep: resolveAgentStep,
@@ -501,6 +533,7 @@ export function createDefaultStoreInstructionResolver(args: {
   definitionVerifier?: DefinitionVerifier;
   originVerifier?: OriginVerifier;
   consumedVerifier?: ConsumedVerifier;
+  invocationBindingSource?: InvocationBindingSource;
   defPolicy?: DefPolicy;
   originPolicy?: DefPolicy;
   originRules?: OriginRules;
@@ -531,6 +564,7 @@ export function createDefaultStoreInstructionResolver(args: {
     definitionVerifier: args.definitionVerifier ?? createExecutionDefinitionVerifier({ env: args.env }),
     originVerifier: args.originVerifier ?? createExecutionOriginVerifier({ env: args.env }),
     ...(args.consumedVerifier !== undefined ? { consumedVerifier: args.consumedVerifier } : {}),
+    ...(args.invocationBindingSource !== undefined ? { invocationBindingSource: args.invocationBindingSource } : {}),
     ...(args.defPolicy !== undefined ? { defPolicy: args.defPolicy } : {}),
     ...(args.originPolicy !== undefined ? { originPolicy: args.originPolicy } : {}),
     ...(args.originRules !== undefined ? { originRules: args.originRules } : {}),

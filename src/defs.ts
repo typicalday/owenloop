@@ -30,6 +30,8 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
+import { validInvocationCall } from './invocation.ts';
+import type { InterfaceCall } from './types.ts';
 import { isCallStep } from './types.ts';
 import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef, WorkflowInterfaceClaim } from './types.ts';
 
@@ -643,7 +645,11 @@ export class InterfaceCallDefinitionError extends DefError {
   }
 }
 
-function parseCallsInterface(value: unknown, step: string): WorkflowInterfaceClaim {
+function parseCallsInterface(value: unknown, step: string): InterfaceCall {
+  if (typeof value === 'object' && value !== null && 'selection' in value) {
+    if (!validInvocationCall(value)) throw new InterfaceCallDefinitionError(step, undefined, 'invalid invocation signature or JSON-only policy');
+    return structuredClone(value);
+  }
   const claim = typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
