@@ -29,7 +29,9 @@ import { dbPathRefusingSymlink, mkdirRefusingSymlink } from './util.ts';
 import { digestScopedCallsTargetKey, finalizeDefs, loadDefs, resolveCallsTarget } from './defs.ts';
 import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
 import type { OrderInstructionSource } from './order-resolver.ts';
-import type { WorkflowDef } from './types.ts';
+import type { InvocationHostAuthority, WorkflowDef } from './types.ts';
+import { verifyInvocationDefinition } from './store/def-source.ts';
+import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
 
 export interface CreateEngineOpts {
   /**
@@ -165,13 +167,14 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
     opts.instructionSource ?? createDefInstructionSource(defs.values());
 
   const engineOpts: {
+    invocationAuthority: InvocationHostAuthority;
     reapTtlMs?: number;
     maxLeaseMs?: number;
     maxCallDepth?: number;
     onEvent?: EngineListener;
     onListenerError?: (err: unknown, event: EngineEvent) => void;
     instructionSource?: OrderInstructionSource;
-  } = {};
+  } = { invocationAuthority: { verifyDefinition: verifyInvocationDefinition, withDefinitions: withWorkflowSnapshotStoreGuard } };
   if (opts.reapTtlMs !== undefined) engineOpts.reapTtlMs = opts.reapTtlMs;
   if (opts.maxLeaseMs !== undefined) engineOpts.maxLeaseMs = opts.maxLeaseMs;
   if (opts.maxCallDepth !== undefined) engineOpts.maxCallDepth = opts.maxCallDepth;
