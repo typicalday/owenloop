@@ -24,6 +24,43 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
+
+test('Engine runtime import graph excludes local invocation authority defaults', () => {
+  const seen = new Set<string>();
+  const forbidden = new Set(['store/def-source.ts', 'store/snapshot-guard.ts']);
+  function visit(url: URL, via: string[]) {
+    const file = fileURLToPath(url);
+    if (seen.has(file)) return;
+    seen.add(file);
+    const relative = fileURLToPath(url).slice(fileURLToPath(SRC_DIR).length);
+    assert.ok(!forbidden.has(relative), `local authority reachable: ${[...via, relative].join(' -> ')}`);
+    const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+    function walk(node: ts.Node) {
+      let specifier: ts.Expression | undefined;
+      if (ts.isImportDeclaration(node)) {
+        const clause = node.importClause;
+        if (clause?.isTypeOnly) return;
+        if (clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
+          && clause.namedBindings.elements.every(e => e.isTypeOnly)) return;
+        specifier = node.moduleSpecifier;
+      } else if (ts.isExportDeclaration(node) && !node.isTypeOnly) {
+        if (node.exportClause && ts.isNamedExports(node.exportClause)
+          && node.exportClause.elements.every(e => e.isTypeOnly)) return;
+        specifier = node.moduleSpecifier;
+      } else if (ts.isCallExpression(node)
+        && (node.expression.kind === ts.SyntaxKind.ImportKeyword || node.expression.getText(source) === 'require')) {
+        specifier = node.arguments[0];
+      }
+      if (specifier && ts.isStringLiteral(specifier) && specifier.text.startsWith('.')) {
+        visit(new URL(specifier.text, url), [...via, relative]);
+      }
+      ts.forEachChild(node, walk);
+    }
+    walk(source);
+  }
+  visit(new URL('engine.ts', SRC_DIR), []);
+});
 
 const SRC_DIR = new URL('../src/', import.meta.url);
 

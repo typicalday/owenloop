@@ -4,6 +4,38 @@ import { candidateSetDigest, evidenceDigest, inheritedBindingAssessment, jsonOnl
 import { valueDigestHex } from '../src/crypto/canonical.ts';
 import { def, input, step } from './helpers.ts';
 import type { AssessedCandidate, InvocationCall, InvocationEvidence } from '../src/types.ts';
+import { Engine } from '../src/engine.ts';
+import { digestScopedCallsTargetKey, resolveCallsTarget } from '../src/defs.ts';
+import { runtimeFixture, ready } from './helpers/runtime-selection.ts';
+
+test('raw Engine without host authority refuses real invocation transitions', async (t) => {
+  const f = await runtimeFixture();
+  t.after(() => f.store.close());
+  const raw = new Engine(f.store, (name, from, digest) => {
+    const d = digest ? f.defs.get(digestScopedCallsTargetKey(digest, name)) ?? f.defs.get(name)
+      : from ? resolveCallsTarget(f.defs, name, from) : f.defs.get(name);
+    if (!d) throw new Error(`missing ${name}`);
+    return d;
+  });
+  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const snapshot = ready(f.engine, workflow, 'one', f.candidates);
+  const changes = () => f.store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  const before = changes();
+  assert.deepEqual(raw.decisionSnapshot(workflow, 'one', f.candidates), { kind: 'parent-unverified' });
+  assert.equal(raw.applyChoice(snapshot, f.candidates[0]!).kind, 'invalid-decision');
+  assert.equal(changes(), before, 'refusal cannot insert a binding');
+  assert.equal(f.engine.applyChoice(snapshot, f.candidates[0]!).kind, 'bound');
+  assert.equal(raw.tick(workflow).orders.length, 0);
+  assert.equal(f.store.listWorkflows().length, 1, 'stored selection cannot authorize child provisioning');
+  assert.equal(raw.snapshotReady(workflow, { now: 10, revision: 'test' }).kind, 'unverified');
+  const order = f.engine.tick(workflow).orders[0]!;
+  f.engine.green(order.workflow, order.run, 'result', { ok: true });
+  f.engine.close(order.workflow, order.run);
+  const key = { parentWorkflow: workflow, parentDefRef: snapshot.key.parentDefRef,
+    callPath: 'one', parentArtifactVersion: f.store.getArtifact(workflow, 'one')!.version };
+  assert.ok(await f.engine.invocationBindingSource().read(key));
+  assert.equal(await raw.invocationBindingSource().read(key), undefined);
+});
 
 const contract: InvocationCall = { name: 'i', version: '1', selection: 'invocation',
   signature: { inputs: [{ name: 'data', schema: true }], outputs: [{ name: 'result', schema: true }] },
