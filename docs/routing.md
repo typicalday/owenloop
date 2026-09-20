@@ -11,8 +11,10 @@ the system. Every term is defined before it is used. Nothing is left implicit.
 
 ## 0. Status of this document
 
-Sections 1 through 8 describe behavior that is live today, with one
-explicitly marked exception inside section 8a.
+Sections 1 through 8 describe the existing routing path, with one
+explicitly marked exception inside section 8a. The native bounded-dispatch
+section below documents the opt-in U1 library API and its separate U2 handoff;
+it does not claim that willing offers or final launch enforcement are deployed.
 
 Section 9 (**When nobody is certified**) describes a rule that is CHANGING.
 Both the old rule and the new rule are stated, and it is marked which is which,
@@ -761,3 +763,99 @@ delivery.yaml          steps: [{ name: builder, capabilities: [build] }]
 If the lookup at step 3 finds nobody: the order **holds** and an alert is
 written. If the operator has configured a reroute rule, the hub substitutes the
 target capability and records `reroutedFrom` on the order.
+
+## Native bounded dispatch (U1)
+
+The native library exposes synchronous `resolveStepCapabilities`,
+`engine.snapshotReady(workflow, options)` and `engine.claimReady(plan, options)`.
+This is an opt-in engine protocol. Existing `tick` callers retain their concrete
+and legacy capability behavior. The service authorization bridge, willing shift
+offers, local role/tuple selection and final launch enforcement are U2 work;
+these native tests do not establish a deployed service or observed model launch.
+
+1. `snapshotReady` runs existing settle/cascade/reap maintenance before reading
+   eligible choices. It does not claim a lease, increment a claim attempt or
+   reserve lane capacity for inference. Independently necessary reaping can
+   increment the retired task's attempts. A shallow scan limits choices to its
+   frame; a deep scan exposes eligible descendants with ancestor guards intact.
+2. Each immutable `ReadyFiring` names the scan root, exact frame, verified CAS
+   `DefRef`, step/key, input fingerprint, admission epoch, executor kind, meaning
+   and evidence digests, persisted-state digest and resolved context. Capability
+   resolution uses own explicit mappings first (identity entries also win), then
+   exact scoped inference, then legacy mapping. Scope matches DefRef, step,
+   authored tag, meaning digest and evidence generation. Composition and reroutes
+   follow mapping. One frozen result supplies both filtering and Order stamps.
+3. The caller evaluates preference outside engine transactions. A `ReadyClaimPlan`
+   binds one exact firing, candidate/evidence/policy digests, authority revision
+   and a lane's stable ID, single-use slot ID, kind, capacity, revision and expiry.
+   Those are trusted current service projections, not native authorization or
+   provider policy. A stable lane ID has one executor kind; command and agent
+   allowances must use different IDs. Capacity/revision updates apply only with
+   a successful claim; the service must prevent stale authority projections.
+4. `claimReady` verifies CAS outside SQLite, then under the definition-store guard
+   and a `BEGIN IMMEDIATE` lock rechecks ancestry, admission, input/lease/state and
+   routing revisions, debt/freeze/idle, cadence, daily budget, parallel occupancy
+   and lane capacity. It commits at most one actual run/task/Order. It never
+   claims everything before selecting a preference. A refusal writes no claim
+   state. A stale result requires a separate fresh snapshot and bounded attempt;
+   there is no implicit fallback or partially retained reservation.
+5. Native schema 14 adds `dispatch_lane` and append-only `dispatch_slot` records.
+   The slot links to its real run; occupied capacity is derived from open runs
+   still owning claimed tasks across the shared database. Slot insertion and
+   the run/task/Order claim share one write transaction. Close/release, cancel,
+   reap and cleanup free actual occupancy, while consumed identities survive
+   restart and run/workflow deletion. Replaying a consumed slot refuses; it never
+   assigns a different run. Legacy runs consume no negotiated native slot.
+   No field is added to the signed Order, its field manifest, `x`, or `spec`.
+
+Snapshot outcomes are `ready`, `unverified`, or `inactive`. Claim outcomes are
+`claimed`, `stale`, `unverified`, `lane-unavailable`, `invalid-plan`, or `deferred`.
+An unresolved workdir is excluded from the eligible snapshot; a changed workdir
+invalidates old advice. Only a successful idle claim consumes its alarm.
+Exceptions during the atomic claim roll back its run/task/Order and lane/slot
+writes, including errors after slot insertion.
+
+### Retained proof contract
+
+The pure barrel exports `RoutingProof`, `ROUTING_PROOF_SCHEMA` and
+`ROUTING_PROOF_CASE_IDS`. The `routing-proof-v1` schema requires one entry per
+case ID, source refs (40 lowercase hex digits or explicit `null` when unprovided),
+artifact paths and SHA-256 byte hashes, execution status, named boolean assertion
+results, and an optional complete decision/claim/order/attempt join. Unexecuted
+cases have no assertion results or join. An executed refusal can have a null
+join; an observed launch requires all four IDs joined to retained real records.
+Schema validity alone is not a passing proof: readers must check actual artifact
+bytes, required execution/assertion results, reviewed refs and receipt joins.
+
+| Cases | Reader / evidence | Status boundary |
+|---|---|---|
+| U1-scoped | capability resolution and exact persisted order/crew stamps | Native C2 |
+| U1-capacity-one, U1-child | one real selected root/child run/task/Order | Native C2 |
+| U1-stale-fallback, U1-currentness | persisted scheduler state, no stale writes, separate fresh claim | Native C2 |
+| U1-lane-race | overlapping independent SQLite connections across roots, rollback and lifecycle replay | Native C2 + Store tests |
+| U1-legacy | opt-in isolation and unchanged legacy invocation/tick behavior | Native C2/C3 |
+| U2-offer, U2-policy, U2-delegation, U2-final-launch, U2-observed | service receipts and real worker launch observations | Future C4/C5; unexecuted by U1 |
+
+C1 validates pure contracts/fixtures; synthetic fixtures are never execution
+receipts. C2 verifies real native claims. C3 includes typecheck, lint, build,
+legacy tests and the unchanged crypto FieldManifest checks. Focused Store tests
+verify genuine schema-13 migration, rollback/idempotency, corruption refusal,
+restart and permanent slot history. The signed recipe retains fresh confined
+receipts at the exact candidate head; independent unit/whole proof and review
+remain delivery gates. U2's C5 consumes retained U1 receipts later and is not a
+U1 ship prerequisite. No paid provider or opt-in live harness test is a U1 check.
+
+### U1 decision log
+
+The reviewed foundation is `820825a95e71a61d40f3b60f13bddb7c8553b6cf` on
+`recipe-27d11bcfb7b03469` ([PR #319](https://github.com/typicalday/owenloop/pull/319)).
+Delivery must preserve the stacked-base remote-SHA check. The adopted patch was
+unverified draft code; its former Order extension was removed under the storage
+amendment. This log describes implementation choices, not a ship verdict.
+
+| ts | phase | decision | why | evidence | result |
+|---|---|---|---|---|---|
+| 2026-09-20T02:14:59.719Z | adoption | Apply the hash-verified seven-file draft at the exact reviewed foundation; treat it as unverified. | The authoritative card requires salvage while preserving the frozen Order contract. | `820825a95e71a61d40f3b60f13bddb7c8553b6cf` | Patch applied only to the seven pinned paths |
+| 2026-09-20T02:22:54.330Z | storage | Use schema14 native lane rows and append-only slot receipts joined to actual run/task ownership. | Single-use identity must survive lifecycle release, restart, and run cleanup without extending Order. | `src/store.ts` | Focused migration, rollback, replay and overlapping connection diagnostics pass |
+| 2026-09-20T02:27:25.562Z | engine | Retain exact firing checks and separate maintenance from conditional claim effects. | Reaping, cadence, budget, parallel and idle guards must remain authoritative while stale advice stays read-only. | `test/engine.test.ts` | Persisted-state scheduler and race diagnostics pass |
+| 2026-09-20T02:27:25.562Z | proof | Export pure proof schema/case IDs and label U2 launch cases unexecuted. | Synthetic fixtures and native test success cannot establish service authorization or observed launches. | `test/boundaries.test.ts` | Seven contract tests pass; final confined verification pending |

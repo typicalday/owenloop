@@ -28,6 +28,7 @@ import type {
   ArtifactHistory,
   ArtifactVersion,
   Author,
+  ExecutorLane,
   Fingerprint,
   InterfaceCallBinding,
   Order,
@@ -52,6 +53,14 @@ export interface RunRow extends RunData {
   id: string;
   createdAt: number;
   updatedAt: number;
+}
+/** Native storage receipt; never part of the signed Order contract. */
+export interface DispatchSlotRow {
+  readonly lane: string;
+  readonly slot: string;
+  readonly run: string;
+  readonly planDigest: string;
+  readonly consumedAt: number;
 }
 export interface WorkflowRow extends WorkflowData {
   id: string;
@@ -373,7 +382,8 @@ CREATE TABLE IF NOT EXISTS meta (
  * Bumped to '12' for immutable start-time interface-call bindings: the
  * `workflow` table gains nullable JSON `interface_bindings`.
  */
-const SCHEMA_VERSION = '13';
+// v14 adds internal dispatch lanes and append-only consumed slots.
+const SCHEMA_VERSION = '14';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -758,6 +768,7 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
 
 export class Store {
   readonly db: DatabaseSync;
+  private inWriteTransaction = false;
   private readonly activeSnapshotDigests = new Set<string>();
 
   constructor(path: string) {
@@ -788,10 +799,11 @@ export class Store {
 		// copied into append-only events exactly once.
 		const backfillLegacyEvents = cur !== undefined && parseInt(cur, 10) < 9;
 		this.migrate(backfillLegacyEvents);
+	this.validateDispatchState();
 		if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
       });
     } catch (err) {
-      if (err instanceof StoreVersionError) this.db.close();
+      this.db.close();
       throw err;
     }
   }
@@ -911,6 +923,32 @@ export class Store {
       BEGIN SELECT RAISE(ABORT, 'invocation child linkage is immutable'); END;
     CREATE UNIQUE INDEX IF NOT EXISTS workflow_invocation_unique ON workflow(produced_by_invocation)
       WHERE produced_by_invocation IS NOT NULL;`);
+    // Native v14 storage. Slots intentionally have NO foreign key to run:
+    // workflow/run cleanup must preserve consumption history permanently.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS dispatch_lane (
+      id TEXT PRIMARY KEY NOT NULL CHECK(length(id) > 0),
+      executor_kind TEXT NOT NULL CHECK(length(executor_kind) > 0),
+      capacity INTEGER NOT NULL CHECK(typeof(capacity) = 'integer' AND capacity BETWEEN 1 AND 9007199254740991),
+      revision TEXT NOT NULL CHECK(length(revision) > 0)
+    );
+    CREATE TABLE IF NOT EXISTS dispatch_slot (
+      lane_id TEXT NOT NULL REFERENCES dispatch_lane(id),
+      slot TEXT NOT NULL CHECK(length(slot) > 0),
+      run_id TEXT NOT NULL UNIQUE CHECK(length(run_id) > 0),
+      plan_digest TEXT NOT NULL CHECK(length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^0-9a-f]*'),
+      consumed_at INTEGER NOT NULL CHECK(typeof(consumed_at) = 'integer' AND consumed_at BETWEEN 0 AND 9007199254740991),
+      PRIMARY KEY (lane_id, slot)
+    );
+    CREATE TRIGGER IF NOT EXISTS dispatch_slot_immutable BEFORE UPDATE ON dispatch_slot
+      BEGIN SELECT RAISE(ABORT, 'dispatch slot is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS dispatch_slot_append_only BEFORE DELETE ON dispatch_slot
+      BEGIN SELECT RAISE(ABORT, 'dispatch slot is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS dispatch_run_no_reuse BEFORE INSERT ON run
+      WHEN EXISTS (SELECT 1 FROM dispatch_slot WHERE run_id = NEW.id)
+      BEGIN SELECT RAISE(ABORT, 'consumed dispatch run identity'); END;
+    CREATE TRIGGER IF NOT EXISTS dispatch_lane_kind_immutable BEFORE UPDATE OF executor_kind ON dispatch_lane
+      WHEN NEW.executor_kind != OLD.executor_kind
+      BEGIN SELECT RAISE(ABORT, 'dispatch lane kind is immutable'); END;`);
     // Reverse-lookup index (CREATE INDEX IF NOT EXISTS is idempotent).
     this.db.exec(`CREATE INDEX IF NOT EXISTS workflow_produced_by ON workflow(produced_by_wf, produced_by_path)`);
     // REL-5 (schema v8): make duplicate calls: children physically impossible
@@ -999,6 +1037,7 @@ export class Store {
 
   tx<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
+    this.inWriteTransaction = true;
     try {
       const result = fn();
       this.db.exec('COMMIT');
@@ -1006,6 +1045,8 @@ export class Store {
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
+    } finally {
+      this.inWriteTransaction = false;
     }
   }
 
@@ -1513,6 +1554,79 @@ export class Store {
       .prepare('SELECT MAX(updated_at) AS t FROM artifact WHERE workflow = ?')
       .get(workflow) as { t: number | null };
     return row.t ?? 0;
+  }
+
+  // -- internal bounded dispatch -----------------------------------------------
+
+  /** Refuse malformed persisted authority instead of silently freeing capacity.
+   * Missing runs are valid tombstones left by workflow cleanup. */
+  private validateDispatchState(): void {
+    const invalid = this.db.prepare(`SELECT 1 FROM dispatch_lane
+      WHERE typeof(id) != 'text' OR length(id) = 0
+	OR typeof(executor_kind) != 'text' OR length(executor_kind) = 0
+	OR typeof(capacity) != 'integer' OR capacity NOT BETWEEN 1 AND 9007199254740991
+	OR typeof(revision) != 'text' OR length(revision) = 0
+      UNION ALL SELECT 1 FROM dispatch_slot s LEFT JOIN dispatch_lane l ON l.id = s.lane_id
+      WHERE l.id IS NULL OR typeof(s.slot) != 'text' OR length(s.slot) = 0
+	OR typeof(s.run_id) != 'text' OR length(s.run_id) = 0
+	OR typeof(s.plan_digest) != 'text' OR length(s.plan_digest) != 64 OR s.plan_digest GLOB '*[^0-9a-f]*'
+	OR typeof(s.consumed_at) != 'integer' OR s.consumed_at NOT BETWEEN 0 AND 9007199254740991
+      LIMIT 1`).get();
+    if (invalid) throw new Error('corrupt native dispatch state');
+  }
+
+  getDispatchSlot(lane: string, slot: string): DispatchSlotRow | undefined {
+    const row = this.db.prepare(`SELECT lane_id AS lane, slot, run_id AS run,
+      plan_digest AS planDigest, consumed_at AS consumedAt FROM dispatch_slot WHERE lane_id = ? AND slot = ?`)
+      .get(lane, slot) as DispatchSlotRow | undefined;
+    return row;
+  }
+
+  /** Occupancy follows actual open runs that still own a claimed task, across
+   * every root sharing this database. Expiry alone never invents a release:
+   * the normal reaper must retire the lease first. No cached counters. */
+  dispatchLaneUsage(lane: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM dispatch_slot s
+      JOIN run r ON r.id = s.run_id
+      JOIN task t ON t.workflow = r.workflow AND t.step = r.step AND t.key = r.key
+	AND t.run = r.id AND t.status = 'claimed'
+      WHERE s.lane_id = ? AND r.outcome IS NULL`).get(lane) as { n: number }).n;
+  }
+
+  /** Called inside the engine's exact-readiness write transaction. The callback
+   * creates the actual run/task/order. Refusal never invokes it or writes state;
+   * exceptions (including insertion failures) roll the entire claim back. */
+  withDispatchSlot<T extends { run: string }>(lane: ExecutorLane, planDigest: string, now: number,
+    claim: () => T): T | undefined {
+    if (!this.inWriteTransaction) throw new Error('dispatch claim requires a Store write transaction');
+    if (![lane.id, lane.slot, lane.executorKind, lane.revision].every(v => typeof v === 'string' && v.length > 0)
+      || !Number.isSafeInteger(lane.capacity) || lane.capacity < 1
+      || !Number.isSafeInteger(now) || now < 0 || !Number.isFinite(lane.expiresAt)
+      || !/^[0-9a-f]{64}$/.test(planDigest)) throw new Error('invalid native dispatch claim');
+    this.validateDispatchState();
+    const prior = this.db.prepare('SELECT executor_kind FROM dispatch_lane WHERE id = ?').get(lane.id);
+    if (lane.expiresAt <= now || (prior && prior.executor_kind !== lane.executorKind)
+      || this.getDispatchSlot(lane.id, lane.slot) || this.dispatchLaneUsage(lane.id) >= lane.capacity) return undefined;
+    const result = claim();
+    const run = this.getRun(result.run);
+    const task = run && this.getTask(run.workflow, run.step, run.key ?? '');
+    if (!run || run.outcome !== undefined || task?.status !== 'claimed' || task.run !== run.id) {
+      throw new Error('dispatch slot requires an actual active run and claimed task');
+    }
+    this.db.prepare(`INSERT INTO dispatch_lane(id, executor_kind, capacity, revision) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET capacity = excluded.capacity, revision = excluded.revision`)
+      .run(lane.id, lane.executorKind, lane.capacity, lane.revision);
+    this.db.prepare(`INSERT INTO dispatch_slot(lane_id, slot, run_id, plan_digest, consumed_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(lane.id, lane.slot, result.run, planDigest, now);
+    return result;
+  }
+
+  /** Cancellation retires only native bounded runs; legacy run semantics stay
+   * unchanged. The consumed slot itself is never modified or deleted. */
+  releaseDispatchRuns(workflow: string): void {
+    const rows = this.db.prepare(`SELECT r.id FROM run r JOIN dispatch_slot s ON s.run_id = r.id
+      WHERE r.workflow = ? AND r.outcome IS NULL`).all(workflow) as Array<{ id: string }>;
+    for (const { id } of rows) this.updateRun(id, { outcome: 'released' });
   }
 
   // -- run ---------------------------------------------------------------------

@@ -214,7 +214,7 @@ export function applyCapabilityRewrites(
   let changed = false;
   const out: string[] = [];
   for (const c of offered) {
-    const target = rewrites[c];
+    const target = Object.prototype.hasOwnProperty.call(rewrites, c) ? rewrites[c] : undefined;
     const next = target ?? c;
     if (target !== undefined && target !== c) changed = true;
     if (!out.includes(next)) out.push(next);
@@ -267,4 +267,40 @@ export function claimMatches(
     const mode = modes[o] ?? DEFAULT_MATCH_MODE;
     return caller.some((c) => matchesOne(o, c, mode));
   });
+}
+
+import type { ResolveStepCapabilitiesInput, ResolvedStepContext } from './types.ts';
+
+/** Resolve one exact firing synchronously. Caller policy never runs here.
+ * Own explicit entries (including identity mappings) precede exact inference;
+ * legacy entries are only a fallback. Copy/freeze the result before sharing it
+ * between eligibility and the order writer. */
+export function resolveStepCapabilities(input: ResolveStepCapabilitiesInput): ResolvedStepContext {
+  const mappings: Record<string, string> = Object.create(null);
+  const own = (map: CapabilityMappings | undefined, key: string): string | undefined =>
+    map && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+  for (const authored of input.authored ?? []) {
+    const explicit = own(input.explicitMappings, authored);
+    const matches = explicit === undefined ? (input.scopedMappings ?? []).filter(m =>
+      m.DefRef.bundleDigest === input.DefRef.bundleDigest && m.DefRef.workflowName === input.DefRef.workflowName
+      && m.step === input.step && m.authored === authored && m.meaningDigest === input.meaningDigest
+      && m.evidenceGeneration === input.evidenceGeneration) : [];
+    if (new Set(matches.map(m => m.target)).size > 1) throw new Error('conflicting exact scoped capability mappings');
+    const target = explicit ?? matches[0]?.target ?? own(input.legacyMappings, authored);
+    if (target !== undefined) mappings[authored] = target;
+  }
+  const composed = composeCapabilities(applyCapabilityMappings(input.authored, mappings), input.modifier);
+  const { offered, reroutedFrom } = applyCapabilityRewrites(composed, input.rewrites ?? {});
+  const crews: string[] = [];
+  const matchModes: Record<string, MatchMode> = Object.create(null);
+  for (const c of offered) {
+    matchModes[c] = input.matchModes && Object.prototype.hasOwnProperty.call(input.matchModes, c)
+      ? input.matchModes[c]! : DEFAULT_MATCH_MODE;
+    if (!input.crewStamps || !Object.prototype.hasOwnProperty.call(input.crewStamps, c)) continue;
+    for (const crew of input.crewStamps[c] ?? []) if (!crews.includes(crew)) crews.push(crew);
+  }
+  return Object.freeze({ capabilities: Object.freeze(offered), crews: Object.freeze(crews),
+    matchModes: Object.freeze(matchModes), revision: input.revision,
+    ...(input.modifier === undefined ? {} : { modifier: input.modifier }),
+    ...(reroutedFrom === undefined ? {} : { reroutedFrom: Object.freeze(reroutedFrom) }) });
 }
