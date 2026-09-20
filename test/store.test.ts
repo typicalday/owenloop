@@ -105,6 +105,53 @@ test('artifact upsert replaces and preserves JSON fields', () => {
   s.close();
 });
 
+test('artifact evidence reads persisted rows independently of logical readers, in the same transaction', (t) => {
+  class LogicalStore extends Store {
+    override getArtifact(workflow: string, path: string) {
+      const row = super.getArtifact(workflow, path);
+      return row && { ...row, value: { hydrated: true } };
+    }
+    override listArtifacts(workflow: string) {
+      return super.listArtifacts(workflow).map(row => ({ ...row, value: { hydrated: true } }));
+    }
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'artifact-evidence-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const db = join(dir, 'store.db');
+  const s = new LogicalStore(db), observer = new Store(db);
+  t.after(() => { observer.close(); s.close(); });
+  const original = artifact('wf', 'seed', { acceptance: 'green', version: 1, value: { opaque: 'one' } });
+  s.putArtifact(original);
+  const persisted = observer.getArtifact('wf', 'seed');
+  assert.deepEqual(s.getArtifactEvidence('wf', 'seed'), persisted);
+  assert.deepEqual(s.getArtifact('wf', 'seed')?.value, { hydrated: true });
+  assert.deepEqual(s.listArtifacts('wf')[0]?.value, { hydrated: true });
+  assert.equal(s.getArtifactEvidence('wf', 'missing'), undefined);
+  const changes = () => s.db.prepare('SELECT total_changes() AS n').get()!.n;
+  const before = changes();
+  s.readTx(() => {
+    assert.equal(s.db.isTransaction, true);
+    assert.deepEqual(s.getArtifactEvidence('wf', 'seed'), persisted);
+  });
+  assert.equal(changes(), before, 'evidence reads perform no writes');
+  assert.throws(() => s.tx(() => {
+    s.putArtifact({ ...original, version: 2, acceptance: 'rejected', value: { opaque: 'two' } });
+    const current = s.getArtifactEvidence('wf', 'seed')!;
+    assert.equal(current.version, 2);
+    assert.equal(current.acceptance, 'rejected');
+    assert.deepEqual(current.value, { opaque: 'two' });
+    assert.deepEqual(observer.getArtifactEvidence('wf', 'seed'), persisted, 'uncommitted row stays connection-local');
+    throw new Error('rollback evidence test');
+  }), /rollback evidence test/);
+  assert.deepEqual(s.getArtifactEvidence('wf', 'seed'), persisted);
+  s.tx(() => s.putArtifact({ ...original, version: 2, value: { opaque: 'two' } }));
+  const reopened = new Store(db);
+  try {
+    assert.deepEqual(reopened.getArtifactEvidence('wf', 'seed'), s.getArtifactEvidence('wf', 'seed'));
+    assert.deepEqual(reopened.getArtifactEvidence('wf', 'seed'), reopened.getArtifact('wf', 'seed'));
+  } finally { reopened.close(); }
+});
+
 test('artifact history retains immutable versions and lifecycle events', () => {
   const s = mem();
   const wf = randId('wf');
