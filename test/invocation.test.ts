@@ -66,9 +66,7 @@ steps:
       name: report
       version: '1'
       selection: invocation
-      signature:
-        inputs: [{name: data, schema: ${schema}}]
-        outputs: [{name: result, schema: true}]
+      signature: {inputs: [{name: data, schema: ${schema}}], outputs: [{name: result, schema: true}]}
       policy: {name: deterministic, version: '1', config: {}}
     inputs: {data: seed}
     produces: [chosen]
@@ -199,21 +197,21 @@ for (const movement of ['version', 'value', 'acceptance', 'missing', 'non-json']
       const row = f.store.getArtifact(f.workflow, 'seed')!;
       if (movement === 'missing') f.store.deleteArtifact(f.workflow, 'seed');
       else f.store.putArtifact({ ...row,
-        ...(movement === 'version' ? { version: row.version + 1 } : {}),
-        ...(movement === 'value' ? { value: { opaque: 'seed-2' } } : {}),
-        ...(movement === 'acceptance' ? { acceptance: 'rejected' as const } : {}),
-        ...(movement === 'non-json' ? { value: undefined } : {}),
+	...(movement === 'version' ? { version: row.version + 1 } : {}),
+	...(movement === 'value' ? { value: { opaque: 'seed-2' } } : {}),
+	...(movement === 'acceptance' ? { acceptance: 'rejected' as const } : {}),
+	...(movement === 'non-json' ? { value: undefined } : {}),
       });
       const changes = () => f.store.db.prepare('SELECT total_changes() AS n').get()!.n;
       const before = changes();
       f.store.withLogicalValue(logicalSeed, () => {
-        assert.equal(f.engine.applyChoice(snapshot, f.candidate).kind, 'stale-evidence');
-        assert.equal(f.engine.invocationStatus(f.workflow, 'chosen').kind, alreadyBound ? 'stale' : 'unresolved');
-        const fresh = f.engine.decisionSnapshot(f.workflow, 'chosen', [f.candidate]);
-        if (movement === 'version' || movement === 'value') {
-          assert.equal(fresh.kind, 'ready');
-          if (fresh.kind === 'ready') assert.notEqual(fresh.snapshot.key.evidenceDigest, snapshot.key.evidenceDigest);
-        } else assert.deepEqual(fresh, { kind: 'evidence-not-ready', paths: ['seed'] });
+	assert.equal(f.engine.applyChoice(snapshot, f.candidate).kind, 'stale-evidence');
+	assert.equal(f.engine.invocationStatus(f.workflow, 'chosen').kind, alreadyBound ? 'stale' : 'unresolved');
+	const fresh = f.engine.decisionSnapshot(f.workflow, 'chosen', [f.candidate]);
+	if (movement === 'version' || movement === 'value') {
+	  assert.equal(fresh.kind, 'ready');
+	  if (fresh.kind === 'ready') assert.notEqual(fresh.snapshot.key.evidenceDigest, snapshot.key.evidenceDigest);
+	} else assert.deepEqual(fresh, { kind: 'evidence-not-ready', paths: ['seed'] });
       });
       assert.equal(changes(), before, 'refusal and currentness reads have no SQLite effects');
       assert.equal(f.store.listWorkflows().length, 1);
