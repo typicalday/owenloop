@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -409,11 +409,29 @@ test('calls relay: a consumer without a verified definition in hand cannot corro
 import { runtimeFixture, ready } from '../../../test/helpers/runtime-selection.ts';
 import type { InvocationBindingSource } from '../../../src/types.ts';
 
+import { createEngine } from '../../../src/factory.ts';
+import { loadCasDefs } from '../../../src/store/def-source.ts';
+
+for (const crossStore of [false, true]) {
 for (const factory of ['store', 'default'] as const) {
-test(`invocation relay (${factory} factory): trusted SQLite/CAS receipt corroborates signed workflow, digest, outcome, version and value`, async () => {
+test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted SQLite/CAS receipt corroborates signed workflow, digest, outcome, version and value`, async () => {
   const cwd = tempDir('owenloop-default-relay-');
-  const f = await runtimeFixture(':memory:', join(cwd, 'workflows'));
-  const workflow = f.engine.createInstance('parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  const env = trustEnv();
+  const globalRoot = crossStore ? join(env.HOME!, '.owenloop', 'workflows') : join(cwd, 'workflows');
+  const f = await runtimeFixture(':memory:', globalRoot);
+  const projectRoot = crossStore ? join(cwd, 'workflows') : f.root;
+  if (crossStore) {
+    const yaml = readFileSync(f.defs.get('parent/parent@1.0.0')!.dir!, 'utf8')
+      .replace('name: parent', 'name: hybrid')
+      .replace('steps:\n', 'steps:\n  - name: concrete\n    calls: left/left@1.0.0\n    inputs: {data: seed}\n    produces: [concrete]\n');
+    await installBundleFixture({ root: projectRoot, projectRoot, globalRoot,
+      sourceDir: writeBundleSource({ name: 'hybrid', workflow: yaml,
+        lock: { 'left/left@1.0.0': f.candidates[0]!.DefRef.bundleDigest } }) });
+    f.store.close();
+    Object.assign(f, createEngine({ db: ':memory:', defs: new Map(
+      loadCasDefs({ projectRoot, globalRoot, warn: () => {} }).map(r => [r.key, r.def])) }));
+  }
+  const workflow = f.engine.createInstance(crossStore ? 'hybrid/hybrid@1.0.0' : 'parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
   for (const [i, path] of ['one', 'two'].entries()) f.engine.applyChoice(ready(f.engine, workflow, path, f.candidates), f.candidates[i]!);
   const children = f.engine.tick(workflow, { deep: true }).orders;
   for (const o of children) {
@@ -433,7 +451,7 @@ test(`invocation relay (${factory} factory): trusted SQLite/CAS receipt corrobor
       consumedFingerprint: {}, producerKeyId: ROOT_KEY_ID, timestamp: 10 });
     relays[path] = { childDefDigest: b.selected.DefRef.bundleDigest, childOutcome: 'result', childVersion: a.version };
   }
-  const fixtureData: Fixture = { projectRoot: f.root, parentDigest, childDigest: f.candidates[0]!.DefRef.bundleDigest, env: trustEnv() };
+  const fixtureData: Fixture = { projectRoot, parentDigest, childDigest: f.candidates[0]!.DefRef.bundleDigest, env };
   const packet: OrderPacket = { ...order(fixtureData), workflow, run: finish.run, step: 'finish', key: '',
     inputs: ['one', 'two'], consumes: finish.consumes, consumedFingerprint: finish.consumedFingerprint,
     consumesProof: JSON.stringify(proofs), consumesProofRelay: relays };
@@ -446,7 +464,7 @@ test(`invocation relay (${factory} factory): trusted SQLite/CAS receipt corrobor
     };
     return factory === 'default'
       ? createDefaultStoreInstructionResolver({ ...options, cwd, env: fixtureData.env })
-      : createStoreInstructionResolver({ ...options, globalRoot: f.root });
+      : createStoreInstructionResolver({ ...options, projectRoot, globalRoot });
   };
   const reads: Parameters<InvocationBindingSource['read']>[0][] = [];
   const passed = await resolver({ read: key => { reads.push(key); return source.read(key); } }).resolveCommand(packet);
@@ -478,4 +496,6 @@ test(`invocation relay (${factory} factory): trusted SQLite/CAS receipt corrobor
   assert.equal((await passed.revalidate!())?.ok, false);
   f.store.close();
 });
+}
+
 }

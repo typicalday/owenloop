@@ -2608,6 +2608,48 @@ import type { DecisionSnapshot, InvocationCandidate } from '../src/types.ts';
 
 import { runtimeFixture, ready } from './helpers/runtime-selection.ts';
 
+test('runtime selection: cross-store locked dependency survives snapshot, apply and trusted receipt', async (t) => {
+  const f = await runtimeFixture();
+  t.after(() => f.store.close());
+  const projectRoot = mkdtempSync(join(tmpdir(), 'invocation-project-'));
+  const yaml = readFileSync(f.defs.get('parent/parent@1.0.0')!.dir!, 'utf8')
+    .replace('name: parent', 'name: hybrid')
+    .replace('steps:\n', 'steps:\n  - name: concrete\n    calls: left/left@1.0.0\n    inputs: {data: seed}\n    produces: [concrete]\n');
+  await installBundleFixture({ root: projectRoot, projectRoot, globalRoot: f.root,
+    sourceDir: writeBundleSource({ name: 'hybrid', workflow: yaml,
+      lock: { 'left/left@1.0.0': f.candidates[0]!.DefRef.bundleDigest } }) });
+  const defs = new Map(loadCasDefs({ projectRoot, globalRoot: f.root, warn: () => {} }).map(r => [r.key, r.def]));
+  const { engine, store } = createEngine({ db: ':memory:', defs });
+  t.after(() => store.close());
+  const workflow = engine.createInstance('hybrid/hybrid@1.0.0', { provide: { seed: { n: 1 } } });
+  const snapshot = ready(engine, workflow, 'one', f.candidates);
+  assert.deepEqual(snapshot.candidates.map(c => c.assessment.kind), ['eligible', 'eligible']);
+  assert.equal(engine.applyChoice(snapshot, f.candidates[1]!).kind, 'bound');
+  assert.equal(engine.applyChoice(snapshot, f.candidates[1]!).kind, 'replayed');
+  const orders = engine.tick(workflow, { deep: true }).orders;
+  assert.equal(orders.length, 2, 'concrete locked child and selected invocation both execute');
+  const concrete = store.findChildByParent(workflow, 'concrete')!;
+  assert.equal(concrete.defSnapshot!.bundleDigest, f.candidates[0]!.DefRef.bundleDigest);
+  for (const order of orders) {
+    engine.green(order.workflow, order.run, 'result', { ok: true });
+    engine.close(order.workflow, order.run);
+  }
+  const key = { parentWorkflow: workflow, parentDefRef: snapshot.key.parentDefRef,
+    callPath: 'one', parentArtifactVersion: store.getArtifact(workflow, 'one')!.version };
+  const receipt = engine.invocationBindingSource().read(key);
+  assert.ok(receipt);
+  assert.deepEqual(receipt.receipt.childDefRef, f.candidates[1]!.DefRef);
+  const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  assert.deepEqual(engine.invocationBindingSource().read(key), receipt);
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before, 'trusted read is read-only');
+  const stale = ready(engine, workflow, 'two', f.candidates);
+  engine.provideInput(workflow, 'seed', { n: 2 });
+  const afterMovement = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+  assert.equal(engine.applyChoice(stale, f.candidates[0]!).kind, 'stale-evidence');
+  assert.equal(engine.invocationBindingSource().read(key), undefined);
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, afterMovement);
+});
+
 test('runtime selection: durable real CAS two-site demo, replay, restart, invalidation and cancel', async () => {
   const proof = join(process.cwd(), '.owenloop/proofs/runtime-selection');
   mkdirSync(proof, { recursive: true });
