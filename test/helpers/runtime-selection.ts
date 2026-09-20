@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createEngine } from '../../src/factory.ts';
 import type { Engine } from '../../src/engine.ts';
-import { loadCasDefs } from '../../src/store/def-source.ts';
+import { withWorkflowSnapshotStoreGuard } from '../../src/store/snapshot-guard.ts';
+import { loadCasDefs, verifyInvocationDefinition } from '../../src/store/def-source.ts';
 import { installBundleFixture, writeBundleSource } from './store-fixture.ts';
 import type { DecisionSnapshot, InvocationCandidate } from '../../src/types.ts';
 export async function runtimeFixture(db = ':memory:', root?: string) {
@@ -68,6 +69,8 @@ export function reloadRuntimeEngine(store: Store, root: string, maxCallDepth?: n
       : from ? resolveCallsTarget(defs, name, from) : defs.get(name);
     if (!d) throw new Error(`unknown workflow definition '${name}'`);
     return d;
-  }, { maxCallDepth });
+  }, { maxCallDepth, invocationAuthority: {
+    verifyDefinition: verifyInvocationDefinition, withDefinitions: withWorkflowSnapshotStoreGuard,
+  } });
   return { engine, defs };
 }
