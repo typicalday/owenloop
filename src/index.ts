@@ -449,3 +449,6 @@ export type {
 // ---- WP-D2 signed submission records ----
 export { canonicalValueBytes, valueDigestHex, buildSubmissionRecord, signSubmission } from './crypto/index.ts';
 export type { BuildSubmissionRecordInput, SubmissionProducedInput } from './crypto/index.ts';
+
+export type { DefRef, JsonValue, InvocationPolicy, InvocationCall, InterfaceCall, InvocationCandidate, CandidateInvalidCode, CandidateIneligibleCode, CandidateAssessment, AssessedCandidate, InvocationEvidence, InvocationKey, RunAdmission, DecisionSnapshot, InvocationBinding, DecisionSnapshotResult, ApplyChoiceResult, InvocationStatus, InvocationRelayKey, InvocationRelayReceipt, VerifiedInvocationReceipt, InvocationBindingSource } from './types.ts';
+export { evidenceDigest, candidateSetDigest, invocationId } from './invocation.ts';

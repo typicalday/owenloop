@@ -254,3 +254,17 @@ test('the owenloop MCP auto-grant is untouched by any of this', async () => {
   assert.deepEqual(reply, { action: 'accept', content: {} });
   assert.deepEqual(asked, [], 'owenloop\'s own mount does not consume a human decision');
 });
+
+
+test('foreign and non-tool MCP elicitations cannot borrow own-mount approval with a channel', async () => {
+  const { handle, asked, events } = handlerFor(APPROVED);
+  for (const params of [
+    { serverName: 'foreign', _meta: { codex_approval_kind: 'mcp_tool_call' } },
+    { serverName: 'owenloop', mode: 'form', requestedSchema: { type: 'object' } },
+    { serverName: 'owenloop', _meta: { codex_approval_kind: 'future_approval_kind' } },
+  ]) {
+    await assert.rejects(handle('mcpServer/elicitation/request', params), /cannot answer an elicitation/);
+  }
+  assert.deepEqual(asked, [], 'the ordinary approval channel does not authorize MCP elicitation');
+  assert.equal(events.filter((event) => event.kind === 'needs_input').length, 3);
+});
