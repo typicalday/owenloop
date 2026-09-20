@@ -437,6 +437,7 @@ function discoverCasDefs(
 	const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
 	const globalRoot = projectStoreRoot(args.globalRoot);
 	const sameRoot = projectRoot === undefined || projectRoot === globalRoot;
+	const resolutionContext = Object.freeze({ ...(projectRoot === undefined ? {} : { projectRoot }), globalRoot });
 
 	const project = sameRoot
 		? { entries: [] as IndexedCoordinate[], complete: true }
@@ -496,6 +497,11 @@ function discoverCasDefs(
 			// and, for project exact-digest fallback, the global root that supplied
 			// its verified bytes.
 			for (const def of loaded.defs.values()) {
+				Object.defineProperty(def, 'bundleResolutionContext', {
+					value: resolutionContext,
+					configurable: true,
+					enumerable: false,
+				});
 				setBundleStoreRoots(def, [...new Set([
 					...(def.bundleStoreRoots ?? []),
 					indexed.root,
@@ -594,13 +600,31 @@ export function inspectCasDefs(args: LoadCasDefsArgs): CasDefInspectionResult {
 	return discoverCasDefs(args, true);
 }
 
+/**
+ * Internal snapshot/invocation revalidation, using the original discovery roles.
+ * Check exact lock reachability before finalization: ordinary calls resolution
+ * can fall back to the direct alias and defer its digest check until spawn.
+ * That fallback cannot authorize a selection or a trusted receipt.
+ */
+export function revalidateCasDefs(args: LoadCasDefsArgs): Map<string, WorkflowDef> {
+	const registrations = loadCasDefs(args);
+	const callableKeys = new Set(registrations.filter(r => r.kind === 'coordinate').map(r => r.key));
+	for (const def of new Set(registrations.map(r => r.def))) {
+		for (const [coordinate, digest] of Object.entries(def.bundleLock ?? {})) {
+			if (!callableKeys.has(digestScopedCallsTargetKey(digest, coordinate))) {
+				throw new Error(`bundle ${def.bundleDigest} lock target '${coordinate}' pinned to ${digest} ` +
+					'is no longer exactly callable from the combined workflow store');
+			}
+		}
+	}
+	return finalizeDefs(new Map(registrations.map(r => [r.key, r.def])));
+}
+
 /** Re-read exact CAS bytes and compare the compiled definition, including its call policy. */
 export function verifyInvocationDefinition(def: WorkflowDef, target?: string): boolean {
-  if (!def.bundleDigest || !def.bundleStoreRoots?.length) return false;
-  const registrations = def.bundleStoreRoots.flatMap(root => loadCasDefs({ globalRoot: root, warn: () => {} }));
-  if (target !== undefined && !registrations.some(r => r.kind === 'coordinate' && r.coordinate === target
-    && r.bundleDigest === def.bundleDigest && r.def.name === def.name)) return false;
-  const defs = finalizeDefs(new Map(registrations.map(r => [r.key, r.def])));
+  if (!def.bundleDigest || !def.bundleStoreRoots?.length || !def.bundleResolutionContext) return false;
+  const defs = revalidateCasDefs({ ...def.bundleResolutionContext, warn: () => {} });
+  if (target !== undefined && defs.get(digestScopedCallsTargetKey(def.bundleDigest, target))?.name !== def.name) return false;
   const exact = [...defs.values()].find(d => d.bundleDigest === def.bundleDigest && d.name === def.name);
   return exact !== undefined && valueDigestHex(exact) === valueDigestHex(def);
 }

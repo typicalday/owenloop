@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Engine, InterfaceBindingRefusalError, SchemaRefusalError } from '../src/engine.ts';
@@ -2608,9 +2608,8 @@ import type { DecisionSnapshot, InvocationCandidate } from '../src/types.ts';
 
 import { runtimeFixture, ready } from './helpers/runtime-selection.ts';
 
-test('runtime selection: cross-store locked dependency survives snapshot, apply and trusted receipt', async (t) => {
+async function crossStoreInvocationFixture() {
   const f = await runtimeFixture();
-  t.after(() => f.store.close());
   const projectRoot = mkdtempSync(join(tmpdir(), 'invocation-project-'));
   const yaml = readFileSync(f.defs.get('parent/parent@1.0.0')!.dir!, 'utf8')
     .replace('name: parent', 'name: hybrid')
@@ -2618,10 +2617,23 @@ test('runtime selection: cross-store locked dependency survives snapshot, apply 
   await installBundleFixture({ root: projectRoot, projectRoot, globalRoot: f.root,
     sourceDir: writeBundleSource({ name: 'hybrid', workflow: yaml,
       lock: { 'left/left@1.0.0': f.candidates[0]!.DefRef.bundleDigest } }) });
+  // The direct project alias must win, but the hybrid's lock still selects
+  // the different global bytes for that same coordinate.
+  await installBundleFixture({ root: projectRoot, projectRoot, globalRoot: f.root,
+    sourceDir: writeBundleSource({ name: 'left',
+      workflow: readFileSync(f.defs.get('left/left@1.0.0')!.dir!, 'utf8') + '\n# project shadow\n' }) });
   const defs = new Map(loadCasDefs({ projectRoot, globalRoot: f.root, warn: () => {} }).map(r => [r.key, r.def]));
   const { engine, store } = createEngine({ db: ':memory:', defs });
+  f.store.close();
+  return { ...f, defs, engine, store, projectRoot };
+}
+
+test('runtime selection: cross-store locked dependency survives snapshot, apply and trusted receipt', async (t) => {
+  const f = await crossStoreInvocationFixture();
+  const { engine, store } = f;
   t.after(() => store.close());
   const workflow = engine.createInstance('hybrid/hybrid@1.0.0', { provide: { seed: { n: 1 } } });
+  assert.notEqual(f.defs.get('left/left@1.0.0')!.bundleDigest, f.candidates[0]!.DefRef.bundleDigest);
   const snapshot = ready(engine, workflow, 'one', f.candidates);
   assert.deepEqual(snapshot.candidates.map(c => c.assessment.kind), ['eligible', 'eligible']);
   assert.equal(engine.applyChoice(snapshot, f.candidates[1]!).kind, 'bound');
@@ -2636,19 +2648,66 @@ test('runtime selection: cross-store locked dependency survives snapshot, apply 
   }
   const key = { parentWorkflow: workflow, parentDefRef: snapshot.key.parentDefRef,
     callPath: 'one', parentArtifactVersion: store.getArtifact(workflow, 'one')!.version };
-  const receipt = engine.invocationBindingSource().read(key);
+  const receipt = await engine.invocationBindingSource().read(key);
   assert.ok(receipt);
   assert.deepEqual(receipt.receipt.childDefRef, f.candidates[1]!.DefRef);
   const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
-  assert.deepEqual(engine.invocationBindingSource().read(key), receipt);
+  assert.deepEqual(await engine.invocationBindingSource().read(key), receipt);
   assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before, 'trusted read is read-only');
   const stale = ready(engine, workflow, 'two', f.candidates);
   engine.provideInput(workflow, 'seed', { n: 2 });
   const afterMovement = store.db.prepare('SELECT total_changes() AS n').get()!.n;
   assert.equal(engine.applyChoice(stale, f.candidates[0]!).kind, 'stale-evidence');
-  assert.equal(engine.invocationBindingSource().read(key), undefined);
+  assert.equal(await engine.invocationBindingSource().read(key), undefined);
   assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, afterMovement);
 });
+
+
+import { readWorkflowStoreIndex, storeIndexPath, writeWorkflowStoreIndex, workflowCoordinate } from '../src/store/index.ts';
+
+for (const damage of ['missing', 'corrupt', 'wrong-digest', 'moved'] as const) {
+  test(`runtime selection: cross-store ${damage} locked dependency refuses apply and relay without writes`, async (t) => {
+    const f = await crossStoreInvocationFixture();
+    const { engine, store } = f;
+    t.after(() => store.close());
+    const workflow = engine.createInstance('hybrid/hybrid@1.0.0', { provide: { seed: { n: 1 } } });
+    const one = ready(engine, workflow, 'one', f.candidates);
+    assert.equal(engine.applyChoice(one, f.candidates[1]!).kind, 'bound');
+    for (const order of engine.tick(workflow, { deep: true }).orders) {
+      engine.green(order.workflow, order.run, 'result', { ok: true });
+      engine.close(order.workflow, order.run);
+    }
+    const key = { parentWorkflow: workflow, parentDefRef: one.key.parentDefRef,
+      callPath: 'one', parentArtifactVersion: store.getArtifact(workflow, 'one')!.version };
+    assert.ok(await engine.invocationBindingSource().read(key));
+    const two = ready(engine, workflow, 'two', f.candidates);
+    const index = readWorkflowStoreIndex(storeIndexPath(f.root));
+    const coordinate = workflowCoordinate({ namespace: 'left', name: 'left', version: '1.0.0' });
+    const objectDir = objectDirForDigest(f.root, defDigest(f.candidates[0]!.DefRef.bundleDigest));
+    if (damage === 'missing') {
+      delete index.entries[coordinate];
+      writeWorkflowStoreIndex(storeIndexPath(f.root), index);
+    } else if (damage === 'wrong-digest') {
+      index.entries[coordinate]!.digest = defDigest(f.candidates[1]!.DefRef.bundleDigest);
+      writeWorkflowStoreIndex(storeIndexPath(f.root), index);
+    } else if (damage === 'moved') {
+      chmodSync(objectDir, 0o755);
+      renameSync(objectDir, join(mkdtempSync(join(tmpdir(), 'moved-dependency-')), 'object'));
+    } else {
+      const file = join(objectDir, 'workflow.yaml');
+      chmodSync(file, 0o644);
+      writeFileSync(file, readFileSync(file, 'utf8') + '\n# corrupt immutable object\n');
+      chmodSync(file, 0o444);
+    }
+    const before = store.db.prepare('SELECT total_changes() AS n').get()!.n;
+    assert.throws(() => engine.decisionSnapshot(workflow, 'two', f.candidates));
+    assert.throws(() => engine.applyChoice(two, f.candidates[1]!));
+    await assert.rejects(async () => engine.invocationBindingSource().read(key));
+    assert.equal(store.db.prepare('SELECT total_changes() AS n').get()!.n, before);
+    assert.equal(store.listInvocations(workflow).length, 1);
+    assert.equal(store.listChildrenByParent(workflow).length, 2);
+  });
+}
 
 test('runtime selection: durable real CAS two-site demo, replay, restart, invalidation and cancel', async () => {
   const proof = join(process.cwd(), '.owenloop/proofs/runtime-selection');

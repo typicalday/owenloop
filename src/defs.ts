@@ -1157,9 +1157,9 @@ export function expandIncludes(
   // cannot carry them. Preserve the original descriptor explicitly so an
   // include-expanded CAS definition still coordinates its snapshot writes with
   // bundle GC.
-  const storeRoots = Object.getOwnPropertyDescriptor(def, 'bundleStoreRoots');
-  if (storeRoots !== undefined) {
-    Object.defineProperty(expanded, 'bundleStoreRoots', storeRoots);
+  for (const key of ['bundleStoreRoots', 'bundleResolutionContext'] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(def, key);
+    if (descriptor !== undefined) Object.defineProperty(expanded, key, descriptor);
   }
   return expanded;
 }

@@ -54,6 +54,26 @@ test('parseDef builds a valid def and fills defaults', () => {
   assert.equal(def.steps[3]!.terminal, true);
 });
 
+test('include expansion preserves live CAS resolution roles without hashing or serializing them', () => {
+  const parent = buildDef({ name: 'parent', inputs: [{ name: 'seed' }],
+    steps: [{ include: 'child', as: 'nested', inputs: { seed: 'seed' } }] });
+  const child = buildDef({ name: 'child', inputs: [{ name: 'seed' }],
+    steps: [{ name: 'work', consumes: ['seed'], produces: ['done'] }] });
+  const resolve = (name: string) => name === 'child' ? child : undefined;
+  const baseline = expandIncludes(parent, resolve);
+  const context = Object.freeze({ projectRoot: '/project/workflows', globalRoot: '/global/workflows' });
+  Object.defineProperty(parent, 'bundleResolutionContext', { value: context, enumerable: false });
+  Object.defineProperty(parent, 'bundleStoreRoots', { value: [context.projectRoot], enumerable: false });
+  const expanded = expandIncludes(parent, resolve);
+  assert.equal(expanded.bundleResolutionContext, context);
+  assert.deepEqual(expanded.bundleStoreRoots, [context.projectRoot]);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(expanded, 'bundleResolutionContext'),
+    Object.getOwnPropertyDescriptor(parent, 'bundleResolutionContext'));
+  assert.equal(hashDef(expanded), hashDef(baseline));
+  assert.equal(JSON.stringify(expanded), JSON.stringify(baseline));
+  assert.equal(JSON.parse(JSON.stringify(expanded)).bundleResolutionContext, undefined);
+});
+
 test('parseDef accepts workdirFrom and records its grammar field', () => {
   const parsed = parseDef({
     name: 'workdir',

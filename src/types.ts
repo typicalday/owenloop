@@ -929,6 +929,14 @@ export interface WorkflowDef {
    */
   bundleStoreRoots?: string[];
   /**
+   * @internal Complete live CAS discovery context, with root roles preserved.
+   * Object provenance above is not a dependency search path: a project object
+   * may lock a global dependency (and vice versa). Revalidation must repeat
+   * the original combined discovery. Non-enumerable, never hashed/persisted;
+   * absent on deserialized snapshots and non-CAS definitions.
+   */
+  bundleResolutionContext?: Readonly<{ projectRoot?: string; globalRoot: string }>;
+  /**
    * @internal WS-6 CAS provenance: a COPY of the containing bundle manifest's
    * `lock` map (explicit `namespace/name@version` reference text → the canonical
    * bundle digest that reference is pinned to). Carried on the def so the
