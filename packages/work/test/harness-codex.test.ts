@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,6 +32,8 @@ import {
   readTurnCompleted,
   RESUME_UNAVAILABLE_CODE,
 } from '../src/harness/codex.ts';
+import { HOLD_MCP_TOOL_NAMES } from '../src/hold/mcp.ts';
+import { parseArgs as parseHoldArgs } from '../src/roles/hold.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import type { AgentEvent, DeliverArgs, StartArgs } from '../src/harness/contract.ts';
 
@@ -593,6 +595,15 @@ interface Case {
   expect(params: Record<string, unknown>, events: AgentEvent[]): void;
 }
 
+const OWN_TOOLS = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'];
+
+function assertOwnPolicy(actual: unknown, selected = OWN_TOOLS): void {
+  const mount = actual as Record<string, unknown>;
+  assert.deepEqual(mount['enabled_tools'], selected);
+  assert.deepEqual(mount['tools'], Object.fromEntries(selected.map((name) => [name, { approval_mode: 'approve' }])));
+  assert.deepEqual(Object.keys(mount).sort(), ['args', 'command', 'enabled_tools', 'env', 'tools']);
+}
+
 const MOUNT = { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenloop-server.mjs'] };
 
 /**
@@ -604,6 +615,7 @@ const MOUNT = { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenloop-
  */
 function assertMount(actual: unknown): void {
   const m = actual as { command: string; args: string[]; env: Record<string, string> };
+  assertOwnPolicy(actual);
   assert.equal(m.command, MOUNT.command);
   assert.deepEqual(m.args, MOUNT.args);
   assert.equal(typeof m.env, 'object');
@@ -1079,6 +1091,118 @@ test('C14 the builders never mutate their inputs', () => {
     .owenloop;
   assert.notEqual(mount.args, args.owenloopMcp.args);
   assert.deepEqual(mount.args, args.owenloopMcp.args);
+});
+
+// The explicit adapter list is a deliberate compatibility boundary. A future
+// holder tool requires a reviewed policy and test change, never auto-discovery.
+test('C16 default policy retains the complete current holder surface', () => {
+  assert.deepEqual(OWN_TOOLS, [...HOLD_MCP_TOOL_NAMES]);
+});
+
+test('C17 all supported subsets match the holder parser in both argv forms and on resume', () => {
+  for (let mask = 1; mask < (1 << OWN_TOOLS.length); mask++) {
+    const selected = OWN_TOOLS.filter((_, i) => mask & (1 << i)).reverse();
+    for (const flags of [['--mcp-tools=' + selected.join(',')], ['--mcp-tools', selected.join(',')]]) {
+      assert.deepEqual(parseHoldArgs(flags).mcpTools, selected);
+      const args = startArgs(undefined, { owenloopMcp: { command: '/fixture/node', args: ['cli', 'work', 'hold', '--mcp', ...flags] } });
+      const before = structuredClone(args);
+      for (const params of [buildThreadStartParams(args), buildThreadResumeParams('cold', structuredClone(args)),
+	buildThreadResumeParams('warm', args, buildThreadStartParams(startArgs(undefined)))]) {
+	const mount = (params['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenloop'];
+	assertOwnPolicy(mount, selected);
+	assert.equal((mount as { command: string }).command, args.owenloopMcp.command);
+	assert.deepEqual((mount as { args: string[] }).args, args.owenloopMcp.args);
+	assert.notEqual((mount as { args: string[] }).args, args.owenloopMcp.args);
+	assert.equal(params['approvalPolicy'], 'never');
+      }
+      assert.deepEqual(args, before);
+    }
+  }
+});
+
+test('C18 repeated selectors use the last valid value and invalid earlier values still refuse', () => {
+  const valid = [
+    ['--mcp-tools=get_order,ask', '--mcp-tools', 'put_file_artifact'],
+    ['--mcp-tools', 'put_file_artifact', '--mcp-tools=ask,submit'],
+    ['--heartbeat-interval', '123', '--jump-tolerance', '456', '--mcp-tools=ask'],
+    ['--order', '--mcp-tools=ask'],
+    // A selector-looking string consumed as another flag's value is not a selector.
+    ...['--order', '--workflow', '--session', '--origin', '--as', '--shift'].map((flag) =>
+      [flag, '--mcp-tools=ask', '--mcp-tools=submit']),
+  ];
+  for (const flags of valid) {
+    const expected = parseHoldArgs(flags);
+    assert.equal(expected.error, undefined);
+    const args = startArgs(undefined, { owenloopMcp: { ...MOUNT, args: ['cli', 'work', 'hold', ...flags] } });
+    for (const params of [buildThreadStartParams(args), buildThreadResumeParams('cold', args)]) {
+      assertOwnPolicy((params['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenloop'], expected.mcpTools);
+    }
+  }
+  const invalid = [
+    ['--mcp-tools'], ['--mcp-tools='], ['--mcp-tools', ''],
+    ['--mcp-tools=ask,'], ['--mcp-tools=,ask'], ['--mcp-tools=ask,,submit'],
+    ['--mcp-tools=ask,ask'], ['--mcp-tools=unknown'], ['--mcp-tools=__proto__'],
+    ['--mcp-tools=*'], ['--mcp-tools= ask'], ['--mcp-tools=ASK'],
+    ['--mcp-tools', '--mcp'], ['--mcp-tools=ask=submit'], ['--mcp-tools-extra=ask'],
+    ['--mcp-tools=bad', '--mcp-tools=ask'], ['--mcp-tools=ask', '--mcp-tools=bad'],
+  ];
+  for (const flags of invalid) {
+    assert.ok(parseHoldArgs(flags).error, JSON.stringify(flags));
+    const args = startArgs(undefined, { owenloopMcp: { ...MOUNT, args: ['cli', 'work', 'hold', ...flags] } });
+    assert.throws(() => buildThreadStartParams(args), /mcp-tools/, JSON.stringify(flags));
+    assert.throws(() => buildThreadResumeParams('cold', args), /mcp-tools/, JSON.stringify(flags));
+  }
+});
+
+test('C19 reserved policy overrides lose on start and reconstructed/warm resume without mutation', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-policy-purity-'));
+  const savedEnv = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  process.env['HOME'] = dir;
+  process.env['CODEX_HOME'] = join(dir, '.codex');
+  mkdirSync(process.env['CODEX_HOME']);
+  const globalConfig = join(process.env['CODEX_HOME'], 'config.toml');
+  const sentinel = '# operator configuration must remain byte-for-byte intact\n';
+  writeFileSync(globalConfig, sentinel);
+  const foreign = { command: '/external', args: ['literal space', '--opaque'], tools: { foreign: { approval_mode: 'prompt' } } };
+  const imposter = { command: '/imposter', args: [], env: { UNTRUSTED: 'value' },
+    enabled_tools: ['unknown'], tools: { unknown: { approval_mode: 'approve' } }, default_tools_approval_mode: 'approve' };
+  for (const extensions of [
+    { mcpServers: { owenloop: imposter, foreign } },
+    { codexConfig: { mcp_servers: { owenloop: imposter, foreign } } },
+    { mcpServers: { owenloop: imposter, foreign }, codexConfig: { mcp_servers: { owenloop: imposter, other: foreign } } },
+  ]) {
+    const args = startArgs({ permissionMode: 'never', sandbox: 'read-only', ...extensions }, {
+      owenloopMcp: { command: '/literal path/node', args: ['literal path/cli', 'work', 'hold', '--mcp-tools=ask,put_file_artifact'] },
+    });
+    const snapshot = structuredClone(args);
+    const env = { ...process.env };
+    const base = buildThreadStartParams(startArgs(undefined));
+    const baseSnapshot = structuredClone(base);
+    for (const params of [buildThreadStartParams(args), buildThreadResumeParams('cold', structuredClone(args)), buildThreadResumeParams('warm', args, base)]) {
+      const servers = (params['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers;
+      assertOwnPolicy(servers['owenloop'], ['ask', 'put_file_artifact']);
+      assert.deepEqual(servers['foreign'], foreign);
+      if ('mcpServers' in extensions && 'codexConfig' in extensions) assert.deepEqual(servers['other'], foreign);
+      const mount = servers['owenloop'] as { command: string; args: string[]; env: Record<string, string> };
+      assert.equal(mount.command, args.owenloopMcp.command);
+      assert.deepEqual(mount.args, args.owenloopMcp.args);
+      assert.equal(mount.env['UNTRUSTED'], undefined);
+      assert.equal(mount.env['HOME'], dir);
+      assert.equal(params['sandbox'], 'read-only');
+      assert.equal(params['approvalPolicy'], 'never');
+    }
+    assert.deepEqual(args, snapshot);
+    assert.deepEqual(base, baseSnapshot);
+    assert.deepEqual({ ...process.env }, env);
+    assert.equal(readFileSync(globalConfig, 'utf8'), sentinel);
+    assert.deepEqual(readdirSync(dir), ['.codex']);
+    assert.deepEqual(readdirSync(process.env['CODEX_HOME']), ['config.toml']);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1766,6 +1890,15 @@ test('D8 an owenloop mount failure interrupts the turn and tears the child down'
 
   // The session is gone, so a later stop is the documented no-op.
   await codexAdapter.stop({ harness: 'codex', token: STUB_THREAD });
+});
+
+test('D8a malformed tool selectors refuse start and resume before spawning an app-server', async (t) => {
+  const stub = useStub(t, 'hang-turn');
+  const args = startArgs(undefined, { cwd: stub.dir, owenloopMcp: { ...MOUNT, args: ['--mcp-tools=ask,unknown'] } });
+  await assert.rejects(codexAdapter.start(args, () => {}), /mcp-tools/);
+  await assert.rejects(codexAdapter.deliver({ harness: 'codex', token: 'missing' }, 'resume', args, () => {}), /mcp-tools/);
+  assert.equal(stub.pid(), undefined);
+  assert.deepEqual(stub.received(), []);
 });
 
 test('D9 owenloop tool-call approvals are granted; every other elicitation is refused', async (t) => {
