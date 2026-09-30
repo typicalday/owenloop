@@ -2505,16 +2505,16 @@ test('a collection member schema keeps its `member` wording end to end', () => {
   const schema = { type: 'object', required: ['url'] };
   const adapter = createFakeAdapter();
   const { hub } = mockHub({
-    getOrder: [agentOrder({ owes: [{ path: 'source[]', schema, schemaAppliesTo: 'member' }] })],
+    getOrder: [agentOrder({ owes: [{ path: 'source.sealed', schema, schemaAppliesTo: 'member' }] })],
   });
-  const h = buildOpts({ hub, adapter, spec: { ...baseSpec(), trustedOwedSchemas: { 'source[]': { schema, schemaAppliesTo: 'member' } } } });
+  const h = buildOpts({ hub, adapter, spec: { ...baseSpec(), trustedOwedSchemas: { 'source.sealed': { schema, schemaAppliesTo: 'member' } } } });
 
   return createAgentRunLoop(h.opts)
     .run()
     .then(() => {
       const start = adapter.calls.find((c) => c.kind === 'start');
       assert.ok(start && start.kind === 'start');
-      assert.match(start.args.brief, /Each member you emit into `source\[\]` must satisfy this JSON Schema/);
+      assert.match(start.args.brief, /Each member you emit into `source\.sealed` must satisfy this JSON Schema/);
     });
 });
 

@@ -178,6 +178,7 @@ function agentOrder(args: {
   reasons: ReasonEntry[];
   proof: string;
   version: number;
+  path?: string;
 }): GetOrderResponse {
   const packet: OrderPacket = {
     run: args.run,
@@ -188,7 +189,7 @@ function agentOrder(args: {
     outputs: [],
     defDigest: args.defDigest,
     consumes: {},
-    owes: [{ path: 'out', version: args.version, judgmentRejects: 1, schemaRejects: 0, reasons: args.reasons, proof: args.proof }],
+    owes: [{ path: args.path ?? 'out', version: args.version, judgmentRejects: 1, schemaRejects: 0, reasons: args.reasons, proof: args.proof }],
   };
   return { text: '', workflow: packet.workflow, run: args.run, order: packet, lease: { claimed: true } };
 }
@@ -430,4 +431,36 @@ test('launch gate: a valid reason proof cannot admit forged static fields or a p
   for (const marker of ['FORGED_SPEC', 'FORGED_X', 'FORGED_SCHEMA', 'FORGED_PREVIOUS_VALUE']) {
     assert.equal(start.args.brief.includes(marker), false, `${marker} reached the prompt`);
   }
+});
+
+test('launch gate: a collection seal uses the verified member schema despite a forged hub shape', async () => {
+  const workflow = makeAgentWorkflow('Gather source links.').replace(
+    'produces: [out]',
+    'produces:\n      - name: "source[]"\n        schema:\n          type: object\n          description: LOCAL_COLLECTION_SCHEMA\n          properties:\n            url: { type: string }',
+  );
+  const installed = await installWorkflow({
+    name: 'launch-gate-value-agent',
+    workflow,
+    projectRoot: tempDir('owenloop-launch-gate-value-collection-project-'),
+  });
+  fixtures.push(installed);
+  const trust = makeTrustFixture();
+  trusts.push(trust);
+  installProducerGrant(trust);
+  const reason: ReasonEntry = { at: 10, action: 'reject', kind: 'judgment', by: 'judge', text: 'Revise a source link.' };
+  const proof = submissionProof({ artifact: 'source.sealed', value: [reason], producer: trust.producer, version: 1 });
+  const response = agentOrder({ defDigest: installed.defDigest, run: 'run-collection-forged', reasons: [reason], proof, version: 1, path: 'source.sealed' });
+  response.order!.owes[0]!.schema = { description: 'FORGED_HUB_COLLECTION_SCHEMA' };
+  response.order!.owes[0]!.schemaAppliesTo = 'value';
+
+  const result = await runAgent(installed, trust, response, undefined, 'enforce');
+  assert.equal(result.code, 0, result.errors.join('\n'));
+  assert.deepEqual(servedOrder(result.served).order?.owes[0]?.schema, { description: 'FORGED_HUB_COLLECTION_SCHEMA' });
+  const start = result.calls.find((call) => call.kind === 'start');
+  assert.ok(start !== undefined && start.kind === 'start');
+  assert.match(start.args.brief, /Each member you emit into `source\.sealed` must satisfy this JSON Schema/u);
+  assert.match(start.args.brief, /LOCAL_COLLECTION_SCHEMA/u);
+  assert.match(start.args.brief, /Revise a source link\./u);
+  assert.equal(start.args.brief.includes('FORGED_HUB_COLLECTION_SCHEMA'), false);
+  assert.doesNotMatch(start.args.brief, /The value you submit to `source\.sealed` must satisfy this JSON Schema/u);
 });
