@@ -114,14 +114,12 @@ export interface OwedBrief {
    *  Schema (`packet.owes[].schemaRejects`). */
   schemaRejects?: number;
   /**
-   * The JSON Schema the engine will enforce on this path at commit time
-   * (`packet.owes[].schema`). Optional for the same reason the counters are: a
-   * hub that does not project it is not a hub reporting "no constraint", so the
-   * shape contract stays silent rather than telling an agent its output is
-   * unconstrained when it may not be.
+   * The JSON Schema the locally resolved definition declares for this path.
+   * Absent means this worker has no verified shape to report; the brief stays
+   * silent rather than claiming the output is unconstrained.
    */
   schema?: unknown;
-  /** What `schema` governs (`packet.owes[].schemaAppliesTo`) — `'value'` for the
+  /** What the local schema governs — `'value'` for the
    *  submitted value itself, `'member'` for each member emitted into a
    *  collection. Read only when `schema` is present. */
   schemaAppliesTo?: 'value' | 'member';
@@ -209,8 +207,8 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
 function renderInputContract(spec: BriefSpec): string {
   if (owedPaths(spec).length === 0) return '';
   return [
-    'Before you start: call the `get_order` tool on the mounted `owenloop` MCP server. It takes no arguments and returns THIS order in full — the inputs you were given (`consumes`), the exact output paths you owe, and each path\'s reason thread, including why any previous attempt was rejected.',
-    'That packet is authoritative. This brief is a summary of it, rendered once when the order was dispatched; where the two disagree, the packet is right.',
+    'Before you start: call the `get_order` tool on the mounted `owenloop` MCP server. It takes no arguments and returns the live inputs you were given (`consumes`), the exact output paths you owe, and each path\'s reason thread, including why any previous attempt was rejected.',
+    'That packet is authoritative for live inputs, owed paths, and reason threads. The output shape in this brief comes from the locally resolved workflow definition.',
     'If something you need is not in what `get_order` returns and you cannot recover it by working — reading the repository, re-reading your inputs, running a read-only command — then it was not given to you. Do not invent it and do not proceed on an assumption: use `ask` (below).',
   ].join('\n');
 }

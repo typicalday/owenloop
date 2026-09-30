@@ -64,6 +64,7 @@ import { createApprovalRequester } from './approvals.ts';
 
 import { createLeaseLoop, type LeaseLoop, type LeaseLoopOptions, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
+import { modelOrder } from '../hub/model-order.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
@@ -132,10 +133,19 @@ export type AgentRunOutcome =
  * refused; the loop releases and leaves the order for the pickup window.
  *
  * The spec arrives already normalized from the verified `StepDef` — brief,
- * harness id, and `StepPermissions`. The loop stays vendor-neutral: it never
- * reaches into a step definition's extension bag, so there is no key to name.
+ * harness id, `StepPermissions`, and declared owed schemas. The loop stays
+ * vendor-neutral: it never reaches into a step definition's extension bag.
  */
-export type StepLoader = (order: OrderPacket) => Promise<NormalizedStepSpec | null>;
+export interface TrustedOwedSchema {
+  schema: unknown;
+  schemaAppliesTo: 'value' | 'member';
+}
+
+export interface ResolvedAgentStep extends NormalizedStepSpec {
+  trustedOwedSchemas?: Readonly<Record<string, TrustedOwedSchema>>;
+}
+
+export type StepLoader = (order: OrderPacket) => Promise<ResolvedAgentStep | null>;
 
 /**
  * The outcome of resolving which adapter hosts this step agent.
@@ -332,25 +342,22 @@ function errMsg(e: unknown): string {
  * An order that owes nothing under BOTH fields renders neither contract, which
  * is correct — there is no path for `submit` or `ask` to name.
  */
-function briefOwes(packet: OrderPacket): BriefSpec['owes'] {
+function briefOwes(packet: OrderPacket, step: ResolvedAgentStep): BriefSpec['owes'] {
   if (packet.owes.length > 0) {
     return packet.owes.map((owed) => ({
       path: owed.path,
       judgmentRejects: owed.judgmentRejects,
       schemaRejects: owed.schemaRejects,
-      // Spread rather than assigned, so an absent schema stays absent instead
-      // of becoming an explicit `undefined`. The shape contract keys off
-      // `schema !== undefined`, and a hub that does not project the field must
-      // read as "nothing to say", never as "no constraint".
-      ...(owed.schema !== undefined
-        ? { schema: owed.schema, schemaAppliesTo: owed.schemaAppliesTo }
+      // The order's schema is unchecked transport data. The local step resolver
+      // supplies the declared shape after resolving the pinned definition.
+      ...(step.trustedOwedSchemas?.[owed.path] !== undefined
+	? step.trustedOwedSchemas[owed.path]
         : {}),
     }));
   }
-  // The `outputs` fallback carries paths only — no counters and no schema. A
-  // hub old enough to project no `owes` is old enough to project no schema
-  // either, so there is nothing lost here that was ever available.
-  return packet.outputs.map((path) => ({ path }));
+  // An older hub can omit `owes`; the fallback still takes the schema from the
+  // local definition when it declares one, never from the transport.
+  return packet.outputs.map((path) => ({ path, ...step.trustedOwedSchemas?.[path] }));
 }
 
 /**
@@ -902,6 +909,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       }
     }
 
+    // The consume gate authenticates values and reasons, not the order's
+    // authored extensions, schema, or prior value. Keep those fields out of the
+    // local prompt and cold replay even when a verifier returns the packet as-is.
+    packet = modelOrder(packet);
+
     stepName = packet.step;
     stepKey = packet.key;
     recordCwd = packet.workdir ?? opts.cwd;
@@ -961,7 +973,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
     // The step spec. No bundle / no spec ⇒ we cannot brief anybody; release so
     // the order lapses back through the hub's pickup window.
-    let material: NormalizedStepSpec | null;
+    let material: ResolvedAgentStep | null;
     try {
       material = await opts.loadStep(packet);
     } catch (e) {
@@ -974,7 +986,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
     /** `material` is a `let`, so its null-narrowing does not survive into the
      *  closures below. This const carries the narrowing across. */
-    const step: NormalizedStepSpec = material;
+    const step: ResolvedAgentStep = material;
 
     // ---- ROUTING: select a roster candidate before resolving an adapter ----
     const routing = resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
@@ -1035,7 +1047,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       ...(opts.shiftId !== undefined ? { shiftId: opts.shiftId } : {}),
       ...(packet.modifier !== undefined ? { modifier: packet.modifier } : {}),
       ...(packet.escalated === true ? { escalated: true } : {}),
-      owes: briefOwes(packet),
+      owes: briefOwes(packet, step),
       // Only the adapter knows whether its own sandbox leaves this step a place
       // to write. `false`/absent render nothing, so a `false` here is silence,
       // not a claim that writing is permitted.
@@ -1056,7 +1068,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
     // The live owed set is the only legitimate recovery target. `briefOwes`
     // preserves the legacy packet.outputs fallback for old hub projections.
-    const recoveryPaths = (briefOwes(packet) ?? [])
+    const recoveryPaths = (briefOwes(packet, step) ?? [])
       .map((owed) => owed.path)
       .filter((path) => path !== '');
     const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);

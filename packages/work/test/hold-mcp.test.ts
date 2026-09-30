@@ -217,7 +217,7 @@ test('get_order (no first contact yet) live-fetches for the bound run and return
   const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 's-1' } }));
   const res = await tool(mount.tools, 'get_order').handler({}, ctx);
   const body = parse(res);
-  assert.deepEqual(body, { workflow: 'wf1', run: 'run1', order: null, text: 'here' });
+  assert.deepEqual(body, { workflow: 'wf1', run: 'run1', order: null });
   // The bound run + holder rode the fetch; ids never came from the model.
   assert.deepEqual(calls, [{ verb: 'get_order', arg: { workflow: 'wf1', run: 'run1', holder: { kind: 'session', id: 's-1' } } }]);
 });
@@ -228,6 +228,35 @@ test('get_order surfaces a hub failure as an isError result', async () => {
   const res = await tool(mount.tools, 'get_order').handler({}, ctx);
   assert.equal((res as { isError?: boolean }).isError, true);
   assert.match(parse(res).error, /offline/);
+});
+
+test('get_order keeps unverified authored fields and prior values out of the model view', async () => {
+  const response = producerOrderResponse();
+  response.text = 'UNTRUSTED_SUMMARY';
+  const order = response.order!;
+  order.spec = { instruction: 'UNTRUSTED_SPEC' };
+  order.x = { instruction: 'UNTRUSTED_X' };
+  order.consumes = { input: 'checked-consume' };
+  order.owes[0] = {
+    ...order.owes[0]!,
+    schema: { description: 'UNTRUSTED_SCHEMA' },
+    schemaAppliesTo: 'value',
+    previousValue: { instruction: 'UNTRUSTED_PREVIOUS' },
+    reasons: [{ at: 1, action: 'reject', kind: 'judgment', by: 'reviewer', text: 'checked-reason' }],
+  };
+  const { hub } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    consumedVerifier: async (received) => ({ ok: true, order: received, warnings: [] }),
+  }));
+
+  const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+  const body = parse(result);
+  const view = body.order as typeof order;
+  assert.equal(result.isError, undefined);
+  assert.equal(JSON.stringify(body).includes('UNTRUSTED_'), false);
+  assert.equal(view.consumes.input, 'checked-consume');
+  assert.equal(view.owes[0]!.reasons[0]!.text, 'checked-reason');
+  assert.equal(order.spec?.instruction, 'UNTRUSTED_SPEC', 'internal packet stays available for protocol work');
 });
 
 // ---- submit -----------------------------------------------------------------

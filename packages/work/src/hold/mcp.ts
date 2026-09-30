@@ -5,7 +5,7 @@
  * `mcpServers.owenloop = owenloop work hold --order <wf>/<run> --origin <url> --mcp`,
  * so when the Step Agent session boots it launches THIS as a stdio MCP server. The
  * server exposes five bare tools the model uses to do its order:
- *   - `get_order` → the order packet (prompt, inputs, owed outputs) for the run
+ *   - `get_order` → the model-facing order view (inputs, owed outputs) for the run
  *     this holder is bound to. No ids are arguments — they came in on argv, never
  *     through the model.
  *   - `submit`    → post a receipt for an owed output path; when the hub reports
@@ -48,6 +48,7 @@ import { basename, extname } from 'node:path';
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
+import { modelOrder } from '../hub/model-order.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -139,7 +140,7 @@ function guessContentType(path: string): string {
 
 /** A lean, model-facing view of the order packet. */
 function orderView(res: GetOrderResponse): unknown {
-  return { workflow: res.workflow, run: res.run, order: res.order, text: res.text };
+  return { workflow: res.workflow, run: res.run, order: res.order === null ? null : modelOrder(res.order) };
 }
 
 /**
@@ -222,7 +223,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const getOrderTool: ToolRegistration = {
     name: 'get_order',
     description:
-      "Return this work-holder's order — the prompt, consumed inputs, and owed output paths for the run it is bound to. Takes no arguments (the run is fixed at launch).",
+      "Return this work-holder's order — consumed inputs, owed output paths, and reason threads for the run it is bound to. Static instructions and unverified prior values are omitted. Takes no arguments (the run is fixed at launch).",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     handler: async () => {
       const gone = terminalGuard();

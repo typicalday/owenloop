@@ -78,6 +78,7 @@ import '../harnesses.ts';
 // ─────────────────────────────────────────────────────────────────────────────
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { owedSchema } from '../../../../src/model.ts';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import {
@@ -85,11 +86,12 @@ import {
   type AdapterResolution,
   type AgentRunOutcome,
   type CrewRosterResolution,
+  type ResolvedAgentStep,
+  type TrustedOwedSchema,
 } from '../agent/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
-import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
@@ -468,7 +470,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   };
 
   /** Resolve the verified step from the local workflow store, never the prepare cache. */
-  const loadStep = async (order: OrderPacket): Promise<NormalizedStepSpec | null> => {
+  const loadStep = async (order: OrderPacket): Promise<ResolvedAgentStep | null> => {
     let resolved;
     try {
       resolved = await instructions.resolveStep(order);
@@ -518,11 +520,24 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       }
     }
 
+    const trustedOwedSchemas: Record<string, TrustedOwedSchema> = Object.create(null);
+    // Real parsed definitions always carry `produces`; injected legacy test
+    // resolvers can omit it. Missing local shape data degrades to silence.
+    if (Array.isArray(resolved.step.produces)) {
+      for (const path of new Set([...order.outputs, ...order.owes.map((owed) => owed.path)])) {
+	const declared = owedSchema(resolved.step, path);
+	if (declared !== undefined) {
+	  trustedOwedSchemas[path] = { schema: declared.schema, schemaAppliesTo: declared.appliesTo };
+	}
+      }
+    }
+
     return {
       step: resolved.step.name,
       brief: resolved.step.body,
       ...(carrier.harness !== undefined ? { harness: carrier.harness } : {}),
       permissions: normalizeStepPermissions(carrier.harnessOptions, resolved.step),
+      trustedOwedSchemas,
     };
   };
 

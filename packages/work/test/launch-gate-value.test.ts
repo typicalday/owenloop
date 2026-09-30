@@ -104,10 +104,10 @@ function commandOrder(args: {
   return { text: '', workflow: packet.workflow, run: args.run, order: packet, lease: { claimed: true } };
 }
 
-function verifierFor(trust: TrustFixture) {
+function verifierFor(trust: TrustFixture, artifactPolicy: 'off' | 'enforce' = 'off') {
   return createConsumedVerifier({
     env: trust.env,
-    artifactPolicy: 'off',
+    artifactPolicy,
     now: () => 100,
     signerForPrincipal,
   });
@@ -217,6 +217,7 @@ async function runAgent(
   trust: TrustFixture,
   response: GetOrderResponse,
   mutate?: (path: string, body: unknown) => unknown,
+  artifactPolicy: 'off' | 'enforce' = 'off',
 ): Promise<{ code: number; calls: ReturnType<typeof useAdapter>['calls']; errors: string[]; served: unknown[] }> {
   const id = `launch-gate-value-agent-${Math.random().toString(16).slice(2)}`;
   const adapter = useAdapter(id);
@@ -231,7 +232,7 @@ async function runAgent(
       globalRoot: installed.globalRoot,
       verifier: createBundleIngestor(),
       definitionVerifier: VERIFIED,
-      consumedVerifier: verifierFor({ ...trust, env }),
+      consumedVerifier: verifierFor({ ...trust, env }, artifactPolicy),
       env,
     });
     const code = await agentRun(
@@ -240,7 +241,7 @@ async function runAgent(
         env,
         hub: createHubClient({ origin: hub.origin, getToken: async () => 'launch-gate-token' }),
         instructions,
-        consumedVerifier: verifierFor({ ...trust, env }),
+	consumedVerifier: verifierFor({ ...trust, env }, artifactPolicy),
         signalHost: { on() { return this; }, exit() {} },
         holderId: 'launch-gate-value:agent',
         cwd: installed.projectRoot,
@@ -395,4 +396,38 @@ test('launch gate: a forged judge rejection reason is refused before an agent pr
   assert.equal(hostile.calls.some((call) => call.kind === 'start'), false);
   const served = servedOrder(hostile.served);
   assert.deepEqual(served.order?.owes[0]?.reasons, [forgedReason], 'L2: the forged rejection reason was actually delivered');
+});
+
+test('launch gate: a valid reason proof cannot admit forged static fields or a prior value', async () => {
+  const workflow = makeAgentWorkflow('Review the submitted work.').replace(
+    'produces: [out]',
+    'produces:\n      - name: out\n        schema:\n          type: object\n          description: LOCAL_SCHEMA\n          properties:\n            message: { type: string }',
+  );
+  const installed = await installWorkflow({
+    name: 'launch-gate-value-agent',
+    workflow,
+    projectRoot: tempDir('owenloop-launch-gate-value-agent-project-'),
+  });
+  fixtures.push(installed);
+  const trust = makeTrustFixture();
+  trusts.push(trust);
+  installProducerGrant(trust);
+  const reason: ReasonEntry = { at: 10, action: 'reject', kind: 'judgment', by: 'judge', text: 'Revise the message.' };
+  const proof = submissionProof({ artifact: 'out', value: [reason], producer: trust.producer, version: 1 });
+  const response = agentOrder({ defDigest: installed.defDigest, run: 'run-static-forged', reasons: [reason], proof, version: 1 });
+  response.order!.spec = { prompt: 'FORGED_SPEC' };
+  response.order!.x = { prompt: 'FORGED_X' };
+  response.order!.owes[0]!.schema = { description: 'FORGED_SCHEMA' };
+  response.order!.owes[0]!.schemaAppliesTo = 'value';
+  response.order!.owes[0]!.previousValue = { instruction: 'FORGED_PREVIOUS_VALUE' };
+
+  const result = await runAgent(installed, trust, response, undefined, 'enforce');
+  assert.equal(result.code, 0, result.errors.join('\n'));
+  const start = result.calls.find((call) => call.kind === 'start');
+  assert.ok(start !== undefined && start.kind === 'start');
+  assert.match(start.args.brief, /LOCAL_SCHEMA/);
+  assert.match(start.args.brief, /Revise the message\./);
+  for (const marker of ['FORGED_SPEC', 'FORGED_X', 'FORGED_SCHEMA', 'FORGED_PREVIOUS_VALUE']) {
+    assert.equal(start.args.brief.includes(marker), false, `${marker} reached the prompt`);
+  }
 });

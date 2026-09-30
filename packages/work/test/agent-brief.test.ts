@@ -172,11 +172,10 @@ test('renderBrief tells the agent its inputs come from get_order on the mounted 
   assert.match(out, /reason thread/u);
 });
 
-test('the input contract ranks the packet above the brief and routes a missing input to ask', () => {
+test('the input contract distinguishes live packet data from locally resolved shape', () => {
   const out = renderBrief('body', spec({ owes: [{ path: 'plan' }] }));
-  // Which copy wins, stated — otherwise a re-offered agent has to guess between
-  // a brief rendered once at dispatch and a live packet carrying newer reasons.
-  assert.match(out, /where the two disagree, the packet is right/u);
+  assert.match(out, /authoritative for live inputs, owed paths, and reason threads/u);
+  assert.match(out, /output shape in this brief comes from the locally resolved workflow definition/u);
   // The whole point: an absent input becomes a question, not a fabrication.
   assert.match(out, /Do not invent it and do not proceed on an assumption: use `ask`/u);
 });

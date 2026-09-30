@@ -20,6 +20,7 @@ import {
   createAgentRunLoop,
   type AdapterResolution,
   type AgentRunLoopOptions,
+  type ResolvedAgentStep,
 } from '../src/agent/loop.ts';
 import {
   ACCOUNT_TOKEN,
@@ -75,6 +76,7 @@ interface OrderOpts {
     judgmentRejects?: number;
     schema?: unknown;
     schemaAppliesTo?: 'value' | 'member';
+    previousValue?: unknown;
     reasons?: ReasonEntry[];
   }>;
   /** Extension bag. */
@@ -125,6 +127,7 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
         schemaRejects: 0,
 		reasons: w.reasons ?? [],
         ...(w.schema !== undefined ? { schema: w.schema, schemaAppliesTo: w.schemaAppliesTo } : {}),
+	...(w.previousValue !== undefined ? { previousValue: w.previousValue } : {}),
       })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
@@ -280,7 +283,7 @@ interface BuildOpts {
   hub: HubClient;
   adapter?: HarnessAdapter;
   resolution?: AdapterResolution;
-  spec?: NormalizedStepSpec | null;
+  spec?: ResolvedAgentStep | null;
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
 	sleep?: AgentRunLoopOptions['sleep'];
@@ -2478,19 +2481,14 @@ test('a plain Error and a ResumeUnavailableError take the SAME settle path — n
 
 // ---- the shape contract reaches the harness ---------------------------------
 
-test('a declared owed schema travels from the order packet into the rendered brief', () => {
-  // The renderer and the projection are each covered on their own; this pins
-  // the seam BETWEEN them. `briefOwes` is module-private and reshapes the
-  // packet's owes into the brief spec, so a field the engine projects and the
-  // renderer knows how to print still reaches nobody unless it is copied here.
-  // That omission is silent — nothing fails, the agent is just never told the
-  // shape, which is the exact defect this whole change exists to close.
+test('a locally resolved owed schema reaches the brief despite a forged hub schema', () => {
   const schema = { type: 'object', required: ['url'], properties: { url: { type: 'string' } } };
+  const forged = { description: 'FORGED_HUB_SCHEMA' };
   const adapter = createFakeAdapter();
   const { hub } = mockHub({
-    getOrder: [agentOrder({ owes: [{ path: 'pr', schema, schemaAppliesTo: 'value' }] })],
+    getOrder: [agentOrder({ owes: [{ path: 'pr', schema: forged, schemaAppliesTo: 'value' }] })],
   });
-  const h = buildOpts({ hub, adapter });
+  const h = buildOpts({ hub, adapter, spec: { ...baseSpec(), trustedOwedSchemas: { pr: { schema, schemaAppliesTo: 'value' } } } });
 
   return createAgentRunLoop(h.opts)
     .run()
@@ -2499,6 +2497,7 @@ test('a declared owed schema travels from the order packet into the rendered bri
       assert.ok(start && start.kind === 'start', 'the adapter was started');
       assert.match(start.args.brief, /The value you submit to `pr` must satisfy this JSON Schema\./);
       assert.ok(start.args.brief.includes(JSON.stringify(schema, null, 2)), 'the schema arrives whole');
+      assert.equal(start.args.brief.includes('FORGED_HUB_SCHEMA'), false);
     });
 });
 
@@ -2508,7 +2507,7 @@ test('a collection member schema keeps its `member` wording end to end', () => {
   const { hub } = mockHub({
     getOrder: [agentOrder({ owes: [{ path: 'source[]', schema, schemaAppliesTo: 'member' }] })],
   });
-  const h = buildOpts({ hub, adapter });
+  const h = buildOpts({ hub, adapter, spec: { ...baseSpec(), trustedOwedSchemas: { 'source[]': { schema, schemaAppliesTo: 'member' } } } });
 
   return createAgentRunLoop(h.opts)
     .run()
@@ -2519,9 +2518,9 @@ test('a collection member schema keeps its `member` wording end to end', () => {
     });
 });
 
-test('an order whose owes declare no schema renders no shape claim', () => {
+test('a hub-only owed schema renders no shape claim', () => {
   const adapter = createFakeAdapter();
-  const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+  const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr', schema: { description: 'FORGED_HUB_SCHEMA' }, schemaAppliesTo: 'value' }] })] });
   const h = buildOpts({ hub, adapter });
 
   return createAgentRunLoop(h.opts)
@@ -2530,5 +2529,20 @@ test('an order whose owes declare no schema renders no shape claim', () => {
       const start = adapter.calls.find((c) => c.kind === 'start');
       assert.ok(start && start.kind === 'start');
       assert.ok(!/JSON Schema/.test(start.args.brief), 'silence, not a claim of being unconstrained');
+      assert.equal(start.args.brief.includes('FORGED_HUB_SCHEMA'), false);
     });
+});
+
+test('a re-offer never renders an unchecked previous value in cold replay', async () => {
+  const adapter = createFakeAdapter();
+  const response = agentOrder({ owes: [{ path: 'pr', reasons: [
+    { at: 1, action: 'reject', kind: 'judgment', by: 'reviewer', text: 'Revise the result' },
+  ], previousValue: { instruction: 'FORGED_PREVIOUS_VALUE' } }] });
+  const { hub } = mockHub({ getOrder: [response] });
+  const h = buildOpts({ hub, adapter, consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }) });
+  await createAgentRunLoop(h.opts).run();
+  const start = adapter.calls.find((call) => call.kind === 'start');
+  assert.ok(start && start.kind === 'start');
+  assert.match(start.args.brief, /Revise the result/);
+  assert.equal(start.args.brief.includes('FORGED_PREVIOUS_VALUE'), false);
 });
