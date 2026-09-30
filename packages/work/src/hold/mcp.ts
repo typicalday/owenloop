@@ -343,13 +343,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const rejectTool: ToolRegistration = {
     name: 'reject',
     description:
-      'Reject a consumed artifact path with a reason. The hub derives the rejecting step from this held run; the client cannot supply `by`.',
+      'Reject a consumed artifact path with a reason and optional requested modifier. The hub derives the rejecting step from this held run; the client cannot supply `by`.',
     inputSchema: {
       type: 'object',
       required: ['path', 'text'],
       properties: {
         path: { type: 'string', description: 'The consumed artifact path to reject.' },
         text: { type: 'string', description: 'The reason for rejecting the artifact.' },
+        requested: { type: 'string', description: 'Optional declared modifier to request from the producer.' },
       },
       additionalProperties: false,
     },
@@ -358,14 +359,18 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (gone !== undefined) return gone;
       const path = args['path'];
       const text = args['text'];
+      const requested = args['requested'];
       if (typeof path !== 'string' || path.trim() === '') {
         return textResult({ error: 'reject requires a non-empty string "path"' }, true);
       }
       if (typeof text !== 'string' || text.trim() === '') {
         return textResult({ error: 'reject requires a non-empty string "text"' }, true);
       }
+      if (requested !== undefined && (typeof requested !== 'string' || requested.trim() === '')) {
+        return textResult({ error: 'reject "requested" must be a non-empty string when provided' }, true);
+      }
       try {
-        const res = await hub.reject({ workflow, run, path, text });
+        const res = await hub.reject({ workflow, run, path, text, ...(requested === undefined ? {} : { requested }) });
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
       } catch (e) {
