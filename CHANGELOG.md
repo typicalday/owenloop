@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.33](https://github.com/typicalday/owenloop/compare/v0.5.32...v0.5.33) (2026-10-01)
+
+
+### Bug Fixes
+
+* **engine:** allow terminal tree teardown to skip parent cascade ([f9eaaea](https://github.com/typicalday/owenloop/commit/f9eaaea4ef097060ce4cc717aae5b4e0d73d8e73))
+* **work:** publish shift reservations atomically ([2ca3025](https://github.com/typicalday/owenloop/commit/2ca302577f28fa59c0274d0cbb3719a028227b89))
+
 ## [0.5.32](https://github.com/typicalday/owenloop/compare/v0.5.31...v0.5.32) (2026-10-01)
 
 
