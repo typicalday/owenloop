@@ -1273,6 +1273,57 @@ test('collection: gather emits a set, formatcheck maps it, synthesize reduces it
   assert.equal(engine.status(wf).done, true);
 });
 
+test('collection: a human retry re-arms a schema-stalled sole consumer without reopening the seal', () => {
+  const synth = step({
+    name: 'synth',
+    consumes: ['gather.source[*]'],
+    produces: ['draft'],
+    maxSchemaFailures: 5,
+    terminal: true,
+  });
+  synth.produces[0]!.schema = {
+    type: 'object',
+    required: ['text'],
+    properties: { text: { type: 'string', minLength: 1 } },
+    additionalProperties: false,
+  };
+  const fixture = def('sealed-consumer-retry', [input('question')], [
+    step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
+    synth,
+  ]);
+  const { engine, store } = makeEngine([fixture]);
+  const wf = engine.createInstance(fixture.name, { provide: { question: { q: 'why' } } });
+
+  const gather = fire(engine, wf, 'gather', 1000);
+  assert.equal(engine.emit(wf, gather.run, [{ value: { source: 'a' } }]).outcome, 'emitted');
+  assert.equal(engine.seal(wf, gather.run, { count: 1 }).outcome, 'green');
+  engine.close(wf, gather.run);
+  const sealBefore = store.getArtifact(wf, 'gather.source.sealed');
+  const memberBefore = store.getArtifact(wf, 'gather.source[0]');
+  assert.equal(sealBefore?.acceptance, 'green');
+  assert.equal(memberBefore?.acceptance, 'green');
+
+  const first = fire(engine, wf, 'synth', 2000);
+  assert.deepEqual(first.inputs.sort(), ['gather.source.sealed', 'gather.source[0]']);
+  for (let i = 0; i < 5; i++) {
+    assert.equal(engine.green(wf, first.run, 'draft', { bad: i }).outcome, 'schema-rejected');
+  }
+  engine.close(wf, first.run, 'no_work');
+  assert.equal(store.getArtifact(wf, 'draft')?.schemaRejects, 5);
+  assert.equal(engine.status(wf).debts.find((debt) => debt.path === 'draft')?.stalled, true);
+  assert.deepEqual(engine.tick(wf, { now: 3000 }).orders.filter((order) => order.step === 'synth'), []);
+
+  engine.retry(wf, 'draft', 'human', 'correct the output schema');
+  assert.equal(store.getArtifact(wf, 'draft')?.schemaRejects, 0);
+  assert.deepEqual(store.getArtifact(wf, 'gather.source.sealed'), sealBefore);
+  assert.deepEqual(store.getArtifact(wf, 'gather.source[0]'), memberBefore);
+  const second = fire(engine, wf, 'synth', 4000);
+  assert.deepEqual(second.inputs.sort(), first.inputs.sort());
+  assert.equal(engine.green(wf, second.run, 'draft', { text: 'finished' }).outcome, 'green');
+  engine.close(wf, second.run);
+  assert.equal(engine.status(wf).done, true);
+});
+
 test('collection: a retracted member drops out of the reduce', () => {
   const { engine } = makeEngine([research]);
   const wf = engine.createInstance('research');
