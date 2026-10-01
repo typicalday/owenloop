@@ -30,7 +30,8 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
-import { parseVersionedCallTarget } from './bundle/manifest.ts';
+import { parseVersionedCallTarget } from './bundle/call-target.ts';
+import { parseWorkflowCoordinate } from './store/types.ts';
 import { isCallStep } from './types.ts';
 import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef, WorkflowInterfaceClaim } from './types.ts';
 
@@ -2562,7 +2563,7 @@ function resolveCallsTargetKey(
     let lockKey = target;
     if (target.includes('#')) {
       try {
-		lockKey = parseVersionedCallTarget(target).coordinate;
+		lockKey = parseVersionedCallTarget(target, parseWorkflowCoordinate).coordinate;
       } catch {
 		return undefined;
       }
