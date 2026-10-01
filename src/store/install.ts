@@ -34,7 +34,7 @@ import {
   loadDefsRaw,
   validateDef,
 } from '../defs.ts';
-import { parseManifestBytes } from '../bundle/manifest.ts';
+import { isVersionedReference, parseManifestBytes, parseVersionedCallTarget } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
 import {
@@ -213,6 +213,7 @@ function assertManifestLocksResolvable(args: {
   projectRoot: string | undefined;
   globalRoot: string | undefined;
   lock: Readonly<Record<string, string>>;
+  callsTargets: readonly string[];
   repairReplacement?: { root: string; digest: DefDigest; objectDir: string };
 }): void {
   const entries = Object.entries(args.lock);
@@ -248,7 +249,11 @@ function assertManifestLocksResolvable(args: {
 
   for (const [coordinate, rawDigest] of entries.sort(([a], [b]) => compareStoreText(a, b))) {
     const digest = defDigest(rawDigest);
-    if (!callableKeys.has(digestScopedCallsTargetKey(digest, coordinate))) {
+    const usedTargets = args.callsTargets.filter((target) =>
+      target.includes('@') && parseVersionedCallTarget(target).coordinate === coordinate,
+    );
+    const targets = usedTargets.length > 0 ? usedTargets : [coordinate];
+    if (targets.some((target) => !callableKeys.has(digestScopedCallsTargetKey(digest, target)))) {
       throw new Error(
 	`refusing bundle install: lock target '${coordinate}' pinned to ${digest} ` +
 		  'is no longer exactly callable from the combined workflow store',
@@ -464,7 +469,6 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       staged = new Map<string, ReturnType<typeof loadDefFile>>();
       try {
         const manifest = parseManifestBytes(readFileSync(manifestPath));
-		externalVersionedCalls = new Set(Object.keys(manifest.lock));
 		stagedBundleLock = manifest.lock;
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
@@ -497,6 +501,12 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       const failures: DefLoadFailure[] = [];
       staged = loadDefsRaw(stagingDir, failures);
       reasons.push(...failures.map((failure) => `${failure.file}: ${failure.error}`));
+    }
+    if (existsSync(manifestPath)) {
+      externalVersionedCalls = new Set(
+		[...staged.values()].flatMap((def) => def.steps.map((step) => step.calls)
+		  .filter((target): target is string => target !== undefined && isVersionedReference(target))),
+      );
     }
     for (const stagedDef of staged.values()) {
       const lintResult = lintDef(stagedDef);
@@ -577,6 +587,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       projectRoot: args.projectRoot,
       globalRoot: args.globalRoot,
       lock: stagedBundleLock,
+      callsTargets: [...staged.values()].flatMap((def) => def.steps.map((step) => step.calls).filter((target): target is string => target !== undefined)),
       ...(repairRequired ? { repairReplacement: { root, digest, objectDir: stagingDir } } : {}),
     });
 

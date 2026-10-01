@@ -29,6 +29,7 @@ import {
 } from 'yaml';
 import type { ParsedNode, Pair } from 'yaml';
 import { canonicalBundlePathViolation } from '../archive.ts';
+import { parseWorkflowCoordinate } from '../store/types.ts';
 import { assertCurrentRuntimeCompatible, isCanonicalSemver } from './runtime.ts';
 import { BundleError } from './types.ts';
 import type { BundleManifest, BundleRuntimeRequirements } from './types.ts';
@@ -51,12 +52,32 @@ const RUNTIME_FEATURE_RE = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]*$/;
 const PLATFORM_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Capability class identifier. */
 const CAPABILITY_CLASS_RE = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
-/** Explicit cross-bundle reference: `namespace/name@version`. */
-const VERSIONED_REF_RE = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)@([!-~]+)$/;
+/** Historical explicit-coordinate spelling; store parsing further excludes ambiguous separators. */
+const VERSIONED_REF_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+@[!-~]+$/;
+/** Parse an exact call. `#` cannot occur in a store coordinate, so the selector is unambiguous. */
+export function parseVersionedCallTarget(text: string): { coordinate: string; workflow?: string } {
+  const hash = text.indexOf('#');
+  const coordinate = hash < 0 ? text : text.slice(0, hash);
+  if (!VERSIONED_REF_RE.test(coordinate)) {
+    throw new BundleError('MANIFEST_ERROR', `invalid exact versioned call target '${text}'`);
+  }
+  parseWorkflowCoordinate(coordinate);
+  if (hash < 0) return { coordinate };
+  const workflow = text.slice(hash + 1);
+  if (!WORKFLOW_NAME_RE.test(workflow)) {
+    throw new BundleError('MANIFEST_ERROR', `invalid named workflow selector '${text}'`);
+  }
+  return { coordinate, workflow };
+}
 
-/** True when `text` is the explicit `namespace/name@version` reference form. */
+/** True for a well-formed exact package call, optionally selecting a named workflow. */
 export function isVersionedReference(text: string): boolean {
-  return VERSIONED_REF_RE.test(text);
+  try {
+    parseVersionedCallTarget(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -382,7 +403,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   // lock — explicit versioned reference text → def digest.
   const lock: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const [ref, digestRaw] of Object.entries(asMap(root['lock'], 'bundle.yaml.lock'))) {
-    if (!isVersionedReference(ref)) {
+    if (!isVersionedReference(ref) || ref.includes('#')) {
       throw new BundleError('MANIFEST_ERROR', `bundle.yaml.lock: key '${ref}' must be an explicit 'namespace/name@version' reference`);
     }
     const digest = asString(digestRaw, `bundle.yaml.lock['${ref}']`);
@@ -499,11 +520,17 @@ export function manifestIsCanonical(bytes: Uint8Array): boolean {
  */
 export function assertLockCoverage(manifest: BundleManifest, callsTargets: string[]): void {
   for (const target of callsTargets) {
-    if (!isVersionedReference(target)) continue;
-    if (!Object.prototype.hasOwnProperty.call(manifest.lock, target)) {
+    if (!target.includes('@') || !target.includes('/')) continue;
+    let coordinate: string;
+    try {
+      coordinate = parseVersionedCallTarget(target).coordinate;
+    } catch {
+      throw new BundleError('MANIFEST_ERROR', `calls: target '${target}' is a malformed exact versioned reference`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(manifest.lock, coordinate)) {
       throw new BundleError(
 	'MANIFEST_ERROR',
-	`bundle.yaml.lock: calls: target '${target}' uses the explicit 'namespace/name@version' form and requires a lock entry`,
+	`bundle.yaml.lock: calls: target '${target}' requires a lock entry for '${coordinate}'`,
       );
     }
   }

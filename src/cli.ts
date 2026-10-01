@@ -120,6 +120,7 @@ import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import { BundleError, digestBundle, inspectBundle, packBundle, unpackBundle } from './bundle/index.ts';
+import { parseVersionedCallTarget } from './bundle/manifest.ts';
 import {
   acquireInstallLock,
   ADD_JOURNAL_FILENAME,
@@ -157,6 +158,7 @@ import {
   parseWorkflowCoordinate,
   projectStoreRoot,
   createBundleIngestor,
+  createVerifiedBundleLockReader,
   createPreCommitVerifier,
   recoverWorkflowStore,
   storeIndexPath,
@@ -849,6 +851,12 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
   // path — one loaded-definition resolver seeds the instruction boundary
   // (emission digests + instruction resolution), never a second local path.
   const instructionSource = createDefInstructionSource(defs.values());
+  let verifiedGlobalRoot: string;
+  try {
+    verifiedGlobalRoot = globalStoreRoot(workflowHome(io));
+  } catch {
+    verifiedGlobalRoot = join(defsDir, '.owenloop-global-store-unavailable');
+  }
   // WS-6: the resolver is SCOPE-AWARE. `from` is supplied only by the engine's
   // `calls:` spawn path; when it is present and carries CAS provenance, a bare
   // target resolves sibling-first inside that def's own bundle (the exact rule
@@ -861,7 +869,13 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
       : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
-  }, { instructionSource });
+  }, {
+    instructionSource,
+    readVerifiedBundleLock: createVerifiedBundleLockReader({
+      projectRoot: projectStoreRoot(defsDir),
+      globalRoot: verifiedGlobalRoot,
+    }),
+  });
   return { store, engine, defs, defsDir, dbPath, definitionDiscoveryComplete };
 }
 
@@ -3244,7 +3258,7 @@ function bundleGcExactCallsFromCurrentDefs(
 		for (const step of def.steps) {
 			if (step.calls === undefined || !step.calls.includes('@')) continue;
 			try {
-				parseWorkflowCoordinate(step.calls);
+				parseVersionedCallTarget(step.calls);
 			} catch (error) {
 				throw new CliError(
 					`owenloop bundle gc: malformed exact calls target ${JSON.stringify(step.calls)} ` +
