@@ -115,6 +115,7 @@ export {
   BundleIngestorUnavailableError,
   PreCommitVerifierUnavailableError,
   createExecutionOriginVerifier,
+  createVerifiedBundleLockReader,
   originEvidencePath,
   persistOriginEvidence,
   readOriginEvidence,
