@@ -6,10 +6,10 @@ import { test } from 'node:test';
 import { assertLockCoverage, parseManifestBytes, parseVersionedCallTarget } from '../src/bundle/manifest.ts';
 import { digestScopedCallsTargetKey, finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { Engine } from '../src/engine.ts';
+import { createVerifiedBundleLockReader } from '../src/index.ts';
 import { openStore, readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   createBundleIngestor,
-  createVerifiedBundleLockReader,
   createStoreInstructionSource,
   loadCasDefs,
   planWorkflowStoreGc,
