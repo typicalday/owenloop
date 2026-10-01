@@ -137,9 +137,34 @@ function guessContentType(path: string): string {
   return CONTENT_TYPE_BY_EXTENSION[extname(path).toLowerCase()] ?? 'application/octet-stream';
 }
 
-/** A lean, model-facing view of the order packet. */
+/** Model-facing dynamic fields whose consumed values and reason threads have
+ * passed the gate. The full packet stays private for proof construction. In
+ * particular, hub-carried static extensions, schema and previousValue do not
+ * inherit authenticity from a valid consumes/reasons proof. */
 function orderView(res: GetOrderResponse): unknown {
-  return { workflow: res.workflow, run: res.run, order: res.order, text: res.text };
+  const order = res.order;
+  if (order === null) return { workflow: res.workflow, run: res.run, order: null };
+  return {
+    workflow: res.workflow,
+    run: res.run,
+    order: {
+      workflow: order.workflow,
+      run: order.run,
+      step: order.step,
+      key: order.key,
+      defDigest: order.defDigest,
+      inputs: order.inputs,
+      outputs: order.outputs,
+      consumes: order.consumes,
+      owes: order.owes.map((owed) => ({
+        path: owed.path,
+        ...(owed.version === undefined ? {} : { version: owed.version }),
+        judgmentRejects: owed.judgmentRejects,
+        schemaRejects: owed.schemaRejects,
+        reasons: owed.reasons,
+      })),
+    },
+  };
 }
 
 /**

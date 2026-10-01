@@ -518,6 +518,25 @@ test('run() happy path: agent order → brief → fake harness turn → hub outc
   assert.deepEqual(fake.calls.map((c) => c.kind), ['start', 'stop']);
 });
 
+test('agent-run takes owed schema from the verified local step even when the hub projects another', async () => {
+  const fake = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedBundle();
+  const localSchema = { type: 'object', required: ['result'] };
+  verifiedStep!.produces = [{ raw: 'out', kind: 'singleton', stem: 'out', suffix: '', schema: localSchema }];
+  const first = agentOrder();
+  first.order!.owes[0]!.schema = { type: 'string', description: 'FORGED-HUB-SCHEMA' };
+  first.order!.owes[0]!.schemaAppliesTo = 'member';
+  const { hub } = probeHub({ responses: [first, agentOrder({ outcome: 'ok' })], def: DEF });
+
+  assert.equal(await run(WIRE, { hub, holderId: 'host:123', cwd: '/work', out: () => {}, err: () => {} }), 0);
+  const start = fake.calls.find((call) => call.kind === 'start');
+  assert.ok(start && start.kind === 'start');
+  assert.ok(start.args.brief.includes(JSON.stringify(localSchema, null, 2)));
+  assert.ok(!start.args.brief.includes('FORGED-HUB-SCHEMA'));
+  assert.match(start.args.brief, /The value you submit to `out` must satisfy this JSON Schema/);
+});
+
 test('run() exposes the verified bundle directory and clears stale provenance', async () => {
   const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);

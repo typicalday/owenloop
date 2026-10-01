@@ -94,7 +94,8 @@ test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing subm
     const got = await callTool(mcp, 'get_order');
     assert.equal(got.isError, false);
     assert.equal(got.body.workflow, 'wf1');
-    assert.equal(got.body.order.prompt, 'do the thing');
+    assert.equal(got.body.order.step, 'builder');
+    assert.equal(got.body.order.prompt, undefined, 'hub prompt text is not locally verified');
 
     // THE error-1 regression: the closing submit terminates the lease loop, but
     // its own response frame must still arrive intact — the process may not
