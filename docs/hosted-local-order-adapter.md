@@ -62,6 +62,11 @@ views. Calls-child **consumed proofs** are corroborated through the verified
 store closure, but the component itself does not expose a calls step to a model.
 
 The bound `work hold --mcp --verified-hosted` mount remains read-only by default.
+Its ordinary `get_order` tool returns a reduced model view. After that tool
+gates the response, the wrapper reads the full packet through a process-local
+mount accessor and compares its digest with the first direct verified fetch.
+Fields withheld from the model still participate in this equality check; the
+accessor is not an MCP registration and becomes unavailable when the hold ends.
 Explicit `--mcp-tools get_order,submit` enables one signed mutation. Before
 every call it fetches and verifies the current order directly from the trusted
 service, selects a path and version from the verified output list, signs the
