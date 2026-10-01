@@ -14,6 +14,7 @@ import {
   existsSync,
   fsyncSync,
   ftruncateSync,
+  linkSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -171,6 +172,38 @@ function atomicWrite(path: string, value: string): void {
   }
 }
 
+/** Publish a complete reservation without replacing another shift's claim. */
+function atomicExclusiveWrite(path: string, value: string): void {
+  const dir = join(path, '..');
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.${randomBytes(8).toString('hex')}-${process.pid}-${Date.now()}.tmp`);
+  try {
+    durableExclusiveWrite(tmp, value);
+  } catch (error) {
+    try {
+      durableRemove(tmp);
+    } catch {
+      // Preserve the write or sync failure; no canonical record was installed.
+    }
+    throw error;
+  }
+  try {
+    // open('wx') on the canonical path exposes an empty file before its write.
+    // A hard link installs the already-fsynced inode atomically and still
+    // refuses an existing run record instead of replacing its owner.
+    linkSync(tmp, path);
+    syncDirectory(dir);
+  } catch (error) {
+    try {
+      durableRemove(tmp);
+    } catch {
+      // Preserve the install failure; a leftover temp is never a run record.
+    }
+    throw error;
+  }
+  durableRemove(tmp);
+}
+
 function writeStateRecord(stateDir: string, record: StateRecord): void {
   atomicWrite(recordFile(stateDir, record.run), JSON.stringify(record));
 }
@@ -199,7 +232,7 @@ export function reserveChild(stateDir: string, request: ReservationRequest): Res
   try {
     // Exclusive create is the same-run reservation point. A stale, live, or even
     // corrupt existing record blocks dispatch rather than being overwritten.
-    durableExclusiveWrite(recordFile(stateDir, reservation.run), JSON.stringify(reservation));
+    atomicExclusiveWrite(recordFile(stateDir, reservation.run), JSON.stringify(reservation));
   } catch (error) {
     try {
       durableRemove(gatePath);
