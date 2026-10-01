@@ -2,7 +2,13 @@
 
 `createDefaultHostedOrderAdapter` is an opt-in **local order-view component**.
 It accepts the service's `client-preflight-v1` reference only as a navigation
-hint. The host must intercept that MCP response **before it reaches model
+hint. At construction the local host must supply an exact `expected.workflowId`
+and `expected.runId`; a preflight reference outside that binding is refused
+**before** the adapter uses its bearer credential. The binding is copied at
+construction and checked against the direct response. One run has one
+persisted order packet in the trusted service, so this workflow/run pair is
+the order identity; the adapter also compares the preflight definition digest.
+The host must intercept that MCP response **before it reaches model
 context**, pass only its `structuredContent` to `open`, and expose only the
 adapter result. A generic MCP client that already displays the preflight
 response is outside this component's protection, even though the service's
@@ -10,7 +16,8 @@ own preflight implementation is bounded. For every `open` call the adapter
 uses a locally configured HTTPS origin and bearer
 credential to fetch `/api/get_order` through `createHubClient`. The MCP preflight
 cannot select an origin, supply credentials, or supply the packet that is
-verified. A local integration must put only the returned projection in both
+verified. The fetch sets `redirect: error`; no redirect may change the origin
+or downgrade HTTPS. A local integration must put only the returned projection in both
 model-facing MCP `content` and `structuredContent`; raw REST or MCP text must
 stay inside the client process.
 
@@ -20,7 +27,9 @@ workflow, run, and definition digest with the preflight reference and requires
 `lease.claimed === true` with no outcome. This is a **service observation**, not
 a signed issuer or lease attestation. Each `open` fetches again and marks its
 observation with a local `observedAt` and an expiry no more than five seconds
-later. A caller must not treat the projection as authority after that expiry.
+later. It rechecks the clock after local verification and refuses if the
+observation has expired or timestamp arithmetic is unsafe. A caller must not
+treat the projection as authority after that expiry.
 
 The instruction source re-verifies installed bundle bytes and requires a
 verified execution-time publication verdict. The adapter forces definition and
@@ -34,7 +43,8 @@ with its hard rule. A `ready` projection labels locally authored prompt,
 output versions (`versionTrust`). Dynamic values carry the signed-submission and locally
 anchored producer-chain verdict at the version observed from the service.
 Unrecognized order fields, unsupported worker/step types, unverified consumed
-values, and unrecognized output paths refuse with fixed codes. Raw service
+values, and output lists that do not exactly match owed paths (including
+duplicates) refuse with fixed codes. Raw service
 errors are never returned.
 
 `owes[].reasons`, `owes[].proof`, and `previousValue` currently refuse the whole

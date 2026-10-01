@@ -84,11 +84,14 @@ function preflight(defDigest: string, extras: Record<string, unknown> = {}): unk
 }
 
 async function harness(overrides: {
-  response?: (p: OrderPacket, fetchCount: number) => GetOrderResponse;
+  response?: (p: OrderPacket, fetchCount: number) => GetOrderResponse | null;
   received?: (body: unknown, init: RequestInit) => void;
   missingPublicationVerifier?: boolean;
   throwPublicationVerifier?: boolean;
   throwFetch?: boolean;
+  redirectResponse?: boolean;
+  expected?: { workflowId: string; runId: string };
+  now?: () => number;
 } = {}) {
   const f = await fixture();
   const p = await packet(f.defDigest, f.keyPath, f.rootKeyId);
@@ -97,13 +100,18 @@ async function harness(overrides: {
     fetches++;
     if (overrides.throwFetch) throw new Error('HOSTILE RAW FETCH ERROR');
     overrides.received?.(JSON.parse(String(init?.body)), init ?? {});
-    const response = overrides.response?.(p, fetches) ?? {
+    if (overrides.redirectResponse) {
+      if (init?.redirect === 'error') throw new TypeError('redirect blocked');
+      return new Response(JSON.stringify({ text: 'HOSTILE REDIRECT TARGET', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } }), { status: 200 });
+    }
+    const response = overrides.response === undefined ? {
       text: 'HOSTILE RAW REST TEXT', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
-    };
+    } : overrides.response(p, fetches);
     return new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } });
   };
   const adapter = createHostedOrderAdapter({
     hub: { origin: 'https://trusted.example', getToken: async () => 'local-secret', fetchImpl },
+    expected: overrides.expected ?? { workflowId: 'wf-hosted', runId: 'run-hosted' },
     instructionSource: {
       projectRoot: f.projectRoot, globalRoot: tempDir('owenloop-hosted-adapter-global-'),
       verifier: createBundleIngestor(), env: f.env,
@@ -115,7 +123,7 @@ async function harness(overrides: {
       }),
     },
     consumeTrust: { env: f.env },
-    now: () => 1_000,
+    now: overrides.now ?? (() => 1_000),
   });
   return { adapter, p, f, fetches: () => fetches };
 }
@@ -124,6 +132,7 @@ test('valid signed consume crosses direct authenticated fetch into a minimized l
   const h = await harness({ received: (body, init) => {
     assert.deepEqual(body, { workflow: 'wf-hosted', run: 'run-hosted' });
     assert.equal((init.headers as Record<string, string>).authorization, 'Bearer local-secret');
+    assert.equal(init.redirect, 'error');
   } });
   const result = await h.adapter.open(preflight(h.f.defDigest, { prompt: 'HOSTILE RELAY PROMPT' }));
   assert.equal(result.state, 'ready');
@@ -150,6 +159,23 @@ test('malformed preflight never triggers a direct fetch', async () => {
     protocol: 'local-hosted-order-v1', state: 'unavailable',
   });
   assert.equal(h.fetches(), 0);
+});
+
+test('hostile preflight cannot use the local bearer token to select another order', async () => {
+  const h = await harness();
+  for (const ref of [
+    { workflow: 'wf-other' },
+    { run: 'run-other' },
+  ]) {
+    assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest, ref)), {
+      protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-out-of-scope',
+    });
+  }
+  assert.equal(h.fetches(), 0, 'no authenticated request is sent for a foreign reference');
+  const expected = { workflowId: 'wf-hosted', runId: 'run-hosted' };
+  const pinned = await harness({ expected });
+  expected.runId = 'run-other';
+  assert.equal((await pinned.adapter.open(preflight(pinned.f.defDigest))).state, 'ready');
 });
 
 test('a rebound direct response and a stale claim are refused', async () => {
@@ -233,6 +259,24 @@ test('raw transport and verifier errors become fixed refusal codes', async () =>
   assert.deepEqual(await verifierFailure.adapter.open(preflight(verifierFailure.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'definition-unverified-def',
   });
+  const nullResponse = await harness({ response: () => null });
+  assert.deepEqual(await nullResponse.adapter.open(preflight(nullResponse.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'direct-response-malformed',
+  });
+  const wrongNullOrder = await harness({ response: (p) => ({
+    text: '', workflow: 'wf-other', run: p.run, order: null, lease: { claimed: false },
+  }) });
+  assert.deepEqual(await wrongNullOrder.adapter.open(preflight(wrongNullOrder.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-rebound',
+  });
+});
+
+test('a redirected get_order is refused before redirected content is parsed', async () => {
+  const h = await harness({ redirectResponse: true });
+  assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'direct-fetch-failed',
+  });
+  assert.equal(h.fetches(), 1);
 });
 
 test('raw author fields cannot become instructions or replace local output schema', async () => {
@@ -289,12 +333,38 @@ test('missing consumed paths and mismatched owed paths cannot be projected as a 
   assert.deepEqual(await wrongOutput.adapter.open(preflight(wrongOutput.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'output-path-mismatch',
   });
+  for (const change of [
+    (p: OrderPacket) => { p.outputs = []; },
+    (p: OrderPacket) => { p.outputs = ['out', 'out']; p.owes.push({ ...p.owes[0]! }); },
+    (p: OrderPacket) => { p.outputs = ['out', 'extra']; },
+  ]) {
+    const h = await harness({ response: (p) => {
+      change(p);
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    } });
+    assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
+      protocol: 'local-hosted-order-v1', state: 'refused', code: 'output-path-mismatch',
+    });
+  }
+});
+
+test('lease observation expires during slow local verification or unsafe timestamp arithmetic', async () => {
+  let tick = 0;
+  const expired = await harness({ now: () => (++tick === 1 ? 1_000 : 6_000) });
+  assert.deepEqual(await expired.adapter.open(preflight(expired.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
+  });
+  const overflow = await harness({ now: () => Number.MAX_SAFE_INTEGER - 1 });
+  assert.deepEqual(await overflow.adapter.open(preflight(overflow.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'clock-unavailable',
+  });
 });
 
 test('configured service origin must be HTTPS', async () => {
   const h = await harness();
   assert.throws(() => createHostedOrderAdapter({
     hub: { origin: 'http://trusted.example', getToken: async () => 'x' },
+    expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
     instructionSource: { globalRoot: '/unused', verifier: createBundleIngestor() },
     consumeTrust: { env: {} }, now: () => 1,
   }), /HTTPS/);
@@ -317,6 +387,7 @@ test('production wiring verifies a real signed local publication and real signed
   const p = await packet(defDigest, keyPath, rootKey.keyid);
   const adapter = createDefaultHostedOrderAdapter({
     cwd, env: { HOME: home }, now: () => 1_000,
+    expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
     hub: {
       origin: 'https://trusted.example', getToken: async () => 'local-secret',
       fetchImpl: async () => new Response(JSON.stringify({

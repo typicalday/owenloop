@@ -71,6 +71,8 @@ export type HostedOrderResult =
 export interface HostedOrderAdapterOptions {
   /** Configured by the local client, never copied from MCP content. */
   hub: HubClientOptions;
+  /** Born-bound locally; the MCP preflight may only name this exact order. */
+  expected: { workflowId: string; runId: string };
   /** The adapter forces publication and origin policy to enforce. */
   instructionSource: Omit<StoreInstructionResolverOptions, 'defPolicy' | 'originPolicy' | 'consumedVerifier'>;
   /** The adapter forces artifact policy to enforce and uses its own clock. */
@@ -82,6 +84,7 @@ export interface HostedOrderAdapterOptions {
 
 export interface DefaultHostedOrderAdapterOptions {
   hub: HubClientOptions;
+  expected: { workflowId: string; runId: string };
   cwd: string;
   env: Record<string, string | undefined>;
   now: () => number;
@@ -152,11 +155,23 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
     || url.pathname !== '/' || url.search !== '' || url.hash !== '') {
     throw new Error('hosted order adapter requires a configured HTTPS service origin');
   }
+  if (!identifier(options.expected.workflowId) || !identifier(options.expected.runId)) {
+    throw new Error('hosted order adapter requires a bounded local workflow/run binding');
+  }
+  const expectedWorkflowId = options.expected.workflowId;
+  const expectedRunId = options.expected.runId;
   const duration = options.observationMs ?? MAX_OBSERVATION_MS;
   if (!Number.isInteger(duration) || duration < 1 || duration > MAX_OBSERVATION_MS) {
     throw new Error('hosted order observation window must be 1..5000 ms');
   }
-  const hub = createHubClient(options.hub);
+  // Fetch must not follow a redirect to another origin or a downgraded HTTP
+  // endpoint while carrying the local bearer token. This overrides any
+  // caller-provided fetch's default redirect behavior at the adapter boundary.
+  const fetchImpl = options.hub.fetchImpl ?? globalThis.fetch;
+  const hub = createHubClient({
+    ...options.hub,
+    fetchImpl: (input, init) => fetchImpl(input, { ...init, redirect: 'error' }),
+  });
   const instructions = createStoreInstructionResolver({
     ...options.instructionSource,
     defPolicy: 'enforce', originPolicy: 'enforce',
@@ -172,9 +187,12 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       const navigation = preflightRef(preflight, index);
       if (navigation.kind !== 'ref') return { protocol: 'local-hosted-order-v1', state: 'unavailable' };
       const { ref } = navigation;
+      if (ref.workflow !== expectedWorkflowId || ref.run !== expectedRunId) {
+	return refused('reference-out-of-scope');
+      }
       let response: Awaited<ReturnType<typeof hub.getOrder>>;
       try {
-	response = await hub.getOrder({ workflow: ref.workflow, run: ref.run });
+	response = await hub.getOrder({ workflow: expectedWorkflowId, run: expectedRunId });
       } catch {
 	return refused('direct-fetch-failed');
       }
@@ -185,11 +203,12 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('clock-unavailable');
       }
       if (!Number.isSafeInteger(observedAt) || observedAt < 0) return refused('clock-unavailable');
+      if (!record(response)) return refused('direct-response-malformed');
+      if (response.workflow !== expectedWorkflowId || response.run !== expectedRunId) return refused('reference-rebound');
       const order = response.order;
       if (order === null) return { protocol: 'local-hosted-order-v1', state: 'unavailable' };
       if (!record(order) || !record(response.lease)
-	|| response.workflow !== ref.workflow || response.run !== ref.run
-	|| order.workflow !== ref.workflow || order.run !== ref.run
+	|| order.workflow !== expectedWorkflowId || order.run !== expectedRunId
 	|| typeof order.defDigest !== 'string' || order.defDigest.toLowerCase() !== ref.defDigest) return refused('reference-rebound');
       if (response.lease.claimed !== true || response.lease.outcome !== undefined) return refused('claim-not-current');
       if (!identifier(order.step) || typeof order.key !== 'string' || order.key.length > 200 || !record(order.consumes)
@@ -229,6 +248,13 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	|| step.workdirFrom !== undefined || step.calls !== undefined || step.callsInterface !== undefined
 	|| step.judges !== undefined) return refused('unsupported-step');
       if (!validConsumedPaths(step, order)) return refused('consume-path-mismatch');
+      if (!Array.isArray(order.outputs) || order.outputs.length !== order.owes.length
+	|| order.outputs.some((path) => typeof path !== 'string')
+	|| new Set(order.outputs).size !== order.outputs.length
+	|| new Set(order.owes.map((owed) => owed.path)).size !== order.owes.length
+	|| order.owes.some((owed) => !order.outputs.includes(owed.path))) {
+	return refused('output-path-mismatch');
+      }
       const outputs: HostedOrderProjection['outputs'] = [];
       for (const owed of order.owes) {
 	if (typeof owed.path !== 'string' || owed.path.length > 200 || !Number.isSafeInteger(owed.version) || owed.version! < 1) {
@@ -254,6 +280,8 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('consume-verifier-failed');
       }
       if (!checked.ok) return refused('consume-proof-refused');
+      const expiresAt = observedAt + duration;
+      if (!Number.isSafeInteger(expiresAt)) return refused('clock-unavailable');
       let prompt: string;
       try {
 	prompt = substituteOrderVars(step.body, {
@@ -266,10 +294,21 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       } catch {
 	return refused('definition-materialization-failed');
       }
+      // Verification can take longer than the bounded service observation.
+      // A projection is never returned ready after that window has elapsed.
+      let finishedAt: number;
+      try {
+	finishedAt = options.now();
+      } catch {
+	return refused('clock-unavailable');
+      }
+      if (!Number.isSafeInteger(finishedAt) || finishedAt < observedAt || finishedAt >= expiresAt) {
+	return refused('claim-observation-expired');
+      }
       return {
 	protocol: 'local-hosted-order-v1',
 	state: 'ready',
-	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, observedAt, expiresAt: observedAt + duration },
+	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, observedAt, expiresAt },
 	definition: { bodyTrust: 'verified-local-publication', substitutions: 'trusted-service-observation', digest: order.defDigest, prompt },
 	...(step.spec === undefined && step.x === undefined ? {} : {
 	  staticExtensions: {
@@ -291,6 +330,7 @@ export function createDefaultHostedOrderAdapter(options: DefaultHostedOrderAdapt
   if (home === undefined) throw new Error('cannot locate the global workflow store: set HOME or USERPROFILE');
   return createHostedOrderAdapter({
     hub: options.hub,
+    expected: options.expected,
     instructionSource: {
       projectRoot: join(options.cwd, 'workflows'),
       globalRoot: globalStoreRoot(home),
