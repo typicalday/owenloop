@@ -41,7 +41,7 @@ import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { checkInterfaceCompatibility } from './implements.ts';
 import { isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
-import { parseVersionedCallTarget } from './bundle/manifest.ts';
+import { parseVersionedCallTarget } from './bundle/call-target.ts';
 import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
 import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
@@ -278,7 +278,7 @@ function callsPinViolation(
   target: string,
 ): string | undefined {
   if (target.includes('/')) {
-    const lockKey = target.includes('#') ? parseVersionedCallTarget(target).coordinate : target;
+    const lockKey = target.includes('#') ? parseVersionedCallTarget(target, parseWorkflowCoordinate).coordinate : target;
     const pinned = parentDef.bundleLock?.[lockKey];
     if (pinned === undefined) {
       return parentDef.bundleDigest !== undefined && target.includes('#')
@@ -1000,7 +1000,7 @@ export class Engine {
     let snapshotDef: WorkflowDef | undefined;
     let optimisticInterfaceBinding: InterfaceCallBinding | undefined;
     const namedExactLockKey = step.calls !== undefined && step.calls.includes('#') && parentDef.bundleDigest !== undefined
-      ? parseVersionedCallTarget(step.calls).coordinate
+      ? parseVersionedCallTarget(step.calls, parseWorkflowCoordinate).coordinate
       : undefined;
     let verifiedParentPin: string | undefined;
 
@@ -3561,7 +3561,17 @@ export class Engine {
   // ---- run lifecycle ---------------------------------------------------------
 
   /** Close a run (audit/budget) and release its lease so the task can re-arm. */
-  close(workflow: string, run: string, outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok', summary?: string): void {
+  close(
+    workflow: string,
+    run: string,
+    outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok',
+    summary?: string,
+    opts?: {
+      /** Disable the child-to-parent cascade only while terminating an entire
+       * calls tree. A live parent needs this cascade for forward progress. */
+      maintainParent?: boolean;
+    },
+  ): void {
     this.store.tx(() => {
       const r = this.store.getRun(run);
       if (!r) throw new Error(`no such run: ${run}`);
@@ -3587,7 +3597,9 @@ export class Engine {
     // forward cascade and no `settled` to derive — just the lifecycle signal.
     this.fire({ type: 'closed', workflow, run, outcome });
     // M2B cascade-up prompt: closing a run may advance the child's artifact state.
-    this.triggerParentIfChild(workflow);
+    // Terminal tree cancellation closes every lease itself. Maintaining a
+    // parent while that tree is being torn down can create new calls children.
+    if (opts?.maintainParent !== false) this.triggerParentIfChild(workflow);
   }
 
   /**

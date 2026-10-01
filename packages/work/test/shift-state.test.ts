@@ -280,6 +280,7 @@ test('reserveChild creates a closed gate and a capacity-bearing reservation befo
   assert.equal(readFileSync(reserved.gatePath, 'utf8'), 'wait\n');
   assert.deepEqual(readChildReservations(dir), [reserved.reservation]);
   assert.deepEqual(readChildRecords(dir), []);
+  assert.equal(readdirSync(dir).filter((name) => name.endsWith('.tmp')).length, 0);
 });
 
 test('reserveChild exclusively deduplicates the same run and removes the losing gate', () => {
@@ -297,6 +298,7 @@ test('reserveChild exclusively deduplicates the same run and removes the losing 
     childKind: 'exec',
   }), /EEXIST/u);
   assert.equal(readdirSync(dir).filter((name) => name.endsWith('.gate')).length, 1);
+  assert.equal(readdirSync(dir).filter((name) => name.endsWith('.tmp')).length, 0);
   assert.equal(readChildReservations(dir).length, 1);
 });
 
