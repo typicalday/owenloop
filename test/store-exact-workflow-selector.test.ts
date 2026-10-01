@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 
 import { assertLockCoverage, parseManifestBytes, parseVersionedCallTarget } from '../src/bundle/manifest.ts';
 import { digestScopedCallsTargetKey, finalizeDefs, resolveCallsTarget } from '../src/defs.ts';
 import { Engine } from '../src/engine.ts';
-import { openStore } from '../src/store.ts';
+import { openStore, readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   createBundleIngestor,
   createStoreInstructionSource,
@@ -56,17 +57,18 @@ function alias(root: string, coordinate: string, digest: string): void {
   writeWorkflowStoreIndex(storeIndexPath(root), index);
 }
 
-async function installChild(root: string, marker: string, withDefault = true) {
+async function installChild(root: string, marker: string, withDefault = true, version = '1.0.0') {
   const installed = await installBundleFixture({
     root,
     sourceDir: writeBundleSource({
       name: 'delivery',
+      version,
       workflow: child('delivery', `default-${marker}`),
       workflows: { 'precision-map': child('precision-map', `selected-${marker}`) },
       ...(withDefault ? { defaultWorkflow: 'delivery' } : {}),
     }),
   });
-  alias(root, base, installed.result.digest);
+  alias(root, `dep/delivery@${version}`, installed.result.digest);
   return installed;
 }
 
@@ -208,6 +210,67 @@ test('GC retains an exact selected workflow without a default', async () => {
     exactCalls: [exact],
   });
   assert.equal(plan.report.objects.some((object) => object.digest === selected.result.digest), false);
+});
+
+test('persisted named calls with missing or stale base locks refuse replay and retain GC roots', async () => {
+  for (const lockState of ['missing', 'stale'] as const) {
+    const root = tempDir();
+    const selected = await installChild(root, 'V1');
+    await installChild(root, 'V2', true, '2.0.0');
+    const installedParent = await installParent(root, selected.result.digest);
+    const definitions = defs(root, root);
+    const dbPath = join(tempDir(), 'state.db');
+    const initial = openStore(dbPath);
+    let instance: string;
+    try {
+      const engine = new Engine(initial, (name, from) => {
+		const resolved = from === undefined ? definitions.get(name) : resolveCallsTarget(definitions, name, from);
+		if (resolved === undefined) throw new Error(`missing ${name}`);
+		return resolved;
+      });
+      instance = engine.createInstance('caller/caller@1.0.0');
+    } finally {
+      initial.close();
+    }
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare('SELECT def_snapshot FROM workflow WHERE id = ?').get(instance) as { def_snapshot: string };
+    const snapshot = JSON.parse(row.def_snapshot) as Record<string, unknown>;
+    snapshot.bundleLock = lockState === 'missing' ? {} : { [base]: 'f'.repeat(64) };
+    db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?').run(JSON.stringify(snapshot), instance);
+    db.close();
+
+    const pins = readRuntimeSnapshotBundlePins(dbPath);
+    assert.equal(pins.length, 1);
+    assert.equal(pins[0]!.bundleDigest, installedParent.result.digest);
+    assert.deepEqual(pins[0]!.exactCalls ?? [], lockState === 'missing' ? [exact] : []);
+    const gc = planWorkflowStoreGc({
+      projectRoot: root,
+      globalRoot: root,
+      level: 'project',
+      keep: 1,
+      snapshotPins: pins,
+    });
+    assert.equal(gc.report.objects.some((object) => object.digest === selected.result.digest), false);
+
+    const replay = openStore(dbPath);
+    try {
+      const engine = new Engine(replay, (name, from) => {
+		const resolved = from === undefined ? definitions.get(name) : resolveCallsTarget(definitions, name, from);
+		if (resolved === undefined) throw new Error(`missing ${name}`);
+		return resolved;
+      });
+      assert.throws(
+		() => engine.provideInput(instance, 'seed', { go: true }),
+		/missing dep\/delivery@1\.0\.0#precision-map/,
+		lockState,
+      );
+      assert.equal(replay.findChildByParent(instance, 'delivered'), undefined, lockState);
+      assert.notEqual(replay.getArtifact(instance, 'delivered')?.acceptance, 'accepted', lockState);
+    } finally {
+      replay.close();
+    }
+  }
 });
 
 test('selector grammar rejects malformed calls and selector lock keys', () => {
