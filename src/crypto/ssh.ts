@@ -139,6 +139,7 @@ export const defaultSshProcess: SshProcessAdapter = {
       let errLen = 0;
       let truncated = false;
       let timedOut = false;
+      let stdinWriteFailed = false;
       const cap = opts.maxBuffer ?? SSH_MAX_BUFFER;
       const timer = setTimeout(() => {
         timedOut = true;
@@ -153,6 +154,11 @@ export const defaultSshProcess: SshProcessAdapter = {
         errLen += c.length;
         if (errLen <= cap) stderr.push(c);
       });
+      // A verifier can reject a malformed signature and close its read end
+      // before the message has drained. Consume the resulting EPIPE instead
+      // of letting an unhandled stdin error terminate the caller. A zero exit
+      // after an incomplete write must never be treated as a valid signature.
+      child.stdin.on('error', () => { stdinWriteFailed = true; });
       child.on('error', () => {
         clearTimeout(timer);
         resolve({ status: null, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: false, truncated: false });
@@ -160,15 +166,14 @@ export const defaultSshProcess: SshProcessAdapter = {
       child.on('close', (code) => {
         clearTimeout(timer);
         resolve({
-          status: code,
+          status: stdinWriteFailed && code === 0 ? null : code,
           stdout: Buffer.concat(stdout),
           stderr: Buffer.concat(stderr),
           timedOut,
           truncated,
         });
       });
-      if (opts.stdin && opts.stdin.length > 0) child.stdin.write(opts.stdin);
-      child.stdin.end();
+      child.stdin.end(opts.stdin && opts.stdin.length > 0 ? opts.stdin : undefined);
     });
   },
   probe(cmd, args, opts) {
