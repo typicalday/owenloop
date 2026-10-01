@@ -105,6 +105,7 @@ The mapping is strict and closed. Unknown keys are rejected. At least one of `mi
 
 This Owenloop release advertises exactly these feature identifiers:
 
+- `exact-workflow-selector.v1`
 - `harness-policy-enforcement.v1`
 - `native-judge-policy-inheritance.v1`
 - `neutral-approval-modes.v1`

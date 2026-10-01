@@ -158,6 +158,7 @@ import {
   parseWorkflowCoordinate,
   projectStoreRoot,
   createBundleIngestor,
+  createVerifiedBundleLockReader,
   createPreCommitVerifier,
   recoverWorkflowStore,
   storeIndexPath,
@@ -850,6 +851,12 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
   // path — one loaded-definition resolver seeds the instruction boundary
   // (emission digests + instruction resolution), never a second local path.
   const instructionSource = createDefInstructionSource(defs.values());
+  let verifiedGlobalRoot: string;
+  try {
+    verifiedGlobalRoot = globalStoreRoot(workflowHome(io));
+  } catch {
+    verifiedGlobalRoot = join(defsDir, '.owenloop-global-store-unavailable');
+  }
   // WS-6: the resolver is SCOPE-AWARE. `from` is supplied only by the engine's
   // `calls:` spawn path; when it is present and carries CAS provenance, a bare
   // target resolves sibling-first inside that def's own bundle (the exact rule
@@ -862,7 +869,13 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
       : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
-  }, { instructionSource });
+  }, {
+    instructionSource,
+    readVerifiedBundleLock: createVerifiedBundleLockReader({
+      projectRoot: projectStoreRoot(defsDir),
+      globalRoot: verifiedGlobalRoot,
+    }),
+  });
   return { store, engine, defs, defsDir, dbPath, definitionDiscoveryComplete };
 }
 

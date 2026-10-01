@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 
@@ -9,6 +9,7 @@ import { Engine } from '../src/engine.ts';
 import { openStore, readRuntimeSnapshotBundlePins } from '../src/store.ts';
 import {
   createBundleIngestor,
+  createVerifiedBundleLockReader,
   createStoreInstructionSource,
   loadCasDefs,
   planWorkflowStoreGc,
@@ -88,6 +89,14 @@ function defs(projectRoot: string, globalRoot: string) {
   return finalizeDefs(new Map(loadCasDefs({ projectRoot, globalRoot, warn: () => {} }).map((r) => [r.key, r.def])));
 }
 
+function namedEngine(store: ReturnType<typeof openStore>, definitions: ReturnType<typeof defs>, projectRoot: string, globalRoot: string) {
+  return new Engine(store, (name, from) => {
+    const resolved = from === undefined ? definitions.get(name) : resolveCallsTarget(definitions, name, from);
+    if (resolved === undefined) throw new Error(`missing ${name}`);
+    return resolved;
+  }, { readVerifiedBundleLock: createVerifiedBundleLockReader({ projectRoot, globalRoot }) });
+}
+
 test('named exact call selects the nondefault workflow for coordinator spawn and worker replay', async () => {
   const root = tempDir();
   const global = tempDir();
@@ -101,11 +110,7 @@ test('named exact call selects the nondefault workflow for coordinator spawn and
 
   const store = openStore(join(tempDir(), 'state.db'));
   try {
-    const engine = new Engine(store, (name, from) => {
-      const resolved = from === undefined ? definitions.get(name) : resolveCallsTarget(definitions, name, from);
-      if (resolved === undefined) throw new Error(`missing ${name}`);
-      return resolved;
-    });
+    const engine = namedEngine(store, definitions, root, global);
     const instance = engine.createInstance('caller/caller@1.0.0', { provide: { seed: { go: true } } });
     engine.tick(instance, { deep: false });
     const spawned = store.findChildByParent(instance, 'delivered');
@@ -150,7 +155,7 @@ test('selector works without a default and stays on its global digest under a pr
       const resolved = definitions.get(name);
       if (resolved === undefined) throw new Error(`missing ${name}`);
       return resolved;
-    });
+    }, { readVerifiedBundleLock: createVerifiedBundleLockReader({ projectRoot: project, globalRoot: global }) });
     const instance = engine.createInstance('caller/caller@1.0.0', { provide: { seed: { go: true } } });
     engine.tick(instance, { deep: false });
     assert.equal(store.findChildByParent(instance, 'delivered'), undefined);
@@ -223,11 +228,7 @@ test('persisted named calls with missing or stale base locks refuse replay and r
     const initial = openStore(dbPath);
     let instance: string;
     try {
-      const engine = new Engine(initial, (name, from) => {
-		const resolved = from === undefined ? definitions.get(name) : resolveCallsTarget(definitions, name, from);
-		if (resolved === undefined) throw new Error(`missing ${name}`);
-		return resolved;
-      });
+      const engine = namedEngine(initial, definitions, root, root);
       instance = engine.createInstance('caller/caller@1.0.0');
     } finally {
       initial.close();
@@ -255,20 +256,97 @@ test('persisted named calls with missing or stale base locks refuse replay and r
 
     const replay = openStore(dbPath);
     try {
-      const engine = new Engine(replay, (name, from) => {
-		const resolved = from === undefined ? definitions.get(name) : resolveCallsTarget(definitions, name, from);
-		if (resolved === undefined) throw new Error(`missing ${name}`);
-		return resolved;
-      });
-      assert.throws(
-		() => engine.provideInput(instance, 'seed', { go: true }),
-		/missing dep\/delivery@1\.0\.0#precision-map/,
+      const engine = namedEngine(replay, definitions, root, root);
+      engine.provideInput(instance, 'seed', { go: true });
+      assert.equal(replay.findChildByParent(instance, 'delivered'), undefined, lockState);
+      assert.match(
+		replay.getArtifact(instance, 'delivered')?.reasons.at(-1)?.text ?? '',
+		/persisted base-coordinate lock differs from the verified parent bundle/,
 		lockState,
       );
-      assert.equal(replay.findChildByParent(instance, 'delivered'), undefined, lockState);
-      assert.notEqual(replay.getArtifact(instance, 'delivered')?.acceptance, 'accepted', lockState);
     } finally {
       replay.close();
+    }
+  }
+});
+
+test('a persisted lock changed to a callable project shadow cannot redirect a named child', async () => {
+  const global = tempDir();
+  const project = tempDir();
+  const original = await installChild(global, 'GLOBAL');
+  await installParent(global, original.result.digest);
+  const shadow = await installChild(project, 'PROJECT');
+  const definitions = defs(project, global);
+  const dbPath = join(tempDir(), 'state.db');
+  const initial = openStore(dbPath);
+  let instance: string;
+  try {
+    instance = namedEngine(initial, definitions, project, global).createInstance('caller/caller@1.0.0');
+  } finally {
+    initial.close();
+  }
+  const db = new DatabaseSync(dbPath);
+  const row = db.prepare('SELECT def_snapshot FROM workflow WHERE id = ?').get(instance) as { def_snapshot: string };
+  const snapshot = JSON.parse(row.def_snapshot) as Record<string, unknown>;
+  snapshot.bundleLock = { [base]: shadow.result.digest };
+  db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?').run(JSON.stringify(snapshot), instance);
+  db.close();
+
+  const replay = openStore(dbPath);
+  try {
+    namedEngine(replay, definitions, project, global).provideInput(instance, 'seed', { go: true });
+    assert.equal(replay.findChildByParent(instance, 'delivered'), undefined);
+    assert.match(replay.getArtifact(instance, 'delivered')?.reasons.at(-1)?.text ?? '', /persisted base-coordinate lock differs/);
+  } finally {
+    replay.close();
+  }
+});
+
+test('a pinned named call replays from verified parent bytes after its index row is removed', async () => {
+  const root = tempDir();
+  const selected = await installChild(root, 'ORIGINAL');
+  await installParent(root, selected.result.digest);
+  const definitions = defs(root, root);
+  const store = openStore(join(tempDir(), 'state.db'));
+  try {
+    const engine = namedEngine(store, definitions, root, root);
+    const instance = engine.createInstance('caller/caller@1.0.0');
+    const index = readWorkflowStoreIndex(storeIndexPath(root));
+    delete index.entries['caller/caller@1.0.0'];
+    writeWorkflowStoreIndex(storeIndexPath(root), index);
+    engine.provideInput(instance, 'seed', { go: true });
+    const spawned = store.findChildByParent(instance, 'delivered');
+    assert.ok(spawned);
+    assert.equal(spawned.defSnapshot?.bundleDigest, selected.result.digest);
+    assert.match(spawned.defSnapshot?.steps[0]?.body ?? '', /selected-ORIGINAL/);
+  } finally {
+    store.close();
+  }
+});
+
+test('missing or corrupt parent CAS bytes refuse a new named child', async () => {
+  for (const damage of ['missing', 'corrupt'] as const) {
+    const root = tempDir();
+    const selected = await installChild(root, damage);
+    const installedParent = await installParent(root, selected.result.digest);
+    const definitions = defs(root, root);
+    const store = openStore(join(tempDir(), 'state.db'));
+    try {
+      const engine = namedEngine(store, definitions, root, root);
+      const instance = engine.createInstance('caller/caller@1.0.0');
+      if (damage === 'missing') {
+		chmodSync(installedParent.result.objectPath, 0o755);
+		rmSync(installedParent.result.objectPath, { recursive: true, force: true });
+      } else {
+		const workflowPath = join(installedParent.result.objectPath, 'workflow.yaml');
+		chmodSync(workflowPath, 0o644);
+		writeFileSync(workflowPath, `${readFileSync(workflowPath, 'utf8')}# tampered\n`);
+      }
+      engine.provideInput(instance, 'seed', { go: true });
+      assert.equal(store.findChildByParent(instance, 'delivered'), undefined, damage);
+      assert.match(store.getArtifact(instance, 'delivered')?.reasons.at(-1)?.text ?? '', /parent bundle could not be verified/, damage);
+    } finally {
+      store.close();
     }
   }
 });

@@ -92,6 +92,7 @@ export type { BundleIngestorOptions } from './ingestor.ts';
 
 // ---- WS-6 CAS -> calls: def bridge ----
 export { inspectCasDefs, loadCasDefs } from './def-source.ts';
+export { createVerifiedBundleLockReader } from './verified-lock.ts';
 export type {
   CasDefInspectionResult,
   CasDefRegistration,
