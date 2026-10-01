@@ -41,7 +41,7 @@ import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { checkInterfaceCompatibility } from './implements.ts';
 import { isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
-import { parseVersionedCallTarget } from './bundle/manifest.ts';
+import { parseVersionedCallTarget } from './bundle/call-target.ts';
 import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
 import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
@@ -278,7 +278,7 @@ function callsPinViolation(
   target: string,
 ): string | undefined {
   if (target.includes('/')) {
-    const lockKey = target.includes('#') ? parseVersionedCallTarget(target).coordinate : target;
+    const lockKey = target.includes('#') ? parseVersionedCallTarget(target, parseWorkflowCoordinate).coordinate : target;
     const pinned = parentDef.bundleLock?.[lockKey];
     if (pinned === undefined) {
       return parentDef.bundleDigest !== undefined && target.includes('#')
@@ -1000,7 +1000,7 @@ export class Engine {
     let snapshotDef: WorkflowDef | undefined;
     let optimisticInterfaceBinding: InterfaceCallBinding | undefined;
     const namedExactLockKey = step.calls !== undefined && step.calls.includes('#') && parentDef.bundleDigest !== undefined
-      ? parseVersionedCallTarget(step.calls).coordinate
+      ? parseVersionedCallTarget(step.calls, parseWorkflowCoordinate).coordinate
       : undefined;
     let verifiedParentPin: string | undefined;
 
