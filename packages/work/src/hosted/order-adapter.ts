@@ -15,7 +15,7 @@ import { globalStoreRoot } from '../../../../src/store/resolve.ts';
 import { createExecutionDefinitionVerifier, createExecutionOriginVerifier } from '../../../../src/store/pre-commit-verifier.ts';
 import type { ProducePattern, StepDef } from '../../../../src/types.ts';
 import { createHubClient, type HubClientOptions } from '../hub/client.ts';
-import type { OrderPacket } from '../hub/types.ts';
+import type { ConditionalSubmitRequest, ConditionalSubmitResponse, OrderPacket } from '../hub/types.ts';
 import { createConsumedVerifier, type CreateConsumedVerifierArgs } from '../consumed-verifier.ts';
 import { createStoreInstructionResolver, type StoreInstructionResolverOptions } from '../exec/instructions.ts';
 
@@ -68,6 +68,12 @@ export type HostedOrderResult =
   | HostedOrderProjection
   | { protocol: 'local-hosted-order-v1'; state: 'unavailable' }
   | { protocol: 'local-hosted-order-v1'; state: 'refused'; code: string };
+
+/** Private only: never serialize this beside the model-facing projection. */
+export interface HostedVerifiedPacket {
+  order: OrderPacket;
+  collectionOutputs: string[];
+}
 
 export interface HostedOrderAdapterOptions {
   /** Configured by the local client, never copied from MCP content. */
@@ -180,7 +186,8 @@ export function hostedPacketDigest(packet: unknown): string | undefined {
  * runtime HTTP downgrade or MCP-selected origin.
  */
 export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
-  open(preflight: unknown, index?: number): Promise<HostedOrderResult>;
+  open(preflight: unknown, index?: number, onVerified?: (packet: HostedVerifiedPacket) => void): Promise<HostedOrderResult>;
+  submitConditional(req: ConditionalSubmitRequest): Promise<ConditionalSubmitResponse>;
 } {
   const url = new URL(options.hub.origin);
   if (url.protocol !== 'https:' || url.username !== '' || url.password !== ''
@@ -215,7 +222,11 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
   });
 
   return {
-    async open(preflight: unknown, index = 0): Promise<HostedOrderResult> {
+    submitConditional(req) {
+      if (hub.submitConditional === undefined) throw new Error('conditional submit transport is unavailable');
+      return hub.submitConditional(req);
+    },
+    async open(preflight: unknown, index = 0, onVerified?: (packet: HostedVerifiedPacket) => void): Promise<HostedOrderResult> {
       const navigation = preflightRef(preflight, index);
       if (navigation.kind !== 'ref') return { protocol: 'local-hosted-order-v1', state: 'unavailable' };
       const { ref } = navigation;
@@ -288,12 +299,14 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('output-path-mismatch');
       }
       const outputs: HostedOrderProjection['outputs'] = [];
+      const collectionOutputs: string[] = [];
       for (const owed of order.owes) {
 	if (typeof owed.path !== 'string' || owed.path.length > 200 || !Number.isSafeInteger(owed.version) || owed.version! < 1) {
 	  return refused('output-malformed');
 	}
 	const produce = outputFor(step, order, owed.path);
 	if (produce === undefined) return refused('output-path-mismatch');
+	if (produce.kind === 'collection') collectionOutputs.push(owed.path);
 	const schemaAppliesTo = produce.kind === 'collection' ? 'member' : 'value';
 	outputs.push({
 	  path: owed.path,
@@ -339,6 +352,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       }
       const packetDigest = hostedPacketDigest(order);
       if (packetDigest === undefined) return refused('order-malformed');
+      onVerified?.({ order, collectionOutputs });
       return {
 	protocol: 'local-hosted-order-v1',
 	state: 'ready',
