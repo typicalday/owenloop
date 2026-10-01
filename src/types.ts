@@ -867,7 +867,7 @@ export interface WorkflowDef {
   bundleStoreRoots?: string[];
   /**
    * @internal WS-6 CAS provenance: a COPY of the containing bundle manifest's
-   * `lock` map (explicit `namespace/name@version` reference text → the canonical
+   * `lock` map (base `namespace/name@version` reference text → the canonical
    * bundle digest that reference is pinned to). Carried on the def so the
    * engine's spawn-time pin check is a pure in-memory comparison and never
    * performs filesystem I/O inside the SQLite write transaction that creates the

@@ -80,6 +80,8 @@ export interface CreateEngineOpts {
    * same reference-mode behavior, no legacy branch.
    */
   instructionSource?: OrderInstructionSource;
+  /** Verified, index-independent CAS lock reader for replaying named exact calls. */
+  readVerifiedBundleLock?: (digest: string) => Readonly<Record<string, string>>;
 }
 
 export interface CreatedEngine {
@@ -171,6 +173,7 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
     onEvent?: EngineListener;
     onListenerError?: (err: unknown, event: EngineEvent) => void;
     instructionSource?: OrderInstructionSource;
+    readVerifiedBundleLock?: (digest: string) => Readonly<Record<string, string>>;
   } = {};
   if (opts.reapTtlMs !== undefined) engineOpts.reapTtlMs = opts.reapTtlMs;
   if (opts.maxLeaseMs !== undefined) engineOpts.maxLeaseMs = opts.maxLeaseMs;
@@ -178,6 +181,7 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
   if (opts.onEvent !== undefined) engineOpts.onEvent = opts.onEvent;
   if (opts.onListenerError !== undefined) engineOpts.onListenerError = opts.onListenerError;
   engineOpts.instructionSource = instructionSource;
+  if (opts.readVerifiedBundleLock !== undefined) engineOpts.readVerifiedBundleLock = opts.readVerifiedBundleLock;
 
   const engine = new Engine(store, resolveDef, engineOpts);
   return { engine, store, defs, resolver: engine.resolver };
