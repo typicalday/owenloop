@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.31](https://github.com/typicalday/owenloop/compare/v0.5.30...v0.5.31) (2026-10-01)
+
+
+### Features
+
+* **store:** support exact calls to named bundle workflows ([#327](https://github.com/typicalday/owenloop/issues/327)) ([6336841](https://github.com/typicalday/owenloop/commit/633684192b68d005e1e65e72b8848d4bcd02f91f))
+
+
+### Bug Fixes
+
+* **deps:** refresh vulnerable transitive lock entries ([#331](https://github.com/typicalday/owenloop/issues/331)) ([02c3bcd](https://github.com/typicalday/owenloop/commit/02c3bcdc8751e40b7f11f746528ab30f0302df2a))
+* **shift:** deadline every poll-loop hub call and add a stall watchdog ([#315](https://github.com/typicalday/owenloop/issues/315)) ([7e3a2a7](https://github.com/typicalday/owenloop/commit/7e3a2a7c3d9be77803ae6a618d01124a49c90997))
+* **work:** release an order whose workdir no longer exists ([#316](https://github.com/typicalday/owenloop/issues/316)) ([d4c6adb](https://github.com/typicalday/owenloop/commit/d4c6adb4da512f9b5579c68881447eb320142293)), closes [#301](https://github.com/typicalday/owenloop/issues/301)
+
 ## [0.5.30](https://github.com/typicalday/owenloop/compare/v0.5.29...v0.5.30) (2026-09-05)
 
 
