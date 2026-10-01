@@ -6,7 +6,7 @@
  */
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HoldMcpMount } from '../hold/mcp.ts';
-import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type ContactHolder, type OrderPacket } from '../hub/types.ts';
+import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type ContactHolder, type GetOrderResponse, type OrderPacket } from '../hub/types.ts';
 import { hostedPacketDigest, type HostedOrderProjection, type HostedOrderResult, type HostedVerifiedPacket } from './order-adapter.ts';
 
 type Adapter = {
@@ -26,7 +26,7 @@ function refusal(code: string): ToolResult {
   return textResult({ protocol: 'local-hosted-order-v1', state: 'refused', code }, true);
 }
 
-function privatePreflight(result: ToolResult, bound: BoundOrder): { ref: unknown; digest: string } | undefined {
+function privatePreflight(result: ToolResult, gated: GetOrderResponse | undefined, bound: BoundOrder): { ref: unknown; digest: string } | undefined {
   if (result.isError || result.content.length !== 1) return undefined;
   let view: unknown;
   try {
@@ -38,8 +38,12 @@ function privatePreflight(result: ToolResult, bound: BoundOrder): { ref: unknown
   const order = record(packet?.order);
   if (packet?.workflow !== bound.workflow || packet?.run !== bound.run
     || order?.workflow !== bound.workflow || order?.run !== bound.run
-    || typeof order.defDigest !== 'string') return undefined;
-  const digest = hostedPacketDigest(order);
+    || gated?.workflow !== bound.workflow || gated.run !== bound.run
+    || gated.order?.workflow !== bound.workflow || gated.order.run !== bound.run
+    || typeof order.defDigest !== 'string' || gated.order.defDigest !== order.defDigest) return undefined;
+  // The model-facing get_order result is deliberately reduced. Compare the
+  // full gated packet held inside this mount with the adapter's direct fetch.
+  const digest = hostedPacketDigest(gated.order);
   if (digest === undefined) return undefined;
   return { digest, ref: {
     protocol: 'client-preflight-v1', verification: 'not-performed',
@@ -73,7 +77,7 @@ export function createVerifiedHostedHoldMcp(
       } catch {
         return { ok: false, result: refusal('holder-order-unavailable') };
       }
-      const privateOrder = privatePreflight(raw, bound);
+      const privateOrder = privatePreflight(raw, mount.readGatedOrder(), bound);
       if (privateOrder === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
       ref = privateOrder.ref;
       initialDigest = privateOrder.digest;
@@ -109,7 +113,7 @@ export function createVerifiedHostedHoldMcp(
       return checked.ok ? textResult(checked.projection) : checked.result;
     },
   };
-  if (!options.enableSubmit) return { loop: mount.loop, tools: [orderTool] };
+  if (!options.enableSubmit) return { loop: mount.loop, tools: [orderTool], readGatedOrder: mount.readGatedOrder };
   const submitTool: ToolRegistration = {
     name: 'submit',
     description: 'Submit one object receipt for a currently verified owed path using the service conditional-v1 protocol. Re-verifies the order before every submit.',
@@ -172,5 +176,5 @@ export function createVerifiedHostedHoldMcp(
       });
     },
   };
-  return { loop: mount.loop, tools: [orderTool, submitTool] };
+  return { loop: mount.loop, tools: [orderTool, submitTool], readGatedOrder: mount.readGatedOrder };
 }

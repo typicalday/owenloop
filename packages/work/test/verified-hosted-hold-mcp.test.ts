@@ -5,7 +5,8 @@ import { createVerifiedHostedHoldMcp } from '../src/hosted/verified-hold-mcp.ts'
 import { hostedPacketDigest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
 import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type OrderPacket } from '../src/hub/types.ts';
 import { textResult, type ToolCallContext, type ToolRegistration } from '../src/mcp/server.ts';
-import type { HoldMcpMount } from '../src/hold/mcp.ts';
+import { createHoldMcp, type HoldMcpMount } from '../src/hold/mcp.ts';
+import type { HubClient } from '../src/hub/client.ts';
 
 const context: ToolCallContext = { cancelled: false, onCancel: () => {}, sendProgress: () => {} };
 const rawOrder: OrderPacket = {
@@ -56,6 +57,7 @@ function fixture(enableSubmit = false) {
       } },
       unsafeAction,
     ],
+    readGatedOrder: () => ({ text: '', workflow: 'wf', run: 'run', order: rawOrder, lease: { claimed: true } }),
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
     open: async (ref, _index, onVerified) => {
@@ -96,6 +98,54 @@ function fixture(enableSubmit = false) {
     setSubmitError: (next: unknown) => { submitError = next; },
   };
 }
+
+test('real hold mount compares its full gated packet while showing a reduced order to the model', async () => {
+  const full: OrderPacket = {
+    ...rawOrder,
+    spec: { privateInstruction: 'HUB-SPEC' },
+    x: { privateInstruction: 'HUB-X' },
+    owes: [{ ...rawOrder.owes[0]!, schema: { privateInstruction: 'HUB-SCHEMA' } }],
+  };
+  const response = { text: 'HUB-TEXT', workflow: 'wf', run: 'run', order: full, lease: { claimed: true } };
+  const hub = { getOrder: async () => response } as unknown as HubClient;
+  const mount = createHoldMcp({
+    hub, workflow: 'wf', run: 'run', workdir: process.cwd(), tools: ['get_order'],
+    sleep: async () => {}, now: () => 0, err: () => {},
+  });
+  const raw = await mount.tools[0]!.handler({}, context);
+  assert.equal(raw.isError, undefined);
+  assert.doesNotMatch(raw.content[0]!.text, /HUB-SPEC|HUB-X|HUB-SCHEMA|HUB-TEXT/);
+  assert.equal(hostedPacketDigest(mount.readGatedOrder()?.order), hostedPacketDigest(full));
+
+  let direct: OrderPacket = full;
+  const wrapped = createVerifiedHostedHoldMcp(mount, {
+    open: async (_ref, _index, onVerified) => {
+      onVerified?.({ order: direct, collectionOutputs: [] });
+      return ready(direct);
+    },
+  }, { workflow: 'wf', run: 'run' });
+  const accepted = await wrapped.tools[0]!.handler({}, context);
+  assert.equal(accepted.isError, undefined);
+  assert.match(accepted.content[0]!.text, /VERIFIED INSTRUCTION/);
+  assert.doesNotMatch(accepted.content[0]!.text, /HUB-SPEC|HUB-X|HUB-SCHEMA|HUB-TEXT/);
+
+  // The full snapshot, including a field omitted from the model view, fences
+  // a changed direct service order before any verified projection is shown.
+  const freshMount = createHoldMcp({
+    hub, workflow: 'wf', run: 'run', workdir: process.cwd(), tools: ['get_order'],
+    sleep: async () => {}, now: () => 0, err: () => {},
+  });
+  direct = { ...full, spec: { privateInstruction: 'CHANGED' } };
+  const fenced = createVerifiedHostedHoldMcp(freshMount, {
+    open: async (_ref, _index, onVerified) => {
+      onVerified?.({ order: direct, collectionOutputs: [] });
+      return ready(direct);
+    },
+  }, { workflow: 'wf', run: 'run' });
+  const changed = await fenced.tools[0]!.handler({}, context);
+  assert.equal(changed.isError, true);
+  assert.match(changed.content[0]!.text, /holder-order-changed/);
+});
 
 test('verified holder exposes only the verified projection and no mutation tools', async () => {
   const f = fixture();
