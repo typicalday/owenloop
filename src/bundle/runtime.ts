@@ -12,6 +12,7 @@ const semver = createRequire(import.meta.url)('semver') as SemverApi;
 
 /** Runtime features implemented by this Owenloop release. */
 export const SUPPORTED_RUNTIME_FEATURES = Object.freeze([
+  'exact-workflow-selector.v1',
   'harness-policy-enforcement.v1',
   'native-judge-policy-inheritance.v1',
   // A def may write `x.harness.permissionMode` as one of the three neutral

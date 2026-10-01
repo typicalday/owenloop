@@ -105,8 +105,9 @@ export interface BundleManifest {
    */
   capabilities: Record<string, string[]>;
   /**
-   * Digest-pinned cross-bundle references: exact `namespace/name@version`
-   * reference text → lowercase 64-hex def digest of the called bundle.
+   * Digest-pinned cross-bundle references: base `namespace/name@version`
+   * coordinate → lowercase 64-hex def digest of the called bundle, including
+   * `#workflow` calls into that bundle.
    */
   lock: Record<string, string>;
 }
