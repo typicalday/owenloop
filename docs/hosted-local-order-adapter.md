@@ -42,9 +42,16 @@ with its hard rule. A `ready` projection labels locally authored prompt,
 `spec`, `x`, and schema separately from service-observed substitutions and
 output versions (`versionTrust`). Dynamic values carry the signed-submission and locally
 anchored producer-chain verdict at the version observed from the service.
+For ordinary consumed artifacts, that verifier does not bind the signed
+producer workflow/run/definition digest to this hosted instance. The trusted
+service selects provenance and claim-time versions; the local verifier checks
+the signature, value, version, and configured chain authority. The projection
+does not claim independently attested instance provenance.
 Unrecognized order fields, unsupported worker/step types, unverified consumed
 values, and output lists that do not exactly match owed paths (including
-duplicates) refuse with fixed codes. Raw service
+duplicates) refuse with fixed codes. Consumed paths must include every
+declared plain input and a reduce collection's exact seal; map input paths,
+bare key, and index must bind the same member. Raw service
 errors are never returned.
 
 `owes[].reasons`, `owes[].proof`, and `previousValue` currently refuse the whole

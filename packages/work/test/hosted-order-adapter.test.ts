@@ -32,12 +32,36 @@ steps:
     x:
       policy: local-only
 `;
+const REDUCE_WORKFLOW = `name: hosted-reduce
+inputs:
+  - name: policy
+    seedOwed: true
+steps:
+  - name: collect
+    produces: ['items[]']
+    body: "Collect items."
+  - name: summarize
+    consumes: ['items[*]', policy]
+    produces: [summary]
+    terminal: true
+    body: "Summarize the signed items."
+`;
+const MAP_WORKFLOW = `name: hosted-map
+steps:
+  - name: collect
+    produces: ['items[]']
+    body: "Collect items."
+  - name: annotate
+    consumes: ['items[$i]']
+    produces: ['items[$i].note', audit]
+    body: "Annotate the bound item."
+`;
 
-async function proof(value: unknown, keyPath: string, keyId: string): Promise<string> {
+async function proof(value: unknown, keyPath: string, keyId: string, artifact = 'seed', version = 2): Promise<string> {
   const payload = {
     run: 'producer-run', workflow: 'wf-hosted', defDigest: 'producer-definition',
     step: 'produce-seed', key: '',
-    produced: [{ artifact: 'seed', version: 2, valueDigest: valueDigestHex(value) }],
+    produced: [{ artifact, version, valueDigest: valueDigestHex(value) }],
     consumedFingerprint: {}, producerKeyId: keyId, timestamp: 10,
   };
   const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
@@ -335,6 +359,7 @@ test('missing consumed paths and mismatched owed paths cannot be projected as a 
   });
   for (const change of [
     (p: OrderPacket) => { p.outputs = []; },
+    (p: OrderPacket) => { p.outputs = []; p.owes = []; },
     (p: OrderPacket) => { p.outputs = ['out', 'out']; p.owes.push({ ...p.owes[0]! }); },
     (p: OrderPacket) => { p.outputs = ['out', 'extra']; },
   ]) {
@@ -398,4 +423,118 @@ test('production wiring verifies a real signed local publication and real signed
   const result = await adapter.open(preflight(defDigest));
   assert.equal(result.state, 'ready', JSON.stringify(result));
   if (result.state === 'ready') assert.equal(result.definition.bodyTrust, 'verified-local-publication');
+});
+
+test('signed reduce order admits only the verified collection seal and member paths', async () => {
+  const cwd = tempDir('owenloop-hosted-reduce-cwd-');
+  const home = tempDir('owenloop-hosted-reduce-home-');
+  const installed = await installSignedBundleFixture({
+    sourceDir: writeBundleSource({ name: 'hosted-reduce', workflow: REDUCE_WORKFLOW }),
+    root: join(cwd, 'workflows'), home,
+  });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition);
+  const keyPath = join(home, 'producer');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'hosted-reduce-test', '-f', keyPath], { stdio: 'ignore' });
+  const rootKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
+  writeFileSync(join(home, '.owenloop', 'org-root.pub'), rootKey.openSshPublicKey);
+  const defDigest = defInstructionDigest(definition);
+  const member = { item: 'signed' };
+  const seal = { count: 1 };
+  const policy = { mode: 'approved' };
+  const p: OrderPacket = {
+    workflow: 'wf-hosted', run: 'run-hosted', step: 'summarize', key: '', defDigest,
+    inputs: ['items[0]', 'items.sealed', 'policy'], outputs: ['summary'],
+    consumes: { 'items[0]': member, 'items.sealed': seal, policy },
+    consumedFingerprint: { 'items[0]': 2, 'items.sealed': 1, policy: 1 },
+    consumesProof: JSON.stringify({
+      'items[0]': await proof(member, keyPath, rootKey.keyid, 'items[0]', 2),
+      'items.sealed': await proof(seal, keyPath, rootKey.keyid, 'items.sealed', 1),
+      policy: await proof(policy, keyPath, rootKey.keyid, 'policy', 1),
+    }),
+    owes: [{ path: 'summary', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+  };
+  const adapter = createDefaultHostedOrderAdapter({
+    cwd, env: { HOME: home }, now: () => 1_000,
+    expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
+    hub: {
+      origin: 'https://trusted.example', getToken: async () => 'local-secret',
+      fetchImpl: async () => new Response(JSON.stringify({
+	text: 'raw service text', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
+      }), { status: 200 }),
+    },
+  });
+  const result = await adapter.open(preflight(defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') {
+    assert.deepEqual(result.consumes.map(({ path }) => path), ['items[0]', 'items.sealed', 'policy']);
+  }
+  p.inputs = ['items[0]', 'policy'];
+  delete p.consumes['items.sealed'];
+  assert.deepEqual(await adapter.open(preflight(defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'consume-path-mismatch',
+  });
+  p.inputs = ['items[0]', 'items.sealed'];
+  p.consumes['items.sealed'] = seal;
+  delete p.consumes.policy;
+  assert.deepEqual(await adapter.open(preflight(defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'consume-path-mismatch',
+  });
+});
+
+test('signed map order binds the bare key, index, input and output to one member', async () => {
+  const cwd = tempDir('owenloop-hosted-map-cwd-');
+  const home = tempDir('owenloop-hosted-map-home-');
+  const installed = await installSignedBundleFixture({
+    sourceDir: writeBundleSource({ name: 'hosted-map', workflow: MAP_WORKFLOW }),
+    root: join(cwd, 'workflows'), home,
+  });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition);
+  const keyPath = join(home, 'producer');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'hosted-map-test', '-f', keyPath], { stdio: 'ignore' });
+  const rootKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
+  writeFileSync(join(home, '.owenloop', 'org-root.pub'), rootKey.openSshPublicKey);
+  const defDigest = defInstructionDigest(definition);
+  const member = { item: 'signed map member' };
+  const p: OrderPacket = {
+    workflow: 'wf-hosted', run: 'run-hosted', step: 'annotate', key: 'items[0]', index: 0, defDigest,
+    inputs: ['items[0]'], outputs: ['items[0].note'], consumes: { 'items[0]': member },
+    consumedFingerprint: { 'items[0]': 2 },
+    consumesProof: JSON.stringify({ 'items[0]': await proof(member, keyPath, rootKey.keyid, 'items[0]', 2) }),
+    owes: [{ path: 'items[0].note', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+  };
+  const adapter = createDefaultHostedOrderAdapter({
+    cwd, env: { HOME: home }, now: () => 1_000,
+    expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
+    hub: {
+      origin: 'https://trusted.example', getToken: async () => 'local-secret',
+      fetchImpl: async () => new Response(JSON.stringify({
+	workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
+      }), { status: 200 }),
+    },
+  });
+  assert.equal((await adapter.open(preflight(defDigest))).state, 'ready');
+  p.key = 'items[1]';
+  assert.deepEqual(await adapter.open(preflight(defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'consume-path-mismatch',
+  });
+  p.key = 'items[0]';
+  p.index = 1;
+  assert.deepEqual(await adapter.open(preflight(defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'consume-path-mismatch',
+  });
+  p.index = 0;
+  p.inputs = ['items[0]', 'items[0]'];
+  assert.deepEqual(await adapter.open(preflight(defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'consume-path-mismatch',
+  });
+  p.inputs = ['items[0]'];
+  p.outputs = ['audit'];
+  p.owes = [{ path: 'audit', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }];
+  assert.deepEqual(await adapter.open(preflight(defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'output-path-mismatch',
+  });
 });

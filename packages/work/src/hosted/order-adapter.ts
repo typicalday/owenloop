@@ -6,7 +6,7 @@
  * any model-facing content. It trusts that service and HTTPS connection; it
  * does not claim a cryptographic order or lease attestation.
  */
-import { bindProduce, matchConsume, sealPath } from '../../../../src/paths.ts';
+import { bindProduce, elementPath, matchConsume, sealPath } from '../../../../src/paths.ts';
 import { substituteOrderVars } from '../../../../src/order-resolver.ts';
 import { join } from 'node:path';
 import { createBundleIngestor } from '../../../../src/store/index.ts';
@@ -127,15 +127,37 @@ function concreteOutput(produce: ProducePattern, order: OrderPacket): string | u
 }
 
 function outputFor(step: StepDef, order: OrderPacket, path: string): ProducePattern | undefined {
-  return step.produces.find((produce) => concreteOutput(produce, order) === path);
+  const mode = step.consumes.some((pattern) => pattern.mode === 'map') ? 'map'
+    : step.consumes.some((pattern) => pattern.mode === 'reduce') ? 'reduce' : 'plain';
+  return step.produces.find((produce) =>
+    (mode === 'plain' ? produce.kind !== 'map' : produce.kind === (mode === 'map' ? 'map' : 'singleton'))
+    && concreteOutput(produce, order) === path);
 }
 
 function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
   if (!Array.isArray(order.inputs) || order.inputs.some((path) => typeof path !== 'string')) return false;
   const expected = new Set(order.inputs);
   const delivered = Object.keys(order.consumes);
-  if (expected.size !== delivered.length || delivered.some((path) => !expected.has(path))) return false;
-  return delivered.every((path) => step.consumes.some((pattern) => matchConsume(pattern, path) !== null));
+  if (expected.size !== order.inputs.length || expected.size !== delivered.length
+    || delivered.some((path) => !expected.has(path))) return false;
+  const map = step.consumes.find((pattern) => pattern.mode === 'map');
+  if (map) {
+    if (!Number.isSafeInteger(order.index) || order.index! < 0
+      || order.key !== elementPath(map.stem, order.index!)
+      || !expected.has(elementPath(map.stem, order.index!, map.suffix))) return false;
+  } else if (order.key !== '' || order.index !== undefined) return false;
+  if (step.consumes.some((pattern) =>
+    (pattern.mode === 'plain' && !expected.has(pattern.stem))
+    || (pattern.mode === 'reduce' && !expected.has(sealPath(pattern.stem))))) return false;
+  if (order.cause === undefined) {
+    if (!(step.on ?? ['inputsGreen']).includes('inputsGreen')) return false;
+  } else if ((order.cause !== 'allGreen' && order.cause !== 'idle')
+    || !step.on?.includes(order.cause) || expected.size !== 0) return false;
+  return delivered.every((path) => step.consumes.some((pattern) => {
+    if (pattern.mode === 'reduce' && path === sealPath(pattern.stem)) return true;
+    const matched = matchConsume(pattern, path);
+    return matched !== null && (pattern.mode !== 'map' || matched.index === order.index);
+  }));
 }
 
 function refused(code: string): HostedOrderResult {
@@ -248,7 +270,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	|| step.workdirFrom !== undefined || step.calls !== undefined || step.callsInterface !== undefined
 	|| step.judges !== undefined) return refused('unsupported-step');
       if (!validConsumedPaths(step, order)) return refused('consume-path-mismatch');
-      if (!Array.isArray(order.outputs) || order.outputs.length !== order.owes.length
+      if (!Array.isArray(order.outputs) || order.outputs.length === 0 || order.outputs.length !== order.owes.length
 	|| order.outputs.some((path) => typeof path !== 'string')
 	|| new Set(order.outputs).size !== order.outputs.length
 	|| new Set(order.owes.map((owed) => owed.path)).size !== order.owes.length
