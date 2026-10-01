@@ -527,6 +527,8 @@ export interface RejectRequest {
   run: string;
   path: string;
   text: string;
+  /** Optional declared modifier requested from the input artifact's producer. */
+  requested?: string;
 }
 
 /** The reject verb's flattened response envelope. */

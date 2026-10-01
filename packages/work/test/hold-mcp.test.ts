@@ -179,6 +179,7 @@ test('the mount exposes exactly ask, get_order, put_file_artifact, reject, and s
     properties: {
       path: { type: 'string', description: 'The consumed artifact path to reject.' },
       text: { type: 'string', description: 'The reason for rejecting the artifact.' },
+      requested: { type: 'string', description: 'Optional declared modifier to request from the producer.' },
     },
     additionalProperties: false,
   });
@@ -658,13 +659,26 @@ test('reject posts only the bound workflow/run/path/text and never accepts clien
   assert.equal((calls[0]!.arg as Record<string, unknown>)['by'], undefined);
 });
 
-test('reject validates path and text before touching the hub', async () => {
+test('reject forwards an optional requested modifier under the held run without caller-supplied authority', async () => {
+  const { hub, calls } = mockHub({ reject: { ok: true, closed: true } });
+  const mount = createHoldMcp(deps(hub));
+  const res = await tool(mount.tools, 'reject').handler({ path: 'modifier', text: 'public API change needs deep review', requested: 'deep', by: 'forged' }, ctx);
+  assert.deepEqual(parse(res), { ok: true, closed: true, text: 'ok' });
+  assert.deepEqual(calls, [{
+    verb: 'reject',
+    arg: { workflow: 'wf1', run: 'run1', path: 'modifier', text: 'public API change needs deep review', requested: 'deep' },
+  }]);
+});
+
+test('reject validates path, text, and requested before touching the hub', async () => {
   const { hub, calls } = mockHub({});
   const mount = createHoldMcp(deps(hub));
   const noPath = await tool(mount.tools, 'reject').handler({ text: 'bad' }, ctx);
   const noText = await tool(mount.tools, 'reject').handler({ path: 'input' }, ctx);
+  const badRequested = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad', requested: '  ' }, ctx);
   assert.equal((noPath as { isError?: boolean }).isError, true);
   assert.equal((noText as { isError?: boolean }).isError, true);
+  assert.equal((badRequested as { isError?: boolean }).isError, true);
   assert.equal(calls.length, 0);
 });
 
