@@ -17,6 +17,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { lstatSync } from 'node:fs';
 import { detId, nowMs } from './util.ts';
 import { compareStoreText, defDigest, isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
+import { parseVersionedCallTarget } from './bundle/manifest.ts';
 import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
 import type {
   Acceptance,
@@ -86,8 +87,9 @@ function exactCallsFromSnapshot(record: Record<string, unknown>, workflow: strin
 			throw new Error(`workflow '${workflow}' has malformed def_snapshot.steps[${index}].calls: expected a string`);
 		}
 		if (!calls.includes('@')) continue;
+		let lockKey: string;
 		try {
-			parseWorkflowCoordinate(calls);
+			lockKey = parseVersionedCallTarget(calls).coordinate;
 		} catch (error) {
 			throw new Error(
 				`workflow '${workflow}' has malformed exact def_snapshot calls target ${JSON.stringify(calls)}: ` +
@@ -99,7 +101,7 @@ function exactCallsFromSnapshot(record: Record<string, unknown>, workflow: strin
 			typeof rawLock === 'object'
 			&& rawLock !== null
 			&& !Array.isArray(rawLock)
-			&& Object.prototype.hasOwnProperty.call(rawLock, calls)
+			&& Object.prototype.hasOwnProperty.call(rawLock, lockKey)
 		) continue;
 		exactCalls.add(calls);
 	}

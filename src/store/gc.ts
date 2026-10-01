@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
+import { parseVersionedCallTarget } from '../bundle/manifest.ts';
 import { loadDefFile } from '../defs.ts';
 import {
   acquireInstallLock,
@@ -298,9 +299,9 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
     if (
       registration.kind === 'coordinate'
       && registration.coordinate !== undefined
-      && registration.key === registration.coordinate
+      && (registration.key === registration.coordinate || registration.key.startsWith(`${registration.coordinate}#`))
     ) {
-      directCoordinateDigests.set(registration.coordinate, registration.bundleDigest);
+      directCoordinateDigests.set(registration.key, registration.bundleDigest);
     }
   }
 
@@ -510,14 +511,15 @@ export function planWorkflowStoreGc(args: PlanWorkflowStoreGcArgs): WorkflowStor
   };
 
   // A retained filesystem/add/legacy parent carries no bundle digest or lock,
-  // but its explicit namespace/name@version call still resolves through the
-  // direct CAS coordinate alias. Root that exact coordinate and the digest it
+  // but its exact package or named-workflow call still resolves through the
+  // direct CAS alias. Root its base coordinate and the digest it
   // selects before walking the selected object's own manifest locks.
-  for (const coordinate of [...retainedExactCalls].sort(compareStoreText)) {
-    const digest = directCoordinateDigests.get(coordinate);
+  for (const target of [...retainedExactCalls].sort(compareStoreText)) {
+    const coordinate = parseVersionedCallTarget(target).coordinate;
+	const digest = directCoordinateDigests.get(target);
 	if (digest === undefined) {
 		throw new Error(
-			`workflow-store GC cannot preserve retained exact calls target '${coordinate}': ` +
+			`workflow-store GC cannot preserve retained exact calls target '${target}': ` +
 				'no callable exact coordinate is installed',
 		);
     }

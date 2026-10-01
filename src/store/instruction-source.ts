@@ -10,7 +10,7 @@
 
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { isVersionedReference, parseManifestBytes } from '../bundle/manifest.ts';
+import { isVersionedReference, parseManifestBytes, parseVersionedCallTarget } from '../bundle/manifest.ts';
 import type { BundleManifest } from '../bundle/types.ts';
 import { defInstructionDigest } from '../order-resolver.ts';
 import type {
@@ -291,8 +291,11 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       child: LoadedObject,
     ): WorkflowDef => {
       let coordinate: ReturnType<typeof parseWorkflowCoordinate>;
+      let namedWorkflow: string | undefined;
       try {
-	coordinate = parseWorkflowCoordinate(target);
+	const parsed = parseVersionedCallTarget(target);
+	coordinate = parseWorkflowCoordinate(parsed.coordinate);
+	namedWorkflow = parsed.workflow;
       } catch (error) {
 	throw new StoreIntegrityError(
 	  'object-corrupt',
@@ -310,7 +313,7 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	  `locked calls target '${target}' does not match child manifest package '${child.manifest.package.name}@${child.manifest.package.version}'`,
 	);
       }
-      const workflowName = child.manifest.default
+      const workflowName = namedWorkflow ?? child.manifest.default
 	?? (child.defs.size === 1 ? child.defs.keys().next().value as string | undefined : undefined);
       if (workflowName === undefined) {
 	throw new StoreIntegrityError(
@@ -338,14 +341,15 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	for (const step of def.steps) {
 	  if (step.calls === undefined || !isVersionedReference(step.calls)) continue;
 	  const target = step.calls;
-	  if (!Object.prototype.hasOwnProperty.call(object.manifest.lock, target)) {
+	  const lockKey = parseVersionedCallTarget(target).coordinate;
+	  if (!Object.prototype.hasOwnProperty.call(object.manifest.lock, lockKey)) {
 	    throw new StoreIntegrityError(
 	      'object-corrupt',
 	      object.bundleDigest,
 	      `locked calls target '${target}' has no entry in parent bundle ${object.bundleDigest} manifest lock`,
 	    );
 	  }
-	  const childDigest = defDigest(object.manifest.lock[target]!);
+	  const childDigest = defDigest(object.manifest.lock[lockKey]!);
 	  let child: LoadedObject | undefined;
 	  for (const candidate of dependencyRoots(object)) {
 	    try {

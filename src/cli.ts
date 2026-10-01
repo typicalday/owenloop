@@ -120,6 +120,7 @@ import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import { BundleError, digestBundle, inspectBundle, packBundle, unpackBundle } from './bundle/index.ts';
+import { parseVersionedCallTarget } from './bundle/manifest.ts';
 import {
   acquireInstallLock,
   ADD_JOURNAL_FILENAME,
@@ -3244,7 +3245,7 @@ function bundleGcExactCallsFromCurrentDefs(
 		for (const step of def.steps) {
 			if (step.calls === undefined || !step.calls.includes('@')) continue;
 			try {
-				parseWorkflowCoordinate(step.calls);
+				parseVersionedCallTarget(step.calls);
 			} catch (error) {
 				throw new CliError(
 					`owenloop bundle gc: malformed exact calls target ${JSON.stringify(step.calls)} ` +

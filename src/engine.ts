@@ -41,6 +41,7 @@ import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { checkInterfaceCompatibility } from './implements.ts';
 import { isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
+import { parseVersionedCallTarget } from './bundle/manifest.ts';
 import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
 import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
@@ -258,8 +259,9 @@ function hasExactImplementationClaim(def: WorkflowDef, expected: WorkflowInterfa
  *     containing bundle's own digest. `childDef.bundleDigest` must equal
  *     `parentDef.bundleDigest`.
  *
- *  2. `target` is an explicit `namespace/name@version` reference AND the parent
- *     bundle's manifest `lock` names it. The lock value is a canonical BUNDLE
+ *  2. `target` is an explicit `namespace/name@version` reference, optionally
+ *     followed by `#workflow`, AND the parent bundle's manifest `lock` names
+ *     its base coordinate. The lock value is a canonical BUNDLE
  *     digest (`bundle.yaml.lock` validates lowercase 64-hex; `assertLockCoverage`
  *     requires an entry for every versioned target), so it is compared against
  *     `childDef.bundleDigest` — NOT against `defInstructionDigest`, which
@@ -276,8 +278,13 @@ function callsPinViolation(
   target: string,
 ): string | undefined {
   if (target.includes('/')) {
-    const pinned = parentDef.bundleLock?.[target];
-    if (pinned === undefined) return undefined; // no lock entry reachable — unpinned
+    const lockKey = target.includes('#') ? parseVersionedCallTarget(target).coordinate : target;
+    const pinned = parentDef.bundleLock?.[lockKey];
+    if (pinned === undefined) {
+      return parentDef.bundleDigest !== undefined && target.includes('#')
+		? `parent bundle has no lock for exact target ${lockKey}`
+		: undefined;
+    }
     if (childDef.bundleDigest === undefined) {
       return `parent bundle pins it to ${pinned} but the resolved definition carries no bundle provenance`;
     }
