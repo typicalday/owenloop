@@ -3561,7 +3561,17 @@ export class Engine {
   // ---- run lifecycle ---------------------------------------------------------
 
   /** Close a run (audit/budget) and release its lease so the task can re-arm. */
-  close(workflow: string, run: string, outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok', summary?: string): void {
+  close(
+    workflow: string,
+    run: string,
+    outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok',
+    summary?: string,
+    opts?: {
+      /** Disable the child-to-parent cascade only while terminating an entire
+       * calls tree. A live parent needs this cascade for forward progress. */
+      maintainParent?: boolean;
+    },
+  ): void {
     this.store.tx(() => {
       const r = this.store.getRun(run);
       if (!r) throw new Error(`no such run: ${run}`);
@@ -3587,7 +3597,9 @@ export class Engine {
     // forward cascade and no `settled` to derive — just the lifecycle signal.
     this.fire({ type: 'closed', workflow, run, outcome });
     // M2B cascade-up prompt: closing a run may advance the child's artifact state.
-    this.triggerParentIfChild(workflow);
+    // Terminal tree cancellation closes every lease itself. Maintaining a
+    // parent while that tree is being torn down can create new calls children.
+    if (opts?.maintainParent !== false) this.triggerParentIfChild(workflow);
   }
 
   /**
