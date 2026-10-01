@@ -78,6 +78,7 @@ import '../harnesses.ts';
 // ─────────────────────────────────────────────────────────────────────────────
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { owedSchema } from '../../../../src/model.ts';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import {
@@ -518,11 +519,22 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       }
     }
 
+    const owedSchemas: NonNullable<NormalizedStepSpec['owedSchemas']> = Object.create(null);
+    if (Array.isArray(resolved.step.produces)) {
+      for (const path of new Set([...order.owes.map((owed) => owed.path), ...order.outputs])) {
+        const declared = owedSchema(resolved.step, path);
+        if (declared !== undefined) {
+          owedSchemas[path] = { schema: declared.schema, schemaAppliesTo: declared.appliesTo };
+        }
+      }
+    }
+
     return {
       step: resolved.step.name,
       brief: resolved.step.body,
       ...(carrier.harness !== undefined ? { harness: carrier.harness } : {}),
       permissions: normalizeStepPermissions(carrier.harnessOptions, resolved.step),
+      owedSchemas,
     };
   };
 
