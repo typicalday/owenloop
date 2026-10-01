@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.32](https://github.com/typicalday/owenloop/compare/v0.5.31...v0.5.32) (2026-10-01)
+
+
+### Bug Fixes
+
+* **work:** forward requested modifier from held reject ([#323](https://github.com/typicalday/owenloop/issues/323)) ([f543983](https://github.com/typicalday/owenloop/commit/f54398307f0c93f087cbb443546a68aec508534a))
+
 ## [0.5.31](https://github.com/typicalday/owenloop/compare/v0.5.30...v0.5.31) (2026-10-01)
 
 
