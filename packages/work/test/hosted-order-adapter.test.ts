@@ -14,7 +14,7 @@ import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { createBundleIngestor } from '../../../src/store/index.ts';
 import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import type { GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
-import { createDefaultHostedOrderAdapter, createHostedOrderAdapter } from '../src/hosted/order-adapter.ts';
+import { createDefaultHostedOrderAdapter, createHostedOrderAdapter, hostedPacketDigest } from '../src/hosted/order-adapter.ts';
 
 const VALUE = { request: 'signed value' };
 const WORKFLOW = `name: hosted-adapter
@@ -171,7 +171,8 @@ test('valid signed consume crosses direct authenticated fetch into a minimized l
   assert.deepEqual(result.consumes, [{ path: 'seed', value: VALUE, trust: 'signed-value-and-local-chain-at-service-observed-version' }]);
   assert.deepEqual(result.outputs, [{ path: 'out', version: 1, versionTrust: 'trusted-service-observation' }]);
   assert.deepEqual(result.serviceObservation, {
-    workflow: 'wf-hosted', run: 'run-hosted', step: 'make', observedAt: 1_000, expiresAt: 6_000,
+    workflow: 'wf-hosted', run: 'run-hosted', step: 'make', packetDigest: hostedPacketDigest(h.p),
+    observedAt: 1_000, expiresAt: 6_000,
   });
   const rendered = JSON.stringify(result);
   assert.doesNotMatch(rendered, /HOSTILE|proof|signature|lease|text|structuredContent/i);
