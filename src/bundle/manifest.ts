@@ -30,9 +30,25 @@ import {
 import type { ParsedNode, Pair } from 'yaml';
 import { canonicalBundlePathViolation } from '../archive.ts';
 import { parseWorkflowCoordinate } from '../store/types.ts';
+import {
+  isVersionedReference as isPortableVersionedReference,
+  parseVersionedCallTarget as parsePortableVersionedCallTarget,
+  WORKFLOW_NAME_RE,
+} from './call-target.ts';
 import { assertCurrentRuntimeCompatible, isCanonicalSemver } from './runtime.ts';
 import { BundleError } from './types.ts';
 import type { BundleManifest, BundleRuntimeRequirements } from './types.ts';
+export { WORKFLOW_NAME_RE } from './call-target.ts';
+
+/** Parse an exact call using the store's canonical coordinate validator. */
+export function parseVersionedCallTarget(text: string): { coordinate: string; workflow?: string } {
+  return parsePortableVersionedCallTarget(text, parseWorkflowCoordinate);
+}
+
+/** Preserve the manifest API's boolean check for an exact call. */
+export function isVersionedReference(text: string): boolean {
+  return isPortableVersionedReference(text, parseWorkflowCoordinate);
+}
 
 /** Lowercase 64-hex SHA-256 of `bytes`. */
 export function sha256Hex(bytes: Uint8Array): string {
@@ -42,8 +58,6 @@ export function sha256Hex(bytes: Uint8Array): string {
 const DIGEST_RE = /^[0-9a-f]{64}$/;
 /** Portable package namespace. */
 const PACKAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-/** Workflow map keys: lowercase-start, lowercase alphanumeric and hyphen. */
-export const WORKFLOW_NAME_RE = /^[a-z][a-z0-9-]*$/;
 /** Version: printable ASCII, no separators that would break filenames or lock keys. */
 const VERSION_RE = /^[!-~]{1,128}$/;
 /** Versioned runtime feature identifier ending in a positive `.vN` version. */
@@ -52,34 +66,6 @@ const RUNTIME_FEATURE_RE = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]*$/;
 const PLATFORM_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Capability class identifier. */
 const CAPABILITY_CLASS_RE = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
-/** Historical explicit-coordinate spelling; store parsing further excludes ambiguous separators. */
-const VERSIONED_REF_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+@[!-~]+$/;
-/** Parse an exact call. `#` cannot occur in a store coordinate, so the selector is unambiguous. */
-export function parseVersionedCallTarget(text: string): { coordinate: string; workflow?: string } {
-  const hash = text.indexOf('#');
-  const coordinate = hash < 0 ? text : text.slice(0, hash);
-  if (!VERSIONED_REF_RE.test(coordinate)) {
-    throw new BundleError('MANIFEST_ERROR', `invalid exact versioned call target '${text}'`);
-  }
-  parseWorkflowCoordinate(coordinate);
-  if (hash < 0) return { coordinate };
-  const workflow = text.slice(hash + 1);
-  if (!WORKFLOW_NAME_RE.test(workflow)) {
-    throw new BundleError('MANIFEST_ERROR', `invalid named workflow selector '${text}'`);
-  }
-  return { coordinate, workflow };
-}
-
-/** True for a well-formed exact package call, optionally selecting a named workflow. */
-export function isVersionedReference(text: string): boolean {
-  try {
-    parseVersionedCallTarget(text);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Walk a yaml AST into plain JS values, fail-closed: refuses aliases, merge
  * keys, any tag (custom `!x` or built-in `!!x`), and non-string map keys.
