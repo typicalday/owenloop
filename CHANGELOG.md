@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.34](https://github.com/typicalday/owenloop/compare/v0.5.33...v0.5.34) (2026-10-01)
+
+
+### Bug Fixes
+
+* handle early ssh verifier stdin close ([bbe69ec](https://github.com/typicalday/owenloop/commit/bbe69ecd8aa8acb92e1740105dfab600c9a0b571))
+* handle early SSH verifier stdin close ([14c04c9](https://github.com/typicalday/owenloop/commit/14c04c95747644a7239a1998eb39b4b021ed856a))
+
 ## [0.5.33](https://github.com/typicalday/owenloop/compare/v0.5.32...v0.5.33) (2026-10-01)
 
 
