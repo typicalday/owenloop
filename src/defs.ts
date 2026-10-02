@@ -30,6 +30,8 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
+import { parseVersionedCallTarget } from './bundle/call-target.ts';
+import { parseWorkflowCoordinate } from './store/types.ts';
 import { isCallStep } from './types.ts';
 import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef, WorkflowInterfaceClaim } from './types.ts';
 
@@ -2529,12 +2531,12 @@ export function digestScopedCallsTargetKey(
  * THREE CASES, checked in this order:
  *
  *  1. `target` contains `/` — an explicitly QUALIFIED reference. When the
- *     calling definition carries a lock digest for that exact target, prefer the
+ *     calling definition carries a lock digest for its base coordinate, prefer the
  *     digest-scoped coordinate alias registered by the CAS loader. That preserves
  *     an already-running parent's selection when a project coordinate later
  *     shadows the global coordinate it originally pinned. Without a reachable
- *     pinned alias, use the direct coordinate/package key so new lookups retain
- *     project-over-global precedence and the engine can surface a pin mismatch.
+ *     pinned alias, a plain local caller may use the direct coordinate/package
+ *     key. A CAS caller's named exact target fails closed without its alias.
  *     Never fall back to a bare lookup: an author who wrote a qualified name
  *     asked for one specific definition.
  *
@@ -2558,10 +2560,21 @@ function resolveCallsTargetKey(
   from: WorkflowDef,
 ): string | undefined {
   if (target.includes('/')) {
-    const pinnedDigest = from.bundleLock?.[target];
+    let lockKey = target;
+    if (target.includes('#')) {
+      try {
+		lockKey = parseVersionedCallTarget(target, parseWorkflowCoordinate).coordinate;
+      } catch {
+		return undefined;
+      }
+    }
+    const pinnedDigest = from.bundleLock?.[lockKey];
     if (pinnedDigest !== undefined) {
       const pinnedKey = digestScopedCallsTargetKey(pinnedDigest, target);
       if (defs.has(pinnedKey)) return pinnedKey;
+    }
+    if (target.includes('#')) {
+      return from.bundleDigest === undefined && defs.has(target) ? target : undefined;
     }
     return defs.has(target) ? target : undefined;
   }

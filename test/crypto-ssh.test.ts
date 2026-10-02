@@ -27,6 +27,7 @@ import {
   SshSignerError,
   assertEd25519PubText,
   createSshSigner,
+  defaultSshProcess,
   probeSshKeygenY,
   resetSshKeygenProbe,
 } from '../src/crypto/ssh.ts';
@@ -47,6 +48,21 @@ function sshKeygenWorks(): boolean {
   }
 }
 const SKIP = !sshKeygenWorks() && 'host ssh-keygen lacks -Y support';
+
+test('spawn adapter handles early stdin close and fails closed on a zero exit', async () => {
+  // Keep the child alive after closing its read end so a large pending write
+  // reliably reaches the broken pipe on both Linux and macOS.
+  const script = 'process.stdin.destroy(); setTimeout(() => process.exit(Number(process.argv[1])), 100)';
+  const input = Buffer.alloc(8 * 1024 * 1024, 0x61);
+  for (const exitCode of [7, 0]) {
+    const result = await defaultSshProcess.run(process.execPath, ['-e', script, String(exitCode)], {
+      stdin: input,
+      timeoutMs: 5_000,
+    });
+    assert.equal(result.timedOut, false);
+    assert.equal(result.status, exitCode === 0 ? null : exitCode);
+  }
+});
 
 /** Generate an ephemeral test key in `dir`; the private file is the test's
  *  responsibility to remove (every caller does so in `finally`). */

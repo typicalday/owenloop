@@ -184,6 +184,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  let stopping = false;
   // Set the moment the lease loop's run() settles (lease-lost, completed,
   // released, …): from then on this mount no longer holds the order, so BOTH
   // registered tools fast-fail with isError and never touch the hub again (plan section 4
@@ -215,13 +216,17 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       terminal = outcome;
       return outcome;
     },
-    stop: (reason?: string, stopOpts?: StopOptions) => inner.stop(reason, stopOpts),
+    stop: (reason?: string, stopOpts?: StopOptions) => {
+      // Revoke model-facing tools before the asynchronous lease loop settles.
+      stopping = true;
+      inner.stop(reason, stopOpts);
+    },
   };
 
   /** The fast-fail both tools apply once the hold is over. */
   function terminalGuard(): ToolResult | undefined {
-    if (terminal === undefined) return undefined;
-    return textResult({ error: `order no longer held (${terminal}) — stop` }, true);
+    if (terminal === undefined && !stopping) return undefined;
+    return textResult({ error: `order no longer held (${terminal ?? 'stopping'}) — stop` }, true);
   }
 
   async function gate(res: GetOrderResponse): Promise<ToolResult | undefined> {
@@ -247,18 +252,22 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const getOrderTool: ToolRegistration = {
     name: 'get_order',
     description:
-      "Return this work-holder's order — the prompt, consumed inputs, and owed output paths for the run it is bound to. Takes no arguments (the run is fixed at launch).",
+      "Return the bound run's gated dynamic order state: consumed inputs, owed paths, and rejection reasons. Static task instructions and schemas come from the locally verified workflow definition or agent brief, not this tool. Takes no arguments.",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     handler: async () => {
       const gone = terminalGuard();
       if (gone !== undefined) return gone;
       if (captured !== undefined) {
         const refused = await gate(captured);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         return textResult(orderView(captured));
       }
       if (firstContact !== undefined) {
         const refused = await gate(firstContact);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = firstContact;
         return textResult(orderView(firstContact));
@@ -266,6 +275,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       try {
         const res = await hub.getOrder({ workflow, run, ...holderReq });
         const refused = await gate(res);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = res;
         return textResult(orderView(res));
@@ -347,6 +358,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
         }
+        const beforeSubmit = terminalGuard();
+        if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({
           workflow,
           run,
@@ -368,13 +381,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const rejectTool: ToolRegistration = {
     name: 'reject',
     description:
-      'Reject a consumed artifact path with a reason. The hub derives the rejecting step from this held run; the client cannot supply `by`.',
+      'Reject a consumed artifact path with a reason and optional requested modifier. The hub derives the rejecting step from this held run; the client cannot supply `by`.',
     inputSchema: {
       type: 'object',
       required: ['path', 'text'],
       properties: {
         path: { type: 'string', description: 'The consumed artifact path to reject.' },
         text: { type: 'string', description: 'The reason for rejecting the artifact.' },
+        requested: { type: 'string', description: 'Optional declared modifier to request from the producer.' },
       },
       additionalProperties: false,
     },
@@ -383,14 +397,18 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (gone !== undefined) return gone;
       const path = args['path'];
       const text = args['text'];
+      const requested = args['requested'];
       if (typeof path !== 'string' || path.trim() === '') {
         return textResult({ error: 'reject requires a non-empty string "path"' }, true);
       }
       if (typeof text !== 'string' || text.trim() === '') {
         return textResult({ error: 'reject requires a non-empty string "text"' }, true);
       }
+      if (requested !== undefined && (typeof requested !== 'string' || requested.trim() === '')) {
+        return textResult({ error: 'reject "requested" must be a non-empty string when provided' }, true);
+      }
       try {
-        const res = await hub.reject({ workflow, run, path, text });
+        const res = await hub.reject({ workflow, run, path, text, ...(requested === undefined ? {} : { requested }) });
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
       } catch (e) {
@@ -510,6 +528,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
+        const beforeUpload = terminalGuard();
+        if (beforeUpload !== undefined) return beforeUpload;
         const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
         // Hand back the envelope EXACTLY as it must be submitted. The hub's
         // `text` is dropped from the pointer so the model cannot paste a field
