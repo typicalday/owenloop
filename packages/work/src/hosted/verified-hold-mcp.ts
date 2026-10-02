@@ -15,7 +15,7 @@ type Adapter = {
 };
 type BoundOrder = { workflow: string; run: string };
 type SignProof = (order: OrderPacket, path: string, value: Record<string, unknown>, version: number) => Promise<string | undefined>;
-type SubmitOptions = { enableSubmit?: boolean; signProof?: SignProof; holder?: ContactHolder };
+type SubmitOptions = { enableSubmit?: boolean; signProof?: SignProof; holder?: ContactHolder; now?: () => number };
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -69,6 +69,11 @@ export function createVerifiedHostedHoldMcp(
   > {
     if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
     let ref = anchoredRef;
+    // The hosted observation proves an active service claim, but it cannot
+    // prove that this local MCP process still holds its original lease.
+    if (ref !== undefined && mount.readGatedOrder() === undefined) {
+      return { ok: false, result: refusal('holder-order-unavailable') };
+    }
     let initialDigest: string | undefined;
     if (ref === undefined) {
       let raw: ToolResult;
@@ -90,6 +95,9 @@ export function createVerifiedHostedHoldMcp(
       return { ok: false, result: refusal('verification-unavailable') };
     }
     if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
+    if (mount.readGatedOrder() === undefined) {
+      return { ok: false, result: refusal('holder-order-unavailable') };
+    }
     if (verified.state !== 'ready') {
       return { ok: false, result: refusal(verified.state === 'refused' ? verified.code : 'order-unavailable') };
     }
@@ -143,6 +151,19 @@ export function createVerifiedHostedHoldMcp(
       }
       if (typeof proof !== 'string' || proof.length === 0) return refusal('submit-proof-unavailable');
       if (ctx.cancelled) return refusal('call-cancelled');
+      if (mount.readGatedOrder() === undefined) return refusal('holder-order-unavailable');
+      // Signing can outlive the short direct-service claim observation. A
+      // version-only conditional submit cannot prove holder continuity then.
+      let dispatchAt: number;
+      try {
+        dispatchAt = (options.now ?? Date.now)();
+      } catch {
+        return refusal('clock-unavailable');
+      }
+      const { observedAt, expiresAt } = checked.projection.serviceObservation;
+      if (!Number.isSafeInteger(dispatchAt) || dispatchAt < observedAt || dispatchAt >= expiresAt) {
+        return refusal('claim-observation-expired');
+      }
       let response: ConditionalSubmitResponse;
       try {
         response = await adapter.submitConditional!({

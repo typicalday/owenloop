@@ -606,6 +606,49 @@ test('a CLOSED submit stops the lease loop without releasing (the claim is alrea
   assert.equal(stops.length, 1);
   assert.equal(stops[0]!.reason, 'submitted');
   assert.deepEqual(stops[0]!.opts, { release: false });
+  assert.equal(mount.readGatedOrder(), undefined);
+  const later = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(later.isError, true);
+  assert.match(parse(later).error, /no longer held/);
+});
+
+test('a stop during order fetch prevents stale get_order output and submit', async () => {
+  for (const name of ['get_order', 'submit'] as const) {
+    let resume!: (value: GetOrderResponse) => void;
+    const pending = new Promise<GetOrderResponse>((resolve) => { resume = resolve; });
+    let submissions = 0;
+    const hub = {
+      getOrder: async () => pending,
+      submit: async () => { submissions++; return { text: 'ok', outcome: 'green', closed: false }; },
+    } as unknown as HubClient;
+    const mount = createHoldMcp(deps(hub));
+    const call = tool(mount.tools, name).handler(
+      name === 'submit' ? { path: 'result', value: 1 } : {}, ctx,
+    );
+    mount.loop.stop('signal');
+    resume(producerOrderResponse());
+    const result = await call;
+    assert.equal(result.isError, true, `${name} must refuse after stop`);
+    assert.match(parse(result).error, /no longer held/);
+    assert.equal(submissions, 0);
+  }
+});
+
+test('a stop during file preparation prevents artifact upload', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hold-upload-stop-'));
+  try {
+    writeFileSync(join(root, 'receipt.txt'), 'contents');
+    const { hub, calls } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: root }));
+    const call = tool(mount.tools, 'put_file_artifact').handler({ file: 'receipt.txt' }, ctx);
+    mount.loop.stop('signal');
+    const result = await call;
+    assert.equal(result.isError, true);
+    assert.match(parse(result).error, /no longer held/);
+    assert.equal(calls.some((entry) => entry.verb === 'put_file_artifact'), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('a non-closed submit does NOT stop the loop', async () => {

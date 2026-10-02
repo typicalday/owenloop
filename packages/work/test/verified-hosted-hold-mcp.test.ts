@@ -42,6 +42,10 @@ function fixture(enableSubmit = false) {
     text: 'RAW HUB SUBMIT TEXT', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1',
   };
   let submitError: unknown;
+  let held = true;
+  let onVerify: (() => void) | undefined;
+  let onSign: (() => void) | undefined;
+  let now = 2;
   const unsafeAction: ToolRegistration = {
     name: 'submit', description: 'unsafe', inputSchema: { type: 'object' },
     handler: async () => { calls.push('submit'); return textResult({ outcome: 'green' }); },
@@ -57,11 +61,14 @@ function fixture(enableSubmit = false) {
       } },
       unsafeAction,
     ],
-    readGatedOrder: () => ({ text: '', workflow: 'wf', run: 'run', order: rawOrder, lease: { claimed: true } }),
+    readGatedOrder: () => held
+      ? ({ text: '', workflow: 'wf', run: 'run', order: rawOrder, lease: { claimed: true } })
+      : undefined,
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
     open: async (ref, _index, onVerified) => {
       calls.push('verify');
+      onVerify?.();
       assert.deepEqual(ref, {
         protocol: 'client-preflight-v1', verification: 'not-performed',
         order: { state: 'available', workflow: 'wf', run: 'run', defDigest: rawOrder.defDigest },
@@ -77,8 +84,10 @@ function fixture(enableSubmit = false) {
     },
   }, { workflow: 'wf', run: 'run' }, enableSubmit ? {
     enableSubmit: true,
+    now: () => now,
     signProof: async (order, path, value, version) => {
       calls.push('sign');
+      onSign?.();
       assert.equal(order, verifiedPacket);
       assert.equal(path, 'out');
       assert.deepEqual(value, { n: 1 });
@@ -96,6 +105,10 @@ function fixture(enableSubmit = false) {
     setProof: (next: string | undefined) => { proof = next; },
     setSubmitResponse: (next: ConditionalSubmitResponse) => { submitResponse = next; },
     setSubmitError: (next: unknown) => { submitError = next; },
+    setHeld: (next: boolean) => { held = next; },
+    setOnVerify: (next: () => void) => { onVerify = next; },
+    setOnSign: (next: () => void) => { onSign = next; },
+    setNow: (next: number) => { now = next; },
   };
 }
 
@@ -155,6 +168,45 @@ test('verified holder exposes only the verified projection and no mutation tools
   assert.match(shown.content[0]!.text, /VERIFIED INSTRUCTION/);
   assert.doesNotMatch(shown.content[0]!.text, /RAW UNVERIFIED|RAW HUB TEXT/);
   assert.deepEqual(f.calls, ['raw-get', 'verify']);
+});
+
+test('verified holder refuses cached reads and submits after its local hold ends', async () => {
+  const f = fixture(true);
+  const first = await f.call();
+  assert.equal(first.isError, undefined);
+  f.setHeld(false);
+  const callsBefore = [...f.calls];
+  const read = await f.call();
+  const submit = await f.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(read.isError, true);
+  assert.equal(submit.isError, true);
+  assert.deepEqual(f.calls, callsBefore);
+  assert.deepEqual(f.submits, []);
+});
+
+test('verified holder refuses a hold lost during verification or signing', async () => {
+  const duringVerify = fixture(true);
+  duringVerify.setOnVerify(() => duringVerify.setHeld(false));
+  const read = await duringVerify.call();
+  assert.equal(read.isError, true);
+  assert.deepEqual(duringVerify.calls, ['raw-get', 'verify']);
+
+  const duringSign = fixture(true);
+  duringSign.setOnSign(() => duringSign.setHeld(false));
+  const submit = await duringSign.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(submit.isError, true);
+  assert.deepEqual(duringSign.calls, ['raw-get', 'verify', 'sign']);
+  assert.deepEqual(duringSign.submits, []);
+});
+
+test('verified submit refuses when signing outlives the claim observation', async () => {
+  const f = fixture(true);
+  f.setOnSign(() => f.setNow(5));
+  const result = await f.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /claim-observation-expired/);
+  assert.deepEqual(f.calls, ['raw-get', 'verify', 'sign']);
+  assert.deepEqual(f.submits, []);
 });
 
 test('packet disagreement and refused verification fail closed', async () => {
