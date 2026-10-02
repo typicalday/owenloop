@@ -28,6 +28,8 @@ import type {
   AnswerApprovalResponse,
   AskRequest,
   AskResponse,
+  ConditionalSubmitRequest,
+  ConditionalSubmitResponse,
   GetRostersResponse,
   ListHarnessModelsResponse,
   ListPendingApprovalsResponse,
@@ -79,6 +81,8 @@ export interface HubClient {
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
+  /** Versioned route only; callers must never fall back to legacy submit. */
+  submitConditional?(req: ConditionalSubmitRequest): Promise<ConditionalSubmitResponse>;
   reject(req: RejectRequest): Promise<RejectResponse>;
   /**
    * ESCALATION: the worker stops and asks a human about an artifact it OWES.
@@ -220,6 +224,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
+    submitConditional: (req) => post<ConditionalSubmitResponse>('submit/conditional-v1', req),
     reject: (req) => post<RejectResponse>('reject', req),
     ask: (req) => post<AskResponse>('ask', req),
     retryArtifact: (req) => post<RetryArtifactResponse>('retry_artifact', req),

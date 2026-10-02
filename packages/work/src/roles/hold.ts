@@ -57,6 +57,7 @@ import type { StopOptions } from '../lease/loop.ts';
 import { createHoldMcp, HOLD_MCP_TOOL_NAMES, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createDefaultHostedOrderAdapter, type HostedOrderResult } from '../hosted/order-adapter.ts';
 import { createVerifiedHostedHoldMcp } from '../hosted/verified-hold-mcp.ts';
+import { buildSubmitProof } from '../submit-proof.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
@@ -207,7 +208,7 @@ function usage(): void {
     'usage: owenloop work hold --order <workflow>/<run> [--origin <url>] [--as <account>] [--session <id>]\n' +
       '                     [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
       '                     [--mcp-tools <get_order,submit,reject>]\n' +
-      '                     [--verified-hosted  (read-only; requires --mcp and an HTTPS origin)]\n' +
+      '                     [--verified-hosted  (read-only by default; submit requires --mcp-tools get_order,submit)]\n' +
       '   or: owenloop work hold --order <run> --workflow <wf> [...]\n',
   );
 }
@@ -280,7 +281,10 @@ export interface RunDeps {
   /** Environment used for settings and local trust-root resolution. */
   env?: Record<string, string | undefined>;
   /** Injected verifier for role wiring tests; production uses the local store. */
-  hostedAdapter?: { open(preflight: unknown): Promise<HostedOrderResult> };
+  hostedAdapter?: {
+    open(preflight: unknown): Promise<HostedOrderResult>;
+    submitConditional?: ReturnType<typeof createDefaultHostedOrderAdapter>['submitConditional'];
+  };
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -316,8 +320,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
   if (parsed.verifiedHosted && parsed.mcpTools !== undefined
-    && (parsed.mcpTools.length !== 1 || parsed.mcpTools[0] !== 'get_order')) {
-    err('owenloop work hold: --verified-hosted exposes only get_order');
+    && !(parsed.mcpTools.length === 1 && parsed.mcpTools[0] === 'get_order')
+    && !(parsed.mcpTools.length === 2 && parsed.mcpTools.includes('get_order') && parsed.mcpTools.includes('submit'))) {
+    err('owenloop work hold: --verified-hosted exposes only get_order and opt-in submit');
     usage();
     return 2;
   }
@@ -425,7 +430,14 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
           expected: { workflowId: target.workflow, runId: target.run },
           cwd: process.cwd(), env, now: () => Date.now(),
         });
-        mount = createVerifiedHostedHoldMcp(baseMount, adapter, target);
+        const enableSubmit = parsed.mcpTools?.includes('submit') ?? false;
+        mount = createVerifiedHostedHoldMcp(baseMount, adapter, target, enableSubmit ? {
+          enableSubmit: true,
+          holder,
+          signProof: (order, path, value, version) => buildSubmitProof({
+            origin, order, path, value, version, now: () => Date.now(), warn: err, env,
+          }),
+        } : {});
       } catch (error) {
         err(`owenloop work hold: verified hosted order boundary unavailable: ${errMsg(error)}`);
         return 1;
