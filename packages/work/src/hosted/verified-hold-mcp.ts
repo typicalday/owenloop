@@ -11,6 +11,7 @@ import { hostedPacketDigest, type HostedOrderResult } from './order-adapter.ts';
 
 type Adapter = { open(preflight: unknown): Promise<HostedOrderResult> };
 type BoundOrder = { workflow: string; run: string };
+type ReadOptions = { now?: () => number };
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -46,6 +47,7 @@ export function createVerifiedHostedHoldMcp(
   mount: HoldMcpMount,
   adapter: Adapter,
   bound: BoundOrder,
+  options: ReadOptions = {},
 ): HoldMcpMount {
   const rawGet = mount.tools.find((tool) => tool.name === 'get_order');
   if (rawGet === undefined) throw new Error('verified hosted holder requires get_order in its private tool set');
@@ -74,6 +76,29 @@ export function createVerifiedHostedHoldMcp(
         return refusal(verified.state === 'refused' ? verified.code : 'order-unavailable');
       }
       if (verified.serviceObservation.packetDigest !== privateOrder.digest) return refusal('holder-order-changed');
+      // The service observation cannot prove that this local holder still has
+      // its lease. Re-read the private mount after verification, which may
+      // have outlived a stop, and require the same gated packet.
+      let current: ToolResult;
+      try {
+        current = await rawGet.handler({}, ctx);
+      } catch {
+        return refusal('holder-order-unavailable');
+      }
+      const liveOrder = privatePreflight(current, bound);
+      if (liveOrder === undefined) return refusal('holder-order-unavailable');
+      if (liveOrder.digest !== privateOrder.digest) return refusal('holder-order-changed');
+      if (ctx.cancelled) return refusal('call-cancelled');
+      let shownAt: number;
+      try {
+        shownAt = (options.now ?? Date.now)();
+      } catch {
+        return refusal('clock-unavailable');
+      }
+      const { observedAt, expiresAt } = verified.serviceObservation;
+      if (!Number.isSafeInteger(shownAt) || shownAt < observedAt || shownAt >= expiresAt) {
+        return refusal('claim-observation-expired');
+      }
       return textResult(verified);
     },
   };
