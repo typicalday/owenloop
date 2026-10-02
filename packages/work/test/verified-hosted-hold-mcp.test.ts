@@ -29,11 +29,19 @@ function ready(packet = rawOrder): HostedOrderResult {
   };
 }
 
-function fixture(enableSubmit = false) {
+function fixture(enableSubmit = false, settings: {
+  open?: () => Promise<HostedOrderResult>;
+  onRawGet?: (count: number) => Promise<void>;
+  sign?: () => Promise<string | undefined>;
+  context?: ToolCallContext;
+} = {}) {
   const calls: string[] = [];
   const submits: ConditionalSubmitRequest[] = [];
   const stops: Array<{ reason: string | undefined; release?: boolean }> = [];
   let observation: HostedOrderResult = ready();
+  let holding = true;
+  let rawGets = 0;
+  let currentTime = 2;
   let verifiedPacket: OrderPacket = rawOrder;
   let collectionOutputs: string[] = [];
   let proof: string | undefined = 'SIGNED PROOF';
@@ -47,11 +55,15 @@ function fixture(enableSubmit = false) {
   };
   const mount: HoldMcpMount = {
     loop: { run: async () => 'completed', stop: (reason, options) => {
+      holding = false;
       stops.push({ reason, ...(options?.release === undefined ? {} : { release: options.release }) });
     } },
     tools: [
       { name: 'get_order', description: 'raw', inputSchema: { type: 'object' }, handler: async () => {
         calls.push('raw-get');
+        rawGets++;
+        await settings.onRawGet?.(rawGets);
+        if (!holding) return textResult({ error: 'order no longer held' }, true);
         return textResult({ workflow: 'wf', run: 'run', order: rawOrder, text: 'RAW HUB TEXT' });
       } },
       unsafeAction,
@@ -65,7 +77,7 @@ function fixture(enableSubmit = false) {
         order: { state: 'available', workflow: 'wf', run: 'run', defDigest: rawOrder.defDigest },
       });
       if (observation.state === 'ready') onVerified?.({ order: verifiedPacket, collectionOutputs });
-      return observation;
+      return settings.open === undefined ? observation : settings.open();
     },
     submitConditional: async (req) => {
       calls.push('conditional-submit');
@@ -81,17 +93,19 @@ function fixture(enableSubmit = false) {
       assert.equal(path, 'out');
       assert.deepEqual(value, { n: 1 });
       assert.equal(version, verifiedPacket.owes[0]!.version);
-      return proof;
+      return settings.sign === undefined ? proof : settings.sign();
     },
-  } : {});
-  const call = () => wrapped.tools[0]!.handler({}, context);
-  const submit = (args: Record<string, unknown>) => wrapped.tools[1]!.handler(args, context);
+    now: () => currentTime,
+  } : { now: () => currentTime });
+  const call = () => wrapped.tools[0]!.handler({}, settings.context ?? context);
+  const submit = (args: Record<string, unknown>) => wrapped.tools[1]!.handler(args, settings.context ?? context);
   return {
     wrapped, call, submit, calls, submits, stops,
     setObservation: (next: HostedOrderResult) => { observation = next; },
     setPacket: (next: OrderPacket) => { verifiedPacket = next; observation = ready(next); },
     setCollectionOutputs: (next: string[]) => { collectionOutputs = next; },
     setProof: (next: string | undefined) => { proof = next; },
+    setTime: (next: number) => { currentTime = next; },
     setSubmitResponse: (next: ConditionalSubmitResponse) => { submitResponse = next; },
     setSubmitError: (next: unknown) => { submitError = next; },
   };
@@ -104,7 +118,55 @@ test('verified holder exposes only the verified projection and no mutation tools
   assert.equal(shown.isError, undefined);
   assert.match(shown.content[0]!.text, /VERIFIED INSTRUCTION/);
   assert.doesNotMatch(shown.content[0]!.text, /RAW UNVERIFIED|RAW HUB TEXT/);
-  assert.deepEqual(f.calls, ['raw-get', 'verify']);
+  assert.deepEqual(f.calls, ['raw-get', 'verify', 'raw-get']);
+});
+
+test('a cached anchor cannot read or submit after the local hold stops', async () => {
+  const f = fixture(true);
+  const first = await f.call();
+  assert.equal(first.isError, undefined);
+  const verifiedBeforeStop = f.calls.filter((entry) => entry === 'verify').length;
+  f.wrapped.loop.stop('signal');
+  const later = await f.call();
+  assert.equal(later.isError, true);
+  assert.match(later.content[0]!.text, /holder-order-unavailable/);
+  const submitted = await f.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(submitted.isError, true);
+  assert.match(submitted.content[0]!.text, /holder-order-unavailable/);
+  assert.equal(f.calls.filter((entry) => entry === 'verify').length, verifiedBeforeStop);
+  assert.deepEqual(f.submits, []);
+});
+
+test('verification that outlives the local hold cannot show a ready order', async () => {
+  let resolve!: (value: HostedOrderResult) => void;
+  let started!: () => void;
+  const pending = new Promise<HostedOrderResult>((done) => { resolve = done; });
+  const verificationStarted = new Promise<void>((done) => { started = done; });
+  const f = fixture(false, { open: async () => { started(); return pending; } });
+  const call = f.call();
+  await verificationStarted;
+  f.wrapped.loop.stop('signal');
+  resolve(ready());
+  const result = await call;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /holder-order-unavailable/);
+});
+
+test('a delayed holder recheck cannot show an expired ready observation', async () => {
+  let resume!: () => void;
+  let started!: () => void;
+  const pending = new Promise<void>((done) => { resume = done; });
+  const secondReadStarted = new Promise<void>((done) => { started = done; });
+  const f = fixture(false, {
+    onRawGet: async (count) => { if (count === 2) { started(); await pending; } },
+  });
+  const call = f.call();
+  await secondReadStarted;
+  f.setTime(5);
+  resume();
+  const result = await call;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /claim-observation-expired/);
 });
 
 test('packet disagreement and refused verification fail closed', async () => {
@@ -129,10 +191,63 @@ test('opt-in verified submit signs the privately verified packet and returns onl
     workflow: 'wf', run: 'run', path: 'out', value: { n: 1 }, done: true,
     expectedVersion: 1, proof: 'SIGNED PROOF',
   }]);
-  assert.deepEqual(f.calls, ['raw-get', 'verify', 'sign', 'conditional-submit']);
+  assert.deepEqual(f.calls, ['raw-get', 'verify', 'raw-get', 'sign', 'raw-get', 'conditional-submit']);
   assert.deepEqual(f.stops, [{ reason: 'submitted', release: false }]);
   assert.match(result.content[0]!.text, /local-hosted-submit-v1/);
   assert.doesNotMatch(result.content[0]!.text, /RAW|SIGNED PROOF|defDigest|lease/i);
+});
+
+test('a stop during proof signing prevents conditional submit', async () => {
+  let resolve!: (value: string) => void;
+  let started!: () => void;
+  const pending = new Promise<string>((done) => { resolve = done; });
+  const signingStarted = new Promise<void>((done) => { started = done; });
+  const f = fixture(true, { sign: async () => { started(); return pending; } });
+  const call = f.submit({ path: 'out', value: { n: 1 } });
+  await signingStarted;
+  f.wrapped.loop.stop('signal');
+  resolve('SIGNED PROOF');
+  const result = await call;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /holder-order-unavailable/);
+  assert.deepEqual(f.submits, []);
+});
+
+test('an observation that expires during signing prevents conditional submit', async () => {
+  let resolve!: (value: string) => void;
+  let started!: () => void;
+  const pending = new Promise<string>((done) => { resolve = done; });
+  const signingStarted = new Promise<void>((done) => { started = done; });
+  const f = fixture(true, { sign: async () => { started(); return pending; } });
+  const call = f.submit({ path: 'out', value: { n: 1 } });
+  await signingStarted;
+  f.setTime(5);
+  resolve('SIGNED PROOF');
+  const result = await call;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /claim-observation-expired/);
+  assert.deepEqual(f.submits, []);
+});
+
+test('cancellation during the final holder check prevents conditional submit', async () => {
+  let resume!: () => void;
+  let started!: () => void;
+  const pending = new Promise<void>((done) => { resume = done; });
+  const finalReadStarted = new Promise<void>((done) => { started = done; });
+  let cancelled = false;
+  const callContext: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: () => {}, sendProgress: () => {} };
+  const f = fixture(true, {
+    context: callContext,
+    onRawGet: async (count) => { if (count === 3) { started(); await pending; } },
+  });
+  const call = f.submit({ path: 'out', value: { n: 1 } });
+  await finalReadStarted;
+  cancelled = true;
+  resume();
+  const result = await call;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /call-cancelled/);
+  assert.deepEqual(f.submits, []);
 });
 
 test('verified submit refuses unlisted, collection, and unsigned values before transport', async () => {
@@ -175,7 +290,8 @@ test('partial verified submit refreshes the direct order rather than the holder 
   assert.equal(second.isError, undefined);
   assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1, 2]);
   assert.deepEqual(f.calls, [
-    'raw-get', 'verify', 'sign', 'conditional-submit', 'verify', 'sign', 'conditional-submit',
+    'raw-get', 'verify', 'raw-get', 'sign', 'raw-get', 'conditional-submit',
+    'raw-get', 'verify', 'raw-get', 'sign', 'raw-get', 'conditional-submit',
   ]);
   assert.deepEqual(f.stops, []);
 });

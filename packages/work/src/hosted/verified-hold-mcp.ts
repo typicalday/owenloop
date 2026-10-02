@@ -15,7 +15,7 @@ type Adapter = {
 };
 type BoundOrder = { workflow: string; run: string };
 type SignProof = (order: OrderPacket, path: string, value: Record<string, unknown>, version: number) => Promise<string | undefined>;
-type SubmitOptions = { enableSubmit?: boolean; signProof?: SignProof; holder?: ContactHolder };
+type SubmitOptions = { enableSubmit?: boolean; signProof?: SignProof; holder?: ContactHolder; now?: () => number };
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -59,6 +59,26 @@ export function createVerifiedHostedHoldMcp(
     throw new Error('verified hosted submit requires a conditional transport and proof signer');
   }
   let anchoredRef: unknown;
+  async function livePrivateOrder(ctx: Parameters<ToolRegistration['handler']>[1]): Promise<{ ref: unknown; digest: string } | undefined> {
+    try {
+      return privatePreflight(await rawGet!.handler({}, ctx), bound);
+    } catch {
+      return undefined;
+    }
+  }
+  function observationCurrent(projection: HostedOrderProjection): ToolResult | undefined {
+    let sampledAt: number;
+    try {
+      sampledAt = (options.now ?? Date.now)();
+    } catch {
+      return refusal('clock-unavailable');
+    }
+    const { observedAt, expiresAt } = projection.serviceObservation;
+    if (!Number.isSafeInteger(sampledAt) || sampledAt < observedAt || sampledAt >= expiresAt) {
+      return refusal('claim-observation-expired');
+    }
+    return undefined;
+  }
   async function readVerified(ctx: Parameters<ToolRegistration['handler']>[1]): Promise<
     | { ok: true; projection: HostedOrderProjection; packet?: HostedVerifiedPacket }
     | { ok: false; result: ToolResult }
@@ -67,16 +87,12 @@ export function createVerifiedHostedHoldMcp(
     let ref = anchoredRef;
     let initialDigest: string | undefined;
     if (ref === undefined) {
-      let raw: ToolResult;
-      try {
-        raw = await rawGet!.handler({}, ctx);
-      } catch {
-        return { ok: false, result: refusal('holder-order-unavailable') };
-      }
-      const privateOrder = privatePreflight(raw, bound);
+      const privateOrder = await livePrivateOrder(ctx);
       if (privateOrder === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
       ref = privateOrder.ref;
       initialDigest = privateOrder.digest;
+    } else if (await livePrivateOrder(ctx) === undefined) {
+      return { ok: false, result: refusal('holder-order-unavailable') };
     }
     let verified: HostedOrderResult;
     let verifiedPacket: HostedVerifiedPacket | undefined;
@@ -97,6 +113,16 @@ export function createVerifiedHostedHoldMcp(
       && hostedPacketDigest(verifiedPacket.order) !== verified.serviceObservation.packetDigest) {
       return { ok: false, result: refusal('verified-packet-mismatch') };
     }
+    // A direct service observation cannot attest that this local process kept
+    // the hold while verification was pending. The raw mount must still gate it.
+    const current = await livePrivateOrder(ctx);
+    if (current === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
+    if (initialDigest !== undefined && current.digest !== initialDigest) {
+      return { ok: false, result: refusal('holder-order-changed') };
+    }
+    if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
+    const stale = observationCurrent(verified);
+    if (stale !== undefined) return { ok: false, result: stale };
     anchoredRef = ref;
     return { ok: true, projection: verified, ...(verifiedPacket === undefined ? {} : { packet: verifiedPacket }) };
   }
@@ -139,6 +165,10 @@ export function createVerifiedHostedHoldMcp(
       }
       if (typeof proof !== 'string' || proof.length === 0) return refusal('submit-proof-unavailable');
       if (ctx.cancelled) return refusal('call-cancelled');
+      if (await livePrivateOrder(ctx) === undefined) return refusal('holder-order-unavailable');
+      if (ctx.cancelled) return refusal('call-cancelled');
+      const stale = observationCurrent(checked.projection);
+      if (stale !== undefined) return stale;
       let response: ConditionalSubmitResponse;
       try {
         response = await adapter.submitConditional!({
