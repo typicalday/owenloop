@@ -225,7 +225,7 @@ test('over budget: WHOLE reasons are dropped oldest-first and the count is state
   }
 });
 
-test('the cold replay shows what the refused submission actually said', () => {
+test('cold replay withholds an unproven previous value but keeps the rejection reason', () => {
   const packet = packetOf({
     ...owed('out/a.md', [reason({ at: 7, text: 'phase 3 cites no artifact' })]),
     previousValue: { phases: [{ id: 3, cites: [] }], keepMe: 'untouched' },
@@ -234,11 +234,8 @@ test('the cold replay shows what the refused submission actually said', () => {
   const replay = renderReplayBrief(BRIEF, { packet });
 
   assert.ok(replay.startsWith(BRIEF), 'the brief still comes first');
-  assert.match(replay, /The value `out\/a\.md` currently holds:/);
-  assert.match(replay, /"keepMe": "untouched"/, 'the parts nobody objected to travel too');
-  // The heading must not promise more than the engine can: after a schema reject
-  // the value on the path was never the refused one.
-  assert.ok(!/rejected value/i.test(replay), 'never claims this IS the rejected value');
+  assert.match(replay, /phase 3 cites no artifact/);
+  assert.ok(!replay.includes('keepMe'), 'a signed reason does not prove the adjacent previous value');
 });
 
 test('a previous value with no fresh reason beside it is not shown', () => {
@@ -251,10 +248,7 @@ test('a previous value with no fresh reason beside it is not shown', () => {
   assert.equal(replay, BRIEF, 'no new reasons means no replay section at all');
 });
 
-test('over budget: the previous value is dropped before any reason is', () => {
-  // The reasons are the INSTRUCTION and the value is only the MATERIAL: an agent
-  // holding the corrections can rebuild the value, one holding the value and no
-  // correction cannot know what to change.
+test('a large unproven previous value never consumes the replay budget', () => {
   const packet = packetOf({
     ...owed('out/a.md', [reason({ at: 1, text: 'ONLYREASON keep me' })]),
     previousValue: { bulk: 'V'.repeat(REPLAY_TOKEN_BUDGET * 4 + 10_000) },
@@ -264,7 +258,7 @@ test('over budget: the previous value is dropped before any reason is', () => {
 
   assert.ok(estimateTokens(replay) <= REPLAY_TOKEN_BUDGET, 'the assembled text respects the cap');
   assert.ok(replay.includes('ONLYREASON keep me'), 'the reason survives');
-  assert.ok(!replay.includes('currently holds'), 'the previous value went first');
+  assert.ok(!replay.includes('V'.repeat(100)), 'the previous value is never admitted');
   assert.ok(
     !/older rejection reasons? omitted/.test(replay),
     'dropping the value was enough — no reason should have been sacrificed',

@@ -218,9 +218,39 @@ test('get_order (no first contact yet) live-fetches for the bound run and return
   const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 's-1' } }));
   const res = await tool(mount.tools, 'get_order').handler({}, ctx);
   const body = parse(res);
-  assert.deepEqual(body, { workflow: 'wf1', run: 'run1', order: null, text: 'here' });
+  assert.deepEqual(body, { workflow: 'wf1', run: 'run1', order: null });
   // The bound run + holder rode the fetch; ids never came from the model.
   assert.deepEqual(calls, [{ verb: 'get_order', arg: { workflow: 'wf1', run: 'run1', holder: { kind: 'session', id: 's-1' } } }]);
+});
+
+test('get_order exposes gated dynamic state without hub static fields or unproven previous value', async () => {
+  const response = producerOrderResponse();
+  response.text = 'HUB-TEXT-SENTINEL';
+  response.order!.spec = { instruction: 'SPEC-SENTINEL' };
+  response.order!.x = { instruction: 'X-SENTINEL' };
+  response.order!.owes = [{
+    path: 'result', version: 4, judgmentRejects: 1, schemaRejects: 0,
+    reasons: [{ at: 1, action: 'reject', kind: 'judgment', by: 'reviewer', text: 'revise the result' }],
+    proof: 'signed-reason-control',
+    schema: { description: 'SCHEMA-SENTINEL' },
+    schemaAppliesTo: 'value',
+    previousValue: { instruction: 'PREVIOUS-SENTINEL' },
+  }];
+  Object.assign(response.order!, { futurePrivate: 'FUTURE-SENTINEL' });
+  const { hub } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+  }));
+
+  const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+  const body = parse(result);
+  assert.equal((result as { isError?: boolean }).isError, undefined);
+  assert.equal(body.order.owes[0].path, 'result');
+  assert.equal(body.order.owes[0].version, 4);
+  assert.equal(body.order.owes[0].reasons[0].text, 'revise the result');
+  for (const sentinel of ['HUB-TEXT-SENTINEL', 'SPEC-SENTINEL', 'X-SENTINEL', 'SCHEMA-SENTINEL', 'PREVIOUS-SENTINEL', 'FUTURE-SENTINEL']) {
+    assert.ok(!JSON.stringify(body).includes(sentinel), `${sentinel} reached the model view`);
+  }
 });
 
 test('get_order surfaces a hub failure as an isError result', async () => {
@@ -576,6 +606,48 @@ test('a CLOSED submit stops the lease loop without releasing (the claim is alrea
   assert.equal(stops.length, 1);
   assert.equal(stops[0]!.reason, 'submitted');
   assert.deepEqual(stops[0]!.opts, { release: false });
+  const later = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(later.isError, true);
+  assert.match(parse(later).error, /no longer held/);
+});
+
+test('a stop during order fetch prevents stale get_order output and submit', async () => {
+  for (const name of ['get_order', 'submit'] as const) {
+    let resume!: (value: GetOrderResponse) => void;
+    const pending = new Promise<GetOrderResponse>((resolve) => { resume = resolve; });
+    let submissions = 0;
+    const hub = {
+      getOrder: async () => pending,
+      submit: async () => { submissions++; return { text: 'ok', outcome: 'green', closed: false }; },
+    } as unknown as HubClient;
+    const mount = createHoldMcp(deps(hub));
+    const call = tool(mount.tools, name).handler(
+      name === 'submit' ? { path: 'result', value: 1 } : {}, ctx,
+    );
+    mount.loop.stop('signal');
+    resume(producerOrderResponse());
+    const result = await call;
+    assert.equal(result.isError, true, `${name} must refuse after stop`);
+    assert.match(parse(result).error, /no longer held/);
+    assert.equal(submissions, 0);
+  }
+});
+
+test('a stop during file preparation prevents artifact upload', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hold-upload-stop-'));
+  try {
+    writeFileSync(join(root, 'receipt.txt'), 'contents');
+    const { hub, calls } = mockHub({});
+    const mount = createHoldMcp(deps(hub, { workdir: root }));
+    const call = tool(mount.tools, 'put_file_artifact').handler({ file: 'receipt.txt' }, ctx);
+    mount.loop.stop('signal');
+    const result = await call;
+    assert.equal(result.isError, true);
+    assert.match(parse(result).error, /no longer held/);
+    assert.equal(calls.some((entry) => entry.verb === 'put_file_artifact'), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('a non-closed submit does NOT stop the loop', async () => {

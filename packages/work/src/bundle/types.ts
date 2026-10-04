@@ -158,6 +158,10 @@ export interface NormalizedStepSpec {
   harness?: string;
   /** From `normalizeStepPermissions(step.harnessOptions, step)` at prepare time. */
   permissions: StepPermissions;
+  /** Schema for each live owed path, derived from the locally verified step.
+   * This is populated by agent-run at order load time, never from hub packet
+   * `owes[].schema`, whose shape alone does not authenticate its contents. */
+  owedSchemas?: Record<string, { schema: unknown; schemaAppliesTo: 'value' | 'member' }>;
 }
 
 /** What we persist under a hash dir: the validated fetch plus provenance. */

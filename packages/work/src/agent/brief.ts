@@ -114,14 +114,12 @@ export interface OwedBrief {
    *  Schema (`packet.owes[].schemaRejects`). */
   schemaRejects?: number;
   /**
-   * The JSON Schema the engine will enforce on this path at commit time
-   * (`packet.owes[].schema`). Optional for the same reason the counters are: a
-   * hub that does not project it is not a hub reporting "no constraint", so the
-   * shape contract stays silent rather than telling an agent its output is
-   * unconstrained when it may not be.
+   * The JSON Schema the engine will enforce on this path at commit time,
+   * derived from the locally verified step definition. When local metadata
+   * cannot provide it, the shape contract stays silent.
    */
   schema?: unknown;
-  /** What `schema` governs (`packet.owes[].schemaAppliesTo`) — `'value'` for the
+  /** What `schema` governs — `'value'` for the
    *  submitted value itself, `'member'` for each member emitted into a
    *  collection. Read only when `schema` is present. */
   schemaAppliesTo?: 'value' | 'member';
@@ -209,8 +207,8 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
 function renderInputContract(spec: BriefSpec): string {
   if (owedPaths(spec).length === 0) return '';
   return [
-    'Before you start: call the `get_order` tool on the mounted `owenloop` MCP server. It takes no arguments and returns THIS order in full — the inputs you were given (`consumes`), the exact output paths you owe, and each path\'s reason thread, including why any previous attempt was rejected.',
-    'That packet is authoritative. This brief is a summary of it, rendered once when the order was dispatched; where the two disagree, the packet is right.',
+    'Before you start: call the `get_order` tool on the mounted `owenloop` MCP server. It takes no arguments and returns the current consumed inputs, owed output paths, and each path\'s reason thread.',
+    'Use that current order for dynamic inputs, owed paths, and feedback. The task instructions and any output schemas in this brief come from the locally resolved workflow definition.',
     'If something you need is not in what `get_order` returns and you cannot recover it by working — reading the repository, re-reading your inputs, running a read-only command — then it was not given to you. Do not invent it and do not proceed on an assumption: use `ask` (below).',
   ].join('\n');
 }
@@ -655,62 +653,6 @@ export function renderRejection(spec: RejectionSpec): RejectionDelta {
 }
 
 /**
- * Render what the refused submission actually SAID, for the paths the cold
- * replay is about to show reasons for.
- *
- * WHY ONLY THE COLD PATH NEEDS THIS. A resumed session still holds its own
- * prior submission, so `renderRejection` alone is enough there. A cold replay
- * has no session: `renderReplayBrief`'s own contract is that without the
- * reasons "the fresh agent repeats the rejected submission verbatim" -- but a
- * fresh agent given only reasons cannot repeat it either. It has to rebuild the
- * whole value from the brief to change the one part that was called out, and
- * the rebuild quietly loses everything the reader did not object to. Sending
- * the value back is what makes "keep everything you already have that was not
- * called out above", which the rejection body already says, a thing the agent
- * is able to do.
- *
- * SCOPE. Only paths that both carry a `previousValue` and have fresh reasons in
- * this delta -- a value shown next to no reason is material with no correction
- * attached, and the agent cannot tell what to do with it.
- *
- * HONESTY. The heading does not call this "the rejected value". After a schema
- * reject nothing was committed, so what the hub sends is the last value that
- * did commit, which may be older than the refusal or absent entirely. The
- * wording says what the engine can actually promise.
- */
-function renderPreviousValues(spec: RejectionSpec): string {
-  const since = spec.deliveredReasonAt;
-  const wanted = spec.paths === undefined ? undefined : new Set(spec.paths);
-  const sections: string[] = [];
-
-  for (const owed of spec.packet.owes) {
-    if (wanted !== undefined && !wanted.has(owed.path)) continue;
-    if (owed.previousValue === undefined) continue;
-    const fresh = owed.reasons.filter((r) => since === undefined || r.at > since);
-    if (fresh.length === 0) continue;
-
-    let body: string;
-    try {
-      body = JSON.stringify(owed.previousValue, null, 2) ?? String(owed.previousValue);
-    } catch {
-      // A value that arrived as JSON cannot cycle, but a projecting layer is
-      // free to hand us anything. Dropping the section beats failing the replay.
-      continue;
-    }
-    sections.push(`The value \`${owed.path}\` currently holds:\n\n\`\`\`json\n${body}\n\`\`\``);
-  }
-
-  if (sections.length === 0) return '';
-  return [
-    'What is already on the owed paths, so you can revise it rather than rebuild it:',
-    ...sections,
-    'This is what the path holds now, which is the value that was refused when the'
-      + ' refusal came from a reader. When it came from the schema check the value was'
-      + ' never committed, so what you see is the last one that was.',
-  ].join('\n\n');
-}
-
-/**
  * Assemble a COLD-REPLAY brief: the ordinary rendered brief plus the same
  * rejection body as a trailing section.
  *
@@ -719,6 +661,8 @@ function renderPreviousValues(spec: RejectionSpec): string {
  * resume with `ResumeUnavailableError`). The session is gone, so the brief has to
  * come back — but the reasons still have to arrive, or the fresh agent repeats
  * the rejected submission verbatim.
+ * The packet's previousValue is not included: the reason-thread proof does
+ * not authenticate that adjacent value or its version.
  *
  * THE CAP. The assembled text is held to roughly `REPLAY_TOKEN_BUDGET` tokens by
  * a chars/4 estimate. When it is over, WHOLE reason entries are dropped from the
@@ -736,29 +680,16 @@ export function renderReplayBrief(brief: string, spec: RejectionSpec): string {
   const full = renderRejection(spec);
   if (full.message === '') return brief;
 
-  const join = (body: string, dropped: number, values: string): string => {
+  const join = (body: string, dropped: number): string => {
     const note =
       dropped > 0
         ? `\n\n(${dropped} older rejection reason${dropped === 1 ? '' : 's'} omitted to fit the context budget.)`
         : '';
-    const prior = values === '' ? '' : `${values}\n\n---\n\n`;
-    return `${brief}\n\n---\n\n${prior}${body}${note}`;
+    return `${brief}\n\n---\n\n${body}${note}`;
   };
 
-  const values = renderPreviousValues(spec);
-
-  let assembled = join(full.message, 0, values);
+  let assembled = join(full.message, 0);
   if (estimateTokens(assembled) <= REPLAY_TOKEN_BUDGET) return assembled;
-
-  // First thing over budget: the previous values, whole. They are MATERIAL,
-  // and the reasons are the INSTRUCTION -- an agent holding the corrections
-  // can still rebuild the value, while one holding the value and no correction
-  // cannot know what to change. Same ordering principle as the brief itself,
-  // which is never trimmed: keep whatever the agent cannot work without.
-  if (values !== '') {
-    assembled = join(full.message, 0, '');
-    if (estimateTokens(assembled) <= REPLAY_TOKEN_BUDGET) return assembled;
-  }
 
   // Over budget: re-render with progressively fewer reasons, oldest dropped
   // first. `ordered` is every candidate entry in ascending `at`, so slicing off
@@ -783,7 +714,7 @@ export function renderReplayBrief(brief: string, spec: RejectionSpec): string {
       ...(since !== undefined ? { deliveredReasonAt: since } : {}),
     });
     if (trimmed.message === '') break;
-    assembled = join(trimmed.message, drop, '');
+    assembled = join(trimmed.message, drop);
     if (estimateTokens(assembled) <= REPLAY_TOKEN_BUDGET) return assembled;
   }
 
