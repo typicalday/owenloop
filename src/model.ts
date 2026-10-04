@@ -2603,7 +2603,8 @@ export function applyOutcome(
  * For 'skipped' artifacts, the fingerprint and latest skip kind are encoded to
  * capture their distinct rearm eligibility correctly.
  */
-function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
+/** @internal Exported for focused checker equivalence tests; not part of the package root API. */
+export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
   const parts: string[] = [];
   const stepMap = new Map(def.steps.map((l) => [l.name, l]));
 
@@ -2630,7 +2631,9 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
     if (art.approvals && Object.keys(art.approvals).length > 0) {
       const apParts = Object.entries(art.approvals)
         .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([judge, v]) => `${judge}@${v}`)
+        // Versions are rank-normalized above. Only whether this approval is
+        // for the current version can affect judge eligibility or completion.
+        .map(([judge, v]) => `${judge}@${v === art.version ? 'current' : 'stale'}`)
         .join(',');
       entry += `|ap:${apParts}`;
     }

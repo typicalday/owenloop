@@ -41,6 +41,7 @@ import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { checkInterfaceCompatibility } from './implements.ts';
 import { isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
+import { parseVersionedCallTarget } from './bundle/call-target.ts';
 import { applyCapabilityMappings, applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
 import type { CapabilityMappings, CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
@@ -258,8 +259,9 @@ function hasExactImplementationClaim(def: WorkflowDef, expected: WorkflowInterfa
  *     containing bundle's own digest. `childDef.bundleDigest` must equal
  *     `parentDef.bundleDigest`.
  *
- *  2. `target` is an explicit `namespace/name@version` reference AND the parent
- *     bundle's manifest `lock` names it. The lock value is a canonical BUNDLE
+ *  2. `target` is an explicit `namespace/name@version` reference, optionally
+ *     followed by `#workflow`, AND the parent bundle's manifest `lock` names
+ *     its base coordinate. The lock value is a canonical BUNDLE
  *     digest (`bundle.yaml.lock` validates lowercase 64-hex; `assertLockCoverage`
  *     requires an entry for every versioned target), so it is compared against
  *     `childDef.bundleDigest` — NOT against `defInstructionDigest`, which
@@ -276,8 +278,13 @@ function callsPinViolation(
   target: string,
 ): string | undefined {
   if (target.includes('/')) {
-    const pinned = parentDef.bundleLock?.[target];
-    if (pinned === undefined) return undefined; // no lock entry reachable — unpinned
+    const lockKey = target.includes('#') ? parseVersionedCallTarget(target, parseWorkflowCoordinate).coordinate : target;
+    const pinned = parentDef.bundleLock?.[lockKey];
+    if (pinned === undefined) {
+      return parentDef.bundleDigest !== undefined && target.includes('#')
+		? `parent bundle has no lock for exact target ${lockKey}`
+		: undefined;
+    }
     if (childDef.bundleDigest === undefined) {
       return `parent bundle pins it to ${pinned} but the resolved definition carries no bundle provenance`;
     }
@@ -558,6 +565,7 @@ export class Engine {
    * compatibility mode). Public read-only facade: {@link Engine.resolver}.
    */
   private readonly instructionSource: OrderInstructionSource;
+  private readonly readVerifiedBundleLock: ((digest: string) => Readonly<Record<string, string>>) | undefined;
   readonly resolver: OrderResolver;
   private readonly reapTtlMs: number;
   private readonly maxLeaseMs: number | undefined;
@@ -594,11 +602,14 @@ export class Engine {
        * no legacy fallback).
        */
       instructionSource?: OrderInstructionSource;
+      /** Verify a persisted CAS parent's manifest lock by bundle digest, without an index lookup. */
+      readVerifiedBundleLock?: (digest: string) => Readonly<Record<string, string>>;
     } = {},
   ) {
     this.store = store;
     this.resolveDef = resolveDef;
     this.instructionSource = opts.instructionSource ?? createDefInstructionSource();
+    this.readVerifiedBundleLock = opts.readVerifiedBundleLock;
     this.resolver = new OrderResolver(this.instructionSource);
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
     this.maxLeaseMs = opts.maxLeaseMs;
@@ -988,6 +999,10 @@ export class Engine {
     const needsSnapshot = Symbol('needs-workflow-snapshot');
     let snapshotDef: WorkflowDef | undefined;
     let optimisticInterfaceBinding: InterfaceCallBinding | undefined;
+    const namedExactLockKey = step.calls !== undefined && step.calls.includes('#') && parentDef.bundleDigest !== undefined
+      ? parseVersionedCallTarget(step.calls, parseWorkflowCoordinate).coordinate
+      : undefined;
+    let verifiedParentPin: string | undefined;
 
     // Interface targets are selected once, stored on the parent, and resolved by
     // exact digest BEFORE either the workflow-store guard or SQLite write lock.
@@ -1088,11 +1103,20 @@ export class Engine {
         let created = false;
         let childDef: WorkflowDef;
         if (!child) {
-			// Resolving a new child's CAS def must happen before its coordinated
-			// transaction acquires SQLite. Return a read-only sentinel on the
-			// first pass; `run` resolves, locks/revalidates the bundle store, and
-			// then repeats every gate/child read under the guarded write tx.
+			// Resolve outside SQLite before any parent-pin comparison or child write.
 			if (snapshotDef === undefined) return needsSnapshot;
+		  if (namedExactLockKey !== undefined) {
+		    const fresh = parentRow.defSnapshot;
+		    if (
+		      verifiedParentPin === undefined
+		      || fresh === undefined
+		      || fresh.bundleDigest !== parentDef.bundleDigest
+		      || fresh.bundleLock?.[namedExactLockKey] !== verifiedParentPin
+		      || fresh.steps.find((candidate) => candidate.name === step.name)?.calls !== step.calls
+		    ) {
+		      throw new CallsPinError(step.calls!, 'the persisted parent or its base-coordinate lock changed before child creation');
+		    }
+		  }
           const childId = randId('wf');
           // WS-6: resolve IN THE PARENT'S SCOPE. `parentDef` is the parent's own
           // §28 pin (defFor prefers `defSnapshot` over the live resolver), so a
@@ -1192,6 +1216,19 @@ export class Engine {
       if (result !== needsSnapshot) return result;
       // Resolve optimistically outside both locks. The snapshot guard then
       // revalidates this CAS provenance under add.lock before SQLite begins.
+      if (namedExactLockKey !== undefined) {
+		if (this.readVerifiedBundleLock === undefined) {
+		  throw new CallsPinError(step.calls!, 'no verified parent bundle lock reader is configured');
+		}
+		try {
+		  verifiedParentPin = this.readVerifiedBundleLock(parentDef.bundleDigest!)[namedExactLockKey];
+		} catch (error) {
+		  throw new CallsPinError(step.calls!, `the parent bundle could not be verified: ${(error as Error).message}`);
+		}
+		if (verifiedParentPin === undefined || parentDef.bundleLock?.[namedExactLockKey] !== verifiedParentPin) {
+		  throw new CallsPinError(step.calls!, `the persisted base-coordinate lock differs from the verified parent bundle for ${namedExactLockKey}`);
+		}
+      }
       snapshotDef = this.resolveDef(step.calls!, parentDef);
       result = transact();
       if (result === needsSnapshot) throw new Error('internal error: guarded child provision requested no snapshot');
@@ -3524,7 +3561,17 @@ export class Engine {
   // ---- run lifecycle ---------------------------------------------------------
 
   /** Close a run (audit/budget) and release its lease so the task can re-arm. */
-  close(workflow: string, run: string, outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok', summary?: string): void {
+  close(
+    workflow: string,
+    run: string,
+    outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok',
+    summary?: string,
+    opts?: {
+      /** Disable the child-to-parent cascade only while terminating an entire
+       * calls tree. A live parent needs this cascade for forward progress. */
+      maintainParent?: boolean;
+    },
+  ): void {
     this.store.tx(() => {
       const r = this.store.getRun(run);
       if (!r) throw new Error(`no such run: ${run}`);
@@ -3550,7 +3597,9 @@ export class Engine {
     // forward cascade and no `settled` to derive — just the lifecycle signal.
     this.fire({ type: 'closed', workflow, run, outcome });
     // M2B cascade-up prompt: closing a run may advance the child's artifact state.
-    this.triggerParentIfChild(workflow);
+    // Terminal tree cancellation closes every lease itself. Maintaining a
+    // parent while that tree is being torn down can create new calls children.
+    if (opts?.maintainParent !== false) this.triggerParentIfChild(workflow);
   }
 
   /**

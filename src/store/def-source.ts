@@ -59,7 +59,7 @@ export interface CasDefRegistration {
 	level: ResolutionLevel;
 	/** Registration purpose. Coordinate aliases are exact versioned call targets. */
 	kind: 'workflow' | 'coordinate';
-	/** Present only for a full versioned coordinate alias. */
+	/** Base package coordinate for an exact alias, including named workflow selectors. */
 	coordinate?: WorkflowCoordinate;
 }
 
@@ -500,6 +500,30 @@ function discoverCasDefs(
 					indexed.root,
 					loaded.objectRoot,
 				])].sort(compareStoreText));
+			}
+			// A selector is derived only from this verified coordinate/object pair.
+			// Register the digest-scoped alias even for a shadowed global row;
+			// the direct alias still obeys project precedence.
+			for (const [workflowName, def] of loaded.defs) {
+				const selector = `${indexed.coordinate}#${workflowName}`;
+				for (const key of [
+					digestScopedCallsTargetKey(digest, selector),
+					...(indexed.registerAlias ? [selector] : []),
+				]) {
+					if (registeredCoordinateKeys.has(key)) continue;
+					registeredCoordinateKeys.add(key);
+					registrations.push({
+						key,
+						qualified: `${loaded.manifest.package.name}/${workflowName}`,
+						bare: workflowName,
+						def,
+						bundleDigest: digest,
+						bundlePackage: loaded.manifest.package.name,
+						level: loaded.level,
+						kind: 'coordinate',
+						coordinate: indexed.coordinate,
+					});
+				}
 			}
 			if (target === undefined) {
 				if (indexed.registerAlias) {

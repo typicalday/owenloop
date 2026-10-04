@@ -29,9 +29,26 @@ import {
 } from 'yaml';
 import type { ParsedNode, Pair } from 'yaml';
 import { canonicalBundlePathViolation } from '../archive.ts';
+import { parseWorkflowCoordinate } from '../store/types.ts';
+import {
+  isVersionedReference as isPortableVersionedReference,
+  parseVersionedCallTarget as parsePortableVersionedCallTarget,
+  WORKFLOW_NAME_RE,
+} from './call-target.ts';
 import { assertCurrentRuntimeCompatible, isCanonicalSemver } from './runtime.ts';
 import { BundleError } from './types.ts';
 import type { BundleManifest, BundleRuntimeRequirements } from './types.ts';
+export { WORKFLOW_NAME_RE } from './call-target.ts';
+
+/** Parse an exact call using the store's canonical coordinate validator. */
+export function parseVersionedCallTarget(text: string): { coordinate: string; workflow?: string } {
+  return parsePortableVersionedCallTarget(text, parseWorkflowCoordinate);
+}
+
+/** Preserve the manifest API's boolean check for an exact call. */
+export function isVersionedReference(text: string): boolean {
+  return isPortableVersionedReference(text, parseWorkflowCoordinate);
+}
 
 /** Lowercase 64-hex SHA-256 of `bytes`. */
 export function sha256Hex(bytes: Uint8Array): string {
@@ -41,8 +58,6 @@ export function sha256Hex(bytes: Uint8Array): string {
 const DIGEST_RE = /^[0-9a-f]{64}$/;
 /** Portable package namespace. */
 const PACKAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-/** Workflow map keys: lowercase-start, lowercase alphanumeric and hyphen. */
-export const WORKFLOW_NAME_RE = /^[a-z][a-z0-9-]*$/;
 /** Version: printable ASCII, no separators that would break filenames or lock keys. */
 const VERSION_RE = /^[!-~]{1,128}$/;
 /** Versioned runtime feature identifier ending in a positive `.vN` version. */
@@ -51,14 +66,6 @@ const RUNTIME_FEATURE_RE = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]*$/;
 const PLATFORM_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Capability class identifier. */
 const CAPABILITY_CLASS_RE = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
-/** Explicit cross-bundle reference: `namespace/name@version`. */
-const VERSIONED_REF_RE = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)@([!-~]+)$/;
-
-/** True when `text` is the explicit `namespace/name@version` reference form. */
-export function isVersionedReference(text: string): boolean {
-  return VERSIONED_REF_RE.test(text);
-}
-
 /**
  * Walk a yaml AST into plain JS values, fail-closed: refuses aliases, merge
  * keys, any tag (custom `!x` or built-in `!!x`), and non-string map keys.
@@ -382,7 +389,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   // lock — explicit versioned reference text → def digest.
   const lock: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const [ref, digestRaw] of Object.entries(asMap(root['lock'], 'bundle.yaml.lock'))) {
-    if (!isVersionedReference(ref)) {
+    if (!isVersionedReference(ref) || ref.includes('#')) {
       throw new BundleError('MANIFEST_ERROR', `bundle.yaml.lock: key '${ref}' must be an explicit 'namespace/name@version' reference`);
     }
     const digest = asString(digestRaw, `bundle.yaml.lock['${ref}']`);
@@ -499,11 +506,17 @@ export function manifestIsCanonical(bytes: Uint8Array): boolean {
  */
 export function assertLockCoverage(manifest: BundleManifest, callsTargets: string[]): void {
   for (const target of callsTargets) {
-    if (!isVersionedReference(target)) continue;
-    if (!Object.prototype.hasOwnProperty.call(manifest.lock, target)) {
+    if (!target.includes('@') || !target.includes('/')) continue;
+    let coordinate: string;
+    try {
+      coordinate = parseVersionedCallTarget(target).coordinate;
+    } catch {
+      throw new BundleError('MANIFEST_ERROR', `calls: target '${target}' is a malformed exact versioned reference`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(manifest.lock, coordinate)) {
       throw new BundleError(
 	'MANIFEST_ERROR',
-	`bundle.yaml.lock: calls: target '${target}' uses the explicit 'namespace/name@version' form and requires a lock entry`,
+	`bundle.yaml.lock: calls: target '${target}' requires a lock entry for '${coordinate}'`,
       );
     }
   }
