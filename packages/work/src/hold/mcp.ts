@@ -92,6 +92,8 @@ export interface HoldMcpMount {
   tools: ToolRegistration[];
   /** The lease loop kept warm underneath — the role runs and stops it. */
   loop: HoldLoop;
+  /** Process-local gated response; never registered as an MCP tool or sent to the model. */
+  readGatedOrder: () => GetOrderResponse | undefined;
 }
 
 function errMsg(e: unknown): string {
@@ -137,9 +139,34 @@ function guessContentType(path: string): string {
   return CONTENT_TYPE_BY_EXTENSION[extname(path).toLowerCase()] ?? 'application/octet-stream';
 }
 
-/** A lean, model-facing view of the order packet. */
+/** Model-facing dynamic fields whose consumed values and reason threads have
+ * passed the gate. The full packet stays private for proof construction. In
+ * particular, hub-carried static extensions, schema and previousValue do not
+ * inherit authenticity from a valid consumes/reasons proof. */
 function orderView(res: GetOrderResponse): unknown {
-  return { workflow: res.workflow, run: res.run, order: res.order, text: res.text };
+  const order = res.order;
+  if (order === null) return { workflow: res.workflow, run: res.run, order: null };
+  return {
+    workflow: res.workflow,
+    run: res.run,
+    order: {
+      workflow: order.workflow,
+      run: order.run,
+      step: order.step,
+      key: order.key,
+      defDigest: order.defDigest,
+      inputs: order.inputs,
+      outputs: order.outputs,
+      consumes: order.consumes,
+      owes: order.owes.map((owed) => ({
+        path: owed.path,
+        ...(owed.version === undefined ? {} : { version: owed.version }),
+        judgmentRejects: owed.judgmentRejects,
+        schemaRejects: owed.schemaRejects,
+        reasons: owed.reasons,
+      })),
+    },
+  };
 }
 
 /**
@@ -159,6 +186,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  let stopping = false;
   // Set the moment the lease loop's run() settles (lease-lost, completed,
   // released, …): from then on this mount no longer holds the order, so BOTH
   // registered tools fast-fail with isError and never touch the hub again (plan section 4
@@ -190,13 +218,18 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       terminal = outcome;
       return outcome;
     },
-    stop: (reason?: string, stopOpts?: StopOptions) => inner.stop(reason, stopOpts),
+    stop: (reason?: string, stopOpts?: StopOptions) => {
+      // A closing submit or signal must revoke the model-facing packet before
+      // the asynchronous lease loop has finished settling.
+      stopping = true;
+      inner.stop(reason, stopOpts);
+    },
   };
 
   /** The fast-fail both tools apply once the hold is over. */
   function terminalGuard(): ToolResult | undefined {
-    if (terminal === undefined) return undefined;
-    return textResult({ error: `order no longer held (${terminal}) — stop` }, true);
+    if (terminal === undefined && !stopping) return undefined;
+    return textResult({ error: `order no longer held (${terminal ?? 'stopping'}) — stop` }, true);
   }
 
   async function gate(res: GetOrderResponse): Promise<ToolResult | undefined> {
@@ -222,18 +255,22 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const getOrderTool: ToolRegistration = {
     name: 'get_order',
     description:
-      "Return this work-holder's order — the prompt, consumed inputs, and owed output paths for the run it is bound to. Takes no arguments (the run is fixed at launch).",
+      "Return the bound run's gated dynamic order state: consumed inputs, owed paths, and rejection reasons. Static task instructions and schemas come from the locally verified workflow definition or agent brief, not this tool. Takes no arguments.",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     handler: async () => {
       const gone = terminalGuard();
       if (gone !== undefined) return gone;
       if (captured !== undefined) {
         const refused = await gate(captured);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         return textResult(orderView(captured));
       }
       if (firstContact !== undefined) {
         const refused = await gate(firstContact);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = firstContact;
         return textResult(orderView(firstContact));
@@ -241,6 +278,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       try {
         const res = await hub.getOrder({ workflow, run, ...holderReq });
         const refused = await gate(res);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = res;
         return textResult(orderView(res));
@@ -322,6 +361,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
         }
+        const beforeSubmit = terminalGuard();
+        if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({
           workflow,
           run,
@@ -490,6 +531,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
+        const beforeUpload = terminalGuard();
+        if (beforeUpload !== undefined) return beforeUpload;
         const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
         // Hand back the envelope EXACTLY as it must be submitted. The hub's
         // `text` is dropped from the pointer so the model cannot paste a field
@@ -519,5 +562,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     put_file_artifact: putFileArtifactTool,
   };
   const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
-  return { tools: selected.map((name) => registrations[name]), loop };
+  return {
+    tools: selected.map((name) => registrations[name]), loop,
+    readGatedOrder: () => terminal === undefined && !stopping ? captured : undefined,
+  };
 }

@@ -63,9 +63,16 @@ export interface ResolvedStep {
   bundleDir?: string;
 }
 
+/** Static step and calls-boundary facts from one verified local publication. */
+export interface ResolvedHostedStep extends ResolvedStep {
+  callsProducers: Readonly<Record<string, VerifiedCallsProducer>>;
+}
+
 export interface InstructionResolver {
   resolveCommand(order: OrderPacket): Promise<ResolvedCommand | InstructionRefusal>;
   resolveStep(order: OrderPacket): Promise<ResolvedStep | InstructionRefusal>;
+  /** Strict publication gate for a locally hosted, model-facing order adapter. */
+  resolveHostedStep?(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal>;
 }
 
 export interface DefinitionVerifierInput {
@@ -462,6 +469,25 @@ export function createStoreInstructionResolver(
   };
 
   return {
+    async resolveHostedStep(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal> {
+      const resolved = await resolveVerifiedStep(order);
+      if (!resolved.ok) return resolved;
+      const verdict = await trustFor(order, resolved);
+      // A hosted adapter never downgrades publication trust with defPolicy.
+      if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
+      const originRefusal = await checkOrigin(order, resolved);
+      if (originRefusal !== undefined) return originRefusal;
+      const calls = verifiedCallsProducers(order, resolved);
+      if (!calls.ok) return calls;
+      // Without the verified dependency closure, a relayed consume cannot be
+      // corroborated. The consume verifier refuses that case under hardRule.
+      return {
+	  ok: true,
+	  step: resolved.step,
+	  callsProducers: calls.producers ?? {},
+	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
+      };
+    },
     async resolveCommand(order: OrderPacket): Promise<ResolvedCommand | InstructionRefusal> {
       const resolved = await resolveVerifiedStep(order);
       if (!resolved.ok) return resolved;

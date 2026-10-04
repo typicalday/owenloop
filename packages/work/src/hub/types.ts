@@ -307,9 +307,9 @@ export interface OrderPacket {
      * the distinction matters; the engine's contract is on `Order.owes[]` in
      * `src/types.ts`.
      *
-     * Used on the COLD-REPLAY path only — see `renderReplayBrief`. A resumed
-     * session still holds its own prior submission, so sending it back there
-     * would spend tokens re-stating what the model already has.
+     * Transport-only until the value and its version have independent
+     * provenance. A reason-thread proof does not authenticate this adjacent
+     * value, so native get_order and cold replay do not display it.
      */
     previousValue?: unknown;
     /**
@@ -317,9 +317,8 @@ export interface OrderPacket {
      * projected off the owning produce entry by a schema-aware hub. Absent
      * when the produce declares none (the common case — any JSON is accepted),
      * and absent from every hub too old to project the field at all. Those two
-     * cases are indistinguishable here on purpose: both mean "this worker was
-     * told no shape", and the brief says nothing either way rather than
-     * claiming an output is unconstrained when it may not be.
+     * cases are indistinguishable on the wire. The native brief derives its
+     * shape from the locally verified definition instead of this field.
      */
     schema?: unknown;
     /**
@@ -456,6 +455,11 @@ export interface SubmitRequest {
   holder?: ContactHolder;
 }
 
+/** This request must use the versioned route; older hubs have no such route. */
+export interface ConditionalSubmitRequest extends SubmitRequest {
+  expectedVersion: number;
+}
+
 /**
  * submit's flattened `{ text, ...data }` envelope (verified against hub-core
  * `verbs/submit.ts` + hub-edge `routes.ts` on 2026-07-17). `outcome` is the
@@ -470,6 +474,10 @@ export interface SubmitRequest {
 export interface SubmitResponse extends HubResponse {
   outcome?: string;
   closed?: boolean;
+}
+
+export interface ConditionalSubmitResponse extends SubmitResponse {
+  conditionApplied: 'expected-version-v1';
 }
 
 // ---- file artifacts ---------------------------------------------------------

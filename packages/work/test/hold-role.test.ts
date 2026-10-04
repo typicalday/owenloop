@@ -82,6 +82,23 @@ test('parseArgs reads and validates the positive MCP tool selector', () => {
   assert.match(parseArgs(['--mcp-tools', 'get_order,']).error!, /empty names/);
 });
 
+test('verified hosted mode is explicit and restricts mutation tools to opt-in submit', async () => {
+  assert.equal(parseArgs(['--verified-hosted']).verifiedHosted, true);
+  const err: string[] = [];
+  assert.equal(await run(['--order', 'wf1/run1', '--verified-hosted'], { err: (line) => err.push(line) }), 2);
+  assert.match(err.join('\n'), /requires --mcp/);
+  err.length = 0;
+  assert.equal(await run(['--order', 'wf1/run1', '--mcp', '--verified-hosted', '--mcp-tools=get_order,reject'],
+    { err: (line) => err.push(line) }), 2);
+  assert.match(err.join('\n'), /only get_order and opt-in submit/);
+  assert.deepEqual(parseArgs(['--mcp', '--verified-hosted', '--mcp-tools=get_order,submit']).mcpTools,
+    ['get_order', 'submit']);
+  err.length = 0;
+  assert.equal(await run(['--order', 'wf1/run1', '--mcp', '--verified-hosted', '--origin', 'http://hub.example'],
+    { err: (line) => err.push(line) }), 2);
+  assert.match(err.join('\n'), /HTTPS origin/);
+});
+
 test('parseArgs rejects a non-positive / non-integer interval', () => {
   assert.match(parseArgs(['--heartbeat-interval', '0']).error!, /positive integer/);
   assert.match(parseArgs(['--heartbeat-interval', 'abc']).error!, /positive integer/);
