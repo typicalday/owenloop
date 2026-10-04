@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.35](https://github.com/typicalday/owenloop/compare/v0.5.34...v0.5.35) (2026-10-04)
+
+
+### Bug Fixes
+
+* **checker:** normalize approval versions in visited key ([#344](https://github.com/typicalday/owenloop/issues/344)) ([150c949](https://github.com/typicalday/owenloop/commit/150c9491c8a088d3334b420708d2b97d5d75bf8b))
+
 ## [0.5.34](https://github.com/typicalday/owenloop/compare/v0.5.33...v0.5.34) (2026-10-01)
 
 
