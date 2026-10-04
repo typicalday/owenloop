@@ -80,9 +80,10 @@ test('parseProduce — singleton / collection / map', () => {
   assert.equal(map.suffix, '.formatcheck');
 });
 
-test('parseProduce rejects reduce and literal index', () => {
+test('parseProduce rejects reduce, literal index, and bare map output', () => {
   assert.throws(() => parseProduce('gather.source[*]'));
   assert.throws(() => parseProduce('gather.source[3]'));
+  assert.throws(() => parseProduce('rows[$i]'), /map produce requires a named child suffix.*collection members/);
 });
 
 test('matchConsume — plain', () => {
