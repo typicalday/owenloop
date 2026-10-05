@@ -2697,13 +2697,29 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
   type StateNode = {
     arts: Map<string, ArtifactData>;
-    path: CheckStep[];
+    id: number;
     depth: number;
   };
 
-  const visited = new Map<string, CheckStep[]>(); // key → path to reach it
-  visited.set(initialKey, []);
-  const queue: StateNode[] = [{ arts: initial, path: [], depth: 0 }];
+  // Keep one predecessor link per discovered state. Copying a full path for
+  // every successor makes queue/visited storage grow with both states and
+  // depth, even though only reported findings need materialized paths.
+  const predecessors: Array<{ parent: number; step?: CheckStep }> = [{ parent: -1 }];
+  const visited = new Map<string, number>(); // key → predecessor id
+  visited.set(initialKey, 0);
+  const pathTo = (id: number): CheckStep[] => {
+    const reversed: CheckStep[] = [];
+    while (id !== 0) {
+      const link = predecessors[id]!;
+      reversed.push(link.step!);
+      id = link.parent;
+    }
+    return reversed.reverse();
+  };
+  // A cursor avoids Array.shift's repeated compaction. Clear processed slots
+  // so their artifact maps can be reclaimed while descendants stay queued.
+  const queue: Array<StateNode | undefined> = [{ arts: initial, id: 0, depth: 0 }];
+  let queueHead = 0;
 
   const report: CheckReport = {
     def: def.name,
@@ -2728,8 +2744,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   let depthReached = 0;
   const boundsHit = new Set<'maxDepth' | 'maxStates'>();
 
-  while (queue.length > 0) {
-    const node = queue.shift()!;
+  while (queueHead < queue.length) {
+    const node = queue[queueHead]!;
+    queue[queueHead++] = undefined;
+    let reportedPath: CheckStep[] | undefined;
+    const nodePath = (): CheckStep[] => (reportedPath ??= pathTo(node.id));
     report.stats.statesExplored++;
     if (node.depth > depthReached) depthReached = node.depth;
 
@@ -2750,7 +2769,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
         if (reportedInvariants.has(inv.name)) continue;
         const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, node.arts, status);
         if (whenHolds && !evalInvariantPredicate(inv.requires, node.arts, status)) {
-          report.invariantViolations.push({ invariant: inv.name, path: node.path });
+          report.invariantViolations.push({ invariant: inv.name, path: nodePath() });
           reportedInvariants.add(inv.name);
         }
       }
@@ -2761,7 +2780,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     if (status.done) {
       if (!report.completable) {
         report.completable = true;
-        report.completePath = node.path;
+        report.completePath = nodePath();
       }
       continue; // done states have no successors
     }
@@ -2807,9 +2826,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     if (firings.length === 0 && !status.done) {
       const eventualFirings = eligibleFirings(def, node.arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier: opts.modifier });
       if (eventualFirings.length > 0) {
-        report.stallStates.push({ path: node.path });
+        report.stallStates.push({ path: nodePath() });
       } else {
-        report.deadlocks.push({ path: node.path });
+        report.deadlocks.push({ path: nodePath() });
       }
       continue;
     }
@@ -2825,7 +2844,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       && !retractClearsDebt(debt.path, retractFirings)
       && progressMovesAnotherBranch(def, debt.path, node.arts, progressFirings),
     )) {
-      report.stuck.push({ path: node.path });
+      report.stuck.push({ path: nodePath() });
     }
 
     // Respect maxDepth
@@ -2852,14 +2871,15 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
         const step: CheckStep = { step: firing.step, key: firing.key, outcome };
         if (outcome === 'emit-seal') report.collectionCapApplied = true;
-	const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
+        const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
 
         for (const suc of successors) {
           const key = canonicalKey(def, suc);
           if (!visited.has(key)) {
-            const newPath = [...node.path, step];
-            visited.set(key, newPath);
-            queue.push({ arts: suc, path: newPath, depth: node.depth + 1 });
+            const id = predecessors.length;
+            predecessors.push({ parent: node.id, step });
+            visited.set(key, id);
+            queue.push({ arts: suc, id, depth: node.depth + 1 });
           }
         }
       }
