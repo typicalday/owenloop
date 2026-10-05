@@ -11,7 +11,7 @@ import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { createSshSigner } from '../../../src/crypto/ssh.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
-import { createBundleIngestor } from '../../../src/store/index.ts';
+import { createBundleIngestor, createStoreInstructionSource } from '../../../src/store/index.ts';
 import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import type { GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
 import { createDefaultHostedOrderAdapter, createHostedOrderAdapter } from '../src/hosted/order-adapter.ts';
@@ -55,6 +55,35 @@ steps:
     consumes: ['items[$i]']
     produces: ['items[$i].note', audit]
     body: "Annotate the bound item."
+`;
+const CALLS_CHILD = `name: hosted-child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: change
+    consumes: [data]
+    produces: [result]
+    terminal: true
+    body: "Change the data."
+outputs: [result]
+`;
+const CALLS_PARENT = `name: hosted-calls
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: unit
+    calls: hosted-child
+    inputs:
+      data: seed
+    produces: [unit-result]
+  - name: inspect
+    consumes: [unit-result]
+    produces: [out]
+    terminal: true
+    body: "Inspect the result."
+outputs: [out]
 `;
 
 async function proof(value: unknown, keyPath: string, keyId: string, artifact = 'seed', version = 2): Promise<string> {
@@ -116,6 +145,7 @@ async function harness(overrides: {
   redirectResponse?: boolean;
   expected?: { workflowId: string; runId: string };
   now?: () => number;
+  monotonicNow?: () => number;
 } = {}) {
   const f = await fixture();
   const p = await packet(f.defDigest, f.keyPath, f.rootKeyId);
@@ -148,6 +178,7 @@ async function harness(overrides: {
     },
     consumeTrust: { env: f.env },
     now: overrides.now ?? (() => 1_000),
+    monotonicNow: overrides.monotonicNow ?? (() => 0),
   });
   return { adapter, p, f, fetches: () => fetches };
 }
@@ -407,6 +438,103 @@ test('a delayed direct fetch cannot reset the claim observation window', async (
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
   });
   assert.equal(h.fetches(), 1);
+});
+
+test('a wall-clock rollback during direct fetch cannot extend the monotonic observation window', async () => {
+  let wall = 10_000;
+  let elapsed = 0;
+  let releaseFetch!: () => void;
+  const delayed = new Promise<void>((resolve) => { releaseFetch = resolve; });
+  let fetchEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { fetchEntered = resolve; });
+  const h = await harness({
+    now: () => wall,
+    monotonicNow: () => elapsed,
+    response: async (p) => {
+      fetchEntered();
+      await delayed;
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    },
+  });
+  const pending = h.adapter.open(preflight(h.f.defDigest));
+  await entered;
+  // Simulate seven seconds of monotonic elapsed time while the wall clock only advances 100 ms.
+  elapsed = 7_000;
+  wall = 10_100;
+  releaseFetch();
+  assert.deepEqual(await pending, {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
+  });
+});
+
+test('a shorter rollback leaves only the remaining monotonic TTL in the projected epoch expiry', async () => {
+  let wall = 10_000;
+  let elapsed = 0;
+  const h = await harness({
+    now: () => wall,
+    monotonicNow: () => elapsed,
+    response: (p) => {
+      elapsed = 4_000;
+      wall = 10_100;
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    },
+  });
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready');
+  if (result.state === 'ready') assert.equal(result.serviceObservation.expiresAt, 11_100);
+});
+
+test('hosted custom source refuses a calls-produced path without a verified child closure', async () => {
+  const installed = await installBundleFixture({
+    root: tempDir('owenloop-hosted-calls-project-'),
+    sourceDir: writeBundleSource({
+      name: 'hosted-calls', workflow: CALLS_PARENT,
+      workflows: { 'hosted-child': CALLS_CHILD }, defaultWorkflow: 'hosted-calls',
+    }),
+  });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const child = loadDefFile(join(installed.result.objectPath, 'hosted-child.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded], [child.name, child]])).get(loaded.name);
+  assert.ok(definition);
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-hosted-calls-home-'));
+  const keyPath = join(home, 'producer');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'hosted-calls-test', '-f', keyPath], { stdio: 'ignore' });
+  const rootKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
+  mkdirSync(join(home, '.owenloop'));
+  writeFileSync(join(home, '.owenloop', 'org-root.pub'), rootKey.openSshPublicKey);
+  const defDigest = defInstructionDigest(definition);
+  const value = { accepted: 'ordinary-parent-path-proof' };
+  const p: OrderPacket = {
+    workflow: 'wf-hosted', run: 'run-hosted', step: 'inspect', key: '', defDigest,
+    inputs: ['unit-result'], outputs: ['out'], consumes: { 'unit-result': value },
+    consumedFingerprint: { 'unit-result': 1 },
+    consumesProof: JSON.stringify({ 'unit-result': await proof(value, keyPath, rootKey.keyid, 'unit-result', 1) }),
+    owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+  };
+  const verifier = createBundleIngestor();
+  const globalRoot = tempDir('owenloop-hosted-calls-global-');
+  const complete = createStoreInstructionSource({ projectRoot: installed.root, globalRoot, verifier });
+  const { getVerifiedCallsChild: _omitted, ...withoutClosure } = complete;
+  const sources = [withoutClosure, { ...complete, getVerifiedCallsChild: () => undefined }];
+  for (const source of sources) {
+    const adapter = createHostedOrderAdapter({
+      hub: {
+	origin: 'https://trusted.example', getToken: async () => 'local-secret',
+	fetchImpl: async () => new Response(JSON.stringify({
+	  workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
+	}), { status: 200 }),
+      },
+      expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
+      instructionSource: {
+	projectRoot: installed.root, globalRoot, verifier, source, env: { HOME: home },
+	definitionVerifier: () => ({ kind: 'verified', publisherKeyId: rootKey.keyid, principal: 'publisher' }),
+      },
+      consumeTrust: { env: { HOME: home } }, now: () => 1_000,
+    });
+    assert.deepEqual(await adapter.open(preflight(defDigest)), {
+      protocol: 'local-hosted-order-v1', state: 'refused', code: 'definition-integrity',
+    });
+  }
 });
 
 test('configured service origin must be HTTPS', async () => {

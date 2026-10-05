@@ -388,8 +388,12 @@ export function createStoreInstructionResolver(
   const verifiedCallsProducers = (
     order: OrderPacket,
     resolved: ResolvedDefinition,
+    requireClosure = false,
   ): { ok: true; producers: Record<string, VerifiedCallsProducer> | undefined } | InstructionRefusal => {
-    if (source.getVerifiedCallsChild === undefined) return { ok: true, producers: undefined };
+    // Command resolution retains its historical optional-closure behavior.
+    // Hosted projection holds the verified definition and must never let a
+    // calls-produced consume fall through to ordinary signed-proof handling.
+    if (source.getVerifiedCallsChild === undefined && !requireClosure) return { ok: true, producers: undefined };
     const producers: Record<string, VerifiedCallsProducer> = {};
     for (const path of Object.keys(order.consumes)) {
       const callsStep = resolved.definition.steps.find(
@@ -397,9 +401,9 @@ export function createStoreInstructionResolver(
       );
       if (callsStep?.calls === undefined) continue;
       const relayed = order.consumesProofRelay?.[path] !== undefined;
-      const child = source.getVerifiedCallsChild(order.defDigest, order.step, callsStep.name);
+      const child = source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
       if (child === undefined) {
-        if (!relayed) continue;
+	if (!relayed && !requireClosure) continue;
         return refusal(
           'integrity',
           order,
@@ -408,7 +412,7 @@ export function createStoreInstructionResolver(
       }
       const childOutcome = child.definition.outputs?.[0];
       if (childOutcome === undefined) {
-        if (!relayed) continue;
+	if (!relayed && !requireClosure) continue;
         return refusal(
           'integrity',
           order,
@@ -477,10 +481,10 @@ export function createStoreInstructionResolver(
       if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
       const originRefusal = await checkOrigin(order, resolved);
       if (originRefusal !== undefined) return originRefusal;
-      const calls = verifiedCallsProducers(order, resolved);
+      const calls = verifiedCallsProducers(order, resolved, true);
       if (!calls.ok) return calls;
-      // Without the verified dependency closure, a relayed consume cannot be
-      // corroborated. The consume verifier refuses that case under hardRule.
+      // Every calls-produced consumed path now has a verified child closure.
+      // The consume verifier checks the corresponding relay under hardRule.
       return {
 	  ok: true,
 	  step: resolved.step,

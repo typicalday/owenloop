@@ -4,7 +4,11 @@
  * through a configured bearer-authenticated HTTPS HubClient, then checks the
  * locally installed publication and signed consumed values before returning
  * any model-facing content. It trusts that service and HTTPS connection; it
- * does not claim a cryptographic order or lease attestation.
+ * does not claim a cryptographic order or lease attestation. An epoch clock
+ * validates signed chain dates; a monotonic clock bounds fetch and local
+ * verification elapsed time. The projected epoch expiry is capped by the
+ * monotonic time remaining at return. Later use must recheck the claim and
+ * expiry; this projection does not continuously monitor clock or lease state.
  */
 import { bindProduce, elementPath, matchConsume, sealPath } from '../../../../src/paths.ts';
 import { substituteOrderVars } from '../../../../src/order-resolver.ts';
@@ -40,7 +44,8 @@ type RefResult = { kind: 'ref'; ref: Ref } | { kind: 'unavailable' };
 export interface HostedOrderProjection {
   protocol: 'local-hosted-order-v1';
   state: 'ready';
-  /** These are fresh observations of the configured service, not signed claims. */
+  /** Fresh observations of the configured service, not signed claims. expiresAt
+   *  is capped by the monotonic time remaining when this result is returned. */
   serviceObservation: { workflow: string; run: string; step: string; observedAt: number; expiresAt: number };
   definition: {
     bodyTrust: 'verified-local-publication';
@@ -77,7 +82,10 @@ export interface HostedOrderAdapterOptions {
   instructionSource: Omit<StoreInstructionResolverOptions, 'defPolicy' | 'originPolicy' | 'consumedVerifier'>;
   /** The adapter forces artifact policy to enforce and uses its own clock. */
   consumeTrust: Omit<CreateConsumedVerifierArgs, 'artifactPolicy' | 'now'>;
+  /** Epoch milliseconds for signed chain checks and projected service metadata. */
   now: () => number;
+  /** Elapsed-time clock; defaults to the process monotonic clock. */
+  monotonicNow?: () => number;
   /** At most five seconds; consumers must re-fetch after expiry. */
   observationMs?: number;
 }
@@ -186,6 +194,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
   if (!Number.isInteger(duration) || duration < 1 || duration > MAX_OBSERVATION_MS) {
     throw new Error('hosted order observation window must be 1..5000 ms');
   }
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
   // Fetch must not follow a redirect to another origin or a downgraded HTTP
   // endpoint while carrying the local bearer token. This overrides any
   // caller-provided fetch's default redirect behavior at the adapter boundary.
@@ -216,12 +225,14 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       // window before authentication, transport, and response parsing, not after
       // they return, so a delayed response cannot receive a new full window.
       let observedAt: number;
+      let startedAt: number;
       try {
+	startedAt = monotonicNow();
 	observedAt = options.now();
       } catch {
 	return refused('clock-unavailable');
       }
-      if (!Number.isSafeInteger(observedAt) || observedAt < 0) return refused('clock-unavailable');
+      if (!Number.isFinite(startedAt) || !Number.isSafeInteger(observedAt) || observedAt < 0) return refused('clock-unavailable');
       const expiresAt = observedAt + duration;
       if (!Number.isSafeInteger(expiresAt)) return refused('clock-unavailable');
       let response: Awaited<ReturnType<typeof hub.getOrder>>;
@@ -232,14 +243,18 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       }
       // A stale direct fetch should not enter the local verification path.
       let fetchedAt: number;
+      let fetchedElapsed: number;
       try {
 	fetchedAt = options.now();
+	fetchedElapsed = monotonicNow() - startedAt;
       } catch {
 	return refused('clock-unavailable');
       }
+      if (!Number.isFinite(fetchedElapsed) || fetchedElapsed < 0) return refused('clock-unavailable');
       if (!Number.isSafeInteger(fetchedAt) || fetchedAt < observedAt || fetchedAt >= expiresAt) {
 	return refused('claim-observation-expired');
       }
+      if (fetchedElapsed >= duration) return refused('claim-observation-expired');
       if (!record(response)) return refused('direct-response-malformed');
       if (response.workflow !== expectedWorkflowId || response.run !== expectedRunId) return refused('reference-rebound');
       const order = response.order;
@@ -332,18 +347,26 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       // Verification and materialization share the original fetch-start window.
       // A projection is never returned ready after that window has elapsed.
       let finishedAt: number;
+      let finishedElapsed: number;
       try {
 	finishedAt = options.now();
+	finishedElapsed = monotonicNow() - startedAt;
       } catch {
 	return refused('clock-unavailable');
       }
+      if (!Number.isFinite(finishedElapsed) || finishedElapsed < fetchedElapsed) return refused('clock-unavailable');
       if (!Number.isSafeInteger(finishedAt) || finishedAt < observedAt || finishedAt >= expiresAt) {
 	return refused('claim-observation-expired');
       }
+      if (finishedElapsed >= duration) return refused('claim-observation-expired');
+      // A wall-clock rollback can leave the original epoch expiry much later
+      // than the monotonic window. Cap metadata to its remaining elapsed TTL.
+      const remainingExpiry = Math.floor(finishedAt + duration - finishedElapsed);
+      if (!Number.isSafeInteger(remainingExpiry) || remainingExpiry <= finishedAt) return refused('claim-observation-expired');
       return {
 	protocol: 'local-hosted-order-v1',
 	state: 'ready',
-	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, observedAt, expiresAt },
+	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, observedAt, expiresAt: Math.min(expiresAt, remainingExpiry) },
 	definition: { bodyTrust: 'verified-local-publication', substitutions: 'trusted-service-observation', digest: order.defDigest, prompt },
 	...(step.spec === undefined && step.x === undefined ? {} : {
 	  staticExtensions: {
