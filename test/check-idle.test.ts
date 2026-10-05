@@ -12,7 +12,7 @@ const futureIdleCompletion = def(
   [input('start', { seedOwed: false })],
   [
     step({ name: 'fanout', consumes: ['start'], produces: ['items[]'] }),
-    step({ name: 'map', consumes: ['items[$i]'], produces: ['mapped[$i]'] }),
+    step({ name: 'map', consumes: ['items[$i]'], produces: ['items[$i].mapped'] }),
     step({ name: 'monitor', produces: ['wake'], on: ['idle'], idleAfterMs: 60_000 }),
     step({ name: 'finish', consumes: ['wake'], produces: ['result'], terminal: true }),
   ],

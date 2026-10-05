@@ -311,6 +311,20 @@ test('buildDef rejects a produce entry that is neither a string nor a { name, sc
   );
 });
 
+test('buildDef rejects a bare indexed map output before it can be claimed', () => {
+  assert.throws(
+    () => buildDef({
+      name: 'bare-map-output',
+      inputs: [{ name: 'seed' }],
+      steps: [
+        { name: 'gather', consumes: ['seed'], produces: ['source[]'] },
+        { name: 'index', consumes: ['source[$i]'], produces: [{ name: 'rows[$i]', schema: { type: 'object' } }] },
+      ],
+    }),
+    /map produce requires a named child suffix.*collection members/,
+  );
+});
+
 // ---- §24 judges: validation (parseJudges / parseProduces) --------------------
 
 test('buildDef rejects a judges: entry missing a name', () => {
