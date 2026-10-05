@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.36](https://github.com/typicalday/owenloop/compare/v0.5.35...v0.5.36) (2026-10-05)
+
+
+### Bug Fixes
+
+* **work:** revoke hold MCP tools immediately on stop ([#346](https://github.com/typicalday/owenloop/issues/346)) ([da3b574](https://github.com/typicalday/owenloop/commit/da3b574850ef05ff19833c69978012bf66dafb9c))
+
 ## [0.5.35](https://github.com/typicalday/owenloop/compare/v0.5.34...v0.5.35) (2026-10-04)
 
 
