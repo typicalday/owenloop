@@ -63,9 +63,16 @@ export interface ResolvedStep {
   bundleDir?: string;
 }
 
+/** Static step and calls-boundary facts from one verified local publication. */
+export interface ResolvedHostedStep extends ResolvedStep {
+  callsProducers: Readonly<Record<string, VerifiedCallsProducer>>;
+}
+
 export interface InstructionResolver {
   resolveCommand(order: OrderPacket): Promise<ResolvedCommand | InstructionRefusal>;
   resolveStep(order: OrderPacket): Promise<ResolvedStep | InstructionRefusal>;
+  /** Strict publication gate for a locally hosted, model-facing order adapter. */
+  resolveHostedStep?(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal>;
 }
 
 export interface DefinitionVerifierInput {
@@ -381,8 +388,12 @@ export function createStoreInstructionResolver(
   const verifiedCallsProducers = (
     order: OrderPacket,
     resolved: ResolvedDefinition,
+    requireClosure = false,
   ): { ok: true; producers: Record<string, VerifiedCallsProducer> | undefined } | InstructionRefusal => {
-    if (source.getVerifiedCallsChild === undefined) return { ok: true, producers: undefined };
+    // Command resolution retains its historical optional-closure behavior.
+    // Hosted projection holds the verified definition and must never let a
+    // calls-produced consume fall through to ordinary signed-proof handling.
+    if (source.getVerifiedCallsChild === undefined && !requireClosure) return { ok: true, producers: undefined };
     const producers: Record<string, VerifiedCallsProducer> = {};
     for (const path of Object.keys(order.consumes)) {
       const callsStep = resolved.definition.steps.find(
@@ -390,9 +401,9 @@ export function createStoreInstructionResolver(
       );
       if (callsStep?.calls === undefined) continue;
       const relayed = order.consumesProofRelay?.[path] !== undefined;
-      const child = source.getVerifiedCallsChild(order.defDigest, order.step, callsStep.name);
+      const child = source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
       if (child === undefined) {
-        if (!relayed) continue;
+	if (!relayed && !requireClosure) continue;
         return refusal(
           'integrity',
           order,
@@ -401,7 +412,7 @@ export function createStoreInstructionResolver(
       }
       const childOutcome = child.definition.outputs?.[0];
       if (childOutcome === undefined) {
-        if (!relayed) continue;
+	if (!relayed && !requireClosure) continue;
         return refusal(
           'integrity',
           order,
@@ -462,6 +473,25 @@ export function createStoreInstructionResolver(
   };
 
   return {
+    async resolveHostedStep(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal> {
+      const resolved = await resolveVerifiedStep(order);
+      if (!resolved.ok) return resolved;
+      const verdict = await trustFor(order, resolved);
+      // A hosted adapter never downgrades publication trust with defPolicy.
+      if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
+      const originRefusal = await checkOrigin(order, resolved);
+      if (originRefusal !== undefined) return originRefusal;
+      const calls = verifiedCallsProducers(order, resolved, true);
+      if (!calls.ok) return calls;
+      // Every calls-produced consumed path now has a verified child closure.
+      // The consume verifier checks the corresponding relay under hardRule.
+      return {
+	  ok: true,
+	  step: resolved.step,
+	  callsProducers: calls.producers ?? {},
+	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
+      };
+    },
     async resolveCommand(order: OrderPacket): Promise<ResolvedCommand | InstructionRefusal> {
       const resolved = await resolveVerifiedStep(order);
       if (!resolved.ok) return resolved;
