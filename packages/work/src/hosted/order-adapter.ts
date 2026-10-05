@@ -212,12 +212,9 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       if (ref.workflow !== expectedWorkflowId || ref.run !== expectedRunId) {
 	return refused('reference-out-of-scope');
       }
-      let response: Awaited<ReturnType<typeof hub.getOrder>>;
-      try {
-	response = await hub.getOrder({ workflow: expectedWorkflowId, run: expectedRunId });
-      } catch {
-	return refused('direct-fetch-failed');
-      }
+      // The fetched packet can describe an earlier claim. Start the freshness
+      // window before authentication, transport, and response parsing, not after
+      // they return, so a delayed response cannot receive a new full window.
       let observedAt: number;
       try {
 	observedAt = options.now();
@@ -225,6 +222,24 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('clock-unavailable');
       }
       if (!Number.isSafeInteger(observedAt) || observedAt < 0) return refused('clock-unavailable');
+      const expiresAt = observedAt + duration;
+      if (!Number.isSafeInteger(expiresAt)) return refused('clock-unavailable');
+      let response: Awaited<ReturnType<typeof hub.getOrder>>;
+      try {
+	response = await hub.getOrder({ workflow: expectedWorkflowId, run: expectedRunId });
+      } catch {
+	return refused('direct-fetch-failed');
+      }
+      // A stale direct fetch should not enter the local verification path.
+      let fetchedAt: number;
+      try {
+	fetchedAt = options.now();
+      } catch {
+	return refused('clock-unavailable');
+      }
+      if (!Number.isSafeInteger(fetchedAt) || fetchedAt < observedAt || fetchedAt >= expiresAt) {
+	return refused('claim-observation-expired');
+      }
       if (!record(response)) return refused('direct-response-malformed');
       if (response.workflow !== expectedWorkflowId || response.run !== expectedRunId) return refused('reference-rebound');
       const order = response.order;
@@ -302,8 +317,6 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('consume-verifier-failed');
       }
       if (!checked.ok) return refused('consume-proof-refused');
-      const expiresAt = observedAt + duration;
-      if (!Number.isSafeInteger(expiresAt)) return refused('clock-unavailable');
       let prompt: string;
       try {
 	prompt = substituteOrderVars(step.body, {
@@ -316,7 +329,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       } catch {
 	return refused('definition-materialization-failed');
       }
-      // Verification can take longer than the bounded service observation.
+      // Verification and materialization share the original fetch-start window.
       // A projection is never returned ready after that window has elapsed.
       let finishedAt: number;
       try {

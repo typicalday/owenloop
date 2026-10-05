@@ -108,7 +108,7 @@ function preflight(defDigest: string, extras: Record<string, unknown> = {}): unk
 }
 
 async function harness(overrides: {
-  response?: (p: OrderPacket, fetchCount: number) => GetOrderResponse | null;
+  response?: (p: OrderPacket, fetchCount: number) => GetOrderResponse | null | Promise<GetOrderResponse | null>;
   received?: (body: unknown, init: RequestInit) => void;
   missingPublicationVerifier?: boolean;
   throwPublicationVerifier?: boolean;
@@ -130,7 +130,7 @@ async function harness(overrides: {
     }
     const response = overrides.response === undefined ? {
       text: 'HOSTILE RAW REST TEXT', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
-    } : overrides.response(p, fetches);
+    } : await overrides.response(p, fetches);
     return new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } });
   };
   const adapter = createHostedOrderAdapter({
@@ -375,7 +375,7 @@ test('missing consumed paths and mismatched owed paths cannot be projected as a 
 
 test('lease observation expires during slow local verification or unsafe timestamp arithmetic', async () => {
   let tick = 0;
-  const expired = await harness({ now: () => (++tick === 1 ? 1_000 : 6_000) });
+  const expired = await harness({ now: () => (++tick < 3 ? 1_000 : 6_000) });
   assert.deepEqual(await expired.adapter.open(preflight(expired.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
   });
@@ -383,6 +383,30 @@ test('lease observation expires during slow local verification or unsafe timesta
   assert.deepEqual(await overflow.adapter.open(preflight(overflow.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'clock-unavailable',
   });
+});
+
+test('a delayed direct fetch cannot reset the claim observation window', async () => {
+  let clock = 1_000;
+  let releaseFetch!: () => void;
+  const delayed = new Promise<void>((resolve) => { releaseFetch = resolve; });
+  let fetchEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { fetchEntered = resolve; });
+  const h = await harness({
+    now: () => clock,
+    response: async (p) => {
+      fetchEntered();
+      await delayed;
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    },
+  });
+  const pending = h.adapter.open(preflight(h.f.defDigest));
+  await entered;
+  clock = 6_000;
+  releaseFetch();
+  assert.deepEqual(await pending, {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
+  });
+  assert.equal(h.fetches(), 1);
 });
 
 test('configured service origin must be HTTPS', async () => {

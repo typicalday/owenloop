@@ -25,11 +25,13 @@ The component assumes the configured authenticated HTTPS service is trusted to
 report the current claim and its claim-time version map. It compares the fetched
 workflow, run, and definition digest with the preflight reference and requires
 `lease.claimed === true` with no outcome. This is a **service observation**, not
-a signed issuer or lease attestation. Each `open` fetches again and marks its
-observation with a local `observedAt` and an expiry no more than five seconds
-later. It rechecks the clock after local verification and refuses if the
-observation has expired or timestamp arithmetic is unsafe. A caller must not
-treat the projection as authority after that expiry.
+a signed issuer or lease attestation. Each `open` fetches again and starts its
+local observation window **before** the authenticated direct fetch. It refuses
+if the fetch or subsequent local verification reaches the expiry, no more than
+five seconds after that start, or if timestamp arithmetic is unsafe. A caller
+must not treat the projection as authority after that expiry. This bounds the
+freshness of a returned `ready` projection; the current `getOrder` client has
+no abort signal, so a stalled fetch is still a separate liveness concern.
 
 The instruction source re-verifies installed bundle bytes and requires a
 verified execution-time publication verdict. The adapter forces definition and
