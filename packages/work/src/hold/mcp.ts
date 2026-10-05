@@ -159,6 +159,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  let stopping = false;
   // Set the moment the lease loop's run() settles (lease-lost, completed,
   // released, …): from then on this mount no longer holds the order, so BOTH
   // registered tools fast-fail with isError and never touch the hub again (plan section 4
@@ -190,13 +191,17 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       terminal = outcome;
       return outcome;
     },
-    stop: (reason?: string, stopOpts?: StopOptions) => inner.stop(reason, stopOpts),
+    stop: (reason?: string, stopOpts?: StopOptions) => {
+      // Revoke model-facing tools before the asynchronous lease loop settles.
+      stopping = true;
+      inner.stop(reason, stopOpts);
+    },
   };
 
   /** The fast-fail both tools apply once the hold is over. */
   function terminalGuard(): ToolResult | undefined {
-    if (terminal === undefined) return undefined;
-    return textResult({ error: `order no longer held (${terminal}) — stop` }, true);
+    if (terminal === undefined && !stopping) return undefined;
+    return textResult({ error: `order no longer held (${terminal ?? 'stopping'}) — stop` }, true);
   }
 
   async function gate(res: GetOrderResponse): Promise<ToolResult | undefined> {
@@ -229,11 +234,15 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (gone !== undefined) return gone;
       if (captured !== undefined) {
         const refused = await gate(captured);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         return textResult(orderView(captured));
       }
       if (firstContact !== undefined) {
         const refused = await gate(firstContact);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = firstContact;
         return textResult(orderView(firstContact));
@@ -241,6 +250,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       try {
         const res = await hub.getOrder({ workflow, run, ...holderReq });
         const refused = await gate(res);
+        const afterGate = terminalGuard();
+        if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = res;
         return textResult(orderView(res));
@@ -322,6 +333,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
         }
+        const beforeSubmit = terminalGuard();
+        if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({
           workflow,
           run,
@@ -490,6 +503,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
+        const beforeUpload = terminalGuard();
+        if (beforeUpload !== undefined) return beforeUpload;
         const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
         // Hand back the envelope EXACTLY as it must be submitted. The hub's
         // `text` is dropped from the pointer so the model cannot paste a field
