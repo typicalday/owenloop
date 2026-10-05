@@ -158,6 +158,12 @@ export function parseProduce(raw: string): ProducePattern {
   const r = raw.trim();
   let m = MAP_RE.exec(r);
   if (m) {
+    if ((m[3] as string) === '') {
+      throw new Error(
+        `map produce requires a named child suffix: '${raw}' (for example '${m[1]}[$${m[2]}].result'); ` +
+        'bare indexed paths are reserved for collection members',
+      );
+    }
     return { raw: r, kind: 'map' as ProduceKind, stem: m[1] as string, binder: m[2] as string, suffix: m[3] as string };
   }
   m = COLLECTION_RE.exec(r);
