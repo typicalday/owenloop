@@ -11,6 +11,7 @@
  * expiry; this projection does not continuously monitor clock or lease state.
  */
 import { bindProduce, elementPath, matchConsume, sealPath } from '../../../../src/paths.ts';
+import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import { substituteOrderVars } from '../../../../src/order-resolver.ts';
 import { join } from 'node:path';
 import { createBundleIngestor } from '../../../../src/store/index.ts';
@@ -44,9 +45,9 @@ type RefResult = { kind: 'ref'; ref: Ref } | { kind: 'unavailable' };
 export interface HostedOrderProjection {
   protocol: 'local-hosted-order-v1';
   state: 'ready';
-  /** Fresh observations of the configured service, not signed claims. expiresAt
-   *  is capped by the monotonic time remaining when this result is returned. */
-  serviceObservation: { workflow: string; run: string; step: string; observedAt: number; expiresAt: number };
+  /** Service reports an active claim, not holder identity. The expiry is capped
+   * by the monotonic time remaining when this result is returned. */
+  serviceObservation: { workflow: string; run: string; step: string; packetDigest: string; observedAt: number; expiresAt: number };
   definition: {
     bodyTrust: 'verified-local-publication';
     substitutions: 'trusted-service-observation';
@@ -170,6 +171,15 @@ function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
 
 function refused(code: string): HostedOrderResult {
   return { protocol: 'local-hosted-order-v1', state: 'refused', code };
+}
+
+/** Equality check between the holder's private packet and the direct verified fetch. */
+export function hostedPacketDigest(packet: unknown): string | undefined {
+  try {
+    return valueDigestHex(packet);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -363,10 +373,12 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       // than the monotonic window. Cap metadata to its remaining elapsed TTL.
       const remainingExpiry = Math.floor(finishedAt + duration - finishedElapsed);
       if (!Number.isSafeInteger(remainingExpiry) || remainingExpiry <= finishedAt) return refused('claim-observation-expired');
+      const packetDigest = hostedPacketDigest(order);
+      if (packetDigest === undefined) return refused('order-malformed');
       return {
 	protocol: 'local-hosted-order-v1',
 	state: 'ready',
-	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, observedAt, expiresAt: Math.min(expiresAt, remainingExpiry) },
+	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, packetDigest, observedAt, expiresAt: Math.min(expiresAt, remainingExpiry) },
 	definition: { bodyTrust: 'verified-local-publication', substitutions: 'trusted-service-observation', digest: order.defDigest, prompt },
 	...(step.spec === undefined && step.x === undefined ? {} : {
 	  staticExtensions: {
