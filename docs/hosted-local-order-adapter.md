@@ -27,11 +27,20 @@ workflow, run, and definition digest with the preflight reference and requires
 `lease.claimed === true` with no outcome. This is a **service observation**, not
 a signed issuer or lease attestation. Each `open` fetches again and starts its
 local observation window **before** the authenticated direct fetch. It refuses
-if the fetch or subsequent local verification reaches the expiry, no more than
-five seconds after that start, or if timestamp arithmetic is unsafe. A caller
-must not treat the projection as authority after that expiry. This bounds the
-freshness of a returned `ready` projection; the current `getOrder` client has
-no abort signal, so a stalled fetch is still a separate liveness concern.
+if the fetch or subsequent local verification reaches the configured window,
+no more than five seconds after that start, or if timestamp arithmetic is
+unsafe. A monotonic clock enforces this elapsed bound through return; the
+epoch clock remains necessary for signed chain dates. The returned epoch
+`expiresAt` is capped by the monotonic time remaining at return, but an
+epoch-only comparison can overstate the real time remaining if the wall clock
+moves backward afterward. An integrating caller that retains a projection
+must enforce its own monotonic deadline, measured before `open` and no later
+than that start plus the configured observation window, or call `open` again
+immediately before use. It must also recheck the lease before consequential
+actions because a claim can change after return. The adapter bounds fetch and
+verification through return; it does not continuously validate a retained
+projection. The current `getOrder` client has no abort signal, so a stalled
+fetch is still a separate liveness concern.
 
 The instruction source re-verifies installed bundle bytes and requires a
 verified execution-time publication verdict. The adapter forces definition and
