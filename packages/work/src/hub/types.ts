@@ -456,6 +456,11 @@ export interface SubmitRequest {
   holder?: ContactHolder;
 }
 
+/** This request must use the versioned route; older hubs have no such route. */
+export interface ConditionalSubmitRequest extends SubmitRequest {
+  expectedVersion: number;
+}
+
 /**
  * submit's flattened `{ text, ...data }` envelope (verified against hub-core
  * `verbs/submit.ts` + hub-edge `routes.ts` on 2026-07-17). `outcome` is the
@@ -470,6 +475,10 @@ export interface SubmitRequest {
 export interface SubmitResponse extends HubResponse {
   outcome?: string;
   closed?: boolean;
+}
+
+export interface ConditionalSubmitResponse extends SubmitResponse {
+  conditionApplied: 'expected-version-v1';
 }
 
 // ---- file artifacts ---------------------------------------------------------

@@ -72,14 +72,32 @@ workdir-dependent steps and command/calls/judge steps as direct hosted agent
 views. Calls-child **consumed proofs** are corroborated through the verified
 store closure, but the component itself does not expose a calls step to a model.
 
-This component has no submit API and is not wired into `createHoldMcp`'s
-existing cached order path. It cannot authorize a submission or prove that a
-lease remains live after `open` returns. A safe follow-on is an opt-in holder
-integration that direct-fetches and repeats the adapter's identity, lease,
-definition, and consume checks immediately before each model-visible order
-read and before each submit; uses the fresh private packet for submit proof and
-owed-path/version checks; refuses if the run has been released or re-offered;
-and never exposes that packet in MCP content or `structuredContent`. The
-holder's current cached `firstContact`/`captured` values cannot serve as fresh
-lease evidence. Issue #330 remains open until that path, signed reason support,
-deployed-client proof, and legacy retirement are complete.
+The bound `work hold --mcp --verified-hosted` mount remains read-only by default.
+Explicit `--mcp-tools get_order,submit` enables one signed mutation. Before
+every call it fetches and verifies the current order directly from the trusted
+service, selects a path and version from the verified output list, signs the
+private verified packet, and posts only to `/api/submit/conditional-v1`. It
+requires a machine signing key and the endpoint's
+`conditionApplied: "expected-version-v1"` response marker. An older service
+has no such route; the client never retries legacy `/api/submit`. After an open
+submit it reads the next order from the direct service, not the holder's cached
+`firstContact`/`captured` packet. The model receives only bounded status;
+raw order, proof, lease, and service response text stay private.
+
+This first submit slice refuses collection seal outputs because a member has a
+different proof target. It also retains the adapter's refusal of feedback and
+prior values, including re-armed route siblings. A 409 stale condition is a
+fixed refusal; transport failures or a missing response marker leave the
+result uncertain. The holder refuses another submit until the model explicitly
+calls `get_order`, receives a freshly verified projection with an opaque
+`reconciliation.submitToken`, and echoes that token in the next submit. The
+token binds that submit to the packet digest the model was shown. A lost
+`get_order` response or an internal submit-time re-fetch cannot clear the
+requirement. An order read started before a newer uncertain submit is refused
+as superseded, even if it finishes later. Concurrent submits are refused while
+one conditional mutation is in flight. An acknowledged non-success
+response or a response missing its marker still stops the holder lease without
+release when it reports `closed: true`. This is a native local holder
+path, not a public hosted MCP gateway. It does not attest exclusive holder
+identity or establish a deployed Jev proof. Issue #330 remains open for those
+boundaries, signed reason support, collection handling, and legacy retirement.

@@ -189,8 +189,11 @@ test('valid signed consume crosses direct authenticated fetch into a minimized l
     assert.equal((init.headers as Record<string, string>).authorization, 'Bearer local-secret');
     assert.equal(init.redirect, 'error');
   } });
-  const result = await h.adapter.open(preflight(h.f.defDigest, { prompt: 'HOSTILE RELAY PROMPT' }));
+  let privatePacket: { order: OrderPacket; collectionOutputs: string[] } | undefined;
+  const result = await h.adapter.open(preflight(h.f.defDigest, { prompt: 'HOSTILE RELAY PROMPT' }), 0,
+    (packet) => { privatePacket = packet; });
   assert.equal(result.state, 'ready');
+  assert.deepEqual(privatePacket, { order: h.p, collectionOutputs: [] });
   assert.equal(h.fetches(), 1);
   if (result.state !== 'ready') return;
   assert.equal(result.definition.bodyTrust, 'verified-local-publication');

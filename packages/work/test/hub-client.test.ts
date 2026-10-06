@@ -126,6 +126,28 @@ test('submit sends its full body including done', async () => {
   assert.deepEqual(captured[0]!.body, { workflow: 'wf1', run: 'r1', path: 'pr', value: { n: 1 }, done: true });
 });
 
+test('conditional submit uses only the versioned route with the observed version', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, {
+    body: { text: 'accepted', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' },
+  }));
+  const req = { workflow: 'wf1', run: 'r1', path: 'pr', value: { n: 1 }, done: true, expectedVersion: 3 };
+  const result = await c.submitConditional!(req);
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0]!.url, 'https://hub.example/api/submit/conditional-v1');
+  assert.deepEqual(captured[0]!.body, req);
+  assert.equal(result.conditionApplied, 'expected-version-v1');
+});
+
+test('conditional submit does not fall back to legacy submit when the route is absent', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { status: 404, body: { error: 'not_found', message: 'route unavailable' } }));
+  await assert.rejects(() => c.submitConditional!({
+    workflow: 'wf1', run: 'r1', path: 'pr', value: { n: 1 }, expectedVersion: 3,
+  }), (error: unknown) => error instanceof HubError && error.status === 404);
+  assert.deepEqual(captured.map((request) => request.url), ['https://hub.example/api/submit/conditional-v1']);
+});
+
 test('reject POSTs /api/reject without a client-supplied by field', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'rejected', ok: true, closed: false } }));

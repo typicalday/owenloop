@@ -92,6 +92,8 @@ export interface HoldMcpMount {
   tools: ToolRegistration[];
   /** The lease loop kept warm underneath — the role runs and stops it. */
   loop: HoldLoop;
+  /** Process-local gated response; never registered as an MCP tool or sent to the model. */
+  readGatedOrder: () => GetOrderResponse | undefined;
 }
 
 function errMsg(e: unknown): string {
@@ -192,7 +194,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       return outcome;
     },
     stop: (reason?: string, stopOpts?: StopOptions) => {
-      // Revoke model-facing tools before the asynchronous lease loop settles.
+      // A closing submit or signal must revoke the model-facing packet before
+      // the asynchronous lease loop has finished settling.
       stopping = true;
       inner.stop(reason, stopOpts);
     },
@@ -534,5 +537,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     put_file_artifact: putFileArtifactTool,
   };
   const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
-  return { tools: selected.map((name) => registrations[name]), loop };
+  return {
+    tools: selected.map((name) => registrations[name]), loop,
+    readGatedOrder: () => terminal === undefined && !stopping ? captured : undefined,
+  };
 }
