@@ -2285,8 +2285,8 @@ function seedArts(def: WorkflowDef, assumeProvided = false): Map<string, Artifac
   return settleInMemory(def, arts);
 }
 
-/** Internal: the eligible outcomes for a given firing. */
-function eligibleOutcomes(
+/** @internal Eligible outcomes for focused checker/runtime conformance tests; not a package-root API. */
+export function eligibleOutcomes(
   def: WorkflowDef,
   arts: Map<string, ArtifactData>,
   firing: Firing,
@@ -2356,7 +2356,8 @@ function eligibleOutcomes(
   // A judged produce's actual green-moment is judge-approve (handled above),
   // so this only applies to a plain (non-judged) producer output.
   const hasJudges = activeJudgesForStem(def, outPath, opts.modifier).length > 0;
-  if (!hasJudges && outPath && groupWouldReject(def, arts, outPath)) {
+  const groupRejectsGreen = !hasJudges && outPath !== '' && groupWouldReject(def, arts, outPath);
+  if (groupRejectsGreen) {
     outcomes.push('group-reject');
   } else {
     outcomes.push('green');
@@ -2374,7 +2375,15 @@ function eligibleOutcomes(
     outcomes.push('judgment-reject');
   }
 
-  outcomes.push('schema-reject');
+  // green() checks plain produce-group exclusion before schema/bind validation.
+  // After that, it can schema-reject only when this produce declares a schema
+  // or a binding whose accepted value may fail validation. With neither, the
+  // real commit accepts any JSON value; a synthetic rejection invents retry states.
+  // Keep the branch if the owning produce is unknown, conservatively.
+  const produce = produceOwning(step, outPath);
+  if (!groupRejectsGreen && (!produce || produce.schema !== undefined || produce.bind !== undefined)) {
+    outcomes.push('schema-reject');
+  }
   // skip is valid for any non-retracted output (producer can route dead branch)
   outcomes.push('skip');
   // retract only for bare collection members

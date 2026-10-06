@@ -74,7 +74,10 @@ test('schema e2e: a fully schema-conforming run reaches done', () => {
   ow('close', wf, g.run);
 
   const s = claim(ow, wf, 'synth');
-  ow('green', wf, s.run, 'report', '--value', J({ ok: true }));
+  // `report` has no schema or artifact bind. An arbitrary JSON object is
+  // accepted; the checker must not invent a schema-reject outcome here.
+  assert.equal(ow('green', wf, s.run, 'report', '--value', J({ unconstrained: 17 })).outcome, 'green');
+  assert.equal(art(ow, wf, 'report').schemaRejects, 0);
   ow('close', wf, s.run);
 
   assert.equal(ow('status', wf).done, true);
