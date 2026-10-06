@@ -253,6 +253,23 @@ test('collection lease: scoped singleton judge uses the selected modifier on the
     assert.equal(engine.green(wf, run.run, 'note', {}).outcome, expected);
     assert.equal(modeled.state.arts.get('note')?.acceptance, expected);
     assert.deepEqual(fields(modeled.state.arts), fields(new Map(store.listArtifacts(wf).map((art) => [art.path, art]))));
+    const repeated = collectionLeaseSuccessors(definition, modeled.state, lease, 1, modifier)
+      .find((move) => move.step.outcome === 'green' && move.step.path === 'note');
+    assert.ok(repeated, 'an open run can commit a singleton again after its first accepted version');
+    assert.equal(engine.green(wf, run.run, 'note', {}).outcome, expected);
+    assert.equal(repeated.state.arts.get('note')?.version, 2);
+    assert.deepEqual(fields(repeated.state.arts), fields(new Map(store.listArtifacts(wf).map((art) => [art.path, art]))));
+    const sealed = collectionLeaseSuccessors(definition, repeated.state, lease, 1, modifier)
+      .find((move) => move.step.outcome === 'collection-seal');
+    assert.ok(sealed);
+    engine.seal(wf, run.run);
+    assert.deepEqual(fields(sealed.state.arts), fields(new Map(store.listArtifacts(wf).map((art) => [art.path, art]))));
+    const afterSeal = collectionLeaseSuccessors(definition, sealed.state, lease, 1, modifier)
+      .find((move) => move.step.outcome === 'green' && move.step.path === 'note');
+    assert.ok(afterSeal, 'sealing does not close the run or make its singleton output immutable');
+    assert.equal(engine.green(wf, run.run, 'note', {}).outcome, expected);
+    assert.equal(afterSeal.state.arts.get('note')?.version, 3);
+    assert.deepEqual(fields(afterSeal.state.arts), fields(new Map(store.listArtifacts(wf).map((art) => [art.path, art]))));
   }
 
   definition.invariants = [{
@@ -265,6 +282,40 @@ test('collection lease: scoped singleton judge uses the selected modifier on the
   assert.ok(check('standard').invariantViolations.some((finding) => finding.invariant === 'note-before-seal'));
   assert.ok(!check('deep').invariantViolations.some((finding) => finding.invariant === 'note-before-seal'),
     'the active judge submits the note; green requires a separate approval outside this two-move prefix');
+});
+
+test('collection lease: losing group sibling refuses before stale-input CAS', () => {
+  const definition = buildDef({
+    name: 'mixed-group-stale',
+    inputs: [{ name: 'q', seedOwed: false }],
+    steps: [{
+      name: 'gather', consumes: ['q'], body: 'gather', terminal: true,
+      produces: [
+        'left', 'right', 'items[]',
+        { group: 'choice', mode: 'exactlyOne', of: ['left', 'right'] },
+      ],
+    }],
+  });
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const run = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'gather');
+  assert.ok(run);
+  const lease: CollectionLease = {
+    step: 'gather', key: '', stem: 'items', inputs: ['q'],
+    fingerprint: computeFingerprint(arts(), ['q']),
+  };
+  assert.equal(engine.green(wf, run.run, 'left', {}).outcome, 'green');
+  assert.equal(store.getArtifact(wf, 'right')?.acceptance, 'skipped');
+  assert.equal(engine.green(wf, 'human', 'q', {}).outcome, 'green');
+  const before = arts();
+  const refused = collectionLeaseSuccessors(definition, { arts: before, leases: [lease] }, lease, 1)
+    .find((move) => move.step.outcome === 'group-reject' && move.step.path === 'right');
+  assert.ok(refused);
+  assert.equal(engine.green(wf, run.run, 'right', {}).outcome, 'group-rejected');
+  assert.equal(refused.state.leases.length, 1, 'group refusal leaves the claimed run open');
+  assert.deepEqual(fields(refused.state.arts), fields(arts()));
 });
 
 test('collection lease: unsampled real schema-valid value is an incomplete check, not a clean archive proof', () => {

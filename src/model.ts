@@ -2593,7 +2593,9 @@ export function collectionLeaseSuccessors(
     !isGreen(state.arts.get(path)) || state.arts.get(path)?.version !== lease.fingerprint[path]);
   const singletonPaths = singletonProduces(step)
     .map((produce) => produce.stem)
-    .filter((path) => isDebt(state.arts.get(path)));
+    // An open run may commit the same singleton again after it is green or
+    // submitted. That bumps its version and may invalidate downstream work.
+    .filter((path) => state.arts.has(path));
   if (stale) {
     // The worker may attempt green() on a singleton or emit()/seal() on the
     // collection. Each CAS-refused verb born-rejects its OWN target and releases
@@ -2601,6 +2603,14 @@ export function collectionLeaseSuccessors(
     for (const path of [sealP, ...singletonPaths]) {
       const target = state.arts.get(path);
       if (!target) continue;
+      // A plain singleton's group refusal precedes the runtime CAS check.
+      // It leaves the open run and the already-settled loser untouched.
+      if (path !== sealP
+	  && activeJudgesForStem(def, path, modifier).length === 0
+	  && groupWouldReject(def, state.arts, path)) {
+	move('group-reject', new Map(state.arts), state.leases, undefined, path);
+	continue;
+      }
       const next = new Map(state.arts);
       next.set(path, {
 	...target, acceptance: 'rejected',
