@@ -308,15 +308,15 @@ test('install: a file the validation gate rejects maps nothing and publishes not
   assert.equal(h.calls.length, 0, 'the gate is client-side and runs before the first hub request');
 });
 
-test('install: finite collection coverage refuses before mapping or publishing', async () => {
+test('install: finite collection coverage warns but accepts a valid source definition', async () => {
   const yaml = capDef('collection-only', []).replace('produces: [out]', 'produces: ["items[]"]');
   const h = harness({ 'workflows/collection-only.yaml': yaml });
-  assert.equal(await mainAsync(['install', SOURCE, '--accept-defaults'], h.t.io), 1);
-  assert.match(h.t.err.join('\n'), /model coverage incomplete \(collection-width-cap\)/);
+  assert.equal(await mainAsync(['install', SOURCE, '--accept-defaults'], h.t.io), 0, h.t.err.join('\n'));
+  assert.match(h.t.err.join('\n'), /warning: collection-only: model coverage incomplete \(collection-width-cap\)/);
   assert.doesNotMatch(h.t.err.join('\n'), /definite defects found/);
-  assert.equal(h.calls.length, 0);
+  assert.ok(h.calls.length > 0);
   assert.equal(h.hub.mappings.size, 0);
-  assert.equal(h.hub.state.get('collection-only'), undefined);
+  assert.ok(h.hub.state.get('collection-only'));
 });
 
 // ---- dry run ----------------------------------------------------------------

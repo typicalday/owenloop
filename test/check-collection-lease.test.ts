@@ -325,13 +325,13 @@ test('collection lease: unsampled real schema-valid value is an incomplete check
     return { code, out: out.join('\n'), err: err.join('\n') };
   };
   const text = runCheck('text');
-  assert.notEqual(text.code, 0);
+  assert.equal(text.code, 0, 'unknown schema-value classes remain diagnostic');
   assert.match(text.out, /Status: INCOMPLETE/);
   assert.match(text.out, /MODEL COVERAGE INCOMPLETE/);
-  assert.match(text.err, /model coverage incomplete/);
+  assert.doesNotMatch(text.err, /model coverage incomplete/);
   assert.doesNotMatch(text.err, /definite defects found/);
   const json = runCheck('json');
-  assert.notEqual(json.code, 0);
+  assert.equal(json.code, 0);
   assert.ok(JSON.parse(json.out).coverageIncomplete.includes('collection-schema-validity'));
 });
 

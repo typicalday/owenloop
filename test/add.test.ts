@@ -70,7 +70,7 @@ function validDefYaml(name: string): string {
   ].join('\n');
 }
 
-test('add: finite collection coverage refuses installation before replacing files', async () => {
+test('add: finite collection coverage warns but accepts a valid source definition', async () => {
   const owner = 'acme';
   const repo = 'widgets';
   const name = 'collection-only';
@@ -82,10 +82,10 @@ test('add: finite collection coverage refuses installation before replacing file
     [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
   });
   const { io, cwd, err } = makeIo(fetch);
-  assert.equal(await mainAsync(['add', `${owner}/${repo}`], io), 1);
-  assert.match(err.join('\n'), /model coverage incomplete \(collection-width-cap\)/);
+  assert.equal(await mainAsync(['add', `${owner}/${repo}`], io), 0, err.join('\n'));
+  assert.match(err.join('\n'), /warning: collection-only: model coverage incomplete \(collection-width-cap\)/);
   assert.doesNotMatch(err.join('\n'), /definite defects found/);
-  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo), `${name}.yaml`)));
+  assert.ok(existsSync(join(cwd, 'workflows', installFolder(owner, repo), `${name}.yaml`)));
 });
 
 /** A def that fails validateDef: 'worker' consumes 'ghost', which nothing produces. */

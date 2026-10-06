@@ -39,12 +39,12 @@ test('CLI check labels a cap-limited deadlock INCOMPLETE while preserving its wi
     cwd: process.cwd(), env: process.env,
     out: (line) => out.push(line), err: (line) => err.push(line),
   });
-  assert.equal(code, 1);
+  assert.equal(code, 0, 'finite-model no-move witnesses are not definite defects');
   assert.match(out.join('\n'), /Status: INCOMPLETE/);
   assert.match(out.join('\n'), /Finite-model no-move states.*\(3\):/);
   assert.doesNotMatch(out.join('\n'), /True deadlocks/);
   assert.doesNotMatch(out.join('\n'), /Status: DEFECTS FOUND/);
-  assert.match(err.join('\n'), /model coverage incomplete/);
+  assert.doesNotMatch(err.join('\n'), /model coverage incomplete/);
 });
 
 test('modelCheck: provided strict-input control has no deadlock', () => {

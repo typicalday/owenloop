@@ -1088,9 +1088,11 @@ export interface CheckReport {
   /** Which bounds were hit, for honest reporting. */
   boundsHit: ('maxDepth' | 'maxStates')[];
   /**
-   * Reasons this finite checker report does not cover every runtime path.
-   * Independent of BFS `bounded`/`boundsHit`: an exhausted capped model is
-   * still not a proof for wider runtime collections or unsampled schema values.
+   * Known collection/value sampling limits in this static workflow-shape
+   * analysis. Independent of BFS `bounded`/`boundsHit`: an exhausted capped
+   * model is not proof for wider collections or unsampled schema values.
+   * An empty array is not a claim that all live task/lease interleavings were
+   * explored; runtime conformance is verified separately.
    */
   coverageIncomplete: Array<'collection-width-cap' | 'collection-unexplored' | 'collection-schema-validity' | 'collection-schema-refusal' | 'collection-mixed-output-values'>;
   /**

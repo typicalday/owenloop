@@ -1671,6 +1671,13 @@ function failureNote(failures: DefLoadFailure[]): string {
 // module. Re-exported here to keep the existing CLI/test import surface.
 export { hasDefiniteCheckDefect };
 
+/** Finite collection/value exploration is diagnostic, not a source-admission proof. */
+function warnModelCoverage(io: CliIO, defName: string, report: CheckReport): void {
+  if (report.coverageIncomplete.length === 0) return;
+  io.err(`warning: ${defName}: model coverage incomplete (${report.coverageIncomplete.join(', ')}); ` +
+    'check runtime behavior separately');
+}
+
 /**
  * Options accepted on EVERY command. docs/cli.md documents `--db`/`--defs` as
  * global ("pass both on every command"), so they are allowlisted everywhere —
@@ -2482,9 +2489,10 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     //   idle wait that becomes eligible after time passes), and a stuck state
     //   (report.stuck) is purely informational (a brake tripped on one branch
     //   while the line still moves on another). Neither is a defect.
-    // - collection width/schema coverage gaps are a separate incomplete-proof
-    //   result. They are neither BFS bounds nor definite runtime defects, but
-    //   cannot pass a release/archive gate that requires a complete check.
+    // - collection width/schema coverage gaps describe finite-model limits.
+    //   They cannot promote a no-moves witness to a definite deadlock, but
+    //   this structural check does not certify every runtime item/value/run.
+    //   Report the limit without making it a blanket source-admission veto.
     const hasDefiniteDefect = hasDefiniteCheckDefect(report);
     if (hasDefiniteDefect) {
       throw new CliError(
@@ -2492,9 +2500,6 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
         `${report.deadlocks.length} true deadlock(s))`,
       );
-    }
-    if (report.coverageIncomplete.length > 0) {
-      throw new CliError(`model coverage incomplete (${report.coverageIncomplete.join(', ')})`);
     }
     return 0;
   }
@@ -3806,9 +3811,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
             `${report.deadlocks.length} true deadlock(s))`,
         );
       }
-      if (report.coverageIncomplete.length > 0) {
-	reasons.push(`${stagedDef.name}: model coverage incomplete (${report.coverageIncomplete.join(', ')})`);
-      }
+      warnModelCoverage(io, stagedDef.name, report);
     }
 
     // Strict backstop: only if the aggregate pass found nothing, run the FULL
@@ -5238,9 +5241,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
           `${report.deadlocks.length} true deadlock(s))`,
       );
     }
-    if (report.coverageIncomplete.length > 0) {
-      reasons.push(`${def.name}: model coverage incomplete (${report.coverageIncomplete.join(', ')})`);
-    }
+    warnModelCoverage(io, def.name, report);
   }
 
   // Assemble the push candidates: verbatim source yaml + the server-canonical
@@ -5790,9 +5791,7 @@ async function dispatchInstall(io: CliIO, args: Args): Promise<number> {
             `${report.deadlocks.length} true deadlock(s))`,
         );
       }
-      if (report.coverageIncomplete.length > 0) {
-	reasons.push(`${def.name}: model coverage incomplete (${report.coverageIncomplete.join(', ')})`);
-      }
+      warnModelCoverage(io, def.name, report);
     }
 
     // 4. Push candidates: verbatim source yaml + the server-canonical hash.

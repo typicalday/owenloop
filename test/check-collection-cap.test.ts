@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { main } from '../src/cli.ts';
-import { modelCheck } from '../src/model.ts';
+import { hasDefiniteCheckDefect, modelCheck } from '../src/model.ts';
 import { def, input, step } from './helpers.ts';
 
 const collectionFixture = def(
@@ -80,10 +80,23 @@ test('modelCheck: collection width coverage is separate from BFS bounds', () => 
   });
   assert.equal(unreachable.collectionCapApplied, false, 'an unexpanded collection declaration is not a cap application');
   assert.deepEqual(unreachable.coverageIncomplete, ['collection-unexplored'],
-    'admission conservatively holds a declared collection even if the BFS never expands it');
+    'the report preserves an unexpanded declaration as a diagnostic');
   assert.equal(unreachable.maxCollectionSize, 4);
   assert.equal(unreachable.bounded, false);
   assert.deepEqual(unreachable.boundsHit, []);
+});
+
+test('modelCheck: a concrete invariant violation remains definite despite collection sampling', () => {
+  const fixture = {
+    ...collectionFixture,
+    name: 'collection-cap-definite-invariant',
+    invariants: [{ name: 'start-must-be-absent', requires: { path: 'start', is: 'absent' } as const }],
+  };
+  const report = modelCheck(fixture, { maxStates: 5_000, assumeProvided: true });
+  assert.deepEqual(report.coverageIncomplete, ['collection-width-cap']);
+  assert.deepEqual(report.invariantViolations[0]?.path, [], 'the seed itself violates the invariant');
+  assert.equal(hasDefiniteCheckDefect(report), true,
+    'sampling caveats do not suppress real invariant counterexamples');
 });
 
 function writeCheckDefinition(dir: string, name: string, produces: string): void {
@@ -135,18 +148,18 @@ function runCheck(defs: string, ...argv: string[]): { code: number; out: string;
   return { code, out: out.join('\n'), err: err.join('\n') };
 }
 
-test('CLI check: finite collection coverage holds acceptance while retaining the full report', () => {
+test('CLI check: finite collection coverage is reported without blocking structural acceptance', () => {
   const defs = mkdtempSync(join(tmpdir(), 'owenloop-collection-cap-defs-'));
   writeCheckDefinition(defs, 'collection-cap-cli', '"items[]"');
   writeCheckDefinition(defs, 'collection-cap-scalar-cli', 'result');
 
   const collectionText = runCheck(defs, 'check', 'collection-cap-cli', '--max-collection', '3');
   const scalarText = runCheck(defs, 'check', 'collection-cap-scalar-cli', '--max-collection', '3');
-  assert.notEqual(collectionText.code, 0, 'finite width cannot certify all runtime collections');
+  assert.equal(collectionText.code, 0, 'finite width is advisory for structural acceptance');
   assert.equal(scalarText.code, 0, 'the scalar control retains the same exit code');
   assert.match(collectionText.out, /Status: INCOMPLETE/);
   assert.match(collectionText.out, /MODEL COVERAGE INCOMPLETE/);
-  assert.match(collectionText.err, /model coverage incomplete/);
+  assert.doesNotMatch(collectionText.err, /model coverage incomplete/);
   assert.doesNotMatch(collectionText.err, /definite defects found/);
   assert.match(collectionText.out, /COLLECTION CAP APPLIED/);
   assert.match(collectionText.out, /--max-collection 3/);
@@ -155,7 +168,7 @@ test('CLI check: finite collection coverage holds acceptance while retaining the
 
   const collectionJson = runCheck(defs, 'check', 'collection-cap-cli', '--max-collection', '3', '--format', 'json');
   const scalarJson = runCheck(defs, 'check', 'collection-cap-scalar-cli', '--max-collection', '3', '--format', 'json');
-  assert.notEqual(collectionJson.code, 0);
+  assert.equal(collectionJson.code, 0);
   assert.equal(scalarJson.code, 0);
   assert.deepEqual(
     JSON.parse(collectionJson.out).collectionCapApplied,
@@ -172,11 +185,11 @@ test('CLI check: a collection beyond the BFS prefix remains coverage-incomplete'
   const defs = mkdtempSync(join(tmpdir(), 'owenloop-late-collection-'));
   writeFileSync(join(defs, 'late-collection.yaml'), lateCollectionYaml('late-collection'));
   const result = runCheck(defs, 'check', 'late-collection', '--format', 'json');
-  assert.equal(result.code, 1);
+  assert.equal(result.code, 0);
   const report = JSON.parse(result.out);
   assert.equal(report.bounded, true, 'the default search stops before the last producer');
   assert.equal(report.collectionCapApplied, false, 'no collection firing was expanded');
   assert.deepEqual(report.coverageIncomplete, ['collection-unexplored']);
-  assert.match(result.err, /model coverage incomplete \(collection-unexplored\)/);
+  assert.doesNotMatch(result.err, /model coverage incomplete/);
   assert.doesNotMatch(result.err, /definite defects found/);
 });

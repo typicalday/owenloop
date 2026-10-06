@@ -49,12 +49,18 @@ zero or multiple outputs, and every member of a calls cycle are hard errors.
 The lint JSON keeps those errors on the calling definition (and on every cycle
 member); `check` presents them in its existing validation-error message.
 
-Collection searches use `--max-collection N` to limit each `emit`/`seal` fork to
-0 through N members (the default is 2). When the search actually expands a
+Collection searches use `--max-collection N` to limit the total number of
+emitted member indices per collection producer to N (the default is 2), across
+successive emits. When the search actually expands a
 reachable collection fork, text output prints a separate `COLLECTION CAP
 APPLIED` caveat naming the flag and effective value. JSON output exposes the
 same information as `collectionCapApplied` and `maxCollectionSize`; the marker
 is independent of the `SEARCH INCOMPLETE` bounds notice.
+`MODEL COVERAGE INCOMPLETE` reports finite collection/value sampling. It can
+appear with exit code 0 and `Status: INCOMPLETE` when no definite structural
+defect was found. The source `add`, `push`, and `install` commands warn rather
+than refusing solely for this sampling limit; archive and release gates may
+require stronger evidence under their own explicit policies.
 
 ## Commands
 
