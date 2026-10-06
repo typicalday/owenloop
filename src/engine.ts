@@ -1314,10 +1314,9 @@ export class Engine {
     return def?.bundleDigest ? { bundleDigest: def.bundleDigest, workflowName: def.name } : null;
   }
   private selectionEvidence(workflow: string, step: StepDef): { evidence: InvocationEvidence[]; paths: string[] } {
-    const arts = this.artMap(workflow);
     const evidence: InvocationEvidence[] = [], paths: string[] = [];
     for (const [childInput, parentPath] of Object.entries(step.callsInputs ?? {}).sort()) {
-      const a = arts.get(parentPath);
+      const a = this.store.getArtifactEvidence(workflow, parentPath);
       if (!isGreen(a) || !a || !jsonOnly(a.value)) paths.push(parentPath);
       else evidence.push({ childInput, parentPath, version: a.version, value: a.value });
     }
