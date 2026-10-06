@@ -76,8 +76,9 @@ Options:
                                  submit, lease kept warm underneath (mutually
                                  exclusive with --ignore-stdin — stdin is the
                                  transport)
-      --verified-hosted          opt-in read-only MCP projection: expose only
-				 locally verified get_order for this held run;
+      --verified-hosted          opt-in locally verified get_order for this held
+				 run; read-only unless --mcp-tools get_order,submit
+				 also opts into signed conditional-v1 submit;
 				 requires --mcp and an HTTPS hub origin
 
   exec options (usually spawned by shift, not run by hand):
