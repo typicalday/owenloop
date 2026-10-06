@@ -146,9 +146,10 @@ test('a closed stdout reader does not strand the executable', async () => {
   const result = await exited;
   assert.deepEqual(
     { code: result.code, signal: result.signal },
-    { code: 0, signal: null },
+    { code: 1, signal: null },
     result.stderr.toString('utf8'),
   );
+  assert.match(result.stderr.toString('utf8'), /model coverage incomplete/);
 });
 
 test('the executable preserves a check error exit code', async () => {

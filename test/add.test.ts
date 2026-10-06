@@ -70,6 +70,24 @@ function validDefYaml(name: string): string {
   ].join('\n');
 }
 
+test('add: finite collection coverage refuses installation before replacing files', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const name = 'collection-only';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    [`workflows/${name}.yaml`]: validDefYaml(name).replace('produces: [out]', 'produces: ["items[]"]'),
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, err } = makeIo(fetch);
+  assert.equal(await mainAsync(['add', `${owner}/${repo}`], io), 1);
+  assert.match(err.join('\n'), /model coverage incomplete \(collection-width-cap\)/);
+  assert.doesNotMatch(err.join('\n'), /definite defects found/);
+  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo), `${name}.yaml`)));
+});
+
 /** A def that fails validateDef: 'worker' consumes 'ghost', which nothing produces. */
 const INVALID_DEF_YAML = [
   'name: broken',

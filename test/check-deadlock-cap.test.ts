@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { hasDefiniteCheckDefect } from '../src/cli.ts';
+import { hasDefiniteCheckDefect, main } from '../src/cli.ts';
 import { loadDefFile } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
 
@@ -15,7 +15,7 @@ const wedge = fixture('wedge');
 const wedgeColl2 = fixture('wedge-coll2');
 const maxStates = 2_000_000;
 
-test('modelCheck: natural collection cap reports the promoted deadlock witnesses', () => {
+test('modelCheck: finite collection width cannot promote its deadlock witnesses', () => {
   const control = modelCheck(wedge, { maxStates, assumeProvided: false });
   const collection = modelCheck(wedgeColl2, { maxStates, assumeProvided: false });
 
@@ -25,8 +25,26 @@ test('modelCheck: natural collection cap reports the promoted deadlock witnesses
     assert.deepEqual(report.boundsHit, []);
     assert.equal(report.bounded, false);
     assert.equal(report.completable, false);
-    assert.equal(hasDefiniteCheckDefect(report), true);
   }
+  assert.deepEqual(control.coverageIncomplete, []);
+  assert.equal(hasDefiniteCheckDefect(control), true);
+  assert.deepEqual(collection.coverageIncomplete, ['collection-width-cap']);
+  assert.equal(hasDefiniteCheckDefect(collection), false);
+});
+
+test('CLI check labels a cap-limited deadlock INCOMPLETE while preserving its witnesses', () => {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = main(['check', 'unprovided-coll', '--defs', fileURLToPath(new URL('./fixtures', import.meta.url)), '--strict-inputs'], {
+    cwd: process.cwd(), env: process.env,
+    out: (line) => out.push(line), err: (line) => err.push(line),
+  });
+  assert.equal(code, 1);
+  assert.match(out.join('\n'), /Status: INCOMPLETE/);
+  assert.match(out.join('\n'), /Finite-model no-move states.*\(3\):/);
+  assert.doesNotMatch(out.join('\n'), /True deadlocks/);
+  assert.doesNotMatch(out.join('\n'), /Status: DEFECTS FOUND/);
+  assert.match(err.join('\n'), /model coverage incomplete/);
 });
 
 test('modelCheck: provided strict-input control has no deadlock', () => {

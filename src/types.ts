@@ -1040,10 +1040,18 @@ export interface CheckStep {
   key: string;      // "" for plain/reduce; element path for map
   outcome:
     | 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal'
+    // Collection checker phases. A claimed producer may emit repeatedly while
+    // its seal remains open; other steps may run between these transitions.
+    | 'collection-claim' | 'collection-emit' | 'collection-schema-reject'
+    | 'collection-seal' | 'collection-close' | 'collection-born-reject'
     // §24: outcomes for a synthesized judge step's own firing (against the judged stem)
     | 'judge-approve' | 'judge-reject'
     // §26: a commit refused because it would violate its group's exactlyOne/atMostOne contract
     | 'group-reject';
+  /** Number of members in a collection-emit transition. */
+  count?: number;
+  /** Concrete owned output targeted by a mixed producer's same-run action. */
+  path?: string;
 }
 
 /** A finding with its shortest witness path from the initial state. */
@@ -1055,7 +1063,7 @@ export interface CheckFinding {
 export interface CheckOptions {
   maxDepth?: number;         // default 50
   maxStates?: number;        // default 5000
-  maxCollectionSize?: number; // default 2 — max members when fan-out from an emit
+  maxCollectionSize?: number; // default 2 — max members emitted by one collection producer in the finite model
   /**
    * Seed `seedOwed: true` inputs green, as if `provide` already ran. The checker
    * has no runtime provide values, so without this every seedOwed input starts
@@ -1080,22 +1088,35 @@ export interface CheckReport {
   /** Which bounds were hit, for honest reporting. */
   boundsHit: ('maxDepth' | 'maxStates')[];
   /**
-   * True when the search expanded at least one reachable `emit-seal` outcome.
-   * This describes the search shape, not a BFS stop condition, and does not
-   * contribute to `bounded`.
+   * Reasons this finite checker report does not cover every runtime path.
+   * Independent of BFS `bounded`/`boundsHit`: an exhausted capped model is
+   * still not a proof for wider runtime collections or unsampled schema values.
+   */
+  coverageIncomplete: Array<'collection-width-cap' | 'collection-unexplored' | 'collection-schema-validity' | 'collection-schema-refusal' | 'collection-mixed-output-values'>;
+  /**
+   * True when the search expanded a reachable collection producer under the
+   * finite total-emitted-member cap. This is separate from BFS bounds and
+   * does not certify unrestricted runtime width.
    */
   collectionCapApplied: boolean;
-  /** Effective per-seal member-count cap, including the default when unspecified. */
+  /** Effective total emitted-member cap per collection producer in this model. */
   maxCollectionSize: number;
   /**
-   * Reachable non-done states with zero eligible firings that have NO path to
-   * completion even after unlimited attempts and elapsed idle time — i.e.
-   * recomputing eligibility with all freezes lifted (a human `retry` =
-   * unlimited attempts) and eventual idle time STILL yields zero firings. A
-   * genuine structural dead-end (TRUE deadlock). A definite
-   * defect only when the search was exhaustive (`!bounded`) — the
-   * maxCollectionSize cap can otherwise manufacture a spurious no-moves
-   * state. Always present ([] when none).
+   * True when a reachable collection schema was explored using concrete
+   * candidate values. Candidate discovery is incomplete for arbitrary JSON
+   * Schema; report findings here as sampled-value results, not a proof that
+   * every schema-valid or schema-invalid payload class was covered.
+   * This field does not change `bounded`; separate `coverageIncomplete`
+   * reasons hold CLI and archive admission when a value class is unknown.
+   */
+  collectionSchemaValuesSampled?: true;
+  /**
+   * Reachable non-done states with zero modeled eligible moves even after
+   * lifting attempt freezes and advancing idle time. These are finite-graph
+   * no-move witnesses. A witness is a definite runtime deadlock only when
+   * the BFS was exhaustive (`!bounded`) and no collection coverage gap is
+   * known; finite collection width or unknown values can manufacture one.
+   * Always present ([] when none).
    */
   deadlocks: CheckFinding[];
   /**
