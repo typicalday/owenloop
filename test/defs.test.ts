@@ -20,6 +20,24 @@ const delivery = {
   ],
 };
 
+test('invocation selection strictly preserves the parent-authored contract and JSON policy', () => {
+  const claim = {
+    name: 'report', version: '1', selection: 'invocation',
+    signature: { inputs: [{ name: 'data' }], outputs: [{ name: 'result' }] },
+    policy: { name: 'local', version: '1', config: { weights: [1, true, null] } },
+  };
+  const parse = (callsInterface: unknown) => parseDef({ name: 'parent', inputs: [{ name: 'seed' }],
+    steps: [{ name: 'choose', callsInterface, inputs: { data: 'seed' }, produces: ['result'] }] });
+  assert.deepEqual(parse(claim).steps[0]!.callsInterface, claim);
+  for (const bad of [
+    { ...claim, selection: 'other' }, { ...claim, signature: undefined },
+    { ...claim, policy: { ...claim.policy, config: { bad: undefined } } },
+    { ...claim, policy: { ...claim.policy, extra: true } },
+    { ...claim, signature: { inputs: [{ name: 'x' }, { name: 'x' }], outputs: [] } },
+    { ...claim, policy: { ...claim.policy, config: new Date() } },
+  ]) assert.throws(() => parse(bad), InterfaceCallDefinitionError);
+});
+
 test('parseDef builds a valid def and fills defaults', () => {
   const def = parseDef(delivery);
   assert.equal(def.name, 'delivery');
@@ -34,6 +52,26 @@ test('parseDef builds a valid def and fills defaults', () => {
   assert.equal(planner.workdir, undefined); // no default: absent unless the def sets it
   assert.deepEqual(planner.invalidates, ['proposal']); // defaults to consumed stems
   assert.equal(def.steps[3]!.terminal, true);
+});
+
+test('include expansion preserves live CAS resolution roles without hashing or serializing them', () => {
+  const parent = buildDef({ name: 'parent', inputs: [{ name: 'seed' }],
+    steps: [{ include: 'child', as: 'nested', inputs: { seed: 'seed' } }] });
+  const child = buildDef({ name: 'child', inputs: [{ name: 'seed' }],
+    steps: [{ name: 'work', consumes: ['seed'], produces: ['done'] }] });
+  const resolve = (name: string) => name === 'child' ? child : undefined;
+  const baseline = expandIncludes(parent, resolve);
+  const context = Object.freeze({ projectRoot: '/project/workflows', globalRoot: '/global/workflows' });
+  Object.defineProperty(parent, 'bundleResolutionContext', { value: context, enumerable: false });
+  Object.defineProperty(parent, 'bundleStoreRoots', { value: [context.projectRoot], enumerable: false });
+  const expanded = expandIncludes(parent, resolve);
+  assert.equal(expanded.bundleResolutionContext, context);
+  assert.deepEqual(expanded.bundleStoreRoots, [context.projectRoot]);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(expanded, 'bundleResolutionContext'),
+    Object.getOwnPropertyDescriptor(parent, 'bundleResolutionContext'));
+  assert.equal(hashDef(expanded), hashDef(baseline));
+  assert.equal(JSON.stringify(expanded), JSON.stringify(baseline));
+  assert.equal(JSON.parse(JSON.stringify(expanded)).bundleResolutionContext, undefined);
 });
 
 test('parseDef accepts workdirFrom and records its grammar field', () => {

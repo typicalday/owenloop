@@ -163,6 +163,19 @@ test('selector works without a default and stays on its global digest under a pr
   } finally {
     store.close();
   }
+
+  const pinnedStore = openStore(join(tempDir(), 'state.db'));
+  try {
+    const engine = namedEngine(pinnedStore, definitions, project, global);
+    const instance = engine.createInstance('caller/caller@1.0.0', { provide: { seed: { go: true } } });
+    engine.tick(instance, { deep: false });
+    const spawned = pinnedStore.findChildByParent(instance, 'delivered');
+    assert.ok(spawned);
+    assert.equal(spawned.defSnapshot?.bundleDigest, selected.result.digest);
+    assert.match(spawned.defSnapshot?.steps[0]?.body ?? '', /selected-GLOBAL/);
+  } finally {
+    pinnedStore.close();
+  }
 });
 
 test('install refuses missing named workflow or mismatched lock before caller commit', async () => {
@@ -170,6 +183,38 @@ test('install refuses missing named workflow or mismatched lock before caller co
   const selected = await installChild(root, 'A');
   await assert.rejects(installParent(root, selected.result.digest, `${base}#absent`), /no longer exactly callable/);
   await assert.rejects(installParent(root, 'f'.repeat(64)), /no longer exactly callable/);
+  assert.equal(readWorkflowStoreIndex(storeIndexPath(root)).entries['caller/caller@1.0.0'], undefined);
+});
+
+test('a shared base lock refuses when only one of two named calls is callable', async () => {
+  const root = tempDir();
+  const selected = await installChild(root, 'A');
+  const twoCalls = `name: caller
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: first
+    calls: ${exact}
+    inputs:
+      data: seed
+    produces: [middle]
+  - name: second
+    calls: ${base}#absent
+    inputs:
+      data: middle
+    produces: [done]
+outputs: [done]
+`;
+  await assert.rejects(installBundleFixture({
+    root,
+    sourceDir: writeBundleSource({
+      name: 'caller',
+      workflow: twoCalls,
+      lock: { [base]: selected.result.digest },
+      runtimeYaml: 'features:\n  - exact-workflow-selector.v1',
+    }),
+  }), /no longer exactly callable/);
   assert.equal(readWorkflowStoreIndex(storeIndexPath(root)).entries['caller/caller@1.0.0'], undefined);
 });
 

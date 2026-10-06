@@ -33,6 +33,22 @@ jobs:
 
       - run: bash .dev/checks.sh
 
+      - name: Validate runtime selection proof
+        if: matrix.node == 22
+        run: |
+          node -e "const fs=require('node:fs'),c=require('node:crypto'),p='./.owenloop/proofs/runtime-selection/';const r=JSON.parse(fs.readFileSync(p+'receipt.json','utf8'));if(r.ok!==true||String(r.sqliteSha256).replace(/^sha256:/,'')!==c.createHash('sha256').update(fs.readFileSync(p+'state.sqlite')).digest('hex'))process.exit(1)"
+
+      - name: Upload runtime selection proof
+        if: matrix.node == 22
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-selection-proof-${{ github.sha }}-node22
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .owenloop/proofs/runtime-selection/state.sqlite
+            .owenloop/proofs/runtime-selection/receipt.json
+
   # Real SSHSIG interoperability: both OS runners ship stock `ssh-keygen` with
   # `-Y` support, so the crypto tests run unskipped — module sign → stock
   # verify and stock sign → module verify in both directions, plus the secure

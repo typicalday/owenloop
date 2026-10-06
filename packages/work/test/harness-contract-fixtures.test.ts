@@ -161,19 +161,103 @@ process.stdin.on('data', (chunk) => {
 });
 `;
 
+/**
+ * SYNTHETIC 0.154 policy model, not a vendor recording. It evaluates the actual
+ * thread/start or thread/resume configuration received from the adapter. No
+ * MCP child, hub, provider, or tool side effect is involved. Successful items
+ * carry constant fixture results; failed items explain exposure vs approval.
+ */
+const policySource = (fixture: string, pidFile: string, _usedFile: string, traceFile: string): string => `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+appendFileSync(${JSON.stringify(pidFile)}, process.pid + '\\n');
+const trace = (dir, frame) => appendFileSync(${JSON.stringify(traceFile)}, JSON.stringify({dir, frame}) + '\\n');
+const send = (frame) => { trace('out', frame); process.stdout.write(JSON.stringify(frame) + '\\n'); };
+const fixture = readFileSync(${JSON.stringify(fixture)}, 'utf8').trim().split('\\n').map(JSON.parse);
+if (fixture.shift().synthetic !== true) throw new Error('policy fixture must be marked synthetic');
+const thread = '33333333-3333-4333-8333-333333333333';
+const turn = '44444444-4444-4444-8444-444444444444';
+let config;
+let results;
+let remaining;
+function finish() {
+  send({ method: 'item/completed', params: { threadId: thread, turnId: turn,
+    item: { type: 'agentMessage', id: 'policy-summary', phase: 'final_answer', text: JSON.stringify(results) } } });
+  send({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed', error: null } } });
+}
+createInterface({ input: process.stdin }).on('line', (line) => {
+  const m = JSON.parse(line);
+  trace('in', m);
+  if (m.method === undefined && (m.id === 900 || m.id === 901)) {
+    remaining--;
+    if (remaining === 0) finish();
+    return;
+  }
+  switch (m.method) {
+    case 'initialize':
+      send({ id: m.id, result: { userAgent: 'synthetic-policy-model/0.154 (NOT a vendor recording)' } });
+      break;
+    case 'turn/interrupt':
+      send({ id: m.id, result: {} });
+      break;
+    case 'thread/start':
+    case 'thread/resume':
+      if (m.params.approvalPolicy !== 'never') {
+	send({ id: m.id, error: { code: -32602, message: 'fixture requires never policy' } });
+	break;
+      }
+      config = m.params.config;
+      send({ id: m.id, result: { thread: { id: thread } } });
+      break;
+    case 'turn/start':
+      send({ id: m.id, result: { turn: { id: turn, status: 'inProgress' } } });
+      send({ method: 'turn/started', params: { threadId: thread, turn: { id: turn, status: 'inProgress' } } });
+      results = fixture.map(({ server, tool }, i) => {
+	const mount = config.mcp_servers[server];
+	const exposed = mount !== undefined && (mount.enabled_tools === undefined || mount.enabled_tools.includes(tool));
+	const approved = mount?.tools?.[tool]?.approval_mode === 'approve';
+	const error = !exposed ? 'tool not exposed' : !approved ? 'MCP tool call requires approval, but approval policy is never' : null;
+	const status = error === null ? 'completed' : 'failed';
+	send({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: {
+	  type: 'mcpToolCall', id: 'synthetic-call-' + i, server, tool, status, arguments: {},
+	  result: error === null ? { content: [{ type: 'text', text: 'SYNTHETIC_OK' }] } : null,
+	  error: error === null ? null : { message: error }, durationMs: 0,
+	} } });
+	return { server, tool, status, error };
+      });
+      // Own tool calls above MUST NOT need a callback. Adversarial foreign and
+      // non-tool callbacks are still sent to exercise real adapter refusal.
+      remaining = 2;
+      send({ id: 900, method: 'mcpServer/elicitation/request', params: {
+	serverName: 'foreign', message: 'foreign tool request', _meta: { codex_approval_kind: 'mcp_tool_call' },
+      } });
+      send({ id: 901, method: 'mcpServer/elicitation/request', params: {
+	serverName: 'owenloop', message: 'non-tool form request', mode: 'form', requestedSchema: { type: 'object' },
+      } });
+      break;
+  }
+});
+`;
+
 interface Replay {
   /** A real directory, because `deliver` refuses a cwd that does not exist. */
   cwd: string;
+  traceFile: string;
 }
 
-function useReplay(t: { after(fn: () => void): void }, fixture: string): Replay {
+function useReplay(
+  t: { after(fn: () => void): void }, fixture: string,
+  source: (fixture: string, pidFile: string, usedFile: string, traceFile: string) => string = replaySource,
+): Replay {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-replay-'));
   const script = join(dir, 'replay-app-server.mjs');
   const pidFile = join(dir, 'pids');
   const usedFile = join(dir, 'used.json');
+  const traceFile = join(dir, 'trace.jsonl');
+  writeFileSync(traceFile, '');
   writeFileSync(pidFile, '');
   writeFileSync(usedFile, '{}');
-  writeFileSync(script, replaySource(join(FIXTURE_DIR, fixture), pidFile, usedFile), { mode: 0o755 });
+  writeFileSync(script, source(join(FIXTURE_DIR, fixture), pidFile, usedFile, traceFile), { mode: 0o755 });
 
   const previous = process.env['OWENLOOP_CODEX_BIN'];
   process.env['OWENLOOP_CODEX_BIN'] = script;
@@ -191,7 +275,7 @@ function useReplay(t: { after(fn: () => void): void }, fixture: string): Replay 
     else process.env['OWENLOOP_CODEX_BIN'] = previous;
     rmSync(dir, { recursive: true, force: true });
   });
-  return { cwd: dir };
+  return { cwd: dir, traceFile };
 }
 
 function startArgs(cwd: string): StartArgs {
@@ -291,6 +375,70 @@ test('the recorded RESUME leg replays through deliver, and never re-emits starte
 
   await codexAdapter.stop(ref);
 });
+
+// This fixture is a deterministic model of the policy seam, deliberately kept
+// separate from the unchanged historical recordings above.
+for (const selected of [
+  ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'],
+  ['get_order', 'ask'],
+  ['put_file_artifact', 'submit'],
+]) {
+  test(`synthetic modern policy executes only ${selected.join(',')} without own elicitation`, { timeout: 10_000 }, async (t) => {
+    const replay = useReplay(t, 'codex-app-server-mcp-policy.jsonl', policySource);
+    const args = startArgs(replay.cwd);
+    args.owenloopMcp.args.push('work', 'hold', '--mcp');
+    if (selected.length !== 5) args.owenloopMcp.args.push('--mcp-tools', selected.join(','));
+    args.permissions = normalizeStepPermissions({
+      permissionMode: 'never', sandbox: 'read-only',
+      mcpServers: { foreign: { command: '/fixture/foreign', args: [] } },
+      codexConfig: { mcp_servers: { owenloop: {
+	command: '/imposter', enabled_tools: ['future_tool'], tools: { future_tool: { approval_mode: 'approve' } },
+      } } },
+    });
+    const first: AgentEvent[] = [];
+    const ref = await codexAdapter.start(args, (e) => first.push(e));
+    await codexAdapter.stop(ref); // Forget local session state before rebuilding on resume.
+    const second: AgentEvent[] = [];
+    const { brief: _brief, ...delivery } = structuredClone(args);
+    await codexAdapter.deliver(ref, 'repeat offline policy checks', delivery, (e) => second.push(e));
+    await codexAdapter.stop(ref);
+
+    for (const events of [first, second]) {
+      const replies = events.filter((e) => e.kind === 'assistant_response');
+      assert.equal(replies.length, 1);
+      const results = JSON.parse(replies[0]!.text) as Array<{ server: string; tool: string; status: string; error: string | null }>;
+      assert.deepEqual(results.filter((r) => r.status === 'completed').map((r) => r.tool).sort(), [...selected].sort());
+      for (const r of results) {
+	if (r.server === 'owenloop' && !selected.includes(r.tool)) assert.equal(r.error, 'tool not exposed');
+	if (r.server === 'foreign') assert.match(r.error ?? '', /approval policy is never/);
+      }
+      assert.equal(results.length, 8, 'five holder tools, two unknown own tools, one foreign tool');
+      assert.equal(events.filter((e) => e.kind === 'turn_ended').length, 1);
+      assert.deepEqual(events.filter((e) => e.kind === 'needs_input').map((e) => e.question), ['foreign tool request', 'non-tool form request']);
+      assert.equal(progress(events).split('\n').filter((line) => /^item\/completed mcpToolCall /.test(line)).length, 8);
+    }
+    const trace = readFileSync(replay.traceFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) as Array<{
+      dir: string; frame: { method?: string; id?: number; error?: unknown; params?: Record<string, unknown> };
+    }>;
+    const threads = trace.filter((e) => e.dir === 'in' && ['thread/start', 'thread/resume'].includes(e.frame.method ?? ''));
+    assert.deepEqual(threads.map((e) => e.frame.method), ['thread/start', 'thread/resume']);
+    for (const { frame } of threads) {
+      assert.equal(frame.params?.['approvalPolicy'], 'never');
+      assert.equal(frame.params?.['sandbox'], 'read-only');
+      const own = (frame.params?.['config'] as { mcp_servers: { owenloop: Record<string, unknown> } }).mcp_servers.owenloop;
+      assert.equal(own['command'], args.owenloopMcp.command);
+      assert.deepEqual(own['args'], args.owenloopMcp.args);
+      assert.deepEqual(own['enabled_tools'], selected);
+      assert.deepEqual(own['tools'], Object.fromEntries(selected.map((tool) => [tool, { approval_mode: 'approve' }])));
+      assert.equal('default_tools_approval_mode' in own, false);
+    }
+    const elicits = trace.filter((e) => e.dir === 'out' && e.frame.method === 'mcpServer/elicitation/request');
+    assert.equal(elicits.length, 4, 'only the two denial probes per turn, no own tool approval callback');
+    const answers = trace.filter((e) => e.dir === 'in' && e.frame.method === undefined && [900, 901].includes(e.frame.id ?? -1));
+    assert.equal(answers.length, 4);
+    for (const { frame } of answers) assert.ok(frame.error, 'foreign and non-tool callbacks remain refused');
+  });
+}
 
 // ---------------------------------------------------------------------------
 // 3. The recorded resume MISS

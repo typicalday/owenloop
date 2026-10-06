@@ -718,7 +718,7 @@ function callsGateReady(step: StepDef, arts: ArtifactMap): boolean {
 function callsDischargeFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
   const firings: Firing[] = [];
   for (const step of def.steps) {
-    if (!isCallStep(step)) continue;
+    if (!isCallStep(step) || step.callsInterface?.selection === 'invocation') continue;
     if (!callsGateReady(step, arts)) continue;
     const outs = plainOutputs(step).filter((p) => isDebt(arts.get(p)));
     if (outs.length === 0) continue;
@@ -3091,6 +3091,16 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // EVENTUAL_TIME_FACTS is classification-only: the timeless BFS below does
     // not enqueue these future idle transitions or include time in its key.
     if (firings.length === 0 && leaseMoves.length === 0 && !status.done) {
+      const waiting = def.steps.filter((step) => step.callsInterface?.selection === 'invocation'
+	&& callsGateReady(step, arts) && plainOutputs(step).some((path) => isDebt(arts.get(path))));
+      if (waiting.length > 0) {
+	(report.externalSelectionWait ??= []).push({
+	  kind: 'external-selection-wait', path: nodePath(), calls: waiting.map((step) => step.name),
+	});
+	// An owed root input cannot be supplied by an invocation selection.
+	// Classify this actual no-move state even while another branch waits.
+	if (!def.inputs.some((input) => arts.get(input.name)?.acceptance === 'owed')) continue;
+      }
       const eventualFirings = eligibleFirings(def, arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier: opts.modifier });
       if (eventualFirings.length > 0) {
         report.stallStates.push({ path: nodePath() });
@@ -3191,7 +3201,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
           break outer;
         }
 
-        const step: CheckStep = { step: firing.step, key: firing.key, outcome };
+	const step: CheckStep = { step: firing.step, key: firing.key, outcome };
 	const successors = applyOutcome(def, arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
 
         for (const suc of successors) {

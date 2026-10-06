@@ -2044,3 +2044,39 @@ The control plane contract is:
 > 7. `onCancel:` is inert in the standalone engine. `eligibleFirings`, `modelCheck`, the forward
 >    cascade, and done-ness do not read it. A host with no cancellation concept loads and runs a
 >    def carrying it with no behaviour change.
+
+## Runtime invocation selection and admission
+
+Opt-in `callsInterface.selection: invocation` uses the parent-authored signature
+and JSON policy pinned by a verified CAS `{bundleDigest, workflowName}`. The
+embedding API is `decisionSnapshot`, `applyChoice`, `cancelRun`,
+`invocationStatus`, and `invocationBindingSource` on `Engine`; the complete
+contract and result precedence are in [authoring.md](authoring.md#per-invocation-interface-selection).
+
+Schema v13 adds root `run_admission` and append-only `call_invocation`. Unique
+invocation keys select one immutable body; children link through
+`producedByInvocation`. Parent/path uniqueness remains for legacy NULL-linked
+children. Migration never invents admission for historical roots. Binding rows
+retain selected bundles before children exist and disappear with cascade cleanup.
+
+Apply/provision resolve exact definitions, acquire the CAS snapshot/GC guard, then
+enter `BEGIN IMMEDIATE` and check admission and current generation before writes.
+Cancellation takes only SQLite, revokes once and returns cleanup declarations.
+There is no reverse CAS/SQLite lock order and no inference inside transitions.
+Binding and provision are separate commits; restart reuses the exact choice.
+Current-key child lookups guard direct claims, descent, mirrors and publication.
+Adoption to another child DefRef cannot satisfy the original invocation identity.
+
+The trusted local receipt reader joins active admission and current binding with
+the green parent version, actual child, whole-child completion and green outcome,
+then corroborates exact CAS bytes. Signed proofs must also match the child's
+workflow instance. The executor repeats the receipt/proof check after payload
+preparation immediately before starting a command, and handles refusal outside
+command-result submission. Hosts without this trusted reader cannot execute
+dynamic relay. The wire carries no callable authority or hosted trust invention.
+
+The model reports `external-selection-wait` for unresolved invocation calls rather
+than discharging them to green. This is an explicit limit on its completion proof;
+legacy and concrete call semantics remain unchanged. The ordinary calls suite
+produces retained self-contained SQLite and a canonical byte-hash receipt; CI
+uploads both on Node 22.

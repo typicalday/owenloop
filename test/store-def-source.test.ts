@@ -38,6 +38,26 @@ import {
 } from '../src/store/index.ts';
 import { makeIo, routedFetch } from './hubkit.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
+import { verifyInvocationDefinition } from '../src/store/def-source.ts';
+
+test('CAS invocation revalidation preserves both root roles and independent global integrity', async () => {
+  const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+  const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+  assert.equal(project.digest, global.digest);
+  const registrations = loadCasDefs({ projectRoot: project.root, globalRoot: global.root, warn: () => {} });
+  const defs = finalizeDefs(new Map(registrations.map(r => [r.key, r.def])));
+  const parent = defs.get('parent/parent@1.0.0')!;
+  assert.deepEqual(parent.bundleStoreRoots, [project.root]);
+  assert.deepEqual(parent.bundleResolutionContext, { projectRoot: project.root, globalRoot: global.root });
+  assert.equal(Object.isFrozen(parent.bundleResolutionContext), true);
+  assert.equal(Object.getOwnPropertyDescriptor(parent, 'bundleResolutionContext')?.enumerable, false);
+  assert.equal(verifyInvocationDefinition(parent), true);
+  assert.equal(verifyInvocationDefinition(JSON.parse(JSON.stringify(parent))), false,
+    'persisted bytes cannot invent live discovery authority');
+  removeInstalledObject(global.root, global.digest);
+  assert.throws(() => verifyInvocationDefinition(parent), /no verified object directory exists/,
+    'verified project bytes must not hide missing independently indexed global bytes');
+});
 
 // ---- fixtures ----------------------------------------------------------------
 

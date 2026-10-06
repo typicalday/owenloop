@@ -696,6 +696,14 @@ test('mcp charter runner isolates Codex config without severing file authenticat
     const params = buildThreadStartParams(args);
     const config = params['config'] as Record<string, unknown>;
     assert.deepEqual(Object.keys(config['mcp_servers'] as Record<string, unknown>), ['owenloop']);
+    const own = (config['mcp_servers'] as Record<string, Record<string, unknown>>)['owenloop']!;
+    const ownTools = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'];
+    assert.deepEqual(own['enabled_tools'], ownTools);
+    assert.deepEqual(own['tools'], Object.fromEntries(ownTools.map((name) => [name, { approval_mode: 'approve' }])));
+    assert.equal('default_tools_approval_mode' in own, false);
+    assert.equal(own['command'], args.owenloopMcp.command);
+    assert.deepEqual(own['args'], args.owenloopMcp.args);
+    assert.equal(params['approvalPolicy'], 'never');
     assert.deepEqual(config['agents'], { enabled: false });
     assert.deepEqual(config['apps'], { _default: { enabled: false } });
     assert.deepEqual(config['tools'], { view_image: false, web_search: false });
