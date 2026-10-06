@@ -1108,8 +1108,9 @@ export interface CheckReport {
    * candidate values. Candidate discovery is incomplete for arbitrary JSON
    * Schema; report findings here as sampled-value results, not a proof that
    * every schema-valid or schema-invalid payload class was covered.
-   * This field does not change `bounded`; separate `coverageIncomplete`
-   * reasons hold CLI and archive admission when a value class is unknown.
+   * This field does not change `bounded`; `coverageIncomplete` makes the
+   * CLI's finite-model limit visible, while an archive or release gate may
+   * apply its own explicit policy to those reasons.
    */
   collectionSchemaValuesSampled?: true;
   /**
