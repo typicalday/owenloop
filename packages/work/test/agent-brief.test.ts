@@ -165,18 +165,17 @@ test('renderBrief tells the agent its inputs come from get_order on the mounted 
   const out = renderBrief('body', spec({ owes: [{ path: 'plan' }] }));
   assert.match(out, /call the `get_order` tool on the mounted `owenloop` MCP server/u);
   assert.match(out, /takes no arguments/u);
-  // The three things the packet holds, named — an agent told only "call
-  // get_order" has no reason to believe its inputs are in the answer.
-  assert.match(out, /inputs you were given \(`consumes`\)/u);
-  assert.match(out, /output paths you owe/u);
+  // The dynamic fields the model can use are named, without claiming that
+  // hub-carried static instructions or schemas outrank the local definition.
+  assert.match(out, /current consumed inputs/u);
+  assert.match(out, /owed output paths/u);
   assert.match(out, /reason thread/u);
 });
 
-test('the input contract ranks the packet above the brief and routes a missing input to ask', () => {
+test('the input contract scopes live order authority and routes a missing input to ask', () => {
   const out = renderBrief('body', spec({ owes: [{ path: 'plan' }] }));
-  // Which copy wins, stated — otherwise a re-offered agent has to guess between
-  // a brief rendered once at dispatch and a live packet carrying newer reasons.
-  assert.match(out, /where the two disagree, the packet is right/u);
+  assert.match(out, /Use that current order for dynamic inputs, owed paths, and feedback/u);
+  assert.match(out, /task instructions and any output schemas.*locally resolved workflow definition/u);
   // The whole point: an absent input becomes a question, not a fabrication.
   assert.match(out, /Do not invent it and do not proceed on an assumption: use `ask`/u);
 });

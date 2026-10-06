@@ -78,6 +78,8 @@ export interface HubClient {
    */
   whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
   getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
+  /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
+  getReferenceOrder?(req: GetOrderRequest): Promise<unknown>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
@@ -221,6 +223,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   return {
     whatsNext: (req, signal) => post<WhatsNextResponse>('whats_next', req, signal),
     getOrder: (req) => post<GetOrderResponse>('get_order', req),
+    getReferenceOrder: (req) => post<unknown>('reference_order/v1', req),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
