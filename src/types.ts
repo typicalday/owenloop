@@ -1292,3 +1292,145 @@ export interface InvariantViolation {
   /** Shortest BFS path of firings from the seed state to the violating state. */
   path: CheckStep[];
 }
+
+// Native bounded dispatch. Service authorization and executor selection are
+// separate authorities; all routing identifiers here are opaque caller data.
+export interface ScopedCapabilityMapping {
+  readonly DefRef: Readonly<DefRef>;
+  readonly step: string;
+  readonly authored: string;
+  readonly meaningDigest: string;
+  readonly evidenceGeneration: string;
+  readonly target: string;
+}
+export interface ResolvedStepContext {
+  readonly capabilities: readonly string[];
+  readonly crews: readonly string[];
+  readonly matchModes: Readonly<Record<string, import('./capabilities.ts').MatchMode>>;
+  readonly reroutedFrom?: readonly string[];
+  readonly modifier?: string;
+  readonly revision: string;
+}
+export interface StepCapabilityOptions {
+  readonly explicitMappings?: import('./capabilities.ts').CapabilityMappings;
+  readonly scopedMappings?: readonly ScopedCapabilityMapping[];
+  readonly legacyMappings?: import('./capabilities.ts').CapabilityMappings;
+  readonly rewrites?: import('./capabilities.ts').CapabilityRewrites;
+  readonly crewStamps?: import('./capabilities.ts').CrewStamps;
+  readonly matchModes?: Readonly<Record<string, import('./capabilities.ts').MatchMode>>;
+  readonly revision: string;
+}
+export interface ResolveStepCapabilitiesInput extends StepCapabilityOptions {
+  readonly DefRef: Readonly<DefRef>;
+  readonly step: string;
+  readonly authored?: readonly string[];
+  readonly meaningDigest: string;
+  readonly evidenceGeneration: string;
+  readonly modifier?: string;
+}
+export interface ReadyFiring {
+  /** Root of the requested scan, and exact instance within that tree. */
+  readonly workflow: string;
+  readonly frameId: string;
+  readonly DefRef: Readonly<DefRef>;
+  readonly step: string;
+  readonly key: string;
+  readonly inputFingerprint: Readonly<Fingerprint>;
+  readonly admissionEpoch: number | null;
+  readonly executorKind: string;
+  readonly meaningDigest: string;
+  readonly evidenceGeneration: string;
+  /** Digest of persisted frame/ancestor, artifact, task, run and alarm state. */
+  readonly stateDigest: string;
+  readonly resolved: ResolvedStepContext;
+}
+export interface ReadyOptions extends StepCapabilityOptions {
+  readonly now?: number;
+  readonly deep?: boolean;
+  readonly capabilities?: readonly string[];
+}
+export type SnapshotReadyResult =
+  | { readonly kind: 'ready'; readonly firings: readonly ReadyFiring[] }
+  | { readonly kind: 'unverified'; readonly frameId: string }
+  | { readonly kind: 'inactive' };
+/** Trusted service projection. id scopes concurrency; slot is single-use,
+ * including after release. The caller must supply the current revision/expiry. */
+export interface ExecutorLane {
+  readonly id: string;
+  readonly slot: string;
+  readonly executorKind: string;
+  readonly capacity: number;
+  readonly revision: string;
+  readonly expiresAt: number;
+}
+export interface ReadyClaimPlan {
+  readonly firing: ReadyFiring;
+  readonly lane: ExecutorLane;
+  readonly candidateDigest: string;
+  readonly evidenceDigest: string;
+  readonly policyDigest: string;
+  readonly authorityRevision: string;
+}
+export type ClaimReadyResult =
+  | { readonly kind: 'claimed'; readonly order: Order }
+  | { readonly kind: 'stale' }
+  | { readonly kind: 'unverified'; readonly frameId: string }
+  | { readonly kind: 'lane-unavailable' }
+  | { readonly kind: 'invalid-plan' }
+  | { readonly kind: 'deferred'; readonly reason: string };
+
+/** Retained proof contracts. Fixtures are not execution receipts. C4/C5 are
+ * future worker/service readers, not prerequisites for the native U1 seam. */
+export const ROUTING_PROOF_CASE_IDS = Object.freeze([
+  'U1-scoped', 'U1-capacity-one', 'U1-child', 'U1-stale-fallback', 'U1-lane-race', 'U1-currentness', 'U1-legacy',
+  'U2-offer', 'U2-policy', 'U2-delegation', 'U2-final-launch', 'U2-observed',
+] as const);
+export type RoutingProofCaseId = typeof ROUTING_PROOF_CASE_IDS[number];
+export interface RoutingProof {
+  readonly schema: 'routing-proof-v1';
+  readonly refs: Readonly<Record<'engine' | 'service' | 'worker', string | null>>;
+  readonly artifacts: readonly { readonly path: string; readonly sha256: string }[];
+  readonly cases: readonly {
+    readonly id: RoutingProofCaseId;
+    readonly executed: boolean;
+    readonly assertions: readonly { readonly name: string; readonly passed: boolean }[];
+    readonly join: { readonly decision: string; readonly claim: string; readonly order: string; readonly attempt: string } | null;
+  }[];
+}
+
+/** Pure retained-proof shape, not evidence of execution. Consumers also check
+ * byte hashes against retained artifacts and join IDs against real receipts.
+ * Unexecuted cases must carry neither assertion results nor launch joins. */
+export const ROUTING_PROOF_SCHEMA: JsonSchema = {
+  type: 'object', additionalProperties: false, required: ['schema', 'refs', 'artifacts', 'cases'],
+  properties: {
+    schema: { const: 'routing-proof-v1' },
+    refs: {
+      type: 'object', additionalProperties: false, required: ['engine', 'service', 'worker'],
+      properties: Object.fromEntries(['engine', 'service', 'worker'].map(name => [name,
+	{ anyOf: [{ type: 'string', pattern: '^[0-9a-f]{40}$' }, { type: 'null' }] }])),
+    },
+    artifacts: { type: 'array', items: { type: 'object', additionalProperties: false,
+      required: ['path', 'sha256'], properties: {
+	path: { type: 'string', minLength: 1 }, sha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+      } } },
+    cases: { type: 'array', minItems: ROUTING_PROOF_CASE_IDS.length, maxItems: ROUTING_PROOF_CASE_IDS.length,
+      // Require each ID exactly once, regardless of result or array ordering.
+      allOf: ROUTING_PROOF_CASE_IDS.map(id => ({ contains: { properties: { id: { const: id } }, required: ['id'] },
+	minContains: 1, maxContains: 1 })),
+      items: { type: 'object', additionalProperties: false, required: ['id', 'executed', 'assertions', 'join'],
+	properties: {
+	  id: { enum: [...ROUTING_PROOF_CASE_IDS] }, executed: { type: 'boolean' },
+	  assertions: { type: 'array', items: { type: 'object', additionalProperties: false,
+	    required: ['name', 'passed'], properties: { name: { type: 'string', minLength: 1 }, passed: { type: 'boolean' } } } },
+	  join: { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false,
+	    required: ['decision', 'claim', 'order', 'attempt'], properties: Object.fromEntries(
+	      ['decision', 'claim', 'order', 'attempt'].map(name => [name, { type: 'string', minLength: 1 }])) }] },
+	},
+	if: { properties: { executed: { const: false } } },
+	then: { properties: { assertions: { maxItems: 0 }, join: { type: 'null' } } },
+	else: { properties: { assertions: { minItems: 1 } } },
+      },
+    },
+  },
+};

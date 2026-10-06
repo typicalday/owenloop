@@ -43,6 +43,7 @@ export {
   capabilityName,
   claimMatches,
   composeCapabilities,
+  resolveStepCapabilities,
   DEFAULT_MATCH_MODE,
   MODIFIER_SEPARATOR,
 } from './capabilities.ts';
@@ -453,3 +454,7 @@ export type { BuildSubmissionRecordInput, SubmissionProducedInput } from './cryp
 
 export type { DefRef, JsonValue, InvocationPolicy, InvocationCall, InterfaceCall, InvocationCandidate, CandidateInvalidCode, CandidateIneligibleCode, CandidateAssessment, AssessedCandidate, InvocationEvidence, InvocationKey, RunAdmission, DecisionSnapshot, InvocationBinding, DecisionSnapshotResult, ApplyChoiceResult, InvocationStatus, InvocationRelayKey, InvocationRelayReceipt, VerifiedInvocationReceipt, InvocationBindingSource } from './types.ts';
 export { evidenceDigest, candidateSetDigest, invocationId } from './invocation.ts';
+
+export type { ScopedCapabilityMapping, ResolvedStepContext, StepCapabilityOptions, ResolveStepCapabilitiesInput, ReadyFiring, ReadyOptions, SnapshotReadyResult, ExecutorLane, ReadyClaimPlan, ClaimReadyResult, RoutingProofCaseId, RoutingProof } from './types.ts';
+
+export { ROUTING_PROOF_CASE_IDS, ROUTING_PROOF_SCHEMA } from './types.ts';

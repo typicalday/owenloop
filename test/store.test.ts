@@ -7,7 +7,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { Engine } from '../src/engine.ts';
 import { Store, StoreVersionError, artifactId, taskId } from '../src/store.ts';
 import { randId } from '../src/util.ts';
-import type { ArtifactData, InterfaceCallBinding, Order } from '../src/types.ts';
+import { candidateSetDigest, evidenceDigest, invocationId } from '../src/invocation.ts';
+import { valueDigestHex } from '../src/crypto/canonical.ts';
+import type { ArtifactData, InterfaceCallBinding, InvocationBinding, Order } from '../src/types.ts';
 import { def, step } from './helpers.ts';
 
 function mem(): Store {
@@ -378,7 +380,7 @@ test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read 
     raw.close();
 
     const s2 = new Store(dbPath); // migrate() must re-add order_json, bump to current
-    assert.equal(s2.getMeta('schema_version'), '13', 'upgraded to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '14', 'upgraded to current SCHEMA_VERSION');
     const cols = (s2.db.prepare('PRAGMA table_info(run)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('order_json'), 'order_json column re-added by migrate()');
     assert.equal(s2.getRun(legacy)?.order, undefined, 'legacy run reads order undefined');
@@ -712,7 +714,7 @@ test('migration: a v11 DB gains nullable interface bindings without inventing a 
     raw.close();
 
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '13');
+    assert.equal(s2.getMeta('schema_version'), '14');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((column) => column.name);
     assert.ok(cols.includes('interface_bindings'));
     assert.equal(s2.getWorkflow(legacy)?.interfaceBindings, undefined);
@@ -789,7 +791,7 @@ test('migration: a pre-modifier DB adds the column with no backfill (existing ro
     raw.close();
 
     const s2 = new Store(dbPath); // migrate() must re-add modifier, bump to current
-    assert.equal(s2.getMeta('schema_version'), '13', 'upgraded to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '14', 'upgraded to current SCHEMA_VERSION');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('modifier'), 'modifier column re-added by migrate()');
     // No backfill: an instance created before modifiers existed IS an
@@ -819,7 +821,7 @@ test('migration: a v10 DB gains nullable metadata without inventing a value', ()
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('10', 'schema_version');
     raw.close();
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '13');
+    assert.equal(s2.getMeta('schema_version'), '14');
     assert.equal(s2.getWorkflow(legacy)?.meta, undefined);
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('meta'));
@@ -952,7 +954,7 @@ test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write
 
 test('fresh database stamps schema_version to current SCHEMA_VERSION, no throw', () => {
   const s = mem();
-  assert.equal(s.getMeta('schema_version'), '13');
+  assert.equal(s.getMeta('schema_version'), '14');
   s.close();
 });
 
@@ -963,7 +965,7 @@ test('opening a DB already at current SCHEMA_VERSION is a no-op, no throw', () =
     const s1 = new Store(dbPath);
     s1.close();
     const s2 = new Store(dbPath); // reopen at same version — must not throw
-    assert.equal(s2.getMeta('schema_version'), '13');
+    assert.equal(s2.getMeta('schema_version'), '14');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -979,7 +981,7 @@ test('opening a DB with an older schema_version upgrades normally (regression gu
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '13', 'upgrades to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '14', 'upgrades to current SCHEMA_VERSION');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -992,17 +994,17 @@ test('opening a DB with a newer-than-binary schema_version throws StoreVersionEr
   try {
     // Create a normal DB, then simulate a newer binary having stamped it.
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '14');
+    s1.setMeta('schema_version', '15');
     s1.close();
 
-    // Reopening at this binary's SCHEMA_VERSION ('13') must refuse.
+    // Reopening at this binary's SCHEMA_VERSION ('14') must refuse.
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     // Direct raw read proves schema_version was NOT rewritten downward by
     // the throwing constructor.
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '14', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '15', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1021,7 +1023,7 @@ test('§28: old-DB-upgrades-fine at the current SCHEMA_VERSION (def_snapshot/def
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '13');
+    assert.equal(s2.getMeta('schema_version'), '14');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('def_snapshot'));
     assert.ok(cols.includes('def_hash'));
@@ -1124,7 +1126,7 @@ test('REL-5: the migration tx re-checks schema_version under the write lock (TOC
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-toctou-'));
   const dbPath = join(dir, 'test.db');
   try {
-    const s = new Store(dbPath); // opens clean at the current version ('13')
+    const s = new Store(dbPath); // opens clean at the current version ('14')
     // A concurrent newer binary migrates + stamps the shared file.
     const other = new DatabaseSync(dbPath);
     other.prepare('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(
@@ -1149,7 +1151,7 @@ test('REL-5: the migration tx re-checks schema_version under the write lock (TOC
     const cleanPath = join(dir, 'clean.db');
     const s2 = new Store(cleanPath);
     const check = (s2 as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s2);
-    assert.equal(check(), '13', 're-check returns the current version and does not throw at parity');
+    assert.equal(check(), '14', 're-check returns the current version and does not throw at parity');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1204,7 +1206,7 @@ test('REL-5: legacy duplicate children are tolerated on open (index skipped, no 
     // Reopening must NOT throw and must NOT delete data — it tolerates the
     // duplicates and simply skips creating the unique index.
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '13', 'still upgrades the version stamp');
+    assert.equal(s2.getMeta('schema_version'), '14', 'still upgrades the version stamp');
     const idxRow = s2.db
       .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'workflow_produced_by_unique'`)
       .get();
@@ -1527,4 +1529,301 @@ test('latestRun: a no_work run is still the cadence anchor', () => {
     polled,
     'a poll that found CI still pending did run — it throttles the next one',
   );
+});
+
+// U1 native dispatch state is independent of the frozen signed Order.
+const dispatchLane = { id: 'lane', slot: 'slot-1', executorKind: 'agent', capacity: 1,
+  revision: 'authority-1', expiresAt: 1000 } as const;
+function dispatchRun(s: Store, id: string, workflow = 'wf') {
+  s.insertRun(id, { workflow, step: 'work' }, 10);
+  s.putTask({ workflow, step: 'work', key: '', status: 'claimed', run: id, claimedAt: 10, attempts: 0 });
+  return { run: id };
+}
+
+test('dispatch slots require a write transaction and consume one actual run atomically', () => {
+  const s = mem();
+  assert.throws(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1')), /write transaction/);
+  const result = s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1')));
+  assert.deepEqual(result, { run: 'r1' });
+  assert.equal(s.dispatchLaneUsage('lane'), 1);
+  assert.equal(s.getDispatchSlot('lane', 'slot-1')?.run, 'r1');
+  assert.equal(s.tx(() => s.withDispatchSlot({ ...dispatchLane, slot: 'slot-2' }, 'b'.repeat(64), 10,
+    () => dispatchRun(s, 'r2'))), undefined);
+  assert.equal(s.getRun('r2'), undefined);
+  s.updateRun('r1', { outcome: 'released' });
+  assert.equal(s.dispatchLaneUsage('lane'), 0);
+  assert.equal(s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10,
+    () => dispatchRun(s, 'r3'))), undefined);
+  assert.equal(s.getRun('r3'), undefined);
+  assert.deepEqual(s.tx(() => s.withDispatchSlot({ ...dispatchLane, slot: 'slot-2' }, 'b'.repeat(64), 10,
+    () => dispatchRun(s, 'r2'))), { run: 'r2' });
+  s.close();
+});
+
+test('dispatch failure after run creation rolls back every claim effect and permits a fresh attempt', () => {
+  const s = mem();
+  s.db.exec(`CREATE TRIGGER fail_dispatch BEFORE INSERT ON dispatch_slot BEGIN SELECT RAISE(ABORT, 'injected dispatch failure'); END`);
+  assert.throws(() => s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1'))), /injected dispatch failure/);
+  assert.equal(s.getRun('r1'), undefined);
+  assert.deepEqual(s.listTasks('wf'), []);
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM dispatch_lane').get()!.n, 0);
+  assert.equal(s.getDispatchSlot('lane', 'slot-1'), undefined);
+  s.db.exec('DROP TRIGGER fail_dispatch');
+  assert.deepEqual(s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1'))), { run: 'r1' });
+  s.close();
+});
+
+// Genuine native schema13 DDL captured from reviewed foundation 820825a9.
+// This fixture never opens a current Store first or relabels newer storage.
+const NATIVE_SCHEMA_13 = `CREATE TABLE workflow (
+  id          TEXT PRIMARY KEY,
+  def         TEXT NOT NULL,
+  title       TEXT,
+  params      TEXT NOT NULL DEFAULT '{}',
+  modifier    TEXT,
+  meta        TEXT,
+  interface_bindings TEXT,
+  created_at  INTEGER NOT NULL
+, produced_by_wf TEXT, produced_by_path TEXT, produced_by_invocation TEXT REFERENCES call_invocation(id), def_snapshot TEXT, def_hash TEXT);
+CREATE TABLE artifact (
+  id               TEXT PRIMARY KEY,
+  workflow         TEXT NOT NULL,
+  path             TEXT NOT NULL,
+  producer         TEXT NOT NULL,
+  acceptance       TEXT NOT NULL,
+  version          INTEGER NOT NULL DEFAULT 0,
+  value            TEXT,
+  fingerprint      TEXT,
+  reasons          TEXT NOT NULL DEFAULT '[]',
+  judgment_rejects INTEGER NOT NULL DEFAULT 0,
+  schema_rejects   INTEGER NOT NULL DEFAULT 0,
+  seal_of          TEXT,
+  terminal         INTEGER NOT NULL DEFAULT 0,
+  approvals        TEXT,
+  updated_at       INTEGER NOT NULL,
+  UNIQUE (workflow, path)
+);
+CREATE INDEX artifact_wf ON artifact (workflow);
+CREATE INDEX artifact_wf_accept ON artifact (workflow, acceptance);
+CREATE TABLE artifact_version (
+  id TEXT PRIMARY KEY,
+  workflow TEXT NOT NULL,
+  path TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  producer TEXT NOT NULL,
+  value TEXT,
+  fingerprint TEXT,
+  initial_acceptance TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (workflow, path, version)
+);
+CREATE INDEX artifact_version_wf_path ON artifact_version (workflow, path, version);
+CREATE TABLE artifact_event (
+  id TEXT PRIMARY KEY,
+  workflow TEXT NOT NULL,
+  path TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT,
+  kind TEXT,
+  metadata TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX artifact_event_wf_path_version_at ON artifact_event (workflow, path, version, created_at, id);
+CREATE TABLE task (
+  id          TEXT PRIMARY KEY,
+  workflow    TEXT NOT NULL,
+  step        TEXT NOT NULL,
+  key         TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'idle',
+  run         TEXT,
+  claimed_at  INTEGER,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  alarm_at    INTEGER,
+  heartbeat_at INTEGER,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (workflow, step, key)
+);
+CREATE INDEX task_wf ON task (workflow);
+CREATE INDEX task_claimed ON task (status, claimed_at);
+CREATE TABLE run (
+  id          TEXT PRIMARY KEY,
+  workflow    TEXT NOT NULL,
+  step        TEXT NOT NULL,
+  key         TEXT NOT NULL DEFAULT '',
+  outcome     TEXT,
+  summary     TEXT,
+  session_id  TEXT,
+  fingerprint TEXT,
+  cause       TEXT,
+  -- The flattened order packet issued at claim time (§8 / Gap 1), JSON in TEXT
+  -- (precedent: fingerprint, def_snapshot). Named order_json, NOT order — ORDER
+  -- is a reserved SQL keyword. Nullable: absent on runs created before v7.
+  order_json  TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX run_wf_step ON run (workflow, step, created_at);
+CREATE INDEX run_wf_step_key ON run (workflow, step, key, created_at);
+CREATE TABLE meta (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+CREATE TABLE run_admission (
+      root_workflow TEXT PRIMARY KEY REFERENCES workflow(id) ON DELETE CASCADE,
+      epoch INTEGER NOT NULL CHECK(epoch >= 0), active INTEGER NOT NULL CHECK(active IN (0,1))
+    );
+CREATE TABLE call_invocation (
+      id TEXT PRIMARY KEY,
+      parent_workflow TEXT NOT NULL REFERENCES workflow(id) ON DELETE CASCADE,
+      key_digest TEXT NOT NULL UNIQUE,
+      body TEXT NOT NULL
+    );
+CREATE TRIGGER call_invocation_immutable BEFORE UPDATE ON call_invocation
+      BEGIN SELECT RAISE(ABORT, 'call_invocation is immutable'); END;
+CREATE TRIGGER call_invocation_append_only BEFORE DELETE ON call_invocation
+      WHEN EXISTS (SELECT 1 FROM workflow WHERE id = OLD.parent_workflow)
+      BEGIN SELECT RAISE(ABORT, 'call_invocation is append-only'); END;
+CREATE TRIGGER workflow_invocation_link BEFORE INSERT ON workflow
+      WHEN NEW.produced_by_invocation IS NOT NULL AND NOT EXISTS (
+	SELECT 1 FROM call_invocation WHERE id = NEW.produced_by_invocation
+	  AND parent_workflow = NEW.produced_by_wf AND json_extract(body, '$.key.callPath') = NEW.produced_by_path)
+      BEGIN SELECT RAISE(ABORT, 'invalid invocation child linkage'); END;
+CREATE TRIGGER workflow_invocation_immutable BEFORE UPDATE OF produced_by_invocation ON workflow
+      WHEN NEW.produced_by_invocation IS NOT OLD.produced_by_invocation
+      BEGIN SELECT RAISE(ABORT, 'invocation child linkage is immutable'); END;
+CREATE UNIQUE INDEX workflow_invocation_unique ON workflow(produced_by_invocation)
+      WHERE produced_by_invocation IS NOT NULL;
+CREATE INDEX workflow_produced_by ON workflow(produced_by_wf, produced_by_path);
+CREATE UNIQUE INDEX workflow_produced_by_unique
+	   ON workflow(produced_by_wf, produced_by_path)
+	   WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL AND produced_by_invocation IS NULL;`;
+
+function schema13Database(path: string): DatabaseSync {
+  const db = new DatabaseSync(path);
+  db.exec(NATIVE_SCHEMA_13);
+  db.prepare('INSERT INTO meta(k,v) VALUES (?,?)').run('schema_version', '13');
+  db.prepare('INSERT INTO workflow(id,def,created_at) VALUES (?,?,?)').run('legacy', 'delivery', 1);
+  db.prepare('INSERT INTO run(id,workflow,step,created_at,updated_at) VALUES (?,?,?,?,?)').run('legacy-run', 'legacy', 'work', 1, 1);
+  db.prepare('INSERT INTO run_admission(root_workflow,epoch,active) VALUES (?,?,?)').run('legacy', 7, 1);
+  const contract = { name: 'work', version: '1', selection: 'invocation' as const,
+    signature: { inputs: [], outputs: [{ name: 'result', schema: true }] },
+    policy: { name: 'local', version: '1', config: {} } };
+  const candidate = { target: 'worker/worker@1.0.0', DefRef: { bundleDigest: 'b'.repeat(64), workflowName: 'worker' } };
+  const candidates = [{ candidate, assessment: { kind: 'eligible' as const } }];
+  const body = { key: { parentWorkflow: 'legacy', parentDefRef: { bundleDigest: 'a'.repeat(64), workflowName: 'delivery' },
+    callPath: 'child', evidenceDigest: evidenceDigest([]) }, contract, evidence: [], candidates,
+    candidateSetDigest: candidateSetDigest(candidates), policyDigest: valueDigestHex(contract.policy),
+    selected: { ...candidate, signature: contract.signature }, admission: { rootWorkflow: 'legacy', epoch: 7 } };
+  const binding: InvocationBinding = { ...body, id: invocationId(body) };
+  db.prepare('INSERT INTO call_invocation(id,parent_workflow,key_digest,body) VALUES (?,?,?,?)')
+    .run(binding.id, 'legacy', valueDigestHex(binding.key), JSON.stringify(binding));
+  return db;
+}
+
+test('native schema13 migrates without relabeling or rewriting workflow/run/invocation/admission data', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dispatch-migrate-'));
+  const path = join(dir, 'state.db');
+  const raw = schema13Database(path);
+  const tables = ['workflow', 'run', 'run_admission', 'call_invocation'];
+  const before = tables.map(t => raw.prepare(`SELECT * FROM ${t}`).all());
+  assert.equal(raw.prepare("SELECT 1 FROM sqlite_master WHERE name = 'dispatch_slot'").get(), undefined);
+  raw.close();
+  for (let i = 0; i < 2; i++) {
+    const s = new Store(path);
+    assert.equal(s.getMeta('schema_version'), '14');
+    assert.deepEqual(tables.map(t => s.db.prepare(`SELECT * FROM ${t}`).all()), before);
+    assert.deepEqual(s.getAdmission('legacy'), { rootWorkflow: 'legacy', epoch: 7, active: true });
+    assert.equal(s.getRun('legacy-run')!.order, undefined);
+    assert.equal(s.listInvocations('legacy')[0]!.admission.epoch, 7);
+    assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM dispatch_slot').get()!.n, 0);
+    s.close();
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('schema13 dispatch migration failure rolls back DDL and version, then retries cleanly', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dispatch-migrate-fail-'));
+  const path = join(dir, 'state.db');
+  const raw = schema13Database(path);
+  raw.exec("CREATE TRIGGER fail_v14 BEFORE UPDATE ON meta WHEN NEW.k = 'schema_version' BEGIN SELECT RAISE(ABORT, 'migration injected'); END");
+  raw.close();
+  assert.throws(() => new Store(path), /migration injected/);
+  const check = new DatabaseSync(path);
+  assert.equal(check.prepare("SELECT v FROM meta WHERE k = 'schema_version'").get()!.v, '13');
+  assert.equal(check.prepare("SELECT 1 FROM sqlite_master WHERE name LIKE 'dispatch_%'").get(), undefined);
+  assert.equal(check.prepare('SELECT COUNT(*) AS n FROM run').get()!.n, 1);
+  check.exec('DROP TRIGGER fail_v14');
+  check.close();
+  const s = new Store(path);
+  assert.equal(s.getMeta('schema_version'), '14');
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('dispatch restart, close and cleanup preserve slot tombstones and prohibit run identity reuse', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dispatch-restart-'));
+  const path = join(dir, 'state.db');
+  let s = new Store(path);
+  s.insertWorkflow('wf', { def: 'flow' });
+  s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1')));
+  s.close();
+  s = new Store(path);
+  assert.equal(s.dispatchLaneUsage('lane'), 1);
+  const receipt = s.getDispatchSlot('lane', 'slot-1');
+  assert.throws(() => s.db.exec("DELETE FROM dispatch_slot"), /append-only/);
+  assert.throws(() => s.db.exec("UPDATE dispatch_slot SET slot = 'other'"), /immutable/);
+  s.updateRun('r1', { outcome: 'ok' });
+  assert.equal(s.dispatchLaneUsage('lane'), 0);
+  s.tx(() => s.deleteWorkflow('wf'));
+  assert.equal(s.getRun('r1'), undefined);
+  s.close();
+  s = new Store(path);
+  assert.deepEqual(s.getDispatchSlot('lane', 'slot-1'), receipt);
+  assert.equal(s.tx(() => s.withDispatchSlot(dispatchLane, 'b'.repeat(64), 10, () => dispatchRun(s, 'r2'))), undefined);
+  assert.throws(() => dispatchRun(s, 'r1'), /consumed dispatch run identity/);
+  assert.equal(s.getRun('r2'), undefined);
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('invalid and corrupt native dispatch authority refuses without spending a slot', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dispatch-corrupt-'));
+  const path = join(dir, 'state.db');
+  const s = new Store(path);
+  for (const change of [{ capacity: 0 }, { capacity: 1.5 }, { id: '' }, { revision: '' }]) {
+    assert.throws(() => s.tx(() => s.withDispatchSlot({ ...dispatchLane, ...change }, 'a'.repeat(64), 10,
+      () => dispatchRun(s, 'r1'))), /invalid native dispatch claim/);
+  }
+  assert.equal(s.getRun('r1'), undefined);
+  assert.throws(() => s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10,
+    () => ({ run: 'made-up' }))), /actual active run/);
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM dispatch_lane').get()!.n, 0);
+  s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1')));
+  assert.throws(() => s.db.exec('UPDATE dispatch_lane SET capacity = 0'), /CHECK constraint/);
+  s.db.exec('PRAGMA ignore_check_constraints = ON; UPDATE dispatch_lane SET capacity = 0');
+  assert.throws(() => s.tx(() => s.withDispatchSlot({ ...dispatchLane, slot: 'slot-2' }, 'a'.repeat(64), 10,
+    () => dispatchRun(s, 'r2'))), /corrupt native dispatch state/);
+  assert.equal(s.getRun('r2'), undefined);
+  s.close();
+  assert.throws(() => new Store(path), /corrupt native dispatch state/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('dispatch storage refuses direct oversubscription and synthetic active-run identities', () => {
+  const s = mem();
+  s.tx(() => s.withDispatchSlot(dispatchLane, 'a'.repeat(64), 10, () => dispatchRun(s, 'r1')));
+  // A low-level writer cannot bypass the same lane bound using a different
+  // Store method. Both a synthetic identity and an extra genuine run refuse.
+  const insert = s.db.prepare('INSERT INTO dispatch_slot(lane_id,slot,run_id,plan_digest,consumed_at) VALUES (?,?,?,?,?)');
+  assert.throws(() => insert.run('lane', 'fake', 'missing', 'b'.repeat(64), 10), /active run/);
+  assert.throws(() => s.tx(() => {
+    dispatchRun(s, 'r2', 'wf2');
+    insert.run('lane', 'slot-2', 'r2', 'b'.repeat(64), 10);
+  }), /lane capacity/);
+  assert.equal(s.getRun('r2'), undefined);
+  assert.equal(s.getDispatchSlot('lane', 'slot-2'), undefined);
+  assert.equal(s.dispatchLaneUsage('lane'), 1);
+  s.close();
 });
