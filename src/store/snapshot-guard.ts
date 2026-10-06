@@ -16,6 +16,7 @@ import { acquireFileLockSync, releaseFileLock } from '../lock.ts';
 import type { FileLockHandle } from '../lock.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
+import { revalidateCasDefs } from './def-source.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, workflowStoreStatePaths } from './resolve.ts';
 import { compareStoreText, defDigest, objectDirForDigest } from './types.ts';
@@ -74,8 +75,15 @@ export function withWorkflowSnapshotStoreGuard<T>(
   const bundles = guardedBundles(defs);
   if (bundles.length === 0) return fn(new Set());
 
+  // Keep dependency discovery separate from each object's reachability roots.
+  // Lock every role in the original combined context, even when this snapshot
+  // only persists a project parent and its selected child is also project-local.
+  const contexts = new Map(defs.flatMap(def => def.bundleResolutionContext
+    ? [[JSON.stringify(def.bundleResolutionContext), def.bundleResolutionContext] as const] : []));
+  const discoveryRoots = [...contexts.values()].flatMap(context =>
+    [context.globalRoot, ...(context.projectRoot === undefined ? [] : [context.projectRoot])]);
   const rootAndStateByLockPath = new Map(
-    bundles.flatMap((bundle) => bundle.roots)
+    [...bundles.flatMap((bundle) => bundle.roots), ...discoveryRoots.map(projectStoreRoot)]
       .map((root) => ({ root, state: workflowStoreStatePaths(root) }))
       .map((item) => [item.state.lockPath, item] as const),
   );
@@ -99,6 +107,12 @@ export function withWorkflowSnapshotStoreGuard<T>(
             'the bundle is no longer indexed with verified object bytes; reload definitions and retry',
         );
       }
+    }
+    // A locked dependency can disappear after the initial CAS read but before
+    // these locks are acquired. Repeat strict combined validation under all
+    // locks, before entering SQLite or returning a trusted relay receipt.
+    for (const context of contexts.values()) {
+      revalidateCasDefs({ ...context, warn: () => {} });
     }
     return fn(new Set(bundles.map((bundle) => bundle.digest)));
   } finally {

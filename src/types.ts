@@ -107,6 +107,69 @@ export interface InterfaceCallBinding {
   signature: WorkflowInterfaceSignature;
 }
 
+/** Exact identity from a verified CAS bundle; never a definition projection hash. */
+export interface DefRef { bundleDigest: string; workflowName: string }
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export interface InvocationPolicy { name: string; version: string; config: JsonValue }
+export interface InvocationCall extends WorkflowInterfaceClaim {
+  selection: 'invocation';
+  signature: WorkflowInterfaceSignature;
+  policy: InvocationPolicy;
+}
+export type InterfaceCall = (WorkflowInterfaceClaim & { selection?: never }) | InvocationCall;
+export interface InvocationCandidate { target: string; DefRef: DefRef }
+export type CandidateInvalidCode = 'malformed-ref' | 'unresolved' | 'digest-mismatch' | 'name-mismatch';
+export type CandidateIneligibleCode = 'implements' | 'wiring' | 'output' | 'signature' | 'legacy-binding-missing' | 'legacy-binding-wiring';
+export type CandidateAssessment = { kind: 'eligible' }
+  | { kind: 'invalid'; code: CandidateInvalidCode }
+  | { kind: 'ineligible'; code: CandidateIneligibleCode };
+export interface AssessedCandidate { candidate: InvocationCandidate; assessment: CandidateAssessment }
+export interface InvocationEvidence { childInput: string; parentPath: string; version: number; value: JsonValue }
+export interface InvocationKey { parentWorkflow: string; parentDefRef: DefRef; callPath: string; evidenceDigest: string }
+export interface RunAdmission { rootWorkflow: string; epoch: number; active: boolean }
+export interface DecisionSnapshot {
+  key: InvocationKey;
+  contract: InvocationCall;
+  policyDigest: string;
+  evidence: InvocationEvidence[];
+  candidates: AssessedCandidate[];
+  candidateSetDigest: string;
+  admission: { rootWorkflow: string; epoch: number };
+}
+export interface InvocationBinding extends DecisionSnapshot {
+  id: string;
+  selected: InvocationCandidate & { signature: WorkflowInterfaceSignature };
+}
+export type DecisionSnapshotResult = { kind: 'ready'; snapshot: DecisionSnapshot }
+  | { kind: 'workflow-missing' } | { kind: 'call-missing' } | { kind: 'not-invocation-call' }
+  | { kind: 'parent-unverified' } | { kind: 'admission-unmanaged' } | { kind: 'canceled'; epoch: number }
+  | { kind: 'evidence-not-ready'; paths: string[] } | { kind: 'already-bound'; binding: InvocationBinding }
+  | { kind: 'invalid-candidate-set'; code: 'not-array' | 'not-object' | 'duplicate' };
+export type ApplyChoiceResult = { kind: 'invalid-decision'; code: string }
+  | { kind: 'admission-unmanaged' } | { kind: 'canceled'; epoch: number }
+  | { kind: 'stale-parent'; expected: DefRef; actual: DefRef | null }
+  | { kind: 'stale-policy'; expected: string; actual: string }
+  | { kind: 'stale-evidence'; expected: string; actual: string | null }
+  | { kind: 'candidate-missing'; selected: InvocationCandidate }
+  | { kind: 'candidate-invalid'; selected: InvocationCandidate; code: CandidateInvalidCode }
+  | { kind: 'candidate-ineligible'; selected: InvocationCandidate; code: CandidateIneligibleCode }
+  | { kind: 'depth-exceeded' } | { kind: 'cycle-detected' }
+  | { kind: 'divergent-race'; existing: InvocationBinding }
+  | { kind: 'replayed'; binding: InvocationBinding } | { kind: 'bound'; binding: InvocationBinding };
+export type InvocationStatus = { kind: 'unresolved' | 'stale' }
+  | { kind: 'bound'; binding: InvocationBinding; childWorkflow?: string };
+export interface InvocationRelayKey { parentWorkflow: string; parentDefRef: DefRef; callPath: string; parentArtifactVersion: number }
+export interface InvocationRelayReceipt {
+  invocationId: string; parentDefRef: DefRef; callPath: string; evidenceDigest: string;
+  parentArtifactVersion: number; childWorkflow: string; childDefRef: DefRef;
+  childOutcome: string; childOutcomeVersion: number;
+}
+export interface VerifiedInvocationReceipt { receipt: InvocationRelayReceipt; receiptDigest: string }
+/** Host-injected authority, never reconstructed from order/relay text. */
+export interface InvocationBindingSource {
+  read(key: InvocationRelayKey): VerifiedInvocationReceipt | undefined | Promise<VerifiedInvocationReceipt | undefined>;
+}
+
 /** One entry in an artifact's append-only reason thread (design §4). */
 export interface ReasonEntry {
   at: number;
@@ -763,7 +826,7 @@ export interface StepDef {
   /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */
   calls?: string;
   /** Versioned interface delegated to through the instance's immutable start-time binding. */
-  callsInterface?: WorkflowInterfaceClaim;
+  callsInterface?: InterfaceCall;
   /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: step. */
   callsInputs?: Record<string, string>;
   /** §24 judges: marker naming the produce stem this synthesized step judges. Mirrors `calls?`. */
@@ -865,6 +928,14 @@ export interface WorkflowDef {
    * and deliberately non-enumerable so it is not hashed or persisted.
    */
   bundleStoreRoots?: string[];
+  /**
+   * @internal Complete live CAS discovery context, with root roles preserved.
+   * Object provenance above is not a dependency search path: a project object
+   * may lock a global dependency (and vice versa). Revalidation must repeat
+   * the original combined discovery. Non-enumerable, never hashed/persisted;
+   * absent on deserialized snapshots and non-CAS definitions.
+   */
+  bundleResolutionContext?: Readonly<{ projectRoot?: string; globalRoot: string }>;
   /**
    * @internal WS-6 CAS provenance: a COPY of the containing bundle manifest's
    * `lock` map (base `namespace/name@version` reference text → the canonical
@@ -1110,6 +1181,7 @@ export interface CheckReport {
    * `completable` can remain false. Always present ([] when none).
    */
   stallStates: CheckFinding[];
+  externalSelectionWait?: Array<CheckFinding & { kind: 'external-selection-wait'; calls: string[] }>;
   /**
    * Reachable states that have a stalled debt (maxAttempts/maxSchemaFailures/
    * held) BUT still have >= 1 eligible firing — a brake tripped on one branch

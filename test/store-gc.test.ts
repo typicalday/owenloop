@@ -35,6 +35,49 @@ import {
 } from '../src/store/index.ts';
 import type { DefDigest, RuntimeSnapshotBundlePins } from '../src/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
+import { withWorkflowSnapshotStoreGuard } from '../src/store/snapshot-guard.ts';
+
+test('snapshot guard locks the combined dependency context and revalidates before its callback', async () => {
+  const global = await installVersion({ name: 'child', version: '1.0.0' });
+  const projectRoot = emptyRoot();
+  const target = workflowCoordinate({ namespace: 'child', name: 'child', version: '1.0.0' });
+  const parent = await installVersion({ name: 'parent', version: '1.0.0', root: projectRoot,
+    projectRoot, globalRoot: global.root, lock: { [target]: global.digest },
+    workflow: `name: parent
+inputs: [{name: seed, seedOwed: true}]
+steps:
+  - name: call
+    calls: ${target}
+    inputs: {seed: seed}
+    produces: [done]
+outputs: [done]
+` });
+  const defs = finalizeDefs(new Map(loadCasDefs({ projectRoot, globalRoot: global.root, warn: () => {} })
+    .map(r => [r.key, r.def])));
+  const def = defs.get('parent/parent@1.0.0')!;
+  assert.deepEqual(def.bundleStoreRoots, [parent.root]);
+  const locks = [parent.root, global.root].map(root => workflowStoreStatePaths(root).lockPath);
+  const probe = (lock: string, held: boolean) => {
+    const db = new DatabaseSync(`${lock}.sqlite-v2`);
+    try {
+      if (held) assert.throws(() => db.exec('BEGIN IMMEDIATE'), /locked/);
+      else { db.exec('BEGIN IMMEDIATE'); db.exec('ROLLBACK'); }
+    } finally { db.close(); }
+  };
+  for (const lock of locks) probe(lock, false);
+  withWorkflowSnapshotStoreGuard([def], () => {
+    for (const lock of locks) probe(lock, true);
+  });
+  for (const lock of locks) probe(lock, false);
+  // Model collection winning after live loading, before the snapshot lock.
+  const index = readWorkflowStoreIndex(storeIndexPath(global.root));
+  delete index.entries[target];
+  writeWorkflowStoreIndex(storeIndexPath(global.root), index);
+  let called = false;
+  assert.throws(() => withWorkflowSnapshotStoreGuard([def], () => { called = true; }), /no longer exactly callable/);
+  assert.equal(called, false, 'no SQLite/receipt callback after locked dependency movement');
+  for (const lock of locks) probe(lock, false);
+});
 
 function workflowYaml(name: string, marker: string): string {
   return [
@@ -928,6 +971,8 @@ test('GC excludes a two-connection stale snapshot writer from the scan-to-delete
   const finalizedTarget = finalized.get(target);
   assert.ok(finalizedTarget, 'the exact include-bearing CAS definition finalizes');
   assert.deepEqual(finalizedTarget.bundleStoreRoots, [installed.root]);
+  assert.deepEqual(finalizedTarget.bundleResolutionContext, { projectRoot: installed.root, globalRoot });
+  assert.equal(Object.getOwnPropertyDescriptor(finalizedTarget, 'bundleResolutionContext')?.enumerable, false);
   assert.equal(
     Object.getOwnPropertyDescriptor(finalizedTarget, 'bundleStoreRoots')?.enumerable,
     false,
