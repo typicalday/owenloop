@@ -1,3 +1,6 @@
+import { decodeBinding } from './invocation.ts';
+import { valueDigestHex } from './crypto/canonical.ts';
+import type { InvocationBinding, InvocationKey, RunAdmission } from './types.ts';
 /**
  * Persistence layer — a thin, typed wrapper over SQLite (node:sqlite).
  *
@@ -56,6 +59,7 @@ export interface WorkflowRow extends WorkflowData {
   createdAt: number;
   /** Mode 2 foundation: parent workflow coordinate for a child instance spawned by a calls: step. */
   producedBy?: { parentWf: string; parentPath: string };
+  producedByInvocation?: string;
 }
 
 /** The bundle identities retained by one persisted workflow definition snapshot. */
@@ -158,7 +162,12 @@ export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBund
 				+ `WHERE ${predicates.join(' OR ')} ORDER BY created_at, id`,
 			)
 			.all() as unknown as Array<{ id: string; def_snapshot: string | null; interface_bindings: string | null }>;
-		return rows.map((row) => {
+        const invocations = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'call_invocation'").get()
+          ? db.prepare('SELECT body FROM call_invocation').all().map(row => decodeBinding(JSON.parse(String(row.body)))) : [];
+        const invocationPins: RuntimeSnapshotBundlePins[] = invocations.map(b => ({
+          bundleDigest: b.selected.DefRef.bundleDigest, bundleLock: [b.key.parentDefRef.bundleDigest],
+        }));
+		return invocationPins.concat(rows.map((row) => {
 			let record: Record<string, unknown> = {};
 			if (row.def_snapshot !== null) {
 				let snapshot: unknown;
@@ -211,7 +220,7 @@ export function readRuntimeSnapshotBundlePins(path: string): RuntimeSnapshotBund
 				...(exactCalls.length === 0 ? {} : { exactCalls }),
 				...(interfaceBindingDigests.length === 0 ? {} : { interfaceBindingDigests }),
 			};
-		});
+		}));
 	} finally {
 		db.close();
 	}
@@ -366,7 +375,7 @@ CREATE TABLE IF NOT EXISTS meta (
  * Bumped to '12' for immutable start-time interface-call bindings: the
  * `workflow` table gains nullable JSON `interface_bindings`.
  */
-const SCHEMA_VERSION = '12';
+const SCHEMA_VERSION = '13';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -706,6 +715,7 @@ interface WorkflowRowRaw {
   modifier: string | null;
   meta: string | null;
   interface_bindings: string | null;
+  produced_by_invocation: string | null;
   created_at: number;
 }
 
@@ -737,6 +747,10 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
     column: 'meta',
   });
   if (meta !== undefined) out.meta = meta;
+  if (r.produced_by_invocation !== null) {
+    if (!/^[0-9a-f]{64}$/.test(r.produced_by_invocation) || !out.producedBy) throw new Error(`workflow '${r.id}' has corrupt produced_by_invocation`);
+    out.producedByInvocation = r.produced_by_invocation;
+  }
   const interfaceBindings = parseStoredInterfaceBindings(r.interface_bindings, r.id);
   if (interfaceBindings !== undefined) out.interfaceBindings = interfaceBindings;
   return out;
@@ -870,6 +884,35 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'produced_by_path')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN produced_by_path TEXT`);
     }
+    if (!wfCols.some((c) => c.name === 'produced_by_invocation')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN produced_by_invocation TEXT REFERENCES call_invocation(id)`);
+      this.db.exec('DROP INDEX IF EXISTS workflow_produced_by_unique');
+    }
+    this.db.exec(`CREATE TABLE IF NOT EXISTS run_admission (
+      root_workflow TEXT PRIMARY KEY REFERENCES workflow(id) ON DELETE CASCADE,
+      epoch INTEGER NOT NULL CHECK(epoch >= 0), active INTEGER NOT NULL CHECK(active IN (0,1))
+    );
+    CREATE TABLE IF NOT EXISTS call_invocation (
+      id TEXT PRIMARY KEY,
+      parent_workflow TEXT NOT NULL REFERENCES workflow(id) ON DELETE CASCADE,
+      key_digest TEXT NOT NULL UNIQUE,
+      body TEXT NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS call_invocation_immutable BEFORE UPDATE ON call_invocation
+      BEGIN SELECT RAISE(ABORT, 'call_invocation is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS call_invocation_append_only BEFORE DELETE ON call_invocation
+      WHEN EXISTS (SELECT 1 FROM workflow WHERE id = OLD.parent_workflow)
+      BEGIN SELECT RAISE(ABORT, 'call_invocation is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_invocation_link BEFORE INSERT ON workflow
+      WHEN NEW.produced_by_invocation IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM call_invocation WHERE id = NEW.produced_by_invocation
+          AND parent_workflow = NEW.produced_by_wf AND json_extract(body, '$.key.callPath') = NEW.produced_by_path)
+      BEGIN SELECT RAISE(ABORT, 'invalid invocation child linkage'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_invocation_immutable BEFORE UPDATE OF produced_by_invocation ON workflow
+      WHEN NEW.produced_by_invocation IS NOT OLD.produced_by_invocation
+      BEGIN SELECT RAISE(ABORT, 'invocation child linkage is immutable'); END;
+    CREATE UNIQUE INDEX IF NOT EXISTS workflow_invocation_unique ON workflow(produced_by_invocation)
+      WHERE produced_by_invocation IS NOT NULL;`);
     // Reverse-lookup index (CREATE INDEX IF NOT EXISTS is idempotent).
     this.db.exec(`CREATE INDEX IF NOT EXISTS workflow_produced_by ON workflow(produced_by_wf, produced_by_path)`);
     // REL-5 (schema v8): make duplicate calls: children physically impossible
@@ -877,7 +920,7 @@ export class Store {
     const dupe = this.db
       .prepare(
         `SELECT 1 FROM workflow
-           WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL
+           WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL AND produced_by_invocation IS NULL
            GROUP BY produced_by_wf, produced_by_path
            HAVING COUNT(*) > 1
            LIMIT 1`,
@@ -887,7 +930,7 @@ export class Store {
       this.db.exec(
         `CREATE UNIQUE INDEX IF NOT EXISTS workflow_produced_by_unique
            ON workflow(produced_by_wf, produced_by_path)
-           WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL`,
+           WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL AND produced_by_invocation IS NULL`,
       );
     }
     // §24: judges — the per-version sign-off ledger (judge name -> approved version).
@@ -949,6 +992,13 @@ export class Store {
    * concurrent ticks serialize. Never call tx() re-entrantly — node:sqlite
    * does not support nested transactions.
    */
+  /** A consistent SQLite read snapshot without acquiring the writer lock. */
+  readTx<T>(fn: () => T): T {
+    this.db.exec('BEGIN');
+    try { const result = fn(); this.db.exec('COMMIT'); return result; }
+    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
   tx<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -967,11 +1017,12 @@ export class Store {
    * before `BEGIN IMMEDIATE`; the guarded digest set then authorizes only the
    * low-level snapshot writes performed by this transaction.
    */
-  txWithWorkflowSnapshots<T>(snapshots: WorkflowDef | readonly WorkflowDef[], fn: () => T): T {
+  txWithWorkflowSnapshots<T>(snapshots: WorkflowDef | readonly WorkflowDef[], fn: () => T, revalidate?: () => void): T {
     const defs = Array.isArray(snapshots) ? snapshots : [snapshots];
     return withWorkflowSnapshotStoreGuard(defs, (guardedDigests) => {
       for (const digest of guardedDigests) this.activeSnapshotDigests.add(digest);
       try {
+        revalidate?.(); // CAS checks while guarded, still outside SQLite.
 				return this.tx(fn);
       } finally {
 				for (const digest of guardedDigests) this.activeSnapshotDigests.delete(digest);
@@ -1006,14 +1057,20 @@ export class Store {
 
   // -- workflow ----------------------------------------------------------------
 
-  insertWorkflow(id: string, data: WorkflowData, producedBy?: { parentWf: string; parentPath: string }): WorkflowRow {
+  insertWorkflow(id: string, data: WorkflowData, producedBy?: { parentWf: string; parentPath: string }, producedByInvocation?: string): WorkflowRow {
     this.assertWorkflowSnapshotGuard(data.defSnapshot);
+    if (producedByInvocation !== undefined) {
+      const binding = this.getInvocation(producedByInvocation);
+      if (!binding || binding.key.parentWorkflow !== producedBy?.parentWf || binding.key.callPath !== producedBy?.parentPath
+        || data.def !== binding.selected.target || data.defSnapshot?.bundleDigest !== binding.selected.DefRef.bundleDigest
+        || data.defSnapshot?.name !== binding.selected.DefRef.workflowName) throw new Error('invalid invocation child linkage or exact identity');
+    }
     const at = nowMs();
     this.db
       .prepare(
         `INSERT INTO workflow
-         (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, interface_bindings, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, interface_bindings, created_at, produced_by_invocation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1028,6 +1085,7 @@ export class Store {
         toJson(data.meta),
         toJson(data.interfaceBindings),
         at,
+        producedByInvocation ?? null,
       );
     return this.getWorkflow(id) as WorkflowRow;
   }
@@ -1107,7 +1165,7 @@ export class Store {
   findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
     const r = this.db
       .prepare(
-        'SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ? ORDER BY created_at, id LIMIT 1',
+        'SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ? AND produced_by_invocation IS NULL ORDER BY created_at, id LIMIT 1',
       )
       .get(parentWf, parentPath) as WorkflowRowRaw | undefined;
     return r ? mapWorkflow(r) : undefined;
@@ -1121,6 +1179,68 @@ export class Store {
       .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? ORDER BY created_at')
       .all(parentWf) as unknown as WorkflowRowRaw[];
     return rows.map(mapWorkflow);
+  }
+
+  rootWorkflow(id: string): string {
+    const seen = new Set<string>();
+    let row = this.getWorkflow(id);
+    while (row?.producedBy) {
+      if (seen.has(row.id)) throw new Error('corrupt workflow ancestry');
+      seen.add(row.id);
+      id = row.producedBy.parentWf;
+      row = this.getWorkflow(id);
+      if (!row) throw new Error('corrupt missing workflow ancestor');
+    }
+    return id;
+  }
+
+  getAdmission(rootWorkflow: string): RunAdmission | undefined {
+    const row = this.db.prepare('SELECT epoch, active FROM run_admission WHERE root_workflow = ?').get(rootWorkflow);
+    if (!row) return undefined;
+    if (!Number.isSafeInteger(row.epoch) || Number(row.epoch) < 0 || (row.active !== 0 && row.active !== 1)) {
+      throw new Error('corrupt run_admission');
+    }
+    return { rootWorkflow, epoch: Number(row.epoch), active: row.active === 1 };
+  }
+
+  insertAdmission(rootWorkflow: string): void {
+    this.db.prepare('INSERT INTO run_admission(root_workflow, epoch, active) VALUES (?, 0, 1)').run(rootWorkflow);
+  }
+
+  revokeAdmission(rootWorkflow: string): RunAdmission | undefined {
+    this.getAdmission(rootWorkflow); // reject corruption before mutation
+    this.db.prepare('UPDATE run_admission SET active = 0, epoch = epoch + 1 WHERE root_workflow = ? AND active = 1').run(rootWorkflow);
+    return this.getAdmission(rootWorkflow);
+  }
+
+  private invocationRow(row: Record<string, unknown> | undefined): InvocationBinding | undefined {
+    if (!row) return undefined;
+    const binding = decodeBinding(JSON.parse(String(row.body)));
+    if (binding.id !== row.id || binding.key.parentWorkflow !== row.parent_workflow || valueDigestHex(binding.key) !== row.key_digest) {
+      throw new Error('corrupt call_invocation index');
+    }
+    return binding;
+  }
+  getInvocation(id: string): InvocationBinding | undefined {
+    return this.invocationRow(this.db.prepare('SELECT * FROM call_invocation WHERE id = ?').get(id));
+  }
+  findInvocation(key: InvocationKey): InvocationBinding | undefined {
+    return this.invocationRow(this.db.prepare('SELECT * FROM call_invocation WHERE key_digest = ?').get(valueDigestHex(key)));
+  }
+  listInvocations(parentWorkflow: string): InvocationBinding[] {
+    return this.db.prepare('SELECT * FROM call_invocation WHERE parent_workflow = ? ORDER BY id').all(parentWorkflow)
+      .map(row => this.invocationRow(row)!);
+  }
+  insertInvocation(binding: InvocationBinding, selectedDef: WorkflowDef): void {
+    decodeBinding(binding);
+    if (!this.activeSnapshotDigests.has(binding.selected.DefRef.bundleDigest)) throw new Error('unguarded invocation write');
+    this.assertWorkflowSnapshotGuard(selectedDef);
+    this.db.prepare('INSERT INTO call_invocation(id, parent_workflow, key_digest, body) VALUES (?, ?, ?, ?)')
+      .run(binding.id, binding.key.parentWorkflow, valueDigestHex(binding.key), JSON.stringify(binding));
+  }
+  findChildByInvocation(id: string): WorkflowRow | undefined {
+    const row = this.db.prepare('SELECT * FROM workflow WHERE produced_by_invocation = ?').get(id) as WorkflowRowRaw | undefined;
+    return row ? mapWorkflow(row) : undefined;
   }
 
   // -- artifact ----------------------------------------------------------------

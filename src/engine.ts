@@ -1,3 +1,9 @@
+import { valueDigestHex } from './crypto/canonical.ts';
+import { assessContract, candidateSetDigest, evidenceDigest, inheritedBindingAssessment, invocationId, jsonOnly, record, validCandidate, validSnapshot } from './invocation.ts';
+import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
+import { verifyInvocationDefinition } from './store/def-source.ts';
+import { cancelCleanupSteps } from './defs.ts';
+import type { ApplyChoiceResult, AssessedCandidate, CandidateAssessment, DecisionSnapshot, DecisionSnapshotResult, DefRef, InvocationBinding, InvocationCandidate, InvocationEvidence, InvocationKey, InvocationStatus, InvocationBindingSource, InvocationRelayKey, VerifiedInvocationReceipt } from './types.ts';
 /**
  * The engine — the stateful layer that turns model decisions (model.ts) into
  * writes, under the store's `BEGIN IMMEDIATE` transactions.
@@ -387,6 +393,7 @@ export interface EngineWorkflowStatus extends WorkflowStatus {
    *  drift"). Informational — the engine keeps operating from the pinned
    *  snapshot regardless; clear the drift by running `owenloop adopt <wf>`. */
   defDrift?: boolean;
+  invocations?: Record<string, InvocationStatus>;
 }
 
 export interface CommitResult {
@@ -428,6 +435,7 @@ export interface CreateOpts {
   provide?: Record<string, Record<string, unknown>>;
   /** Mode 2: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; used only to cascade the child's outcome back up. */
   producedBy?: { parentWf: string; parentPath: string };
+  producedByInvocation?: string;
   /**
    * The ONE routing modifier this instance carries at a time. Must be a member
    * of the def's declared `modifiers` set — `createInstance` throws
@@ -795,7 +803,7 @@ export class Engine {
       const signatureInputNames = new Set(signature.inputs.map((input) => input.name));
       const targetInputNames = new Set(targetDef.inputs.map((input) => input.name));
       for (const interfaceStep of def.steps) {
-        if (interfaceStep.callsInterface === undefined || !sameInterfaceClaim(interfaceStep.callsInterface, normalizedClaim)) continue;
+        if (interfaceStep.callsInterface === undefined || interfaceStep.callsInterface.selection === 'invocation' || !sameInterfaceClaim(interfaceStep.callsInterface, normalizedClaim)) continue;
         for (const childInput of Object.keys(interfaceStep.callsInputs ?? {})) {
           if (!signatureInputNames.has(childInput)) {
             refuse(interfaceStep.name, normalizedClaim, `maps input '${childInput}', which the supplied interface signature does not declare`);
@@ -825,7 +833,7 @@ export class Engine {
     }
 
     for (const step of def.steps) {
-      if (step.callsInterface === undefined) continue;
+      if (step.callsInterface === undefined || step.callsInterface.selection === 'invocation') continue;
       if (!bindings.some((binding) => sameInterfaceClaim(binding.interface, step.callsInterface!))) {
         refuse(step.name, step.callsInterface, 'is missing; every directly called interface must be bound at instance start');
       }
@@ -839,28 +847,19 @@ export class Engine {
     def: WorkflowDef,
     bindings: readonly InterfaceCallBinding[] | undefined,
   ): void {
-    for (const step of def.steps) {
-      if (step.callsInterface === undefined) continue;
-      const binding = (bindings ?? []).find((candidate) =>
-        sameInterfaceClaim(candidate.interface, step.callsInterface!));
-      if (binding === undefined) {
-        throw new InterfaceBindingRefusalError(
-          defName,
-          step.name,
-          step.callsInterface,
-          'is missing from the inherited immutable binding set',
-        );
+    const result = inheritedBindingAssessment(def, bindings);
+    if (result.kind === 'ineligible') {
+      const pairs = def.steps.filter(s => s.callsInterface !== undefined && s.callsInterface.selection !== 'invocation')
+        .map(step => ({ step, binding: (bindings ?? []).find(b => sameInterfaceClaim(b.interface, step.callsInterface!)) }));
+      if (result.code === 'legacy-binding-missing') {
+        const missing = pairs.find(p => !p.binding)!;
+        throw new InterfaceBindingRefusalError(defName, missing.step.name, missing.step.callsInterface,
+          'is missing from the inherited immutable binding set');
       }
-      const interfaceInputs = new Set(binding.signature.inputs.map((input) => input.name));
-      for (const childInput of Object.keys(step.callsInputs ?? {})) {
-        if (!interfaceInputs.has(childInput)) {
-          throw new InterfaceBindingRefusalError(
-            defName,
-            step.name,
-            step.callsInterface,
-            `maps input '${childInput}', which the inherited interface signature does not declare`,
-          );
-        }
+      for (const pair of pairs) {
+        const childInput = Object.keys(pair.step.callsInputs ?? {}).find(n => !pair.binding!.signature.inputs.some(i => i.name === n));
+        if (childInput !== undefined) throw new InterfaceBindingRefusalError(defName, pair.step.name, pair.step.callsInterface,
+          `maps input '${childInput}', which the inherited interface signature does not declare`);
       }
     }
   }
@@ -920,7 +919,8 @@ export class Engine {
       }
       wfData.modifier = opts.modifier;
     }
-    this.store.insertWorkflow(id, wfData, opts.producedBy);
+    this.store.insertWorkflow(id, wfData, opts.producedBy, opts.producedByInvocation);
+    if (!opts.producedBy) this.store.insertAdmission(id);
 
     for (const input of def.inputs) {
       const provided = opts.provide?.[input.name];
@@ -1003,13 +1003,19 @@ export class Engine {
       ? parseVersionedCallTarget(step.calls, parseWorkflowCoordinate).coordinate
       : undefined;
     let verifiedParentPin: string | undefined;
+    let invocation: InvocationBinding | undefined;
+    const asLegacy = (b: InvocationBinding): InterfaceCallBinding => ({ interface: b.contract, target: b.selected.target, digest: b.selected.DefRef.bundleDigest, signature: b.selected.signature });
 
     // Interface targets are selected once, stored on the parent, and resolved by
     // exact digest BEFORE either the workflow-store guard or SQLite write lock.
     // The transaction below re-reads and compares the persisted selection.
     if (step.callsInterface !== undefined) {
       const parent = this.store.getWorkflow(parentWf);
-      const binding = parent?.interfaceBindings?.find((candidate) =>
+      if (step.callsInterface.selection === 'invocation') {
+        invocation = this.currentInvocation(parentWf, step);
+        if (!invocation) return null;
+      }
+      const binding = invocation ? asLegacy(invocation) : parent?.interfaceBindings?.find((candidate) =>
         sameInterfaceClaim(candidate.interface, step.callsInterface!));
       if (binding === undefined) {
         throw new InterfaceCallPinError(
@@ -1031,6 +1037,15 @@ export class Engine {
     }
 
     const transactionBody = (): ProvisionResult | typeof needsSnapshot => {
+        if (!this.invocationCurrent(parentWf)) return null;
+        if (invocation) {
+          const freshStep = this.store.getWorkflow(parentWf)?.defSnapshot?.steps.find(s => s.produces[0]?.stem === callsStem);
+          if (!freshStep || this.currentInvocation(parentWf, freshStep)?.id !== invocation.id) return null;
+          if (this.callsAncestryDepth(parentWf) >= this.maxCallDepth) return null;
+          if (!snapshotDef || snapshotDef.name !== invocation.selected.DefRef.workflowName) return null;
+          const a = assessContract(invocation.contract, freshStep.callsInputs ?? {}, snapshotDef, this.store.getWorkflow(parentWf)?.interfaceBindings);
+          if (a.kind !== 'eligible') return null;
+        }
         // 1. FRESH parent snapshot — re-read inside the write lock; never trust
         //    the caller's STEP-1 map.
         const parentArts = this.artMap(parentWf);
@@ -1061,7 +1076,7 @@ export class Engine {
         if (parentRow === undefined) throw new Error(`no such workflow instance: ${parentWf}`);
         let target: string;
         if (step.callsInterface !== undefined) {
-          const freshBinding = parentRow.interfaceBindings?.find((candidate) =>
+          const freshBinding = invocation ? asLegacy(invocation) : parentRow.interfaceBindings?.find((candidate) =>
             sameInterfaceClaim(candidate.interface, step.callsInterface!));
           if (freshBinding === undefined) {
             throw new InterfaceCallPinError(
@@ -1099,7 +1114,7 @@ export class Engine {
 
         // 4. Find-or-create the child (in-tx check-then-insert — absorbs the old
         //    spawnChildIfAbsent guarantee, only its home moved).
-        let child = this.store.findChildByParent(parentWf, callsStem);
+        let child = this.currentCallsChild(parentWf, callsStem);
         let created = false;
         let childDef: WorkflowDef;
         if (!child) {
@@ -1140,6 +1155,7 @@ export class Engine {
           // and throws SchemaRefusalError (tx rolls back — no orphan child).
           const childOpts: CreateOpts = {
             producedBy: { parentWf, parentPath: callsStem },
+            ...(invocation ? { producedByInvocation: invocation.id } : {}),
             provide: seedProvide,
           };
           if (parentRow.interfaceBindings !== undefined) {
@@ -1210,7 +1226,9 @@ export class Engine {
     };
     const transact = (): ProvisionResult | typeof needsSnapshot => snapshotDef === undefined
       ? this.store.tx(transactionBody)
-      : this.store.txWithWorkflowSnapshots(snapshotDef, transactionBody);
+      : this.store.txWithWorkflowSnapshots(snapshotDef, transactionBody, () => {
+        if (invocation && !verifyInvocationDefinition(snapshotDef!, invocation.selected.target)) snapshotDef = undefined;
+      });
     const run = (): ProvisionResult => {
       let result = transact();
       if (result !== needsSnapshot) return result;
@@ -1254,6 +1272,221 @@ export class Engine {
       if (err instanceof SchemaRefusalError) err.gateFingerprint = seenGateFp;
       throw err;
     }
+  }
+
+  private pinnedRef(workflow: string): DefRef | null {
+    const def = this.store.getWorkflow(workflow)?.defSnapshot;
+    return def?.bundleDigest ? { bundleDigest: def.bundleDigest, workflowName: def.name } : null;
+  }
+  private selectionEvidence(workflow: string, step: StepDef): { evidence: InvocationEvidence[]; paths: string[] } {
+    const arts = this.artMap(workflow);
+    const evidence: InvocationEvidence[] = [], paths: string[] = [];
+    for (const [childInput, parentPath] of Object.entries(step.callsInputs ?? {}).sort()) {
+      const a = arts.get(parentPath);
+      if (!isGreen(a) || !a || !jsonOnly(a.value)) paths.push(parentPath);
+      else evidence.push({ childInput, parentPath, version: a.version, value: a.value });
+    }
+    return { evidence, paths: [...new Set(paths)].sort() };
+  }
+  private currentInvocationKey(workflow: string, step: StepDef): InvocationKey | undefined {
+    const parentDefRef = this.pinnedRef(workflow);
+    const { evidence, paths } = this.selectionEvidence(workflow, step);
+    if (!parentDefRef || paths.length || step.callsInterface?.selection !== 'invocation') return undefined;
+    return { parentWorkflow: workflow, parentDefRef, callPath: step.produces[0]!.stem, evidenceDigest: evidenceDigest(evidence) };
+  }
+  private currentInvocation(workflow: string, step: StepDef): InvocationBinding | undefined {
+    const key = this.currentInvocationKey(workflow, step);
+    if (!key) return undefined;
+    const a = this.store.getAdmission(this.store.rootWorkflow(workflow));
+    if (!a?.active) return undefined;
+    const b = this.store.findInvocation(key);
+    if (!b || b.admission.epoch !== a.epoch || b.policyDigest !== valueDigestHex(step.callsInterface?.selection === 'invocation' ? step.callsInterface.policy : null)) return undefined;
+    return b;
+  }
+  private currentCallsChild(workflow: string, callPath: string): WorkflowRow | undefined {
+    const step = this.store.getWorkflow(workflow)?.defSnapshot?.steps.find(s => isCallStep(s) && s.produces[0]?.stem === callPath);
+    if (step?.callsInterface?.selection !== 'invocation') return this.store.findChildByParent(workflow, callPath);
+    const b = this.currentInvocation(workflow, step);
+    if (!b) return undefined;
+    const child = this.store.findChildByInvocation(b.id);
+    if (!child || child.def !== b.selected.target || valueDigestHex(this.pinnedRef(child.id)) !== valueDigestHex(b.selected.DefRef)) return undefined;
+    return child;
+  }
+  /** Checks every invocation ancestor, including direct ticks on a historical child. No I/O beyond SQLite. */
+  private invocationCurrent(workflow: string): boolean {
+    const admission = this.store.getAdmission(this.store.rootWorkflow(workflow));
+    if (admission && !admission.active) return false;
+    let row = this.store.getWorkflow(workflow);
+    while (row?.producedBy) {
+      if (row.producedByInvocation && this.currentCallsChild(row.producedBy.parentWf, row.producedBy.parentPath)?.id !== row.id) return false;
+      row = this.store.getWorkflow(row.producedBy.parentWf);
+    }
+    return true;
+  }
+  private assessCandidate(candidate: InvocationCandidate, parent: WorkflowDef, step: StepDef,
+    bindings: readonly InterfaceCallBinding[] | undefined): { assessment: CandidateAssessment; def?: WorkflowDef } {
+    if (!validCandidate(candidate)) return { assessment: { kind: 'invalid', code: 'malformed-ref' } };
+    let def: WorkflowDef;
+    try { def = this.resolveDef(candidate.target, parent, candidate.DefRef.bundleDigest); }
+    catch { return { assessment: { kind: 'invalid', code: 'unresolved' } }; }
+    if (def.bundleDigest !== candidate.DefRef.bundleDigest) return { assessment: { kind: 'invalid', code: 'digest-mismatch' } };
+    if (def.name !== candidate.DefRef.workflowName) return { assessment: { kind: 'invalid', code: 'name-mismatch' } };
+    if (!verifyInvocationDefinition(def, candidate.target)) return { assessment: { kind: 'invalid', code: 'unresolved' } };
+    if (step.callsInterface?.selection !== 'invocation') throw new Error('expected invocation call');
+    return { def, assessment: assessContract(step.callsInterface, step.callsInputs ?? {}, def, bindings) };
+  }
+  decisionSnapshot(workflow: string, callPath: string, candidates: unknown): DecisionSnapshotResult {
+    return this.store.readTx(() => this.readDecisionSnapshot(workflow, callPath, candidates));
+  }
+  private readDecisionSnapshot(workflow: string, callPath: string, candidates: unknown): DecisionSnapshotResult {
+    const row = this.store.getWorkflow(workflow);
+    if (!row) return { kind: 'workflow-missing' };
+    const parent = row.defSnapshot;
+    const step = (parent ?? this.defFor(workflow)).steps.find(s => s.produces.some(p => p.stem === callPath));
+    if (!step) return { kind: 'call-missing' };
+    if (step.callsInterface?.selection !== 'invocation') return { kind: 'not-invocation-call' };
+    const ref = this.pinnedRef(workflow);
+    if (!parent || !ref) return { kind: 'parent-unverified' };
+    let verified: WorkflowDef;
+    try { verified = this.resolveDef(row.def, parent, ref.bundleDigest); }
+    catch { return { kind: 'parent-unverified' }; }
+    if (!verifyInvocationDefinition(verified) || valueDigestHex(verified) !== valueDigestHex(parent)) return { kind: 'parent-unverified' };
+    const admission = this.store.getAdmission(this.store.rootWorkflow(workflow));
+    if (!admission) return { kind: 'admission-unmanaged' };
+    if (!admission.active) return { kind: 'canceled', epoch: admission.epoch };
+    const { evidence, paths } = this.selectionEvidence(workflow, step);
+    if (paths.length) return { kind: 'evidence-not-ready', paths };
+    const key: InvocationKey = { parentWorkflow: workflow, parentDefRef: ref, callPath, evidenceDigest: evidenceDigest(evidence) };
+    const existing = this.store.findInvocation(key);
+    if (existing) return { kind: 'already-bound', binding: existing };
+    if (!Array.isArray(candidates)) return { kind: 'invalid-candidate-set', code: 'not-array' };
+    if (candidates.some(c => !record(c) || !jsonOnly(c))) return { kind: 'invalid-candidate-set', code: 'not-object' };
+    if (new Set(candidates.map(c => valueDigestHex(c))).size !== candidates.length) return { kind: 'invalid-candidate-set', code: 'duplicate' };
+    const assessed: AssessedCandidate[] = candidates.map(candidate => ({ candidate,
+      assessment: this.assessCandidate(candidate, parent, step, row.interfaceBindings).assessment }));
+    return { kind: 'ready', snapshot: structuredClone({ key, contract: step.callsInterface, policyDigest: valueDigestHex(step.callsInterface.policy),
+      evidence, candidates: assessed, candidateSetDigest: candidateSetDigest(assessed),
+      admission: { rootWorkflow: admission.rootWorkflow, epoch: admission.epoch } }) };
+  }
+  applyChoice(snapshot: DecisionSnapshot, selected: InvocationCandidate): ApplyChoiceResult {
+    if (!validSnapshot(snapshot) || !validCandidate(selected)) return { kind: 'invalid-decision', code: 'shape-or-digest' };
+    // Resolve exact bytes before CAS/GC then SQLite; no filesystem/provider calls in the transaction.
+    const row = this.store.getWorkflow(snapshot.key.parentWorkflow);
+    const rootWorkflow = row ? this.store.rootWorkflow(row.id) : snapshot.admission.rootWorkflow;
+    if (row && rootWorkflow !== snapshot.admission.rootWorkflow) return { kind: 'invalid-decision', code: 'root' };
+    const parent = row?.defSnapshot;
+    const step = parent?.steps.find(s => s.produces[0]?.stem === snapshot.key.callPath);
+    let verifiedParent: WorkflowDef | undefined;
+    if (row && parent?.bundleDigest) {
+      try { verifiedParent = this.resolveDef(row.def, parent, parent.bundleDigest); } catch { /* fresh transaction reports stale parent */ }
+      if (verifiedParent && !verifyInvocationDefinition(verifiedParent)) verifiedParent = undefined;
+    }
+    const resolved = parent && step?.callsInterface?.selection === 'invocation'
+      ? this.assessCandidate(selected, parent, step, row?.interfaceBindings) : undefined;
+    const tx = (): ApplyChoiceResult => {
+      const admission = this.store.getAdmission(rootWorkflow);
+      if (!admission) return { kind: 'admission-unmanaged' };
+      if (!admission.active || admission.epoch !== snapshot.admission.epoch) return { kind: 'canceled', epoch: admission.epoch };
+      const fresh = this.store.getWorkflow(snapshot.key.parentWorkflow);
+      const actual = this.pinnedRef(snapshot.key.parentWorkflow);
+      const freshStep = fresh?.defSnapshot?.steps.find(s => s.produces[0]?.stem === snapshot.key.callPath);
+      if (!actual || valueDigestHex(actual) !== valueDigestHex(snapshot.key.parentDefRef) || freshStep?.callsInterface?.selection !== 'invocation') {
+        return { kind: 'stale-parent', expected: snapshot.key.parentDefRef, actual };
+      }
+      if (this.store.rootWorkflow(fresh!.id) !== snapshot.admission.rootWorkflow) return { kind: 'invalid-decision', code: 'root' };
+      if (!this.invocationCurrent(fresh!.id)) return { kind: 'stale-parent', expected: snapshot.key.parentDefRef, actual: null };
+      const policyDigest = valueDigestHex(freshStep.callsInterface.policy);
+      if (policyDigest !== snapshot.policyDigest) return { kind: 'stale-policy', expected: snapshot.policyDigest, actual: policyDigest };
+      if (valueDigestHex(freshStep.callsInterface) !== valueDigestHex(snapshot.contract)) return { kind: 'invalid-decision', code: 'contract' };
+      if (!verifiedParent || valueDigestHex(verifiedParent) !== valueDigestHex(fresh!.defSnapshot)) return { kind: 'invalid-decision', code: 'parent-authority' };
+      const e = this.selectionEvidence(fresh!.id, freshStep), digest = e.paths.length ? null : evidenceDigest(e.evidence);
+      if (digest !== snapshot.key.evidenceDigest) return { kind: 'stale-evidence', expected: snapshot.key.evidenceDigest, actual: digest };
+      const offered = snapshot.candidates.find(c => valueDigestHex(c.candidate) === valueDigestHex(selected));
+      if (!offered) return { kind: 'candidate-missing', selected };
+      const a = resolved?.assessment ?? { kind: 'invalid' as const, code: 'unresolved' as const };
+      for (const assessment of [offered.assessment, a]) {
+        if (assessment.kind === 'invalid') return { kind: 'candidate-invalid', selected, code: assessment.code };
+      }
+      for (const assessment of [offered.assessment, a]) {
+        if (assessment.kind === 'ineligible') return { kind: 'candidate-ineligible', selected, code: assessment.code };
+      }
+      const freshAssessment = assessContract(freshStep.callsInterface, freshStep.callsInputs ?? {}, resolved!.def!, fresh!.interfaceBindings);
+      if (freshAssessment.kind === 'ineligible') return { kind: 'candidate-ineligible', selected, code: freshAssessment.code };
+      if (this.callsAncestryDepth(fresh!.id) >= this.maxCallDepth) return { kind: 'depth-exceeded' };
+      let ancestor = fresh;
+      while (ancestor) {
+        if (valueDigestHex(this.pinnedRef(ancestor.id)) === valueDigestHex(selected.DefRef)) return { kind: 'cycle-detected' };
+        ancestor = ancestor.producedBy ? this.store.getWorkflow(ancestor.producedBy.parentWf) : undefined;
+      }
+      const body = { ...snapshot, selected: { ...selected, signature: snapshot.contract.signature } };
+      const binding: InvocationBinding = { ...body, id: invocationId(body) };
+      const existing = this.store.findInvocation(snapshot.key);
+      if (existing) return existing.id === binding.id ? { kind: 'replayed', binding: existing } : { kind: 'divergent-race', existing };
+      this.store.insertInvocation(binding, resolved!.def!);
+      return { kind: 'bound', binding };
+    };
+    return resolved?.def ? this.store.txWithWorkflowSnapshots([resolved.def, ...(verifiedParent ? [verifiedParent] : [])], tx, () => {
+      if (!verifyInvocationDefinition(resolved.def!, selected.target)) resolved.assessment = { kind: 'invalid', code: 'unresolved' };
+      if (verifiedParent && !verifyInvocationDefinition(verifiedParent)) verifiedParent = undefined;
+    }) : this.store.tx(tx);
+  }
+  /** Trusted local Store/CAS seam for a command executor. Never serialize this capability. */
+  invocationBindingSource(): InvocationBindingSource {
+    return { read: key => this.readInvocationReceipt(key) };
+  }
+  private readInvocationReceipt(key: InvocationRelayKey): VerifiedInvocationReceipt | undefined {
+    const parent = this.store.getWorkflow(key.parentWorkflow);
+    if (!parent || valueDigestHex(this.pinnedRef(parent.id)) !== valueDigestHex(key.parentDefRef)) return undefined;
+    const step = parent.defSnapshot?.steps.find(s => s.produces[0]?.stem === key.callPath);
+    if (!step || step.callsInterface?.selection !== 'invocation') return undefined;
+    const binding = this.currentInvocation(parent.id, step);
+    if (!binding) return undefined;
+    const child = this.store.findChildByInvocation(binding.id);
+    if (!child) return undefined;
+    const parentDef = this.resolveDef(parent.def, parent.defSnapshot, key.parentDefRef.bundleDigest);
+    const childDef = this.resolveDef(binding.selected.target, parentDef, binding.selected.DefRef.bundleDigest);
+    if (!verifyInvocationDefinition(parentDef) || !verifyInvocationDefinition(childDef, binding.selected.target)
+      || valueDigestHex(parentDef) !== valueDigestHex(parent.defSnapshot)
+      || valueDigestHex(childDef) !== valueDigestHex(child.defSnapshot)) return undefined;
+    return withWorkflowSnapshotStoreGuard([parentDef, childDef], () => this.store.readTx(() => {
+      if (!this.invocationCurrent(parent.id) || this.currentInvocation(parent.id, step)?.id !== binding.id) return undefined;
+      const currentChild = this.store.findChildByInvocation(binding.id);
+      if (currentChild?.id !== child.id || valueDigestHex(currentChild.defSnapshot) !== valueDigestHex(childDef)) return undefined;
+      const freshParent = this.store.getWorkflow(parent.id);
+      if (valueDigestHex(freshParent?.defSnapshot) !== valueDigestHex(parentDef)) return undefined;
+      const artifact = this.store.getArtifact(parent.id, key.callPath);
+      const outcome = childDef.outputs?.[0];
+      if (!outcome) return undefined;
+      const childArts = this.artMap(child.id), childArtifact = childArts.get(outcome);
+      if (!isGreen(artifact) || artifact?.version !== key.parentArtifactVersion || !isGreen(childArtifact)
+        || childArtifact?.value === undefined || !workflowDone(childDef, childArts)
+        || !artifact.fingerprint?.[`__invocation_${binding.id}__`]
+        || artifact.fingerprint[Engine.CHILD_OUTCOME_PIN_KEY] !== childArtifact.version
+        || !deepEqual(artifact.value, childArtifact.value)) return undefined;
+      const receipt = { invocationId: binding.id, parentDefRef: key.parentDefRef, callPath: key.callPath,
+        evidenceDigest: binding.key.evidenceDigest, parentArtifactVersion: artifact.version, childWorkflow: child.id,
+        childDefRef: binding.selected.DefRef, childOutcome: outcome, childOutcomeVersion: childArtifact.version };
+      return { receipt, receiptDigest: valueDigestHex(receipt) };
+    }));
+  }
+
+  cancelRun(workflow: string): { admission: ReturnType<Store['getAdmission']>; cleanup: Array<{ workflow: string; steps: StepDef[] }> } {
+    return this.store.tx(() => {
+      const root = this.store.rootWorkflow(workflow);
+      const admission = this.store.revokeAdmission(root);
+      const cleanup = this.store.listWorkflows().filter(w => this.store.rootWorkflow(w.id) === root)
+        .map(w => ({ workflow: w.id, steps: w.defSnapshot ? cancelCleanupSteps(w.defSnapshot) : [] }));
+      return { admission, cleanup };
+    });
+  }
+  invocationStatus(workflow: string, callPath: string): InvocationStatus {
+    const step = this.store.getWorkflow(workflow)?.defSnapshot?.steps.find(s => s.produces[0]?.stem === callPath);
+    const binding = step ? this.currentInvocation(workflow, step) : undefined;
+    if (binding) {
+      const child = this.store.findChildByInvocation(binding.id);
+      return { kind: 'bound', binding, ...(child ? { childWorkflow: child.id } : {}) };
+    }
+    return { kind: this.store.listInvocations(workflow).some(b => b.key.callPath === callPath) ? 'stale' : 'unresolved' };
   }
 
   /** A human/external producer supplies (greens) an owed input. */
@@ -1306,6 +1539,12 @@ export class Engine {
     // naturally — adopting onto a def that's gone is a genuine error, unlike
     // status's drift check which tolerates it.
     const freshDef = this.resolveDef(wf.def);
+    if (wf.producedByInvocation) {
+      const binding = this.store.getInvocation(wf.producedByInvocation);
+      if (!binding || freshDef.bundleDigest !== binding.selected.DefRef.bundleDigest || freshDef.name !== binding.selected.DefRef.workflowName) {
+        throw new Error('cannot adopt an invocation child away from its immutable exact selection');
+      }
+    }
     const newHash = hashDef(freshDef);
     const previousHash = wf.defHash;
     this.store.txWithWorkflowSnapshots(freshDef, () => {
@@ -1339,7 +1578,7 @@ export class Engine {
    * if no child has ever been spawned (nothing to pin to).
    */
   private childOutcomePin(parentWf: string, callsPath: string): number | undefined {
-    const child = this.store.findChildByParent(parentWf, callsPath);
+    const child = this.currentCallsChild(parentWf, callsPath);
     if (!child) return undefined;
     const childDef = this.defFor(child.id);
     const childOutcomeStem = childDef.outputs![0]!;
@@ -1569,7 +1808,7 @@ export class Engine {
    * whole child workflow is done.
    */
   private maintainCalls(parentWf: string, def: WorkflowDef, now?: number): void {
-    if (this._inMaintainCalls.has(parentWf)) return;
+    if (this._inMaintainCalls.has(parentWf) || !this.invocationCurrent(parentWf)) return;
     this._inMaintainCalls.add(parentWf);
     try {
       for (const step of def.steps) {
@@ -1583,7 +1822,7 @@ export class Engine {
         if (!this.callsGateReady(parentArts, step)) continue;
 
         // STEP 2 — Look up any existing child via reverse index.
-        let existingChild = this.store.findChildByParent(parentWf, callsPath);
+        let existingChild = this.currentCallsChild(parentWf, callsPath);
 
         // F2: if the parent calls artifact is already `rejected` on a schema
         // refusal (see STEP 3/5 below) and the gate stems haven't moved since
@@ -1731,7 +1970,8 @@ export class Engine {
           // the child actually rebuilds past that pin, instead of being
           // silently overridden on the very next tick. (Re-checked in-tx by
           // the helper against the snapshot it commits under.)
-          const pinnedVersion = parentCallsArt?.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
+          const pinnedVersion = existingChild.producedByInvocation && !parentCallsArt?.fingerprint?.[`__invocation_${existingChild.producedByInvocation}__`]
+            ? undefined : parentCallsArt?.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
           const pastPin = pinnedVersion === undefined || childOutcomeArt.version > pinnedVersion;
           if ((!alreadyGreen || !sameValue) && pastPin && parentCallsArt) {
             // parentCallsArt truthy: not-yet-materialized (pendingOwed) → skip.
@@ -1809,7 +2049,7 @@ export class Engine {
       if (!parentCallsArt || parentCallsArt.acceptance === 'rejected') return false;
 
       // Same child the optimistic read saw; a different id means the tree moved.
-      const child = this.store.findChildByParent(parentWf, callsStem);
+      const child = this.currentCallsChild(parentWf, callsStem);
       if (!child || child.id !== expectedChildId) return false;
 
       const childDef = this.defFor(child.id);
@@ -1832,10 +2072,12 @@ export class Engine {
       if (alreadyGreen && deepEqual(childOutcomeArt.value, parentCallsArt.value)) return false;
 
       // F4 version pin, recomputed from the in-tx child outcome version.
-      const pinnedVersion = parentCallsArt.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
+      const pinnedVersion = child.producedByInvocation && !parentCallsArt.fingerprint?.[`__invocation_${child.producedByInvocation}__`]
+        ? undefined : parentCallsArt.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
       if (pinnedVersion !== undefined && childOutcomeArt.version <= pinnedVersion) return false;
 
       const fp = computeFingerprint(parentArts, gateStems);
+      if (child.producedByInvocation) fp[`__invocation_${child.producedByInvocation}__`] = 1;
       fp[Engine.CHILD_OUTCOME_PIN_KEY] = childOutcomeArt.version;
       // Do NOT set terminal: calls: artifact must be re-armable if gate inputs move.
       this.store.putArtifact({
@@ -1871,7 +2113,7 @@ export class Engine {
     return this.store.tx(() => {
       const artNow = this.store.getArtifact(parentWf, callsStem);
       if (!artNow || !isGreen(artNow)) return false; // already re-armed or gone
-      const child = this.store.findChildByParent(parentWf, callsStem);
+      const child = this.currentCallsChild(parentWf, callsStem);
       if (!child || child.id !== expectedChildId) return false;
       const childDef = this.defFor(child.id);
       const currentChildOutcomeStem = childDef.outputs?.[0];
@@ -1917,7 +2159,7 @@ export class Engine {
     const wfRow = this.store.getWorkflow(workflow);
     if (!wfRow?.producedBy) return;
     const { parentWf } = wfRow.producedBy;
-    if (this._inMaintainCalls.has(parentWf)) return;
+    if (this._inMaintainCalls.has(parentWf) || !this.invocationCurrent(parentWf)) return;
     const parentWfRow = this.store.getWorkflow(parentWf);
     if (!parentWfRow) return;
     // §28: go through defFor so a pinned parent instance is maintained per its
@@ -2075,6 +2317,7 @@ export class Engine {
         + `in the definition set; raise maxCallDepth via Engine opts only if this depth is intentional`,
       );
     }
+    if (!this.invocationCurrent(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
     if (visited.has(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
     visited.add(workflow);
     // ONE run-record read per frame yields both the pinned def and the run's
@@ -2102,6 +2345,10 @@ export class Engine {
       // parent advanced since provision: settle/reap already ran and stay (both
       // child-local and useful), but this frame issues no firings/claims and its
       // subtree is skipped below. Next parent tick re-synchronizes.
+      if (!this.invocationCurrent(workflow)) {
+        staleEdge = true;
+        return { workflow, orders: [], reaped, deferred: [] } as TickResult;
+      }
       if (parentEdge) {
         const pArts = this.artMap(parentEdge.parentWf);
         const callsArt = pArts.get(parentEdge.callsStem);
@@ -2217,7 +2464,7 @@ export class Engine {
       if (!isCallStep(step)) continue;
       const stem = step.produces[0]!.stem;
       if (!this.callsGateReady(arts, step)) continue; // 1. gate green
-      const child = this.store.findChildByParent(parentWf, stem);
+      const child = this.currentCallsChild(parentWf, stem);
       if (!child) continue; // 2. child exists
       if (arts.get(stem)?.acceptance !== 'owed') continue; // 3. descend only on an owed debt
       out.push({ step, child });
@@ -3199,6 +3446,7 @@ export class Engine {
     let releasedRun: string | undefined;
 
     const result = this.store.tx((): { outcome: 'rejected' | 'born-rejected'; reason?: string } => {
+      if (!this.invocationCurrent(workflow)) return { outcome: 'born-rejected', reason: 'historical invocation or canceled run' };
       const art = this.store.getArtifact(workflow, path);
       if (!art) throw new Error(`cannot reject unknown artifact: ${path}`);
       if (requested !== undefined) {
@@ -3314,7 +3562,7 @@ export class Engine {
     text: string,
     requested?: string,
   ): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
-    const child = this.store.findChildByParent(parentWf, callsStem);
+    const child = this.currentCallsChild(parentWf, callsStem);
     if (!child) {
       throw new Error(
         `cannot reject '${callsStem}': no child instance has been spawned yet (a verdict requires a built version)`,
@@ -3323,7 +3571,14 @@ export class Engine {
     const childDef = this.defFor(child.id);
     const childOutcomeStem = childDef.outputs![0]!;
 
-    this.store.tx(() => {
+    const result = this.store.tx((): { outcome: 'rejected' | 'born-rejected'; reason?: string } => {
+      // Child resolution happens before BEGIN IMMEDIATE. Another connection may
+      // replace the current invocation or revoke admission in that window. Check
+      // both the parent's ancestry/admission and the exact selected child while
+      // holding the write lock, before touching either generation's artifacts.
+      if (!this.invocationCurrent(parentWf) || this.currentCallsChild(parentWf, callsStem)?.id !== child.id) {
+        return { outcome: 'born-rejected', reason: 'historical invocation or canceled run' };
+      }
       const parentArt = this.store.getArtifact(parentWf, callsStem);
       if (!parentArt) throw new Error(`cannot reject unknown artifact: ${callsStem}`);
       if (parentArt.acceptance !== 'green' && parentArt.acceptance !== 'submitted') {
@@ -3369,15 +3624,19 @@ export class Engine {
         ],
       });
       this.settle(parentWf, def);
+      return { outcome: 'rejected' };
     });
-    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject',
+      ...(result.outcome === 'born-rejected' ? { outcome: 'born-rejected' as const } : {}) });
+    // No settle or maintenance writes may follow a stale rejection.
+    if (result.outcome === 'born-rejected') return result;
     this.fireSettled(parentWf);
     // The child's own firings (re-arming its producer with the feedback on
     // its owes thread) need tick(child) — not driven from here; see docs/design.md
     // M2/M2B "sweeping" note. Prompt maintainCalls now so the parent's own
     // state (owed/pin) is visible immediately, mirroring provideInput's cascade.
     this.maintainCalls(parentWf, def);
-    return { outcome: 'rejected' };
+    return result;
   }
 
   /** Retract a collection member (§11.3): drop it, terminally; abandon the index. */
@@ -3711,6 +3970,8 @@ export class Engine {
     const { def, modifier } = this.instanceFor(workflow);
     const arts = this.artMap(workflow);
     const st: EngineWorkflowStatus = workflowStatus(def, arts, { modifier });
+    const invocationSteps = def.steps.filter(s => s.callsInterface?.selection === 'invocation');
+    if (invocationSteps.length) st.invocations = Object.fromEntries(invocationSteps.map(s => [s.produces[0]!.stem, this.invocationStatus(workflow, s.produces[0]!.stem)]));
     // Enrich each debt with its producer's crash-step signal (the run log; the
     // pure layer has no store). A map-step producer fires once per element, its
     // run keyed by the consumed element path (e.g. "gather.source[0]"); a
@@ -3735,7 +3996,7 @@ export class Engine {
     for (const d of st.debts) {
       const callsStep = def.steps.find((s) => isCallStep(s) && s.produces[0]!.stem === d.path);
       if (!callsStep) continue;
-      const child = this.store.findChildByParent(workflow, d.path);
+      const child = this.currentCallsChild(workflow, d.path);
       if (!child) continue;
       const summary = this.childStatusSummary(child.id, new Set());
       if (summary !== undefined) d.child = summary;
@@ -3900,6 +4161,16 @@ export class Engine {
 
   /** Materialize owed outputs + run the cascade to a fixpoint (inside a tx). */
   private settle(workflow: string, def: WorkflowDef, now?: number): void {
+    for (const step of def.steps) {
+      if (step.callsInterface?.selection !== 'invocation') continue;
+      const art = this.store.getArtifact(workflow, step.produces[0]!.stem);
+      if (!isGreen(art) || !art) continue;
+      const binding = this.currentInvocation(workflow, step);
+      if (!binding || !art.fingerprint?.[`__invocation_${binding.id}__`]) {
+        this.store.putArtifact({ ...art, acceptance: 'owed', fingerprint: undefined },
+          { action: 'reopened', actor: 'engine', reason: 'invocation generation moved' });
+      }
+    }
     const limit = 1000;
     for (let i = 0; i < limit; i++) {
       let arts = this.artMap(workflow);
@@ -4214,7 +4485,7 @@ export class Engine {
       for (const d of cs.debts) {
         const callsStep = childDef.steps.find((s) => isCallStep(s) && s.produces[0]!.stem === d.path);
         if (!callsStep) continue;
-        const grandchild = this.store.findChildByParent(childWf, d.path);
+        const grandchild = this.currentCallsChild(childWf, d.path);
         if (!grandchild || visited.has(grandchild.id)) continue;
         if (this.childStatusSummary(grandchild.id, visited)?.stalled) {
           stalled = true;

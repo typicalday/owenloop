@@ -140,6 +140,33 @@ test('collection lease: checker reaches unsealed member and schema refusal as se
   assert.ok(refused?.path.some((move) => move.outcome === 'collection-schema-reject'));
 });
 
+test('collection lease: invocation wait does not hide an open producer run', () => {
+  const definition = def('invocation-with-collection', [input('q', { seedOwed: false })], [
+    step({ name: 'gather', consumes: ['q'], produces: ['items[]'] }),
+    {
+      ...step({ name: 'choose', produces: ['choice'] }),
+      callsInterface: {
+	name: 'report', version: '1', selection: 'invocation',
+	signature: { inputs: [{ name: 'data', schema: true }], outputs: [{ name: 'result', schema: true }] },
+	policy: { name: 'local', version: '1', config: {} },
+      },
+      callsInputs: { data: 'q' },
+    },
+  ]);
+  definition.invariants = [{
+    name: 'member-requires-seal', when: { path: 'items[0]', is: 'green' },
+    requires: { path: 'items.sealed', is: 'green' },
+  }];
+  const report = modelCheck(definition, {
+    maxStates: 2000, maxDepth: 20, maxCollectionSize: 1, assumeProvided: true,
+  });
+  const beforeSeal = report.invariantViolations.find((finding) => finding.invariant === 'member-requires-seal');
+  assert.ok(beforeSeal?.path.some((move) => move.outcome === 'collection-emit'),
+    'an unrelated invocation wait must not suppress valid lease transitions');
+  assert.ok(report.externalSelectionWait?.length,
+    'the checker still reports the invocation wait after other work stops');
+});
+
 test('collection lease: a capped schema-refused seal is recoverable while its producer run remains open', () => {
   const report = modelCheck(fixture(), {
     maxStates: 2000, maxDepth: 30, maxCollectionSize: 1, assumeProvided: true,

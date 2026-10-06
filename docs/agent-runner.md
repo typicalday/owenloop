@@ -85,7 +85,46 @@ Codex also refuses every defined `maxTurns` value before both cold start and res
 
 An omitted `filesystem` field preserves the existing Codex default sandbox behavior. `filesystem: unrestricted` preserves the existing explicit `danger-full-access` behavior. The legacy adapter extension `sandbox` remains available with `read-only`, `workspace-write`, or `danger-full-access` for backward compatibility, but `sandbox` is a vendor-specific pass-through rather than Owenloop's neutral filesystem guarantee. A workflow that requires an enforceable neutral read-only policy must select the Claude Code adapter.
 
-The worker-created `owenloop` MCP mount still wins any `mcp_servers.owenloop` name clash. The default unrestricted mount registers `get_order`, `submit`, and `reject`. Codex approval policy still accepts only `untrusted`, `on-request`, or `never` as vendor values.
+The worker-created `owenloop` MCP mount still wins any `mcp_servers.owenloop` name clash. The default mount registers `get_order`, `submit`, `reject`, `ask`, and `put_file_artifact`. Codex approval policy still accepts only `untrusted`, `on-request`, or `never` as vendor values.
+
+The Codex adapter also emits an explicit per-thread `enabled_tools` list and a
+`tools.<name>.approval_mode: approve` entry for each selected own-mount tool.
+Without a selector this names all five holder tools above, including file
+artifacts. `--mcp-tools=a,b` and `--mcp-tools a,b` on the worker's mount select
+exactly that supported subset. Like the holder parser, each occurrence is
+validated and the last valid occurrence wins; missing values, unknown or empty
+names, duplicate names, and malformed selectors refuse rather than falling
+back to the full surface. New holder tools require an explicit adapter and test
+change. There is no wildcard or server-wide default approval.
+
+The supplied September 19, 2026 diagnostic found that Desktop
+`0.154.0-alpha.6.2` rejected an MCP call under `approvalPolicy: never` before
+emitting the legacy callback, while standalone `0.147.0` emitted
+`mcpServer/elicitation/request`. The supplied named-policy probe succeeded for
+synthetic `get_order` on the Desktop runtime. That is evidence for this seam,
+not a claim about the first version that changed behavior or live success of
+every tool. The adapter retains the recorded `0.146.0` / supplied `0.147.0`
+own-mount tool-approval callback handling; foreign and non-tool elicitations
+remain refused, and ordinary command/file approvals still use their existing
+bridge.
+
+Start and resume, including reconstruction without local session state, install
+this policy on the worker-created reserved mount. Authored `mcpServers.owenloop`
+and `codexConfig.mcp_servers.owenloop` entries cannot replace or widen it.
+Command, copied argv, admitted environment, sandbox, thread approval policy,
+and unrelated configured servers are preserved. This does not edit operator
+settings or global configuration, select a different binary, or isolate all
+provider configuration layers described above.
+
+`harness-codex.test.ts` checks exact default/subset policies and builder purity;
+`harness-contract-fixtures.test.ts` drives the real adapter through the separately
+marked synthetic `codex-app-server-mcp-policy.jsonl` policy model. The latter
+checks all five tools and smaller subsets under `never`, excluded/unknown tools,
+foreign authority, and cross-process-style resume without own-tool elicitation.
+These are offline protocol tests with constant fixture results, not new live
+provider runs or real holder side effects. Historical recordings remain
+unchanged; existing replay and approval tests retain legacy coverage. Opt-in
+live tests are not needed for this regression proof.
 
 ## Neutral approval modes
 
@@ -129,7 +168,7 @@ For Claude Code isolation, the adapter sets `settingSources: []`, `strictMcpConf
 
 The born-bound Owenloop MCP server is created by the worker from the live workflow, run, origin, account, Shift, and held claim. Workflow extension data cannot replace that mount. During isolation, the adapter adds `mcp__owenloop__get_order`, `mcp__owenloop__submit`, and `mcp__owenloop__ask` to `allowedTools` so those control calls execute without an unattended permission prompt. `allowedTools` controls permission automation; `allowedTools` does not filter the MCP server's `tools/list` response. The positive registration list on the MCP child is the visibility boundary. The adapter also adds `mcp__owenloop__reject` to `disallowedTools` as defense in depth. A direct deny or an MCP wildcard deny that blocks Owenloop `get_order`, `submit`, or `ask` is refused.
 
-Outside Claude Code isolation, the default work-holder MCP child continues to register `get_order`, `submit`, and `reject`.
+Outside Claude Code isolation, the default work-holder MCP child registers `get_order`, `submit`, `reject`, `ask`, and `put_file_artifact`.
 
 ## Security boundary
 

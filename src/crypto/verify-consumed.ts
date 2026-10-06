@@ -34,6 +34,7 @@ export interface CallsRelayExpectation {
   /** The child definition's single outcome stem (`outputs[0]`), the artifact
    *  the child's record must cover; the engine folds it into `path`. */
   childOutcome: string;
+  childWorkflow?: string;
 }
 
 export interface VerifyConsumedInput {
@@ -267,6 +268,7 @@ export async function verifyConsumed(
   // exactly the child definition the verified parent pins, and only under the
   // child's outcome stem. Both expectations are the consumer's own bytes.
   const relay = input.relay;
+  if (relay?.childWorkflow !== undefined && record.workflow !== relay.childWorkflow) return invalid(`calls: signed child workflow '${record.workflow}' does not match trusted invocation '${relay.childWorkflow}'`);
   if (relay !== undefined && record.defDigest !== relay.childDefDigest) {
     return invalid(`calls: relayed submission record for artifact '${input.path}' was signed for definition digest '${record.defDigest}', but the verified parent definition pins its calls child at '${relay.childDefDigest}'`);
   }

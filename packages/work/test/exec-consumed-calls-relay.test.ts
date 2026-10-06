@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -15,7 +15,7 @@ import {
 } from '../../../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
-import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
+import { createDefaultStoreInstructionResolver, createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import type { OrderPacket } from '../src/hub/types.ts';
 
 // Calls boundary, end to end through the command resolver. The parent's
@@ -405,3 +405,97 @@ test('calls relay: a consumer without a verified definition in hand cannot corro
   assert.equal(enforced.ok, false);
   if (!enforced.ok) assert.match(enforced.reason, /\(prerequisite\) .* calls-boundary relay/);
 });
+
+import { runtimeFixture, ready } from '../../../test/helpers/runtime-selection.ts';
+import type { InvocationBindingSource } from '../../../src/types.ts';
+
+import { createEngine } from '../../../src/factory.ts';
+import { loadCasDefs } from '../../../src/store/def-source.ts';
+
+for (const crossStore of [false, true]) {
+for (const factory of ['store', 'default'] as const) {
+test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted SQLite/CAS receipt corroborates signed workflow, digest, outcome, version and value`, async () => {
+  const cwd = tempDir('owenloop-default-relay-');
+  const env = trustEnv();
+  const globalRoot = crossStore ? join(env.HOME!, '.owenloop', 'workflows') : join(cwd, 'workflows');
+  const f = await runtimeFixture(':memory:', globalRoot);
+  const projectRoot = crossStore ? join(cwd, 'workflows') : f.root;
+  if (crossStore) {
+    const yaml = readFileSync(f.defs.get('parent/parent@1.0.0')!.dir!, 'utf8')
+      .replace('name: parent', 'name: hybrid')
+      .replace('steps:\n', 'steps:\n  - name: concrete\n    calls: left/left@1.0.0\n    inputs: {data: seed}\n    produces: [concrete]\n');
+    await installBundleFixture({ root: projectRoot, projectRoot, globalRoot,
+      sourceDir: writeBundleSource({ name: 'hybrid', workflow: yaml,
+      lock: { 'left/left@1.0.0': f.candidates[0]!.DefRef.bundleDigest } }) });
+    f.store.close();
+    Object.assign(f, createEngine({ db: ':memory:', defs: new Map(
+      loadCasDefs({ projectRoot, globalRoot, warn: () => {} }).map(r => [r.key, r.def])) }));
+  }
+  const workflow = f.engine.createInstance(crossStore ? 'hybrid/hybrid@1.0.0' : 'parent/parent@1.0.0', { provide: { seed: { n: 1 } } });
+  for (const [i, path] of ['one', 'two'].entries()) f.engine.applyChoice(ready(f.engine, workflow, path, f.candidates), f.candidates[i]!);
+  const children = f.engine.tick(workflow, { deep: true }).orders;
+  for (const o of children) {
+    f.engine.green(o.workflow, o.run, 'result', U1_VALUE);
+    f.engine.close(o.workflow, o.run);
+  }
+  const finish = f.engine.tick(workflow, { deep: true }).orders[0]!;
+  const parentDigest = f.store.getWorkflow(workflow)!.defSnapshot!.bundleDigest!;
+  const proofs: Record<string, string> = {}, relays: NonNullable<OrderPacket['consumesProofRelay']> = {};
+  for (const path of ['one', 'two']) {
+    const b = f.store.listInvocations(workflow).find(b => b.key.callPath === path)!;
+    const child = f.store.findChildByInvocation(b.id)!;
+    const a = f.store.getArtifact(child.id, 'result')!;
+    proofs[path] = envelope({ run: children.find(o => o.workflow === child.id)!.run, workflow: child.id,
+      defDigest: b.selected.DefRef.bundleDigest, step: 'work', key: '',
+      produced: [{ artifact: 'result', version: a.version, valueDigest: valueDigestHex(U1_VALUE) }],
+      consumedFingerprint: {}, producerKeyId: ROOT_KEY_ID, timestamp: 10 });
+    relays[path] = { childDefDigest: b.selected.DefRef.bundleDigest, childOutcome: 'result', childVersion: a.version };
+  }
+  const fixtureData: Fixture = { projectRoot, parentDigest, childDigest: f.candidates[0]!.DefRef.bundleDigest, env };
+  const packet: OrderPacket = { ...order(fixtureData), workflow, run: finish.run, step: 'finish', key: '',
+    inputs: ['one', 'two'], consumes: finish.consumes, consumedFingerprint: finish.consumedFingerprint,
+    consumesProof: JSON.stringify(proofs), consumesProofRelay: relays };
+  const source = f.engine.invocationBindingSource();
+  const resolver = (invocationBindingSource?: InvocationBindingSource) => {
+    const options = {
+      verifier: createBundleIngestor(),
+      definitionVerifier: () => ({ kind: 'verified' as const, publisherKeyId: '', principal: '' }),
+      consumedVerifier: verifierFor(fixtureData, 'enforce'), invocationBindingSource,
+    };
+    return factory === 'default'
+      ? createDefaultStoreInstructionResolver({ ...options, cwd, env: fixtureData.env })
+      : createStoreInstructionResolver({ ...options, projectRoot, globalRoot });
+  };
+  const reads: Parameters<InvocationBindingSource['read']>[0][] = [];
+  const passed = await resolver({ read: key => { reads.push(key); return source.read(key); } }).resolveCommand(packet);
+  assert.equal(passed.ok, true, JSON.stringify(passed));
+  assert.deepEqual(reads.map(key => key.callPath), ['one', 'two']);
+  assert.equal(typeof passed.revalidate, 'function');
+  assert.equal(await passed.revalidate!(), undefined);
+  assert.deepEqual(reads.slice(2), reads.slice(0, 2), 'final revalidation rereads both trusted receipts');
+  const refused = async (p: OrderPacket, src: InvocationBindingSource | undefined = source) => {
+    const r = await resolver(src).resolveCommand(p);
+    assert.equal(r.ok, false, JSON.stringify(r));
+    return r.ok ? '' : r.reason;
+  };
+  const signedRecord = JSON.parse(Buffer.from(JSON.parse(proofs.one!).payload, 'base64').toString('utf8'));
+  for (const change of [ { workflow: 'different-child' }, { defDigest: OTHER_DIGEST },
+    { produced: [{ artifact: 'other', version: 1, valueDigest: valueDigestHex(U1_VALUE) }] },
+    { produced: [{ artifact: 'result', version: 999, valueDigest: valueDigestHex(U1_VALUE) }] },
+    { produced: [{ artifact: 'result', version: 1, valueDigest: valueDigestHex({ wrong: true }) }] } ]) {
+    await refused({ ...packet, consumesProof: JSON.stringify({ ...proofs, one: envelope({ ...signedRecord, ...change }) }) });
+  }
+  await refused({ ...packet, consumesProofRelay: { ...relays, one: { ...relays.one!, childVersion: 999 } } });
+  await refused({ ...packet, consumedFingerprint: { ...packet.consumedFingerprint, one: 999 } });
+  const absent = await resolver().resolveCommand(packet);
+  assert.equal(absent.ok, false);
+  if (!absent.ok) assert.match(absent.reason, /InvocationBindingSource/);
+  await refused(packet, { read: () => undefined });
+  await refused(packet, { read: () => { throw new Error('unavailable'); } });
+  f.engine.cancelRun(workflow);
+  assert.equal((await passed.revalidate!())?.ok, false);
+  f.store.close();
+});
+}
+
+}

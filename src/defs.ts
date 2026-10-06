@@ -32,6 +32,8 @@ import { assertValidSchema } from './schema.ts';
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
 import { parseVersionedCallTarget } from './bundle/call-target.ts';
 import { parseWorkflowCoordinate } from './store/types.ts';
+import { validInvocationCall } from './invocation.ts';
+import type { InterfaceCall } from './types.ts';
 import { isCallStep } from './types.ts';
 import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, OnCancelDef, StepDef, ProducePattern, WorkflowDef, WorkflowInterfaceClaim } from './types.ts';
 
@@ -645,7 +647,11 @@ export class InterfaceCallDefinitionError extends DefError {
   }
 }
 
-function parseCallsInterface(value: unknown, step: string): WorkflowInterfaceClaim {
+function parseCallsInterface(value: unknown, step: string): InterfaceCall {
+  if (typeof value === 'object' && value !== null && 'selection' in value) {
+    if (!validInvocationCall(value)) throw new InterfaceCallDefinitionError(step, undefined, 'invalid invocation signature or JSON-only policy');
+    return structuredClone(value);
+  }
   const claim = typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
@@ -1153,9 +1159,9 @@ export function expandIncludes(
   // cannot carry them. Preserve the original descriptor explicitly so an
   // include-expanded CAS definition still coordinates its snapshot writes with
   // bundle GC.
-  const storeRoots = Object.getOwnPropertyDescriptor(def, 'bundleStoreRoots');
-  if (storeRoots !== undefined) {
-    Object.defineProperty(expanded, 'bundleStoreRoots', storeRoots);
+  for (const key of ['bundleStoreRoots', 'bundleResolutionContext'] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(def, key);
+    if (descriptor !== undefined) Object.defineProperty(expanded, key, descriptor);
   }
   return expanded;
 }

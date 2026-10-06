@@ -1055,6 +1055,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 
     let resolvedCommand: string;
     let resolvedBundleDir: string | undefined;
+    let revalidate: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     try {
       const resolved = await opts.instructions.resolveCommand(order);
       if (!resolved.ok) {
@@ -1065,6 +1066,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       }
       resolvedCommand = resolved.command;
       resolvedBundleDir = resolved.bundleDir;
+      revalidate = resolved.revalidate;
     } catch (e) {
       opts.err(
         `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
@@ -1160,6 +1162,17 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
           );
         }
         const startOptions = { cwd, env: childEnv };
+        if (revalidate) {
+          let reason: string | undefined;
+          try { reason = (await revalidate())?.reason; }
+          catch (error) { reason = `trusted pre-launch revalidation failed: ${errMsg(error)}`; }
+          if (reason !== undefined) {
+            opts.err(reason);
+            lease.stop('unresolved-instructions');
+            await leasePromise;
+            return 'unresolved-instructions';
+          }
+        }
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
 	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
