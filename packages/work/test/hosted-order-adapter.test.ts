@@ -14,7 +14,37 @@ import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../src/store/index.ts';
 import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import type { GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
-import { createDefaultHostedOrderAdapter, createHostedOrderAdapter, hostedPacketDigest } from '../src/hosted/order-adapter.ts';
+import { createDefaultHostedOrderAdapter, createHostedOrderAdapter, hostedReferencePacketDigest } from '../src/hosted/order-adapter.ts';
+
+const CALLS_CHILD = `name: hosted-child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: change
+    consumes: [data]
+    produces: [result]
+    terminal: true
+    body: "Change the data."
+outputs: [result]
+`;
+const CALLS_PARENT = `name: hosted-calls
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: unit
+    calls: hosted-child
+    inputs:
+      data: seed
+    produces: [unit-result]
+  - name: inspect
+    consumes: [unit-result]
+    produces: [out]
+    terminal: true
+    body: "Inspect the result."
+outputs: [out]
+`;
 
 const VALUE = { request: 'signed value' };
 const WORKFLOW = `name: hosted-adapter
@@ -56,35 +86,6 @@ steps:
     produces: ['items[$i].note', audit]
     body: "Annotate the bound item."
 `;
-const CALLS_CHILD = `name: hosted-child
-inputs:
-  - name: data
-    seedOwed: true
-steps:
-  - name: change
-    consumes: [data]
-    produces: [result]
-    terminal: true
-    body: "Change the data."
-outputs: [result]
-`;
-const CALLS_PARENT = `name: hosted-calls
-inputs:
-  - name: seed
-    seedOwed: true
-steps:
-  - name: unit
-    calls: hosted-child
-    inputs:
-      data: seed
-    produces: [unit-result]
-  - name: inspect
-    consumes: [unit-result]
-    produces: [out]
-    terminal: true
-    body: "Inspect the result."
-outputs: [out]
-`;
 
 async function proof(value: unknown, keyPath: string, keyId: string, artifact = 'seed', version = 2): Promise<string> {
   const payload = {
@@ -102,10 +103,10 @@ async function proof(value: unknown, keyPath: string, keyId: string, artifact = 
   }
 }
 
-async function fixture() {
+async function fixture(workflow = WORKFLOW) {
   const installed = await installBundleFixture({
     root: tempDir('owenloop-hosted-adapter-project-'),
-    sourceDir: writeBundleSource({ name: 'hosted-adapter', workflow: WORKFLOW }),
+    sourceDir: writeBundleSource({ name: 'hosted-adapter', workflow }),
   });
   const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
   const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
@@ -138,6 +139,9 @@ function preflight(defDigest: string, extras: Record<string, unknown> = {}): unk
 
 async function harness(overrides: {
   response?: (p: OrderPacket, fetchCount: number) => GetOrderResponse | null | Promise<GetOrderResponse | null>;
+  wireResponse?: (p: OrderPacket, fetchCount: number) => unknown;
+  status?: number;
+  workflowYaml?: string;
   received?: (body: unknown, init: RequestInit) => void;
   missingPublicationVerifier?: boolean;
   throwPublicationVerifier?: boolean;
@@ -147,21 +151,23 @@ async function harness(overrides: {
   now?: () => number;
   monotonicNow?: () => number;
 } = {}) {
-  const f = await fixture();
+  const f = await fixture(overrides.workflowYaml);
   const p = await packet(f.defDigest, f.keyPath, f.rootKeyId);
   let fetches = 0;
-  const fetchImpl: typeof fetch = async (_input, init) => {
+  const fetchImpl: typeof fetch = async (input, init) => {
     fetches++;
     if (overrides.throwFetch) throw new Error('HOSTILE RAW FETCH ERROR');
     overrides.received?.(JSON.parse(String(init?.body)), init ?? {});
+    assert.equal(String(input), 'https://trusted.example/api/reference_order/v1');
     if (overrides.redirectResponse) {
       if (init?.redirect === 'error') throw new TypeError('redirect blocked');
-      return new Response(JSON.stringify({ text: 'HOSTILE REDIRECT TARGET', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } }), { status: 200 });
+      return new Response(JSON.stringify({ text: 'HOSTILE REDIRECT TARGET' }), { status: 200 });
     }
-    const response = overrides.response === undefined ? {
+    const raw = overrides.response === undefined ? {
       text: 'HOSTILE RAW REST TEXT', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
     } : await overrides.response(p, fetches);
-    return new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } });
+    const response = overrides.wireResponse === undefined ? serviceWire(raw) : overrides.wireResponse(p, fetches);
+    return new Response(JSON.stringify(response), { status: overrides.status ?? 200, headers: { 'content-type': 'application/json' } });
   };
   const adapter = createHostedOrderAdapter({
     hub: { origin: 'https://trusted.example', getToken: async () => 'local-secret', fetchImpl },
@@ -183,6 +189,31 @@ async function harness(overrides: {
   return { adapter, p, f, fetches: () => fetches };
 }
 
+/** Test double for the Service v1 allowlist. Negative tests can bypass this
+ * helper with wireResponse to inject malformed protocol payloads. */
+function serviceWire(raw: GetOrderResponse | null): unknown {
+  if (raw === null) return null;
+  const { workflow, run, order, lease } = raw;
+  const base = { protocol: 'trusted-reference-read-v1', workflow, run };
+  if (order === null || !lease.claimed || lease.outcome !== undefined) return { ...base, state: 'unavailable' };
+  if (order.owes.some((owed) => owed.reasons.length > 0 || owed.judgmentRejects > 0
+    || owed.schemaRejects > 0 || Object.hasOwn(owed, 'previousValue'))) return { ...base, state: 'unsupported-feedback' };
+  return { ...base, state: 'available', order: {
+    workflow: order.workflow, run: order.run, step: order.step, key: order.key,
+    ...(order.index === undefined ? {} : { index: order.index }),
+    defDigest: order.defDigest, inputs: order.inputs, outputs: order.outputs,
+    consumes: order.consumes, consumedFingerprint: order.consumedFingerprint,
+    ...(order.consumesProof === undefined ? {} : { consumesProof: order.consumesProof }),
+    ...(order.consumesProofRelay === undefined ? {} : { consumesProofRelay: order.consumesProofRelay }),
+    owes: order.owes.map((owed) => ({ path: owed.path, version: owed.version,
+      ...(owed.proof === undefined ? {} : { proof: owed.proof }) })),
+  }, lease: { claimed: true } };
+}
+
+function availableWire(order: OrderPacket): Record<string, unknown> {
+  return serviceWire({ text: '', workflow: order.workflow, run: order.run, order, lease: { claimed: true } }) as Record<string, unknown>;
+}
+
 test('valid signed consume crosses direct authenticated fetch into a minimized labeled projection', async () => {
   const h = await harness({ received: (body, init) => {
     assert.deepEqual(body, { workflow: 'wf-hosted', run: 'run-hosted' });
@@ -192,8 +223,9 @@ test('valid signed consume crosses direct authenticated fetch into a minimized l
   let privatePacket: { order: OrderPacket; collectionOutputs: string[] } | undefined;
   const result = await h.adapter.open(preflight(h.f.defDigest, { prompt: 'HOSTILE RELAY PROMPT' }), 0,
     (packet) => { privatePacket = packet; });
-  assert.equal(result.state, 'ready');
-  assert.deepEqual(privatePacket, { order: h.p, collectionOutputs: [] });
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  assert.deepEqual(privatePacket, { order: (serviceWire({ workflow: h.p.workflow, run: h.p.run,
+    order: h.p, lease: { claimed: true }, text: '' }) as { order: OrderPacket }).order, collectionOutputs: [] });
   assert.equal(h.fetches(), 1);
   if (result.state !== 'ready') return;
   assert.equal(result.definition.bodyTrust, 'verified-local-publication');
@@ -205,7 +237,7 @@ test('valid signed consume crosses direct authenticated fetch into a minimized l
   assert.deepEqual(result.consumes, [{ path: 'seed', value: VALUE, trust: 'signed-value-and-local-chain-at-service-observed-version' }]);
   assert.deepEqual(result.outputs, [{ path: 'out', version: 1, versionTrust: 'trusted-service-observation' }]);
   assert.deepEqual(result.serviceObservation, {
-    workflow: 'wf-hosted', run: 'run-hosted', step: 'make', packetDigest: hostedPacketDigest(h.p),
+    workflow: 'wf-hosted', run: 'run-hosted', step: 'make', packetDigest: hostedReferencePacketDigest(h.p),
     observedAt: 1_000, expiresAt: 6_000,
   });
   const rendered = JSON.stringify(result);
@@ -218,6 +250,64 @@ test('malformed preflight never triggers a direct fetch', async () => {
     protocol: 'local-hosted-order-v1', state: 'unavailable',
   });
   assert.equal(h.fetches(), 0);
+});
+
+test('old Service 404 and malformed v1 acknowledgements never retry legacy get_order', async () => {
+  const old = await harness({ status: 404, wireResponse: () => ({ error: 'not_found', message: 'OLD RAW SERVICE' }) });
+  assert.deepEqual(await old.adapter.open(preflight(old.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable',
+  });
+  assert.equal(old.fetches(), 1);
+  for (const wireResponse of [
+    (p: OrderPacket) => ({ ...availableWire(p), protocol: undefined }),
+    (p: OrderPacket) => ({ ...availableWire(p), protocol: 'client-preflight-v1' }),
+    (p: OrderPacket) => ({ ...availableWire(p), state: 'new-unknown-state' }),
+    (p: OrderPacket) => ({ ...availableWire(p), text: 'HOSTILE LEGACY TEXT' }),
+  ]) {
+    const h = await harness({ wireResponse });
+    const result = await h.adapter.open(preflight(h.f.defDigest));
+    assert.equal(result.state, 'refused');
+    assert.equal(h.fetches(), 1);
+    assert.doesNotMatch(JSON.stringify(result), /HOSTILE|signed value/u);
+  }
+});
+
+test('v1 rejects missing dynamic identity, extra authored fields and malformed proof envelopes', async () => {
+  const mutations: Array<(wire: Record<string, unknown>) => unknown> = [
+    (wire) => ({ ...wire, order: { ...(wire.order as object), consumedFingerprint: undefined } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), spec: { prompt: 'HOSTILE' } } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), modifier: 'deep' } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), cause: 'idle' } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), consumesProof: '{bad-json' } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), consumesProof: undefined } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), owes: [{ path: 'out', version: 0 }] } }),
+    (wire) => ({ ...wire, order: { ...(wire.order as object), owes: [{ path: 'out', version: 1, proof: { hostile: true } }] } }),
+    (wire) => ({ ...wire, lease: { claimed: false } }),
+    (wire) => ({ ...wire, lease: { claimed: true, claimedAt: 'unknown' } }),
+  ];
+  for (const mutate of mutations) {
+    const h = await harness({ wireResponse: (p) => mutate(availableWire(p)) });
+    const result = await h.adapter.open(preflight(h.f.defDigest));
+    assert.equal(result.state, 'refused', JSON.stringify(result));
+    assert.equal(h.fetches(), 1);
+    assert.doesNotMatch(JSON.stringify(result), /HOSTILE|signed value/u);
+  }
+});
+
+test('v1 refuses modifier-dependent local definitions and explicit unsupported Service states', async () => {
+  const modified = await harness({ workflowYaml: WORKFLOW.replace('Use the verified seed for ${WORKFLOW}.',
+    'Use ${MODIFIER} with the verified seed.') });
+  assert.deepEqual(await modified.adapter.open(preflight(modified.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'unsupported-service-v1-shape',
+  });
+  for (const state of ['unavailable', 'unsupported-feedback', 'routing-unsupported'] as const) {
+    const h = await harness({ wireResponse: (p) => ({ protocol: 'trusted-reference-read-v1', state,
+      workflow: p.workflow, run: p.run }) });
+    assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
+      protocol: 'local-hosted-order-v1', state: 'refused', code: `service-${state}`,
+    });
+    assert.equal(h.fetches(), 1);
+  }
 });
 
 test('hostile preflight cannot use the local bearer token to select another order', async () => {
@@ -244,7 +334,7 @@ test('a rebound direct response and a stale claim are refused', async () => {
   });
   const stale = await harness({ response: (p) => ({ text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: false } }) });
   assert.deepEqual(await stale.adapter.open(preflight(stale.f.defDigest)), {
-    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-not-current',
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'service-unavailable',
   });
   const digest = await harness();
   assert.deepEqual(await digest.adapter.open(preflight('a'.repeat(64))), {
@@ -259,23 +349,23 @@ test('every retrieval fetches a fresh service claim and refuses after re-offer',
   }) });
   assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'ready');
   assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
-    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-not-current',
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'service-unavailable',
   });
   assert.equal(h.fetches(), 2);
 });
 
 test('unsupported feedback and previous value never cross the boundary', async () => {
-  for (const change of [
-    (p: OrderPacket) => { p.owes[0]!.reasons = [{ at: 1, action: 'reject', kind: 'human', by: 'x', text: 'HOSTILE REASON' }]; },
-    (p: OrderPacket) => { p.owes[0]!.proof = 'unsupported-reason-proof'; },
-    (p: OrderPacket) => { p.owes[0]!.previousValue = 'HOSTILE OLD VALUE'; },
-  ]) {
+  for (const [code, change] of [
+    ['service-unsupported-feedback', (p: OrderPacket) => { p.owes[0]!.reasons = [{ at: 1, action: 'reject', kind: 'human', by: 'x', text: 'HOSTILE REASON' }]; }],
+    ['unsupported-feedback', (p: OrderPacket) => { p.owes[0]!.proof = 'unsupported-reason-proof'; }],
+    ['service-unsupported-feedback', (p: OrderPacket) => { p.owes[0]!.previousValue = 'HOSTILE OLD VALUE'; }],
+  ] as const) {
     const h = await harness({ response: (p) => {
       change(p);
       return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
     } });
     assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
-      protocol: 'local-hosted-order-v1', state: 'refused', code: 'unsupported-feedback',
+      protocol: 'local-hosted-order-v1', state: 'refused', code,
     });
   }
 });
@@ -312,7 +402,7 @@ test('missing execution-time publication verifier refuses under enforce policy',
 test('raw transport and verifier errors become fixed refusal codes', async () => {
   const fetchFailure = await harness({ throwFetch: true });
   assert.deepEqual(await fetchFailure.adapter.open(preflight(fetchFailure.f.defDigest)), {
-    protocol: 'local-hosted-order-v1', state: 'refused', code: 'direct-fetch-failed',
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable',
   });
   const verifierFailure = await harness({ throwPublicationVerifier: true });
   assert.deepEqual(await verifierFailure.adapter.open(preflight(verifierFailure.f.defDigest)), {
@@ -333,7 +423,7 @@ test('raw transport and verifier errors become fixed refusal codes', async () =>
 test('a redirected get_order is refused before redirected content is parsed', async () => {
   const h = await harness({ redirectResponse: true });
   assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
-    protocol: 'local-hosted-order-v1', state: 'refused', code: 'direct-fetch-failed',
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable',
   });
   assert.equal(h.fetches(), 1);
 });
@@ -362,17 +452,16 @@ test('raw author fields cannot become instructions or replace local output schem
 });
 
 test('unknown future order fields and absent packets fail closed', async () => {
-  const unknown = await harness({ response: (p) => ({
-    text: '', workflow: p.workflow, run: p.run,
-    order: { ...p, futurePrompt: 'HOSTILE FUTURE FIELD' } as OrderPacket,
-    lease: { claimed: true },
-  }) });
+  const unknown = await harness({ wireResponse: (p) => {
+    const wire = serviceWire({ text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } }) as { order: OrderPacket };
+    return { ...wire, order: { ...wire.order, futurePrompt: 'HOSTILE FUTURE FIELD' } };
+  } });
   assert.deepEqual(await unknown.adapter.open(preflight(unknown.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'unsupported-order-field',
   });
   const absent = await harness({ response: (p) => ({ text: '', workflow: p.workflow, run: p.run, order: null, lease: { claimed: false } }) });
   assert.deepEqual(await absent.adapter.open(preflight(absent.f.defDigest)), {
-    protocol: 'local-hosted-order-v1', state: 'unavailable',
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'service-unavailable',
   });
 });
 
@@ -410,7 +499,7 @@ test('missing consumed paths and mismatched owed paths cannot be projected as a 
 
 test('lease observation expires during slow local verification or unsafe timestamp arithmetic', async () => {
   let tick = 0;
-  const expired = await harness({ now: () => (++tick < 3 ? 1_000 : 6_000) });
+  const expired = await harness({ now: () => (++tick === 1 ? 1_000 : 6_000) });
   assert.deepEqual(await expired.adapter.open(preflight(expired.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
   });
@@ -418,127 +507,6 @@ test('lease observation expires during slow local verification or unsafe timesta
   assert.deepEqual(await overflow.adapter.open(preflight(overflow.f.defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'clock-unavailable',
   });
-});
-
-test('a delayed direct fetch cannot reset the claim observation window', async () => {
-  let clock = 1_000;
-  let releaseFetch!: () => void;
-  const delayed = new Promise<void>((resolve) => { releaseFetch = resolve; });
-  let fetchEntered!: () => void;
-  const entered = new Promise<void>((resolve) => { fetchEntered = resolve; });
-  const h = await harness({
-    now: () => clock,
-    response: async (p) => {
-      fetchEntered();
-      await delayed;
-      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
-    },
-  });
-  const pending = h.adapter.open(preflight(h.f.defDigest));
-  await entered;
-  clock = 6_000;
-  releaseFetch();
-  assert.deepEqual(await pending, {
-    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
-  });
-  assert.equal(h.fetches(), 1);
-});
-
-test('a wall-clock rollback during direct fetch cannot extend the monotonic observation window', async () => {
-  let wall = 10_000;
-  let elapsed = 0;
-  let releaseFetch!: () => void;
-  const delayed = new Promise<void>((resolve) => { releaseFetch = resolve; });
-  let fetchEntered!: () => void;
-  const entered = new Promise<void>((resolve) => { fetchEntered = resolve; });
-  const h = await harness({
-    now: () => wall,
-    monotonicNow: () => elapsed,
-    response: async (p) => {
-      fetchEntered();
-      await delayed;
-      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
-    },
-  });
-  const pending = h.adapter.open(preflight(h.f.defDigest));
-  await entered;
-  // Simulate seven seconds of monotonic elapsed time while the wall clock only advances 100 ms.
-  elapsed = 7_000;
-  wall = 10_100;
-  releaseFetch();
-  assert.deepEqual(await pending, {
-    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
-  });
-});
-
-test('a shorter rollback leaves only the remaining monotonic TTL in the projected epoch expiry', async () => {
-  let wall = 10_000;
-  let elapsed = 0;
-  const h = await harness({
-    now: () => wall,
-    monotonicNow: () => elapsed,
-    response: (p) => {
-      elapsed = 4_000;
-      wall = 10_100;
-      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
-    },
-  });
-  const result = await h.adapter.open(preflight(h.f.defDigest));
-  assert.equal(result.state, 'ready');
-  if (result.state === 'ready') assert.equal(result.serviceObservation.expiresAt, 11_100);
-});
-
-test('hosted custom source refuses a calls-produced path without a verified child closure', async () => {
-  const installed = await installBundleFixture({
-    root: tempDir('owenloop-hosted-calls-project-'),
-    sourceDir: writeBundleSource({
-      name: 'hosted-calls', workflow: CALLS_PARENT,
-      workflows: { 'hosted-child': CALLS_CHILD }, defaultWorkflow: 'hosted-calls',
-    }),
-  });
-  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
-  const child = loadDefFile(join(installed.result.objectPath, 'hosted-child.yaml'));
-  const definition = finalizeDefs(new Map([[loaded.name, loaded], [child.name, child]])).get(loaded.name);
-  assert.ok(definition);
-  const home = mkdtempSync(join(tmpdir(), 'owenloop-hosted-calls-home-'));
-  const keyPath = join(home, 'producer');
-  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'hosted-calls-test', '-f', keyPath], { stdio: 'ignore' });
-  const rootKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
-  mkdirSync(join(home, '.owenloop'));
-  writeFileSync(join(home, '.owenloop', 'org-root.pub'), rootKey.openSshPublicKey);
-  const defDigest = defInstructionDigest(definition);
-  const value = { accepted: 'ordinary-parent-path-proof' };
-  const p: OrderPacket = {
-    workflow: 'wf-hosted', run: 'run-hosted', step: 'inspect', key: '', defDigest,
-    inputs: ['unit-result'], outputs: ['out'], consumes: { 'unit-result': value },
-    consumedFingerprint: { 'unit-result': 1 },
-    consumesProof: JSON.stringify({ 'unit-result': await proof(value, keyPath, rootKey.keyid, 'unit-result', 1) }),
-    owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
-  };
-  const verifier = createBundleIngestor();
-  const globalRoot = tempDir('owenloop-hosted-calls-global-');
-  const complete = createStoreInstructionSource({ projectRoot: installed.root, globalRoot, verifier });
-  const { getVerifiedCallsChild: _omitted, ...withoutClosure } = complete;
-  const sources = [withoutClosure, { ...complete, getVerifiedCallsChild: () => undefined }];
-  for (const source of sources) {
-    const adapter = createHostedOrderAdapter({
-      hub: {
-	origin: 'https://trusted.example', getToken: async () => 'local-secret',
-	fetchImpl: async () => new Response(JSON.stringify({
-	  workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
-	}), { status: 200 }),
-      },
-      expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
-      instructionSource: {
-	projectRoot: installed.root, globalRoot, verifier, source, env: { HOME: home },
-	definitionVerifier: () => ({ kind: 'verified', publisherKeyId: rootKey.keyid, principal: 'publisher' }),
-      },
-      consumeTrust: { env: { HOME: home } }, now: () => 1_000,
-    });
-    assert.deepEqual(await adapter.open(preflight(defDigest)), {
-      protocol: 'local-hosted-order-v1', state: 'refused', code: 'definition-integrity',
-    });
-  }
 });
 
 test('configured service origin must be HTTPS', async () => {
@@ -571,9 +539,9 @@ test('production wiring verifies a real signed local publication and real signed
     expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
     hub: {
       origin: 'https://trusted.example', getToken: async () => 'local-secret',
-      fetchImpl: async () => new Response(JSON.stringify({
+      fetchImpl: async () => new Response(JSON.stringify(serviceWire({
 	text: 'raw service text', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
-      }), { status: 200 }),
+      })), { status: 200 }),
     },
   });
   const result = await adapter.open(preflight(defDigest));
@@ -616,9 +584,9 @@ test('signed reduce order admits only the verified collection seal and member pa
     expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
     hub: {
       origin: 'https://trusted.example', getToken: async () => 'local-secret',
-      fetchImpl: async () => new Response(JSON.stringify({
+      fetchImpl: async () => new Response(JSON.stringify(serviceWire({
 	text: 'raw service text', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
-      }), { status: 200 }),
+      })), { status: 200 }),
     },
   });
   const result = await adapter.open(preflight(defDigest));
@@ -667,9 +635,9 @@ test('signed map order binds the bare key, index, input and output to one member
     expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
     hub: {
       origin: 'https://trusted.example', getToken: async () => 'local-secret',
-      fetchImpl: async () => new Response(JSON.stringify({
-	workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
-      }), { status: 200 }),
+      fetchImpl: async () => new Response(JSON.stringify(serviceWire({
+	text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
+      })), { status: 200 }),
     },
   });
   assert.equal((await adapter.open(preflight(defDigest))).state, 'ready');
@@ -693,4 +661,126 @@ test('signed map order binds the bare key, index, input and output to one member
   assert.deepEqual(await adapter.open(preflight(defDigest)), {
     protocol: 'local-hosted-order-v1', state: 'refused', code: 'output-path-mismatch',
   });
+});
+
+test('a delayed v1 fetch cannot reset the claim observation window', async () => {
+  let clock = 1_000;
+  let releaseFetch!: () => void;
+  const delayed = new Promise<void>((resolve) => { releaseFetch = resolve; });
+  let fetchEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { fetchEntered = resolve; });
+  const h = await harness({
+    now: () => clock,
+    response: async (p) => {
+      fetchEntered();
+      await delayed;
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    },
+  });
+  const pending = h.adapter.open(preflight(h.f.defDigest));
+  await entered;
+  clock = 6_000;
+  releaseFetch();
+  assert.deepEqual(await pending, {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
+  });
+  assert.equal(h.fetches(), 1);
+});
+
+test('a wall-clock rollback during v1 fetch cannot extend the monotonic observation window', async () => {
+  let wall = 10_000;
+  let elapsed = 0;
+  let releaseFetch!: () => void;
+  const delayed = new Promise<void>((resolve) => { releaseFetch = resolve; });
+  let fetchEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { fetchEntered = resolve; });
+  const h = await harness({
+    now: () => wall,
+    monotonicNow: () => elapsed,
+    response: async (p) => {
+      fetchEntered();
+      await delayed;
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    },
+  });
+  const pending = h.adapter.open(preflight(h.f.defDigest));
+  await entered;
+  // Simulate seven seconds of monotonic elapsed time while the wall clock only advances 100 ms.
+  elapsed = 7_000;
+  wall = 10_100;
+  releaseFetch();
+  assert.deepEqual(await pending, {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired',
+  });
+});
+
+test('a shorter rollback leaves only the remaining monotonic TTL in the projected epoch expiry', async () => {
+  let wall = 10_000;
+  let elapsed = 0;
+  const h = await harness({
+    now: () => wall,
+    monotonicNow: () => elapsed,
+    response: (p) => {
+      elapsed = 4_000;
+      wall = 10_100;
+      return { text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true } };
+    },
+  });
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready');
+  if (result.state === 'ready') assert.equal(result.serviceObservation.expiresAt, 11_100);
+});
+
+
+test('v1 hosted source refuses a calls-produced path without a verified child closure', async () => {
+  const installed = await installBundleFixture({
+    root: tempDir('owenloop-hosted-calls-project-'),
+    sourceDir: writeBundleSource({
+      name: 'hosted-calls', workflow: CALLS_PARENT,
+      workflows: { 'hosted-child': CALLS_CHILD }, defaultWorkflow: 'hosted-calls',
+    }),
+  });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const child = loadDefFile(join(installed.result.objectPath, 'hosted-child.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded], [child.name, child]])).get(loaded.name);
+  assert.ok(definition);
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-hosted-calls-home-'));
+  const keyPath = join(home, 'producer');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'hosted-calls-test', '-f', keyPath], { stdio: 'ignore' });
+  const rootKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
+  mkdirSync(join(home, '.owenloop'));
+  writeFileSync(join(home, '.owenloop', 'org-root.pub'), rootKey.openSshPublicKey);
+  const defDigest = defInstructionDigest(definition);
+  const value = { accepted: 'ordinary-parent-path-proof' };
+  const p: OrderPacket = {
+    workflow: 'wf-hosted', run: 'run-hosted', step: 'inspect', key: '', defDigest,
+    inputs: ['unit-result'], outputs: ['out'], consumes: { 'unit-result': value },
+    consumedFingerprint: { 'unit-result': 1 },
+    consumesProof: JSON.stringify({ 'unit-result': await proof(value, keyPath, rootKey.keyid, 'unit-result', 1) }),
+    owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+  };
+  const verifier = createBundleIngestor();
+  const globalRoot = tempDir('owenloop-hosted-calls-global-');
+  const complete = createStoreInstructionSource({ projectRoot: installed.root, globalRoot, verifier });
+  const { getVerifiedCallsChild: _omitted, ...withoutClosure } = complete;
+  const sources = [withoutClosure, { ...complete, getVerifiedCallsChild: () => undefined }];
+  for (const source of sources) {
+    const adapter = createHostedOrderAdapter({
+      hub: {
+	origin: 'https://trusted.example', getToken: async () => 'local-secret',
+	fetchImpl: async () => new Response(JSON.stringify(serviceWire({
+	  text: '', workflow: p.workflow, run: p.run, order: p, lease: { claimed: true },
+	})), { status: 200 }),
+      },
+      expected: { workflowId: 'wf-hosted', runId: 'run-hosted' },
+      instructionSource: {
+	projectRoot: installed.root, globalRoot, verifier, source, env: { HOME: home },
+	definitionVerifier: () => ({ kind: 'verified', publisherKeyId: rootKey.keyid, principal: 'publisher' }),
+      },
+      consumeTrust: { env: { HOME: home } }, now: () => 1_000,
+    });
+    assert.deepEqual(await adapter.open(preflight(defDigest)), {
+      protocol: 'local-hosted-order-v1', state: 'refused', code: 'definition-integrity',
+    });
+  }
 });

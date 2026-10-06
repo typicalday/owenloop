@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HoldMcpMount } from '../hold/mcp.ts';
 import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type ContactHolder, type GetOrderResponse, type OrderPacket } from '../hub/types.ts';
-import { hostedPacketDigest, type HostedOrderProjection, type HostedOrderResult, type HostedVerifiedPacket } from './order-adapter.ts';
+import { hostedPacketDigest, hostedReferencePacketDigest, hostedReferenceStableDigest, type HostedOrderProjection, type HostedOrderResult, type HostedVerifiedPacket } from './order-adapter.ts';
 
 type Adapter = {
   open(preflight: unknown, index?: number, onVerified?: (packet: HostedVerifiedPacket) => void): Promise<HostedOrderResult>;
@@ -18,6 +18,16 @@ type Adapter = {
 type BoundOrder = { workflow: string; run: string };
 type SignProof = (order: OrderPacket, path: string, value: Record<string, unknown>, version: number) => Promise<string | undefined>;
 type SubmitOptions = { enableSubmit?: boolean; signProof?: SignProof; holder?: ContactHolder; now?: () => number; monotonicNow?: () => number };
+const RAW_ORDER_FIELDS = new Set([
+  'workflow', 'run', 'step', 'key', 'index', 'defDigest', 'inputs', 'outputs',
+  'consumes', 'consumedFingerprint', 'consumesProof', 'consumesProofRelay', 'owes',
+  'spec', 'x', 'worker', 'workdir', 'capabilities', 'crews', 'modifier',
+  'reroutedFrom', 'escalated', 'model', 'judge', 'cause', 'routing',
+]);
+const RAW_OWED_FIELDS = new Set([
+  'path', 'version', 'judgmentRejects', 'schemaRejects', 'reasons',
+  'previousValue', 'schema', 'schemaAppliesTo', 'proof',
+]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -28,21 +38,7 @@ function refusal(code: string): ToolResult {
   return textResult({ protocol: 'local-hosted-order-v1', state: 'refused', code }, true);
 }
 
-function stablePacketDigest(value: unknown): string | undefined {
-  const order = record(value);
-  if (order === undefined || !Array.isArray(order.owes)) return undefined;
-  const owes = order.owes.map((entry: unknown) => {
-    const owed = record(entry);
-    if (owed === undefined) return undefined;
-    const stable = { ...owed };
-    delete stable.version;
-    return stable;
-  });
-  if (owes.includes(undefined)) return undefined;
-  return hostedPacketDigest({ ...order, owes });
-}
-
-function privatePreflight(result: ToolResult, gated: GetOrderResponse | undefined, bound: BoundOrder): { ref: unknown; fullDigest: string; stableDigest: string } | undefined {
+function privatePreflight(result: ToolResult, gated: GetOrderResponse | undefined, bound: BoundOrder): { ref: unknown; fullDigest: string; referenceDigest: string; stableDigest: string } | undefined {
   if (result.isError || result.content.length !== 1) return undefined;
   let view: unknown;
   try {
@@ -59,10 +55,30 @@ function privatePreflight(result: ToolResult, gated: GetOrderResponse | undefine
     || order?.workflow !== bound.workflow || order?.run !== bound.run
     || visible.step !== order.step || visible.key !== order.key || visible.defDigest !== order.defDigest
     || typeof order.defDigest !== 'string') return undefined;
+  if (Object.keys(order).some((field) => !RAW_ORDER_FIELDS.has(field))
+    || !Array.isArray(order.owes)
+    || order.owes.some((entry: unknown) => {
+      const owed = record(entry);
+      return !owed || Object.keys(owed).some((field) => !RAW_OWED_FIELDS.has(field));
+    })) return undefined;
+  // Service v1 does not attest these omitted execution, routing or rework fields.
+  if (Object.hasOwn(order, 'modifier') || Object.hasOwn(order, 'cause')
+    || Object.hasOwn(order, 'routing') || Object.hasOwn(order, 'workdir')
+    || Object.hasOwn(order, 'capabilities') || Object.hasOwn(order, 'crews')
+    || Object.hasOwn(order, 'reroutedFrom') || Object.hasOwn(order, 'escalated')
+    || Object.hasOwn(order, 'model') || Object.hasOwn(order, 'judge')
+    || (Object.hasOwn(order, 'worker') && order.worker !== 'agent')
+    || order.owes.some((entry: unknown) => {
+      const owed = record(entry);
+      return !owed || !Array.isArray(owed.reasons) || owed.reasons.length !== 0
+	|| owed.judgmentRejects !== 0 || owed.schemaRejects !== 0
+	|| Object.hasOwn(owed, 'previousValue') || Object.hasOwn(owed, 'proof');
+    })) return undefined;
   const fullDigest = hostedPacketDigest(order);
-  const stableDigest = stablePacketDigest(order);
-  if (fullDigest === undefined || stableDigest === undefined) return undefined;
-  return { fullDigest, stableDigest, ref: {
+  const referenceDigest = hostedReferencePacketDigest(order);
+  const stableDigest = hostedReferenceStableDigest(order);
+  if (fullDigest === undefined || referenceDigest === undefined || stableDigest === undefined) return undefined;
+  return { fullDigest, referenceDigest, stableDigest, ref: {
     protocol: 'client-preflight-v1', verification: 'not-performed',
     order: { state: 'available', workflow: bound.workflow, run: bound.run, defDigest: order.defDigest },
   } };
@@ -94,7 +110,7 @@ export function createVerifiedHostedHoldMcp(
     reconciliationToken = undefined;
     reconciliationDigest = undefined;
   }
-  async function livePrivateOrder(ctx: Parameters<ToolRegistration['handler']>[1]): Promise<{ ref: unknown; fullDigest: string; stableDigest: string } | undefined> {
+  async function livePrivateOrder(ctx: Parameters<ToolRegistration['handler']>[1]): Promise<{ ref: unknown; fullDigest: string; referenceDigest: string; stableDigest: string } | undefined> {
     try {
       if (anchoredRef !== undefined && mount.readGatedOrder() === undefined) return undefined;
       return privatePreflight(await rawGet!.handler({}, ctx), mount.readGatedOrder(), bound);
@@ -125,19 +141,23 @@ export function createVerifiedHostedHoldMcp(
   > {
     if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
     let ref = anchoredRef;
+    const firstObservation = ref === undefined;
     let initialFullDigest: string;
+    let initialReferenceDigest: string;
     let initialStableDigest: string;
     if (ref === undefined) {
       const privateOrder = await livePrivateOrder(ctx);
       if (privateOrder === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
       ref = privateOrder.ref;
       initialFullDigest = privateOrder.fullDigest;
+      initialReferenceDigest = privateOrder.referenceDigest;
       initialStableDigest = privateOrder.stableDigest;
     } else {
       const privateOrder = await livePrivateOrder(ctx);
       if (privateOrder === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
       if (privateOrder.fullDigest !== anchoredFullDigest) return { ok: false, result: refusal('holder-order-changed') };
       initialFullDigest = privateOrder.fullDigest;
+      initialReferenceDigest = privateOrder.referenceDigest;
       initialStableDigest = privateOrder.stableDigest;
     }
     let startedAt: number;
@@ -158,25 +178,22 @@ export function createVerifiedHostedHoldMcp(
     if (verified.state !== 'ready') {
       return { ok: false, result: refusal(verified.state === 'refused' ? verified.code : 'order-unavailable') };
     }
-    if (anchoredRef === undefined && verified.serviceObservation.packetDigest !== initialFullDigest) {
+    if (firstObservation && verified.serviceObservation.packetDigest !== initialReferenceDigest) {
       return { ok: false, result: refusal('holder-order-changed') };
     }
-    if (verifiedPacket === undefined && options.enableSubmit) return { ok: false, result: refusal('verified-packet-unavailable') };
-    if (verifiedPacket !== undefined
-      && hostedPacketDigest(verifiedPacket.order) !== verified.serviceObservation.packetDigest) {
+    if (verifiedPacket === undefined) return { ok: false, result: refusal('verified-packet-unavailable') };
+    if (hostedReferencePacketDigest(verifiedPacket.order) !== verified.serviceObservation.packetDigest) {
       return { ok: false, result: refusal('verified-packet-mismatch') };
     }
-    if (verifiedPacket !== undefined && stablePacketDigest(verifiedPacket.order) !== initialStableDigest) {
-      return { ok: false, result: refusal('holder-order-changed') };
-    }
-    if (verifiedPacket === undefined && verified.serviceObservation.packetDigest !== initialFullDigest) {
+    if (hostedReferenceStableDigest(verifiedPacket.order) !== initialStableDigest) {
       return { ok: false, result: refusal('holder-order-changed') };
     }
     // A direct service observation cannot attest that this local process kept
     // the hold while verification was pending. The raw mount must still gate it.
     const current = await livePrivateOrder(ctx);
     if (current === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
-    if (current.fullDigest !== initialFullDigest) {
+    if (current.fullDigest !== initialFullDigest || current.referenceDigest !== initialReferenceDigest
+      || current.stableDigest !== initialStableDigest) {
       return { ok: false, result: refusal('holder-order-changed') };
     }
     if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };

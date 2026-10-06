@@ -745,6 +745,11 @@ and exposes the holder's MCP tools over stdio. Its `submit` tool requires
 exactly one of `value` or `valueFile`, along with the owed `path`; `done: true`
 marks the final receipt for that path.
 
+`get_order` exposes gated dynamic inputs, owed paths, and rejection reasons. It
+does not take static task instructions or output schemas from the hub. Automated
+`agent-run` supplies those from its locally verified workflow definition; an
+interactive holder must supply that trusted definition context separately.
+
 `valueFile` is a UTF-8 JSON document resolved inside the holder's run working
 directory. Traversal, outside absolute paths, and symlinks that escape that
 directory are refused. The file is parsed as JSON before the normal submit

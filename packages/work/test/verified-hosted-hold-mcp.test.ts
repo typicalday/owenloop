@@ -2,16 +2,17 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { createVerifiedHostedHoldMcp } from '../src/hosted/verified-hold-mcp.ts';
-import { createHoldMcp, type HoldMcpMount } from '../src/hold/mcp.ts';
-import { hostedPacketDigest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
-import type { HubClient } from '../src/hub/client.ts';
-import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type GetOrderResponse, type OrderPacket } from '../src/hub/types.ts';
+import { createHostedOrderAdapter, hostedPacketDigest, hostedReferencePacketDigest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
+import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type OrderPacket } from '../src/hub/types.ts';
 import { textResult, type ToolCallContext, type ToolRegistration } from '../src/mcp/server.ts';
+import { createHoldMcp, type HoldMcpMount } from '../src/hold/mcp.ts';
+import type { HubClient } from '../src/hub/client.ts';
+import { createBundleIngestor } from '../../../src/store/index.ts';
 
 const context: ToolCallContext = { cancelled: false, onCancel: () => {}, sendProgress: () => {} };
 const rawOrder: OrderPacket = {
   workflow: 'wf', run: 'run', step: 'make', defDigest: 'a'.repeat(64),
-  key: '', inputs: [], outputs: ['out'], consumes: {},
+  key: '', inputs: [], outputs: ['out'], consumes: {}, consumedFingerprint: {},
   owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
 };
 
@@ -19,7 +20,7 @@ function ready(packet = rawOrder): HostedOrderResult {
   return {
     protocol: 'local-hosted-order-v1', state: 'ready',
     serviceObservation: {
-      workflow: 'wf', run: 'run', step: 'make', packetDigest: hostedPacketDigest(packet)!,
+      workflow: 'wf', run: 'run', step: 'make', packetDigest: hostedReferencePacketDigest(packet)!,
       observedAt: 1, expiresAt: 5,
     },
     definition: {
@@ -30,13 +31,20 @@ function ready(packet = rawOrder): HostedOrderResult {
   };
 }
 
+function reducedOrder(order: OrderPacket) {
+  return { workflow: order.workflow, run: order.run, step: order.step, key: order.key,
+    defDigest: order.defDigest, inputs: order.inputs, outputs: order.outputs,
+    consumes: order.consumes, owes: order.owes.map((owed) => ({ path: owed.path,
+      ...(owed.version === undefined ? {} : { version: owed.version }),
+      judgmentRejects: owed.judgmentRejects, schemaRejects: owed.schemaRejects, reasons: owed.reasons })) };
+}
+
 function fixture(enableSubmit = false, settings: {
   open?: () => Promise<HostedOrderResult>;
-  onRawGet?: (count: number) => Promise<void>;
+  onRawGet?: (count: number, order: OrderPacket) => Promise<void>;
   sign?: () => Promise<string | undefined>;
-  context?: ToolCallContext;
-  monotonicNow?: () => number;
   onConditionalSubmit?: (req: ConditionalSubmitRequest) => Promise<void> | void;
+  context?: ToolCallContext;
 } = {}) {
   const calls: string[] = [];
   const submits: ConditionalSubmitRequest[] = [];
@@ -44,9 +52,9 @@ function fixture(enableSubmit = false, settings: {
   let observation: HostedOrderResult = ready();
   let holding = true;
   let rawGets = 0;
-  let currentTime = 2;
-  let currentMonotonicTime = 0;
   const heldOrder: OrderPacket = structuredClone(rawOrder);
+  let currentTime = 2;
+  let monotonicTime = 0;
   let verifiedPacket: OrderPacket = rawOrder;
   let collectionOutputs: string[] = [];
   let proof: string | undefined = 'SIGNED PROOF';
@@ -67,15 +75,15 @@ function fixture(enableSubmit = false, settings: {
       { name: 'get_order', description: 'raw', inputSchema: { type: 'object' }, handler: async () => {
 	calls.push('raw-get');
 	rawGets++;
-	await settings.onRawGet?.(rawGets);
+	await settings.onRawGet?.(rawGets, heldOrder);
 	if (!holding) return textResult({ error: 'order no longer held' }, true);
-	return textResult({ workflow: 'wf', run: 'run', order: rawOrder, text: 'RAW HUB TEXT' });
+	return textResult({ workflow: 'wf', run: 'run', order: reducedOrder(heldOrder) });
       } },
       unsafeAction,
     ],
-    readGatedOrder: () => holding ? {
-      workflow: 'wf', run: 'run', order: heldOrder, text: 'PRIVATE HUB TEXT', lease: { claimed: true },
-    } as GetOrderResponse : undefined,
+    readGatedOrder: () => holding
+      ? { text: 'RAW HUB TEXT', workflow: 'wf', run: 'run', order: heldOrder, lease: { claimed: true } }
+      : undefined,
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
     open: async (ref, _index, onVerified) => {
@@ -105,8 +113,8 @@ function fixture(enableSubmit = false, settings: {
       return settings.sign === undefined ? proof : settings.sign();
     },
     now: () => currentTime,
-    monotonicNow: settings.monotonicNow ?? (() => currentMonotonicTime),
-  } : { now: () => currentTime, monotonicNow: settings.monotonicNow ?? (() => currentMonotonicTime) });
+    monotonicNow: () => monotonicTime,
+  } : { now: () => currentTime, monotonicNow: () => monotonicTime });
   const call = () => wrapped.tools[0]!.handler({}, settings.context ?? context);
   const submit = (args: Record<string, unknown>) => wrapped.tools[1]!.handler(args, settings.context ?? context);
   return {
@@ -116,14 +124,14 @@ function fixture(enableSubmit = false, settings: {
     setCollectionOutputs: (next: string[]) => { collectionOutputs = next; },
     setProof: (next: string | undefined) => { proof = next; },
     setTime: (next: number) => { currentTime = next; },
-    setMonotonicTime: (next: number) => { currentMonotonicTime = next; },
-    mutateHeldOrder: (mutate: (order: OrderPacket) => void) => { mutate(heldOrder); },
+    setMonotonicTime: (next: number) => { monotonicTime = next; },
     setSubmitResponse: (next: ConditionalSubmitResponse) => { submitResponse = next; },
     setSubmitError: (next: unknown) => { submitError = next; },
+    mutateHeldOrder: (mutate: (order: OrderPacket) => void) => { mutate(heldOrder); },
   };
 }
 
-test('real hold keeps hidden authored fields private and fences full-packet drift', async () => {
+test('real hold keeps authored fields private and fences a changed gated full order', async () => {
   const full: OrderPacket = {
     ...structuredClone(rawOrder), spec: { privateInstruction: 'HUB-SPEC' },
     x: { privateInstruction: 'HUB-X' },
@@ -137,15 +145,15 @@ test('real hold keeps hidden authored fields private and fences full-packet drif
   });
   const raw = await mount.tools[0]!.handler({}, context);
   assert.equal(raw.isError, undefined);
-  assert.match(raw.content[0]!.text, /HUB-SPEC|HUB-X|HUB-SCHEMA|HUB-TEXT/);
+  assert.doesNotMatch(raw.content[0]!.text, /HUB-SPEC|HUB-X|HUB-SCHEMA|HUB-TEXT/);
   assert.equal(hostedPacketDigest(mount.readGatedOrder()?.order), hostedPacketDigest(full));
 
   const wrapped = createVerifiedHostedHoldMcp(mount, {
     open: async (_ref, _index, onVerified) => {
-      onVerified?.({ order: full, collectionOutputs: [] });
-      return ready(full);
+      onVerified?.({ order: rawOrder, collectionOutputs: [] });
+      return ready(rawOrder);
     },
-  }, { workflow: 'wf', run: 'run' }, { now: () => 2, monotonicNow: () => 0 });
+  }, { workflow: 'wf', run: 'run' }, { now: () => 2 });
   const accepted = await wrapped.tools[0]!.handler({}, context);
   assert.equal(accepted.isError, undefined, accepted.content[0]?.text);
   assert.doesNotMatch(accepted.content[0]!.text, /HUB-SPEC|HUB-X|HUB-SCHEMA|HUB-TEXT/);
@@ -157,11 +165,38 @@ test('real hold keeps hidden authored fields private and fences full-packet drif
   assert.match(changed.content[0]!.text, /holder-order-changed/);
 });
 
+test('real reduced hold cannot fall back when Service lacks the versioned reference acknowledgement', async () => {
+  const hub = { getOrder: async () => ({ text: 'RAW HUB TEXT', workflow: 'wf', run: 'run',
+    order: rawOrder, lease: { claimed: true } }) } as unknown as HubClient;
+  const mount = createHoldMcp({
+    hub, workflow: 'wf', run: 'run', workdir: process.cwd(), tools: ['get_order'],
+    sleep: async () => {}, now: () => 0, err: () => {},
+  });
+  let reads = 0;
+  const adapter = createHostedOrderAdapter({
+    hub: { origin: 'https://trusted.example', getToken: async () => 'local-secret',
+      fetchImpl: async (input) => {
+	reads++;
+	assert.equal(String(input), 'https://trusted.example/api/reference_order/v1');
+	return new Response(JSON.stringify({ error: 'not_found', text: 'RAW OLD SERVICE' }), { status: 404 });
+      } },
+    expected: { workflowId: 'wf', runId: 'run' },
+    instructionSource: { globalRoot: '/unused', verifier: createBundleIngestor() },
+    consumeTrust: { env: {} }, now: () => 2,
+  });
+  const wrapped = createVerifiedHostedHoldMcp(mount, adapter, { workflow: 'wf', run: 'run' }, { now: () => 2 });
+  const result = await wrapped.tools[0]!.handler({}, context);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /reference-read-unavailable/);
+  assert.doesNotMatch(result.content[0]!.text, /RAW OLD SERVICE|RAW HUB TEXT/);
+  assert.equal(reads, 1);
+});
+
 test('verified holder exposes only the verified projection and no mutation tools', async () => {
   const f = fixture();
   assert.deepEqual(f.wrapped.tools.map((tool) => tool.name), ['get_order']);
   const shown = await f.call();
-  assert.equal(shown.isError, undefined);
+  assert.equal(shown.isError, undefined, shown.content[0]?.text);
   assert.match(shown.content[0]!.text, /VERIFIED INSTRUCTION/);
   assert.doesNotMatch(shown.content[0]!.text, /RAW UNVERIFIED|RAW HUB TEXT/);
   assert.deepEqual(f.calls, ['raw-get', 'verify', 'raw-get']);
@@ -228,6 +263,81 @@ test('packet disagreement and refused verification fail closed', async () => {
   assert.equal(f.calls.includes('submit'), false);
 });
 
+test('private modifier, cause, and feedback shapes absent from Service v1 refuse before a wire read', async () => {
+  for (const mutate of [
+    (order: OrderPacket) => { order.modifier = 'deep'; },
+    (order: OrderPacket) => { order.cause = 'rework'; },
+    (order: OrderPacket) => { order.owes[0]!.reasons = [{ at: 1, action: 'reject', kind: 'human', by: 'human', text: 'hidden' }]; },
+  ]) {
+    const f = fixture();
+    f.mutateHeldOrder(mutate);
+    const result = await f.call();
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /holder-order-unavailable/);
+    assert.deepEqual(f.calls, ['raw-get']);
+    assert.doesNotMatch(result.content[0]!.text, /deep|rework|hidden/);
+  }
+});
+
+test('private execution and routing stamps omitted by Service v1 refuse before a wire read', async () => {
+  const unsupported: Array<(order: OrderPacket) => void> = [
+    (order) => { order.worker = 'command'; },
+    (order) => { order.workdir = '/private/host'; },
+    (order) => { order.capabilities = []; },
+    (order) => { order.crews = ['review']; },
+    (order) => { (order as OrderPacket & { reroutedFrom: string }).reroutedFrom = 'base'; },
+    (order) => { order.escalated = false; },
+    (order) => { order.model = 'hidden'; },
+    (order) => { order.judge = 'out'; },
+  ];
+  for (const mutate of unsupported) {
+    const f = fixture();
+    f.mutateHeldOrder(mutate);
+    const result = await f.call();
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /holder-order-unavailable/);
+    assert.deepEqual(f.calls, ['raw-get']);
+    assert.doesNotMatch(result.content[0]!.text, /command|private|review|hidden|base/);
+  }
+  const explicitDefault = fixture();
+  explicitDefault.mutateHeldOrder((order) => { order.worker = 'agent'; });
+  const accepted = await explicitDefault.call();
+  assert.equal(accepted.isError, undefined, accepted.content[0]?.text);
+});
+
+test('unreviewed raw order and owed fields refuse before a v1 read while known authored fields remain local', async () => {
+  for (const mutate of [
+    (order: OrderPacket) => { (order as OrderPacket & { futureRouting: string }).futureRouting = 'HOSTILE NEW ROUTE'; },
+    (order: OrderPacket) => { (order.owes[0] as OrderPacket['owes'][number] & { futureFeedback: string }).futureFeedback = 'HOSTILE NEW FEEDBACK'; },
+  ]) {
+    const f = fixture();
+    f.mutateHeldOrder(mutate);
+    const result = await f.call();
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /holder-order-unavailable/);
+    assert.deepEqual(f.calls, ['raw-get']);
+    assert.doesNotMatch(result.content[0]!.text, /HOSTILE/);
+  }
+  const authored = fixture();
+  authored.mutateHeldOrder((order) => {
+    order.spec = { signed: true };
+    order.x = { policy: 'local' };
+    order.owes[0]!.schema = { type: 'object' };
+    order.owes[0]!.schemaAppliesTo = 'value';
+  });
+  const accepted = await authored.call();
+  assert.equal(accepted.isError, undefined, accepted.content[0]?.text);
+});
+
+test('a hidden raw field mutation during verification is fenced by the full hold digest', async () => {
+  const f = fixture(false, {
+    onRawGet: async (count, order) => { if (count === 2) order.spec = { hidden: 'changed' }; },
+  });
+  const result = await f.call();
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /holder-order-changed/);
+});
+
 test('opt-in verified submit signs the privately verified packet and returns only bounded status', async () => {
   const f = fixture(true);
   assert.deepEqual(f.wrapped.tools.map((tool) => tool.name), ['get_order', 'submit']);
@@ -259,7 +369,7 @@ test('a stop during proof signing prevents conditional submit', async () => {
   assert.deepEqual(f.submits, []);
 });
 
-test('a hidden private field change during signing prevents conditional submit', async () => {
+test('a hidden raw field mutation during proof signing prevents conditional submit', async () => {
   let resolve!: (value: string) => void;
   let started!: () => void;
   const pending = new Promise<string>((done) => { resolve = done; });
@@ -275,7 +385,7 @@ test('a hidden private field change during signing prevents conditional submit',
   assert.deepEqual(f.submits, []);
 });
 
-test('monotonic elapsed time fences a wall-clock rollback during signing', async () => {
+test('monotonic elapsed time fences a wall-clock rollback during signing on v1', async () => {
   let resolve!: (value: string) => void;
   let started!: () => void;
   const pending = new Promise<string>((done) => { resolve = done; });
@@ -290,6 +400,60 @@ test('monotonic elapsed time fences a wall-clock rollback during signing', async
   assert.equal(result.isError, true);
   assert.match(result.content[0]!.text, /claim-observation-expired/);
   assert.deepEqual(f.submits, []);
+});
+
+test('lost partial v1 acknowledgement requires visible token reconciliation', async () => {
+  let committed = false;
+  let f: ReturnType<typeof fixture>;
+  f = fixture(true, { onConditionalSubmit: () => {
+    if (committed) return;
+    committed = true;
+    f.setPacket({ ...rawOrder, owes: [{ ...rawOrder.owes[0]!, version: 2 }] });
+    throw new Error('transport lost after commit');
+  } });
+  f.setSubmitResponse({ text: 'RAW', outcome: 'emitted', closed: false, conditionApplied: 'expected-version-v1' });
+  const first = await f.submit({ path: 'out', value: { n: 1 }, done: false });
+  assert.match(first.content[0]!.text, /submit-result-unknown/);
+  assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1]);
+  const before = f.calls.length;
+  const retry = await f.submit({ path: 'out', value: { n: 1 }, done: false });
+  assert.match(retry.content[0]!.text, /submit-reconciliation-required/);
+  assert.equal(f.calls.length, before);
+  const visible = await f.call();
+  assert.equal(visible.isError, undefined, visible.content[0]?.text);
+  const state = JSON.parse(visible.content[0]!.text) as {
+    outputs: Array<{ version: number }>;
+    reconciliation: { submitToken: string };
+  };
+  assert.equal(state.outputs[0]!.version, 2);
+  assert.equal(typeof state.reconciliation.submitToken, 'string');
+  const unseen = await f.submit({ path: 'out', value: { n: 1 }, done: false });
+  assert.match(unseen.content[0]!.text, /submit-reconciliation-required/);
+  const second = await f.submit({
+    path: 'out', value: { n: 1 }, done: false, reconciliationToken: state.reconciliation.submitToken,
+  });
+  assert.equal(second.isError, undefined, second.content[0]?.text);
+  assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1, 2]);
+});
+
+test('a concurrent submit cannot bypass an in-flight ambiguous v1 mutation', async () => {
+  let reject!: (reason: Error) => void;
+  let started!: () => void;
+  const pending = new Promise<void>((_resolve, fail) => { reject = fail; });
+  const submitting = new Promise<void>((done) => { started = done; });
+  const f = fixture(true, { onConditionalSubmit: async () => { started(); await pending; } });
+  f.setSubmitResponse({ text: 'RAW', outcome: 'emitted', closed: false, conditionApplied: 'expected-version-v1' });
+  const firstCall = f.submit({ path: 'out', value: { n: 1 }, done: false });
+  await submitting;
+  const concurrent = await f.submit({ path: 'out', value: { n: 1 }, done: false });
+  assert.match(concurrent.content[0]!.text, /submit-in-progress/);
+  assert.equal(f.submits.length, 1);
+  reject(new Error('transport lost after commit'));
+  const ambiguous = await firstCall;
+  assert.match(ambiguous.content[0]!.text, /submit-result-unknown/);
+  const later = await f.submit({ path: 'out', value: { n: 1 }, done: false });
+  assert.match(later.content[0]!.text, /submit-reconciliation-required/);
+  assert.equal(f.submits.length, 1);
 });
 
 test('an observation that expires during signing prevents conditional submit', async () => {
@@ -375,55 +539,66 @@ test('partial verified submit refreshes the direct order rather than the holder 
   assert.deepEqual(f.stops, []);
 });
 
-test('lost open partial-submit acknowledgement requires visible order reconciliation before another submit', async () => {
-  let committed = false;
-  let f: ReturnType<typeof fixture>;
-  f = fixture(true, { onConditionalSubmit: () => {
-    if (committed) return;
-    committed = true;
-    // The Service commits version 1 and advances the owed target, but its
-    // response is lost after the commit.
-    f.setPacket({ ...rawOrder, owes: [{ ...rawOrder.owes[0]!, version: 2 }] });
-    throw new Error('transport lost after commit');
-  } });
-  f.setSubmitResponse({ text: 'RAW', outcome: 'emitted', closed: false, conditionApplied: 'expected-version-v1' });
-  const first = await f.submit({ path: 'out', value: { n: 1 }, done: false });
-  assert.equal(first.isError, true);
-  assert.match(first.content[0]!.text, /submit-result-unknown/);
-  assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1]);
-
-  const before = f.calls.length;
-  const directRetry = await f.submit({ path: 'out', value: { n: 1 }, done: false });
-  assert.equal(directRetry.isError, true);
-  assert.match(directRetry.content[0]!.text, /submit-reconciliation-required/);
-  assert.equal(f.calls.length, before, 'an internal reverify cannot silently retry the committed partial submit');
-  assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1]);
-
-  f.setObservation({ protocol: 'local-hosted-order-v1', state: 'refused', code: 'order-unavailable' });
-  const unavailable = await f.call();
-  assert.equal(unavailable.isError, true);
-  const stillBlocked = await f.submit({ path: 'out', value: { n: 1 }, done: false });
-  assert.match(stillBlocked.content[0]!.text, /submit-reconciliation-required/);
-
-  f.setPacket({ ...rawOrder, owes: [{ ...rawOrder.owes[0]!, version: 2 }] });
-  const visible = await f.call();
-  assert.equal(visible.isError, undefined);
-  const visibleOrder = JSON.parse(visible.content[0]!.text) as {
-    outputs: Array<{ version: number }>;
-    reconciliation: { submitToken: string };
-  };
-  assert.equal(visibleOrder.outputs[0]!.version, 2);
-  assert.equal(typeof visibleOrder.reconciliation.submitToken, 'string');
-  const unseenRetry = await f.submit({ path: 'out', value: { n: 1 }, done: false });
-  assert.match(unseenRetry.content[0]!.text, /submit-reconciliation-required/);
-  const afterVisibleRead = await f.submit({
-    path: 'out', value: { n: 1 }, done: false, reconciliationToken: visibleOrder.reconciliation.submitToken,
-  });
-  assert.equal(afterVisibleRead.isError, undefined);
-  assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1, 2]);
+test('later Service reads cannot change stable claim identity, consumes, proof, or owed path', async () => {
+  const variants: OrderPacket[] = [
+    { ...rawOrder, step: 'other' },
+    { ...rawOrder, key: 'other-key' },
+    { ...rawOrder, consumes: { in: { hostile: true } } },
+    { ...rawOrder, consumesProof: 'other-proof' },
+    { ...rawOrder, owes: [{ ...rawOrder.owes[0]!, path: 'other-path' }] },
+  ];
+  for (const changed of variants) {
+    const f = fixture();
+    const first = await f.call();
+    assert.equal(first.isError, undefined);
+    f.setPacket(changed);
+    const later = await f.call();
+    assert.equal(later.isError, true);
+    assert.match(later.content[0]!.text, /holder-order-changed/);
+  }
 });
 
-test('an older concurrent order read cannot reconcile a newer ambiguous submit', async () => {
+test('stale, absent route, and missing acknowledgement do not leak service text or retry legacy submit', async () => {
+  const stale = fixture(true);
+  stale.setSubmitError(new HubError(409, 'RAW HOSTILE STALE TEXT', 'stale_submit_condition'));
+  const staleResult = await stale.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(staleResult.isError, true);
+  assert.match(staleResult.content[0]!.text, /stale-submit-condition/);
+  assert.doesNotMatch(staleResult.content[0]!.text, /RAW HOSTILE/);
+  assert.equal(stale.submits.length, 1);
+
+  const oldService = fixture(true);
+  oldService.setSubmitError(new HubError(404, 'RAW OLD SERVICE ERROR', 'not_found'));
+  const absent = await oldService.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(absent.isError, true);
+  assert.match(absent.content[0]!.text, /conditional-submit-unavailable/);
+  assert.equal(oldService.submits.length, 1);
+
+  const noAck = fixture(true);
+  noAck.setSubmitResponse({ text: 'RAW SUCCESS', outcome: 'green', closed: true } as ConditionalSubmitResponse);
+  const ambiguous = await noAck.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(ambiguous.isError, true);
+  assert.match(ambiguous.content[0]!.text, /condition-ack-missing/);
+  assert.doesNotMatch(ambiguous.content[0]!.text, /RAW SUCCESS/);
+  assert.deepEqual(noAck.stops, [{ reason: 'submitted', release: false }]);
+
+  const born = fixture(true);
+  born.setSubmitResponse({ text: 'RAW BORN ERROR', outcome: 'born-rejected', closed: true, conditionApplied: 'expected-version-v1' });
+  const bornResult = await born.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(bornResult.isError, true);
+  assert.match(bornResult.content[0]!.text, /submit-not-accepted/);
+  assert.doesNotMatch(bornResult.content[0]!.text, /RAW BORN/);
+  assert.deepEqual(born.stops, [{ reason: 'submitted', release: false }]);
+
+  const closed = fixture(true);
+  closed.setSubmitError(new HubError(409, 'RAW CLOSED ERROR', 'run_closed'));
+  const closedResult = await closed.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(closedResult.isError, true);
+  assert.match(closedResult.content[0]!.text, /run-closed/);
+  assert.deepEqual(closed.stops, [{ reason: 'submitted', release: false }]);
+});
+
+test('an older v1 read cannot reconcile a newer ambiguous submit', async () => {
   let finishG1!: (result: HostedOrderResult) => void;
   let finishG2!: (result: HostedOrderResult) => void;
   let bothStarted!: () => void;
@@ -496,65 +671,4 @@ test('an older concurrent order read cannot reconcile a newer ambiguous submit',
   });
   assert.equal(third.isError, undefined, third.content[0]?.text);
   assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1, 2, 3]);
-});
-
-test('a concurrent submit cannot bypass an in-flight ambiguous conditional mutation', async () => {
-  let reject!: (reason: Error) => void;
-  let started!: () => void;
-  const pending = new Promise<void>((_resolve, fail) => { reject = fail; });
-  const submitting = new Promise<void>((done) => { started = done; });
-  const f = fixture(true, { onConditionalSubmit: async () => { started(); await pending; } });
-  f.setSubmitResponse({ text: 'RAW', outcome: 'emitted', closed: false, conditionApplied: 'expected-version-v1' });
-  const firstCall = f.submit({ path: 'out', value: { n: 1 }, done: false });
-  await submitting;
-  const concurrent = await f.submit({ path: 'out', value: { n: 1 }, done: false });
-  assert.equal(concurrent.isError, true);
-  assert.match(concurrent.content[0]!.text, /submit-in-progress/);
-  assert.equal(f.submits.length, 1);
-  reject(new Error('transport lost after commit'));
-  const ambiguous = await firstCall;
-  assert.match(ambiguous.content[0]!.text, /submit-result-unknown/);
-  const later = await f.submit({ path: 'out', value: { n: 1 }, done: false });
-  assert.match(later.content[0]!.text, /submit-reconciliation-required/);
-  assert.equal(f.submits.length, 1);
-});
-
-test('stale, absent route, and missing acknowledgement do not leak service text or retry legacy submit', async () => {
-  const stale = fixture(true);
-  stale.setSubmitError(new HubError(409, 'RAW HOSTILE STALE TEXT', 'stale_submit_condition'));
-  const staleResult = await stale.submit({ path: 'out', value: { n: 1 } });
-  assert.equal(staleResult.isError, true);
-  assert.match(staleResult.content[0]!.text, /stale-submit-condition/);
-  assert.doesNotMatch(staleResult.content[0]!.text, /RAW HOSTILE/);
-  assert.equal(stale.submits.length, 1);
-
-  const oldService = fixture(true);
-  oldService.setSubmitError(new HubError(404, 'RAW OLD SERVICE ERROR', 'not_found'));
-  const absent = await oldService.submit({ path: 'out', value: { n: 1 } });
-  assert.equal(absent.isError, true);
-  assert.match(absent.content[0]!.text, /conditional-submit-unavailable/);
-  assert.equal(oldService.submits.length, 1);
-
-  const noAck = fixture(true);
-  noAck.setSubmitResponse({ text: 'RAW SUCCESS', outcome: 'green', closed: true } as ConditionalSubmitResponse);
-  const ambiguous = await noAck.submit({ path: 'out', value: { n: 1 } });
-  assert.equal(ambiguous.isError, true);
-  assert.match(ambiguous.content[0]!.text, /condition-ack-missing/);
-  assert.doesNotMatch(ambiguous.content[0]!.text, /RAW SUCCESS/);
-  assert.deepEqual(noAck.stops, [{ reason: 'submitted', release: false }]);
-
-  const born = fixture(true);
-  born.setSubmitResponse({ text: 'RAW BORN ERROR', outcome: 'born-rejected', closed: true, conditionApplied: 'expected-version-v1' });
-  const bornResult = await born.submit({ path: 'out', value: { n: 1 } });
-  assert.equal(bornResult.isError, true);
-  assert.match(bornResult.content[0]!.text, /submit-not-accepted/);
-  assert.doesNotMatch(bornResult.content[0]!.text, /RAW BORN/);
-  assert.deepEqual(born.stops, [{ reason: 'submitted', release: false }]);
-
-  const closed = fixture(true);
-  closed.setSubmitError(new HubError(409, 'RAW CLOSED ERROR', 'run_closed'));
-  const closedResult = await closed.submit({ path: 'out', value: { n: 1 } });
-  assert.equal(closedResult.isError, true);
-  assert.match(closedResult.content[0]!.text, /run-closed/);
-  assert.deepEqual(closed.stops, [{ reason: 'submitted', release: false }]);
 });

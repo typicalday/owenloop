@@ -4,11 +4,7 @@
  * through a configured bearer-authenticated HTTPS HubClient, then checks the
  * locally installed publication and signed consumed values before returning
  * any model-facing content. It trusts that service and HTTPS connection; it
- * does not claim a cryptographic order or lease attestation. An epoch clock
- * validates signed chain dates; a monotonic clock bounds fetch and local
- * verification elapsed time. The projected epoch expiry is capped by the
- * monotonic time remaining at return. Later use must recheck the claim and
- * expiry; this projection does not continuously monitor clock or lease state.
+ * does not claim a cryptographic order or lease attestation.
  */
 import { bindProduce, elementPath, matchConsume, sealPath } from '../../../../src/paths.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
@@ -24,20 +20,18 @@ import { createConsumedVerifier, type CreateConsumedVerifierArgs } from '../cons
 import { createStoreInstructionResolver, type StoreInstructionResolverOptions } from '../exec/instructions.ts';
 
 const PROTOCOL = 'client-preflight-v1';
+const REFERENCE_PROTOCOL = 'trusted-reference-read-v1';
 const MAX_REFS = 64;
 const MAX_OBSERVATION_MS = 5_000;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const DIGEST = /^[a-f0-9]{64}$/i;
 const ORDER_FIELDS = new Set([
   'run', 'workflow', 'step', 'key', 'index', 'defDigest', 'inputs', 'outputs',
-  'workdir', 'capabilities', 'crews', 'modifier', 'reroutedFrom', 'escalated',
-  'model', 'worker', 'judge', 'spec', 'x', 'consumes', 'consumedFingerprint',
-  'consumesProof', 'consumesProofRelay', 'owes', 'cause',
+  'consumes', 'consumedFingerprint', 'consumesProof', 'consumesProofRelay', 'owes',
 ]);
-const OWED_FIELDS = new Set([
-  'path', 'version', 'judgmentRejects', 'schemaRejects', 'reasons',
-  'previousValue', 'schema', 'schemaAppliesTo', 'proof',
-]);
+const OWED_FIELDS = new Set(['path', 'version', 'proof']);
+const RESPONSE_FIELDS = new Set(['protocol', 'state', 'workflow', 'run', 'order', 'lease']);
+const LEASE_FIELDS = new Set(['claimed', 'claimedAt', 'heartbeatAt']);
 
 type Ref = { workflow: string; run: string; defDigest: string };
 type RefResult = { kind: 'ref'; ref: Ref } | { kind: 'unavailable' };
@@ -45,8 +39,7 @@ type RefResult = { kind: 'ref'; ref: Ref } | { kind: 'unavailable' };
 export interface HostedOrderProjection {
   protocol: 'local-hosted-order-v1';
   state: 'ready';
-  /** Service reports an active claim, not holder identity. The expiry is capped
-   * by the monotonic time remaining when this result is returned. */
+  /** Service reports an active claim for this run; this does not attest the holder identity. */
   serviceObservation: { workflow: string; run: string; step: string; packetDigest: string; observedAt: number; expiresAt: number };
   definition: {
     bodyTrust: 'verified-local-publication';
@@ -188,6 +181,48 @@ export function hostedPacketDigest(packet: unknown): string | undefined {
   }
 }
 
+/** Canonical input for the Service v1 comparison, whether sourced from the
+ * private raw hold or the versioned REST order. It includes only dynamic
+ * identity/consume/proof/owed-version fields that Service v1 actually sends.
+ * The wrapper separately hashes the ENTIRE raw hold before and after every
+ * awaited verification, so hidden local fields remain a change fence. */
+function referencePacketDigest(packet: unknown, includeTargetVersions: boolean): string | undefined {
+  const order = record(packet);
+  if (!order || typeof order.workflow !== 'string' || typeof order.run !== 'string'
+    || typeof order.step !== 'string' || typeof order.key !== 'string'
+    || typeof order.defDigest !== 'string' || !Array.isArray(order.inputs)
+    || !Array.isArray(order.outputs) || !record(order.consumes)
+    || !record(order.consumedFingerprint) || !Array.isArray(order.owes)) return undefined;
+  const owes = order.owes.map((entry: unknown) => {
+    const owed = record(entry);
+    if (!owed || typeof owed.path !== 'string' || !Number.isSafeInteger(owed.version) || (owed.version as number) < 1) return undefined;
+    return { path: owed.path, ...(includeTargetVersions ? { version: owed.version } : {}),
+      ...(owed.proof === undefined ? {} : { proof: owed.proof }) };
+  });
+  if (owes.includes(undefined)) return undefined;
+  return hostedPacketDigest({
+    workflow: order.workflow, run: order.run, step: order.step, key: order.key,
+    ...(order.index === undefined ? {} : { index: order.index }),
+    defDigest: order.defDigest.toLowerCase(), inputs: order.inputs, outputs: order.outputs,
+    consumes: order.consumes, consumedFingerprint: order.consumedFingerprint,
+    ...(order.consumesProof === undefined ? {} : { consumesProof: order.consumesProof }),
+    ...(order.consumesProofRelay === undefined ? {} : { consumesProofRelay: order.consumesProofRelay }),
+    owes,
+  });
+}
+
+/** Exact Service v1 dynamic packet digest, including owed target versions. */
+export function hostedReferencePacketDigest(packet: unknown): string | undefined {
+  return referencePacketDigest(packet, true);
+}
+
+/** Service v1 claim identity and dynamic data that cannot change under a
+ * held claim. Only owed target versions are excluded: conditional submissions
+ * can advance those versions without changing the local claim-time packet. */
+export function hostedReferenceStableDigest(packet: unknown): string | undefined {
+  return referencePacketDigest(packet, false);
+}
+
 /**
  * Create one adapter for one locally configured service. The supplied origin
  * must be HTTPS and origin-only. Tests may inject `fetchImpl`; there is no
@@ -242,9 +277,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       if (ref.workflow !== expectedWorkflowId || ref.run !== expectedRunId) {
 	return refused('reference-out-of-scope');
       }
-      // The fetched packet can describe an earlier claim. Start the freshness
-      // window before authentication, transport, and response parsing, not after
-      // they return, so a delayed response cannot receive a new full window.
+      // Start the freshness window before authentication and transport.
       let observedAt: number;
       let startedAt: number;
       try {
@@ -256,13 +289,13 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       if (!Number.isFinite(startedAt) || !Number.isSafeInteger(observedAt) || observedAt < 0) return refused('clock-unavailable');
       const expiresAt = observedAt + duration;
       if (!Number.isSafeInteger(expiresAt)) return refused('clock-unavailable');
-      let response: Awaited<ReturnType<typeof hub.getOrder>>;
+      let response: unknown;
       try {
-	response = await hub.getOrder({ workflow: expectedWorkflowId, run: expectedRunId });
+	if (hub.getReferenceOrder === undefined) return refused('reference-read-unavailable');
+	response = await hub.getReferenceOrder({ workflow: expectedWorkflowId, run: expectedRunId });
       } catch {
-	return refused('direct-fetch-failed');
+	return refused('reference-read-unavailable');
       }
-      // A stale direct fetch should not enter the local verification path.
       let fetchedAt: number;
       let fetchedElapsed: number;
       try {
@@ -272,39 +305,42 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('clock-unavailable');
       }
       if (!Number.isFinite(fetchedElapsed) || fetchedElapsed < 0) return refused('clock-unavailable');
-      if (!Number.isSafeInteger(fetchedAt) || fetchedAt < observedAt || fetchedAt >= expiresAt) {
-	return refused('claim-observation-expired');
+      if (!Number.isSafeInteger(fetchedAt) || fetchedAt < observedAt || fetchedAt >= expiresAt
+	|| fetchedElapsed >= duration) return refused('claim-observation-expired');
+      const envelope = record(response);
+      if (!envelope) return refused('direct-response-malformed');
+      if (envelope.protocol !== REFERENCE_PROTOCOL) return refused('reference-protocol-unavailable');
+      if (envelope.workflow !== expectedWorkflowId || envelope.run !== expectedRunId) return refused('reference-rebound');
+      if (envelope.state !== 'available') {
+	if (envelope.state === 'unavailable' || envelope.state === 'unsupported-feedback' || envelope.state === 'routing-unsupported') {
+	  return refused(`service-${envelope.state}`);
+	}
+	return refused('reference-state-malformed');
       }
-      if (fetchedElapsed >= duration) return refused('claim-observation-expired');
-      if (!record(response)) return refused('direct-response-malformed');
-      if (response.workflow !== expectedWorkflowId || response.run !== expectedRunId) return refused('reference-rebound');
-      const order = response.order;
-      if (order === null) return { protocol: 'local-hosted-order-v1', state: 'unavailable' };
-      if (!record(order) || !record(response.lease)
+      if (Object.keys(envelope).some((field) => !RESPONSE_FIELDS.has(field))) return refused('direct-response-malformed');
+      const order = envelope.order as OrderPacket;
+      const lease = record(envelope.lease);
+      if (!record(order) || !lease
 	|| order.workflow !== expectedWorkflowId || order.run !== expectedRunId
 	|| typeof order.defDigest !== 'string' || order.defDigest.toLowerCase() !== ref.defDigest) return refused('reference-rebound');
-      if (response.lease.claimed !== true || response.lease.outcome !== undefined) return refused('claim-not-current');
+      if (lease.claimed !== true || lease.outcome !== undefined) return refused('claim-not-current');
+      if (Object.keys(lease).some((field) => !LEASE_FIELDS.has(field))) return refused('direct-response-malformed');
+      if ((lease.claimedAt !== undefined && (!Number.isSafeInteger(lease.claimedAt) || (lease.claimedAt as number) < 0))
+	|| (lease.heartbeatAt !== undefined && (!Number.isSafeInteger(lease.heartbeatAt) || (lease.heartbeatAt as number) < 0))) {
+	return refused('direct-response-malformed');
+      }
       if (!identifier(order.step) || typeof order.key !== 'string' || order.key.length > 200 || !record(order.consumes)
 	|| !Array.isArray(order.owes)) return refused('order-malformed');
       if (Object.keys(order).some((field) => !ORDER_FIELDS.has(field))
 	|| order.owes.some((owed) => !record(owed) || Object.keys(owed).some((field) => !OWED_FIELDS.has(field)))) {
 	return refused('unsupported-order-field');
       }
-      // These fields have no supported local reason/prior-value verifier. A
-      // partial projection would hide actionable feedback from the worker.
-      if (order.owes.some((owed) => !record(owed) || !Array.isArray(owed.reasons)
-	|| owed.reasons.length !== 0 || owed.proof !== undefined
-	|| owed.judgmentRejects !== 0 || owed.schemaRejects !== 0
-	|| Object.hasOwn(owed, 'previousValue'))) return refused('unsupported-feedback');
-      if (order.workdir !== undefined) {
-	return refused('unsupported-order-field');
-      }
+      if (order.owes.some((owed) => owed.proof !== undefined)) return refused('unsupported-feedback');
+      // Service v1 withholds authored feedback/previous values, modifier and
+      // cause. Reject all unrecognized fields and unsupported local shapes.
       if (Object.keys(order.consumes).length === 0
 	&& (order.consumesProof !== undefined || order.consumesProofRelay !== undefined)) {
 	return refused('unsupported-order-field');
-      }
-      if (order.worker !== undefined && order.worker !== 'agent') {
-	return refused('unsupported-worker');
       }
       if (instructions.resolveHostedStep === undefined) {
 	return refused('unsupported-worker');
@@ -320,6 +356,10 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       if ((step.executor !== undefined && step.executor !== 'agent') || step.workdir !== undefined
 	|| step.workdirFrom !== undefined || step.calls !== undefined || step.callsInterface !== undefined
 	|| step.judges !== undefined) return refused('unsupported-step');
+      // Service v1 has no dynamic modifier/cause fields. A local definition
+      // that needs either value cannot be materialized from this protocol.
+      if ((step.on !== undefined && (step.on.length !== 1 || step.on[0] !== 'inputsGreen'))
+	|| step.body.includes('${MODIFIER}')) return refused('unsupported-service-v1-shape');
       if (!validConsumedPaths(step, order)) return refused('consume-path-mismatch');
       if (!Array.isArray(order.outputs) || order.outputs.length === 0 || order.outputs.length !== order.owes.length
 	|| order.outputs.some((path) => typeof path !== 'string')
@@ -347,7 +387,10 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       }
       let checked: Awaited<ReturnType<typeof consumedVerifier>>;
       try {
-	checked = await consumedVerifier(order, {
+	// The v1 marker asserts no rework thread. Legacy verifier code expects
+	// empty counters/reasons, so supply that private neutral shape only here.
+	checked = await consumedVerifier({ ...order, owes: order.owes.map((owed) => ({ ...owed,
+	  reasons: [], judgmentRejects: 0, schemaRejects: 0 })) }, {
 	  hardRule: true,
 	  callsProducers: staticResult.callsProducers,
 	});
@@ -367,8 +410,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       } catch {
 	return refused('definition-materialization-failed');
       }
-      // Verification and materialization share the original fetch-start window.
-      // A projection is never returned ready after that window has elapsed.
+      // Verification and materialization share the fetch-start window.
       let finishedAt: number;
       let finishedElapsed: number;
       try {
@@ -382,11 +424,9 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	return refused('claim-observation-expired');
       }
       if (finishedElapsed >= duration) return refused('claim-observation-expired');
-      // A wall-clock rollback can leave the original epoch expiry much later
-      // than the monotonic window. Cap metadata to its remaining elapsed TTL.
       const remainingExpiry = Math.floor(finishedAt + duration - finishedElapsed);
       if (!Number.isSafeInteger(remainingExpiry) || remainingExpiry <= finishedAt) return refused('claim-observation-expired');
-      const packetDigest = hostedPacketDigest(order);
+      const packetDigest = hostedReferencePacketDigest(order);
       if (packetDigest === undefined) return refused('order-malformed');
       onVerified?.({ order, collectionOutputs });
       return {
