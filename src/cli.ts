@@ -33,6 +33,8 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS), --verbose.
  */
 
+import { verifyInvocationDefinition } from './store/def-source.ts';
+import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -875,6 +877,9 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
       projectRoot: projectStoreRoot(defsDir),
       globalRoot: verifiedGlobalRoot,
     }),
+    invocationAuthority: {
+      verifyDefinition: verifyInvocationDefinition, withDefinitions: withWorkflowSnapshotStoreGuard,
+    },
   });
   return { store, engine, defs, defsDir, dbPath, definitionDiscoveryComplete };
 }
