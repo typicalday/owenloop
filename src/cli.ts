@@ -1671,6 +1671,13 @@ function failureNote(failures: DefLoadFailure[]): string {
 // module. Re-exported here to keep the existing CLI/test import surface.
 export { hasDefiniteCheckDefect };
 
+/** Finite collection/value exploration is diagnostic, not a source-admission proof. */
+function warnModelCoverage(io: CliIO, defName: string, report: CheckReport): void {
+  if (report.coverageIncomplete.length === 0) return;
+  io.err(`warning: ${defName}: model coverage incomplete (${report.coverageIncomplete.join(', ')}); ` +
+    'check runtime behavior separately');
+}
+
 /**
  * Options accepted on EVERY command. docs/cli.md documents `--db`/`--defs` as
  * global ("pass both on every command"), so they are allowlisted everywhere —
@@ -2366,9 +2373,10 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       print(io, report);
     } else {
       // text format
-      const clean = report.deadlocks.length === 0
-        && report.invariantViolations.length === 0 && report.structurallyDeadSteps.length === 0;
-      const status = clean && report.completable ? 'OK' : clean ? 'INCOMPLETE' : 'DEFECTS FOUND';
+      const definiteDefect = hasDefiniteCheckDefect(report);
+      const status = definiteDefect ? 'DEFECTS FOUND'
+	: report.bounded || report.coverageIncomplete.length > 0 || !report.completable
+	  ? 'INCOMPLETE' : 'OK';
       io.out(`=== owenloop check: ${def.name} ===`);
       io.out(`Status: ${status}`);
       io.out(`Completable: ${report.completable ? 'yes' : 'no'}`);
@@ -2378,12 +2386,21 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out(`SEARCH INCOMPLETE — bounds hit: ${report.boundsHit.join(', ')}`);
         io.out('Verdicts apply only within the explored region.');
       }
+	if (report.coverageIncomplete.length > 0) {
+	  io.out('');
+	  io.out(`MODEL COVERAGE INCOMPLETE — ${report.coverageIncomplete.join(', ')}.`);
+	  io.out('The finite checker graph was explored only within these collection/value limits.');
+	}
 	if (report.collectionCapApplied) {
 	  io.out('');
 	  io.out(
-	    `COLLECTION CAP APPLIED — --max-collection ${report.maxCollectionSize} limited each emit/seal fork to 0..${report.maxCollectionSize} members.`,
+	    `COLLECTION CAP APPLIED — --max-collection ${report.maxCollectionSize} limits total emitted member indices per collection producer in this finite model. Runtime can emit more.`,
 	  );
 	}
+      if (report.collectionSchemaValuesSampled) {
+	io.out('');
+	io.out('COLLECTION SCHEMA VALUES SAMPLED — the checker used concrete candidate item values. Arbitrary schema-valid/invalid payload classes are not fully covered; review this report before using it as release proof.');
+      }
       if (report.stallStates.length > 0) {
         io.out('');
 		io.out(`Stall states (expected — retryable brakes / future idle waits) (${report.stallStates.length}):`);
@@ -2393,7 +2410,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       }
       if (report.deadlocks.length > 0) {
         io.out('');
-        io.out(`True deadlocks (no path to completion at unlimited attempts) (${report.deadlocks.length}):`);
+	io.out(report.coverageIncomplete.length > 0
+	  ? `Finite-model no-move states (runtime coverage incomplete) (${report.deadlocks.length}):`
+	  : `True deadlocks (no path to completion at unlimited attempts) (${report.deadlocks.length}):`);
         for (const d of report.deadlocks) {
           io.out(`  path: ${d.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
         }
@@ -2470,8 +2489,10 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     //   idle wait that becomes eligible after time passes), and a stuck state
     //   (report.stuck) is purely informational (a brake tripped on one branch
     //   while the line still moves on another). Neither is a defect.
-    // - truncated with no invariant violations / structurally-dead steps / true
-    //   deadlocks → 0
+    // - collection width/schema coverage gaps describe finite-model limits.
+    //   They cannot promote a no-moves witness to a definite deadlock, but
+    //   this structural check does not certify every runtime item/value/run.
+    //   Report the limit without making it a blanket source-admission veto.
     const hasDefiniteDefect = hasDefiniteCheckDefect(report);
     if (hasDefiniteDefect) {
       throw new CliError(
@@ -3790,6 +3811,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
             `${report.deadlocks.length} true deadlock(s))`,
         );
       }
+      warnModelCoverage(io, stagedDef.name, report);
     }
 
     // Strict backstop: only if the aggregate pass found nothing, run the FULL
@@ -5219,6 +5241,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
           `${report.deadlocks.length} true deadlock(s))`,
       );
     }
+    warnModelCoverage(io, def.name, report);
   }
 
   // Assemble the push candidates: verbatim source yaml + the server-canonical
@@ -5768,6 +5791,7 @@ async function dispatchInstall(io: CliIO, args: Args): Promise<number> {
             `${report.deadlocks.length} true deadlock(s))`,
         );
       }
+      warnModelCoverage(io, def.name, report);
     }
 
     // 4. Push candidates: verbatim source yaml + the server-canonical hash.

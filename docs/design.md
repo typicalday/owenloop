@@ -1055,13 +1055,19 @@ true deadlocks, stuck artifacts, dead steps, and violations of any declared
 invariants. It is a static analysis of a workflow definition's shape, not a
 simulation of a running instance.
 
-**Collection-cap reporting.** The finite member-count cap used when expanding
-an `emit`/`seal` outcome defaults to 2 and can be set with `--max-collection`.
+**Collection-cap reporting.** The finite cap on total emitted member indices
+per collection producer defaults to 2 and can be set with `--max-collection`.
 The structured `CheckReport` records the effective value in
 `maxCollectionSize` and sets `collectionCapApplied` when the search expands at
 least one reachable collection fork. This metadata describes the explored
 search shape; it is not a `boundsHit` value and does not make `bounded` true.
 The CLI reports the same caveat in text mode and includes both fields in JSON.
+`coverageIncomplete` also records collection-width and sampled-schema limits.
+It is a diagnostic about the finite search, not a generic source-admission
+failure: `check` may print `Status: INCOMPLETE` and exit 0 when no definite
+structural defect was found. `add`, `push`, and source `install` warn and retain
+their definite-defect validation gates. An archive or release policy that
+needs stronger evidence must state and check that requirement separately.
 
 **Collection-member retract transitions.** A bare collection member may be
 retracted by any authorized non-judge consumer, even when that member is
@@ -1105,9 +1111,9 @@ idle successor.
   idle time. A genuine structural dead-end (e.g. a `group:`-blocked or
   ungreen-input state, or an owed input with no producer). This is folded
   into `hasDefiniteDefect` and makes `check` exit nonzero — but only when the
-  search was exhaustive (`!report.bounded`), since a tight
-  `--max-collection`/`--max-states` cap can otherwise manufacture a spurious
-  no-moves state.
+  BFS was exhaustive (`!report.bounded`) **and** `coverageIncomplete` is empty.
+  A tight `--max-collection` cap can manufacture a spurious no-moves state
+  even when BFS exhausts its finite graph; `--max-states` can truncate BFS.
 
 The freeze-lift recompute ONLY lifts the `frozen()` guard — it does not
 bypass group-exclusivity (`groupBlockingWinner`), input-green gates, or
@@ -1151,13 +1157,18 @@ residual case `canEverFire` exists to catch is a reduce-mode step whose
 so `validateDef`'s reduce check doesn't trip), which reaches `modelCheck`
 silently dead.
 
-Two things it deliberately does not model, and why: **born-rejected
-commits** — a stale-CAS refusal (§12.2, §24.4) is a refusal, not a state
-transition, so it isn't a reachable state the search should explore; and
-**human overrides** (`green(workflow, 'human', ...)`, §24.6) — a human can
-always force any artifact green, so modeling that as an explorable
-transition would make nearly every workflow trivially "completable,"
-defeating the purpose of running the checker at all. Don't over-trust
+Two runtime features are deliberately outside its general model:
+
+- **Ordinary held-run born-reject interleavings:** a stale-CAS refusal
+  (§12.2, §24.4) changes artifact/run state in the live engine, but ordinary
+  claim-time concurrency is outside this static workflow-shape abstraction.
+  The checker does explore stale-input refusal on its modeled collection
+  producer lease.
+- **Human overrides** (`green(workflow, 'human', ...)`, §24.6): a human can
+  force any artifact green. Modeling that as an explorable transition would
+  make nearly every workflow trivially "completable."
+
+Don't over-trust
 `owenloop check` results for concurrency or liveness questions that hinge on
 either of these — it answers "is this graph structurally sound," not "can a
 human or a stale commit route around a stall." See README's Testing section

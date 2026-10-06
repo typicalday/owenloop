@@ -97,6 +97,22 @@ function validDefYaml(name: string): string {
   ].join('\n');
 }
 
+function lateCollectionYaml(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs: [{ name: seed, seedOwed: false }]',
+    'steps:',
+    ...Array.from({ length: 55 }, (_, index) => [
+      `  - name: stage-${index + 1}`,
+      `    consumes: [${index === 0 ? 'seed' : `value-${index}`}]`,
+      `    produces: [${index === 54 ? '"items[]"' : `value-${index + 1}`}]`,
+      ...(index === 54 ? ['    terminal: true'] : []),
+      '    maxSchemaFailures: 0',
+    ]).flat(),
+    '',
+  ].join('\n');
+}
+
 interface WireManifest {
   coordinate: { namespace: string; name: string; version: string };
   files: Record<string, string>;
@@ -709,6 +725,47 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   assert.ok(!existsSync(journalPath), 'journal removed on success');
   await assertLockReleased(lockPath, 'lock released on success');
   assert.ok(!existsSync(join(root, '.owenloop-staging')), 'staging root cleared');
+});
+
+test('install: direct store API lets verifier admit collection bundles despite checker coverage gaps', async () => {
+  const { root, lockPath, journalPath, markerDir } = tempStore();
+  const scalar = makeBundle('widget');
+  const firstVerifier = fakeVerifier();
+  const common = { source: SRC, root, level: 'project' as const, lockPath, journalPath,
+    recoveryMarkerDir: markerDir, ingestor: fakeIngestor() };
+  const installed = await installWorkflowBundle({
+    ...common, bytes: bundleBytes(scalar), verifier: firstVerifier,
+  });
+  assert.equal(installed.installed, true, 'scalar positive control installs');
+  assert.equal(firstVerifier.calls.length, 1);
+  const collection = makeBundle('collection-only', {
+    'def.yaml': validDefYaml('collection-only').replace('produces: [out]', 'produces: ["items[]"]'),
+  });
+  const collectionVerifier = fakeVerifier();
+  const collectionResult = await installWorkflowBundle({
+    ...common, bytes: bundleBytes(collection), verifier: collectionVerifier,
+  });
+  assert.equal(collectionResult.installed, true);
+  assert.equal(collectionVerifier.calls.length, 1, 'publisher verifier retains the admission decision');
+  assert.ok(existsSync(collectionResult.objectPath));
+
+  const late = makeBundle('late-collection', { 'def.yaml': lateCollectionYaml('late-collection') });
+  const lateVerifier = fakeVerifier();
+  const lateResult = await installWorkflowBundle({ ...common, bytes: bundleBytes(late), verifier: lateVerifier });
+  assert.equal(lateResult.installed, true, 'the checker BFS prefix is not publisher authority');
+  assert.equal(lateVerifier.calls.length, 1);
+  assert.ok(existsSync(lateResult.objectPath));
+  assert.ok(!existsSync(journalPath), 'commit journal is finalized after admission');
+
+  const lateScalar = makeBundle('late-scalar', {
+    'def.yaml': lateCollectionYaml('late-scalar').replace('"items[]"', 'final-result'),
+  });
+  const scalarVerifier = fakeVerifier();
+  const scalarResult = await installWorkflowBundle({
+    ...common, bytes: bundleBytes(lateScalar), verifier: scalarVerifier,
+  });
+  assert.equal(scalarResult.installed, true, 'a BFS-bounded scalar definition remains admissible');
+  assert.equal(scalarVerifier.calls.length, 1);
 });
 
 test('install: expected digest mismatch refuses before verifier, object, or index mutation', async () => {

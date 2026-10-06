@@ -18,6 +18,7 @@ import {
   sealPath,
   sealStem,
 } from './paths.ts';
+import { validateValue } from './schema.ts';
 import { DEBT_STATES, isCallStep, OUTSTANDING_STATES, SETTLED_STATES } from './types.ts';
 import type {
   Acceptance,
@@ -2339,10 +2340,9 @@ export function eligibleOutcomes(
   const isMember = !!el && el.suffix === '';
 
   const outcomes: CheckStep['outcome'][] = [];
-  // A mixed producer commits its singleton outputs separately before it emits
-  // and seals its collection. `plainOutputs()` intentionally orders those
-  // singletons before the seal, so only the seal is the collection verb; the
-  // runtime still permits a consumer to judgment-reject that green seal.
+  // A mixed producer commits its singleton outputs separately from collection
+  // emit/seal, in either order on the same run. `plainOutputs()` lists those
+  // singletons before the seal, so only the seal is the collection verb.
   if (stem && !el && outPath === sealPath(stem)) {
     // collection producer's actual seal output — emit-seal path
     outcomes.push('emit-seal');
@@ -2401,7 +2401,7 @@ function groupWouldReject(def: WorkflowDef, arts: Map<string, ArtifactData>, pat
   return groupBlockingWinner(def, arts, path) !== undefined;
 }
 
-/** Internal: emit-seal branches — one map per element count 0..maxCollectionSize. */
+/** Legacy one-step conformance helper. modelCheck uses collection leases instead. */
 function applyEmitSeal(
   def: WorkflowDef,
   arts: Map<string, ArtifactData>,
@@ -2453,6 +2453,246 @@ function applyEmitSeal(
   return results;
 }
 
+/** A model-only open collection run. The live engine keeps this in its task table. */
+/** @internal Checker-only task state; not a package-root API. */
+export interface CollectionLease {
+  step: string;
+  key: string;
+  stem: string;
+  inputs: string[];
+  fingerprint: Fingerprint;
+}
+
+/** @internal Checker-only combined artifact/task state; not a package-root API. */
+export interface CollectionCheckState {
+  arts: Map<string, ArtifactData>;
+  leases: CollectionLease[];
+}
+
+/**
+ * A collection schema constrains the values of each emit item, not the seal.
+ * Enumerate a few concrete object witnesses rather than claiming that either
+ * branch exists merely because a schema was declared. This is deliberately a
+ * sampled-value abstraction; the report flags it whenever reached.
+ */
+/** @internal Concrete candidate values for differential checker/runtime tests. */
+export function collectionValueWitnesses(schema: JsonSchema | undefined): {
+  valid?: Record<string, unknown>;
+  invalid?: Record<string, unknown>;
+  validClassKnown: boolean;
+  invalidClassKnown: boolean;
+} {
+  if (schema === undefined) return { valid: {}, validClassKnown: true, invalidClassKnown: true };
+
+  const sample = (shape: JsonSchema | undefined, depth: number): unknown => {
+    if (depth > 5 || shape === undefined || shape === true) return {};
+    if (shape === false) return undefined;
+    if ('const' in shape) return shape.const;
+    const values = shape.enum;
+    if (Array.isArray(values) && values.length > 0) return values[0];
+    const union = shape.anyOf ?? shape.oneOf;
+    if (Array.isArray(union) && union.length > 0) return sample(union[0] as JsonSchema, depth + 1);
+    const type = Array.isArray(shape.type) ? shape.type[0] : shape.type;
+    if (type === 'string') return typeof shape.minLength === 'number' ? 'x'.repeat(Math.min(shape.minLength, 32)) : 'x';
+    if (type === 'integer' || type === 'number') return typeof shape.minimum === 'number' ? shape.minimum : 1;
+    if (type === 'boolean') return true;
+    if (type === 'null') return null;
+    if (type === 'array') return [];
+    const object: Record<string, unknown> = {};
+    const props = shape.properties && typeof shape.properties === 'object' && !Array.isArray(shape.properties)
+      ? shape.properties as Record<string, JsonSchema> : {};
+    const required = Array.isArray(shape.required) ? shape.required.filter((name): name is string => typeof name === 'string') : [];
+    for (const name of required) object[name] = sample(props[name], depth + 1);
+    if (Array.isArray(shape.allOf)) {
+      for (const branch of shape.allOf) {
+	const part = sample(branch as JsonSchema, depth + 1);
+	if (part && typeof part === 'object' && !Array.isArray(part)) Object.assign(object, part);
+      }
+    }
+    return object;
+  };
+
+  const generated = sample(schema, 0);
+  const candidates: Record<string, unknown>[] = [
+    {}, { ok: true }, { ok: false }, { url: 'x' }, { value: 'x' },
+    { n: 1 }, { value: 1 }, { items: [] },
+  ];
+  if (generated && typeof generated === 'object' && !Array.isArray(generated)) {
+    const object = generated as Record<string, unknown>;
+    candidates.unshift(object);
+    for (const key of Object.keys(object)) {
+      const omitted = { ...object };
+      delete omitted[key];
+      candidates.push(omitted, { ...object, [key]: null });
+    }
+  }
+  let valid: Record<string, unknown> | undefined;
+  let invalid: Record<string, unknown> | undefined;
+  for (const value of candidates) {
+    if (validateValue(schema, value).valid) valid ??= value;
+    else invalid ??= value;
+    if (valid && invalid) break;
+  }
+  // The TypeScript signature says Record, but Engine.emit is callable from JS
+  // and validates the runtime value directly. Only an unconstrained schema
+  // proves that no caller can trigger a schema refusal.
+  const allObjectsValid = schema === true || (schema !== false && Object.keys(schema).length === 0);
+  return {
+    valid, invalid,
+    validClassKnown: valid !== undefined || schema === false,
+    invalidClassKnown: invalid !== undefined || allObjectsValid,
+  };
+}
+
+/** @internal Checker key includes the open collection task. */
+export function collectionCheckKey(def: WorkflowDef, state: CollectionCheckState): string {
+  const leases = state.leases.map((lease) => ({
+    step: lease.step,
+    key: lease.key,
+    stem: lease.stem,
+    inputs: lease.inputs.map((path) => [
+      path,
+      isGreen(state.arts.get(path)) && state.arts.get(path)?.version === lease.fingerprint[path]
+	? 'current' : 'moved',
+    ]),
+  })).sort((a, b) => a.step.localeCompare(b.step) || a.key.localeCompare(b.key));
+  return `${canonicalKey(def, state.arts)}|leases:${JSON.stringify(leases)}`;
+}
+
+/** @internal One visible action by an open collection producer. */
+export function collectionLeaseSuccessors(
+  def: WorkflowDef,
+  state: CollectionCheckState,
+  lease: CollectionLease,
+  maxCollectionSize: number,
+  modifier?: string,
+): Array<{ state: CollectionCheckState; step: CheckStep }> {
+  const step = def.steps.find((candidate) => candidate.name === lease.step);
+  if (!step) return [];
+  const sealP = sealPath(lease.stem);
+  const seal = state.arts.get(sealP);
+  if (!seal) return [];
+  const withoutLease = state.leases.filter((candidate) => candidate !== lease);
+  const result: Array<{ state: CollectionCheckState; step: CheckStep }> = [];
+  const move = (
+    outcome: CheckStep['outcome'], arts: Map<string, ArtifactData>,
+    leases = state.leases, count?: number, path?: string,
+  ): void => {
+    result.push({
+      state: { arts: settleInMemory(def, arts), leases },
+      step: { step: lease.step, key: lease.key, outcome,
+	...(count === undefined ? {} : { count }), ...(path === undefined ? {} : { path }) },
+    });
+  };
+
+  // `close()` always releases the task. It may be the only live action after a
+  // seal, a human intervention, or an input move.
+  move('collection-close', new Map(state.arts), withoutLease);
+
+  const stale = lease.inputs.some((path) =>
+    !isGreen(state.arts.get(path)) || state.arts.get(path)?.version !== lease.fingerprint[path]);
+  const singletonPaths = singletonProduces(step)
+    .map((produce) => produce.stem)
+    // An open run may commit the same singleton again after it is green or
+    // submitted. That bumps its version and may invalidate downstream work.
+    .filter((path) => state.arts.has(path));
+  if (stale) {
+    // The worker may attempt green() on a singleton or emit()/seal() on the
+    // collection. Each CAS-refused verb born-rejects its OWN target and releases
+    // the same run; the alternative targets have distinct artifact effects.
+    for (const path of [sealP, ...singletonPaths]) {
+      const target = state.arts.get(path);
+      if (!target) continue;
+      // A plain singleton's group refusal precedes the runtime CAS check.
+      // It leaves the open run and the already-settled loser untouched.
+      if (path !== sealP
+	  && activeJudgesForStem(def, path, modifier).length === 0
+	  && groupWouldReject(def, state.arts, path)) {
+	move('group-reject', new Map(state.arts), state.leases, undefined, path);
+	continue;
+      }
+      const next = new Map(state.arts);
+      next.set(path, {
+	...target, acceptance: 'rejected',
+	reasons: [...target.reasons, {
+	  at: 0, action: 'born-rejected', kind: 'structural', by: 'engine',
+	  text: 'input moved during collection run', fromVersion: target.version,
+	}],
+      });
+      move('collection-born-reject', next, withoutLease, undefined, path);
+    }
+    return result;
+  }
+
+  // A mixed producer owns its singleton outputs on this SAME run. Runtime may
+  // green/skip/reject one before or after any emit(), including after sealing;
+  // there is no enforced singleton-before-collection order.
+  for (const path of singletonPaths) {
+    const produce = step.produces.find((candidate) => candidate.kind === 'singleton' && candidate.stem === path);
+    const witnesses = collectionValueWitnesses(produce?.schema);
+    const firing: Firing = {
+      step: lease.step, key: lease.key, inputs: lease.inputs, outputs: [path],
+    };
+    for (const outcome of eligibleOutcomes(def, state.arts, firing, { modifier })) {
+      // Every newly interleaved commit branch needs a concrete runtime value.
+      // A bind can reject a schema-valid value through a separate validator;
+      // until a bind witness exists, omit both value-dependent branches.
+      if (outcome === 'green' && (produce?.bind !== undefined || witnesses.valid === undefined)) continue;
+      if (outcome === 'schema-reject' && (produce?.bind !== undefined || witnesses.invalid === undefined)) continue;
+      for (const arts of applyOutcome(def, state.arts, firing, outcome, { maxCollectionSize, modifier })) {
+	move(outcome, arts, state.leases, undefined, path);
+      }
+    }
+  }
+
+  const fp = computeFingerprint(state.arts, lease.inputs);
+  const sealed = new Map(state.arts);
+  sealed.set(sealP, {
+    ...seal, acceptance: 'green', version: seal.version + 1, fingerprint: fp,
+  });
+  // seal() does not close the claimed run and may be called again after green;
+  // the repeat bumps the seal version, even though emit() is then refused.
+  move('collection-seal', sealed);
+  if (seal.acceptance === 'green') return result;
+
+  const produce = step.produces.find((pattern) => pattern.kind === 'collection' && pattern.stem === lease.stem);
+  const witnesses = collectionValueWitnesses(produce?.schema);
+  const nextIdx = members(state.arts, lease.stem).reduce((max, member) => {
+    const element = parseElement(member.path);
+    return element ? Math.max(max, element.index + 1) : max;
+  }, 0);
+  if (witnesses.valid !== undefined) {
+    // The cap is on TOTAL emitted indices in this finite model, not on one
+    // emit() call. Repeated emits can reach the cap by different interleavings.
+    for (let count = 1; count <= maxCollectionSize - nextIdx; count++) {
+      const next = new Map(state.arts);
+      for (let offset = 0; offset < count; offset++) {
+	const path = elementPath(lease.stem, nextIdx + offset);
+	next.set(path, {
+	  workflow: '', path, producer: lease.step, acceptance: 'green',
+	  version: 1, value: witnesses.valid,
+	  fingerprint: fp, reasons: [], judgmentRejects: 0, schemaRejects: 0,
+	});
+      }
+      move('collection-emit', next, state.leases, count);
+    }
+  }
+  if (witnesses.invalid !== undefined) {
+    const next = new Map(state.arts);
+    next.set(sealP, {
+      ...seal, acceptance: 'rejected', schemaRejects: seal.schemaRejects + 1,
+      reasons: [...seal.reasons, {
+	at: 0, action: 'schema-reject', kind: 'validation', by: 'engine',
+	text: 'collection member failed schema validation', fromVersion: seal.version,
+      }],
+    });
+    move('collection-schema-reject', next);
+  }
+  // emit([]) and an emit on a green seal do not change artifacts or the lease;
+  // their stuttering loops are omitted from the finite state graph.
+  return result;
+}
+
 /**
  * Given a firing and a nondeterministic outcome, produce the post-commit
  * in-memory state (cloned from arts) then run settleInMemory.
@@ -2467,8 +2707,8 @@ function applyEmitSeal(
  *   'skip'            — acceptance skipped + fingerprint of requiredInputs
  *   'retract'         — a non-judge consumer retracts an authorized bare
  *                       collection member; acceptance becomes retracted
- *   'emit-seal'       — collection producer: emit 1..maxCollectionSize green elements,
- *                       then seal; forks into (maxCollectionSize+1) successor states
+ *   'emit-seal'       — legacy one-step conformance helper only; modelCheck
+ *                       uses separate claim/emit/seal/close transitions
  *
  * Returns an array of successor states (>1 only for emit-seal). Each successor
  * is already settled.
@@ -2676,9 +2916,9 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
  *   - stall states: the recompute yields >= 1 firing — a retryable frozen debt
  *     or future idle threshold is the only blocker. An expected brake/wait,
  *     never a defect.
- *   - true deadlocks: the recompute STILL yields zero firings — a genuine
- *     structural dead-end with no move even after retry or elapsed idle time.
- *     A real defect.
+ *   - true deadlocks: the recompute STILL yields zero firings. They are a
+ *     definite defect only when the graph has neither BFS bounds nor known
+ *     collection-width/value undercoverage.
  * - stuck states: reachable states that have a stalled debt but STILL have
  *   >= 1 eligible firing elsewhere (a brake tripped on one branch while the
  *   line moves on another). Informational only; a no-moves state is never
@@ -2701,11 +2941,13 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   const maxStates = opts.maxStates ?? 5000;
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
-  const initial = seedArts(def, opts.assumeProvided ?? false);
-  const initialKey = canonicalKey(def, initial);
+  const initial: CollectionCheckState = {
+    arts: seedArts(def, opts.assumeProvided ?? false), leases: [],
+  };
+  const initialKey = collectionCheckKey(def, initial);
 
   type StateNode = {
-    arts: Map<string, ArtifactData>;
+    state: CollectionCheckState;
     id: number;
     depth: number;
   };
@@ -2727,13 +2969,14 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   };
   // A cursor avoids Array.shift's repeated compaction. Clear processed slots
   // so their artifact maps can be reclaimed while descendants stay queued.
-  const queue: Array<StateNode | undefined> = [{ arts: initial, id: 0, depth: 0 }];
+  const queue: Array<StateNode | undefined> = [{ state: initial, id: 0, depth: 0 }];
   let queueHead = 0;
 
   const report: CheckReport = {
     def: def.name,
     bounded: false,
     boundsHit: [],
+    coverageIncomplete: [],
     collectionCapApplied: false,
     maxCollectionSize,
     deadlocks: [],
@@ -2761,7 +3004,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     report.stats.statesExplored++;
     if (node.depth > depthReached) depthReached = node.depth;
 
-    const status = workflowStatus(def, node.arts, { modifier: opts.modifier });
+    const arts = node.state.arts;
+    const status = workflowStatus(def, arts, { modifier: opts.modifier });
 
     // ---- invariant checking -------------------------------------------------
     // A state violates an invariant iff eval(when ?? ALWAYS_TRUE) && !eval(requires).
@@ -2776,8 +3020,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     if (def.invariants) {
       for (const inv of def.invariants) {
         if (reportedInvariants.has(inv.name)) continue;
-        const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, node.arts, status);
-        if (whenHolds && !evalInvariantPredicate(inv.requires, node.arts, status)) {
+	const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, arts, status);
+	if (whenHolds && !evalInvariantPredicate(inv.requires, arts, status)) {
           report.invariantViolations.push({ invariant: inv.name, path: nodePath() });
           reportedInvariants.add(inv.name);
         }
@@ -2791,7 +3035,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
         report.completable = true;
         report.completePath = nodePath();
       }
-      continue; // done states have no successors
+      // A claimed producer can still call seal() again or close(). Continue
+      // exploring its lease actions even if the artifacts are presently done.
+      if (node.state.leases.length === 0) continue;
     }
 
     // WS-6 — model the `calls:` handoff as a real TRANSITION, not a
@@ -2815,16 +3061,28 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     //
     // `eligibleFirings` (the LIVE engine scheduler) and `hasDefiniteCheckDefect`
     // (shared by check / add / push / install) are deliberately untouched.
-    const callsFirings = callsDischargeFirings(def, node.arts);
+    const callsFirings = callsDischargeFirings(def, arts);
     // Member retraction is likewise a runtime-valid authority transition, not
     // a worker firing. It is separate from eligibleFirings so a rejected map
     // input still has the later retract move the runtime permits.
-    const retractFirings = memberRetractFirings(def, node.arts);
+    const retractFirings = memberRetractFirings(def, arts);
     // Member retractions remain real successor transitions, including in the
     // zero-move branch below. They are recovery authority actions, though, not
     // ordinary worker/calls progress on another branch for `stuck` reporting.
-    const progressFirings = [...status.eligible, ...callsFirings];
-    const firings = [...progressFirings, ...retractFirings];
+    const openSteps = new Set(node.state.leases.map((lease) => lease.step));
+    // An open collection task cannot be re-offered merely because its seal is
+    // still owed or rejected. Its own emit/seal/close actions remain possible,
+    // including when a schema counter has frozen *new* offers.
+    const workerFirings = status.eligible.filter((firing) => !openSteps.has(firing.step));
+    const leaseMoves = node.state.leases.flatMap((lease) =>
+      collectionLeaseSuccessors(def, node.state, lease, maxCollectionSize, opts.modifier));
+    const leaseProgressFirings: Firing[] = node.state.leases
+      .filter((lease) => leaseMoves.some((move) =>
+	move.step.step === lease.step && move.step.outcome !== 'collection-close'))
+      .map((lease) => ({ step: lease.step, key: lease.key, inputs: lease.inputs,
+	outputs: [sealPath(lease.stem)] }));
+    const progressFirings = [...workerFirings, ...callsFirings, ...leaseProgressFirings];
+    const firings = status.done ? [] : [...workerFirings, ...callsFirings, ...retractFirings];
 
     // Non-done state with no eligible firings: classify by recomputing
     // eligibility as if every freeze/stall were lifted and idle time had
@@ -2832,8 +3090,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // expected stall/wait; otherwise it is a true structural deadlock.
     // EVENTUAL_TIME_FACTS is classification-only: the timeless BFS below does
     // not enqueue these future idle transitions or include time in its key.
-    if (firings.length === 0 && !status.done) {
-      const eventualFirings = eligibleFirings(def, node.arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier: opts.modifier });
+    if (firings.length === 0 && leaseMoves.length === 0 && !status.done) {
+      const eventualFirings = eligibleFirings(def, arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier: opts.modifier });
       if (eventualFirings.length > 0) {
         report.stallStates.push({ path: nodePath() });
       } else {
@@ -2851,7 +3109,14 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     if (status.debts.some((debt) =>
       debt.stalled
       && !retractClearsDebt(debt.path, retractFirings)
-      && progressMovesAnotherBranch(def, debt.path, node.arts, progressFirings),
+      // A schema-stalled seal can still be corrected or sealed by its already
+      // claimed producer. `frozen()` blocks a NEW offer, not verbs on that
+      // open run. Do not call this `stuck` merely because a map can also move.
+      && !leaseMoves.some((move) =>
+	move.step.outcome === 'collection-seal'
+	&& node.state.leases.some((lease) =>
+	  lease.step === move.step.step && sealPath(lease.stem) === debt.path))
+      && progressMovesAnotherBranch(def, debt.path, arts, progressFirings),
     )) {
       report.stuck.push({ path: nodePath() });
     }
@@ -2862,14 +3127,62 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       continue;
     }
 
-    // Expand successors
+    const enqueue = (state: CollectionCheckState, step: CheckStep): void => {
+      const key = collectionCheckKey(def, state);
+      if (!visited.has(key)) {
+	const id = predecessors.length;
+	predecessors.push({ parent: node.id, step });
+	visited.set(key, id);
+	queue.push({ state, id, depth: node.depth + 1 });
+      }
+    };
+
+    // Expand ordinary worker/calls/retract transitions. A collection producer
+    // first claims a run; subsequent emit/refusal/seal actions occur through
+    // the lease transitions below and can interleave with all other firings.
     outer: for (const firing of firings) {
       // An authority-only member retract does not prove its actor ever
       // produced an ordinary firing; preserve structural-dead-step accounting.
       if ((firing as Partial<MemberRetractFiring>).modelTransition !== 'member-retract') {
         firedSteps.add(firing.step);
       }
-      const outcomes = eligibleOutcomes(def, node.arts, firing, { modifier: opts.modifier });
+      const producer = def.steps.find((candidate) => candidate.name === firing.step);
+      const stem = producer && collectionStem(producer);
+      if (stem && firing.outputs.includes(sealPath(stem))) {
+	if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
+	report.collectionCapApplied = true;
+	if (!report.coverageIncomplete.includes('collection-width-cap')) {
+	  report.coverageIncomplete.push('collection-width-cap');
+	}
+	const collectionProduce = producer?.produces.find((p) => p.kind === 'collection' && p.stem === stem);
+	if (collectionProduce?.schema !== undefined) {
+	  report.collectionSchemaValuesSampled = true;
+	  const witnesses = collectionValueWitnesses(collectionProduce.schema);
+	  if (!witnesses.validClassKnown && !report.coverageIncomplete.includes('collection-schema-validity')) {
+	    report.coverageIncomplete.push('collection-schema-validity');
+	  }
+	  if (!witnesses.invalidClassKnown && !report.coverageIncomplete.includes('collection-schema-refusal')) {
+	    report.coverageIncomplete.push('collection-schema-refusal');
+	  }
+	}
+	if (producer?.produces.some((p) => p.kind === 'singleton' && (p.schema !== undefined || p.bind !== undefined))) {
+	  if (!report.coverageIncomplete.includes('collection-mixed-output-values')) {
+	    report.coverageIncomplete.push('collection-mixed-output-values');
+	  }
+	}
+	const lease: CollectionLease = {
+	  // Runtime emit/seal CAS the step's declared plain consumes even for
+	  // allGreen/idle firings whose claim fingerprint contains no inputs.
+	  step: firing.step, key: firing.key, stem,
+	  inputs: plainConsumes(producer).map((consume) => consume.stem),
+	  fingerprint: computeFingerprint(arts, firing.inputs),
+	};
+	const claimed = { arts, leases: [...node.state.leases, lease] };
+	enqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' });
+	continue;
+      }
+
+      const outcomes = eligibleOutcomes(def, arts, firing, { modifier: opts.modifier });
 
       for (const outcome of outcomes) {
         // Check state count before expanding
@@ -2879,19 +3192,18 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
         }
 
         const step: CheckStep = { step: firing.step, key: firing.key, outcome };
-        if (outcome === 'emit-seal') report.collectionCapApplied = true;
-        const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
+	const successors = applyOutcome(def, arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
 
         for (const suc of successors) {
-          const key = canonicalKey(def, suc);
-          if (!visited.has(key)) {
-            const id = predecessors.length;
-            predecessors.push({ parent: node.id, step });
-            visited.set(key, id);
-            queue.push({ arts: suc, id, depth: node.depth + 1 });
-          }
+	  enqueue({ arts: suc, leases: node.state.leases }, step);
         }
       }
+    }
+    if (boundsHit.has('maxStates')) break;
+
+    for (const move of leaseMoves) {
+      if (visited.size >= maxStates) { boundsHit.add('maxStates'); break; }
+      enqueue(move.state, move.step);
     }
     if (boundsHit.has('maxStates')) break;
   }
@@ -2899,6 +3211,12 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   report.stats.depthReached = depthReached;
   report.boundsHit = [...boundsHit];
   report.bounded = boundsHit.size > 0;
+  // A declaration hidden behind a BFS prefix still has runtime collection
+  // behavior. Admission cannot treat an unexpanded finite graph as proof that
+  // the collection width/value abstraction was never needed.
+  if (!report.collectionCapApplied && def.steps.some((step) => collectionStem(step) !== undefined)) {
+    report.coverageIncomplete.push('collection-unexplored');
+  }
 
   // Dead steps: steps in the def that never appeared as a firing.step, split
   // by the static canEverFire check into structurally-dead (a real wiring
@@ -2932,13 +3250,15 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
  * invariant violations and structurally-dead steps are ALWAYS definite (sound
  * regardless of bounds); a true deadlock counts ONLY when the search was
  * exhaustive (`!bounded`) because a tight maxCollectionSize cap can manufacture
- * a spurious one. `unreachedSteps` is deliberately EXCLUDED — it is a bounds
+ * a spurious one. A finite collection-width cap or unresolved schema-value
+ * class can also manufacture a no-moves state, so those reports cannot make a
+ * deadlock definite. `unreachedSteps` is deliberately EXCLUDED — it is a bounds
  * artifact ("raise --max-states/--max-depth"), never a definite defect.
  */
 export function hasDefiniteCheckDefect(report: CheckReport): boolean {
   return (
     report.invariantViolations.length > 0 ||
     report.structurallyDeadSteps.length > 0 ||
-    (!report.bounded && report.deadlocks.length > 0)
+    (!report.bounded && report.coverageIncomplete.length === 0 && report.deadlocks.length > 0)
   );
 }

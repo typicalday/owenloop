@@ -84,7 +84,7 @@ test('owenloop#229: a bare reduce exhausts without recoverable collection states
   assert.deepEqual(report.stuck, []);
 });
 
-test('owenloop#236: map with a member reduce hits maxStates', () => {
+test('owenloop#236: map with a member reduce can exhaust the finite width-two model', () => {
   const fixture = def(
     'owenloop-236-member-reduce',
     [input('question', { seedOwed: false })],
@@ -108,11 +108,13 @@ test('owenloop#236: map with a member reduce hits maxStates', () => {
   const report = modelCheck(fixture, { maxStates: 5_000, maxCollectionSize: 2, assumeProvided: true });
 
   assert.equal(report.completable, true);
-  assert.equal(report.bounded, true);
-  assert.ok(report.boundsHit.includes('maxStates'));
+  assert.equal(report.bounded, false);
+  assert.deepEqual(report.boundsHit, []);
+  assert.deepEqual(report.coverageIncomplete, ['collection-width-cap'],
+    'finite-model exhaustion does not certify wider runtime collections');
 });
 
-test('owenloop#229: minimal-budget map then suffix reduce is exhaustively clean', () => {
+test('owenloop#229: minimal-budget map/reduce has only recoverable finite-model stalls', () => {
   const report = modelCheck(memberReduceFixture(1, 0), {
     maxStates: 10_000,
     maxCollectionSize: 2,
@@ -123,7 +125,11 @@ test('owenloop#229: minimal-budget map then suffix reduce is exhaustively clean'
   assert.equal(report.bounded, false);
   assert.deepEqual(report.boundsHit, []);
   assert.deepEqual(report.deadlocks, []);
-  assert.deepEqual(report.stuck, []);
+  assert.ok(report.stuck.length > 0, 'new pre-seal and same-run paths expose real stalled branches');
+  assert.ok(report.stuck.every((finding) =>
+    finding.path.some((move) => move.outcome === 'collection-close')),
+  'a schema-free stalled branch appears only after its producer closes the open run');
+  assert.deepEqual(report.coverageIncomplete, ['collection-width-cap']);
   assert.deepEqual(report.structurallyDeadSteps, []);
   assert.deepEqual(report.unreachedSteps, []);
   assert.deepEqual(report.invariantViolations, []);
@@ -136,8 +142,7 @@ test('owenloop#236: schema-free retry profiles avoid impossible schema-reject br
   const oneFive = modelCheck(memberReduceFixture(1, 5), options);
   const twoFive = modelCheck(memberReduceFixture(2, 5), options);
 
-  assert.equal(oneZero.bounded, false);
-  assert.deepEqual(oneZero.boundsHit, []);
+  assert.ok(oneZero.coverageIncomplete.includes('collection-width-cap'));
 
   // No produce declares a schema or bind, so changing maxSchemaFailures alone
   // must not add transitions. Only the judgment-reject attempt budget matters.
@@ -149,6 +154,9 @@ test('owenloop#236: schema-free retry profiles avoid impossible schema-reject br
   assert.ok(twoZero.boundsHit.includes('maxStates'));
   assert.equal(twoFive.bounded, true);
   assert.ok(twoFive.boundsHit.includes('maxStates'));
+  assert.ok(oneZero.stuck.every((finding) =>
+    !finding.path.some((move) => move.outcome === 'collection-schema-reject')),
+  'schema-free producers cannot take a collection schema-refusal transition');
 });
 
 test('owenloop#236: no schema or bind cannot schema-reject, while either guard can', () => {
@@ -230,7 +238,7 @@ test('owenloop#236: a plain losing group sibling cannot schema-reject before gro
   assert.ok(!refused.includes('green'));
 });
 
-test('owenloop#236: schema-free width-two map/reduce exhausts under the archive state cap', () => {
+test('owenloop#236: schema-free width-two map/reduce exhausts BFS but remains width-incomplete', () => {
   const report = modelCheck(memberReduceFixture(2, 5), {
     maxStates: 100_000,
     maxDepth: 50,
@@ -239,6 +247,7 @@ test('owenloop#236: schema-free width-two map/reduce exhausts under the archive 
   });
   assert.equal(report.bounded, false);
   assert.deepEqual(report.boundsHit, []);
+  assert.deepEqual(report.coverageIncomplete, ['collection-width-cap']);
   assert.equal(report.completable, true);
   assert.deepEqual(report.deadlocks, []);
   assert.deepEqual(report.invariantViolations, []);

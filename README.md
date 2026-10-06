@@ -781,6 +781,14 @@ input no longer reports a false `True deadlocks ... (initial state)` and nonzero
 blocker, it also prints a one-line hint naming the seedOwed input(s) responsible.
 `--assume-provided` is still accepted but is now a no-op (redundant with the default).
 
+For collection workflows, `check` reports finite member-count and sampled-schema
+limits as `MODEL COVERAGE INCOMPLETE`. That diagnostic may accompany an exit-0
+structural check; it does not certify every runtime emission or validation path.
+Source `add`, `push`, and `install` warn on the same limit while retaining their
+definite-defect gates. Runtime CAS, schema, lease, and recovery behavior is
+verified separately by integration and end-to-end tests; a particular archive
+or release policy can require additional evidence.
+
 ---
 
 ## Design reference

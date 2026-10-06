@@ -110,7 +110,7 @@ test('memberRetractFirings: every non-retracted member retracts through every au
   );
 });
 
-test('modelCheck: shipped research reports no definite defects before the expected state bound', () => {
+test('modelCheck: shipped research exhausts its finite graph without a definite defect', () => {
   const loadDefFileInputIsString: Exactly<Parameters<typeof loadDefFile>[0], string> = true;
   assert.equal(loadDefFileInputIsString, true, 'loadDefFile remains a filesystem-string API');
   const shippedResearch = loadDefFile(
@@ -118,8 +118,9 @@ test('modelCheck: shipped research reports no definite defects before the expect
   );
   const report = modelCheck(shippedResearch, { maxStates: 50_000, assumeProvided: true });
 
-  assert.equal(report.bounded, true, 'the complete member-retract model exceeds the shipped search budget');
-  assert.deepEqual(report.boundsHit, ['maxStates']);
+  assert.equal(report.bounded, false, 'the lease-aware width-two graph fits the stated search budget');
+  assert.deepEqual(report.boundsHit, []);
+  assert.deepEqual(report.coverageIncomplete, ['collection-width-cap'], 'finite width is not runtime coverage');
   assert.deepEqual(report.deadlocks, []);
   assert.deepEqual(report.structurallyDeadSteps, []);
   assert.deepEqual(report.invariantViolations, []);

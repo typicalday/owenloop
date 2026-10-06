@@ -149,6 +149,7 @@ test('a closed stdout reader does not strand the executable', async () => {
     { code: 0, signal: null },
     result.stderr.toString('utf8'),
   );
+  assert.doesNotMatch(result.stderr.toString('utf8'), /model coverage incomplete/);
 });
 
 test('the executable preserves a check error exit code', async () => {

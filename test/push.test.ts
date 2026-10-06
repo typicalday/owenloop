@@ -39,6 +39,19 @@ function validDef(name: string): string {
   ].join('\n');
 }
 
+test('push: finite collection coverage warns but accepts a valid source definition', async () => {
+  const hub = makeFakeHub();
+  const routed = routedFetch(hub.routes);
+  const t = makeIo({ fetch: routed.fetch });
+  writeDefs(t.cwd, { 'collection-only.yaml': validDef('collection-only').replace('produces: [out]', 'produces: ["items[]"]') });
+  bind(t);
+  assert.equal(await mainAsync(['push'], t.io), 0, t.err.join('\n'));
+  assert.match(t.err.join('\n'), /warning: collection-only: model coverage incomplete \(collection-width-cap\)/);
+  assert.doesNotMatch(t.err.join('\n'), /definite defects found/);
+  assert.ok(hub.state.get('collection-only'));
+  assert.equal(routed.calls.filter((call) => call.method === 'POST').length, 1);
+});
+
 function callsDef(name: string, stepName: string, target?: string): string {
   return target === undefined
     ? [
