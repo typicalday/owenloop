@@ -27,6 +27,7 @@ import {
   capabilityName,
   claimMatches,
   composeCapabilities,
+  resolveStepCapabilities,
 } from '../src/capabilities.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -792,4 +793,29 @@ test('capability mapping: the deep tick threads the mapping into a calls: child'
   assert.ok(runnerOrder, 'the mapped name claims the child runner');
   assert.equal(runnerOrder!.workflow, child!.id);
   assert.deepEqual(runnerOrder!.capabilities, ['repo-a-flow.coding']);
+});
+
+test('scoped resolution binds exact step meaning and generation; explicit no-op wins', () => {
+  const DefRef = { bundleDigest: 'a'.repeat(64), workflowName: 'flow' };
+  const identity = { DefRef, step: 'B', meaningDigest: 'b'.repeat(64), evidenceGeneration: 'c'.repeat(64) };
+  const scopedMappings = [{ ...identity, authored: 'work', target: 'special' }];
+  const resolved = resolveStepCapabilities({ ...identity, authored: ['work', 'work'], scopedMappings,
+    legacyMappings: { work: 'legacy' }, modifier: 'deep', rewrites: { 'special:deep': 'served' },
+    crewStamps: { served: ['right'], 'legacy:deep': ['wrong'] }, revision: 'r1' });
+  assert.deepEqual(resolved.capabilities, ['served']);
+  assert.deepEqual(resolved.crews, ['right']);
+  assert.deepEqual(resolved.reroutedFrom, ['special:deep']);
+  assert.ok(Object.isFrozen(resolved));
+  assert.ok(Object.isFrozen(resolved.capabilities));
+  const noOp = resolveStepCapabilities({ ...identity, authored: ['work', 'work'], scopedMappings,
+    explicitMappings: { work: 'work' }, legacyMappings: { work: 'legacy' }, revision: 'r1' });
+  assert.deepEqual(noOp.capabilities, ['work', 'work']);
+  for (const changed of [{ step: 'A' }, { DefRef: { ...DefRef, workflowName: 'child' } },
+    { meaningDigest: 'd'.repeat(64) }, { evidenceGeneration: 'e'.repeat(64) }]) {
+    const other = resolveStepCapabilities({ ...identity, ...changed, authored: ['work'], scopedMappings,
+      legacyMappings: { work: 'legacy' }, revision: 'r1' });
+    assert.deepEqual(other.capabilities, ['legacy']);
+  }
+  assert.deepEqual(resolveStepCapabilities({ ...identity, authored: ['constructor', 'toString', 'constructor'],
+    explicitMappings: {}, legacyMappings: {}, revision: 'r1' }).capabilities, ['constructor', 'toString', 'constructor']);
 });
