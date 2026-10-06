@@ -1306,6 +1306,18 @@ export class Store {
     return r ? mapArtifact(r) : undefined;
   }
 
+  /**
+   * Authoritative persisted evidence, without request-local logical hydration.
+   * Synchronous and read-only on this connection (and its current transaction).
+   * Keep this independent of overridable logical getArtifact/listArtifacts reads.
+   */
+  getArtifactEvidence(workflow: string, path: string): ArtifactRow | undefined {
+    const r = this.db
+      .prepare('SELECT * FROM artifact WHERE workflow = ? AND path = ?')
+      .get(workflow, path) as ArtifactRowRaw | undefined;
+    return r ? mapArtifact(r) : undefined;
+  }
+
   getArtifactById(id: string): ArtifactRow | undefined {
     const r = this.db.prepare('SELECT * FROM artifact WHERE id = ?').get(id) as
       | ArtifactRowRaw
