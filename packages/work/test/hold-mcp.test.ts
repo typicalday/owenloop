@@ -9,6 +9,8 @@ import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
 import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
 import { createHoldMcp } from '../src/hold/mcp.ts';
+import { validModelOrderFields } from '../src/order-definition-binding.ts';
+import { buildDef } from '../../../src/defs.ts';
 import type { SubmissionKeyManager } from '../src/submit-proof.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
@@ -22,7 +24,7 @@ interface Call {
 }
 
 interface HubCfg {
-  getOrder?: GetOrderResponse | Error;
+  getOrder?: GetOrderResponse | Error | Array<GetOrderResponse | Error>;
   submit?: { outcome?: string; closed?: boolean } | Error | Array<{ outcome?: string; closed?: boolean } | Error>;
   reject?: { ok?: boolean; closed?: boolean } | Error;
   ask?: { ok?: boolean; closed?: boolean } | Error;
@@ -58,11 +60,15 @@ afterEach(() => {
 
 function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
   const calls: Call[] = [];
+  let getOrderIdx = 0;
   let submitIdx = 0;
   const hub = {
     async getOrder(req: unknown) {
       calls.push({ verb: 'get_order', arg: req });
-      const r = cfg.getOrder ?? { text: '', workflow: 'wf1', run: 'run1', order: null, lease: { claimed: true } };
+      const configured = cfg.getOrder ?? defaultOrderResponse();
+      const r = Array.isArray(configured)
+	? configured[Math.min(getOrderIdx++, configured.length - 1)]!
+	: configured;
       if (r instanceof Error) throw r;
       return r;
     },
@@ -125,6 +131,7 @@ function deps(hub: HubClient, extra: Partial<Parameters<typeof createHoldMcp>[0]
     sleep: async () => {},
     now: () => 0,
     err: () => {},
+    modelOrderVerifier: async () => ({ ok: true as const }),
     ...extra,
   };
 }
@@ -158,6 +165,13 @@ function producerOrderResponse(): GetOrderResponse {
     },
     lease: { claimed: true },
   };
+}
+
+function defaultOrderResponse(): GetOrderResponse {
+  const response = producerOrderResponse();
+  response.order!.outputs = ['pr'];
+  response.order!.owes[0]!.path = 'pr';
+  return response;
 }
 
 // ---- shape ------------------------------------------------------------------
@@ -223,6 +237,163 @@ test('get_order (no first contact yet) live-fetches for the bound run and return
   assert.deepEqual(calls, [{ verb: 'get_order', arg: { workflow: 'wf1', run: 'run1', holder: { kind: 'session', id: 's-1' } } }]);
 });
 
+test('get_order and direct submit refuse an undeclared owed path without displaying it', async () => {
+  const local = buildDef({ name: 'local', steps: [{ name: 'producer', produces: ['result'] }] }).steps[0]!;
+  const response = producerOrderResponse();
+  response.order!.outputs = ['HOSTILE-OWED-PATH'];
+  response.order!.owes[0]!.path = 'HOSTILE-OWED-PATH';
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    modelOrderVerifier: async (order) => validModelOrderFields(local, order)
+      ? { ok: true } : { ok: false, reason: 'model order refusal: fields differ from local definition' },
+  }));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, true);
+  assert.deepEqual(parse(shown), { error: 'model order refusal: fields differ from local definition' });
+  assert.doesNotMatch(JSON.stringify(shown), /HOSTILE-OWED-PATH/);
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'HOSTILE-OWED-PATH', value: 1 }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('get_order fails closed if no local definition verifier was wired', async () => {
+  const { hub } = mockHub({ getOrder: producerOrderResponse() });
+  const mount = createHoldMcp(deps(hub, { modelOrderVerifier: undefined }));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, true);
+  assert.deepEqual(parse(shown), { error: 'model order refusal: local definition verifier is not configured' });
+});
+
+test('get_order accepts a Service-canonicalized child and keeps the requested root for submit', async () => {
+  const response = producerOrderResponse();
+  response.workflow = 'child-wf';
+  response.order!.workflow = 'child-wf';
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub));
+  const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(parse(result).order.workflow, 'child-wf');
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'result', value: 1 }, ctx);
+  assert.equal(submitted.isError, undefined);
+  assert.deepEqual(calls.filter((call) => call.verb === 'get_order').map((call) => call.arg),
+    [{ workflow: 'wf1', run: 'run1' }]);
+  assert.deepEqual(calls.find((call) => call.verb === 'submit')!.arg, {
+    workflow: 'wf1', run: 'run1', path: 'result', value: 1,
+  });
+});
+
+test('get_order refuses inconsistent outer or inner identity before exposing an empty-consumes order', async () => {
+  const cases = [
+    { field: 'outer workflow', change: (response: GetOrderResponse) => { response.workflow = 'other-wf'; } },
+    { field: 'outer run', change: (response: GetOrderResponse) => { response.run = 'other-run'; } },
+    { field: 'inner workflow', change: (response: GetOrderResponse) => { response.order!.workflow = 'other-wf'; } },
+    { field: 'inner run', change: (response: GetOrderResponse) => { response.order!.run = 'other-run'; } },
+  ];
+  for (const { field, change } of cases) {
+    const response = producerOrderResponse();
+    response.order!.key = 'HOSTILE-KEY-SENTINEL';
+    change(response);
+    const { hub } = mockHub({ getOrder: response });
+    const mount = createHoldMcp(deps(hub));
+    const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+    assert.equal(result.isError, true, field);
+    assert.deepEqual(parse(result), { error: 'order identity refusal: response does not match the held run' }, field);
+    assert.ok(!JSON.stringify(result).includes('HOSTILE-KEY-SENTINEL'), field);
+  }
+});
+
+test('get_order accepts a canonical child with a legacy null packet but refuses an unclaimed lease', async () => {
+  const { hub } = mockHub({ getOrder: {
+    text: '', workflow: 'child-wf', run: 'run1', order: null, lease: { claimed: true },
+  } });
+  const mount = createHoldMcp(deps(hub));
+  const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(parse(result), { workflow: 'child-wf', run: 'run1', order: null });
+
+  const unclaimed = mockHub({ getOrder: {
+    text: '', workflow: 'child-wf', run: 'run1', order: null, lease: { claimed: false },
+  } });
+  const refused = await tool(createHoldMcp(deps(unclaimed.hub)).tools, 'get_order').handler({}, ctx);
+  assert.equal(refused.isError, true);
+  assert.deepEqual(parse(refused), { error: 'order identity refusal: response does not match the held run' });
+
+  const closed = mockHub({ getOrder: {
+    text: '', workflow: 'child-wf', run: 'run1', order: null,
+    lease: { claimed: true, outcome: 'green' },
+  } as GetOrderResponse });
+  const refusedClosed = await tool(createHoldMcp(deps(closed.hub)).tools, 'get_order').handler({}, ctx);
+  assert.equal(refusedClosed.isError, true);
+  assert.deepEqual(parse(refusedClosed), { error: 'order identity refusal: response does not match the held run' });
+});
+
+test('get_order refuses a missing order field rather than treating it as a legacy null packet', async () => {
+  const { hub } = mockHub({ getOrder: {
+    text: '', workflow: 'wf1', run: 'run1', order: undefined, lease: { claimed: true },
+  } as unknown as GetOrderResponse });
+  const mount = createHoldMcp(deps(hub));
+  const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, true);
+  assert.deepEqual(parse(result), { error: 'order identity refusal: response does not match the held run' });
+});
+
+test('get_order refuses a changed canonical child after an earlier Service read', async () => {
+  const first = producerOrderResponse();
+  first.workflow = 'child-wf';
+  first.order!.workflow = 'child-wf';
+  first.order!.consumes = { seed: 1 };
+  const rebound = producerOrderResponse();
+  rebound.workflow = 'unrelated-wf';
+  rebound.order!.workflow = 'unrelated-wf';
+  rebound.order!.key = 'HOSTILE-KEY-SENTINEL';
+  const { hub } = mockHub({ getOrder: [first, rebound] });
+  const mount = createHoldMcp(deps(hub, {
+    consumedVerifier: async () => ({ ok: false, reason: 'synthetic proof refusal' }),
+  }));
+  const rejectedProof = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(rejectedProof.isError, true);
+  assert.deepEqual(parse(rejectedProof), { error: 'synthetic proof refusal' });
+  const rejectedRebound = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(rejectedRebound.isError, true);
+  assert.deepEqual(parse(rejectedRebound), { error: 'order identity refusal: response does not match the held run' });
+  assert.ok(!JSON.stringify(rejectedRebound).includes('HOSTILE-KEY-SENTINEL'));
+});
+
+test('the lease-loop first contact latches canonical child identity before get_order', async () => {
+  const response = producerOrderResponse();
+  response.workflow = 'child-wf';
+  response.order!.workflow = 'child-wf';
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, { sleep: () => new Promise<void>(() => {}) }));
+  const holding = mount.loop.run();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const result = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(parse(result).order.workflow, 'child-wf');
+  assert.equal(calls.filter((call) => call.verb === 'get_order').length, 1);
+  mount.loop.stop('test', { release: false });
+  assert.equal(await holding, 'stopped');
+});
+
+test('a later first contact cannot replace a canonical child already shown to the model', async () => {
+  const first = producerOrderResponse();
+  first.workflow = 'child-wf';
+  first.order!.workflow = 'child-wf';
+  const rebound = producerOrderResponse();
+  rebound.workflow = 'unrelated-wf';
+  rebound.order!.workflow = 'unrelated-wf';
+  const { hub } = mockHub({ getOrder: [first, rebound] });
+  const mount = createHoldMcp(deps(hub, { sleep: () => new Promise<void>(() => {}) }));
+  assert.equal((await tool(mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const holding = mount.loop.run();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const refused = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(refused.isError, true);
+  assert.deepEqual(parse(refused), { error: 'order identity refusal: response does not match the held run' });
+  mount.loop.stop('test', { release: false });
+  assert.equal(await holding, 'stopped');
+});
+
 test('get_order exposes gated dynamic state without hub static fields or unproven previous value', async () => {
   const response = producerOrderResponse();
   response.text = 'HUB-TEXT-SENTINEL';
@@ -276,6 +447,76 @@ test('submit posts a receipt for the bound run and echoes the outcome', async ()
   ]);
 });
 
+test('direct submit refuses a null packet and never calls the hub submit verb', async () => {
+  const { hub, calls } = mockHub({ getOrder: {
+    text: '', workflow: 'wf1', run: 'run1', order: null, lease: { claimed: true },
+  } });
+  const mount = createHoldMcp(deps(hub));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.deepEqual(parse(shown), { workflow: 'wf1', run: 'run1', order: null });
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'HOSTILE-PATH', value: 1 }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.match(parse(submitted).error, /no bound order packet/);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('direct submit refuses a path outside validated owes, including a hostile caller argument', async () => {
+  const { hub, calls } = mockHub({ getOrder: producerOrderResponse() });
+  const mount = createHoldMcp(deps(hub));
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'HOSTILE-PATH', value: 1 }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.match(parse(submitted).error, /submit path refusal/);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('direct submit accepts a locally validated legacy outputs-only packet', async () => {
+  const response = producerOrderResponse();
+  response.order!.owes = [];
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub));
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'result', value: 1 }, ctx);
+  assert.equal(submitted.isError, undefined);
+  assert.equal(calls.some((call) => call.verb === 'submit'), true);
+});
+
+test('direct submit accepts a projected route sibling and refuses one absent from the current offer', async () => {
+  const local = buildDef({ name: 'route', steps: [{ name: 'producer', produces: ['result', 'sibling'] }] }).steps[0]!;
+  const projected = producerOrderResponse();
+  projected.order!.outputs = ['result', 'sibling'];
+  projected.order!.owes.push({ path: 'sibling', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] });
+  const verifier = async (order: NonNullable<GetOrderResponse['order']>) => validModelOrderFields(local, order)
+    ? { ok: true as const } : { ok: false as const, reason: 'model order refusal' };
+  const current = mockHub({ getOrder: projected });
+  const allowed = await tool(createHoldMcp(deps(current.hub, { modelOrderVerifier: verifier })).tools, 'submit')
+    .handler({ path: 'sibling', value: 1 }, ctx);
+  assert.equal(allowed.isError, undefined);
+  assert.equal(current.calls.some((call) => call.verb === 'submit'), true);
+
+  const older = mockHub({ getOrder: producerOrderResponse() });
+  const refused = await tool(createHoldMcp(deps(older.hub, { modelOrderVerifier: verifier })).tools, 'submit')
+    .handler({ path: 'sibling', value: 1 }, ctx);
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /submit path refusal/);
+  assert.equal(older.calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('collection member emission cannot be smuggled through Hold MCP submit', async () => {
+  const local = buildDef({ name: 'collection', steps: [{ name: 'collect', produces: ['items[]'] }] }).steps[0]!;
+  const response = producerOrderResponse();
+  response.order!.step = 'collect';
+  response.order!.outputs = ['items.sealed'];
+  response.order!.owes[0]!.path = 'items.sealed';
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    modelOrderVerifier: async (order) => validModelOrderFields(local, order)
+      ? { ok: true } : { ok: false, reason: 'model order refusal' },
+  }));
+  const refused = await tool(mount.tools, 'submit').handler({ path: 'items[0]', value: 1 }, ctx);
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /submit path refusal/);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
 test('hold-MCP judge submit attaches a DSSE proof for the fingerprinted artifact version', async () => {
   const orderResponse: GetOrderResponse = {
     text: '',
@@ -285,14 +526,14 @@ test('hold-MCP judge submit attaches a DSSE proof for the fingerprinted artifact
       run: 'run1',
       workflow: 'wf1',
       step: 'judge-result',
-      key: 'k',
+      key: '',
       defDigest: 'def-digest',
       inputs: ['result'],
-      outputs: [],
+      outputs: ['result'],
       judge: 'result',
       consumes: { result: { value: 'seen' } },
       consumedFingerprint: { result: 2 },
-      owes: [],
+      owes: [{ path: 'result', version: 3, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };
@@ -445,11 +686,11 @@ test('hold-MCP repeated judge approval signs the same fingerprinted version', as
       key: '',
       defDigest: 'def-digest',
       inputs: ['result'],
-      outputs: [],
+      outputs: ['result'],
       judge: 'result',
       consumes: { result: { draft: 1 } },
       consumedFingerprint: { result: 7 },
-      owes: [],
+      owes: [{ path: 'result', version: 8, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };

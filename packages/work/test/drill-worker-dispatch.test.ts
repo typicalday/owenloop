@@ -78,11 +78,11 @@ function packet(): OrderPacket {
     run: 'run_x1234',
     workflow: 'wf1',
     step: 'builder',
-    key: 'k',
-    inputs: [],
+    key: '',
+    inputs: ['seed'],
     outputs: ['pr'],
     defDigest: localDefDigest,
-    consumes: {},
+    consumes: { seed: 'seed-value' },
     owes: [{ path: 'pr', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
   };
 }

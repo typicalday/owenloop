@@ -28,12 +28,14 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { callTool, handshake, spawnMcp, startMockHub, until, type HubReq } from './helpers/mcp-stdio-client.ts';
 import { DRILL_AUTH, fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
+import { installHolderDefinition, makeHolderStoreWritable } from './helpers/holder-definition.ts';
 
 const ORDER_PACKET = {
   run: 'run1',
   workflow: 'wf1',
   step: 'builder',
-  key: 'k',
+  key: '',
+  defDigest: '',
   inputs: [],
   outputs: ['pr'],
   prompt: 'do the thing',
@@ -52,11 +54,13 @@ const of = (reqs: HubReq[], verb: string): HubReq[] => reqs.filter((r) => r.verb
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 let home: string;
-beforeEach(() => {
+beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), 'owenloop-drill5-'));
+  ORDER_PACKET.defDigest = await installHolderDefinition(home);
 });
 afterEach(() => {
-  rmSync(home, { recursive: true, force: true });
+  makeHolderStoreWritable(home);
+  rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('a SIGSTOP past interval+tolerance trips the clock-jump guard → fast lease-lost (exit 1); the order re-offers and completes elsewhere', async () => {

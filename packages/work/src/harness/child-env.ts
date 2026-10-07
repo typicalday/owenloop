@@ -93,6 +93,9 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   // The step agent and anything it runs. Resolves bundle-shipped assets from
   // the verified installed object directory. A path, not credential material.
   'OWENLOOP_BUNDLE_DIR',
+  // `hold --mcp` uses the same project workflow store as its agent-run parent
+  // even when the harness starts in a separate per-run work directory.
+  'OWENLOOP_INSTRUCTION_CWD',
   // The step agent and anything it runs. Identifies the workflow instance.
   'OWENLOOP_WORKFLOW',
   // The step agent and anything it runs. Identifies the current run.

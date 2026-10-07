@@ -141,6 +141,7 @@ test('real hold keeps authored fields private and fences a changed gated full or
   const hub = { getOrder: async () => response } as unknown as HubClient;
   const mount = createHoldMcp({
     hub, workflow: 'wf', run: 'run', workdir: process.cwd(), tools: ['get_order'],
+    modelOrderVerifier: async () => ({ ok: true }),
     sleep: async () => {}, now: () => 0, err: () => {},
   });
   const raw = await mount.tools[0]!.handler({}, context);
@@ -170,6 +171,7 @@ test('real reduced hold cannot fall back when Service lacks the versioned refere
     order: rawOrder, lease: { claimed: true } }) } as unknown as HubClient;
   const mount = createHoldMcp({
     hub, workflow: 'wf', run: 'run', workdir: process.cwd(), tools: ['get_order'],
+    modelOrderVerifier: async () => ({ ok: true }),
     sleep: async () => {}, now: () => 0, err: () => {},
   });
   let reads = 0;

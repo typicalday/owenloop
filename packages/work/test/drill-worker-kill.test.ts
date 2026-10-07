@@ -50,8 +50,8 @@ let localDefDigest = '';
 
 function packet(): OrderPacket {
   return {
-    run: 'run_x1234', workflow: 'wf1', step: 'builder', key: 'k', inputs: [], outputs: ['pr'],
-    defDigest: localDefDigest, consumes: {},
+    run: 'run_x1234', workflow: 'wf1', step: 'builder', key: '', inputs: ['seed'], outputs: ['pr'],
+    defDigest: localDefDigest, consumes: { seed: 'seed-value' },
     owes: [{ path: 'pr', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
   };
 }

@@ -47,7 +47,7 @@ import { basename, extname } from 'node:path';
 
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
+import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -76,6 +76,8 @@ export interface HoldMcpDeps {
   sshProcess?: SshProcessAdapter;
   /** Gate dynamic consumed values before the packet reaches the model. */
   consumedVerifier?: ConsumedVerifier;
+  /** Local definition binding for fields that signed artifact proofs do not cover. */
+  modelOrderVerifier?: (order: OrderPacket) => Promise<{ ok: true } | { ok: false; reason: string }>;
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -186,6 +188,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  let canonicalWorkflow: string | undefined;
+  let firstContactIdentityRefusal: ToolResult | undefined;
   let stopping = false;
   // Set the moment the lease loop's run() settles (lease-lost, completed,
   // released, …): from then on this mount no longer holds the order, so BOTH
@@ -204,6 +208,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     err: deps.err,
     onOrder: (res) => {
       firstContact = res;
+      // The lease loop may contact the hub after a tool's direct read. Keep
+      // that second canonical identity from silently replacing the first.
+      firstContactIdentityRefusal ??= identityGuard(res);
     },
     ...(deps.holder !== undefined ? { holder: deps.holder } : {}),
     ...(deps.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: deps.heartbeatIntervalMs } : {}),
@@ -232,8 +239,36 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     return textResult({ error: `order no longer held (${terminal ?? 'stopping'}) — stop` }, true);
   }
 
+  function identityGuard(res: GetOrderResponse): ToolResult | undefined {
+    // Service get_order authorizes the requested root against the run's durable
+    // child ancestry and returns the canonical child workflow. The run remains
+    // argv-bound; the outer and inner canonical IDs must agree and cannot move
+    // after the first authenticated read. Keep argv workflow for hub writes.
+    if (res.run !== run || typeof res.workflow !== 'string' || res.workflow === ''
+      || res.order === undefined
+      || (res.order !== null && (res.order.workflow !== res.workflow || res.order.run !== run))
+      || res.lease?.claimed !== true || res.lease.outcome !== undefined
+      || (canonicalWorkflow !== undefined && canonicalWorkflow !== res.workflow)) {
+      return textResult({ error: 'order identity refusal: response does not match the held run' }, true);
+    }
+    canonicalWorkflow ??= res.workflow;
+    return undefined;
+  }
+
   async function gate(res: GetOrderResponse): Promise<ToolResult | undefined> {
+    if (firstContactIdentityRefusal !== undefined) return firstContactIdentityRefusal;
+    const refusedIdentity = identityGuard(res);
+    if (refusedIdentity !== undefined) return refusedIdentity;
     if (res.order === null) return undefined;
+    if (deps.modelOrderVerifier === undefined) {
+      return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
+    }
+    try {
+      const bound = await deps.modelOrderVerifier(res.order);
+      if (!bound.ok) return textResult({ error: bound.reason }, true);
+    } catch {
+      return textResult({ error: 'model order refusal: local definition binding failed' }, true);
+    }
     const hasConsumedData = Object.keys(res.order.consumes).length > 0
       || res.order.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
     if (deps.consumedVerifier === undefined) {
@@ -345,6 +380,15 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         }
         const refused = await gate(orderResponse);
         if (refused !== undefined) return refused;
+	if (orderResponse.order === null) {
+	  return textResult({ error: 'submit order refusal: no bound order packet is available' }, true);
+	}
+	const allowedPaths = orderResponse.order.owes.length > 0
+	  ? orderResponse.order.owes.map((owed) => owed.path)
+	  : orderResponse.order.outputs;
+	if (!allowedPaths.includes(path)) {
+	  return textResult({ error: 'submit path refusal: path is not owed by the bound order' }, true);
+	}
         captured = orderResponse;
 
         let proof: string | undefined;

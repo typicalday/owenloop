@@ -85,6 +85,7 @@ test('get_order refuses tampered dynamic values and never returns the value', as
     sleep: async () => {},
     now: () => 0,
     err: () => {},
+    modelOrderVerifier: async () => ({ ok: true }),
     consumedVerifier: refusedVerifier(seen),
   });
 
@@ -107,6 +108,7 @@ test('a direct submit cannot bypass consume-side verification when no verifier i
     sleep: async () => {},
     now: () => 0,
     err: () => {},
+    modelOrderVerifier: async () => ({ ok: true }),
   });
 
   const result = await tool(mount.tools, 'submit').handler({ path: 'output', value: 'new-value' }, ctx);
@@ -129,6 +131,7 @@ test('a submit-fetched packet is not cached or submitted before consumed verific
     sleep: async () => {},
     now: () => 0,
     err: () => {},
+    modelOrderVerifier: async () => ({ ok: true }),
     consumedVerifier: refusedVerifier(seen),
   });
 

@@ -79,6 +79,7 @@ import '../harnesses.ts';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { owedSchema } from '../../../../src/model.ts';
+import { validModelOrderFields } from '../order-definition-binding.ts';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import {
@@ -481,6 +482,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       err(`owenloop work agent-run: ${resolved.reason}`);
       return null;
     }
+    if (!validModelOrderFields(resolved.step, order)) {
+      err('owenloop work agent-run: model order refusal: fields differ from local definition');
+      return null;
+    }
 
     // Harness adapters build their child environment from process.env. This
     // worker owns one agent order, so the resolver-derived bundle root is
@@ -488,6 +493,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     // values from reaching a later step in the same process.
     if (resolved.bundleDir !== undefined) process.env['OWENLOOP_BUNDLE_DIR'] = resolved.bundleDir;
     else delete process.env['OWENLOOP_BUNDLE_DIR'];
+    process.env['OWENLOOP_INSTRUCTION_CWD'] = instructionCwd;
 
     // Run identity is engine-derived from this worker's target, never a consumed
     // artifact value. Both registered adapter paths read process.env when they

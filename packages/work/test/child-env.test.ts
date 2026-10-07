@@ -22,7 +22,7 @@ import {
   isAdmittedChildEnvKey,
 } from '../src/harness/child-env.ts';
 
-test('the admitted set is exactly the ten names with a reachable child consumer', () => {
+test('the admitted set is exactly the eleven names with a reachable child consumer', () => {
   // Pinned as a LIST, not a count: growing this set is a deliberate act that
   // must show up in a diff next to the consumer that justifies it.
   assert.deepEqual(
@@ -33,6 +33,7 @@ test('the admitted set is exactly the ten names with a reachable child consumer'
       'OWENLOOP_CONFIG_DIR',
       'OWENLOOP_CREDENTIAL_COMMAND',
       'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
+      'OWENLOOP_INSTRUCTION_CWD',
       'OWENLOOP_NO_KEYCHAIN',
       'OWENLOOP_RUN',
       'OWENLOOP_SESSION',

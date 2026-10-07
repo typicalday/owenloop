@@ -100,11 +100,11 @@ function packet(reasons: ReasonEntry[]): OrderPacket {
     run: 'run_r1',
     workflow: 'wf1',
     step: 'builder',
-    key: 'k',
-    inputs: [],
+    key: '',
+    inputs: ['seed'],
     outputs: ['pr'],
     defDigest: localDefDigest,
-    consumes: {},
+    consumes: { seed: 'seed-value' },
     owes: [
       {
         path: 'pr',
