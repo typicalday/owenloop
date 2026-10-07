@@ -1557,6 +1557,7 @@ export function validateDef(def: WorkflowDef): string[] {
     // a step must consume in exactly one mode (plain-only, or one map, or one reduce)
     const maps = l.consumes.filter((c) => c.mode === 'map');
     const reduces = l.consumes.filter((c) => c.mode === 'reduce');
+    const seenCollectionStems = new Set<string>();
     if (maps.length > 1) errors.push(`step '${l.name}' has more than one map consume`);
     if (reduces.length > 1) errors.push(`step '${l.name}' has more than one reduce consume`);
     if (maps.length && reduces.length) {
@@ -1565,6 +1566,10 @@ export function validateDef(def: WorkflowDef): string[] {
 
     for (const p of l.produces) {
       if (p.kind === 'collection') {
+        if (seenCollectionStems.has(p.stem)) {
+          errors.push(`step '${l.name}' declares collection '${p.raw}' more than once`);
+        }
+        seenCollectionStems.add(p.stem);
         collectionStems.add(p.stem);
         register(producerOf, p.stem, l.name, errors);
       } else if (p.kind === 'singleton') {
