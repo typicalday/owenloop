@@ -2899,6 +2899,12 @@ export class Engine {
     if (routing.escalation) this.recordEscalation(workflow, f, routing.escalation, now);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
+    // The private prior-version record belongs to this claim, not to the
+    // mutable owed target in order.v1. The same in-transaction artifact map
+    // supplied buildOrder, so a concurrent commit cannot move either reading.
+    for (const path of f.outputs) {
+      this.store.recordClaimPriorVersion(runId, path, arts.get(path)?.version ?? 0);
+    }
     this.store.putTask({
       workflow,
       step: f.step,

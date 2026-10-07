@@ -347,6 +347,15 @@ CREATE INDEX IF NOT EXISTS run_wf_step ON run (workflow, step, created_at);
 -- runs of one step+key in order without scanning the whole step's history.
 CREATE INDEX IF NOT EXISTS run_wf_step_key ON run (workflow, step, key, created_at);
 
+-- Private claim-time snapshot of the artifact version preceding each owed
+-- target. This is not an Order field or a proof of the prior value.
+CREATE TABLE IF NOT EXISTS claim_prior_version (
+  run_id  TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+  path    TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version >= 0),
+  PRIMARY KEY (run_id, path)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -385,7 +394,8 @@ CREATE TABLE IF NOT EXISTS meta (
  * `workflow` table gains nullable JSON `interface_bindings`.
  */
 // v14 adds internal dispatch lanes and append-only consumed slots.
-const SCHEMA_VERSION = '14';
+// v15 adds private claim-time prior-version snapshots, with no legacy backfill.
+const SCHEMA_VERSION = '15';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -1681,6 +1691,26 @@ export class Store {
       .run(id, data.workflow, data.step, data.key ?? '', data.outcome ?? null, data.summary ?? null,
         data.sessionId ?? null, toJson(data.fingerprint), data.cause ?? null, toJson(data.order), at, at);
     return this.getRun(id) as RunRow;
+  }
+
+  /** Record an owed path's prior artifact version in the claim transaction.
+   * Insert-only: a re-offer has a new run, while a target restamp cannot change
+   * the original claim snapshot. Earlier runs have no row and read as unknown.
+   */
+  recordClaimPriorVersion(run: string, path: string, version: number): void {
+    if (!this.inWriteTransaction) throw new Error('claim prior version requires a Store write transaction');
+    if (!Number.isSafeInteger(version) || version < 0) throw new Error('claim prior version must be a nonnegative safe integer');
+    this.db.prepare('INSERT INTO claim_prior_version (run_id, path, version) VALUES (?, ?, ?)')
+      .run(run, path, version);
+  }
+
+  /** Absent means no claim-time snapshot exists; it must not be inferred from
+   * an order target, current artifact, or legacy run. Zero is a real snapshot.
+   */
+  getClaimPriorVersion(run: string, path: string): number | undefined {
+    const row = this.db.prepare('SELECT version FROM claim_prior_version WHERE run_id = ? AND path = ?')
+      .get(run, path) as { version: number } | undefined;
+    return row?.version;
   }
 
   updateRun(id: string, patch: Partial<RunData>): RunRow {
