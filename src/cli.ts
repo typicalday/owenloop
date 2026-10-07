@@ -2394,7 +2394,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 	if (report.coverageIncomplete.length > 0) {
 	  io.out('');
 	  io.out(`MODEL COVERAGE INCOMPLETE — ${report.coverageIncomplete.join(', ')}.`);
-	  io.out('The finite checker graph was explored only within these collection/value limits.');
+	  io.out('The finite checker graph has unresolved input, collection, or value coverage.');
 	}
 	if (report.collectionCapApplied) {
 	  io.out('');
@@ -2472,12 +2472,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     }
 
     // Exit codes:
-    // - invariant violations → ALWAYS nonzero, regardless of bounded. A reported
-    //   counterexample path was produced by real applyOutcome/settleInMemory
-    //   transitions (pinned to the live Engine by the conformance test). The path
-    //   is a genuine executable witness; bounds only cause MISSES, never
-    //   fabrications. Contrast true deadlocks, where the maxCollectionSize cap can
-    //   manufacture a spurious "no moves" state — hence that requires !bounded.
+    // - reported invariant violations → ALWAYS nonzero, regardless of bounds.
+    //   The checker filters speculative states when an assumed provide has no
+    //   sampled schema-valid witness, while retaining independent initial-state
+    //   violations. Bounds can miss witnesses but cannot turn a reported one
+    //   into a speculative provide.
     //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
     // - structurally-dead steps → ALWAYS nonzero, regardless of bounded. Unlike
     //   true deadlocks (found by the bounded BFS, so a tighter maxCollectionSize

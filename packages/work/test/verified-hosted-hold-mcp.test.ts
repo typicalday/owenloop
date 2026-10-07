@@ -153,7 +153,7 @@ test('real hold keeps authored fields private and fences a changed gated full or
       onVerified?.({ order: rawOrder, collectionOutputs: [] });
       return ready(rawOrder);
     },
-  }, { workflow: 'wf', run: 'run' }, { now: () => 2 });
+  }, { workflow: 'wf', run: 'run' }, { now: () => 2, monotonicNow: () => 0 });
   const accepted = await wrapped.tools[0]!.handler({}, context);
   assert.equal(accepted.isError, undefined, accepted.content[0]?.text);
   assert.doesNotMatch(accepted.content[0]!.text, /HUB-SPEC|HUB-X|HUB-SCHEMA|HUB-TEXT/);
