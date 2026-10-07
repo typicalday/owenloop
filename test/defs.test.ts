@@ -821,6 +821,69 @@ test('validateDef flags a reduce-mode step that produces only collections (silen
   );
 });
 
+test('validateDef rejects a map step with a collection output that its keyed run cannot discharge', () => {
+  const errors = validateDef(buildDef({
+    name: 'map-collection',
+    inputs: [{ name: 'q' }],
+    outputs: ['derived'],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['src[]'] },
+      { name: 'map', consumes: ['src[$i]'], produces: ['src[$i].checked', 'derived[]'] },
+    ],
+  }));
+  assert.ok(errors.some((e) => e.includes("step 'map' is map-mode and cannot produce collection 'derived[]'")), errors.join('; '));
+});
+
+test('validateDef rejects a reduce step with a collection output even beside a singleton', () => {
+  const errors = validateDef(buildDef({
+    name: 'reduce-collection',
+    inputs: [{ name: 'q' }],
+    outputs: ['draft', 'derived'],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['src[]'] },
+      { name: 'reduce', consumes: ['src[*]'], produces: ['draft', 'derived[]'] },
+    ],
+  }));
+  assert.ok(errors.some((e) => e.includes("step 'reduce' is reduce-mode and cannot produce collection 'derived[]'")), errors.join('; '));
+});
+
+test('validateDef rejects a map step with a singleton output outside its keyed discharge set', () => {
+  const errors = validateDef(buildDef({
+    name: 'map-singleton',
+    inputs: [{ name: 'q' }],
+    outputs: ['summary'],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['src[]'] },
+      { name: 'map', consumes: ['src[$i]'], produces: ['src[$i].checked', 'summary'] },
+    ],
+  }));
+  assert.ok(errors.some((e) => e.includes("step 'map' is map-mode and cannot produce singleton 'summary'")), errors.join('; '));
+});
+
+test('validateDef rejects a plain step with two collection outputs', () => {
+  const errors = validateDef(buildDef({
+    name: 'plain-two-collections',
+    inputs: [{ name: 'q' }],
+    outputs: ['a', 'b'],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['a[]', 'b[]'] },
+    ],
+  }));
+  assert.ok(errors.some((e) => e.includes("step 'gather' produces more than one collection")), errors.join('; '));
+});
+
+test('validateDef keeps mixed singleton and collection outputs on a plain step valid', () => {
+  const errors = validateDef(buildDef({
+    name: 'plain-mixed',
+    inputs: [{ name: 'q' }],
+    outputs: ['draft', 'derived'],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['draft', 'derived[]'] },
+    ],
+  }));
+  assert.deepEqual(errors, []);
+});
+
 test('validateDef does not flag a reduce-mode step that produces a singleton', () => {
   const errors = validateDef(buildDef({
     name: 'ok',
