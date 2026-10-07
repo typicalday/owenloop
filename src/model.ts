@@ -2502,8 +2502,33 @@ export interface CollectionCheckState {
 
 /** Bounded concrete JSON candidates, shared by collection and singleton guards. */
 function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives = false): unknown[] {
+  // Width and depth alone are not a resource bound: four items at every nested
+  // array level would allocate exponentially. Exhaustion leaves this class
+  // unsampled; the caller must report incomplete coverage.
+  let remainingSampleNodes = 1_024;
+  let sampleBudgetExhausted = false;
+  const withHints = (base: JsonSchema | undefined, hints: JsonSchema | undefined): JsonSchema | undefined => {
+    if (hints === undefined || typeof hints === 'boolean') return base;
+    if (base === undefined || typeof base === 'boolean') return hints;
+    const baseProps = base.properties && typeof base.properties === 'object' && !Array.isArray(base.properties)
+      ? base.properties as Record<string, JsonSchema> : undefined;
+    const hintProps = hints.properties && typeof hints.properties === 'object' && !Array.isArray(hints.properties)
+      ? hints.properties as Record<string, JsonSchema> : undefined;
+    const properties: Record<string, JsonSchema> | undefined = hintProps
+      ? Object.assign(Object.create(null) as Record<string, JsonSchema>, baseProps) : undefined;
+    if (properties && hintProps) {
+      for (const [name, shape] of Object.entries(hintProps)) {
+	properties[name] = withHints(baseProps?.[name], shape) ?? shape;
+      }
+    }
+    return { ...base, ...hints, ...(properties ? { properties } : {}) };
+  };
   const sample = (shape: JsonSchema | undefined, depth: number): unknown => {
-    if (depth > 5 || shape === undefined || shape === true) return {};
+    if (depth > 16 || remainingSampleNodes-- <= 0) {
+      sampleBudgetExhausted = true;
+      return undefined;
+    }
+    if (shape === undefined || shape === true) return {};
     if (shape === false) return undefined;
     if ('const' in shape) return shape.const;
     const values = shape.enum;
@@ -2511,11 +2536,30 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     const union = shape.anyOf ?? shape.oneOf;
     if (Array.isArray(union) && union.length > 0) return sample(union[0] as JsonSchema, depth + 1);
     const type = Array.isArray(shape.type) ? shape.type[0] : shape.type;
-    if (type === 'string') return typeof shape.minLength === 'number' ? 'x'.repeat(Math.min(shape.minLength, 32)) : 'x';
+    if (type === 'string') {
+      const minLength = typeof shape.minLength === 'number' ? Math.max(1, shape.minLength) : 1;
+      const strings = ['x', 'E1', 'C1', 'S1', 'SC1', 'U1', 'F1', 'R1', '1', '2026-01-01'];
+      if (typeof shape.pattern === 'string') {
+	try {
+	  const pattern = new RegExp(shape.pattern);
+	  const matching = strings.find((value) => value.length >= minLength && pattern.test(value));
+	  if (matching !== undefined) return matching;
+	} catch { /* The validator below remains authoritative. */ }
+      }
+      return 'x'.repeat(Math.min(minLength, 32));
+    }
     if (type === 'integer' || type === 'number') return typeof shape.minimum === 'number' ? shape.minimum : 1;
     if (type === 'boolean') return true;
     if (type === 'null') return null;
-    if (type === 'array') return [];
+    if (type === 'array') {
+      // One concrete nonempty value can reveal downstream structure. This is
+      // never a claim about arbitrary collection widths or schema values:
+      // every completed candidate is checked by the runtime validator below.
+      const count = typeof shape.minItems === 'number' ? shape.minItems : 0;
+      if (!Number.isInteger(count) || count < 0 || count > 4) return [];
+      const item = shape.items as JsonSchema | undefined;
+      return Array.from({ length: count }, () => sample(item, depth + 1));
+    }
     const object: Record<string, unknown> = {};
     const props = shape.properties && typeof shape.properties === 'object' && !Array.isArray(shape.properties)
       ? shape.properties as Record<string, JsonSchema> : {};
@@ -2523,8 +2567,23 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     for (const name of required) object[name] = sample(props[name], depth + 1);
     if (Array.isArray(shape.allOf)) {
       for (const branch of shape.allOf) {
-	const part = sample(branch as JsonSchema, depth + 1);
-	if (part && typeof part === 'object' && !Array.isArray(part)) Object.assign(object, part);
+	if (typeof branch !== 'object' || branch === null || Array.isArray(branch)) continue;
+	const conditional = branch as Record<string, unknown>;
+	if (conditional.if !== undefined) {
+	  if (!validateValue(conditional.if as JsonSchema, object).valid) continue;
+	  const then = conditional.then;
+	  if (typeof then !== 'object' || then === null || Array.isArray(then)) continue;
+	  const thenProps = (then as Record<string, unknown>).properties;
+	  if (typeof thenProps !== 'object' || thenProps === null || Array.isArray(thenProps)) continue;
+	  for (const [name, hints] of Object.entries(thenProps)) {
+	    if (Object.prototype.hasOwnProperty.call(object, name)) {
+	      object[name] = sample(withHints(props[name], hints as JsonSchema), depth + 1);
+	    }
+	  }
+	} else {
+	  const part = sample(branch as JsonSchema, depth + 1);
+	  if (part && typeof part === 'object' && !Array.isArray(part)) Object.assign(object, part);
+	}
       }
     }
     return object;
@@ -2537,11 +2596,11 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     { n: 1 }, { value: 1 }, { items: [] },
   ];
   if (includePrimitives) candidates.push(null, false, true, 0, 1, '', 'x', []);
-  if (generated !== undefined && (includePrimitives
+  if (!sampleBudgetExhausted && generated !== undefined && (includePrimitives
     || (generated !== null && typeof generated === 'object' && !Array.isArray(generated)))) {
     candidates.unshift(generated);
   }
-  if (generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
+  if (!sampleBudgetExhausted && generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
     const object = generated as Record<string, unknown>;
     for (const key of Object.keys(object)) {
       const omitted = { ...object };
