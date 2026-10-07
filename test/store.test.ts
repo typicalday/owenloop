@@ -95,13 +95,13 @@ test('artifact upsert replaces and preserves JSON fields', () => {
   assert.equal(got?.reasons[0]?.text, 'nope');
   assert.equal(got?.judgmentRejects, 1);
 
-  // upsert fully replaces
-  s.putArtifact(artifact(wf, 'gather.source[0]', { acceptance: 'owed', version: 1 }));
+  // Other fields remain replaceable; the reason history remains append-only.
+  s.putArtifact(artifact(wf, 'gather.source[0]', { acceptance: 'owed', version: 1, reasons: got!.reasons }));
   const re = s.getArtifact(wf, 'gather.source[0]');
   assert.equal(re?.acceptance, 'owed');
   assert.equal(re?.value, undefined);
   assert.equal(re?.fingerprint, undefined);
-  assert.equal(re?.reasons.length, 0);
+  assert.deepEqual(re?.reasons, got?.reasons);
   s.close();
 });
 
@@ -160,7 +160,8 @@ test('artifact history retains immutable versions and lifecycle events', () => {
     acceptance: 'rejected', version: 1, value: { url: 'v1' }, fingerprint: { plan: 1 },
     reasons: [{ at: 10, action: 'reject', kind: 'judgment', by: 'review', text: 'fix checks', fromVersion: 1 }], judgmentRejects: 1,
   }));
-  s.putArtifact(artifact(wf, 'pr', { acceptance: 'green', version: 2, value: { url: 'v2' }, fingerprint: { plan: 2 } }));
+  s.putArtifact(artifact(wf, 'pr', { acceptance: 'green', version: 2, value: { url: 'v2' }, fingerprint: { plan: 2 },
+    reasons: s.getArtifact(wf, 'pr')!.reasons }));
   const history = s.getArtifactHistory(wf, 'pr');
   assert.deepEqual(history?.versions.map((v) => v.value), [{ url: 'v1' }, { url: 'v2' }]);
   assert.deepEqual(history?.versions.map((v) => v.fingerprint), [{ plan: 1 }, { plan: 2 }]);
@@ -474,6 +475,11 @@ test('migration: a pre-v9 reason thread backfills once and reopening v9 is idemp
     const s3 = new Store(dbPath);
     const reopened = s3.getArtifactHistory(wf, 'pr');
     assert.equal(reopened?.events.length, 1, 'opening an already-v8 database does not duplicate legacy events');
+    const legacy = s3.getArtifact(wf, 'pr')!;
+    s3.putArtifact({ ...legacy, reasons: [...legacy.reasons,
+      { at: 43, action: 'retry', kind: 'structural', by: 'human', text: 'try again', fromVersion: 4 }] });
+    assert.deepEqual(s3.getArtifactHistory(wf, 'pr')?.events.map((event) => event.reason),
+      ['needs tests', 'try again'], 'post-upgrade append preserves the legacy prefix');
     s3.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1394,10 +1400,98 @@ test('putArtifact: structural change-detection — key-order-only rewrites are t
       version: 2,
       value: { beta: 2, alpha: 1, nested: { y: 2, x: 99 } },
       fingerprint: { plan: 2 },
+      reasons: s.getArtifact(wf, 'pr')!.reasons,
     }),
   );
   assert.ok(countEvents() > afterAcceptance, 'value change appends an event');
 
+  s.close();
+});
+
+test('putArtifact preserves an existing reason prefix and records only appended reasons', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const first: ArtifactData['reasons'][number] = {
+    at: 10, action: 'reject', kind: 'judgment', by: 'review', text: 'fix checks', fromVersion: 1,
+  };
+  const second: ArtifactData['reasons'][number] = {
+    at: 11, action: 'retry', kind: 'structural', by: 'human', text: 'try again', fromVersion: 1,
+  };
+  const initial = artifact(wf, 'pr', { acceptance: 'rejected', version: 1, reasons: [first] });
+  s.putArtifact(initial);
+  const eventCount = () => s.getArtifactHistory(wf, 'pr')!.versions.flatMap((version) => version.events).length;
+  const before = eventCount();
+
+  // Canonical equality accepts a harmless JSON key-order change, but writes
+  // no extra event. The next real write appends exactly one reason event.
+  s.putArtifact({ ...initial, reasons: [{ text: first.text, by: first.by, kind: first.kind,
+    action: first.action, at: first.at, fromVersion: first.fromVersion }] });
+  assert.equal(eventCount(), before);
+  s.putArtifact({ ...initial, reasons: [first, second] });
+  assert.deepEqual(s.getArtifact(wf, 'pr')?.reasons, [first, second]);
+  assert.equal(eventCount(), before + 1);
+  assert.equal(s.getArtifactHistory(wf, 'pr')?.versions[0]?.events.at(-1)?.reason, 'try again');
+  s.close();
+});
+
+test('putArtifact refuses reason deletion, rewrite and reorder before changing artifact or history', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const reasons: ArtifactData['reasons'] = [
+    { at: 10, action: 'reject', kind: 'judgment', by: 'review', text: 'first', fromVersion: 1 },
+    { at: 11, action: 'retry', kind: 'structural', by: 'human', text: 'second', fromVersion: 1 },
+  ];
+  const initial = artifact(wf, 'pr', { acceptance: 'rejected', version: 1, reasons });
+  s.putArtifact(initial);
+  const before = s.getArtifactHistory(wf, 'pr');
+  for (const changed of [
+    reasons.slice(0, 1),
+    [{ ...reasons[0]!, text: 'forged' }, reasons[1]!],
+    [reasons[1]!, reasons[0]!],
+  ]) {
+    assert.throws(() => s.putArtifact({ ...initial, version: 2, reasons: changed }), /reason thread must be append-only/);
+    assert.deepEqual(s.getArtifactHistory(wf, 'pr'), before);
+  }
+  s.close();
+});
+
+test('putArtifact serializes direct stale writers and rolls back artifact, version and event together', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'reason-prefix-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'store.db');
+  const firstStore = new Store(path);
+  const secondStore = new Store(path);
+  t.after(() => { secondStore.close(); firstStore.close(); });
+  const wf = randId('wf');
+  const base = artifact(wf, 'pr', { acceptance: 'green', version: 1 });
+  firstStore.putArtifact(base);
+  const stale = secondStore.getArtifact(wf, 'pr')!;
+  const reason: ArtifactData['reasons'][number] = {
+    at: 12, action: 'reject', kind: 'judgment', by: 'review', text: 'new', fromVersion: 1,
+  };
+  firstStore.putArtifact({ ...base, acceptance: 'rejected', reasons: [reason] });
+  const accepted = firstStore.getArtifactHistory(wf, 'pr');
+  assert.throws(() => secondStore.putArtifact({ ...stale, version: 2 }), /reason thread must be append-only/);
+  assert.deepEqual(secondStore.getArtifactHistory(wf, 'pr'), accepted);
+
+  // Even if a later history write fails, a direct put is one transaction.
+  firstStore.db.exec(`CREATE TRIGGER fail_reason_event BEFORE INSERT ON artifact_event
+    BEGIN SELECT RAISE(ABORT, 'blocked reason event'); END`);
+  const after = { ...firstStore.getArtifact(wf, 'pr')!, version: 2,
+    acceptance: 'rejected' as const, reasons: [reason, { ...reason, at: 13, text: 'another' }] };
+  assert.throws(() => firstStore.putArtifact(after), /blocked reason event/);
+  assert.deepEqual(firstStore.getArtifactHistory(wf, 'pr'), accepted);
+  assert.equal(firstStore.db.prepare('SELECT COUNT(*) AS n FROM artifact_version WHERE workflow = ? AND path = ?')
+    .get(wf, 'pr')!.n, 1);
+});
+
+test('putArtifact refuses to mutate from a caller-owned read transaction', () => {
+  const s = mem();
+  const wf = randId('wf');
+  s.readTx(() => {
+    assert.throws(() => s.putArtifact(artifact(wf, 'pr')), /requires a write transaction/);
+  });
+  assert.equal(s.getArtifact(wf, 'pr'), undefined);
   s.close();
 });
 
