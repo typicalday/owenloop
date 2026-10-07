@@ -860,7 +860,7 @@ test('validateDef rejects a map step with a singleton output outside its keyed d
   assert.ok(errors.some((e) => e.includes("step 'map' is map-mode and cannot produce singleton 'summary'")), errors.join('; '));
 });
 
-test('validateDef rejects a plain step with two collection outputs', () => {
+test('validateDef accepts a plain step with two explicitly targetable collection outputs', () => {
   const errors = validateDef(buildDef({
     name: 'plain-two-collections',
     inputs: [{ name: 'q' }],
@@ -869,7 +869,26 @@ test('validateDef rejects a plain step with two collection outputs', () => {
       { name: 'gather', consumes: ['q'], produces: ['a[]', 'b[]'] },
     ],
   }));
-  assert.ok(errors.some((e) => e.includes("step 'gather' produces more than one collection")), errors.join('; '));
+  assert.deepEqual(errors, []);
+});
+
+test('duplicate collection stem with conflicting schemas is refused before instance creation', () => {
+  const raw = {
+    name: 'duplicate-collection-stem',
+    inputs: [{ name: 'seed' }],
+    outputs: ['items'],
+    steps: [{
+      name: 'gather', consumes: ['seed'], body: 'gather items',
+      produces: [
+        { name: 'items[]', schema: { type: 'object', required: ['left'] } },
+        { name: 'items[]', schema: { type: 'object', required: ['right'] } },
+      ],
+    }],
+  };
+  const errors = validateDef(buildDef(raw));
+  assert.ok(errors.some((error) => error.includes("step 'gather' declares collection 'items[]' more than once")),
+    errors.join('; '));
+  assert.throws(() => parseDef(raw), /declares collection 'items\[\]' more than once/);
 });
 
 test('validateDef keeps mixed singleton and collection outputs on a plain step valid', () => {

@@ -1557,6 +1557,7 @@ export function validateDef(def: WorkflowDef): string[] {
     // a step must consume in exactly one mode (plain-only, or one map, or one reduce)
     const maps = l.consumes.filter((c) => c.mode === 'map');
     const reduces = l.consumes.filter((c) => c.mode === 'reduce');
+    const seenCollectionStems = new Set<string>();
     if (maps.length > 1) errors.push(`step '${l.name}' has more than one map consume`);
     if (reduces.length > 1) errors.push(`step '${l.name}' has more than one reduce consume`);
     if (maps.length && reduces.length) {
@@ -1565,6 +1566,10 @@ export function validateDef(def: WorkflowDef): string[] {
 
     for (const p of l.produces) {
       if (p.kind === 'collection') {
+        if (seenCollectionStems.has(p.stem)) {
+          errors.push(`step '${l.name}' declares collection '${p.raw}' more than once`);
+        }
+        seenCollectionStems.add(p.stem);
         collectionStems.add(p.stem);
         register(producerOf, p.stem, l.name, errors);
       } else if (p.kind === 'singleton') {
@@ -1585,8 +1590,8 @@ export function validateDef(def: WorkflowDef): string[] {
 
   // A firing mode determines which outputs can be owed and discharged. Map
   // orders contain only per-element outputs; reduce orders contain only
-  // singleton outputs. A plain run may emit/seal one collection (the runtime
-  // selects its first collection stem) alongside singleton outputs.
+  // singleton outputs. A plain run may emit/seal each declared collection
+  // alongside singleton outputs, selecting the exact owed stem at commit.
   // Preserve the existing more-specific diagnostic for a reduce with no
   // singleton output: it cannot fire at all.
   for (const l of def.steps) {
@@ -1598,9 +1603,6 @@ export function validateDef(def: WorkflowDef): string[] {
       for (const singleton of singletons) {
 		errors.push(`step '${l.name}' is map-mode and cannot produce singleton '${singleton.raw}'; map firings only discharge per-element outputs`);
       }
-    }
-    if (!isMap && !isReduce && collections.length > 1) {
-      errors.push(`step '${l.name}' produces more than one collection; a plain run can emit and seal only one collection`);
     }
     if (isReduce && collections.length > 0 && singletons.length === 0) {
       errors.push(`step ${l.name} is reduce-mode but produces only collections; reduce steps can only discharge singleton produces`);

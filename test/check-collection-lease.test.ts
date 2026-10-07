@@ -210,13 +210,13 @@ test('collection lease: mixed producer emits before singleton green on one runti
   };
 
   assert.deepEqual(engine.emit(wf, run.run, [{ value: {} }]).created, ['items[0]']);
-  move('collection-emit');
+  move('collection-emit', 'items.sealed');
   assert.equal(store.getArtifact(wf, 'note')?.acceptance, 'owed');
   assert.ok(engine.tick(wf, { now: 2000 }).orders.some((order) => order.step === 'inspect'));
   assert.equal(engine.green(wf, run.run, 'note', {}).outcome, 'green');
   move('green', 'note');
   assert.equal(engine.seal(wf, run.run).outcome, 'green');
-  move('collection-seal');
+  move('collection-seal', 'items.sealed');
 
   // The same claimed-run verbs can occur in the reverse order as well.
   const wfReverse = engine.createInstance(definition.name);
@@ -238,9 +238,9 @@ test('collection lease: mixed producer emits before singleton green on one runti
   assert.equal(engine.green(wfReverse, runReverse.run, 'note', {}).outcome, 'green');
   reverseMove('green', 'note');
   assert.deepEqual(engine.emit(wfReverse, runReverse.run, [{ value: {} }]).created, ['items[0]']);
-  reverseMove('collection-emit');
+  reverseMove('collection-emit', 'items.sealed');
   assert.equal(engine.seal(wfReverse, runReverse.run).outcome, 'green');
-  reverseMove('collection-seal');
+  reverseMove('collection-seal', 'items.sealed');
 
   const report = modelCheck(definition, {
     maxStates: 1000, maxDepth: 20, maxCollectionSize: 1, assumeProvided: true,
