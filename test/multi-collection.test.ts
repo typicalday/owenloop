@@ -50,6 +50,50 @@ test('plain multi-collection native verbs require an owed stem and preserve sibl
   assert.equal(store.getRun(order.run)?.outcome, 'ok');
 });
 
+test('migrated orderless single-collection run still emits and seals', () => {
+  const definition = def('legacy-single-collection', [input('seed', { seedOwed: false })], [
+    step({ name: 'gather', consumes: ['seed'], produces: ['items[]'] }),
+  ]);
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const order = engine.tick(wf).orders[0]!;
+  // The v6→v7 migration leaves pre-v7 run.order undefined. Keep the live
+  // claimed task and fingerprint while reproducing that persisted row shape.
+  store.db.prepare('UPDATE run SET order_json = NULL WHERE id = ?').run(order.run);
+  assert.equal(store.getRun(order.run)?.order, undefined);
+  assert.deepEqual(engine.emit(wf, order.run, [{ value: { item: 1 } }]).created, ['items[0]']);
+  assert.deepEqual(engine.seal(wf, order.run), { path: 'items.sealed', outcome: 'green' });
+  assert.equal(store.getArtifact(wf, 'items.sealed')?.acceptance, 'green');
+});
+
+test('persisted order missing the seal and orderless multi-collection run both refuse', () => {
+  const single = def('single-owed-control', [input('seed', { seedOwed: false })], [
+    step({ name: 'gather', consumes: ['seed'], produces: ['items[]'] }),
+  ]);
+  const singleStore = openStore(':memory:');
+  const singleEngine = new Engine(singleStore, () => single);
+  const singleWf = singleEngine.createInstance(single.name);
+  const singleOrder = singleEngine.tick(singleWf).orders[0]!;
+  singleStore.db.prepare('UPDATE run SET order_json = ? WHERE id = ?')
+    .run(JSON.stringify({ ...singleOrder, owes: [] }), singleOrder.run);
+  assert.ok(singleStore.getRun(singleOrder.run)?.order);
+  assert.throws(() => singleEngine.emit(singleWf, singleOrder.run, [], { stem: 'items' }), /does not owe collection seal/);
+  assert.throws(() => singleEngine.seal(singleWf, singleOrder.run), /does not owe collection seal/);
+  assert.equal(singleStore.getArtifact(singleWf, 'items.sealed')?.acceptance, 'owed');
+
+  const multiple = fixture();
+  const multiStore = openStore(':memory:');
+  const multiEngine = new Engine(multiStore, () => multiple);
+  const multiWf = multiEngine.createInstance(multiple.name);
+  const multiOrder = multiEngine.tick(multiWf).orders[0]!;
+  multiStore.db.prepare('UPDATE run SET order_json = NULL WHERE id = ?').run(multiOrder.run);
+  assert.throws(() => multiEngine.emit(multiWf, multiOrder.run, [], { stem: 'right' }), /does not owe collection seal/);
+  assert.throws(() => multiEngine.seal(multiWf, multiOrder.run, {}, { stem: 'left' }), /does not owe collection seal/);
+  assert.throws(() => multiEngine.emit(multiWf, multiOrder.run, []), /specify a stem/);
+  assert.equal(multiStore.getArtifact(multiWf, 'right.sealed')?.acceptance, 'owed');
+});
+
 test('one checker lease models both stems and matches native per-stem effects', () => {
   const definition = fixture();
   const store = openStore(':memory:');

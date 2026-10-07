@@ -4863,8 +4863,8 @@ export class Engine {
     return r;
   }
 
-  /** Resolve an explicitly owed collection. Legacy calls remain unambiguous for
-   * single-collection steps; multi-collection steps require a target. */
+  /** Resolve a collection on the held run. Pre-v7 orderless runs retain their
+   * unambiguous single-collection behavior; persisted orders require exact debt. */
   private collectionStemForRun(
     step: StepDef,
     run: ReturnType<Store['getRun']> & object,
@@ -4877,7 +4877,8 @@ export class Engine {
     }
     const stem = requested ?? collections[0]!.stem;
     if (!collections.some((produce) => produce.stem === stem)
-      || !run.order?.owes.some((owed) => owed.path === sealPath(stem))) {
+      || (run.order === undefined && collections.length !== 1)
+      || (run.order !== undefined && !run.order.owes.some((owed) => owed.path === sealPath(stem)))) {
       throw new Error(`run ${run.id} does not owe collection seal ${sealPath(stem)}`);
     }
     return stem;
