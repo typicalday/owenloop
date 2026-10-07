@@ -65,7 +65,7 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
   const hub = {
     async getOrder(req: unknown) {
       calls.push({ verb: 'get_order', arg: req });
-      const configured = cfg.getOrder ?? { text: '', workflow: 'wf1', run: 'run1', order: null, lease: { claimed: true } };
+      const configured = cfg.getOrder ?? defaultOrderResponse();
       const r = Array.isArray(configured)
 	? configured[Math.min(getOrderIdx++, configured.length - 1)]!
 	: configured;
@@ -165,6 +165,13 @@ function producerOrderResponse(): GetOrderResponse {
     },
     lease: { claimed: true },
   };
+}
+
+function defaultOrderResponse(): GetOrderResponse {
+  const response = producerOrderResponse();
+  response.order!.outputs = ['pr'];
+  response.order!.owes[0]!.path = 'pr';
+  return response;
 }
 
 // ---- shape ------------------------------------------------------------------
@@ -440,6 +447,76 @@ test('submit posts a receipt for the bound run and echoes the outcome', async ()
   ]);
 });
 
+test('direct submit refuses a null packet and never calls the hub submit verb', async () => {
+  const { hub, calls } = mockHub({ getOrder: {
+    text: '', workflow: 'wf1', run: 'run1', order: null, lease: { claimed: true },
+  } });
+  const mount = createHoldMcp(deps(hub));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.deepEqual(parse(shown), { workflow: 'wf1', run: 'run1', order: null });
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'HOSTILE-PATH', value: 1 }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.match(parse(submitted).error, /no bound order packet/);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('direct submit refuses a path outside validated owes, including a hostile caller argument', async () => {
+  const { hub, calls } = mockHub({ getOrder: producerOrderResponse() });
+  const mount = createHoldMcp(deps(hub));
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'HOSTILE-PATH', value: 1 }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.match(parse(submitted).error, /submit path refusal/);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('direct submit accepts a locally validated legacy outputs-only packet', async () => {
+  const response = producerOrderResponse();
+  response.order!.owes = [];
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub));
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'result', value: 1 }, ctx);
+  assert.equal(submitted.isError, undefined);
+  assert.equal(calls.some((call) => call.verb === 'submit'), true);
+});
+
+test('direct submit accepts a projected route sibling and refuses one absent from the current offer', async () => {
+  const local = buildDef({ name: 'route', steps: [{ name: 'producer', produces: ['result', 'sibling'] }] }).steps[0]!;
+  const projected = producerOrderResponse();
+  projected.order!.outputs = ['result', 'sibling'];
+  projected.order!.owes.push({ path: 'sibling', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] });
+  const verifier = async (order: NonNullable<GetOrderResponse['order']>) => validModelOrderFields(local, order)
+    ? { ok: true as const } : { ok: false as const, reason: 'model order refusal' };
+  const current = mockHub({ getOrder: projected });
+  const allowed = await tool(createHoldMcp(deps(current.hub, { modelOrderVerifier: verifier })).tools, 'submit')
+    .handler({ path: 'sibling', value: 1 }, ctx);
+  assert.equal(allowed.isError, undefined);
+  assert.equal(current.calls.some((call) => call.verb === 'submit'), true);
+
+  const older = mockHub({ getOrder: producerOrderResponse() });
+  const refused = await tool(createHoldMcp(deps(older.hub, { modelOrderVerifier: verifier })).tools, 'submit')
+    .handler({ path: 'sibling', value: 1 }, ctx);
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /submit path refusal/);
+  assert.equal(older.calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('collection member emission cannot be smuggled through Hold MCP submit', async () => {
+  const local = buildDef({ name: 'collection', steps: [{ name: 'collect', produces: ['items[]'] }] }).steps[0]!;
+  const response = producerOrderResponse();
+  response.order!.step = 'collect';
+  response.order!.outputs = ['items.sealed'];
+  response.order!.owes[0]!.path = 'items.sealed';
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    modelOrderVerifier: async (order) => validModelOrderFields(local, order)
+      ? { ok: true } : { ok: false, reason: 'model order refusal' },
+  }));
+  const refused = await tool(mount.tools, 'submit').handler({ path: 'items[0]', value: 1 }, ctx);
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /submit path refusal/);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
 test('hold-MCP judge submit attaches a DSSE proof for the fingerprinted artifact version', async () => {
   const orderResponse: GetOrderResponse = {
     text: '',
@@ -449,14 +526,14 @@ test('hold-MCP judge submit attaches a DSSE proof for the fingerprinted artifact
       run: 'run1',
       workflow: 'wf1',
       step: 'judge-result',
-      key: 'k',
+      key: '',
       defDigest: 'def-digest',
       inputs: ['result'],
-      outputs: [],
+      outputs: ['result'],
       judge: 'result',
       consumes: { result: { value: 'seen' } },
       consumedFingerprint: { result: 2 },
-      owes: [],
+      owes: [{ path: 'result', version: 3, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };
@@ -609,11 +686,11 @@ test('hold-MCP repeated judge approval signs the same fingerprinted version', as
       key: '',
       defDigest: 'def-digest',
       inputs: ['result'],
-      outputs: [],
+      outputs: ['result'],
       judge: 'result',
       consumes: { result: { draft: 1 } },
       consumedFingerprint: { result: 7 },
-      owes: [],
+      owes: [{ path: 'result', version: 8, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };

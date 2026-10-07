@@ -754,8 +754,10 @@ marks the final receipt for that path.
 `get_order` exposes gated dynamic inputs, owed paths, and rejection reasons.
 Before showing them, the holder resolves the step from its local workflow store
 and checks the step, consumed paths, key, and every output and owed path against
-that definition. A direct `submit` applies the same check. Missing local
-definitions and mismatched paths are refused. An interactive `hold --mcp` uses
+that definition. A direct `submit` requires a non-null order packet and checks
+its requested path against the validated owed paths (or validated legacy outputs
+when no owes are present). Missing local definitions, null packets, and mismatched
+paths are refused. An interactive `hold --mcp` uses
 the current directory to find the project workflow store, so launch it from a
 directory with the required definition installed, or use the global store.
 `agent-run` passes its instruction-store directory to its `--never-release`
@@ -765,6 +767,12 @@ is present; MCP tool arguments cannot set it. The existing definition and origin
 policies still apply: `warn` reports unsigned or unadmitted publications while
 `enforce` refuses them. Static task instructions and output schemas are resolved
 locally, never taken from the hub packet.
+
+Route siblings can be submitted when the Service projects them as owed by the
+current run. An older Service that cannot project a sibling's issued target
+cannot authorize that path through this holder. Collection members use the
+separate `emit` operation; `submit` does not accept a member merely because the
+local definition declares its collection.
 
 `valueFile` is a UTF-8 JSON document resolved inside the holder's run working
 directory. Traversal, outside absolute paths, and symlinks that escape that

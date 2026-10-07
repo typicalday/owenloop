@@ -55,12 +55,21 @@ export function validModelOrderFields(step: StepDef, order: OrderPacket): boolea
     || !Array.isArray(owed.reasons)
     || !Number.isSafeInteger(owed.judgmentRejects) || owed.judgmentRejects < 0
     || !Number.isSafeInteger(owed.schemaRejects) || owed.schemaRejects < 0
-    || (owed.version !== undefined && (!Number.isSafeInteger(owed.version) || owed.version < 0)))) return false;
+    || (owed.version !== undefined && (!Number.isSafeInteger(owed.version) || owed.version < 1)))) return false;
   const owedPaths = order.owes.map((owed) => owed.path);
   if (outputs.some((path) => typeof path !== 'string')
     || owedPaths.some((path) => typeof path !== 'string')
     || new Set(outputs).size !== outputs.length || new Set(owedPaths).size !== owedPaths.length) return false;
   if (owedPaths.length > 0
     && (outputs.length !== owedPaths.length || owedPaths.some((path) => !outputs.includes(path)))) return false;
+  // Synthesized judges issue a verdict on the locally declared judged stem.
+  // They intentionally have no `produces`; Engine still offers that stem in
+  // outputs/owes so the judge can act on the submitted artifact. Require the
+  // sole exact stem and its consume edge rather than widening outputFor.
+  if (step.judges !== undefined) {
+    return step.judges !== '' && step.produces.length === 0 && order.cause === undefined
+      && step.consumes.some((consume) => consume.mode === 'plain' && consume.stem === step.judges)
+      && outputs.length === 1 && outputs[0] === step.judges;
+  }
   return [...outputs, ...owedPaths].every((path) => outputFor(step, order, path) !== undefined);
 }

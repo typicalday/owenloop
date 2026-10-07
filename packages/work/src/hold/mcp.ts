@@ -380,6 +380,15 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         }
         const refused = await gate(orderResponse);
         if (refused !== undefined) return refused;
+	if (orderResponse.order === null) {
+	  return textResult({ error: 'submit order refusal: no bound order packet is available' }, true);
+	}
+	const allowedPaths = orderResponse.order.owes.length > 0
+	  ? orderResponse.order.owes.map((owed) => owed.path)
+	  : orderResponse.order.outputs;
+	if (!allowedPaths.includes(path)) {
+	  return textResult({ error: 'submit path refusal: path is not owed by the bound order' }, true);
+	}
         captured = orderResponse;
 
         let proof: string | undefined;

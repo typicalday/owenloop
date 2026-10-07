@@ -1018,7 +1018,7 @@ test('a roster-selected Codex candidate refuses inherited judge policy before st
   const judge = seedSynthesizedJudge({ harness: { id: 'codex', tools: [] } });
   process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
   const packet = agentOrder({ step: judge.name, model: judge.model, x: judge.x,
-    inputs: ['report'], consumes: { report: 'value' }, outputs: [] });
+    inputs: ['report'], consumes: { report: 'value' }, outputs: ['report'] });
 
   writeRoster({ build: [{ harness: 'codex', model: 'test-model', effort: 'high' }] });
   const { hub, releases } = probeHub({ responses: [packet, noHold('ok')], def: DEF });
