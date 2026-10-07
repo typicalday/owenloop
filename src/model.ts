@@ -2498,6 +2498,13 @@ export interface CollectionLease {
 export interface CollectionCheckState {
   arts: Map<string, ArtifactData>;
   leases: CollectionLease[];
+  modifier?: string;
+  /** Selected by an accepted submission; routing changes only on final approval. */
+  pendingModifiers?: Record<string, string>;
+}
+
+function clonePendingModifiers(pending?: Record<string, string>): Record<string, string> {
+  return Object.assign(Object.create(null) as Record<string, string>, pending);
 }
 
 /** Bounded concrete JSON candidates, shared by collection and singleton guards. */
@@ -2674,6 +2681,23 @@ function bindCandidate(path: string, leaf: unknown): Record<string, unknown> {
   return root;
 }
 
+/** Replace a bound leaf without discarding the other schema-required fields. */
+function bindVariant(base: unknown, path: string, leaf: unknown): Record<string, unknown> | undefined {
+  if (base === null || typeof base !== 'object' || Array.isArray(base)) return undefined;
+  const root = { ...base } as Record<string, unknown>;
+  let cursor = root;
+  const keys = path.split('.');
+  for (const key of keys.slice(0, -1)) {
+    const child = cursor[key];
+    if (child === null || typeof child !== 'object' || Array.isArray(child)) return undefined;
+    const copy = { ...child } as Record<string, unknown>;
+    cursor[key] = copy;
+    cursor = copy;
+  }
+  cursor[keys[keys.length - 1]!] = leaf;
+  return root;
+}
+
 /** Concrete singleton commit classes; no declaration alone creates a branch. */
 function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modifier?: string): {
   green: boolean;
@@ -2682,15 +2706,28 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
   schemaRefusalClassKnown: boolean;
   greenClassKnown: boolean;
   bindRefusal: boolean;
+  acceptedModifiers: Array<string | undefined>;
 } {
   const schema = produce.schema;
   const bind = produce.bind;
   if (schema === undefined && bind === undefined) {
     return { green: true, refusal: false, schemaValidClassKnown: true,
-      schemaRefusalClassKnown: true, greenClassKnown: true, bindRefusal: false };
+      schemaRefusalClassKnown: true, greenClassKnown: true, bindRefusal: false,
+      acceptedModifiers: [undefined] };
   }
   const candidates = schemaValueCandidates(schema, true);
   if (bind) {
+    // A bare bind-shaped object often omits another required schema field.
+    // Vary the bound leaf in a bounded set of complete sampled objects too;
+    // the runtime validator below remains the acceptance authority.
+    const leaves = bind.to === 'modifier'
+      ? [...(def.modifiers ?? []), '__invalid_modifier__'] : [null];
+    for (const base of candidates.slice(0, 16)) {
+      for (const leaf of leaves) {
+	const variant = bindVariant(base, bind.from, leaf);
+	if (variant !== undefined) candidates.push(variant);
+      }
+    }
     candidates.unshift(bindCandidate(bind.from, bind.to === 'modifier'
       ? (modifier ?? def.modifiers?.[0] ?? 'x') : null));
     for (const name of def.modifiers ?? []) candidates.push(bindCandidate(bind.from, name));
@@ -2701,6 +2738,7 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
   let schemaValid = false;
   let schemaRefusal = false;
   let bindRefusal = false;
+  const acceptedModifiers = new Set<string | undefined>();
   for (const value of candidates) {
     if (schema !== undefined && !validateValue(schema, value).valid) {
       refusal = true;
@@ -2713,11 +2751,10 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
       refusal = true;
       bindRefusal = true;
     }
-    else if (bound.modifier !== undefined && bound.modifier !== modifier) {
-      // Changing the instance modifier changes later firing/judge eligibility;
-      // the checker has no modifier in its state key, so this successor is omitted.
-      continue;
-    } else green = true;
+    else {
+      green = true;
+      acceptedModifiers.add(bound.modifier);
+    }
   }
   return {
     green, refusal,
@@ -2725,7 +2762,7 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
     schemaRefusalClassKnown: schemaRefusal || schema === undefined || schema === true
       || (schema !== false && Object.keys(schema).length === 0),
     greenClassKnown: green || schema === false,
-    bindRefusal,
+    bindRefusal, acceptedModifiers: [...acceptedModifiers],
   };
 }
 
@@ -2741,7 +2778,15 @@ export function collectionCheckKey(def: WorkflowDef, state: CollectionCheckState
 	? 'current' : 'moved',
     ]),
   })).sort((a, b) => a.step.localeCompare(b.step) || a.key.localeCompare(b.key));
-  return `${canonicalKey(def, state.arts)}|leases:${JSON.stringify(leases)}`;
+  // A rejected/skipped/cascaded submission can leave a stale pending choice.
+  // Only a submitted artifact can reach final judge approval, and a later
+  // submission replaces its pending value, so stale entries are inert.
+  const pending = Object.entries(state.pendingModifiers ?? {})
+    .filter(([path]) => state.arts.get(path)?.acceptance === 'submitted')
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  return `${canonicalKey(def, state.arts)}|modifier:${JSON.stringify(state.modifier ?? null)}`
+    + `|pending:${JSON.stringify(pending)}`
+    + `|leases:${JSON.stringify(leases)}`;
 }
 
 /** @internal One visible action by an open collection producer. */
@@ -2765,11 +2810,15 @@ export function collectionLeaseSuccessors(
   const move = (
     outcome: CheckStep['outcome'], arts: Map<string, ArtifactData>,
     leases = state.leases, count?: number, path?: string,
+    routing = state.modifier ?? modifier, pending = state.pendingModifiers,
+    selectedModifier?: string,
   ): void => {
     result.push({
-      state: { arts: settleInMemory(def, arts), leases },
+      state: { arts: settleInMemory(def, arts), leases, modifier: routing,
+	pendingModifiers: pending },
       step: { step: lease.step, key: lease.key, outcome,
-	...(count === undefined ? {} : { count }), ...(path === undefined ? {} : { path }) },
+	...(count === undefined ? {} : { count }), ...(path === undefined ? {} : { path }),
+	...(selectedModifier === undefined ? {} : { selectedModifier }) },
     });
   };
 
@@ -2794,7 +2843,7 @@ export function collectionLeaseSuccessors(
       // A plain singleton's group refusal precedes the runtime CAS check.
       // It leaves the open run and the already-settled loser untouched.
       if (!sealPaths.includes(path)
-	  && activeJudgesForStem(def, path, modifier).length === 0
+	  && activeJudgesForStem(def, path, state.modifier ?? modifier).length === 0
 	  && groupWouldReject(def, state.arts, path)) {
 	move('group-reject', new Map(state.arts), state.leases, undefined, path);
 	continue;
@@ -2817,18 +2866,25 @@ export function collectionLeaseSuccessors(
   // there is no enforced singleton-before-collection order.
   for (const path of singletonPaths) {
     const produce = step.produces.find((candidate) => candidate.kind === 'singleton' && candidate.stem === path);
-    const witnesses = collectionValueWitnesses(produce?.schema);
+    const witnesses = produce && singletonValueWitnesses(def, produce, state.modifier ?? modifier);
     const firing: Firing = {
       step: lease.step, key: lease.key, inputs: lease.inputs, outputs: [path],
     };
-    for (const outcome of eligibleOutcomes(def, state.arts, firing, { modifier })) {
-      // Every newly interleaved commit branch needs a concrete runtime value.
-      // A bind can reject a schema-valid value through a separate validator;
-      // until a bind witness exists, omit both value-dependent branches.
-      if (outcome === 'green' && (produce?.bind !== undefined || witnesses.valid === undefined)) continue;
-      if (outcome === 'schema-reject' && (produce?.bind !== undefined || witnesses.invalid === undefined)) continue;
-      for (const arts of applyOutcome(def, state.arts, firing, outcome, { maxCollectionSize, modifier })) {
-	move(outcome, arts, state.leases, undefined, path);
+    for (const outcome of eligibleOutcomes(def, state.arts, firing, { modifier: state.modifier ?? modifier })) {
+      if (outcome === 'green' && !witnesses?.green) continue;
+      if (outcome === 'schema-reject' && !witnesses?.refusal) continue;
+      const selected = outcome === 'green' ? witnesses!.acceptedModifiers : [undefined];
+      for (const selectedModifier of selected) {
+	for (const arts of applyOutcome(def, state.arts, firing, outcome,
+	  { maxCollectionSize, modifier: state.modifier ?? modifier })) {
+	  const submitted = arts.get(path)?.acceptance === 'submitted';
+	  const pending = clonePendingModifiers(state.pendingModifiers);
+	  if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
+	  else if (outcome === 'green') delete pending[path];
+	  move(outcome, arts, state.leases, undefined, path,
+	    outcome === 'green' && selectedModifier !== undefined && !submitted
+	      ? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
+	}
       }
     }
   }
@@ -3128,12 +3184,17 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
  * Pure — no store, no engine, no IO.
  */
 export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckReport {
+  // Match createInstance's pinned-vocabulary preflight. An undeclared initial
+  // route has no runtime instance, so its checker paths cannot be witnesses.
+  if (opts.modifier !== undefined && !(def.modifiers ?? []).includes(opts.modifier)) {
+    throw new Error(`modifier '${opts.modifier}' is not declared by workflow '${def.name}'`);
+  }
   const maxDepth = opts.maxDepth ?? 50;
   const maxStates = opts.maxStates ?? 5000;
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
   const seeded = seedArts(def, opts.assumeProvided ?? false);
-  const initial: CollectionCheckState = { arts: seeded.arts, leases: [] };
+  const initial: CollectionCheckState = { arts: seeded.arts, leases: [], modifier: opts.modifier };
   const definitelySeededInputs = new Set(def.inputs.filter((input) => !input.seedOwed).map((input) => input.name));
   const initialKey = collectionCheckKey(def, initial);
 
@@ -3196,7 +3257,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     if (node.depth > depthReached) depthReached = node.depth;
 
     const arts = node.state.arts;
-    const status = workflowStatus(def, arts, { modifier: opts.modifier });
+    const modifier = node.state.modifier;
+    const status = workflowStatus(def, arts, { modifier });
 
     // ---- invariant checking -------------------------------------------------
     // A state violates an invariant iff eval(when ?? ALWAYS_TRUE) && !eval(requires).
@@ -3268,7 +3330,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // including when a schema counter has frozen *new* offers.
     const workerFirings = status.eligible.filter((firing) => !openSteps.has(firing.step));
     const leaseMoves = node.state.leases.flatMap((lease) =>
-      collectionLeaseSuccessors(def, node.state, lease, maxCollectionSize, opts.modifier));
+      collectionLeaseSuccessors(def, node.state, lease, maxCollectionSize, modifier));
     const leaseProgressFirings: Firing[] = node.state.leases.flatMap((lease) =>
       leaseMoves.filter((move) => move.step.step === lease.step
         && move.step.outcome !== 'collection-close' && move.step.path !== undefined)
@@ -3294,7 +3356,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	// Classify this actual no-move state even while another branch waits.
 	if (!def.inputs.some((input) => arts.get(input.name)?.acceptance === 'owed')) continue;
       }
-      const eventualFirings = eligibleFirings(def, arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier: opts.modifier });
+      const eventualFirings = eligibleFirings(def, arts, EVENTUAL_TIME_FACTS, { ignoreFreeze: true, modifier });
       if (eventualFirings.length > 0) {
         report.stallStates.push({ path: nodePath() });
       } else {
@@ -3367,9 +3429,25 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	    report.coverageIncomplete.push('collection-schema-refusal');
 	  }
 	}
-	if (producer?.produces.some((p) => p.kind === 'singleton' && (p.schema !== undefined || p.bind !== undefined))) {
+	if (producer?.produces.some((p) => p.kind === 'singleton' && p.schema !== undefined)) {
 	  if (!report.coverageIncomplete.includes('collection-mixed-output-values')) {
 	    report.coverageIncomplete.push('collection-mixed-output-values');
+	  }
+	}
+	for (const produce of producer?.produces ?? []) {
+	  if (produce.kind !== 'singleton' || produce.bind === undefined) continue;
+	  const witnesses = singletonValueWitnesses(def, produce, modifier);
+	  if (!witnesses.greenClassKnown && !report.coverageIncomplete.includes('singleton-bind-validity')) {
+	    report.coverageIncomplete.push('singleton-bind-validity');
+	  }
+	  if (!witnesses.bindRefusal && produce.schema !== false
+	    && !report.coverageIncomplete.includes('singleton-bind-refusal')) {
+	    report.coverageIncomplete.push('singleton-bind-refusal');
+	  }
+	  if (produce.bind.to === 'modifier'
+	    && (def.modifiers ?? []).some((name) => !witnesses.acceptedModifiers.includes(name))
+	    && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
+	    report.coverageIncomplete.push('singleton-bind-modifier');
 	  }
 	}
 	const lease: CollectionLease = {
@@ -3380,7 +3458,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	  inputs: plainConsumes(producer!).map((consume) => consume.stem),
 	  fingerprint: computeFingerprint(arts, firing.inputs),
 	};
-	const claimed = { arts, leases: [...node.state.leases, lease] };
+	const claimed = { ...node.state, leases: [...node.state.leases, lease] };
 	enqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' });
 	continue;
       }
@@ -3388,7 +3466,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       const ordinaryStep = def.steps.find((candidate) => candidate.name === firing.step);
       const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, firing.outputs[0] ?? '');
       if (ordinaryProduce?.schema !== undefined || ordinaryProduce?.bind !== undefined) {
-	const witnesses = singletonValueWitnesses(def, ordinaryProduce, opts.modifier);
+	const witnesses = singletonValueWitnesses(def, ordinaryProduce, modifier);
 	if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
 	  && !report.coverageIncomplete.includes('singleton-schema-validity')) {
 	  report.coverageIncomplete.push('singleton-schema-validity');
@@ -3406,13 +3484,13 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	  report.coverageIncomplete.push('singleton-bind-refusal');
 	}
 	if (ordinaryProduce.bind?.to === 'modifier'
-	  && ordinaryProduce.schema !== false
+	  && (def.modifiers ?? []).some((name) => !witnesses.acceptedModifiers.includes(name))
 	  && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
 	  report.coverageIncomplete.push('singleton-bind-modifier');
 	}
       }
 
-      const outcomes = eligibleOutcomes(def, arts, firing, { modifier: opts.modifier });
+      const outcomes = eligibleOutcomes(def, arts, firing, { modifier });
 
       for (const outcome of outcomes) {
         // Check state count before expanding
@@ -3421,11 +3499,37 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
           break outer;
         }
 
-	const step: CheckStep = { step: firing.step, key: firing.key, outcome };
-	const successors = applyOutcome(def, arts, firing, outcome, { maxCollectionSize, modifier: opts.modifier });
+	const successors = applyOutcome(def, arts, firing, outcome, { maxCollectionSize, modifier });
 
         for (const suc of successors) {
-	  enqueue({ arts: suc, leases: node.state.leases }, step);
+	  const path = firing.outputs[0];
+	  const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
+	  if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
+	  let nextModifier = modifier;
+	  let approvedModifier: string | undefined;
+	  if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
+	    approvedModifier = pendingModifiers[path];
+	    nextModifier = approvedModifier ?? modifier;
+	    delete pendingModifiers[path];
+	  }
+	  const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier'
+	    ? singletonValueWitnesses(def, ordinaryProduce, modifier).acceptedModifiers : [undefined];
+	  for (const selected of choices) {
+	    const nextPending = clonePendingModifiers(pendingModifiers);
+	    let routed = nextModifier;
+	    if (outcome === 'green' && path) {
+	      delete nextPending[path];
+	      if (selected !== undefined) {
+		if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
+		else routed = selected;
+	      }
+	    }
+	    const selectedModifier = outcome === 'green' ? selected : approvedModifier;
+	    const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
+	      ...(selectedModifier === undefined ? {} : { selectedModifier }) };
+	    enqueue({ arts: suc, leases: node.state.leases, modifier: routed,
+	      pendingModifiers: nextPending }, trace);
+	  }
         }
       }
     }
@@ -3454,8 +3558,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   // (can fire in principle; the bounded search just didn't reach it).
   // Compute the reachability fixpoint once, not per dead step.
   const reachable = reachableStems(def);
+  const canRebindModifier = def.steps.some((step) =>
+    step.produces.some((produce) => produce.bind?.to === 'modifier'));
   for (const l of def.steps) {
-    if (l.judges && !activeJudgesForStem(def, l.judges, opts.modifier).some((judge) => judge.name === judgeNameOf(l))) {
+    if (l.judges && !(canRebindModifier ? [opts.modifier, ...(def.modifiers ?? [])] : [opts.modifier]).some((modifier) =>
+      activeJudgesForStem(def, l.judges!, modifier).some((judge) => judge.name === judgeNameOf(l)))) {
       continue;
     }
     if (firedSteps.has(l.name)) continue;

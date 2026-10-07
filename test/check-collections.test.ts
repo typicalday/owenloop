@@ -286,8 +286,9 @@ test('owenloop#236: singleton witnesses agree with Engine schema and bind outcom
   produce.bind = { to: 'modifier', from: 'choice' };
   assert.equal(runtime({ choice: 'fast' }, 'fast'), 'green');
   assert.ok(outcomes('fast').includes('green'));
-  assert.ok(!outcomes().includes('green'), 'changing the instance modifier needs a state the checker does not track');
-  assert.ok(modelCheck(fixture, { maxStates: 100 }).coverageIncomplete.includes('singleton-bind-modifier'));
+  assert.ok(outcomes().includes('green'), 'a concrete accepted bind can change the instance modifier');
+  assert.ok(!modelCheck(fixture, { maxStates: 100 }).coverageIncomplete.includes('singleton-bind-modifier'),
+    'the declared modifier has a schema-valid concrete witness');
 
   produce.schema = { const: { choice: 'slow' } };
   assert.equal(runtime({ choice: 'slow' }, 'fast'), 'schema-rejected');

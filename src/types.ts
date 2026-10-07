@@ -1135,6 +1135,8 @@ export interface CheckStep {
   count?: number;
   /** Concrete owned output targeted by a mixed producer's same-run action. */
   path?: string;
+  /** Accepted bind value selected by this commit or applied by final judge approval. */
+  selectedModifier?: string;
 }
 
 /** A finding with its shortest witness path from the initial state. */

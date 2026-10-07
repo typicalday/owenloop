@@ -37,6 +37,20 @@ function fields(arts: Map<string, ArtifactData>) {
   }));
 }
 
+test('checker initial modifier preflight agrees with Engine starts', () => {
+  const definition = buildDef({ name: 'initial-route', modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'q', seedOwed: false }],
+    steps: [{ name: 'work', consumes: ['q'], produces: ['out'], body: 'work' }] });
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  for (const modifier of [undefined, 'standard', 'deep']) {
+    assert.doesNotThrow(() => engine.createInstance(definition.name, { modifier }));
+    assert.doesNotThrow(() => modelCheck(definition, { modifier, maxStates: 100 }));
+  }
+  assert.throws(() => engine.createInstance(definition.name, { modifier: 'undeclared' }), /not declared/);
+  assert.throws(() => modelCheck(definition, { modifier: 'undeclared' }), /not declared/);
+});
+
 test('collection lease: emit, later schema refusal, same-run correction after cap, and seal match Engine', () => {
   const definition = fixture();
   const store = openStore(':memory:');
@@ -311,6 +325,140 @@ test('collection lease: scoped singleton judge uses the selected modifier on the
     'the active judge submits the note; green requires a separate approval outside this two-move prefix');
 });
 
+test('collection lease: concrete modifier binds, refusal, and same-value rebind match Engine routing', () => {
+  const definition = buildDef({
+    name: 'mixed-routing', modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'q', seedOwed: false }],
+    steps: [{ name: 'gather', consumes: ['q'], body: 'gather', produces: [
+      { name: 'selection', schema: { type: 'object', required: ['modifier'],
+	properties: { modifier: { type: 'string' } } }, bind: 'modifier' },
+      'items[]',
+    ] }],
+  });
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name, { modifier: 'standard' });
+  const run = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'gather');
+  assert.ok(run);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const lease: CollectionLease = { step: 'gather', key: '', stem: 'items', inputs: ['q'],
+    fingerprint: computeFingerprint(arts(), ['q']) };
+  let model: CollectionCheckState = { arts: arts(), leases: [lease], modifier: 'standard' };
+  for (const selected of ['standard', 'deep', 'bogus', 'deep']) {
+    const actual = engine.green(wf, run.run, 'selection', { modifier: selected });
+    const wanted = selected === 'bogus' ? 'schema-reject' : 'green';
+    const moves = collectionLeaseSuccessors(definition, model, lease, 1)
+      .filter((move) => move.step.outcome === wanted && move.step.path === 'selection');
+    const next = moves.find((move) => wanted === 'schema-reject'
+      || move.state.modifier === selected);
+    assert.ok(next, `checker needs concrete ${selected} branch`);
+    if (wanted === 'green') assert.equal(next.step.selectedModifier, selected);
+    assert.equal(actual.outcome, selected === 'bogus' ? 'schema-rejected' : 'green');
+    model = next.state;
+    assert.equal(model.modifier, store.getWorkflow(wf)?.modifier);
+    assert.deepEqual(fields(model.arts), fields(arts()));
+  }
+  const standard = { ...model, modifier: 'standard' };
+  assert.notEqual(collectionCheckKey(definition, standard), collectionCheckKey(definition, model));
+});
+
+test('collection lease: judged bind keeps routing pending and replaces it on repeated submission', () => {
+  const definition = buildDef({ name: 'judged-mixed-route', modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'q', seedOwed: false }],
+    steps: [{ name: 'gather', consumes: ['q'], body: 'gather', produces: [
+      { name: 'selection', bind: 'modifier', judges: [{ name: 'review', body: 'review' }] },
+      'items[]',
+    ] }],
+  });
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name, { modifier: 'standard' });
+  const run = engine.tick(wf).orders.find((order) => order.step === 'gather');
+  assert.ok(run);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const lease: CollectionLease = { step: 'gather', key: '', stem: 'items', inputs: ['q'],
+    fingerprint: computeFingerprint(arts(), ['q']) };
+  let model: CollectionCheckState = { arts: arts(), leases: [lease], modifier: 'standard' };
+  for (const selected of ['deep', 'standard']) {
+    assert.equal(engine.green(wf, run.run, 'selection', { modifier: selected }).outcome, 'submitted');
+    const next = collectionLeaseSuccessors(definition, model, lease, 1).find((move) =>
+      move.step.outcome === 'green' && move.step.path === 'selection'
+      && move.step.selectedModifier === selected);
+    assert.ok(next);
+    model = next.state;
+    assert.equal(model.modifier, 'standard');
+    assert.equal(model.pendingModifiers?.selection, selected);
+    assert.equal(store.getWorkflow(wf)?.modifier, 'standard');
+    assert.deepEqual(fields(model.arts), fields(arts()));
+  }
+  assert.notEqual(collectionCheckKey(definition, model), collectionCheckKey(definition,
+    { ...model, pendingModifiers: { selection: 'deep' } }),
+  'pending choice changes the future final-approval route');
+  const moved = new Map(model.arts);
+  moved.set('selection', { ...moved.get('selection')!, acceptance: 'rejected' });
+  assert.equal(collectionCheckKey(definition, { ...model, arts: moved }),
+    collectionCheckKey(definition, { ...model, arts: moved, pendingModifiers: { selection: 'deep' } }),
+    'a stale choice on a non-submitted artifact cannot affect future eligibility');
+  const judge = engine.tick(wf).orders.find((order) => order.step.endsWith('.review'));
+  assert.ok(judge);
+  assert.equal(engine.green(wf, judge.run, 'selection', {}).outcome, 'green');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'standard', 'the latest submitted value wins');
+});
+
+test('checker reaches modifier-scoped judges after approved bind, from an absent initial modifier', () => {
+  const definition = buildDef({
+    name: 'judged-routing', modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'q', seedOwed: false }],
+    steps: [
+      { name: 'select', consumes: ['q'], body: 'select', produces: [
+	{ name: 'selection', bind: { from: 'payload.modifier', to: 'modifier' },
+	  schema: { type: 'object', required: ['kind', 'payload'], properties: {
+	    kind: { const: 'receipt' },
+	    payload: { type: 'object', required: ['modifier'], properties: {
+	      modifier: { type: 'string', enum: ['standard', 'deep'] },
+	    } },
+	  } }, judges: [
+	  { name: 'approve', body: 'approve' },
+	] },
+      ] },
+      { name: 'use', consumes: ['selection'], body: 'use', produces: [
+	{ name: 'result', judges: [{ name: 'deepReview', body: 'review', modifiers: ['deep'] }] },
+      ] },
+    ],
+  });
+  definition.invariants = [{ name: 'requires-result', when: { path: 'selection', is: 'green' },
+    requires: { path: 'result', is: 'green' } }];
+  const report = modelCheck(definition, { maxDepth: 8, maxStates: 5000, assumeProvided: true });
+  assert.ok(!report.coverageIncomplete.includes('singleton-bind-modifier'),
+    'both declared modifiers have concrete schema-valid complete payloads');
+  const witness = report.invariantViolations.find((finding) => finding.invariant === 'requires-result');
+  assert.ok(witness);
+  const submitted = witness.path.find((entry) => entry.step === 'select' && entry.outcome === 'green');
+  const approved = witness.path.find((entry) => entry.outcome === 'judge-approve');
+  assert.ok(submitted?.selectedModifier);
+  assert.equal(approved?.selectedModifier, submitted.selectedModifier,
+    'a trace records the pending choice at submission and its later approval');
+  assert.ok(!report.structurallyDeadSteps.includes('use.result.judges.deepReview'));
+  assert.ok(!report.unreachedSteps.includes('use.result.judges.deepReview'),
+    'deep judge must become eligible after final approval changes routing');
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const producer = engine.tick(wf).orders.find((order) => order.step === 'select');
+  assert.ok(producer);
+  assert.equal(engine.green(wf, producer.run, 'selection',
+    { kind: 'receipt', payload: { modifier: 'deep' } }).outcome, 'submitted');
+  assert.equal(store.getWorkflow(wf)?.modifier, undefined, 'submission has not changed routing');
+  const judge = engine.tick(wf).orders.find((order) => order.step.endsWith('.approve'));
+  assert.ok(judge);
+  assert.equal(engine.green(wf, judge.run, 'selection', {}).outcome, 'green');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  const worker = engine.tick(wf).orders.find((order) => order.step === 'use');
+  assert.ok(worker);
+  assert.equal(engine.green(wf, worker.run, 'result', {}).outcome, 'submitted');
+  assert.ok(engine.tick(wf).orders.some((order) => order.step.endsWith('.deepReview')));
+});
+
 test('collection lease: losing group sibling refuses before stale-input CAS', () => {
   const definition = buildDef({
     name: 'mixed-group-stale',
@@ -343,6 +491,37 @@ test('collection lease: losing group sibling refuses before stale-input CAS', ()
   assert.equal(engine.green(wf, run.run, 'right', {}).outcome, 'group-rejected');
   assert.equal(refused.state.leases.length, 1, 'group refusal leaves the claimed run open');
   assert.deepEqual(fields(refused.state.arts), fields(arts()));
+});
+
+test('collection lease: stale CAS uses rebound modifier for scoped group precedence', () => {
+  const definition = buildDef({ name: 'rebound-stale-group', modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'q', seedOwed: false }],
+    steps: [{ name: 'gather', consumes: ['q'], body: 'gather', produces: [
+      { name: 'selection', bind: 'modifier' },
+      'left',
+      { name: 'right', judges: [{ name: 'review', body: 'review', modifiers: ['deep'] }] },
+      'items[]',
+      { group: 'choice', mode: 'exactlyOne', of: ['left', 'right'] },
+    ] }],
+  });
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name, { modifier: 'standard' });
+  const run = engine.tick(wf).orders.find((order) => order.step === 'gather');
+  assert.ok(run);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const lease: CollectionLease = { step: 'gather', key: '', stem: 'items', inputs: ['q'],
+    fingerprint: computeFingerprint(arts(), ['q']) };
+  assert.equal(engine.green(wf, run.run, 'left', {}).outcome, 'green');
+  assert.equal(engine.green(wf, run.run, 'selection', { modifier: 'deep' }).outcome, 'green');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  engine.green(wf, 'human', 'q', { changed: true });
+  const model: CollectionCheckState = { arts: arts(), leases: [lease], modifier: 'deep' };
+  const next = collectionLeaseSuccessors(definition, model, lease, 1).find((move) =>
+    move.step.path === 'right' && move.step.outcome === 'collection-born-reject');
+  assert.ok(next, 'deep judge defers group exclusion, so stale CAS born-rejects');
+  assert.equal(engine.green(wf, run.run, 'right', {}).outcome, 'born-rejected');
+  assert.deepEqual(fields(next.state.arts), fields(arts()));
 });
 
 test('collection lease: unsampled real schema-valid value is an incomplete check, not a clean archive proof', () => {
