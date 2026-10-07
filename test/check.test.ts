@@ -1692,6 +1692,15 @@ test('modelCheck: a calls: step whose gate IS green completes — the handoff is
   assert.ok(!report.structurallyDeadSteps.includes('deliver'), 'the calls: step itself is not structurally dead');
 });
 
+test('modelCheck: calls handoff remains reachable when its output schema has no sampled value', () => {
+  const handoff = callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { proposal: 'proposal' } });
+  handoff.produces[0]!.schema = { type: 'string', pattern: '^a-value-the-checker-does-not-sample$' };
+  const d = def('calls-unsampled-schema', [input('proposal', { seedOwed: false })], [handoff]);
+  const report = modelCheck(d, { maxStates: 100 });
+  assert.equal(report.completable, true);
+  assert.ok(!report.unreachedSteps.includes('deliver'));
+});
+
 test('modelCheck: a SKIPPED calls: gate settles the calls branch without passing it', () => {
   // A calls gate that becomes skipped never provisions its child, so its output
   // must settle through ordinary dead-input maintenance instead. The old defect
