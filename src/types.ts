@@ -1177,7 +1177,7 @@ export interface CheckReport {
    * An empty array is not a claim that all live task/lease interleavings were
    * explored; runtime conformance is verified separately.
    */
-  coverageIncomplete: Array<'collection-width-cap' | 'collection-unexplored' | 'collection-schema-validity' | 'collection-schema-refusal' | 'collection-mixed-output-values'>;
+  coverageIncomplete: Array<'collection-width-cap' | 'collection-unexplored' | 'collection-schema-validity' | 'collection-schema-refusal' | 'collection-mixed-output-values' | 'singleton-schema-validity' | 'singleton-schema-refusal' | 'singleton-bind-validity' | 'singleton-bind-refusal' | 'singleton-bind-modifier'>;
   /**
    * True when the search expanded a reachable collection producer under the
    * finite total-emitted-member cap. This is separate from BFS bounds and

@@ -2357,9 +2357,12 @@ export function eligibleOutcomes(
   // so this only applies to a plain (non-judged) producer output.
   const hasJudges = activeJudgesForStem(def, outPath, opts.modifier).length > 0;
   const groupRejectsGreen = !hasJudges && outPath !== '' && groupWouldReject(def, arts, outPath);
+  const produce = produceOwning(step, outPath);
+  const witnesses = produce && singletonValueWitnesses(def, produce, opts.modifier);
   if (groupRejectsGreen) {
     outcomes.push('group-reject');
-  } else {
+  } else if (!witnesses || witnesses.green) {
+    // Value-dependent commits need a concrete payload accepted by both guards.
     outcomes.push('green');
   }
 
@@ -2376,12 +2379,9 @@ export function eligibleOutcomes(
   }
 
   // green() checks plain produce-group exclusion before schema/bind validation.
-  // After that, it can schema-reject only when this produce declares a schema
-  // or a binding whose accepted value may fail validation. With neither, the
-  // real commit accepts any JSON value; a synthetic rejection invents retry states.
-  // Keep the branch if the owning produce is unknown, conservatively.
-  const produce = produceOwning(step, outPath);
-  if (!groupRejectsGreen && (!produce || produce.schema !== undefined || produce.bind !== undefined)) {
+  // A refusal also needs a concrete payload. A schema-valid payload alone
+  // does not prove that bind validation can reject it.
+  if (!groupRejectsGreen && witnesses?.refusal) {
     outcomes.push('schema-reject');
   }
   // skip is valid for any non-retracted output (producer can route dead branch)
@@ -2469,21 +2469,8 @@ export interface CollectionCheckState {
   leases: CollectionLease[];
 }
 
-/**
- * A collection schema constrains the values of each emit item, not the seal.
- * Enumerate a few concrete object witnesses rather than claiming that either
- * branch exists merely because a schema was declared. This is deliberately a
- * sampled-value abstraction; the report flags it whenever reached.
- */
-/** @internal Concrete candidate values for differential checker/runtime tests. */
-export function collectionValueWitnesses(schema: JsonSchema | undefined): {
-  valid?: Record<string, unknown>;
-  invalid?: Record<string, unknown>;
-  validClassKnown: boolean;
-  invalidClassKnown: boolean;
-} {
-  if (schema === undefined) return { valid: {}, validClassKnown: true, invalidClassKnown: true };
-
+/** Bounded concrete JSON candidates, shared by collection and singleton guards. */
+function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives = false): unknown[] {
   const sample = (shape: JsonSchema | undefined, depth: number): unknown => {
     if (depth > 5 || shape === undefined || shape === true) return {};
     if (shape === false) return undefined;
@@ -2513,34 +2500,142 @@ export function collectionValueWitnesses(schema: JsonSchema | undefined): {
   };
 
   const generated = sample(schema, 0);
-  const candidates: Record<string, unknown>[] = [
-    {}, { ok: true }, { ok: false }, { url: 'x' }, { value: 'x' },
+  const candidates: unknown[] = [
+    {},
+    { ok: true }, { ok: false }, { url: 'x' }, { value: 'x' },
     { n: 1 }, { value: 1 }, { items: [] },
   ];
-  if (generated && typeof generated === 'object' && !Array.isArray(generated)) {
+  if (includePrimitives) candidates.push(null, false, true, 0, 1, '', 'x', []);
+  if (generated !== undefined && (includePrimitives
+    || (generated !== null && typeof generated === 'object' && !Array.isArray(generated)))) {
+    candidates.unshift(generated);
+  }
+  if (generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
     const object = generated as Record<string, unknown>;
-    candidates.unshift(object);
     for (const key of Object.keys(object)) {
       const omitted = { ...object };
       delete omitted[key];
       candidates.push(omitted, { ...object, [key]: null });
     }
   }
+  return candidates;
+}
+
+/**
+ * A collection schema constrains each emit item, not the seal. Candidate
+ * discovery is sampled; absence of a witness is proved only for false (no
+ * accepted JSON) and true/{} (no rejected JSON).
+ */
+/** @internal Concrete candidate values for differential checker/runtime tests. */
+export function collectionValueWitnesses(schema: JsonSchema | undefined): {
+  valid?: Record<string, unknown>;
+  invalid?: Record<string, unknown>;
+  validClassKnown: boolean;
+  invalidClassKnown: boolean;
+} {
+  if (schema === undefined) return { valid: {}, validClassKnown: true, invalidClassKnown: true };
   let valid: Record<string, unknown> | undefined;
   let invalid: Record<string, unknown> | undefined;
-  for (const value of candidates) {
-    if (validateValue(schema, value).valid) valid ??= value;
-    else invalid ??= value;
-    if (valid && invalid) break;
+  for (const value of schemaValueCandidates(schema)) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+    const object = value as Record<string, unknown>;
+    if (validateValue(schema, value).valid) {
+      if (valid === undefined) valid = object;
+    } else if (invalid === undefined) invalid = object;
+    if (valid !== undefined && invalid !== undefined) break;
   }
-  // The TypeScript signature says Record, but Engine.emit is callable from JS
-  // and validates the runtime value directly. Only an unconstrained schema
-  // proves that no caller can trigger a schema refusal.
-  const allObjectsValid = schema === true || (schema !== false && Object.keys(schema).length === 0);
+  const universal = schema === true || (schema !== false && Object.keys(schema).length === 0);
   return {
     valid, invalid,
     validClassKnown: valid !== undefined || schema === false,
-    invalidClassKnown: invalid !== undefined || allObjectsValid,
+    invalidClassKnown: invalid !== undefined || universal,
+  };
+}
+
+/** Mirror the runtime bind preflight: every segment must be an own object key. */
+function boundCandidate(def: WorkflowDef, produce: ProducePattern, value: unknown): {
+  accepted: boolean;
+  modifier?: string;
+} {
+  const bind = produce.bind;
+  if (!bind) return { accepted: true };
+  let selected: unknown = value;
+  for (const key of bind.from.split('.')) {
+    if (selected === null || typeof selected !== 'object' || Array.isArray(selected)
+      || !Object.prototype.hasOwnProperty.call(selected, key)) return { accepted: false };
+    selected = (selected as Record<string, unknown>)[key];
+  }
+  if (bind.to !== 'modifier') return { accepted: true };
+  if (typeof selected !== 'string' || !(def.modifiers ?? []).includes(selected)) return { accepted: false };
+  return { accepted: true, modifier: selected };
+}
+
+/** A bind-shaped JSON object, used only after the real schema accepts it. */
+function bindCandidate(path: string, leaf: unknown): Record<string, unknown> {
+  const root: Record<string, unknown> = {};
+  let cursor = root;
+  const keys = path.split('.');
+  for (const key of keys.slice(0, -1)) {
+    const child: Record<string, unknown> = {};
+    cursor[key] = child;
+    cursor = child;
+  }
+  cursor[keys[keys.length - 1]!] = leaf;
+  return root;
+}
+
+/** Concrete singleton commit classes; no declaration alone creates a branch. */
+function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modifier?: string): {
+  green: boolean;
+  refusal: boolean;
+  schemaValidClassKnown: boolean;
+  schemaRefusalClassKnown: boolean;
+  greenClassKnown: boolean;
+  bindRefusal: boolean;
+} {
+  const schema = produce.schema;
+  const bind = produce.bind;
+  if (schema === undefined && bind === undefined) {
+    return { green: true, refusal: false, schemaValidClassKnown: true,
+      schemaRefusalClassKnown: true, greenClassKnown: true, bindRefusal: false };
+  }
+  const candidates = schemaValueCandidates(schema, true);
+  if (bind) {
+    candidates.unshift(bindCandidate(bind.from, bind.to === 'modifier'
+      ? (modifier ?? def.modifiers?.[0] ?? 'x') : null));
+    for (const name of def.modifiers ?? []) candidates.push(bindCandidate(bind.from, name));
+    candidates.push(bindCandidate(bind.from, '__invalid_modifier__'));
+  }
+  let green = false;
+  let refusal = false;
+  let schemaValid = false;
+  let schemaRefusal = false;
+  let bindRefusal = false;
+  for (const value of candidates) {
+    if (schema !== undefined && !validateValue(schema, value).valid) {
+      refusal = true;
+      schemaRefusal = true;
+      continue;
+    }
+    schemaValid = true;
+    const bound = boundCandidate(def, produce, value);
+    if (!bound.accepted) {
+      refusal = true;
+      bindRefusal = true;
+    }
+    else if (bound.modifier !== undefined && bound.modifier !== modifier) {
+      // Changing the instance modifier changes later firing/judge eligibility;
+      // the checker has no modifier in its state key, so this successor is omitted.
+      continue;
+    } else green = true;
+  }
+  return {
+    green, refusal,
+    schemaValidClassKnown: schemaValid || schema === false,
+    schemaRefusalClassKnown: schemaRefusal || schema === undefined || schema === true
+      || (schema !== false && Object.keys(schema).length === 0),
+    greenClassKnown: green || schema === false,
+    bindRefusal,
   };
 }
 
@@ -3190,6 +3285,33 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	const claimed = { arts, leases: [...node.state.leases, lease] };
 	enqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' });
 	continue;
+      }
+
+      const ordinaryStep = def.steps.find((candidate) => candidate.name === firing.step);
+      const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, firing.outputs[0] ?? '');
+      if (ordinaryProduce?.schema !== undefined || ordinaryProduce?.bind !== undefined) {
+	const witnesses = singletonValueWitnesses(def, ordinaryProduce, opts.modifier);
+	if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
+	  && !report.coverageIncomplete.includes('singleton-schema-validity')) {
+	  report.coverageIncomplete.push('singleton-schema-validity');
+	}
+	if (ordinaryProduce.schema !== undefined && !witnesses.schemaRefusalClassKnown
+	  && !report.coverageIncomplete.includes('singleton-schema-refusal')) {
+	  report.coverageIncomplete.push('singleton-schema-refusal');
+	}
+	if (ordinaryProduce.bind !== undefined && !witnesses.greenClassKnown
+	  && !report.coverageIncomplete.includes('singleton-bind-validity')) {
+	  report.coverageIncomplete.push('singleton-bind-validity');
+	}
+	if (ordinaryProduce.bind !== undefined && !witnesses.bindRefusal && ordinaryProduce.schema !== false
+	  && !report.coverageIncomplete.includes('singleton-bind-refusal')) {
+	  report.coverageIncomplete.push('singleton-bind-refusal');
+	}
+	if (ordinaryProduce.bind?.to === 'modifier'
+	  && ordinaryProduce.schema !== false
+	  && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
+	  report.coverageIncomplete.push('singleton-bind-modifier');
+	}
       }
 
       const outcomes = eligibleOutcomes(def, arts, firing, { modifier: opts.modifier });

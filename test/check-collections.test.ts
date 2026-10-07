@@ -3,7 +3,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildDef } from '../src/defs.ts';
+import { Engine } from '../src/engine.ts';
 import { eligibleOutcomes, modelCheck } from '../src/model.ts';
+import { openStore } from '../src/store.ts';
 import { arts, def, input, step } from './helpers.ts';
 
 const reduceOnlyFixture = def(
@@ -182,6 +184,119 @@ test('owenloop#236: no schema or bind cannot schema-reject, while either guard c
   const bindReport = modelCheck(withBind, options);
   assert.ok(bindReport.stallStates.some((finding) =>
     finding.path.some((move) => move.outcome === 'schema-reject')));
+});
+
+test('owenloop#236: universal singleton schemas cannot invent a definite rejection', () => {
+  for (const schema of [true, {}] as const) {
+    const fixture = def('owenloop-236-universal-schema', [], [
+      step({ name: 'make', produces: ['out'] }),
+    ]);
+    fixture.steps[0]!.produces[0]!.schema = schema;
+    fixture.invariants = [
+      { name: 'never-rejected', requires: { not: { path: 'out', is: 'rejected' } } },
+    ];
+    const outcomes = eligibleOutcomes(fixture, new Map(arts([{ path: 'out', producer: 'make' }])),
+      { step: 'make', key: '', inputs: [], outputs: ['out'] });
+    assert.ok(outcomes.includes('green'));
+    assert.ok(!outcomes.includes('schema-reject'));
+    const report = modelCheck(fixture, { maxStates: 100, maxDepth: 10 });
+    assert.deepEqual(report.invariantViolations, []);
+    assert.deepEqual(report.coverageIncomplete, []);
+  }
+});
+
+test('owenloop#236: singleton schema outcomes need accepted and refused payload witnesses', () => {
+  const fixture = def('owenloop-236-singleton-witnesses', [], [
+    step({ name: 'make', produces: ['out'] }),
+  ]);
+  const produce = fixture.steps[0]!.produces[0]!;
+  const firing = { step: 'make', key: '', inputs: [], outputs: ['out'] };
+  const state = new Map(arts([{ path: 'out', producer: 'make' }]));
+
+  produce.schema = false;
+  assert.ok(!eligibleOutcomes(fixture, state, firing).includes('green'));
+  assert.ok(eligibleOutcomes(fixture, state, firing).includes('schema-reject'));
+
+  produce.schema = { type: 'string' };
+  assert.ok(eligibleOutcomes(fixture, state, firing).includes('green'));
+  assert.ok(eligibleOutcomes(fixture, state, firing).includes('schema-reject'));
+  assert.deepEqual(modelCheck(fixture, { maxStates: 100 }).coverageIncomplete, [],
+    'primitive witnesses count for singleton coverage as well as transitions');
+
+  produce.schema = { type: 'object', required: ['id'], properties: { id: { type: 'string' } } };
+  assert.ok(eligibleOutcomes(fixture, state, firing).includes('green'));
+  assert.ok(eligibleOutcomes(fixture, state, firing).includes('schema-reject'));
+
+  produce.schema = { type: 'object', minProperties: 2 };
+  const report = modelCheck(fixture, { maxStates: 100, maxDepth: 10 });
+  assert.ok(report.coverageIncomplete.includes('singleton-schema-validity'));
+  assert.ok(!report.coverageIncomplete.includes('singleton-schema-refusal'));
+});
+
+test('owenloop#236: singleton witnesses agree with Engine schema and bind outcomes', () => {
+  const fixture = def('owenloop-236-singleton-runtime', [], [
+    step({ name: 'make', produces: ['out'] }),
+  ]);
+  const produce = fixture.steps[0]!.produces[0]!;
+  const firing = { step: 'make', key: '', inputs: [], outputs: ['out'] };
+  const state = new Map(arts([{ path: 'out', producer: 'make' }]));
+  const runtime = (value: Record<string, unknown>, modifier?: string) => {
+    const store = openStore(':memory:');
+    const engine = new Engine(store, () => fixture);
+    const wf = engine.createInstance(fixture.name, modifier === undefined ? {} : { modifier });
+    const run = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'make');
+    assert.ok(run);
+    return engine.green(wf, run.run, 'out', value).outcome;
+  };
+  const outcomes = (modifier?: string) => eligibleOutcomes(fixture, state, firing, { modifier });
+
+  for (const schema of [true, {}] as const) {
+    produce.schema = schema;
+    assert.equal(runtime({ anything: 1 }), 'green');
+    assert.ok(outcomes().includes('green'));
+    assert.ok(!outcomes().includes('schema-reject'));
+  }
+  produce.schema = { type: 'string' };
+  assert.equal(runtime('x' as unknown as Record<string, unknown>), 'green',
+    'the runtime validates the actual JS value even though green is typed for records');
+  assert.ok(outcomes().includes('green'));
+  assert.ok(outcomes().includes('schema-reject'));
+  produce.schema = false;
+  assert.equal(runtime({}), 'schema-rejected');
+  assert.ok(!outcomes().includes('green'));
+  assert.ok(outcomes().includes('schema-reject'));
+  assert.ok(outcomes().includes('skip'), 'skip has no value to validate');
+  assert.ok(!outcomes().includes('retract'), 'a singleton is not a bare collection member');
+  {
+    const store = openStore(':memory:');
+    const engine = new Engine(store, () => fixture);
+    const wf = engine.createInstance(fixture.name);
+    engine.skip(wf, 'out', 'make', 'not produced');
+    assert.equal(store.getArtifact(wf, 'out')?.acceptance, 'skipped');
+  }
+
+  produce.schema = { const: { choice: 'fast' } };
+  produce.bind = { to: 'meta.choice', from: 'choice' };
+  assert.equal(runtime({ choice: 'fast' }), 'green');
+  assert.equal(runtime({}), 'schema-rejected');
+  assert.ok(outcomes().includes('green'));
+  assert.ok(outcomes().includes('schema-reject'));
+
+  fixture.modifiers = ['fast'];
+  produce.bind = { to: 'modifier', from: 'choice' };
+  assert.equal(runtime({ choice: 'fast' }, 'fast'), 'green');
+  assert.ok(outcomes('fast').includes('green'));
+  assert.ok(!outcomes().includes('green'), 'changing the instance modifier needs a state the checker does not track');
+  assert.ok(modelCheck(fixture, { maxStates: 100 }).coverageIncomplete.includes('singleton-bind-modifier'));
+
+  produce.schema = { const: { choice: 'slow' } };
+  assert.equal(runtime({ choice: 'slow' }, 'fast'), 'schema-rejected');
+  assert.ok(!outcomes('fast').includes('green'), 'an accepted schema payload cannot bind an undeclared modifier');
+  assert.ok(outcomes('fast').includes('schema-reject'));
+  fixture.invariants = [{ name: 'never-green', requires: { not: { path: 'out', is: 'green' } } }];
+  const report = modelCheck(fixture, { modifier: 'fast', maxStates: 100 });
+  assert.deepEqual(report.invariantViolations, [], 'an impossible bind success cannot violate an invariant');
+  assert.ok(report.coverageIncomplete.includes('singleton-bind-validity'));
 });
 
 test('owenloop#236: schema rejection follows the exact singleton or map produce', () => {
