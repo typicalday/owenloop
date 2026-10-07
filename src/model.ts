@@ -1591,6 +1591,23 @@ export function evalInvariantPredicate(
   return !evalInvariantPredicate(pred.not, arts, status); // 'not'
 }
 
+/**
+ * With an unresolved assumed provide, only the initial state of inputs that
+ * createInstance itself seeds green is independent of the missing value. Later
+ * states and derived artifacts can depend on that provide, even if an invariant
+ * does not name the input directly.
+ */
+function invariantIndependentOfUnresolvedProvide(
+  pred: InvariantPredicate,
+  definitelySeededInputs: ReadonlySet<string>,
+): boolean {
+  if ('path' in pred) return definitelySeededInputs.has(pred.path);
+  if ('state' in pred) return false;
+  if ('all' in pred) return pred.all.every((part) => invariantIndependentOfUnresolvedProvide(part, definitelySeededInputs));
+  if ('any' in pred) return pred.any.every((part) => invariantIndependentOfUnresolvedProvide(part, definitelySeededInputs));
+  return invariantIndependentOfUnresolvedProvide(pred.not, definitelySeededInputs);
+}
+
 // ---- trace builder (§17 derived temporal view) --------------------------------
 
 /**
@@ -2261,17 +2278,27 @@ export function settleInMemory(
   throw new Error(`settleInMemory did not converge (possible cascade cycle)`);
 }
 
-/** Internal: seed the initial artifact map exactly as Engine.createInstance does. */
-function seedArts(def: WorkflowDef, assumeProvided = false): Map<string, ArtifactData> {
+/** Internal: seed only input states reachable through Engine's schema-checked provide. */
+function seedArts(def: WorkflowDef, assumeProvided = false): {
+  arts: Map<string, ArtifactData>;
+  inputSchemaValidityUnknown: boolean;
+} {
   const arts = new Map<string, ArtifactData>();
+  let inputSchemaValidityUnknown = false;
   for (const input of def.inputs) {
     // seedOwed=false → seed green (version 1); seedOwed=true → seed owed (version 0)
-    // The checker has no runtime `provide` values, so seedOwed inputs start owed —
-    // unless assumeProvided, which models "the operator ran `provide` at create".
+    // An assumed provide must have a concrete schema-valid object, just as
+    // createInstance/provideInput require. An absent sampled witness is not a
+    // proof that an arbitrary schema has no valid value.
     // This function's own default stays false; the `owenloop check` CLI command
     // now passes assumeProvided: true by default (its `--strict-inputs` flag
     // passes false to restore this owed-start behavior) — see CheckOptions.
-    const seedGreen = !input.seedOwed || assumeProvided;
+    const witness = input.seedOwed && assumeProvided
+      ? collectionValueWitnesses(input.schema) : undefined;
+    if (witness && witness.valid === undefined && !witness.validClassKnown) {
+      inputSchemaValidityUnknown = true;
+    }
+    const seedGreen = !input.seedOwed || witness?.valid !== undefined;
     arts.set(input.name, {
       workflow: '',
       path: input.name,
@@ -2281,9 +2308,10 @@ function seedArts(def: WorkflowDef, assumeProvided = false): Map<string, Artifac
       reasons: [],
       judgmentRejects: 0,
       schemaRejects: 0,
+      ...(witness?.valid !== undefined ? { value: witness.valid } : {}),
     });
   }
-  return settleInMemory(def, arts);
+  return { arts: settleInMemory(def, arts), inputSchemaValidityUnknown };
 }
 
 /** @internal Eligible outcomes for focused checker/runtime conformance tests; not a package-root API. */
@@ -3036,9 +3064,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   const maxStates = opts.maxStates ?? 5000;
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
-  const initial: CollectionCheckState = {
-    arts: seedArts(def, opts.assumeProvided ?? false), leases: [],
-  };
+  const seeded = seedArts(def, opts.assumeProvided ?? false);
+  const initial: CollectionCheckState = { arts: seeded.arts, leases: [] };
+  const definitelySeededInputs = new Set(def.inputs.filter((input) => !input.seedOwed).map((input) => input.name));
   const initialKey = collectionCheckKey(def, initial);
 
   type StateNode = {
@@ -3071,7 +3099,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     def: def.name,
     bounded: false,
     boundsHit: [],
-    coverageIncomplete: [],
+    coverageIncomplete: seeded.inputSchemaValidityUnknown ? ['input-schema-validity'] : [],
     collectionCapApplied: false,
     maxCollectionSize,
     deadlocks: [],
@@ -3107,14 +3135,16 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // Checked BEFORE the `done` continue so terminal properties ("when done,
     // merge must be green") are verified.
     //
-    // Soundness under bounds: a reported counterexample path was produced by real
-    // applyOutcome/settleInMemory transitions (the same transitions the conformance
-    // test pins to the live Engine). Bounds only cause MISSES, never fabrications —
-    // which is why invariant violations exit non-zero even when bounded (unlike
-    // deadlocks/stuck, which the maxCollectionSize cap can spuriously manufacture).
+    // With an unresolved assumed provide, the owed fallback is only one possible
+    // initial state. Report only properties of independently seeded inputs at
+    // depth zero; derived/later states might change after a valid provide.
+    // Other reported counterexamples remain executable under the model's bounds.
     if (def.invariants) {
       for (const inv of def.invariants) {
         if (reportedInvariants.has(inv.name)) continue;
+	if (seeded.inputSchemaValidityUnknown && (node.depth !== 0 ||
+	  !invariantIndependentOfUnresolvedProvide(inv.when ?? ALWAYS_TRUE, definitelySeededInputs) ||
+	  !invariantIndependentOfUnresolvedProvide(inv.requires, definitelySeededInputs))) continue;
 	const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, arts, status);
 	if (whenHolds && !evalInvariantPredicate(inv.requires, arts, status)) {
           report.invariantViolations.push({ invariant: inv.name, path: nodePath() });
@@ -3379,8 +3409,10 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
  * (install/push seed `assumeProvided: true`; check seeds
  * `assumeProvided: !strictInputs`).
  *
- * invariant violations and structurally-dead steps are ALWAYS definite (sound
- * regardless of bounds); a true deadlock counts ONLY when the search was
+ * Reported invariant violations are executable witnesses, including
+ * independent initial-state violations when an assumed provide is unresolved.
+ * Structurally-dead steps remain definite regardless of bounds. A true
+ * deadlock counts ONLY when the search was
  * exhaustive (`!bounded`) because a tight maxCollectionSize cap can manufacture
  * a spurious one. A finite collection-width cap or unresolved schema-value
  * class can also manufacture a no-moves state, so those reports cannot make a

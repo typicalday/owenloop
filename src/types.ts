@@ -1148,15 +1148,13 @@ export interface CheckOptions {
   maxStates?: number;        // default 5000
   maxCollectionSize?: number; // default 2 — max members emitted by one collection producer in the finite model
   /**
-   * Seed `seedOwed: true` inputs green, as if `provide` already ran. The checker
-   * has no runtime provide values, so without this every seedOwed input starts
-   * owed with no transition that can green it — a def whose inputs the operator
-   * supplies at create time reports a false depth-0 deadlock. Default (this
-   * field, when calling `modelCheck` directly) is false — that library default
-   * is unchanged. The `owenloop check` CLI command, however, now defaults this
-   * to true (seedOwed inputs are assumed provided by default, modeling the
-   * operator's `provide` at create); its `--strict-inputs` flag opts back out
-   * to false, restoring the seedOwed-starts-owed behavior described above.
+   * Seed `seedOwed: true` inputs green only after finding a concrete
+   * schema-valid provide value. Without this assumption every seedOwed input
+   * starts owed with no modeled transition that can green it. If an arbitrary
+   * schema has no sampled valid witness, the input stays owed and the report
+   * records incomplete input-schema coverage rather than inventing a provide.
+   * Default for direct modelCheck calls is false. The `owenloop check` CLI
+   * defaults this to true; `--strict-inputs` restores the owed start.
    */
   assumeProvided?: boolean;
   /** Select the stored workflow modifier variant for this pure check. */
@@ -1177,7 +1175,7 @@ export interface CheckReport {
    * An empty array is not a claim that all live task/lease interleavings were
    * explored; runtime conformance is verified separately.
    */
-  coverageIncomplete: Array<'collection-width-cap' | 'collection-unexplored' | 'collection-schema-validity' | 'collection-schema-refusal' | 'collection-mixed-output-values' | 'singleton-schema-validity' | 'singleton-schema-refusal' | 'singleton-bind-validity' | 'singleton-bind-refusal' | 'singleton-bind-modifier'>;
+  coverageIncomplete: Array<'collection-width-cap' | 'collection-unexplored' | 'collection-schema-validity' | 'collection-schema-refusal' | 'collection-mixed-output-values' | 'singleton-schema-validity' | 'singleton-schema-refusal' | 'singleton-bind-validity' | 'singleton-bind-refusal' | 'singleton-bind-modifier' | 'input-schema-validity'>;
   /**
    * True when the search expanded a reachable collection producer under the
    * finite total-emitted-member cap. This is separate from BFS bounds and

@@ -731,6 +731,93 @@ test('modelCheck: assumeProvided seeds seedOwed inputs green, dissolving the fal
   assert.equal(report.completable, true, 'the real workflow completes, so should the model');
 });
 
+test('modelCheck: assumeProvided cannot invent a green input rejected by its schema', () => {
+  const impossible: WorkflowDef = {
+    ...def('impossible-provision',
+      [{ ...input('seed', { seedOwed: true }), schema: false }],
+      [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
+    invariants: [{ name: 'seed-never-green', requires: { path: 'seed', is: 'owed' } }],
+  };
+  assert.deepEqual(validateDef(impossible), []);
+  const { engine } = makeEngine([impossible]);
+  const wf = engine.createInstance(impossible.name);
+  assert.equal(engine.store.getArtifact(wf, 'seed')?.acceptance, 'owed');
+  assert.throws(() => engine.provideInput(wf, 'seed', {}), /failed schema/);
+  assert.equal(engine.store.getArtifact(wf, 'seed')?.acceptance, 'owed');
+
+  const report = modelCheck(impossible, { assumeProvided: true });
+  assert.deepEqual(report.invariantViolations, [], 'a rejected provide cannot create a counterexample');
+});
+
+test('modelCheck: unsampled valid input schema is incomplete, not a definite assumed-provide verdict', () => {
+  const uncommon: WorkflowDef = {
+    ...def('uncommon-provision',
+      [{ ...input('seed', { seedOwed: true }), schema: {
+	      type: 'object', required: ['code'],
+	      properties: { code: { type: 'string', pattern: '^z{40}$' } },
+      } }],
+      [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
+    invariants: [{ name: 'seed-provided', requires: { path: 'seed', is: 'green' } }],
+  };
+  assert.deepEqual(validateDef(uncommon), []);
+  const { engine } = makeEngine([uncommon]);
+  const wf = engine.createInstance(uncommon.name);
+  engine.provideInput(wf, 'seed', { code: 'z'.repeat(40) });
+  assert.equal(engine.store.getArtifact(wf, 'seed')?.acceptance, 'green');
+
+  const report = modelCheck(uncommon, { assumeProvided: true });
+  assert.ok(report.coverageIncomplete.includes('input-schema-validity'));
+  assert.deepEqual(report.invariantViolations, [], 'unresolved provide cannot produce a definite violation');
+  assert.equal(hasDefiniteCheckDefect(report), false,
+    'absence of a sampled object is not proof that an assumed provide cannot succeed');
+});
+
+test('modelCheck: unresolved provide does not hide an independent initial invariant violation', () => {
+  const independent: WorkflowDef = {
+    ...def('independent-initial-violation', [
+      { ...input('seed', { seedOwed: true }), schema: {
+	      type: 'object', required: ['code'],
+	      properties: { code: { type: 'string', pattern: '^z{40}$' } },
+      } },
+      input('ready', { seedOwed: false }),
+    ], [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
+    invariants: [{ name: 'ready-must-be-absent', requires: { path: 'ready', is: 'absent' } }],
+  };
+  assert.deepEqual(validateDef(independent), []);
+  const { engine } = makeEngine([independent]);
+  const wf = engine.createInstance(independent.name);
+  assert.equal(engine.store.getArtifact(wf, 'ready')?.acceptance, 'green');
+
+  const report = modelCheck(independent, { assumeProvided: true });
+  assert.ok(report.coverageIncomplete.includes('input-schema-validity'));
+  assert.deepEqual(report.invariantViolations, [{ invariant: 'ready-must-be-absent', path: [] }]);
+  assert.equal(hasDefiniteCheckDefect(report), true);
+});
+
+test('modelCheck: schema-valid assumed input still enables the normal green path', () => {
+  const provided = def('witnessed-provision',
+    [{ ...input('seed', { seedOwed: true }), schema: {
+      type: 'object', required: ['ok'], properties: { ok: { const: true } },
+    } }],
+    [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]);
+  assert.deepEqual(validateDef(provided), []);
+  const report = modelCheck(provided, { assumeProvided: true });
+  assert.equal(report.completable, true);
+  assert.equal(report.coverageIncomplete.includes('input-schema-validity'), false);
+});
+
+test('modelCheck: non-owed input remains initially green even with a false schema', () => {
+  const preseeded = def('preseeded-false-schema',
+    [{ ...input('seed', { seedOwed: false }), schema: false }],
+    [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]);
+  const { engine } = makeEngine([preseeded]);
+  const wf = engine.createInstance(preseeded.name);
+  assert.equal(engine.store.getArtifact(wf, 'seed')?.acceptance, 'green');
+  const report = modelCheck(preseeded, { assumeProvided: true });
+  assert.equal(report.completable, true);
+  assert.equal(report.coverageIncomplete.includes('input-schema-validity'), false);
+});
+
 test('modelCheck: assumeProvided does not mask a genuine (stall) problem past the inputs', () => {
   // proposal is provided, but step a's produce of 'x' still stalls at
   // maxAttempts=1 after one reject — assumeProvided must not hide that. This
@@ -1374,6 +1461,41 @@ const violatedInvYaml = [
   '      path: result',
   '      is: green',
 ].join('\n');
+
+test('CLI check: unrelated initial invariant still fails with unresolved assumed input', () => {
+  const yaml = [
+    'name: independent-cli-invariant',
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    '    schema:',
+    '      type: object',
+    '      required: [code]',
+    '      properties:',
+    '        code:',
+    '          type: string',
+    '          pattern: "^z{40}$"',
+    '  - name: ready',
+    '    seedOwed: false',
+    'steps:',
+    '  - name: make',
+    '    consumes: [seed]',
+    '    produces: [out]',
+    '    terminal: true',
+    '    body: run',
+    'invariants:',
+    '  - name: ready-must-be-absent',
+    '    requires:',
+    '      path: ready',
+    '      is: absent',
+  ].join('\n');
+  const { run } = makeInvCli(yaml, 'independent-cli-invariant');
+  const result = run('check', 'independent-cli-invariant');
+  assert.equal(result.code, 1);
+  assert.match(result.out, /DEFECTS FOUND/);
+  assert.match(result.out, /MODEL COVERAGE INCOMPLETE.*input-schema-validity/);
+  assert.match(result.out, /ready-must-be-absent/);
+});
 
 // §3.4 test 29: YAML def with violated invariant → code=1, /DEFECTS FOUND/, /Invariant violations/, name
 test('CLI check: violated invariant → exit 1, DEFECTS FOUND, Invariant violations, invariant name in output', () => {
