@@ -1332,9 +1332,23 @@ export class Store {
     return rows.map(mapArtifact);
   }
 
-  /** Insert or fully replace the artifact at (workflow, path). */
+  /** Replace the artifact at (workflow, path), preserving its reason prefix. */
   putArtifact(data: ArtifactData, provenance?: { action?: string; actor?: string; reason?: string; kind?: string; timestamp?: number; key?: string }): ArtifactRow {
+    // Direct Store callers exist alongside Engine's already-scoped writes. Take
+    // the writer lock before reading the old thread so a second connection
+    // cannot replace it between the prefix check and the UPSERT/history writes.
+    if (!this.inWriteTransaction) {
+      if (this.db.isTransaction) throw new Error('putArtifact requires a write transaction');
+      return this.tx(() => this.putArtifact(data, provenance));
+    }
     const previous = this.getArtifact(data.workflow, data.path);
+    if (previous) {
+      const nextReasons = data.reasons ?? [];
+      if (nextReasons.length < previous.reasons.length ||
+	  previous.reasons.some((entry, index) => canonicalJson(entry) !== canonicalJson(nextReasons[index]))) {
+	throw new Error(`artifact reason thread must be append-only: ${data.workflow}/${data.path}`);
+      }
+    }
     const id = artifactId(data.workflow, data.path);
     const at = provenance?.timestamp ?? nowMs();
     this.db
