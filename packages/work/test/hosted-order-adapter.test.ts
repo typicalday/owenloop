@@ -83,7 +83,7 @@ steps:
     body: "Collect items."
   - name: annotate
     consumes: ['items[$i]']
-    produces: ['items[$i].note', audit]
+    produces: ['items[$i].note']
     body: "Annotate the bound item."
 `;
 

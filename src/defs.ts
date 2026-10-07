@@ -1583,16 +1583,32 @@ export function validateDef(def: WorkflowDef): string[] {
     }
   }
 
-  // a reduce-mode step whose only produces are collections can never fire: eligibleFirings'
-  // reduce branch (src/model.ts) derives the discharge set from singletonProduces(step) only,
-  // so zero singleton produces means outs.length === 0 and no firing is ever pushed — the step
-  // is silently dead (collection debt owed forever, absent from eligible/pending/blocked).
+  // A firing mode determines which outputs can be owed and discharged. Map
+  // orders contain only per-element outputs; reduce orders contain only
+  // singleton outputs. A plain run may emit/seal one collection (the runtime
+  // selects its first collection stem) alongside singleton outputs.
+  // Preserve the existing more-specific diagnostic for a reduce with no
+  // singleton output: it cannot fire at all.
   for (const l of def.steps) {
+    const isMap = l.consumes.some((c) => c.mode === 'map');
     const isReduce = l.consumes.some((c) => c.mode === 'reduce');
-    const hasCollectionProduce = l.produces.some((p) => p.kind === 'collection');
-    const hasSingletonProduce = l.produces.some((p) => p.kind === 'singleton');
-    if (isReduce && hasCollectionProduce && !hasSingletonProduce) {
+    const collections = l.produces.filter((p) => p.kind === 'collection');
+    const singletons = l.produces.filter((p) => p.kind === 'singleton');
+    if (isMap) {
+      for (const singleton of singletons) {
+		errors.push(`step '${l.name}' is map-mode and cannot produce singleton '${singleton.raw}'; map firings only discharge per-element outputs`);
+      }
+    }
+    if (!isMap && !isReduce && collections.length > 1) {
+      errors.push(`step '${l.name}' produces more than one collection; a plain run can emit and seal only one collection`);
+    }
+    if (isReduce && collections.length > 0 && singletons.length === 0) {
       errors.push(`step ${l.name} is reduce-mode but produces only collections; reduce steps can only discharge singleton produces`);
+    } else if (isReduce || isMap) {
+      for (const collection of collections) {
+		const mode = isMap ? 'map' : 'reduce';
+		errors.push(`step '${l.name}' is ${mode}-mode and cannot produce collection '${collection.raw}'; collection outputs require a plain-mode firing`);
+      }
     }
   }
 
