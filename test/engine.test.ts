@@ -302,13 +302,16 @@ test("an owed output's issued version is the target the consumer later checks a 
   // passes its own claim-time fingerprint to verifyConsumed as expectedVersion.
   // Those two numbers must be the same one, which is why the engine issues the
   // target (committed + 1) rather than the currently-committed version.
-  const { engine } = makeEngine([orderShapeDef()]);
+  const { engine, store } = makeEngine([orderShapeDef()]);
   const wf = engine.createInstance('ordershape', { provide: { proposal: { text: 'x' } } });
 
   // a never-produced artifact sits at v0, so its first target is v1
   const planner1 = fire(engine, wf, 'planner', 1000);
   const target1 = planner1.owes.find((w) => w.path === 'plan')!.version;
   assert.equal(target1, 1);
+  assert.equal(store.getClaimPriorVersion(planner1.run, 'plan'), 0, 'first claim snapshots v0');
+  assert.equal(Object.hasOwn(planner1.owes[0]!, 'previousValueVersion'), false, 'order.v1 keeps its exact shape');
+  assert.deepEqual(store.getRun(planner1.run)!.order, planner1, 'the private snapshot does not enter the stored order');
   complete(engine, wf, planner1, { plan: 'v1' });
 
   const runner1 = fire(engine, wf, 'runner', 2000);
@@ -321,6 +324,8 @@ test("an owed output's issued version is the target the consumer later checks a 
   const planner2 = fire(engine, wf, 'planner', 3000);
   const target2 = planner2.owes.find((w) => w.path === 'plan')!.version;
   assert.equal(target2, target1 + 1);
+  assert.equal(store.getClaimPriorVersion(planner2.run, 'plan'), 1, 'new claim snapshots committed v1');
+  assert.equal(store.getClaimPriorVersion(planner1.run, 'plan'), 0, 're-offer does not rewrite the old claim');
   complete(engine, wf, planner2, { plan: 'v2' });
 
   const runner2 = fire(engine, wf, 'runner', 4000);
@@ -340,6 +345,7 @@ test('a reject that re-arms an OPEN claim re-stamps the owed target, so the sign
 
   const planner = fire(engine, wf, 'planner', 1000);
   assert.equal(planner.owes.find((w) => w.path === 'plan')!.version, 1);
+  assert.equal(store.getClaimPriorVersion(planner.run, 'plan'), 0);
 
   // First commit on this claim — deliberately NOT closed.
   assert.equal(engine.green(wf, planner.run, 'plan', { plan: 'v1' }).outcome, 'green');
@@ -358,6 +364,7 @@ test('a reject that re-arms an OPEN claim re-stamps the owed target, so the sign
   // Re-read the order the way a resumed worker does, and resolve the version it
   // would sign through the real production lookup rather than a hand-copy.
   const reread = store.getRun(planner.run)!.order!;
+  assert.equal(store.getClaimPriorVersion(planner.run, 'plan'), 0, 'target restamp cannot move the claim-time prior version');
   const signed = outputVersionForSubmission(reread as unknown as OrderPacket, 'plan');
 
   assert.equal(engine.green(wf, planner.run, 'plan', { plan: 'v2' }).outcome, 'green');
@@ -595,6 +602,19 @@ test('claim persists the emitted order packet in the same txn — present the mo
   // The emitted Order IS the persisted packet, written in the claim txn — so it
   // is already on the run row the instant tick returns (no separate write).
   assert.deepStrictEqual(store.getRun(planner.run)?.order, planner);
+});
+
+test('claim prior snapshot rolls back with run and task when the claim fails', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: { goal: 'ship it' } } });
+  store.db.exec("CREATE TRIGGER fail_planner_claim AFTER INSERT ON task WHEN NEW.step = 'planner' BEGIN SELECT RAISE(ABORT, 'claim failed'); END");
+  assert.throws(() => engine.tick(wf, { now: 1000 }), /claim failed/);
+  assert.deepEqual(store.listRuns(wf), []);
+  assert.equal(store.getTask(wf, 'planner', ''), undefined);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM claim_prior_version').get()!.n, 0);
+  store.db.exec('DROP TRIGGER fail_planner_claim');
+  const planner = fire(engine, wf, 'planner', 1000);
+  assert.equal(store.getClaimPriorVersion(planner.run, 'plan'), 0);
 });
 
 test('sweep: every claimed run row carries a persisted order whose run/step match the row', () => {
