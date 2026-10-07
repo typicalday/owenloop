@@ -16,21 +16,25 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { callTool, handshake, spawnMcp, startMockHub, until, type HubReq, type McpChild } from './helpers/mcp-stdio-client.ts';
+import { installHolderDefinition, makeHolderStoreWritable } from './helpers/holder-definition.ts';
 
 const TOKEN = 'tok-e2e';
 
 let configDir: string;
-beforeEach(() => {
+beforeEach(async () => {
   // Isolate settings: a temp HOME means the child sees NO settings
   // file — origin comes only from --origin, token only from OWENLOOP_TOKEN.
   configDir = mkdtempSync(join(tmpdir(), 'owenloop-hold-e2e-'));
+  ORDER_PACKET.defDigest = await installHolderDefinition(configDir);
 });
 afterEach(() => {
-  rmSync(configDir, { recursive: true, force: true });
+  makeHolderStoreWritable(configDir);
+  rmSync(configDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 function childEnv(): Record<string, string | undefined> {
-  return { OWENLOOP_TOKEN: TOKEN, HOME: configDir, OWENLOOP_CONFIG_DIR: undefined, OWENLOOP_SESSION: '' };
+  return { OWENLOOP_TOKEN: TOKEN, HOME: configDir, OWENLOOP_CONFIG_DIR: undefined, OWENLOOP_SESSION: '',
+    OWENLOOP_INSTRUCTION_CWD: join(configDir, 'untrusted-ambient-location') };
 }
 
 function of(reqs: HubReq[], verb: string): HubReq[] {
@@ -41,7 +45,8 @@ const ORDER_PACKET = {
   run: 'run1',
   workflow: 'wf1',
   step: 'builder',
-  key: 'k',
+  key: '',
+  defDigest: '',
   inputs: [],
   outputs: ['pr'],
   prompt: 'do the thing',
@@ -96,6 +101,7 @@ test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing subm
     assert.equal(got.body.workflow, 'wf1');
     assert.equal(got.body.order.step, 'builder');
     assert.equal(got.body.order.prompt, undefined, 'hub prompt text is not locally verified');
+    assert.match(mcp.stderr(), /defPolicy=warn allows agent execution/, 'unsigned local definition retains the default warning policy');
 
     // THE error-1 regression: the closing submit terminates the lease loop, but
     // its own response frame must still arrive intact — the process may not
@@ -132,6 +138,29 @@ test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing subm
   } finally {
     mcp.child.kill('SIGKILL');
     server.close();
+  }
+});
+
+test('standalone hold --mcp refuses a model order when its local definition is absent', async () => {
+  const emptyHome = mkdtempSync(join(tmpdir(), 'owenloop-hold-empty-home-'));
+  const { origin, server } = await startMockHub(hubScript);
+  const mcp = spawnMcp(
+    ['hold', '--order', 'wf1/run1', '--origin', origin, '--mcp'],
+    { OWENLOOP_TOKEN: TOKEN, HOME: emptyHome, OWENLOOP_CONFIG_DIR: undefined },
+    emptyHome,
+  );
+  try {
+    await handshake(mcp);
+    const shown = await callTool(mcp, 'get_order');
+    assert.equal(shown.isError, true);
+    assert.match(shown.body.error, /model order refusal: local definition unavailable/);
+    assert.doesNotMatch(JSON.stringify(shown.body), /"path":"pr"/);
+    mcp.endStdin();
+    await mcp.exited;
+  } finally {
+    mcp.child.kill('SIGKILL');
+    server.close();
+    rmSync(emptyHome, { recursive: true, force: true });
   }
 });
 

@@ -47,7 +47,7 @@ import { basename, extname } from 'node:path';
 
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
+import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -76,6 +76,8 @@ export interface HoldMcpDeps {
   sshProcess?: SshProcessAdapter;
   /** Gate dynamic consumed values before the packet reaches the model. */
   consumedVerifier?: ConsumedVerifier;
+  /** Local definition binding for fields that signed artifact proofs do not cover. */
+  modelOrderVerifier?: (order: OrderPacket) => Promise<{ ok: true } | { ok: false; reason: string }>;
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -258,6 +260,15 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     const refusedIdentity = identityGuard(res);
     if (refusedIdentity !== undefined) return refusedIdentity;
     if (res.order === null) return undefined;
+    if (deps.modelOrderVerifier === undefined) {
+      return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
+    }
+    try {
+      const bound = await deps.modelOrderVerifier(res.order);
+      if (!bound.ok) return textResult({ error: bound.reason }, true);
+    } catch {
+      return textResult({ error: 'model order refusal: local definition binding failed' }, true);
+    }
     const hasConsumedData = Object.keys(res.order.consumes).length > 0
       || res.order.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
     if (deps.consumedVerifier === undefined) {

@@ -147,6 +147,9 @@ function agentOrder(o: {
   capabilities?: string[];
   crews?: string[];
   x?: Record<string, unknown>;
+  inputs?: string[];
+  outputs?: string[];
+  consumes?: Record<string, unknown>;
 } = {}): GetOrderResponse {
   const workflow = o.workflow ?? 'wf1';
   const run = o.run ?? 'run1';
@@ -158,17 +161,17 @@ function agentOrder(o: {
       run,
       workflow,
       step: o.step ?? 'builder',
-      key: 'k',
-      inputs: [],
-      outputs: [],
+      key: '',
+      inputs: o.inputs ?? [],
+      outputs: o.outputs ?? ['out'],
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
       capabilities: o.capabilities ?? ['build'],
       crews: o.crews ?? ['test-crew'],
       ...(o.x !== undefined ? { x: o.x } : {}),
       defDigest: o.defDigest ?? HASH,
-      consumes: {},
-      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      consumes: o.consumes ?? {},
+      owes: (o.outputs ?? ['out']).map((path) => ({ path, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
@@ -305,7 +308,7 @@ function spawningEnvProbe(): { adapter: HarnessAdapter; observed: string[] } {
 		process.execPath,
 		[
 		  '-e',
-		  'process.stdout.write(JSON.stringify({workflow: process.env.OWENLOOP_WORKFLOW ?? null, run: process.env.OWENLOOP_RUN ?? null}))',
+		  'process.stdout.write(JSON.stringify({workflow: process.env.OWENLOOP_WORKFLOW ?? null, run: process.env.OWENLOOP_RUN ?? null, instructionCwd: process.env.OWENLOOP_INSTRUCTION_CWD ?? null}))',
 		],
 		{ env: filterOwenloopEnv(process.env), stdio: ['ignore', 'pipe', 'pipe'] },
       );
@@ -392,6 +395,8 @@ function seedBundle(seed: { harness?: string; model?: string; permissions?: Step
   verifiedStep = {
     name: 'builder',
     body: TEMPLATE,
+    consumes: [],
+    produces: [{ kind: 'singleton', stem: 'out' }],
     ...(seed.model !== undefined ? { model: seed.model } : {}),
     x: { harness: carrier },
   } as unknown as StepDef;
@@ -420,6 +425,8 @@ function seedRawStep(x: Record<string, unknown>): void {
   verifiedStep = {
     name: 'builder',
     body: TEMPLATE,
+    consumes: [],
+    produces: [{ kind: 'singleton', stem: 'out' }],
     x,
   } as unknown as StepDef;
 }
@@ -598,7 +605,7 @@ test('run() sets agent child identity and overrides ambient values in a real spa
     );
 
     assert.equal(code, 0);
-    assert.deepEqual(probe.observed, [JSON.stringify({ workflow, run: runId })]);
+    assert.deepEqual(probe.observed, [JSON.stringify({ workflow, run: runId, instructionCwd: '/work' })]);
   } finally {
     if (savedWorkflow === undefined) delete process.env['OWENLOOP_WORKFLOW'];
     else process.env['OWENLOOP_WORKFLOW'] = savedWorkflow;
@@ -1010,7 +1017,8 @@ test('selected Codex candidate refusal names the restriction and releases the he
 test('a roster-selected Codex candidate refuses inherited judge policy before startup', async () => {
   const judge = seedSynthesizedJudge({ harness: { id: 'codex', tools: [] } });
   process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
-  const packet = agentOrder({ step: judge.name, model: judge.model, x: judge.x });
+  const packet = agentOrder({ step: judge.name, model: judge.model, x: judge.x,
+    inputs: ['report'], consumes: { report: 'value' }, outputs: [] });
 
   writeRoster({ build: [{ harness: 'codex', model: 'test-model', effort: 'high' }] });
   const { hub, releases } = probeHub({ responses: [packet, noHold('ok')], def: DEF });
@@ -1123,7 +1131,8 @@ test('default agent wiring recovers a signed missing bundle before hosting the s
   assert.equal(signed.source.kind, 'file');
   const publication = readFileSync(`${signed.source.path}.dsse`);
   const auths: string[] = [];
-  const responses = [agentOrder({ defDigest: signed.packed.digest }), noHold('ok')];
+  const responses = [agentOrder({ defDigest: signed.packed.digest,
+    inputs: ['seed'], consumes: { seed: 'value' } }), noHold('ok')];
   let getOrderCalls = 0;
   const server = createServer((req, res) => {
     auths.push(req.headers.authorization ?? '');

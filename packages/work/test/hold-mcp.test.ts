@@ -9,6 +9,8 @@ import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
 import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
 import { createHoldMcp } from '../src/hold/mcp.ts';
+import { validModelOrderFields } from '../src/order-definition-binding.ts';
+import { buildDef } from '../../../src/defs.ts';
 import type { SubmissionKeyManager } from '../src/submit-proof.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
@@ -129,6 +131,7 @@ function deps(hub: HubClient, extra: Partial<Parameters<typeof createHoldMcp>[0]
     sleep: async () => {},
     now: () => 0,
     err: () => {},
+    modelOrderVerifier: async () => ({ ok: true as const }),
     ...extra,
   };
 }
@@ -225,6 +228,33 @@ test('get_order (no first contact yet) live-fetches for the bound run and return
   assert.deepEqual(body, { workflow: 'wf1', run: 'run1', order: null });
   // The bound run + holder rode the fetch; ids never came from the model.
   assert.deepEqual(calls, [{ verb: 'get_order', arg: { workflow: 'wf1', run: 'run1', holder: { kind: 'session', id: 's-1' } } }]);
+});
+
+test('get_order and direct submit refuse an undeclared owed path without displaying it', async () => {
+  const local = buildDef({ name: 'local', steps: [{ name: 'producer', produces: ['result'] }] }).steps[0]!;
+  const response = producerOrderResponse();
+  response.order!.outputs = ['HOSTILE-OWED-PATH'];
+  response.order!.owes[0]!.path = 'HOSTILE-OWED-PATH';
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    modelOrderVerifier: async (order) => validModelOrderFields(local, order)
+      ? { ok: true } : { ok: false, reason: 'model order refusal: fields differ from local definition' },
+  }));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, true);
+  assert.deepEqual(parse(shown), { error: 'model order refusal: fields differ from local definition' });
+  assert.doesNotMatch(JSON.stringify(shown), /HOSTILE-OWED-PATH/);
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'HOSTILE-OWED-PATH', value: 1 }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.equal(calls.some((call) => call.verb === 'submit'), false);
+});
+
+test('get_order fails closed if no local definition verifier was wired', async () => {
+  const { hub } = mockHub({ getOrder: producerOrderResponse() });
+  const mount = createHoldMcp(deps(hub, { modelOrderVerifier: undefined }));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, true);
+  assert.deepEqual(parse(shown), { error: 'model order refusal: local definition verifier is not configured' });
 });
 
 test('get_order accepts a Service-canonicalized child and keeps the requested root for submit', async () => {

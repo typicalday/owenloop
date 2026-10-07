@@ -59,6 +59,8 @@ import { createDefaultHostedOrderAdapter, type HostedOrderResult } from '../host
 import { createVerifiedHostedHoldMcp } from '../hosted/verified-hold-mcp.ts';
 import { buildSubmitProof } from '../submit-proof.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
+import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
+import { validModelOrderFields } from '../order-definition-binding.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, watchStdinEof, type SignalHost, type StdinHost } from './signals.ts';
@@ -209,7 +211,8 @@ function usage(): void {
       '                     [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
       '                     [--mcp-tools <get_order,submit,reject>]\n' +
       '                     [--verified-hosted  (read-only by default; submit requires --mcp-tools get_order,submit)]\n' +
-      '   or: owenloop work hold --order <run> --workflow <wf> [...]\n',
+      '   or: owenloop work hold --order <run> --workflow <wf> [...]\n' +
+      '  --mcp requires the order definition in the local workflow store (project cwd or global store).\n',
   );
 }
 
@@ -285,6 +288,8 @@ export interface RunDeps {
     open(preflight: unknown): Promise<HostedOrderResult>;
     submitConditional?: ReturnType<typeof createDefaultHostedOrderAdapter>['submitConditional'];
   };
+  /** Injected local resolver for model-field binding tests. */
+  modelInstructionResolver?: InstructionResolver;
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -401,6 +406,23 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // human-launched `hold --mcp` is the holder of record and releases; the
   // `agent-run` child is not and does not.
   if (parsed.mcp) {
+    let modelResolver = deps.modelInstructionResolver;
+    const modelOrderVerifier: NonNullable<Parameters<typeof createHoldMcp>[0]['modelOrderVerifier']> = async (order) => {
+      try {
+	modelResolver ??= createDefaultStoreInstructionResolver({
+	  cwd: parsed.neverRelease ? env['OWENLOOP_INSTRUCTION_CWD'] ?? process.cwd() : process.cwd(), env,
+	  warn: (line) => err(`owenloop work hold: ${line}`),
+	});
+	const resolved = await modelResolver.resolveStep(order);
+	if (!resolved.ok) return { ok: false, reason: 'model order refusal: local definition unavailable' };
+	if (!validModelOrderFields(resolved.step, order)) {
+	  return { ok: false, reason: 'model order refusal: fields differ from local definition' };
+	}
+	return { ok: true };
+      } catch {
+	return { ok: false, reason: 'model order refusal: local definition binding failed' };
+      }
+    };
     const baseMount = createHoldMcp({
       hub,
       workflow: target.workflow,
@@ -414,6 +436,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
         env,
         now: () => Date.now(),
       }),
+      modelOrderVerifier,
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
       err,
