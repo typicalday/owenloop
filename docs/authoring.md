@@ -46,9 +46,10 @@ steps:
       Read the proposal and produce a `plan`.
     bodyFile: path/to.md       # load body from a file, relative to this workflow's dir (must resolve inside it); mutually exclusive with body
 
-    # A plain-mode firing can produce one collection (src[]) alongside
-    # singletons. Map firings discharge only per-element outputs, and reduce
-    # firings discharge only singletons.
+    # A plain-mode firing can produce multiple collections (src[]) alongside
+    # singletons. Each emit/seal targets an owed stem; with multiple collections,
+    # pass --stem (or { stem } to the Engine API). Map firings discharge only
+    # per-element outputs, and reduce firings discharge only singletons.
 
     generates:                 # optional; outputs this step makes that NO step
       - audit_log              #   consumes. Exempt from dead-end lint; otherwise

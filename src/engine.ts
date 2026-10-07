@@ -21,7 +21,7 @@ import {
   sealPath,
 } from './paths.ts';
 import {
-  collectionStem,
+  collectionProduces,
   activeJudgesForStem,
   computeFingerprint,
   eligibleFirings,
@@ -3463,15 +3463,13 @@ export class Engine {
    * index. CAS'd against the producer's plain inputs; a moved input born-rejects
    * the seal instead of emitting.
    */
-  emit(workflow: string, run: string, items: Array<{ value: Record<string, unknown> }>): EmitResult {
+  emit(workflow: string, run: string, items: Array<{ value: Record<string, unknown> }>, options: { stem?: string } = {}): EmitResult {
     const def = this.defFor(workflow);
     let stem = '';
     const result = this.store.tx((): EmitResult => {
       const r = this.openRun(workflow, run);
       const step = this.step(def, r.step);
-      const s = collectionStem(step);
-      if (!s) throw new Error(`step ${r.step} does not produce a collection`);
-      stem = s;
+      stem = this.collectionStemForRun(step, r, options.stem);
       const arts = this.artMap(workflow);
 
       const req = plainConsumes(step).map((c) => c.stem);
@@ -3558,13 +3556,12 @@ export class Engine {
   }
 
   /** Green a collection's seal — the producer's "I am done emitting" signal. */
-  seal(workflow: string, run: string, value: Record<string, unknown> = {}): CommitResult {
+  seal(workflow: string, run: string, value: Record<string, unknown> = {}, options: { stem?: string } = {}): CommitResult {
     const def = this.defFor(workflow);
     const result = this.store.tx((): CommitResult => {
       const r = this.openRun(workflow, run);
       const step = this.step(def, r.step);
-      const stem = collectionStem(step);
-      if (!stem) throw new Error(`step ${r.step} does not produce a collection`);
+      const stem = this.collectionStemForRun(step, r, options.stem);
       const arts = this.artMap(workflow);
       const sealP = sealPath(stem);
       const sealArt = arts.get(sealP);
@@ -4864,6 +4861,26 @@ export class Engine {
       throw new Error(`run ${run} no longer holds its lease (reaped or superseded)`);
     }
     return r;
+  }
+
+  /** Resolve an explicitly owed collection. Legacy calls remain unambiguous for
+   * single-collection steps; multi-collection steps require a target. */
+  private collectionStemForRun(
+    step: StepDef,
+    run: ReturnType<Store['getRun']> & object,
+    requested?: string,
+  ): string {
+    const collections = collectionProduces(step);
+    if (collections.length === 0) throw new Error(`step ${step.name} does not produce a collection`);
+    if (requested === undefined && collections.length !== 1) {
+      throw new Error(`step ${step.name} produces multiple collections; specify a stem`);
+    }
+    const stem = requested ?? collections[0]!.stem;
+    if (!collections.some((produce) => produce.stem === stem)
+      || !run.order?.owes.some((owed) => owed.path === sealPath(stem))) {
+      throw new Error(`run ${run.id} does not owe collection seal ${sealPath(stem)}`);
+    }
+    return stem;
   }
 
   /**

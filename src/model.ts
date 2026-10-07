@@ -2362,7 +2362,6 @@ export function eligibleOutcomes(
   // what the engine can actually do here.
   if (isCallStep(step)) return ['green'];
 
-  const stem = collectionStem(step);
   const outPath = firing.outputs[0] ?? '';
   const el = parseElement(outPath);
   const isMember = !!el && el.suffix === '';
@@ -2371,7 +2370,7 @@ export function eligibleOutcomes(
   // A mixed producer commits its singleton outputs separately from collection
   // emit/seal, in either order on the same run. `plainOutputs()` lists those
   // singletons before the seal, so only the seal is the collection verb.
-  if (stem && !el && outPath === sealPath(stem)) {
+  if (!el && collectionProduces(step).some((produce) => outPath === sealPath(produce.stem))) {
     // collection producer's actual seal output — emit-seal path
     outcomes.push('emit-seal');
     return outcomes;
@@ -2438,7 +2437,8 @@ function applyEmitSeal(
 ): Array<Map<string, ArtifactData>> {
   const step = def.steps.find((l) => l.name === firing.step);
   if (!step) return [];
-  const stem = collectionStem(step);
+  const stem = collectionProduces(step).find((produce) =>
+    firing.outputs.includes(sealPath(produce.stem)))?.stem;
   if (!stem) return [];
   const sealP = sealPath(stem);
   const sealArt = arts.get(sealP);
@@ -2486,7 +2486,10 @@ function applyEmitSeal(
 export interface CollectionLease {
   step: string;
   key: string;
+  /** First stem remains for internal single-collection conformance callers. */
   stem: string;
+  /** All seals owed by this one claimed run, in declaration order. */
+  stems?: string[];
   inputs: string[];
   fingerprint: Fingerprint;
 }
@@ -2672,7 +2675,7 @@ export function collectionCheckKey(def: WorkflowDef, state: CollectionCheckState
   const leases = state.leases.map((lease) => ({
     step: lease.step,
     key: lease.key,
-    stem: lease.stem,
+    stems: lease.stems ?? [lease.stem],
     inputs: lease.inputs.map((path) => [
       path,
       isGreen(state.arts.get(path)) && state.arts.get(path)?.version === lease.fingerprint[path]
@@ -2692,9 +2695,12 @@ export function collectionLeaseSuccessors(
 ): Array<{ state: CollectionCheckState; step: CheckStep }> {
   const step = def.steps.find((candidate) => candidate.name === lease.step);
   if (!step) return [];
-  const sealP = sealPath(lease.stem);
-  const seal = state.arts.get(sealP);
-  if (!seal) return [];
+  if (collectionProduces(step).length > 1 && lease.stems === undefined) {
+    throw new Error(`multi-collection checker lease for '${step.name}' must enumerate its owed stems`);
+  }
+  const stems = lease.stems ?? [lease.stem];
+  const sealPaths = stems.map(sealPath);
+  if (sealPaths.some((path) => !state.arts.has(path))) return [];
   const withoutLease = state.leases.filter((candidate) => candidate !== lease);
   const result: Array<{ state: CollectionCheckState; step: CheckStep }> = [];
   const move = (
@@ -2723,12 +2729,12 @@ export function collectionLeaseSuccessors(
     // The worker may attempt green() on a singleton or emit()/seal() on the
     // collection. Each CAS-refused verb born-rejects its OWN target and releases
     // the same run; the alternative targets have distinct artifact effects.
-    for (const path of [sealP, ...singletonPaths]) {
+    for (const path of [...sealPaths, ...singletonPaths]) {
       const target = state.arts.get(path);
       if (!target) continue;
       // A plain singleton's group refusal precedes the runtime CAS check.
       // It leaves the open run and the already-settled loser untouched.
-      if (path !== sealP
+      if (!sealPaths.includes(path)
 	  && activeJudgesForStem(def, path, modifier).length === 0
 	  && groupWouldReject(def, state.arts, path)) {
 	move('group-reject', new Map(state.arts), state.leases, undefined, path);
@@ -2769,47 +2775,50 @@ export function collectionLeaseSuccessors(
   }
 
   const fp = computeFingerprint(state.arts, lease.inputs);
-  const sealed = new Map(state.arts);
-  sealed.set(sealP, {
-    ...seal, acceptance: 'green', version: seal.version + 1, fingerprint: fp,
-  });
-  // seal() does not close the claimed run and may be called again after green;
-  // the repeat bumps the seal version, even though emit() is then refused.
-  move('collection-seal', sealed);
-  if (seal.acceptance === 'green') return result;
-
-  const produce = step.produces.find((pattern) => pattern.kind === 'collection' && pattern.stem === lease.stem);
-  const witnesses = collectionValueWitnesses(produce?.schema);
-  const nextIdx = members(state.arts, lease.stem).reduce((max, member) => {
-    const element = parseElement(member.path);
-    return element ? Math.max(max, element.index + 1) : max;
-  }, 0);
-  if (witnesses.valid !== undefined) {
-    // The cap is on TOTAL emitted indices in this finite model, not on one
-    // emit() call. Repeated emits can reach the cap by different interleavings.
-    for (let count = 1; count <= maxCollectionSize - nextIdx; count++) {
-      const next = new Map(state.arts);
-      for (let offset = 0; offset < count; offset++) {
-	const path = elementPath(lease.stem, nextIdx + offset);
-	next.set(path, {
-	  workflow: '', path, producer: lease.step, acceptance: 'green',
-	  version: 1, value: witnesses.valid,
-	  fingerprint: fp, reasons: [], judgmentRejects: 0, schemaRejects: 0,
-	});
-      }
-      move('collection-emit', next, state.leases, count);
-    }
-  }
-  if (witnesses.invalid !== undefined) {
-    const next = new Map(state.arts);
-    next.set(sealP, {
-      ...seal, acceptance: 'rejected', schemaRejects: seal.schemaRejects + 1,
-      reasons: [...seal.reasons, {
-	at: 0, action: 'schema-reject', kind: 'validation', by: 'engine',
-	text: 'collection member failed schema validation', fromVersion: seal.version,
-      }],
+  for (const stem of stems) {
+    const sealP = sealPath(stem);
+    const seal = state.arts.get(sealP)!;
+    const sealed = new Map(state.arts);
+    sealed.set(sealP, {
+      ...seal, acceptance: 'green', version: seal.version + 1, fingerprint: fp,
     });
-    move('collection-schema-reject', next);
+    // seal() can repeat while the run remains open; emit() then refuses only
+    // for this sealed stem, leaving sibling collections available.
+    move('collection-seal', sealed, state.leases, undefined, sealP);
+    if (seal.acceptance === 'green') continue;
+
+    const produce = step.produces.find((pattern) => pattern.kind === 'collection' && pattern.stem === stem);
+    const witnesses = collectionValueWitnesses(produce?.schema);
+    const nextIdx = members(state.arts, stem).reduce((max, member) => {
+      const element = parseElement(member.path);
+      return element ? Math.max(max, element.index + 1) : max;
+    }, 0);
+    if (witnesses.valid !== undefined) {
+      // Bound total emitted indices independently for each collection.
+      for (let count = 1; count <= maxCollectionSize - nextIdx; count++) {
+        const next = new Map(state.arts);
+        for (let offset = 0; offset < count; offset++) {
+	  const path = elementPath(stem, nextIdx + offset);
+	  next.set(path, {
+	    workflow: '', path, producer: lease.step, acceptance: 'green',
+	    version: 1, value: witnesses.valid,
+	    fingerprint: fp, reasons: [], judgmentRejects: 0, schemaRejects: 0,
+	  });
+        }
+        move('collection-emit', next, state.leases, count, sealP);
+      }
+    }
+    if (witnesses.invalid !== undefined) {
+      const next = new Map(state.arts);
+      next.set(sealP, {
+        ...seal, acceptance: 'rejected', schemaRejects: seal.schemaRejects + 1,
+        reasons: [...seal.reasons, {
+	  at: 0, action: 'schema-reject', kind: 'validation', by: 'engine',
+	  text: 'collection member failed schema validation', fromVersion: seal.version,
+        }],
+      });
+      move('collection-schema-reject', next, state.leases, undefined, sealP);
+    }
   }
   // emit([]) and an emit on a green seal do not change artifacts or the lease;
   // their stuttering loops are omitted from the finite state graph.
@@ -3201,11 +3210,11 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     const workerFirings = status.eligible.filter((firing) => !openSteps.has(firing.step));
     const leaseMoves = node.state.leases.flatMap((lease) =>
       collectionLeaseSuccessors(def, node.state, lease, maxCollectionSize, opts.modifier));
-    const leaseProgressFirings: Firing[] = node.state.leases
-      .filter((lease) => leaseMoves.some((move) =>
-	move.step.step === lease.step && move.step.outcome !== 'collection-close'))
-      .map((lease) => ({ step: lease.step, key: lease.key, inputs: lease.inputs,
-	outputs: [sealPath(lease.stem)] }));
+    const leaseProgressFirings: Firing[] = node.state.leases.flatMap((lease) =>
+      leaseMoves.filter((move) => move.step.step === lease.step
+        && move.step.outcome !== 'collection-close' && move.step.path !== undefined)
+        .map((move) => ({ step: lease.step, key: lease.key, inputs: lease.inputs,
+          outputs: [move.step.path!] })));
     const progressFirings = [...workerFirings, ...callsFirings, ...leaseProgressFirings];
     const firings = status.done ? [] : [...workerFirings, ...callsFirings, ...retractFirings];
 
@@ -3248,9 +3257,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       // claimed producer. `frozen()` blocks a NEW offer, not verbs on that
       // open run. Do not call this `stuck` merely because a map can also move.
       && !leaseMoves.some((move) =>
-	move.step.outcome === 'collection-seal'
-	&& node.state.leases.some((lease) =>
-	  lease.step === move.step.step && sealPath(lease.stem) === debt.path))
+	move.step.outcome === 'collection-seal' && move.step.path === debt.path)
       && progressMovesAnotherBranch(def, debt.path, arts, progressFirings),
     )) {
       report.stuck.push({ path: nodePath() });
@@ -3282,15 +3289,16 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
         firedSteps.add(firing.step);
       }
       const producer = def.steps.find((candidate) => candidate.name === firing.step);
-      const stem = producer && collectionStem(producer);
-      if (stem && firing.outputs.includes(sealPath(stem))) {
+      const collections = producer ? collectionProduces(producer)
+        .filter((produce) => firing.outputs.includes(sealPath(produce.stem))) : [];
+      if (collections.length > 0) {
 	if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
 	report.collectionCapApplied = true;
 	if (!report.coverageIncomplete.includes('collection-width-cap')) {
 	  report.coverageIncomplete.push('collection-width-cap');
 	}
-	const collectionProduce = producer?.produces.find((p) => p.kind === 'collection' && p.stem === stem);
-	if (collectionProduce?.schema !== undefined) {
+	for (const collectionProduce of collections) {
+	  if (collectionProduce.schema === undefined) continue;
 	  report.collectionSchemaValuesSampled = true;
 	  const witnesses = collectionValueWitnesses(collectionProduce.schema);
 	  if (!witnesses.validClassKnown && !report.coverageIncomplete.includes('collection-schema-validity')) {
@@ -3308,8 +3316,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	const lease: CollectionLease = {
 	  // Runtime emit/seal CAS the step's declared plain consumes even for
 	  // allGreen/idle firings whose claim fingerprint contains no inputs.
-	  step: firing.step, key: firing.key, stem,
-	  inputs: plainConsumes(producer).map((consume) => consume.stem),
+	  step: firing.step, key: firing.key, stem: collections[0]!.stem,
+	  stems: collections.map((produce) => produce.stem),
+	  inputs: plainConsumes(producer!).map((consume) => consume.stem),
 	  fingerprint: computeFingerprint(arts, firing.inputs),
 	};
 	const claimed = { arts, leases: [...node.state.leases, lease] };

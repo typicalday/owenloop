@@ -21,8 +21,8 @@
  *   owenloop show <wf>                  dump raw artifacts (debugging)
  *   owenloop list                       list instances
  *   owenloop green <wf> <run> <path> [--value json] [--terminal]
- *   owenloop emit  <wf> <run> --items '[{...},{...}]'
- *   owenloop seal  <wf> <run> [--value json]
+ *   owenloop emit  <wf> <run> --items '[{...},{...}]' [--stem name]
+ *   owenloop seal  <wf> <run> [--value json] [--stem name]
  *   owenloop reject  <wf> <path> --by <author> --text <msg>
  *   owenloop retract <wf> <path> --by <author> --text <msg>
  *   owenloop skip    <wf> <path> --by <author> --text <msg>
@@ -1649,8 +1649,8 @@ ${' '.repeat(41)}create a local SQLite workflow instance
   graph <def-or-wf> [--format dot|mermaid|json]   wiring graph (+ live overlay if wf id)
   list                                   list workflow instances
   green <wf> <run> <path> [--value json] [--terminal]
-  emit <wf> <run> --items '[{...}]'      accrete collection elements
-  seal <wf> <run> [--value json]         signal a collection is complete
+  emit <wf> <run> --items '[{...}]' [--stem name]  accrete collection elements
+  seal <wf> <run> [--value json] [--stem name]    signal a collection is complete
   reject <wf> <path> --by <author> --text <msg> [--requested <modifier>] [--hub <url>]
   retract <wf> <path> --by <author> --text <msg>
   skip <wf> <path> --by <author> --text <msg>
@@ -2814,7 +2814,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         }
         if (!Array.isArray(parsed)) throw new CliError('--items must be a JSON array');
         const items = parsed.map((v) => ({ value: v as Record<string, unknown> }));
-        const emitRes = engine.emit(wf, run, items);
+        const emitRes = engine.emit(wf, run, items, { stem: last(args, 'stem') });
         print(io, emitRes);
         if (emitRes.outcome !== 'emitted') {
           io.err(`emit: ${emitRes.outcome}${emitRes.reason ? ' — ' + emitRes.reason : ''}`);
@@ -2825,7 +2825,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       case 'seal': {
         const wf = need(args, 1, 'workflow');
         const run = need(args, 2, 'run');
-        const sealRes = engine.seal(wf, run, parseJson(last(args, 'value')));
+        const sealRes = engine.seal(wf, run, parseJson(last(args, 'value')), { stem: last(args, 'stem') });
         print(io, sealRes);
         if (sealRes.outcome !== 'green') {
           io.err(`seal ${sealRes.path}: ${sealRes.outcome}${sealRes.reason ? ' — ' + sealRes.reason : ''}`);
