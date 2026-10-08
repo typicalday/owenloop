@@ -9,6 +9,8 @@ import { test } from 'node:test';
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { parseConsume, parseProduce } from '../../../src/paths.ts';
 import type { StepDef } from '../../../src/types.ts';
+import { createHubClient } from '../src/hub/client.ts';
+import { createRoutingBackoff } from '../src/shift/runtime.ts';
 import { createTrustedRoutedInputV2Admission } from '../src/hosted/trusted-input-admission.ts';
 import { createBrokerRoutedReferenceV2Reader, createTrustedRoutedReferenceV2Reader,
   parseRoutedClaimV2, parseRoutedReferenceV2,
@@ -74,7 +76,8 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
     { stdio: 'ignore' });
     const observed: string[] = [];
-    let status = 200, cache = 'no-store', rateLimits = 0;
+    let status = 200, cache = 'no-store', rateLimits = 0, monotonic = 0;
+    const backoff = createRoutingBackoff(() => monotonic);
     let witness = pair();
     const server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
       observed.push(req.url!);
@@ -96,9 +99,9 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       assert.ok(address && typeof address !== 'string');
       const reader = createTrustedRoutedReferenceV2Reader({ origin: `https://localhost:${address.port}`,
 	expected, getToken: async () => 'worker-secret', getSession: async () => session,
-	trustedCa: readFileSync(cert), onRateLimit: error => {
-	  rateLimits++; assert.equal(error.status, 429); assert.equal(error.retryAfterMs, 2_000);
-	} });
+	trustedCa: readFileSync(cert), beforeRequest: backoff.beforeRequest,
+	onRateLimit: error => { rateLimits++; backoff.onRateLimit(error);
+	  assert.equal(error.status, 429); assert.equal(error.retryAfterMs, 2_000); } });
       assert.deepEqual(await reader.read(), witness);
       assert.deepEqual(observed, ['/api/routing_reference_order/v2', '/api/read_routing_claim/v2']);
       status = 302;
@@ -109,6 +112,18 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       status = 429;
       await assert.rejects(reader.read());
       assert.equal(rateLimits, 1);
+      const beforeBlocked = observed.length;
+      await assert.rejects(reader.read());
+      assert.equal(observed.length, beforeBlocked, 'preexisting backoff refuses v2 before network');
+      let ordinaryFetches = 0;
+      const ordinary = createHubClient({ origin: 'https://hub.example', getToken: async () => 'worker-secret',
+	routingSession: { allowedOrigin: 'https://hub.example', get: () => ({
+	  sessionId: 'rs_00000000-0000-4000-8000-000000000000', shiftId: 'shf_example',
+	  credential: session, expiresAt: Date.now() + 60_000 }), beforeRequest: backoff.beforeRequest },
+	fetchImpl: (async () => { ordinaryFetches++; throw new Error('unexpected ordinary fetch'); }) as typeof fetch });
+      await assert.rejects(ordinary.readRoutingClaim({ workflow: expected.workflow, run: expected.run }));
+      assert.equal(ordinaryFetches, 0, 'v2 429 gates the shared ordinary routed client');
+      monotonic = 2_000;
       status = 200;
       cache = 'max-age=60';
       await assert.rejects(reader.read());
@@ -118,6 +133,72 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       assert.equal((await reader.read()).reference.state, 'unsupported-feedback');
       assert.throws(() => createTrustedRoutedReferenceV2Reader({ origin: 'http://localhost', expected,
 	getToken: async () => 'secret', getSession: async () => session }));
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stalled 429 body still records Retry-After from response headers before transport timeout', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'routed-v2-429-'));
+  try {
+    const key = join(dir, 'key.pem'), cert = join(dir, 'cert.pem');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+    { stdio: 'ignore' });
+    let requests = 0, clock = 0, observed = 0;
+    const backoff = createRoutingBackoff(() => 0);
+    const server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      requests++;
+      for await (const _chunk of req) { /* consume bounded request */ }
+      res.writeHead(429, { 'content-type': 'application/json', 'cache-control': 'no-store', 'retry-after': '5' });
+      res.flushHeaders(); // deliberately never send a body or EOF
+    });
+    await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const reader = createTrustedRoutedReferenceV2Reader({ origin: `https://localhost:${address.port}`,
+	expected, trustedCa: readFileSync(cert), now: () => clock,
+	getToken: async () => 'worker-secret', getSession: async () => { clock = 4_950; return session; },
+	beforeRequest: backoff.beforeRequest, onRateLimit: error => {
+	  observed++; backoff.onRateLimit(error); assert.equal(error.retryAfterMs, 5_000);
+	} });
+      await assert.rejects(reader.read());
+      assert.equal(observed, 1);
+      await assert.rejects(reader.read());
+      assert.equal(requests, 1, 'stalled-body 429 arms shared backoff before another request');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('oversize 429 body records Retry-After before response-size refusal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'routed-v2-429-large-'));
+  try {
+    const key = join(dir, 'key.pem'), cert = join(dir, 'cert.pem');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+    { stdio: 'ignore' });
+    let observed = 0;
+    const server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      for await (const _chunk of req) { /* consume bounded request */ }
+      res.writeHead(429, { 'content-type': 'application/json', 'cache-control': 'no-store', 'retry-after': '7' });
+      res.end(Buffer.alloc(2_000_001));
+    });
+    await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const reader = createTrustedRoutedReferenceV2Reader({ origin: `https://localhost:${address.port}`,
+	expected, trustedCa: readFileSync(cert), getToken: async () => 'worker-secret',
+	getSession: async () => session, onRateLimit: error => {
+	  observed++; assert.equal(error.retryAfterMs, 7_000);
+	} });
+      await assert.rejects(reader.read());
+      assert.equal(observed, 1);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }

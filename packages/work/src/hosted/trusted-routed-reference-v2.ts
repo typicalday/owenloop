@@ -154,7 +154,8 @@ export function parseRoutedClaimV2(raw: unknown, expected: { workflow: string; r
 }
 
 function postHttps(url: URL, token: string, session: string, body: string, remainingMs: number,
-  ca?: string | Buffer): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
+  ca?: string | Buffer, onHeaders?: (status: number, headers: IncomingHttpHeaders) => void,
+): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (error?: Error, value?: { status: number; headers: IncomingHttpHeaders; body: string }) => {
@@ -168,6 +169,8 @@ function postHttps(url: URL, token: string, session: string, body: string, remai
       'content-type': 'application/json', accept: 'application/json',
       'content-length': Buffer.byteLength(body), 'cache-control': 'no-store',
     } }, response => {
+      try { onHeaders?.(response.statusCode ?? 0, response.headers); }
+      catch (error) { req.destroy(error instanceof Error ? error : new Error('routed v2 response refused')); return; }
       const chunks: Buffer[] = [];
       let size = 0;
       response.on('data', (chunk: Buffer) => {
@@ -210,15 +213,19 @@ export function createTrustedRoutedReferenceV2Reader(options: {
       throw new Error('routed v2 credential unavailable');
     if (remaining() <= 0) throw new Error('routed v2 deadline exceeded');
     options.beforeRequest?.();
-    const response = await postHttps(new URL(path, origin), token, session,
-      JSON.stringify(options.expected), remaining(), options.trustedCa);
-    if (response.status === 429) {
-      const raw = response.headers['retry-after'];
+    const retryAfter = (headers: IncomingHttpHeaders) => {
+      const raw = headers['retry-after'];
       const seconds = typeof raw === 'string' ? Number(raw.trim()) : Number.NaN;
-      const retryAfterMs = Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1_000) : undefined;
-      const error = new HubError(429, 'routed v2 request refused', undefined, retryAfterMs);
-      options.onRateLimit?.(error);
-      throw error;
+      return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1_000) : undefined;
+    };
+    const response = await postHttps(new URL(path, origin), token, session,
+      JSON.stringify(options.expected), remaining(), options.trustedCa,
+      (status, headers) => {
+	if (status === 429) options.onRateLimit?.(new HubError(429,
+	  'routed v2 request refused', undefined, retryAfter(headers)));
+      });
+    if (response.status === 429) {
+      throw new HubError(429, 'routed v2 request refused', undefined, retryAfter(response.headers));
     }
     if (remaining() <= 0 || response.status !== 200
       || !String(response.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')
