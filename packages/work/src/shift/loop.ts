@@ -914,6 +914,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     return true;
   }
 
+  function syncRoutingBackoff(): void {
+    if (opts.routingSession) backoffUntil = Math.max(backoffUntil, opts.routingSession.nextRequestAllowedAt());
+  }
+
   /**
    * Ask whether a LOCAL fault is the reason this shift cannot work, and stop if
    * one is. Returns true when the shift has been wedged.
@@ -1059,6 +1063,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   function startTimers(): void {
     let maintenanceRunning = false;
     if (opts.routingSession) cancelRoutingMaintenance = schedule(() => {
+      syncRoutingBackoff();
       if (stopped || maintenanceRunning || monotonicNow() < backoffUntil) return;
       maintenanceRunning = true;
       void opts.routingSession!.maintain().catch(error => {
@@ -2193,6 +2198,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   async function iteration(): Promise<number> {
+    // A detached handoff may have closed an old session between iterations.
+    // Its 429 must gate roster sync, which runs before scope reconciliation.
+    syncRoutingBackoff();
     const backoffActiveAtStart = monotonicNow() < backoffUntil;
     let rateLimitedThisIteration = false;
 

@@ -877,6 +877,8 @@ export interface ShiftRoutingSession {
   identity(): { orgId: string; principalId: string; sessionId: string; shiftId: string; expiresAt: number } | undefined;
   createHandoff(reservation: ChildReservation): RoutingHandoff;
   maintain(): Promise<void>;
+  /** Monotonic service deadline shared with Shift's other Hub requests. */
+  nextRequestAllowedAt(): number;
   /** Open new authority for changed serving selections; never widen a session. */
   ensureScope(selection: { capabilities: string[]; crews: string[] }): Promise<void>;
   /** Stop dispatch. Live detached workers preserve the shared session. */
@@ -1011,6 +1013,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const session: ShiftRoutingSession = {
     hub,
     identity: () => active.identity(),
+    nextRequestAllowedAt: () => renewalBackoffUntil,
     createHandoff: reservation => {
       if (stopped) throw new Error('routing session stopped');
       return active.createHandoff(reservation);
@@ -1090,7 +1093,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 }
 
 async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise<
-  Omit<ShiftRoutingSession, 'ensureScope' | 'stop'> & { stop(): Promise<HubError | undefined> }
+  Omit<ShiftRoutingSession, 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & { stop(): Promise<HubError | undefined> }
 > {
   const origin = new URL(opts.origin);
   if (origin.protocol !== 'https:' || origin.origin !== opts.origin || origin.username || origin.password) throw new Error('routing origin refused');

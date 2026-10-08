@@ -4332,6 +4332,7 @@ test('routing maintenance timer honors scope and renewal Retry-After before anot
   const session = {
     hub,
     identity: () => undefined,
+    nextRequestAllowedAt: () => Number.NEGATIVE_INFINITY,
     createHandoff: () => { throw new Error('unexpected dispatch'); },
     ensureScope: async () => {
       scopeCalls++;
@@ -5306,4 +5307,63 @@ test('rate-limited close during session rotation suppresses Shift polling until 
     assert.equal(offers, quiet.offers + 1, 'polling resumes at the close response deadline');
     assert.ok(calls.length > quiet.calls);
   } finally { loop.stop(); await session.stop(); }
+});
+
+test('delayed handoff close 429 suppresses due roster sync before the next Shift poll', async () => {
+  let clock = 0;
+  let opens = 0;
+  let closes = 0;
+  let offers = 0;
+  let syncs = 0;
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => clock,
+    monotonicNow: () => clock, getToken: async () => 'enrolled-base',
+    fetchImpl: (async url => {
+      if (String(url).endsWith('/routing_session_open')) {
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++opens).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${opens}`,
+	  credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: clock + 900_000 });
+      }
+      if (String(url).endsWith('/routing_session_close')) {
+	if (++closes === 1) return Response.json({ error: 'rate_limited' },
+	  { status: 429, headers: { 'Retry-After': '120' } });
+	return Response.json({ closed: true });
+      }
+      if (String(url).endsWith('/routing_offer_context')) { offers++; return Response.json({ contexts: [] }); }
+      assert.fail(`unexpected session request ${String(url)}`);
+    }) as typeof fetch,
+  });
+  const { hub, calls } = mockHub({});
+  let capabilities = ['build'];
+  const loop = createShiftLoop(baseOpts(hub, () => { assert.fail('no work offered'); }, {
+    workflow: 'wf', routingSession: session, now: () => clock, monotonicNow: () => clock,
+    computeServeCapabilities: () => capabilities,
+    syncRosters: async () => { syncs++; }, rosterSyncIntervalMs: 5_000,
+  }));
+  let handoff: ReturnType<typeof session.createHandoff> | undefined;
+  try {
+    await loop.iterate();
+    handoff = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'delayed-close',
+      reservedAt: clock, childKind: 'agent-run' }).reservation);
+    capabilities = ['build', 'test'];
+    loop.setShift({ serveCrews: [] });
+    clock = 5_000;
+    await loop.iterate();
+    assert.equal(opens, 2);
+    assert.equal(closes, 0, 'the retired session remains owned by its handoff');
+    clock = 6_000;
+    handoff.terminal();
+    await settle(() => session.nextRequestAllowedAt() === 126_000, 'retired close rate limit');
+    assert.equal(closes, 1);
+    const quiet = { calls: calls.length, offers, syncs, opens, closes };
+    for (clock of [10_000, 65_000, 125_999]) {
+      await loop.iterate();
+      assert.deepEqual({ calls: calls.length, offers, syncs, opens, closes }, quiet,
+	'no Hub request, including due roster sync, may bypass delayed close Retry-After');
+    }
+    clock = 126_000;
+    await loop.iterate();
+    assert.equal(syncs, quiet.syncs + 1);
+    assert.equal(offers, quiet.offers + 1);
+  } finally { handoff?.terminal(); loop.stop(); await session.stop(); }
 });
