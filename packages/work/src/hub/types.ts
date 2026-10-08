@@ -12,6 +12,7 @@ export interface HubResponse {
 // ---- whats_next -------------------------------------------------------------
 
 export interface WhatsNextRequest {
+  routing?: { kind: 'ready_firing' | 'child' | 'crew' | 'shift'; frameId?: string; callPath?: string };
   workflow?: string;
   /** Server-side filter for which serve crews this caller will accept. */
   serve_crews?: string[];
@@ -30,6 +31,7 @@ export interface WhatsNextRequest {
  * workflow store by the worker.
  */
 export interface WorkOrder {
+  routing?: ReferenceRouting;
   workflow: string;
   run: string;
   step: string;
@@ -207,6 +209,7 @@ export interface Lease {
  * the deployed hub can omit them; optionality does not imply end-to-end support.
  */
 export interface OrderPacket {
+  routing?: ReferenceRouting;
   run: string;
   workflow: string;
   step: string;
@@ -744,4 +747,225 @@ export class HubError extends Error {
     if (code !== undefined) this.code = code;
     if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
   }
+}
+
+// ---- Authenticated routing: service ab73dce frozen REST DTOs -----------------
+export type Sha256Digest = `sha256:${string}`;
+export interface RoutingDefRef { bundleDigest: Sha256Digest; workflowName: string }
+export interface MeaningRef { def: RoutingDefRef; step: string; tag: string; meaningDigest: Sha256Digest }
+export interface RevisionVector {
+  definition: string;
+  candidates: string;
+  policy: string;
+  authority: string;
+  rolePolicy: string;
+  roster: string;
+  routes: string;
+  membership: string;
+  evidenceGeneration: string;
+}
+export interface DecisionBindingV1 {
+  orgId: string;
+  runId: string;
+  frameId: string;
+  def: RoutingDefRef;
+  subjectKey: string;
+  evidenceDigest: Sha256Digest;
+  candidateDigest: Sha256Digest;
+  policyDigest: Sha256Digest;
+  revisions: RevisionVector;
+  issuedAt: number;
+  expiresAt: number;
+  authority: { principalId: string; sessionId: string };
+}
+export type TaskRole = 'research' | 'implementation' | 'review' | 'judge';
+export interface LocalModelTuple {
+  id: string;
+  harness: string;
+  model: string;
+  effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+}
+export interface LocalTupleEligibility {
+  tuple: LocalModelTuple;
+  eligible: boolean;
+  available: boolean;
+}
+/** Trusted user/authored policy, independent of any probabilistic ranking. */
+export interface RoleModelPolicy {
+  revision: string;
+  unknownRole: 'refuse';
+  rules: readonly { model: string; roles: readonly TaskRole[] }[];
+}
+export interface ShiftOffer {
+  version: 'shift-offer-v1';
+  /** Exact service protocol required by this offer, when local-model advice is opted in. */
+  localModelProtocol?: 'local-model-assessment-v1';
+  offerId: string;
+  orgId: string;
+  principalId: string;
+  sessionId: string;
+  shiftId: string;
+  willingness: { runIds: readonly string[]; crewIds: readonly string[]; capabilities: readonly string[] };
+  rosterRevision: string;
+  rolePolicyRevision: string;
+  tuples: readonly LocalTupleEligibility[];
+  issuedAt: number;
+  expiresAt: number;
+}
+export interface ShiftOfferContext {
+  now: number;
+  maxTtlMs: number;
+  orgId: string;
+  principalId: string;
+  sessionId: string;
+  shiftId: string;
+  rosterRevision: string;
+  rolePolicyRevision: string;
+  runId: string;
+  crewId: string;
+  capability: string;
+}
+export type DecisionSelectionV1 =
+  | { kind: 'workflow'; target: { candidateId: string; def: RoutingDefRef } }
+  | { kind: 'child'; target: { candidateId: string; invocationKey: string; def: RoutingDefRef; meaning: MeaningRef } }
+  | { kind: 'ready_firing'; target: { candidateId: string; firingId: string; step: string; key: string } }
+  | { kind: 'crew'; target: { candidateId: string; crewId: string } }
+  | { kind: 'shift'; target: { candidateId: string; shiftId: string; offerId: string } }
+  | { kind: 'local_model'; target: { candidateId: string; tuple: LocalModelTuple } }
+  | { kind: 'judge'; target: { candidateId: string; judgeId: string; tuple: LocalModelTuple } };
+export type CapabilityMappingSelectionV1 = {
+  kind: 'capability_mapping'; target: { candidateId: string; meaning: MeaningRef; capability: string };
+};
+export interface ArtifactRef { path: string; digest: Sha256Digest }
+export interface SourceRef { commit: string; sourceDigest: Sha256Digest }
+export type DecisionEffectRef =
+  | { kind: 'workflow'; runId: string }
+  | { kind: 'child'; invocationId: string; childRunId: string }
+  | { kind: 'ready_firing'; firingId: string }
+  | { kind: 'crew'; crewId: string }
+  | { kind: 'shift'; claimId: string; orderId: string; attemptId: string }
+  | { kind: 'local_model'; orderId: string; attemptId: string }
+  | { kind: 'judge'; judgmentId: string }
+  | { kind: 'capability_mapping'; mappingId: string };
+export interface ClaimProofV1 {
+  state: 'claimed';
+  claimId: string;
+  decisionId: string;
+  binding: DecisionBindingV1;
+  invocationId: string | null;
+  orderId: string;
+  attemptId: string;
+  principalId: string;
+  sessionId: string;
+  shiftId: string;
+}
+export type LaunchObservationV1 =
+  | { state: 'unknown' }
+  | { state: 'reported'; tuple: LocalModelTuple }
+  | { state: 'observed'; tuple: LocalModelTuple; pid: number; argv: readonly string[]; evidence: ArtifactRef };
+export interface LaunchReportV1 {
+  version: 'launch-v1';
+  decisionId: string;
+  binding: DecisionBindingV1;
+  claimId: string;
+  orderId: string;
+  attemptId: string;
+  requested: LocalModelTuple | null;
+  selected: LocalModelTuple | null;
+  observation: LaunchObservationV1;
+}
+
+export interface RoutingScope { workflows?: string[]; crews?: string[]; capabilities?: string[] }
+export interface RoutingSessionOpenResponse {
+  sessionId: string; shiftId: string; credential: string; expiresAt: number;
+}
+export type RoutingSessionRenewResponse = Omit<RoutingSessionOpenResponse, 'credential'>;
+export interface RoutingOfferRequest {
+  workflow: string; serve_capabilities: string[]; serve_crews?: string[]; frameId?: string;
+}
+export interface RoutingOfferSubmission { candidateId: string; crewId: string; capability: string; offer: ShiftOffer }
+export interface RoutingOfferCandidate {
+  candidateId: string; frameId: string; step: string; key: string; evidenceGeneration: string;
+  context: ShiftOfferContext; role: string; rolePolicy: RoleModelPolicy; tuples: LocalTupleEligibility[];
+  /** Present only when the candidate is authorized for local-model assessment. */
+  localModelProtocol?: 'local-model-assessment-v1';
+}
+export interface RoutingOfferResponse { contexts: RoutingOfferCandidate[] }
+export interface LocalModelPolicy {
+  version: 'local-model-policy-v1';
+  onFailure: 'fallback' | 'refuse';
+}
+export interface LocalModelRequest {
+  workflow: string;
+  run: string;
+  candidateIds: string[];
+}
+export interface LocalModelAssessment {
+  version: 'local-model-assessment-v1';
+  assessmentId: string;
+  workflow: string;
+  frameId: string;
+  definition: RoutingDefRef;
+  decisionId: string;
+  claimId: string;
+  orderId: string;
+  attemptId: string;
+  anchorDigest: Sha256Digest;
+  candidateIds: string[];
+  candidateDigest: Sha256Digest;
+  policy: {
+    id: string;
+    revision: string;
+    digest: Sha256Digest;
+    onFailure: 'fallback' | 'refuse';
+  };
+  createdAt: number;
+  expiresAt: number;
+  status: 'pending' | 'advisory' | 'fallback' | 'refused' | 'stale';
+  reason: string;
+  advised: LocalModelTuple | null;
+  provider: {
+    model: string;
+    usage: { input_tokens: number; output_tokens: number };
+    cost: null;
+  } | null;
+}
+export interface LocalModelResponse {
+  status: 'pending' | 'advisory' | 'fallback' | 'refused' | 'stale';
+  reason: string;
+  assessment: LocalModelAssessment | null;
+}
+export interface ReferenceRouting {
+  claim: ClaimProofV1;
+  decision: {
+    decisionId: string; binding: DecisionBindingV1;
+    status: 'applied' | 'advisory' | 'abstained' | 'no_fit' | 'stale' | 'unavailable' | 'fallback' | 'refused';
+    applied: DecisionSelectionV1 | CapabilityMappingSelectionV1 | null; effect: DecisionEffectRef | null;
+  };
+  preference: { offer: ShiftOffer | null; tuples: readonly LocalTupleEligibility[]; role: string;
+    rolePolicy: RoleModelPolicy | null; rosterRevision: string; expiresAt: number;
+    localModel?: LocalModelPolicy };
+}
+export interface RoutingClaimReadResponse { routing: ReferenceRouting; freshness: 'fresh-at-read'; atomicLaunch: false }
+export interface BindingDelegationV1 {
+  version: 'binding-delegation-v1'; protocol: 'owenloop-binding-v1'; origin: string; orgId: string;
+  scope: { workflowName: string; callPaths: string[] };
+}
+export interface InvocationBindingReadRequest {
+  workflow: string; orderId: string; parentWorkflow: string;
+  parentDefRef: import('../../../../src/types.ts').DefRef; callPath: string; parentArtifactVersion?: number;
+}
+export interface InvocationBindingReadResponse {
+  protocol: 'owenloop-binding-v1'; origin: string; orgId: string;
+  // Summary is deliberately NOT the complete native InvocationBinding.
+  binding: Pick<import('../../../../src/types.ts').InvocationBinding, 'id' | 'key' | 'admission' | 'policyDigest' | 'candidateSetDigest'> & {
+    selected: import('../../../../src/types.ts').InvocationCandidate;
+  };
+  bindingJson: string; bindingDigest: string;
+  parentDefRef: import('../../../../src/types.ts').DefRef; childDefRef: import('../../../../src/types.ts').DefRef;
+  relay: import('../../../../src/types.ts').VerifiedInvocationReceipt | null;
+  freshness: 'fresh-at-read'; atomicLaunch: false;
+}
+export interface LaunchReportResponse {
+  orderId: string; digest: string; recordedAt: number; provenance: 'authenticated-worker-report';
 }

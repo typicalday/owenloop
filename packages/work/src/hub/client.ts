@@ -57,6 +57,19 @@ import type {
   WhatsNextRequest,
   WhatsNextResponse,
   WhoamiResponse,
+  RoutingScope,
+  RoutingSessionOpenResponse,
+  RoutingSessionRenewResponse,
+  RoutingOfferRequest,
+  RoutingOfferSubmission,
+  RoutingOfferResponse,
+  RoutingClaimReadResponse,
+  InvocationBindingReadRequest,
+  InvocationBindingReadResponse,
+  LaunchReportV1,
+  LaunchReportResponse,
+  LocalModelRequest,
+  LocalModelResponse,
 } from './types.ts';
 
 export interface HubClientOptions {
@@ -66,6 +79,12 @@ export interface HubClientOptions {
   getToken: () => Promise<string>;
   /** Override the transport in tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
+  /** Trusted per-client closure; the capability never enters a request body. */
+  routingSession?: {
+    allowedOrigin: string;
+    get: () => RoutingSessionOpenResponse | undefined;
+    now?: () => number;
+  };
 }
 
 export interface HubClient {
@@ -127,6 +146,8 @@ export interface HubClient {
   getRosters?(signal?: AbortSignal): Promise<GetRostersResponse>;
   /** Read the hub's known harness/model registry. */
   listHarnessModels?(): Promise<ListHarnessModelsResponse>;
+  /** Ask the authorized routing service for one local-model advisory. */
+  assessLocalModel?(req: LocalModelRequest, signal?: AbortSignal): Promise<LocalModelResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
   wake(cursor?: number, signal?: AbortSignal): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
@@ -142,7 +163,19 @@ export interface HubClient {
   putFileArtifact(req: PutFileArtifactRequest): Promise<PutFileArtifactResponse>;
 }
 
-export function createHubClient(opts: HubClientOptions): HubClient {
+export interface RoutingHubClient extends HubClient {
+  assessLocalModel(req: LocalModelRequest, signal?: AbortSignal): Promise<LocalModelResponse>;
+  openRoutingSession(req: { scope?: RoutingScope }, signal?: AbortSignal): Promise<RoutingSessionOpenResponse>;
+  renewRoutingSession(signal?: AbortSignal): Promise<RoutingSessionRenewResponse>;
+  closeRoutingSession(signal?: AbortSignal): Promise<{ closed: true }>;
+  routingOfferContext(req: RoutingOfferRequest, signal?: AbortSignal): Promise<RoutingOfferResponse>;
+  putShiftOffer(req: RoutingOfferRequest & { submission: RoutingOfferSubmission }, signal?: AbortSignal): Promise<RoutingOfferResponse>;
+  readRoutingClaim(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<RoutingClaimReadResponse>;
+  readInvocationBinding(req: InvocationBindingReadRequest, signal?: AbortSignal): Promise<InvocationBindingReadResponse>;
+  reportLaunch(req: { workflow: string; report: LaunchReportV1 }, signal?: AbortSignal): Promise<LaunchReportResponse>;
+}
+
+export function createHubClient(opts: HubClientOptions): RoutingHubClient {
   const base = opts.origin.replace(/\/+$/, '');
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
 
@@ -193,11 +226,46 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     return parse<T>(res);
   }
 
+  async function scopedPost<T>(verb: string, body: unknown, signal?: AbortSignal, opening = false): Promise<T> {
+    // Validate before resolving either credential. URL normalization must not
+    // quietly bless a path, userinfo, another origin, or an HTTP endpoint.
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password) throw new Error('routing origin refused');
+    const session = opening ? undefined : routing.get();
+    if (!opening && (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)) throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      if (session) headers['X-Owenloop-Routing-Session'] = session.credential;
+      const res = await fetchImpl(`${base}/api/${verb}`, {
+        method: 'POST', headers, body: JSON.stringify(body), redirect: 'error',
+        ...(signal === undefined ? {} : { signal }),
+      });
+      // Response bodies and fetch errors can echo credentials. Keep them out
+      // of persisted worker diagnostics while retaining status/backoff metadata.
+      if (!res.ok) throw new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+      return await res.json() as T;
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
   async function get<T>(verb: string, query?: string, signal?: AbortSignal): Promise<T> {
+    if (opts.routingSession) {
+      let origin: URL;
+      try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+      if (origin.protocol !== 'https:' || base !== origin.origin || origin.origin !== opts.routingSession.allowedOrigin
+        || origin.username || origin.password) throw new Error('routing origin refused');
+    }
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
     const res = await fetchImpl(url, {
       method: 'GET',
       headers: await authHeaders(),
+      ...(opts.routingSession ? { redirect: 'error' as const } : {}),
       ...(signal === undefined ? {} : { signal }),
     });
     return parse<T>(res);
@@ -221,9 +289,24 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   return {
-    whatsNext: (req, signal) => post<WhatsNextResponse>('whats_next', req, signal),
-    getOrder: (req) => post<GetOrderResponse>('get_order', req),
-    getReferenceOrder: (req) => post<unknown>('reference_order/v1', req),
+    whatsNext: (req, signal) => opts.routingSession !== undefined || req.routing !== undefined
+      ? scopedPost<WhatsNextResponse>('whats_next', req, signal)
+      : post<WhatsNextResponse>('whats_next', req, signal),
+    getOrder: (req) => opts.routingSession !== undefined
+      ? scopedPost<GetOrderResponse>('get_order', req)
+      : post<GetOrderResponse>('get_order', req),
+    openRoutingSession: (req, signal) => scopedPost('routing_session_open', req, signal, true),
+    renewRoutingSession: (signal) => scopedPost('routing_session_renew', {}, signal),
+    closeRoutingSession: (signal) => scopedPost('routing_session_close', {}, signal),
+    routingOfferContext: (req, signal) => scopedPost('routing_offer_context', req, signal),
+    putShiftOffer: (req, signal) => scopedPost('put_shift_offer', req, signal),
+    readRoutingClaim: (req, signal) => scopedPost('read_routing_claim', req, signal),
+    readInvocationBinding: (req, signal) => scopedPost('read_invocation_binding', req, signal),
+    reportLaunch: (req, signal) => scopedPost('report_launch', req, signal),
+    assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
+    getReferenceOrder: (req) => opts.routingSession !== undefined
+      ? scopedPost<unknown>('reference_order/v1', req)
+      : post<unknown>('reference_order/v1', req),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),

@@ -311,3 +311,160 @@ test('presencePing forwards attended_at using the exact snake_case wire field', 
   assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: [], serve_capabilities: [], attended_at: 456789 });
   assert.equal((captured[0]!.body as Record<string, unknown>)['attendedAt'], undefined);
 });
+
+// Frozen REST contract: reviewed service ab73dce, not a model-facing secret channel.
+test('routing session transport pins HTTPS origin, keeps capability in headers and preserves native evidence', async () => {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const authority = { sessionId: 'rs_session', shiftId: 'shf_service', credential: 'private-capability', expiresAt: 2000 };
+  const evidence = { text: 'order', order: { routing: { claim: { orderId: 'run' } }, consumesProof: 'signed', consumesProofRelay: { child: { childDefDigest: 'digest', childVersion: 2, childOutcome: 'done' } } } };
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => authority, now: () => 1000 },
+    fetchImpl: (async (url, init) => {
+      requests.push({ url: String(url), init: init! });
+      return Response.json(evidence);
+    }) as typeof fetch,
+  });
+  const scope = { workflows: ['wf'], crews: ['crew'], capabilities: ['build'] };
+  await c.openRoutingSession({ scope });
+  await c.renewRoutingSession();
+  await c.routingOfferContext({ workflow: 'wf', serve_capabilities: ['build'], serve_crews: ['crew'], frameId: 'frame' });
+  const submission = { candidateId: 'candidate', crewId: 'crew-id', capability: 'build', offer: { offerId: 'offer' } };
+  await c.putShiftOffer({ workflow: 'wf', serve_capabilities: ['build'], submission: submission as never });
+  await c.whatsNext({ workflow: 'wf', serve_capabilities: ['build'], routing: { kind: 'shift', frameId: 'frame' } });
+  assert.deepEqual(await c.getOrder({ workflow: 'wf', run: 'run' }), evidence);
+  await c.readRoutingClaim({ workflow: 'wf', run: 'run' });
+  const binding = { workflow: 'wf', orderId: 'run', parentWorkflow: 'parent', parentDefRef: { bundleDigest: 'a'.repeat(64), workflowName: 'parent' }, callPath: 'child', parentArtifactVersion: 2 };
+  await c.readInvocationBinding(binding);
+  await c.reportLaunch({ workflow: 'wf', report: { version: 'launch-v1' } as never });
+  await c.closeRoutingSession();
+  assert.deepEqual(requests.map(r => r.url.split('/').at(-1)), ['routing_session_open', 'routing_session_renew', 'routing_offer_context', 'put_shift_offer', 'whats_next', 'get_order', 'read_routing_claim', 'read_invocation_binding', 'report_launch', 'routing_session_close']);
+  for (const [index, r] of requests.entries()) {
+    const headers = new Headers(r.init.headers);
+    assert.equal(r.init.redirect, 'error');
+    assert.equal(headers.get('authorization'), 'Bearer enrolled');
+    assert.equal(headers.get('x-owenloop-routing-session'), index === 0 ? null : authority.credential);
+    assert.equal(String(r.init.body).includes(authority.credential), false);
+  }
+  assert.deepEqual(JSON.parse(String(requests[0]!.init.body)), { scope });
+  assert.deepEqual(JSON.parse(String(requests[3]!.init.body)).submission, submission);
+  assert.deepEqual(JSON.parse(String(requests[7]!.init.body)), binding);
+});
+
+test('assessLocalModel uses the scoped service verb with exactly the reviewed body', async () => {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => ({
+      sessionId: 'rs_session', shiftId: 'shf_service', credential: 'private-capability', expiresAt: 2000,
+    }), now: () => 1000 },
+    fetchImpl: (async (url, init) => {
+      requests.push({ url: String(url), init: init! });
+      return Response.json({ status: 'fallback', reason: 'provider unavailable', assessment: null });
+    }) as typeof fetch,
+  });
+
+  await c.assessLocalModel!({ workflow: 'wf', run: 'run', candidateIds: ['tuple-a', 'tuple-b'] });
+
+  assert.equal(requests[0]!.url, 'https://hub.example/api/assess_local_model');
+  assert.equal(requests[0]!.init.method, 'POST');
+  assert.equal(requests[0]!.init.redirect, 'error');
+  const headers = new Headers(requests[0]!.init.headers);
+  assert.equal(headers.get('authorization'), 'Bearer enrolled');
+  assert.equal(headers.get('x-owenloop-routing-session'), 'private-capability');
+  assert.deepEqual(JSON.parse(String(requests[0]!.init.body)), {
+    workflow: 'wf', run: 'run', candidateIds: ['tuple-a', 'tuple-b'],
+  });
+  assert.equal(String(requests[0]!.init.body).includes('private-capability'), false);
+});
+
+test('a configured routing session binds ordinary polling and reference reads', async () => {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => ({
+      sessionId: 'rs', shiftId: 'shf', credential: 'rs1.rs.secret', expiresAt: 2000,
+    }), now: () => 1000 },
+    fetchImpl: (async (url, init) => {
+      requests.push({ url: String(url), init: init! });
+      return Response.json({ text: 'ok', order: null });
+    }) as typeof fetch,
+  });
+  await c.whatsNext({ workflow: 'wf', serve_capabilities: [] });
+  await c.getReferenceOrder!({ workflow: 'wf', run: 'run' });
+  assert.deepEqual(requests.map(r => r.url), [
+    'https://hub.example/api/whats_next', 'https://hub.example/api/reference_order/v1',
+  ]);
+  for (const request of requests) {
+    assert.equal(request.init.redirect, 'error');
+    assert.equal(new Headers(request.init.headers).get('x-owenloop-routing-session'), 'rs1.rs.secret');
+    assert.equal(String(request.init.body).includes('rs1.rs.secret'), false);
+  }
+
+  const legacy: Array<{ url: string; init: RequestInit }> = [];
+  const ordinary = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    fetchImpl: (async (url, init) => {
+      legacy.push({ url: String(url), init: init! });
+      return Response.json({ text: 'ok', order: null });
+    }) as typeof fetch,
+  });
+  await ordinary.whatsNext({ workflow: 'wf', serve_capabilities: [] });
+  await ordinary.getReferenceOrder!({ workflow: 'wf', run: 'run' });
+  assert.equal(legacy.every(r => !new Headers(r.init.headers).has('x-owenloop-routing-session')), true);
+  assert.equal(legacy.every(r => r.init.redirect === undefined), true);
+});
+
+// Credential-free final-head service exchange. This is transport evidence only,
+// not a live Jev result or a complete ReferenceRouting anchor.
+// Source: model-routing-integration-preparation/worker-binding-preparation/
+// settled-executed-http-fixture.json (SHA256 429274df2a4136317423856c424f2b82347ad706668eaf4657ff7217a9fe5a8a).
+const SETTLED_EXECUTED_RESPONSE = String.raw`{"status":"advisory","reason":"supported_preference","assessment":{"advised":{"effort":"medium","harness":"codex","id":"b9045f516a08b3387d2e3f35fea63cade722e5f1810ad6a563bae7ddf8e2083c","model":"economical"},"anchorDigest":"sha256:d8a56ea7d40886fc173555b7279e5fccbf18b3e7814bb4e77f9a97115b041f03","assessmentId":"lma-1712b3cc-5b0d-46b1-a9e4-60358ac519ab","attemptId":"run_20ad2ca32adb87bfddbf362a","candidateDigest":"sha256:bdfb1a168ff3989628a07c03bc8b26991d9e7303b37af6df1f9586efbbd677bc","candidateIds":["7c773969c7ac4e35e0bcab090069e8d392a37541ed86e1ff4d3a878524d0b138","b9045f516a08b3387d2e3f35fea63cade722e5f1810ad6a563bae7ddf8e2083c"],"claimId":"run_20ad2ca32adb87bfddbf362a","createdAt":1790800211367,"decisionId":"routing-12da6b42-f121-42f5-8ac4-c77869d9bf9e","definition":{"bundleDigest":"sha256:620aed37bef6cb3b9a875d6c991b63bf5b3b25173b26c67a204615e36746dcd7","workflowName":"routing/local-model"},"expiresAt":1790800241329,"frameId":"wf_3f2869ff717fb20ff9693ec5","orderId":"run_20ad2ca32adb87bfddbf362a","policy":{"digest":"sha256:8afc3795bebadab8d9be2bc8e9f7d3166f49eca86c47647ec1ad6384b90b8dbf","id":"jev-routing-default","onFailure":"fallback","revision":"1"},"provider":{"cost":null,"model":"jev-1.13.0","usage":{"input_tokens":1,"output_tokens":1}},"reason":"supported_preference","status":"advisory","version":"local-model-assessment-v1","workflow":"wf_3f2869ff717fb20ff9693ec5"}}`;
+
+test('assessLocalModel preserves the credential-free settled service response bytes', async () => {
+  const body = { workflow: 'wf_3f2869ff717fb20ff9693ec5', run: 'run_20ad2ca32adb87bfddbf362a', candidateIds: [
+    '7c773969c7ac4e35e0bcab090069e8d392a37541ed86e1ff4d3a878524d0b138',
+    'b9045f516a08b3387d2e3f35fea63cade722e5f1810ad6a563bae7ddf8e2083c',
+  ] };
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => ({ sessionId: 'rs', shiftId: 'shf', credential: 'capability', expiresAt: 2000 }), now: () => 1000 },
+    fetchImpl: (async (_url, init) => {
+      assert.deepEqual(JSON.parse(String(init?.body)), body);
+      return new Response(SETTLED_EXECUTED_RESPONSE, { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch,
+  });
+  const response = await c.assessLocalModel!(body);
+  assert.equal(JSON.stringify(response), SETTLED_EXECUTED_RESPONSE);
+  assert.equal(response.status, 'advisory');
+  assert.equal(response.assessment?.advised?.id, body.candidateIds[1]);
+});
+
+test('routing credentials never travel to mismatched or non-HTTPS origins, expired sessions or redirected endpoints', async () => {
+  let fetched = 0;
+  let tokenReads = 0;
+  const make = (origin: string, allowedOrigin = 'https://hub.example', expiresAt = 2000) => createHubClient({ origin,
+    getToken: async () => { tokenReads++; return 'base-secret'; },
+    routingSession: { allowedOrigin, now: () => 1000, get: () => ({ sessionId: 'rs', shiftId: 'shf', credential: 'cap-secret', expiresAt }) },
+    fetchImpl: (async () => { fetched++; return new Response('cap-secret', { status: 403 }); }) as typeof fetch,
+  });
+  for (const origin of ['http://hub.example', 'https://evil.example', 'https://user:pass@hub.example', 'https://hub.example/path']) {
+    await assert.rejects(make(origin).readRoutingClaim({ workflow: 'wf', run: 'r' }), /routing/);
+  }
+  await assert.rejects(make('https://hub.example', undefined, 1000).readRoutingClaim({ workflow: 'wf', run: 'r' }), /routing/);
+  assert.equal(fetched, 0);
+  assert.equal(tokenReads, 0);
+  await assert.rejects(make('https://hub.example').readRoutingClaim({ workflow: 'wf', run: 'r' }), e => e instanceof HubError && e.status === 403 && !e.message.includes('cap-secret'));
+  assert.equal(fetched, 1); // no hidden retry or legacy downgrade
+  const legacy = client(fakeFetch([], { body: { text: 'legacy' } }));
+  await assert.rejects(legacy.readRoutingClaim({ workflow: 'wf', run: 'r' }), /routing/);
+});
+
+test('session bootstrap identity refuses redirects and mismatched origins before bearer lookup', async () => {
+  let reads = 0;
+  let request: RequestInit | undefined;
+  const create = (origin: string) => createHubClient({ origin, getToken: async () => { reads++; return 'enrolled'; },
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => undefined },
+    fetchImpl: (async (_url, init) => { request = init; return Response.json({ text: 'identity' }); }) as typeof fetch,
+  });
+  await assert.rejects(create('https://other.example').whoami(), /routing/);
+  assert.equal(reads, 0);
+  await create('https://hub.example').whoami();
+  assert.equal(request?.redirect, 'error');
+  assert.equal(new Headers(request?.headers).has('X-Owenloop-Routing-Session'), false);
+});
