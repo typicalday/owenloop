@@ -1216,13 +1216,17 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    upload = { remaining: body.size as number, stream };
 	    const keyPrefix = `orgs/${grant.identity.orgId}/artifacts/${grant.reservation.workflow}`
 	      + `/files/routed/${encodeURIComponent(grant.reservation.run)}/`;
+	    let uploadDispatched = false;
 	    void (async () => {
 	      await verifyCurrentConsequence(grant, entry.scope, now, controller.signal);
-	      return checked(grant, startEffect(grant, () => grant.hub.routingPutFileArtifact({
+	      return checked(grant, startEffect(grant, () => {
+		uploadDispatched = true;
+		return grant.hub.routingPutFileArtifact({
 		workflow: grant.reservation.workflow, run: grant.reservation.run,
 		body: stream, size: body.size as number, contentType: body.contentType as string,
 		...(body.filename === undefined ? {} : { filename: body.filename as string }),
-	      }, controller.signal)), now);
+		}, controller.signal);
+	      }), now);
 	    })().then(async (value: PutFileArtifactResponse) => {
 	      await verifyCurrentConsequence(grant, entry.scope, now, controller.signal);
 	      if (!value || typeof value.__file !== 'string' || !value.__file.startsWith(keyPrefix)
@@ -1233,7 +1237,13 @@ export async function createRoutingBroker(args: { now?: () => number;
 		|| value.filename !== body.filename
 		|| typeof value.text !== 'string') throw new Error('routing broker response refused');
 	      if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
-	    }).catch(refuse).finally(() => {
+	    }).catch(error => {
+	      if (uploadDispatched) {
+		grant.uncertainEffects.add('upload_file');
+		grant.syncUncertainty?.();
+	      }
+	      refuse(error);
+	    }).finally(() => {
 	      grant.uploadControllers.delete(controller);
 	      grant.uploadEffectControllers.delete(controller);
 	      stream.destroy();

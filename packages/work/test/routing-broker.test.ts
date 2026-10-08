@@ -787,7 +787,7 @@ test('broker rejects malformed upload pointers and a role-cap upload', async () 
       contentType: 'text/plain' }), /routing broker unavailable/);
     assert.equal(uploadCalls, 3, 'role cap never reaches the scoped upload route');
     grant.terminal();
-  } finally { await broker.close(); }
+  } finally { await assert.rejects(broker.close(), /quarantined/); }
 });
 
 test('broker upload absolute deadline aborts the parent request and child stream', async () => {
@@ -821,7 +821,7 @@ test('broker upload absolute deadline aborts the parent request and child stream
       chunks: slowBytes(), contentType: 'application/octet-stream' }), /routing broker unavailable/);
     assert.equal(aborted, true);
     grant.terminal();
-  } finally { await broker.close(); }
+  } finally { await assert.rejects(broker.close(), /quarantined/); }
 });
 
 test('malformed lifecycle replies and rotated sessions refuse through the child transport', async () => {
