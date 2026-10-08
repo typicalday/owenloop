@@ -56,6 +56,24 @@ Only owed target versions may advance under the held claim. Hidden authored
 fields therefore still fence drift even though Service v1 does not project
 them. The accessor becomes unavailable when the local hold ends.
 
+For an opt-in local MCP client, start this command only for the run whose
+claim was handed to this process, from a directory with the locally installed
+workflow definition (or with that definition in the global store):
+
+```sh
+owenloop work hold --order <workflow>/<run> --origin https://<service-origin> --as <account> --mcp --verified-hosted
+```
+
+The work-scoped agent credential is resolved from the local credential store;
+it does not belong in MCP content or command arguments. The client sees only
+`get_order` in `tools/list` by default. `--never-release` is refused in this
+mode because it declares that another process holds the claim. The holder's
+initial `get_order`, reference reads, and heartbeat contact the Service as
+part of its lease lifecycle; MCP stdin EOF or a stop signal releases its
+claim. This is a model-read-only surface, not a no-touch spectator read. The
+Service's claimed bit and holder tag remain trusted observations, not proof
+of exclusive holder identity. Do not mount a second client on the same claim.
+
 Explicit `--mcp-tools get_order,submit` enables conditional submission. The
 wrapper re-verifies the v1 order, takes path and version from its verified
 output list, signs the private verified packet, and posts only to
