@@ -324,6 +324,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     usage();
     return 2;
   }
+  if (parsed.verifiedHosted && parsed.neverRelease) {
+    err('owenloop work hold: --verified-hosted requires this process to be the holder of record; --never-release is unsupported');
+    usage();
+    return 2;
+  }
   if (parsed.verifiedHosted && parsed.mcpTools !== undefined
     && !(parsed.mcpTools.length === 1 && parsed.mcpTools[0] === 'get_order')
     && !(parsed.mcpTools.length === 2 && parsed.mcpTools.includes('get_order') && parsed.mcpTools.includes('submit'))) {

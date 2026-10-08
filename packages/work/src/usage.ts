@@ -79,7 +79,8 @@ Options:
       --verified-hosted          opt-in locally verified get_order for this held
 				 run; read-only unless --mcp-tools get_order,submit
 				 also opts into signed conditional-v1 submit;
-				 requires --mcp and an HTTPS hub origin
+				 requires --mcp, an HTTPS hub origin, and this
+				 process to be the holder of record
 
   exec options (usually spawned by shift, not run by hand):
       <workflow>/<run>           the command order to run (positional order-id;
