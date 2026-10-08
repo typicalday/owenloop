@@ -28,6 +28,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { ASYNC_COMMANDS, classifyAddSource, COMMAND_OPTIONS, defaultIO, main, mainAsync, USAGE } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { ADD_JOURNAL_FILENAME } from '../src/add.ts';
+import { validateValue } from '../src/schema.ts';
+import { orderSchema } from '../src/schemas/index.ts';
 import { packBundle, unpackBundle } from '../src/bundle/index.ts';
 import { writeHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import {
@@ -946,6 +948,38 @@ test('order: prints the persisted order packet for a run, identical to the tick 
   const res = run('order', wf, order.run);
   assert.equal(res.code, 0);
   assert.deepStrictEqual(res.json(), order, 'read-back packet equals the order the tick emitted');
+});
+
+test('order: private claim input witness stays in SQLite and out of frozen v1 JSON', (t) => {
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-input-workdir-order-'));
+  t.after(() => rmSync(defsDir, { recursive: true, force: true }));
+  writeFileSync(join(defsDir, 'input-workdir-order.yaml'), [
+    'name: input-workdir-order',
+    'inputs: [{name: target, seedOwed: true}]',
+    'steps:',
+    '  - name: provisioner',
+    '    consumes: []',
+    '    produces: [workspace]',
+    '    workdirFrom: target.path',
+    '',
+  ].join('\n'));
+  const { run, db } = makeCli({ defs: defsDir });
+  const wf = run('create', 'input-workdir-order', '--provide', `target=${J({ path: '/claim-cwd' })}`).json().workflow;
+  const emitted = run('tick', wf).json().orders[0];
+  assert.ok(emitted);
+  const result = run('order', wf, emitted.run);
+  assert.equal(result.code, 0, result.err);
+  assert.deepEqual(result.json(), emitted);
+  assert.equal(Object.hasOwn(result.json(), 'claimWorkdirInputV1'), false);
+  assert.equal(validateValue(orderSchema, result.json()).valid, true);
+  const raw = new DatabaseSync(db);
+  try {
+    const row = raw.prepare('SELECT order_json FROM run WHERE id = ?').get(emitted.run) as { order_json: string };
+    assert.deepEqual(JSON.parse(row.order_json).claimWorkdirInputV1,
+      { stem: 'target', version: 1, present: true });
+  } finally {
+    raw.close();
+  }
 });
 
 test('order: unknown run exits 1 with a run-not-found message', () => {
