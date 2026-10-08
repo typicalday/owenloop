@@ -9,7 +9,7 @@ import { buildDef } from '../src/defs.ts';
 import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import {
-  collectionCheckKey, collectionLeaseSuccessors, collectionValueWitnesses,
+  applyOutcome, collectionCheckKey, collectionLeaseSuccessors, collectionValueWitnesses,
   computeFingerprint, eligibleFirings, modelCheck,
 } from '../src/model.ts';
 import type { CollectionCheckState, CollectionLease } from '../src/model.ts';
@@ -109,6 +109,153 @@ test('collection lease: emit, later schema refusal, same-run correction after ca
   engine.close(wf, run.run);
   move('collection-close');
   assert.deepEqual(model.leases, []);
+});
+
+test('collection lease: rejected seal reoffers producer for another emit and reseal', () => {
+  const definition = def('reseal-after-reducer-reject', [input('request', { seedOwed: false })], [
+    step({ name: 'produce', consumes: ['request'], produces: ['items[]'] }),
+    step({ name: 'reduce', consumes: ['items[*]'], produces: ['report'], terminal: true }),
+  ]);
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const sameArtifacts = (stage: string) =>
+    assert.deepEqual(fields(model.arts), fields(arts()), `model/runtime diverged ${stage}`);
+  const firstRun = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'produce');
+  assert.ok(firstRun);
+  const firstLease: CollectionLease = {
+    step: 'produce', key: firstRun.key, stem: 'items', inputs: ['request'],
+    fingerprint: computeFingerprint(arts(), ['request']),
+  };
+  let model: CollectionCheckState = { arts: arts(), leases: [firstLease] };
+  const leaseMove = (lease: CollectionLease, outcome: string, count?: number) => {
+    const next = collectionLeaseSuccessors(definition, model, lease, 2).find((entry) =>
+      entry.step.outcome === outcome && entry.step.count === count);
+    assert.ok(next, `expected ${outcome}${count === undefined ? '' : `(${count})`}`);
+    model = next.state;
+    sameArtifacts(`after ${outcome}`);
+  };
+
+  assert.deepEqual(engine.emit(wf, firstRun.run, [{ value: { item: 'first' } }]).created, ['items[0]']);
+  leaseMove(firstLease, 'collection-emit', 1);
+  assert.equal(store.getArtifact(wf, 'items.sealed')?.acceptance, 'owed');
+  assert.equal(engine.seal(wf, firstRun.run).outcome, 'green');
+  leaseMove(firstLease, 'collection-seal');
+  engine.close(wf, firstRun.run);
+  leaseMove(firstLease, 'collection-close');
+
+  const firstReducer = engine.tick(wf, { now: 2000 }).orders.find((order) => order.step === 'reduce');
+  assert.ok(firstReducer);
+  const rejectFiring = eligibleFirings(definition, model.arts).find((firing) => firing.step === 'reduce');
+  assert.ok(rejectFiring, 'checker must offer the same reducer');
+  assert.equal(engine.reject(wf, 'items.sealed', 'reduce', 'add another item').outcome, 'rejected');
+  model = { ...model, arts: applyOutcome(definition, model.arts, rejectFiring, 'judgment-reject',
+    { maxCollectionSize: 2, rejectPath: 'items.sealed' })[0]! };
+  sameArtifacts('after reducer rejects the seal');
+  engine.close(wf, firstReducer.run, 'no_work');
+  sameArtifacts('after reducer close');
+  assert.equal(store.getArtifact(wf, 'items.sealed')?.acceptance, 'rejected');
+
+  const reoffer = eligibleFirings(definition, model.arts).find((firing) => firing.step === 'produce');
+  assert.ok(reoffer, 'checker must reoffer the producer after seal rejection');
+  const secondRun = engine.tick(wf, { now: 3000 }).orders.find((order) => order.step === 'produce');
+  assert.ok(secondRun, 'runtime must reoffer the producer after seal rejection');
+  const secondLease: CollectionLease = {
+    step: 'produce', key: reoffer.key, stem: 'items', inputs: ['request'],
+    fingerprint: computeFingerprint(model.arts, reoffer.inputs),
+  };
+  model = { ...model, leases: [secondLease] };
+  sameArtifacts('after producer reoffer');
+
+  assert.deepEqual(engine.emit(wf, secondRun.run, [{ value: { item: 'second' } }]).created, ['items[1]']);
+  leaseMove(secondLease, 'collection-emit', 1);
+  assert.equal(store.getArtifact(wf, 'items[0]')?.acceptance, 'green');
+  assert.equal(store.getArtifact(wf, 'items[1]')?.acceptance, 'green');
+  assert.equal(engine.seal(wf, secondRun.run).outcome, 'green');
+  leaseMove(secondLease, 'collection-seal');
+  engine.close(wf, secondRun.run);
+  leaseMove(secondLease, 'collection-close');
+
+  const finalReducer = engine.tick(wf, { now: 4000 }).orders.find((order) => order.step === 'reduce');
+  assert.ok(finalReducer);
+  const completeFiring = eligibleFirings(definition, model.arts).find((firing) => firing.step === 'reduce');
+  assert.ok(completeFiring);
+  assert.equal(engine.green(wf, finalReducer.run, 'report', { complete: true }).outcome, 'green');
+  model = { ...model, arts: applyOutcome(definition, model.arts, completeFiring, 'green',
+    { maxCollectionSize: 2 })[0]! };
+  sameArtifacts('after reducer completion');
+  engine.close(wf, finalReducer.run);
+  assert.equal(engine.status(wf).done, true);
+});
+
+test('collection reducer may reject a member while leaving its seal green', () => {
+  const definition = def('member-target-reject', [input('request', { seedOwed: false })], [
+    step({ name: 'produce', consumes: ['request'], produces: ['items[]'] }),
+    step({ name: 'reduce', consumes: ['items[*]'], produces: ['report'] }),
+  ]);
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const produce = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'produce');
+  assert.ok(produce);
+  engine.emit(wf, produce.run, [{ value: { item: 'first' } }]);
+  engine.seal(wf, produce.run);
+  engine.close(wf, produce.run);
+  const before = new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const firing = eligibleFirings(definition, before).find((candidate) => candidate.step === 'reduce');
+  assert.ok(firing);
+  const reduce = engine.tick(wf, { now: 2000 }).orders.find((order) => order.step === 'reduce');
+  assert.ok(reduce);
+  assert.equal(engine.reject(wf, 'items[0]', 'reduce', 'correct this item').outcome, 'rejected');
+  const modeled = applyOutcome(definition, before, firing, 'judgment-reject',
+    { maxCollectionSize: 1, rejectPath: 'items[0]' })[0]!;
+  assert.deepEqual(fields(modeled), fields(new Map(store.listArtifacts(wf).map((art) => [art.path, art]))));
+  assert.equal(store.getArtifact(wf, 'items.sealed')?.acceptance, 'green');
+  assert.throws(() => applyOutcome(definition, before, firing, 'judgment-reject',
+    { maxCollectionSize: 1, rejectPath: 'request' }), /cannot judgment-reject/);
+});
+
+test('collection reducer checker witnesses distinguish seal and member rejection', () => {
+  const definition = def('reducer-reject-targets', [input('request', { seedOwed: false })], [
+    step({ name: 'produce', consumes: ['request'], produces: ['items[]'] }),
+    step({ name: 'reduce', consumes: ['items[*]'], produces: ['report'] }),
+  ]);
+  definition.invariants = [
+    { name: 'seal-stays-green', requires: { not: { path: 'items.sealed', is: 'rejected' } } },
+    { name: 'member-stays-green', requires: { not: { path: 'items[0]', is: 'rejected' } } },
+  ];
+  const report = modelCheck(definition, {
+    maxStates: 3000, maxDepth: 20, maxCollectionSize: 1, assumeProvided: true,
+  });
+  const seal = report.invariantViolations.find((finding) => finding.invariant === 'seal-stays-green');
+  const member = report.invariantViolations.find((finding) => finding.invariant === 'member-stays-green');
+  assert.ok(seal?.path.some((move) => move.outcome === 'judgment-reject' && move.path === 'items.sealed'),
+    'the checker must explore the reducer rejecting the seal');
+  assert.ok(member?.path.some((move) => move.outcome === 'judgment-reject' && move.path === 'items[0]'),
+    'the checker must also explore the reducer rejecting a member');
+});
+
+test('CLI text names the exact collection rejection target in checker witnesses', () => {
+  const defs = mkdtempSync(join(tmpdir(), 'owenloop-reject-targets-'));
+  writeFileSync(join(defs, 'reject-target-trace.yaml'), [
+    'name: reject-target-trace',
+    'inputs: [{ name: request, seedOwed: false }]',
+    'steps:',
+    '  - { name: produce, consumes: [request], produces: ["items[]"], body: produce }',
+    '  - { name: reduce, consumes: ["items[*]"], produces: [report], body: reduce }',
+  ].join('\n'));
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = main(['check', 'reject-target-trace', '--max-collection', '1', '--max-states', '3000'], {
+    cwd: defs, env: { OWENLOOP_DEFS: defs, OWENLOOP_DB: join(defs, 'state.db') },
+    out: (line) => out.push(line), err: (line) => err.push(line),
+  });
+  assert.equal(code, 0, err.join('\n'));
+  const text = out.join('\n');
+  assert.notEqual(text, '', err.join('\n'));
+  assert.match(text, /reduce\/judgment-reject\(items\.sealed\)/);
+  assert.match(text, /reduce\/judgment-reject\(items\[0\]\)/);
 });
 
 test('collection lease: moved claim input born-rejects the seal before emit or seal', () => {
@@ -264,6 +411,42 @@ test('collection lease: mixed producer emits before singleton green on one runti
   assert.equal(report.bounded, false, 'BFS can exhaust its finite model');
   assert.deepEqual(report.coverageIncomplete, ['collection-width-cap'],
     'finite width stays explicit rather than being confused with BFS exhaustion');
+});
+
+test('mixed collection lease can reject its second produced input on the open run', () => {
+  const definition = def('mixed-input-reject', [input('seed', { seedOwed: false })], [
+    step({ name: 'left-build', consumes: ['seed'], produces: ['left'] }),
+    step({ name: 'right-build', consumes: ['seed'], produces: ['right'] }),
+    step({ name: 'gather', consumes: ['left', 'right'], produces: ['note', 'items[]'] }),
+  ]);
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const builders = engine.tick(wf, { now: 1000 }).orders;
+  for (const [name, path] of [['left-build', 'left'], ['right-build', 'right']] as const) {
+    const order = builders.find((candidate) => candidate.step === name);
+    assert.ok(order);
+    assert.equal(engine.green(wf, order.run, path, { ready: true }).outcome, 'green');
+    engine.close(wf, order.run);
+  }
+  const run = engine.tick(wf, { now: 2000 }).orders.find((order) => order.step === 'gather');
+  assert.ok(run);
+  const arts = new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const lease: CollectionLease = {
+    step: 'gather', key: run.key, stem: 'items', inputs: ['left', 'right'],
+    fingerprint: computeFingerprint(arts, ['left', 'right']),
+  };
+  const model: CollectionCheckState = { arts, leases: [lease] };
+  const rejections = collectionLeaseSuccessors(definition, model, lease, 1)
+    .filter((move) => move.step.outcome === 'judgment-reject');
+  assert.deepEqual(rejections.map((move) => move.step.path), ['left', 'right'],
+    'checker must retain both legal consumed targets on the same claimed run');
+  assert.equal(engine.reject(wf, 'right', 'gather', 'redo right').outcome, 'rejected');
+  assert.deepEqual(fields(rejections[1]!.state.arts),
+    fields(new Map(store.listArtifacts(wf).map((art) => [art.path, art]))));
+  assert.equal(store.getArtifact(wf, 'left')?.acceptance, 'green');
+  assert.equal(store.getArtifact(wf, 'right')?.acceptance, 'rejected');
+  assert.equal(rejections[1]!.state.leases.length, 1, 'judgment does not silently close the claimed run');
 });
 
 test('collection lease: scoped singleton judge uses the selected modifier on the same run', () => {

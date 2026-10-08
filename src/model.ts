@@ -2393,15 +2393,10 @@ export function eligibleOutcomes(
     outcomes.push('green');
   }
 
-  // judgment-reject is only valid when the firing has at least one consumed input
-  // from a step producer (not 'human'). A step can only invalidate artifacts it
-  // didn't originally seed — rejecting a human-provided input is not modeled here
-  // (the engine's assertAuthority enforces this at runtime).
-  const hasRejectableInput = firing.inputs.some((p) => {
-    const a = arts.get(p);
-    return a && a.producer !== 'human' && a.acceptance === 'green';
-  });
-  if (hasRejectableInput) {
+  // Model step-produced green consume targets here. Runtime authority also
+  // permits rejecting a human-provided consumed input, but the corresponding
+  // human reprovide transition is outside this finite checker graph.
+  if (rejectableFiringInputs(def, arts, firing).length > 0) {
     outcomes.push('judgment-reject');
   }
 
@@ -2416,6 +2411,18 @@ export function eligibleOutcomes(
   // retract only for bare collection members
   if (isMember) outcomes.push('retract');
   return outcomes;
+}
+
+/** Concrete green inputs this consumer can reject under Engine.assertAuthority. */
+function rejectableFiringInputs(def: WorkflowDef, arts: ArtifactMap, firing: Firing): string[] {
+  const step = def.steps.find((candidate) => candidate.name === firing.step);
+  if (!step || step.judges !== undefined) return [];
+  return [...new Set(firing.inputs)].filter((path) => {
+    const art = arts.get(path);
+    if (!art || art.producer === 'human' || art.acceptance !== 'green') return false;
+    const stem = parseElement(path)?.stem ?? sealStem(path) ?? path;
+    return step.consumes.some((consume) => consume.stem === stem || consume.stem === path);
+  });
 }
 
 /**
@@ -2874,16 +2881,20 @@ export function collectionLeaseSuccessors(
       if (outcome === 'green' && !witnesses?.green) continue;
       if (outcome === 'schema-reject' && !witnesses?.refusal) continue;
       const selected = outcome === 'green' ? witnesses!.acceptedModifiers : [undefined];
-      for (const selectedModifier of selected) {
-	for (const arts of applyOutcome(def, state.arts, firing, outcome,
-	  { maxCollectionSize, modifier: state.modifier ?? modifier })) {
-	  const submitted = arts.get(path)?.acceptance === 'submitted';
-	  const pending = clonePendingModifiers(state.pendingModifiers);
-	  if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
-	  else if (outcome === 'green') delete pending[path];
-	  move(outcome, arts, state.leases, undefined, path,
-	    outcome === 'green' && selectedModifier !== undefined && !submitted
-	      ? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
+      const rejectPaths = outcome === 'judgment-reject'
+	? rejectableFiringInputs(def, state.arts, firing) : [undefined];
+      for (const rejectPath of rejectPaths) {
+	for (const selectedModifier of selected) {
+	  for (const arts of applyOutcome(def, state.arts, firing, outcome,
+	    { maxCollectionSize, modifier: state.modifier ?? modifier, rejectPath })) {
+	    const submitted = arts.get(path)?.acceptance === 'submitted';
+	    const pending = clonePendingModifiers(state.pendingModifiers);
+	    if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
+	    else if (outcome === 'green') delete pending[path];
+	    move(outcome, arts, state.leases, undefined, rejectPath ?? path,
+	      outcome === 'green' && selectedModifier !== undefined && !submitted
+		? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
+	  }
 	}
       }
     }
@@ -2947,8 +2958,8 @@ export function collectionLeaseSuccessors(
  * Outcomes modeled (single-threaded; born-rejected CAS races omitted):
  *   'green'           — singleton/map output: acceptance green, version+1,
  *                       fingerprint = computeFingerprint(arts, firing.inputs)
- *   'judgment-reject' — reject the primary consumed input (the green artifact
- *                       the step consumes that it has authority to invalidate),
+ *   'judgment-reject' — reject a concrete green consumed input that this step
+ *                       has authority to invalidate (selected by rejectPath),
  *                       bumping judgmentRejects+1
  *   'schema-reject'   — acceptance rejected, schemaRejects+1 on the output
  *   'skip'            — acceptance skipped + fingerprint of requiredInputs
@@ -2965,7 +2976,7 @@ export function applyOutcome(
   arts: Map<string, ArtifactData>,
   firing: Firing,
   outcome: CheckStep['outcome'],
-  opts: { maxCollectionSize: number; modifier?: string },
+  opts: { maxCollectionSize: number; modifier?: string; rejectPath?: string },
 ): Array<Map<string, ArtifactData>> {
   // emit-seal branches: return one map per element count 0..maxCollectionSize
   if (outcome === 'emit-seal') {
@@ -2984,15 +2995,13 @@ export function applyOutcome(
   }
 
   if (outcome === 'judgment-reject') {
-    // judgment-reject is a CONSUMER action on a CONSUMED artifact, not on the output.
-    // Identify the "reject target" — the primary consumed artifact that this
-    // firing step can invalidate. This is the first input that has a step producer
-    // (not 'human') and is currently green. If no such input exists, this outcome
-    // is a no-op (eligibleOutcomes guards against this case).
-    const rejectTarget = firing.inputs.find((p) => {
-      const a = next.get(p);
-      return a && a.producer !== 'human' && a.acceptance === 'green';
-    });
+    // A reducer can reject either a live member or its seal. The checker must
+    // preserve the chosen target, since the two verdicts reoffer different work.
+    const targets = rejectableFiringInputs(def, arts, firing);
+    if (opts.rejectPath !== undefined && !targets.includes(opts.rejectPath)) {
+      throw new Error(`'${firing.step}' cannot judgment-reject '${opts.rejectPath}'`);
+    }
+    const rejectTarget = opts.rejectPath ?? targets[0];
 
     if (rejectTarget !== undefined) {
       const targetArt = next.get(rejectTarget);
@@ -3499,38 +3508,47 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
           break outer;
         }
 
-	const successors = applyOutcome(def, arts, firing, outcome, { maxCollectionSize, modifier });
+	const rejectPaths = outcome === 'judgment-reject'
+	  ? rejectableFiringInputs(def, arts, firing) : [undefined];
+	for (const rejectPath of rejectPaths) {
+	  // A reducer may have many live members. Count each target branch against
+	  // the same search limit rather than expanding the whole fan-in at once.
+	  if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
+	  const successors = applyOutcome(def, arts, firing, outcome,
+	    { maxCollectionSize, modifier, rejectPath });
 
-        for (const suc of successors) {
-	  const path = firing.outputs[0];
-	  const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
-	  if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
-	  let nextModifier = modifier;
-	  let approvedModifier: string | undefined;
-	  if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
-	    approvedModifier = pendingModifiers[path];
-	    nextModifier = approvedModifier ?? modifier;
-	    delete pendingModifiers[path];
-	  }
-	  const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier'
-	    ? singletonValueWitnesses(def, ordinaryProduce, modifier).acceptedModifiers : [undefined];
-	  for (const selected of choices) {
-	    const nextPending = clonePendingModifiers(pendingModifiers);
-	    let routed = nextModifier;
-	    if (outcome === 'green' && path) {
-	      delete nextPending[path];
-	      if (selected !== undefined) {
-		if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
-		else routed = selected;
-	      }
+	  for (const suc of successors) {
+	    const path = firing.outputs[0];
+	    const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
+	    if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
+	    let nextModifier = modifier;
+	    let approvedModifier: string | undefined;
+	    if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
+	      approvedModifier = pendingModifiers[path];
+	      nextModifier = approvedModifier ?? modifier;
+	      delete pendingModifiers[path];
 	    }
-	    const selectedModifier = outcome === 'green' ? selected : approvedModifier;
-	    const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
-	      ...(selectedModifier === undefined ? {} : { selectedModifier }) };
-	    enqueue({ arts: suc, leases: node.state.leases, modifier: routed,
-	      pendingModifiers: nextPending }, trace);
+	    const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier'
+	      ? singletonValueWitnesses(def, ordinaryProduce, modifier).acceptedModifiers : [undefined];
+	    for (const selected of choices) {
+	      const nextPending = clonePendingModifiers(pendingModifiers);
+	      let routed = nextModifier;
+	      if (outcome === 'green' && path) {
+		delete nextPending[path];
+		if (selected !== undefined) {
+		  if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
+		  else routed = selected;
+		}
+	      }
+	      const selectedModifier = outcome === 'green' ? selected : approvedModifier;
+	      const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
+		...(rejectPath === undefined ? {} : { path: rejectPath }),
+		...(selectedModifier === undefined ? {} : { selectedModifier }) };
+	      enqueue({ arts: suc, leases: node.state.leases, modifier: routed,
+		pendingModifiers: nextPending }, trace);
+	    }
 	  }
-        }
+	}
       }
     }
     if (boundsHit.has('maxStates')) break;
