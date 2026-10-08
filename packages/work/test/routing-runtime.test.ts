@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -72,7 +73,7 @@ test('spawn plans transport only an explicit handoff and strip ambient bearer fo
 });
 
 test('role startup consumes a private session handoff, then stops before any legacy effects', async () => {
-  const root = mkdtempSync('/Volumes/more/owenloop-routing-role-');
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-role-'));
   const now = Date.now();
   const calls: string[] = [];
   try {
@@ -118,7 +119,7 @@ test('role startup consumes a private session handoff, then stops before any leg
 });
 
 test('handoff refuses wrong target, wrong session credential, and expired authority without fallback', async () => {
-  const root = mkdtempSync('/Volumes/more/owenloop-routing-refuse-');
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-refuse-'));
   let now = 1_000;
   try {
     const session = await openShiftRoutingSession({ stateDir: root, origin, orgId: 'org', principalId: 'actor',
@@ -156,7 +157,7 @@ test('handoff refuses wrong target, wrong session credential, and expired author
 });
 
 test('willing tuples require exact cached org, account, crew, serving crew and local availability', () => {
-  const root = mkdtempSync('/Volumes/more/owenloop-routing-roster-');
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-roster-'));
   try {
     const env = { HOME: root };
     writeHubRosterCache(env, { version: 1, origin, orgId: 'org', orgName: 'Org', account: 'default', fetchedAt: 1000,
