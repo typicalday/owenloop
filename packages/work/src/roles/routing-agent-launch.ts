@@ -23,7 +23,7 @@ type Args = {
   holder: ContactHolder; workflow: string; run: string; now?: () => number;
   /** Optional local effects such as git worktree provisioning. Only after the
    * authenticated report ACK; the final live order read follows the effect. */
-  beforeFinalCheck?: (signal?: AbortSignal) => Promise<void> | void;
+  beforeFinalCheck?: (order: OrderPacket, signal?: AbortSignal) => Promise<void> | void;
 };
 
 /**
@@ -104,7 +104,7 @@ export function createRoutedAgentSelection(args: Args):
       || accepted.digest !== valueDigestHex(report) || !Number.isSafeInteger(accepted.recordedAt)
       || now() >= reservation.expiresAt) throw refused();
       if (args.beforeFinalCheck) {
-	await args.beforeFinalCheck(later ?? signal);
+	await args.beforeFinalCheck(pinned, later ?? signal);
 	if (!live(later) || now() >= reservation.expiresAt) throw refused();
       }
       const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,

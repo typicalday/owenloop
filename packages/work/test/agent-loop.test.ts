@@ -293,6 +293,7 @@ interface BuildOpts {
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   routedSelect?: AgentRunLoopOptions['routedSelect'];
   routingHolderPath?: string;
+  createRoutingHolderPath?: AgentRunLoopOptions['createRoutingHolderPath'];
   routedFileCacheRoot?: string;
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
@@ -327,6 +328,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.routedSelect === undefined ? {} : {
       routingHolderPath: b.routingHolderPath ?? '/private/routed-holder.json',
     }),
+    ...(b.createRoutingHolderPath ? { createRoutingHolderPath: b.createRoutingHolderPath } : {}),
     ...(b.routedFileCacheRoot ? { routedFileCacheRoot: b.routedFileCacheRoot } : {}),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
@@ -456,6 +458,38 @@ test('routed authorization refusal starts no provider process', async () => {
   assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
   assert.ok(h.errs.some(line => line.includes('routed launch authorization refused')));
   assert.ok(h.errs.every(line => !line.includes('private broker failed')));
+});
+
+test('routed holder subcap is issued only after final launch authorization', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({ getOrder: [agentOrder(),
+    agentOrder({ claimed: false, outcome: 'green' })] });
+  const gates: string[] = [];
+  const h = buildOpts({ hub, adapter,
+    createRoutingHolderPath: () => { gates.push('holder'); return '/private/fresh-holder.json'; },
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => { gates.push('report-and-final-order'); return {
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }; } }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.deepEqual(gates, ['report-and-final-order', 'holder']);
+  const start = adapter.calls.find(call => call.kind === 'start');
+  if (start?.kind !== 'start') assert.fail('missing routed provider start');
+  assert.ok(start.args.owenloopMcp.args.includes('/private/fresh-holder.json'));
+  assert.equal(start.args.owenloopMcp.args.includes('--as'), false);
+});
+
+test('holder handoff issuance failure after final launch order starts no provider', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({ hub, adapter,
+    createRoutingHolderPath: () => { throw new Error('private path detail'); },
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }) }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+  assert.ok(h.errs.every(line => !line.includes('private path detail')));
 });
 
 test('routed start refuses missing holder subcap before report and provider work', async () => {

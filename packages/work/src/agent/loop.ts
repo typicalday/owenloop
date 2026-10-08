@@ -234,6 +234,9 @@ export interface AgentRunLoopOptions {
   /** One-use private holder subcap for nested MCP. Required for routed starts;
    * never substitute the operator account selector or a bearer fallback. */
   routingHolderPath?: string;
+  /** Issue the one-use routed holder handoff immediately after the final
+   * launch-order gate, so preflight cannot consume its short lifetime. */
+  createRoutingHolderPath?: () => string;
   /** Published read-only cache view, used only when a routed input actually
    * contains a verified file pointer. Never attach it to every routed agent. */
   routedFileCacheRoot?: string;
@@ -1246,9 +1249,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       if (delta.deliveredReasonAt !== undefined) deliveredReasonAt = delta.deliveredReasonAt;
     }
 
-    if (routedSelection && (!opts.routingHolderPath || !isAbsolute(opts.routingHolderPath)))
+    if (routedSelection && !opts.createRoutingHolderPath
+      && (!opts.routingHolderPath || !isAbsolute(opts.routingHolderPath)))
       return releaseWith('routed-holder-unavailable', 'routed-launch-refused');
-    const owenloopMcp = buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath);
+    let owenloopMcp = routedSelection && opts.createRoutingHolderPath
+      ? undefined : buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath);
+    const holderMount = () => {
+      if (!owenloopMcp) throw new Error('routed holder handoff unavailable');
+      return owenloopMcp;
+    };
     /**
      * The human approval channel for this session's escalated tool calls.
      *
@@ -1276,15 +1285,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       routing.kind === 'resolved'
         ? { model: routing.model, effort: routing.effort }
         : undefined;
-    const deliverArgs: DeliverArgs = {
+    const deliverArgs = (): DeliverArgs => ({
       cwd: recordCwd,
-      owenloopMcp,
+      owenloopMcp: holderMount(),
       permissions,
       approvals,
       ...(routedFileCacheRoot ? { verifiedFileCacheRoot: routedFileCacheRoot } : {}),
       ...(resolvedModel ?? {}),
       ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
-    };
+    });
     /** Built lazily: a cold start after a refused resume needs a FRESH one. */
     const coldArgs = (): StartArgs => ({
       // The replay brief is the ordinary brief PLUS a trailing rejection section,
@@ -1296,7 +1305,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
           : {}),
       }),
       cwd: recordCwd,
-      owenloopMcp,
+      owenloopMcp: holderMount(),
       permissions,
       approvals,
       ...(routedFileCacheRoot ? { verifiedFileCacheRoot: routedFileCacheRoot } : {}),
@@ -1636,7 +1645,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						if (resumable && prev !== null) {
 							sessionRef = { harness: prev.harness, token: prev.token };
 							createdAt = prev.createdAt;
-							await active.deliver(sessionRef, delta.message, deliverArgs, onEvent);
+							await active.deliver(sessionRef, delta.message, deliverArgs(), onEvent);
 							markDelivered();
 							return;
 						}
@@ -1661,7 +1670,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						next = 'cold-restart';
 					} else {
 						const wake = await dispatch('wake', { wakeUsed: true }, async () => {
-							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs, onEvent);
+							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs(), onEvent);
 						});
 							if ('outcome' in wake) return wake.outcome;
 							if (isHarnessTurnError(wake.failure) && wake.failure.terminal) {
@@ -1715,9 +1724,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       routedStartUsed = true;
       try {
 	const admitted = await routedSelection.authorize(routedAbort.signal);
+	if (signalled || leaseSettled || routedAbort.signal.aborted
+	  || opts.now() >= admitted.expiresAt
+	  || !isDeepStrictEqual(admitted.selected, routedSelection.selected)) return false;
+	if (opts.createRoutingHolderPath) {
+	  const path = opts.createRoutingHolderPath();
+	  if (!isAbsolute(path)) return false;
+	  owenloopMcp = buildOwenloopMcp(spec, undefined, undefined, path);
+	}
 	return !signalled && !leaseSettled && !routedAbort.signal.aborted
-	  && opts.now() < admitted.expiresAt
-	  && isDeepStrictEqual(admitted.selected, routedSelection.selected);
+	  && opts.now() < admitted.expiresAt;
       } catch { return false; }
     }
 
@@ -1774,7 +1790,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       }
 
       try {
-        await active.deliver(sessionRef, delta.message, deliverArgs, onEvent);
+	await active.deliver(sessionRef, delta.message, deliverArgs(), onEvent);
         markDelivered();
         return { t: 'turn' };
       } catch (e: unknown) {

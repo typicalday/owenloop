@@ -91,7 +91,10 @@ test('local workdir materialization runs after report ACK and before final launc
   const f = fixture();
   const plan = await createRoutedAgentSelection({ child: f.child, holder,
     workflow: 'wf', run: 'run', now: () => 2_000,
-    beforeFinalCheck: () => { f.calls.push('materialize'); },
+    beforeFinalCheck: (pinned) => {
+      assert.deepEqual(pinned, order);
+      f.calls.push('materialize');
+    },
   })(order);
   assert.deepEqual(f.calls, ['claim']);
   await plan.authorize();

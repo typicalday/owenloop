@@ -1,0 +1,127 @@
+/** Credential-free routed agent composition, still held behind agent-run's
+ * top-level startup fence until provider resume/terminal acceptance is proven. */
+import { dirname } from 'node:path';
+import { createAgentRunLoop, type AgentRunOutcome } from '../agent/loop.ts';
+import { resolveCacheDir } from '../bundle/cache.ts';
+import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
+import { adapterFor, registeredHarnessIds } from '../harness/registry.ts';
+import { appendSession, sessionsPath } from '../harness/session-store.ts';
+import { allocateRoutedFileCache } from '../hub/routed-file-cache.ts';
+import type { ContactHolder } from '../hub/types.ts';
+import type { RoutingHandoffV1 } from '../shift/runtime.ts';
+import { createRoutedAgentSelection } from './routing-agent-launch.ts';
+import { createRoutedAgentStepLoader } from './routing-agent-step.ts';
+import { assertRoutedAgentWorkdirDisjoint, planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
+import { createRoutingHolderHandoff } from './routing-holder-handoff.ts';
+import { createRoutingRoleClient } from './routing-role-client.ts';
+import { openRoutingRoleStage } from './routing-role-stage.ts';
+import { routedWorkerEnv } from './routing-role-env.ts';
+
+const refused = (): Error => new Error('routed agent role refused');
+
+function replaceProcessEnv(next: Record<string, string | undefined>): () => void {
+  const previous = { ...process.env };
+  const install = (env: Record<string, string | undefined>) => {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    for (const [key, value] of Object.entries(env)) if (value !== undefined) process.env[key] = value;
+  };
+  install(next);
+  return () => install(previous);
+}
+
+/** Build all child authority from the one-use Shift handoff. No settings,
+ * resolveBearer, account store, or private signer enters this composition. */
+export async function prepareRoutedAgentRunner(args: {
+  handoff: RoutingHandoffV1;
+  originalEnv: Record<string, string | undefined>;
+  out: (line: string) => void; err: (line: string) => void;
+  heartbeatIntervalMs?: number; jumpToleranceMs?: number;
+  submitGraceMs?: number; confirmIntervalMs?: number;
+}): Promise<{ loop: ReturnType<typeof createAgentRunLoop>;
+  run(): Promise<AgentRunOutcome> }> {
+  const { handoff } = args;
+  if (handoff.reservation.childKind !== 'agent-run' || !handoff.definitionStage
+    || !handoff.broker || !handoff.holderBroker || !handoff.workRoot) throw refused();
+  const client = createRoutingRoleClient(handoff);
+  const stage = openRoutingRoleStage(handoff);
+  const HOME = stage.publicEnv.HOME, OWENLOOP_CONFIG_DIR = stage.publicEnv.OWENLOOP_CONFIG_DIR;
+  if (!HOME || !OWENLOOP_CONFIG_DIR) throw refused();
+  const publicEnv = { HOME, OWENLOOP_CONFIG_DIR };
+  const planned = planRoutedAgentWorkdir({ workRoot: handoff.workRoot,
+    ...(handoff.workRepo ? { workRepo: handoff.workRepo } : {}),
+    workflow: handoff.reservation.workflow, run: handoff.reservation.run,
+    definitionStagePath: handoff.definitionStage.path,
+    originalEnv: args.originalEnv, publicEnv, err: args.err });
+  const providerEnv = routedWorkerEnv(args.originalEnv, publicEnv);
+  // Cache custody is inside the durable stage owner marker. A post-gate role
+  // exit cannot prove vendor descendants stopped reading, so this runner does
+  // not delete the cache on exit. Shift's stage lifecycle owns the bytes.
+  const cache = allocateRoutedFileCache(handoff.definitionStage.path);
+  let holderHandoff: ReturnType<typeof createRoutingHolderHandoff> | undefined;
+  try {
+  const workflow = handoff.reservation.workflow, run = handoff.reservation.run;
+  const holder: ContactHolder = { kind: 'session', id: handoff.sessionId, shiftId: handoff.shiftId };
+  const strictConsumed = createConsumedVerifier({ env: publicEnv,
+    now: Date.now, artifactPolicy: 'enforce' });
+  const consumedVerifier: ConsumedVerifier = async (order, opts) => {
+    try {
+      const hosted = await stage.instructions.resolveHostedStep?.(order);
+      if (!hosted?.ok) throw refused();
+      const checked = await strictConsumed(order, { ...opts,
+	hardRule: true, callsProducers: hosted.callsProducers });
+      return checked.ok ? checked : { ok: false, reason: 'routed consumed proof refused' };
+    } catch { return { ok: false, reason: 'routed consumed proof refused' }; }
+  };
+  const sessionsFile = sessionsPath(resolveCacheDir(publicEnv));
+  const select = createRoutedAgentSelection({ child: client.routed, holder, workflow, run,
+    beforeFinalCheck: (order) => {
+      if (order.workdir === undefined) planned.materialize();
+      else assertRoutedAgentWorkdirDisjoint(order.workdir, dirname(handoff.definitionStage!.path));
+    } });
+  const loop = createAgentRunLoop({
+    hub: client, workflow, run, holder, origin: handoff.origin, account: 'routed',
+    shiftId: handoff.shiftId,
+    ...(args.originalEnv.OWENLOOP_SHIFT_NAME ? { shiftName: args.originalEnv.OWENLOOP_SHIFT_NAME } : {}),
+    ...(args.originalEnv.OWENLOOP_SHIFT_OWNER ? { shiftOwner: args.originalEnv.OWENLOOP_SHIFT_OWNER } : {}),
+    cwd: planned.cwd, allowedWorkdirRoots: planned.allowedWorkdirRoots,
+    loadStep: createRoutedAgentStepLoader({ instructions: stage.instructions,
+      instructionCwd: handoff.definitionStage.path, workflow, run, err: args.err }),
+    resolveAdapter: (chosenHarness, stepHarness) => {
+      const id = chosenHarness ?? stepHarness ?? '';
+      const adapter = adapterFor(id);
+      return { id: id || '<none>', ...(adapter ? { adapter } : {}),
+	registered: registeredHarnessIds() };
+    },
+    resolveCrewRosters: crew => ({ ok: false, crew: crew[0] ?? 'routed',
+      detail: 'routed server selection required' }),
+    harnessAvailable: id => adapterFor(id) !== undefined,
+    consumedVerifier,
+    routedSelect: (order, signal) => select(order, signal),
+    createRoutingHolderPath: () => {
+      if (holderHandoff) throw refused();
+      holderHandoff = createRoutingHolderHandoff(handoff, cache.custodyRoot);
+      return holderHandoff.path;
+    },
+    routedFileCacheRoot: cache.publishedRoot,
+    appendSession: rec => appendSession(sessionsFile, rec),
+    nextAttempt: () => 1,
+    latestSession: () => null,
+    latestRunSession: () => null,
+    sleep: ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
+    now: Date.now, out: args.out, err: args.err,
+    heartbeatIntervalMs: args.heartbeatIntervalMs ?? 60_000,
+    ...(args.jumpToleranceMs ? { jumpToleranceMs: args.jumpToleranceMs } : {}),
+    ...(args.submitGraceMs ? { submitGraceMs: args.submitGraceMs } : {}),
+    ...(args.confirmIntervalMs ? { confirmIntervalMs: args.confirmIntervalMs } : {}),
+  });
+  return { loop, run: async () => {
+    const restore = replaceProcessEnv(providerEnv);
+    try { return await loop.run(); }
+    finally { restore(); holderHandoff?.cleanup(); }
+  } };
+  } catch {
+    holderHandoff?.cleanup();
+    await cache.cleanup();
+    throw refused();
+  }
+}
