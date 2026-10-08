@@ -4,6 +4,8 @@ import { Engine, ModifierRefusalError } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { buildDef, hashDef, parseDef } from '../src/defs.ts';
 import { modelCheck } from '../src/model.ts';
+import { validateValue } from '../src/schema.ts';
+import { orderSchema } from '../src/schemas/index.ts';
 import type { Firing } from '../src/model.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
 import type { OrderInstructionSource } from '../src/order-resolver.ts';
@@ -457,6 +459,8 @@ test('workdirFrom resolves a nested consumed value into the reference order with
   assert.deepEqual(order.consumes, { workspace: { payload: { worktreePath: ' ./repo/worktree ' } } });
   assert.equal(store.listRuns(wf).length, 1);
   assert.equal(store.listRuns(wf)[0]!.order?.workdir, ' ./repo/worktree ');
+  assert.equal(store.listRuns(wf)[0]!.order?.claimWorkdirInputV1, undefined,
+    'a consumed stem has its own fingerprint and receives no input witness');
 });
 
 test('workdirFrom resolves a declared input the step does not consume, and defers until it is provided', () => {
@@ -495,6 +499,83 @@ test('workdirFrom resolves a declared input the step does not consume, and defer
   assert.equal(order.workdir, '/Users/alex/code/dev');
   assert.deepEqual(order.consumes, {});
   assert.equal(store.listRuns(wf)[0]!.order?.workdir, '/Users/alex/code/dev');
+  assert.equal(Object.hasOwn(order, 'claimWorkdirInputV1'), false, 'frozen v1 emission stays public-only');
+  assert.deepEqual(store.getRun(order.run)?.order?.claimWorkdirInputV1,
+    { stem: 'target', version: 1, present: true });
+  const raw = store.db.prepare('SELECT order_json FROM run WHERE id = ?').get(order.run) as { order_json: string };
+  assert.deepEqual(JSON.parse(raw.order_json).claimWorkdirInputV1,
+    { stem: 'target', version: 1, present: true }, 'same claim insert persisted the private witness');
+  assert.equal(validateValue(orderSchema, order).valid, true, 'ordinary v1 projection still matches frozen schema');
+  assert.equal(validateValue(orderSchema, JSON.parse(raw.order_json)).valid, false,
+    'the private native row must never be sent as order.v1');
+  store.restampOrderTarget(order.run, 'workspace', 2);
+  assert.deepEqual(store.getRun(order.run)?.order?.claimWorkdirInputV1,
+    { stem: 'target', version: 1, present: true }, 'old target restamp preserves unknown metadata');
+});
+
+test('workdirFrom uses the canonical longest declared-input stem and stamps its exact version', () => {
+  const dynamic = def('dotted-input-workdir', [input('target'), input('target.path')], [step({
+    name: 'provisioner', consumes: ['target'], produces: ['workspace'],
+    workdirFrom: 'target.path.cwd',
+  })]);
+  const { engine, store } = makeEngine([dynamic]);
+  const wf = engine.createInstance('dotted-input-workdir', { provide: {
+    target: { path: { cwd: '/wrong-shorter-consume' } },
+    'target.path': { cwd: '/chosen-longest-input' },
+  } });
+  const order = fire(engine, wf, 'provisioner', 1000);
+  assert.equal(order.workdir, '/chosen-longest-input');
+  assert.deepEqual(order.consumes, { target: { path: { cwd: '/wrong-shorter-consume' } } });
+  assert.deepEqual(store.getRun(order.run)?.order?.claimWorkdirInputV1,
+    { stem: 'target.path', version: 1, present: true });
+});
+
+test('unconsumed workdir input refuses absent or non-green value without a claim stamp', () => {
+  const dynamic = def('workdir-input-gate', [input('target', { seedOwed: true })], [step({
+    name: 'provisioner', consumes: [], produces: ['workspace'], workdirFrom: 'target.path',
+  })]);
+  const { engine, store } = makeEngine([dynamic]);
+  const wf = engine.createInstance('workdir-input-gate');
+  assert.equal(engine.tick(wf, { now: 1000 }).orders.length, 0);
+  assert.equal(store.listRuns(wf).length, 0);
+  store.tx(() => store.putArtifact({ ...store.getArtifact(wf, 'target')!,
+    acceptance: 'submitted', version: 1, value: { path: '/not-green' } }));
+  assert.equal(engine.tick(wf, { now: 2000 }).orders.length, 0);
+  assert.equal(store.listRuns(wf).length, 0);
+
+  const absent = def('workdir-input-green-absent', [input('target')], [step({
+    name: 'provisioner', consumes: [], produces: ['workspace'], workdirFrom: 'target.path',
+  })]);
+  const green = makeEngine([absent]);
+  const greenWf = green.engine.createInstance('workdir-input-green-absent');
+  assert.deepEqual(green.store.getArtifact(greenWf, 'target')?.acceptance, 'green');
+  assert.equal(green.engine.tick(greenWf, { now: 1000 }).orders.length, 0,
+    'a green version without a value cannot supply a workdir witness');
+  assert.equal(green.store.listRuns(greenWf).length, 0);
+});
+
+test('unconsumed workdir claim keeps its original version across input movement and reoffer', () => {
+  const dynamic = def('workdir-input-version', [input('target', { seedOwed: true })], [step({
+    name: 'provisioner', consumes: [], produces: ['workspace'], workdirFrom: 'target.path',
+  })]);
+  const { engine, store } = makeEngine([dynamic], { reapTtlMs: 100 });
+  const wf = engine.createInstance('workdir-input-version');
+  engine.provideInput(wf, 'target', { path: '/first' });
+  const first = fire(engine, wf, 'provisioner', 1000);
+  engine.provideInput(wf, 'target', { path: '/second' });
+  const next = engine.tick(wf, { now: 1200 });
+  assert.equal(next.reaped, 1);
+  assert.equal(next.orders.length, 1);
+  assert.equal(next.orders[0]!.workdir, '/second');
+  assert.deepEqual(store.getRun(first.run)?.order?.claimWorkdirInputV1,
+    { stem: 'target', version: 1, present: true });
+  assert.deepEqual(store.getRun(next.orders[0]!.run)?.order?.claimWorkdirInputV1,
+    { stem: 'target', version: 2, present: true });
+  const history = store.getArtifactHistory(wf, 'target')!;
+  assert.deepEqual(history.versions.map(version => [version.version, version.value]), [
+    [1, { path: '/first' }], [2, { path: '/second' }],
+  ], 'each marker names one immutable version row, never the mutable current substitute');
+  assert.equal(Object.hasOwn(next.orders[0]!, 'claimWorkdirInputV1'), false);
 });
 
 test('workdirFrom defers unresolved values without emitting an order, run, task, budget use, or parallel claim', () => {

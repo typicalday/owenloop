@@ -56,6 +56,8 @@ import type {
   ArtifactBind,
   ArtifactData,
   Author,
+  ClaimOrder,
+  ClaimWorkdirInputV1,
   Fingerprint,
   InterfaceCallBinding,
   JsonSchema,
@@ -2914,7 +2916,11 @@ export class Engine {
       claimedAt: now,
       attempts: existing?.attempts ?? 0,
     });
-    return order;
+    if (order.claimWorkdirInputV1 === undefined) return order;
+    // The persisted native claim retains this witness. The existing tick and
+    // claimReady Order is the frozen v1 projection and must not expose it.
+    const { claimWorkdirInputV1: _private, ...publicOrder } = order;
+    return publicOrder;
   }
 
   /**
@@ -2937,7 +2943,7 @@ export class Engine {
     consumedFingerprint: Fingerprint,
     routing: { modifier?: string; escalation?: EscalationRecord } = {},
     resolved?: ResolvedStepContext,
-  ): Order | DeferredClaim {
+  ): ClaimOrder | DeferredClaim {
     const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
     for (const p of f.inputs) {
@@ -2959,6 +2965,7 @@ export class Engine {
     };
 
     let resolvedWorkdir: string | undefined;
+    let claimWorkdirInputV1: ClaimWorkdirInputV1 | undefined;
     if (step.workdirFrom !== undefined) {
       const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes, def.inputs.map((i) => i.name));
       if (!parsed) {
@@ -2992,6 +2999,11 @@ export class Engine {
             `workdirFrom '${step.workdirFrom}': input '${parsed.stem}' is not green yet`,
           );
         }
+		if (!Number.isSafeInteger(art.version) || art.version < 1
+		  || !Object.hasOwn(art, 'value')) {
+		  return unresolved(`workdirFrom '${step.workdirFrom}': input '${parsed.stem}' has no claimable version/value`);
+		}
+		claimWorkdirInputV1 = { stem: parsed.stem, version: art.version, present: true };
         value = art.value;
       }
       const segments = parsed.path.split('.');
@@ -3062,7 +3074,7 @@ export class Engine {
           : {}),
       };
     });
-    const order: Order = {
+    const order: ClaimOrder = {
       run: runId,
       workflow,
       step: f.step,
@@ -3071,6 +3083,7 @@ export class Engine {
       inputs: f.inputs,
       outputs: f.outputs,
       ...(resolvedWorkdir !== undefined ? { workdir: resolvedWorkdir } : {}),
+      ...(claimWorkdirInputV1 !== undefined ? { claimWorkdirInputV1 } : {}),
       consumes,
       consumedFingerprint: { ...consumedFingerprint },
       owes,
