@@ -446,6 +446,44 @@ test('collection lease: mixed producer emits before singleton green on one runti
     'finite width stays explicit rather than being confused with BFS exhaustion');
 });
 
+test('collection lease: stale mixed run can skip its singleton without closing the run', () => {
+  const a = step({ name: 'a', consumes: ['q'], produces: ['x', 'a[]'] });
+  const b = step({ name: 'b', consumes: ['x'], produces: ['note', 'b[]'], maxSchemaFailures: 1 });
+  for (const produce of b.produces) {
+    produce.schema = { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } };
+  }
+  const definition = def('stale-mixed-skip', [input('q')], [a, b]);
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const runA = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'a');
+  assert.ok(runA);
+  assert.equal(engine.green(wf, runA.run, 'x', {}).outcome, 'green');
+  const runB = engine.tick(wf, { now: 2000 }).orders.find((order) => order.step === 'b');
+  assert.ok(runB);
+  const lease: CollectionLease = {
+    step: 'b', key: runB.key, stem: 'b', inputs: ['x'],
+    fingerprint: computeFingerprint(arts(), ['x']),
+  };
+  assert.equal(engine.green(wf, runB.run, 'note', {}).outcome, 'schema-rejected');
+  assert.equal(engine.emit(wf, runB.run, [{ value: {} }]).outcome, 'schema-rejected');
+  assert.equal(engine.green(wf, runA.run, 'x', {}).outcome, 'green');
+  assert.equal(store.getArtifact(wf, 'x')?.version, 2);
+
+  const before: CollectionCheckState = { arts: arts(), leases: [lease] };
+  const successors = collectionLeaseSuccessors(definition, before, lease, 1);
+  const skipped = successors.filter((move) => move.step.outcome === 'skip' && move.step.path === 'note');
+  assert.equal(skipped.length, 1, 'checker must model the runtime singleton skip once');
+  assert.ok(successors.some((move) => move.step.outcome === 'skip' && move.step.path === 'b.sealed'));
+  engine.skip(wf, 'note', 'b', 'skip stale singleton');
+  assert.equal(store.getArtifact(wf, 'note')?.acceptance, 'skipped');
+  assert.deepEqual(fields(skipped[0]!.state.arts), fields(arts()));
+  assert.deepEqual(skipped[0]!.state.leases, [lease], 'skip leaves the stale run open');
+  assert.equal(store.getArtifact(wf, 'note')?.fingerprint?.x, 2,
+    'skip records the current input version, not the stale claim fingerprint');
+});
+
 test('mixed collection lease can reject its second produced input on the open run', () => {
   const definition = def('mixed-input-reject', [input('seed', { seedOwed: false })], [
     step({ name: 'left-build', consumes: ['seed'], produces: ['left'] }),
