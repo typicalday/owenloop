@@ -4595,7 +4595,8 @@ test('exclusive-create collision never removes another reservation handoff', asy
 test('startup and bounded maintenance reclaim fixed-deadline orphans without PID assumptions', async () => {
   const f = routingSessionFixture();
   const old = await f.open();
-  const files = Array.from({ length: 140 }, (_, i) => old.createHandoff(f.reserve(`orphan-${i}`)).path);
+  const handoffs = Array.from({ length: 140 }, (_, i) => old.createHandoff(f.reserve(`orphan-${i}`)));
+  const files = handoffs.map(handoff => handoff.path);
   const liveBytes = readFileSync(files[0]!, 'utf8');
   await old.stop(); // all children are detached, none is known terminal
   const next = await f.open();
@@ -4608,6 +4609,8 @@ test('startup and bounded maintenance reclaim fixed-deadline orphans without PID
   for (let i = 0; i < 12; i++) await next.maintain();
   assert.equal(files.filter(existsSync).length, 0);
   assert.throws(() => old.createHandoff(f.reserve('late')), /routing/);
+  for (const handoff of handoffs) handoff.terminal();
+  await old.stop();
   await next.stop();
 });
 
@@ -4961,6 +4964,115 @@ test('session scope rotates after roster recovery, capability addition and crew 
   handoff.terminal();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(closed.filter(id => id === oldId).length, 1);
+});
+
+test('failed scope expansion cannot poison renewal of the retained session', async () => {
+  let now = 1_000;
+  let opens = 0;
+  let renews = 0;
+  const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
+    fetchImpl: (async url => {
+      const verb = String(url).split('/').at(-1);
+      if (verb === 'routing_session_open') {
+	if (opens++) return Response.json({ error: 'forbidden' }, { status: 403 });
+	return Response.json({ sessionId, shiftId: 'shf_one', credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_renew') {
+	renews++;
+	return Response.json({ sessionId, shiftId: 'shf_one', expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_close') return Response.json({ closed: true });
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  await assert.rejects(session.ensureScope({ capabilities: ['build', 'test'], crews: [] }),
+    error => error instanceof HubError && error.status === 403);
+  now = 841_000;
+  await session.maintain();
+  assert.equal(renews, 1);
+  assert.equal(session.identity()?.sessionId, sessionId);
+  await session.stop();
+});
+
+test('stopped Shift owns a renewal timer until its detached handoff terminates', async () => {
+  let now = 1_000;
+  let renews = 0;
+  let closes = 0;
+  const { schedule, timers } = fakeSchedule();
+  const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
+    postStopSchedule: schedule,
+    fetchImpl: (async url => {
+      const verb = String(url).split('/').at(-1);
+      if (verb === 'routing_session_open') return Response.json({ sessionId, shiftId: 'shf_one',
+	credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
+      if (verb === 'routing_session_renew') {
+	renews++;
+	return Response.json({ sessionId, shiftId: 'shf_one', expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_close') { closes++; return Response.json({ closed: true }); }
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  const handoff = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'detached',
+    reservedAt: now, childKind: 'agent-run' }).reservation);
+  unlinkSync(handoff.path);
+  await session.stop();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0]!.everyMs, 30_000);
+  assert.equal(closes, 0);
+  now = 841_000;
+  timers[0]!.fn();
+  await settle(() => renews === 1, 'post-stop session renewal');
+  assert.equal(closes, 0);
+  handoff.terminal();
+  await settle(() => closes === 1 && timers[0]!.cancelled, 'post-stop timer cleanup');
+});
+
+test('a revoked retired session does not starve renewal of another live incarnation', async () => {
+  let now = 1_000;
+  let nextId = 0;
+  const renews: string[] = [];
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
+    fetchImpl: (async (url, init) => {
+      const verb = String(url).split('/').at(-1);
+      if (verb === 'routing_session_open') {
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++nextId).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${nextId}`,
+	  credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_renew') {
+	const id = new Headers(init?.headers).get('X-Owenloop-Routing-Session')!.split('.')[1]!;
+	renews.push(id);
+	if (id.endsWith('000000000001')) return Response.json({ error: 'revoked' }, { status: 403 });
+	return Response.json({ sessionId: id, shiftId: 'shf_2', expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_close') return Response.json({ closed: true });
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  const first = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'first',
+    reservedAt: now, childKind: 'agent-run' }).reservation);
+  now = 2_000;
+  await session.ensureScope({ capabilities: ['build', 'test'], crews: [] });
+  const secondId = session.identity()!.sessionId;
+  const second = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'second',
+    reservedAt: now, childKind: 'agent-run' }).reservation);
+  unlinkSync(first.path); unlinkSync(second.path);
+  now = 842_000;
+  try {
+    await assert.rejects(session.maintain(), error => error instanceof HubError && error.status === 403);
+    assert.equal(renews.length, 2, 'healthy session renews despite retired revocation');
+    assert.equal(renews[1], secondId);
+    assert.equal(session.identity()?.sessionId, secondId);
+  } finally {
+    first.terminal(); second.terminal();
+    await session.stop();
+  }
 });
 
 

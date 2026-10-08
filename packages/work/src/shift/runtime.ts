@@ -642,6 +642,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       }
       routingSession = await openShiftRoutingSession({ origin, stateDir,
 	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
+	onMaintenanceError: () => process.stderr.write(`${roleLabel}: parked routing session maintenance failed\n`),
 	scope: {
 	  ...(parsed.workflow ? { workflows: [parsed.workflow] } : {}),
 	  ...(parsed.serveCrews?.length ? { crews: parsed.serveCrews } : {}),
@@ -967,6 +968,10 @@ function handoffMaintenance(root: string, now: () => number, preserved: Set<stri
 interface ShiftRoutingSessionOptions {
   stateDir: string; origin: string; orgId: string; principalId: string; scope: RoutingScope;
   getToken: () => Promise<string>; fetchImpl?: typeof fetch; now?: () => number; nonce?: () => string;
+  /** Keeps a stopped Shift alive while detached workers still own sessions. */
+  postStopSchedule?: (fn: () => void, everyMs: number) => () => void;
+  onMaintenanceError?: () => void;
+  onClosed?: () => void;
 }
 
 export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions): Promise<ShiftRoutingSession> {
@@ -974,17 +979,28 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
     Object.entries(scope).sort(([a], [b]) => a.localeCompare(b)).map(([key, values]) => [key, [...new Set(values)].sort()]));
   const workflows = opts.scope.workflows && [...opts.scope.workflows];
   let scope = normalize(structuredClone(opts.scope));
-  let active = await openRoutingIncarnation({ ...opts, scope });
-  const retired = new Set<Awaited<ReturnType<typeof openRoutingIncarnation>>>();
+  type Incarnation = Awaited<ReturnType<typeof openRoutingIncarnation>>;
+  let active: Incarnation;
+  const retired = new Set<Incarnation>();
   let stopped = false;
   let changing: Promise<void> = Promise.resolve();
+  let cancelParked: (() => void) | undefined;
+  const live = () => Boolean(active.identity()) || [...retired].some(incarnation => Boolean(incarnation.identity()));
+  const onClosed = () => {
+    for (const incarnation of retired) if (!incarnation.identity()) retired.delete(incarnation);
+    if (stopped && !live()) { cancelParked?.(); cancelParked = undefined; }
+  };
+  const incarnationOptions = { ...opts, onClosed };
+  active = await openRoutingIncarnation({ ...incarnationOptions, scope });
   // Callers keep this client, while each request resolves the current authority.
   // In-flight calls and old handoffs retain their original incarnation closure.
   const hub = new Proxy(active.hub, {
     get: (_target, property) => Reflect.get(active.hub, property),
     set: (_target, property, value) => Reflect.set(active.hub, property, value),
   });
-  return {
+  let parkedBackoffUntil = Number.NEGATIVE_INFINITY;
+  let parkedInFlight = false;
+  const session: ShiftRoutingSession = {
     hub,
     identity: () => active.identity(),
     createHandoff: reservation => {
@@ -1002,7 +1018,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	if (JSON.stringify(scope) === JSON.stringify(desired)
 	  && (active.identity()?.expiresAt ?? 0) > (opts.now ?? Date.now)()) return;
 	// Never alter the old session, nor discard it on a failed open.
-	const next = await openRoutingIncarnation({ ...opts, scope: desired });
+	const next = await openRoutingIncarnation({ ...incarnationOptions, scope: desired });
 	if (stopped) { await next.stop(); throw new Error('routing session stopped'); }
 	const previous = active;
 	active = next;
@@ -1016,24 +1032,50 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       await change;
     },
     async maintain() {
-      await changing;
+      // A failed scope expansion rejects its caller, but never poisons the
+      // still-valid authority's independent renewal path.
+      await changing.catch(() => {});
       // An older worker's session normally expires first. Renew in deadline
       // order so a slow or rate-limited newer session cannot starve it.
       const incarnations = [active, ...retired].sort((a, b) =>
 	(a.identity()?.expiresAt ?? Number.POSITIVE_INFINITY) - (b.identity()?.expiresAt ?? Number.POSITIVE_INFINITY));
+      let firstError: unknown;
       for (const incarnation of incarnations) {
 	if (!incarnation.identity()) { retired.delete(incarnation); continue; }
-	await incarnation.maintain();
+	try { await incarnation.maintain(); }
+	catch (error) {
+	  if (firstError === undefined || (error instanceof HubError && error.status === 429)) firstError = error;
+	}
 	if (!incarnation.identity()) retired.delete(incarnation);
       }
+      if (firstError !== undefined) throw firstError;
     },
     async stop() {
       stopped = true;
       try { await changing; } catch { /* Failed scope changes retain active. */ }
       await active.stop();
       for (const incarnation of retired) await incarnation.stop();
+      if (live() && !cancelParked) {
+	const schedule = opts.postStopSchedule ?? ((fn: () => void, everyMs: number) => {
+	  const timer = setInterval(fn, everyMs);
+	  return () => clearInterval(timer);
+	});
+	cancelParked = schedule(() => {
+	  const now = (opts.now ?? Date.now)();
+	  if (!live()) { onClosed(); return; }
+	  if (parkedInFlight || now < parkedBackoffUntil) return;
+	  parkedInFlight = true;
+	  void session.maintain().catch(error => {
+	    if (error instanceof HubError && error.status === 429) {
+	      parkedBackoffUntil = Math.max(parkedBackoffUntil, (opts.now ?? Date.now)() + (error.retryAfterMs ?? 30_000));
+	    }
+	    opts.onMaintenanceError?.();
+	  }).finally(() => { parkedInFlight = false; onClosed(); });
+	}, 30_000);
+      }
     },
   };
+  return session;
 }
 
 async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise<Omit<ShiftRoutingSession, 'ensureScope'>> {
@@ -1092,6 +1134,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
   };
   const owned = new Map<string, RoutingHandoff>();
   let stopped = false;
+  let renewalDenied = false;
   let renewing: Promise<void> | undefined;
   let closing: Promise<void> | undefined;
   const finish = (): Promise<void> => {
@@ -1105,16 +1148,17 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
 	authority = undefined;
 	maintenance.close();
 	try { if (sameInode(privateDirectory(directory), directoryInode)) rmdirSync(directory); } catch { /* Preserve substituted or nonempty entries. */ }
+	opts.onClosed?.();
       }
     })();
     return closing;
   };
   return {
     hub,
-    identity: () => authority && ({ orgId: opts.orgId, principalId: opts.principalId,
+    identity: () => renewalDenied ? undefined : authority && ({ orgId: opts.orgId, principalId: opts.principalId,
       sessionId: authority.sessionId, shiftId: authority.shiftId, expiresAt: authority.expiresAt }),
     createHandoff(reservation) {
-      if (stopped || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
+      if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
 	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token
 	  && r.workflow === reservation.workflow && r.run === reservation.run && r.reservedAt === reservation.reservedAt)) throw new Error('routing reservation unavailable');
       ensureIncarnation();
@@ -1166,9 +1210,14 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
       maintenance.sweep();
       // stop() forbids new handoffs but a live detached worker still owns this
       // session. Rotation and global stop both keep it renewable until terminal.
-      if (!authority || (stopped && owned.size === 0) || now() < authority.expiresAt - 60_000) return;
+      if (renewalDenied || !authority || (stopped && owned.size === 0) || now() < authority.expiresAt - 60_000) return;
       renewing ??= (async () => {
-	const renewed = await hub.renewRoutingSession(AbortSignal.timeout(10_000));
+	let renewed;
+	try { renewed = await hub.renewRoutingSession(AbortSignal.timeout(10_000)); }
+	catch (error) {
+	  if (error instanceof HubError && (error.status === 401 || error.status === 403)) renewalDenied = true;
+	  throw error;
+	}
 	if (!authority || renewed.sessionId !== authority.sessionId || renewed.shiftId !== authority.shiftId
 	  || !Number.isSafeInteger(renewed.expiresAt) || renewed.expiresAt <= now()) throw new Error('routing renewal refused');
 	authority = { ...authority, expiresAt: renewed.expiresAt };
