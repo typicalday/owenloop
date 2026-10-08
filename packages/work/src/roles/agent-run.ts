@@ -93,6 +93,7 @@ import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
+import { consumeRoutingHandoff } from './routing-handoff.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { effectiveRosterLayers, mergeRosterLayers, type MergedRoster } from '../settings/roster.ts';
@@ -325,6 +326,22 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
+  }
+
+  const routingExpected = env['OWENLOOP_ROUTING_SESSION'] === '1'
+    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined;
+  try {
+    const handoff = consumeRoutingHandoff({ env, origin, target, kind: 'agent-run' });
+    if (routingExpected || handoff) {
+      // This slice establishes private startup authority. The agent's final
+      // read/reservation/adapter fence is installed in the next slice.
+      err('owenloop work agent-run: routed launch fence unavailable');
+      return 1;
+    }
+  } catch {
+    err('owenloop work agent-run: routing handoff refused');
+    return 1;
   }
 
   const consumedVerifier = deps.consumedVerifier ?? createConsumedVerifier({

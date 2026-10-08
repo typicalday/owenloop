@@ -35,6 +35,7 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
+import { consumeRoutingHandoff } from './routing-handoff.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { resolveAllowedWorkdirRoots } from '../agent/workdir.ts';
 import { loadSettings } from '../settings/settings.ts';
@@ -218,6 +219,20 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
+  }
+
+  const routingExpected = env['OWENLOOP_ROUTING_SESSION'] === '1'
+    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined;
+  try {
+    const handoff = consumeRoutingHandoff({ env, origin, target, kind: 'exec' });
+    if (routingExpected || handoff) {
+      err('owenloop work exec: routed launch fence unavailable');
+      return 1;
+    }
+  } catch {
+    err('owenloop work exec: routing handoff refused');
+    return 1;
   }
 
   const cwd = deps.cwd ?? process.cwd();

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, unlinkSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,8 +42,8 @@ import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
 import { exitCodeFor } from '../src/roles/agent-run.ts';
-import type { HubClient } from '../src/hub/client.ts';
-import { reachesSocketConsumer } from '../src/shift/runtime.ts';
+import { createHubClient, type HubClient } from '../src/hub/client.ts';
+import { reachesSocketConsumer, openShiftRoutingSession, selectShiftRoutingTuples, routingSessionEnabled } from '../src/shift/runtime.ts';
 import { HubError, type InboxInstance, type WorkOrder } from '../src/hub/types.ts';
 
 // ---- fixtures ---------------------------------------------------------------
@@ -4459,4 +4459,555 @@ test('#300: the heartbeat fires on its own cadence, never under `once`, and is f
   // watchdog's `stalled` is the record that does.
   assert.equal(reachesSocketConsumer('heartbeat'), false);
   assert.equal(reachesSocketConsumer('stalled'), true);
+});
+
+function routingSessionFixture(options: { expiresAt?: number; failClose?: boolean; nonce?: () => string } = {}) {
+  let now = 1_000;
+  const calls: Array<{ verb: string; body: unknown; headers: Headers }> = [];
+  const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
+  const credential = `rs1.${sessionId}.${'x'.repeat(43)}`;
+  const open = () => openShiftRoutingSession({ stateDir, origin: 'https://hub.example', orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled-base',
+    ...(options.nonce ? { nonce: options.nonce } : {}),
+    fetchImpl: (async (url, init) => {
+      const verb = String(url).split('/').at(-1)!;
+      calls.push({ verb, body: JSON.parse(String(init?.body)), headers: new Headers(init?.headers) });
+      if (verb === 'routing_session_open') return Response.json({ sessionId, shiftId: 'shf_service', credential, expiresAt: options.expiresAt ?? now + 900_000 });
+      if (verb === 'routing_session_renew') return Response.json({ sessionId, shiftId: 'shf_service', expiresAt: now + 900_000 });
+      if (verb === 'routing_session_close') return Response.json({ closed: true }, { status: options.failClose ? 503 : 200 });
+      throw new Error(`unexpected fixture request: ${verb}`);
+    }) as typeof fetch,
+  });
+  const reserve = (run: string) => reserveChild(stateDir, { workflow: 'wf', run, reservedAt: now, childKind: 'agent-run' }).reservation;
+  return { open, reserve, calls, credential, setNow: (next: number) => { now = next; } };
+}
+
+test('routing handoffs are exclusive, private, reservation-bound, sibling-independent and have fixed deadlines', async () => {
+  const f = routingSessionFixture({ expiresAt: 90_000 });
+  const session = await f.open();
+  const ar = f.reserve('a'); const br = f.reserve('b');
+  const a = session.createHandoff(ar); const b = session.createHandoff(br);
+  assert.notEqual(a.path, b.path);
+  assert.equal(statSync(a.path).mode & 0o777, 0o600);
+  assert.equal(statSync(join(a.path, '..')).mode & 0o777, 0o700);
+  const payload = JSON.parse(readFileSync(a.path, 'utf8'));
+  assert.equal(payload.credential, f.credential);
+  assert.equal(payload.orgId, 'org');
+  assert.equal(payload.origin, 'https://hub.example');
+  assert.deepEqual(payload.reservation, ar);
+  assert.equal(payload.expiresAt, 90_000);
+  assert.equal(payload.sessionExpiresAt, 90_000);
+  assert.equal(JSON.stringify(session.identity()).includes(f.credential), false);
+  assert.throws(() => session.createHandoff(ar), /routing/);
+  f.setNow(40_000);
+  await session.maintain();
+  assert.equal(f.calls.filter(c => c.verb === 'routing_session_renew').length, 1);
+  assert.equal(JSON.parse(readFileSync(a.path, 'utf8')).expiresAt, 90_000);
+  a.terminal(); a.terminal();
+  assert.equal(existsSync(a.path), false);
+  assert.equal(existsSync(b.path), true);
+  unlinkSync(b.path); // trusted child already consumed its own file
+  b.terminal();
+  await session.stop();
+  assert.equal(f.calls.filter(c => c.verb === 'routing_session_close').length, 1);
+  assert.equal(existsSync(join(a.path, '..')), false);
+  assert.equal(session.identity(), undefined);
+  assert.equal(JSON.stringify(f.calls.map(c => c.body)).includes(f.credential), false);
+});
+
+test('detached stop preserves live handoffs; true completion closes once even on transport failure', async () => {
+  const f = routingSessionFixture({ failClose: true });
+  const session = await f.open();
+  const a = session.createHandoff(f.reserve('a'));
+  await session.stop();
+  assert.equal(existsSync(a.path), true);
+  assert.equal(f.calls.some(c => c.verb === 'routing_session_close'), false);
+  assert.throws(() => session.createHandoff(f.reserve('b')), /routing/);
+  a.terminal();
+  await session.stop();
+  assert.equal(existsSync(a.path), false);
+  assert.equal(session.identity(), undefined);
+  assert.equal(f.calls.filter(c => c.verb === 'routing_session_close').length, 1);
+});
+
+test('exclusive-create collision never removes another reservation handoff', async () => {
+  const f = routingSessionFixture({ nonce: () => 'a'.repeat(32) });
+  const session = await f.open();
+  const a = session.createHandoff(f.reserve('a'));
+  const bytes = readFileSync(a.path, 'utf8');
+  assert.throws(() => session.createHandoff(f.reserve('b')), /routing/);
+  assert.equal(readFileSync(a.path, 'utf8'), bytes);
+  a.terminal();
+  await session.stop();
+});
+
+test('startup and bounded maintenance reclaim fixed-deadline orphans without PID assumptions', async () => {
+  const f = routingSessionFixture();
+  const old = await f.open();
+  const files = Array.from({ length: 140 }, (_, i) => old.createHandoff(f.reserve(`orphan-${i}`)).path);
+  const liveBytes = readFileSync(files[0]!, 'utf8');
+  await old.stop(); // all children are detached, none is known terminal
+  const next = await f.open();
+  assert.equal(readFileSync(files[0]!, 'utf8'), liveBytes);
+  f.setNow(121_000);
+  await next.maintain();
+  const firstRemaining = files.filter(existsSync).length;
+  assert.ok(firstRemaining > 0, 'one pass is bounded');
+  assert.ok(firstRemaining < files.length, 'the cursor makes progress');
+  for (let i = 0; i < 12; i++) await next.maintain();
+  assert.equal(files.filter(existsSync).length, 0);
+  assert.throws(() => old.createHandoff(f.reserve('late')), /routing/);
+  await next.stop();
+});
+
+async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
+  const f = routingSessionFixture();
+  const session = await f.open();
+  const id = session.identity()!;
+  const tuple = { id: 'service-tuple', harness: 'codex', model: 'approved-model', effort: 'high' as const };
+  const candidate = {
+    candidateId: 'candidate', frameId: 'wf', step: 'builder', key: '', evidenceGeneration: 'generation-1',
+    context: { now: 1000, maxTtlMs: 300_000, ...id, rosterRevision: 'roster', rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew-id', capability: 'build' },
+    role: 'implementation', rolePolicy: { revision: 'policy', unknownRole: 'refuse' as const, rules: [{ model: tuple.model, roles: ['implementation' as const] }] },
+    tuples: [{ tuple, eligible: true, available: true }],
+  };
+  const offers: import('../src/hub/types.ts').ShiftOffer[] = [];
+  const requests: import('../src/hub/types.ts').WhatsNextRequest[] = [];
+  const { hub, calls } = mockHub({});
+  let replay: WorkOrder | undefined;
+  let editOrder = (_order: WorkOrder) => {};
+  session.hub.routingOfferContext = async () => ({ contexts: [candidate] });
+  session.hub.putShiftOffer = async req => {
+    assert.equal(readChildReservations(stateDir).length, 0, 'inference has no reservation or attempt');
+    offers.push(structuredClone(req.submission.offer));
+    return { contexts: [candidate] };
+  };
+  hub.whatsNext = async req => {
+    requests.push(req);
+    if (replay) return { text: '', orders: [replay] };
+    const binding: import('../src/hub/types.ts').DecisionBindingV1 = {
+      orgId: id.orgId, runId: 'wf', frameId: 'wf', def: { bundleDigest: `sha256:${'a'.repeat(64)}`, workflowName: 'demo' },
+      subjectKey: 'subject', evidenceDigest: 'sha256:evidence', candidateDigest: 'sha256:candidates', policyDigest: 'sha256:policy',
+      revisions: { definition: 'd', candidates: 'c', policy: 'p', authority: 'a', rolePolicy: 'policy', roster: 'scoped-generation', routes: 'r', membership: 'm', evidenceGeneration: 'generation-1' },
+      issuedAt: 1000, expiresAt: 100_000, authority: { principalId: id.principalId, sessionId: id.sessionId },
+    };
+    // The service offer path includes command firings too.
+    const offer = req.routing?.kind === 'shift' ? offers.at(-1) ?? null : null;
+    const routing: import('../src/hub/types.ts').ReferenceRouting = {
+      claim: { state: 'claimed', claimId: 'run_routed', orderId: 'run_routed', attemptId: 'run_routed', decisionId: 'decision', binding, invocationId: null, principalId: id.principalId, sessionId: id.sessionId, shiftId: id.shiftId },
+      decision: { decisionId: 'decision', binding, status: 'applied', applied: offer ? { kind: 'shift', target: { candidateId: 'selected', shiftId: id.shiftId, offerId: offer.offerId } } : { kind: 'ready_firing', target: { candidateId: 'candidate', firingId: 'firing', step: 'builder', key: '' } }, effect: offer ? { kind: 'shift', claimId: 'run_routed', orderId: 'run_routed', attemptId: 'run_routed' } : { kind: 'ready_firing', firingId: 'firing' } },
+      preference: { offer, tuples: candidate.tuples, role: candidate.role, rolePolicy: candidate.rolePolicy, rosterRevision: 'roster', expiresAt: 100_000 },
+    };
+    const order: WorkOrder = { ...modernWo('run_routed', 'builder', kind), workflow: 'wf', capabilities: ['build'], crews: ['crew'], routing };
+    editOrder(order);
+    replay = order;
+    return { text: '', orders: [order] };
+  };
+  const spawns: SpawnSpec[] = [];
+  const spawner: Spawner = spec => {
+    assert.equal(readChildReservations(stateDir).length, 1);
+    assert.ok(spec.routingHandoff && existsSync(spec.routingHandoff));
+    spawns.push(spec);
+    return { pid: 9001 };
+  };
+  const options = baseOpts(hub, spawner, { workflow: 'wf', now: () => 1000, routingSession: session,
+    selectRoutingTuples: c => c.tuples, computeServeCapabilities: () => ['build'],
+    resolveOrderStep: async () => ({ name: 'builder', executor: 'command' }),
+  });
+  return { f, session, candidate, offers, requests, hub, calls, spawns, options, edit: (fn: typeof editOrder) => { editOrder = fn; } };
+}
+
+test('willing offers use service identities before reserving; claimed allowance launches once even after terminal replay', async () => {
+  const f = await routedLoopFixture();
+  const loop = createShiftLoop(f.options);
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(f.offers.length, 1);
+  assert.equal(f.offers[0]!.sessionId, f.session.identity()!.sessionId);
+  assert.equal(f.requests[0]!.routing?.kind, 'shift');
+  assert.equal(f.calls.some(c => c.verb === 'get_order'), false);
+  const spec = f.spawns[0]!;
+  spec.onTerminal?.();
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001 });
+  assert.equal(existsSync(spec.routingHandoff!), false);
+  assert.equal(await loop.iterate(), 0);
+  assert.equal(f.spawns.length, 1);
+  loop.stop();
+  await f.session.stop();
+});
+
+test('cap/free/running/agentCeiling 3/1/2/2 offers no agent allowance and dispatches a command only', async () => {
+  const f = await routedLoopFixture('command');
+  for (let i = 0; i < 2; i++) writeChildRecord(stateDir, { workflow: 'wf', run: `agent-${i}`, pid: 8000 + i, spawnedAt: 0, kind: 'agent-run' });
+  const loop = createShiftLoop({ ...f.options, cap: 3, maxConcurrentAgents: 2, execReserve: 1 });
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(f.offers.length, 0);
+  assert.equal(f.requests[0]!.routing?.kind, 'ready_firing');
+  assert.equal(f.spawns[0]!.kind, undefined);
+  assert.equal(loop.freeCapacity(), 0);
+  f.spawns[0]!.onTerminal?.();
+  loop.stop(); await f.session.stop();
+});
+
+for (const refusal of ['session', 'expired', 'unknown-role', 'allowance', 'frame', 'nonfinite'] as const) {
+  test(`routing ${refusal} refusal releases once without reservation or spawn`, async () => {
+    const f = await routedLoopFixture();
+    f.edit(order => {
+      const r = order.routing!;
+      if (refusal === 'session') r.claim.sessionId = 'foreign';
+      if (refusal === 'expired') r.preference.expiresAt = 1000;
+      if (refusal === 'unknown-role') r.preference.role = 'untrusted';
+      if (refusal === 'allowance') r.preference.offer!.offerId = 'foreign-offer';
+      if (refusal === 'frame') r.claim.binding.frameId = 'foreign';
+      if (refusal === 'nonfinite') r.claim.binding.expiresAt = Number.NaN;
+    });
+    const loop = createShiftLoop(f.options);
+    assert.equal(await loop.iterate(), 0);
+    assert.equal(f.spawns.length, 0);
+    assert.equal(readChildReservations(stateDir).length, 0);
+    assert.equal(f.calls.filter(c => c.verb === 'release').length, 0);
+    loop.stop(); await f.session.stop();
+  });
+}
+
+for (const failure of ['sync', 'early-terminal', 'async'] as const) {
+  test(`routing ${failure} spawn failure deletes only its handoff and releases once`, async () => {
+    const f = await routedLoopFixture();
+    let spawned: SpawnSpec | undefined;
+    const loop = createShiftLoop({ ...f.options, spawner: spec => {
+      spawned = spec;
+      assert.ok(existsSync(spec.routingHandoff!));
+      if (failure === 'sync') throw new Error('spawn refused');
+      if (failure === 'early-terminal') spec.onTerminal?.();
+      return { pid: 9001 };
+    } });
+    assert.equal(await loop.iterate(), failure === 'async' ? 1 : 0);
+    if (failure === 'async') {
+      spawned!.onTerminal?.();
+      loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001 });
+      const event = { workflow: 'wf', run: 'run_routed', kind: 'agent-run' as const, executable: 'worker', exitStatus: 1, signal: null, message: 'failed' };
+      loop.noteWorkerFailure(event); loop.noteWorkerFailure(event);
+    }
+    assert.ok(spawned);
+    assert.equal(existsSync(spawned.routingHandoff!), false);
+    assert.equal(readChildRecords(stateDir).length, 0);
+    assert.equal(readChildReservations(stateDir).length, 0);
+    assert.equal(f.calls.filter(c => c.verb === 'release').length, 0);
+    loop.stop(); await f.session.stop();
+  });
+}
+
+test('routing is opt-in and malformed enablement refuses without echoing input', () => {
+  assert.equal(routingSessionEnabled({}), false);
+  assert.equal(routingSessionEnabled({ OWENLOOP_ROUTING_SESSION: '0' }), false);
+  assert.equal(routingSessionEnabled({ OWENLOOP_ROUTING_SESSION: '1' }), true);
+  assert.throws(() => routingSessionEnabled({ OWENLOOP_ROUTING_SESSION: 'not-a-secret-channel' }), error => error instanceof Error && !error.message.includes('not-a-secret-channel'));
+});
+
+test('runtime willingness intersects exact account/crew local roster with service tuples', async () => {
+  const f = await routedLoopFixture();
+  const c = f.candidate;
+  const local = [{ harness: c.tuples[0]!.tuple.harness, model: c.tuples[0]!.tuple.model, effort: c.tuples[0]!.tuple.effort }];
+  assert.deepEqual(selectShiftRoutingTuples(c, local), c.tuples);
+  assert.deepEqual(selectShiftRoutingTuples(c, [{ ...local[0]!, model: 'other-model' }]), []);
+  assert.deepEqual(selectShiftRoutingTuples({ ...c, role: 'unknown' }, local), []);
+  assert.deepEqual(selectShiftRoutingTuples({ ...c, context: { ...c.context, rolePolicyRevision: 'stale' } }, local), []);
+  assert.deepEqual(selectShiftRoutingTuples({ ...c, tuples: [{ ...c.tuples[0]!, available: false }] }, local), []);
+  await f.session.stop();
+});
+
+test('routing retries identical offer bytes without renewing an uncertain firing window', async () => {
+  const f = await routedLoopFixture();
+  f.hub.whatsNext = async () => { throw new Error('uncertain response'); };
+  const loop = createShiftLoop(f.options);
+  await loop.iterate();
+  assert.equal(f.offers.length, 1);
+  f.candidate.context.now += 1000;
+  await loop.iterate();
+  assert.equal(f.offers.length, 2);
+  assert.deepEqual(f.offers[0], f.offers[1]);
+  f.candidate.candidateId = 'changed-authority-same-window';
+  await loop.iterate();
+  assert.equal(f.offers.length, 2, 'an authority ABA cannot issue a replacement allowance');
+  loop.stop(); await f.session.stop();
+});
+
+test('offer submission rechecks locked reservations after awaiting service context', async () => {
+  const f = await routedLoopFixture();
+  f.session.hub.routingOfferContext = async () => {
+    reserveChild(stateDir, { workflow: 'wf', run: 'reserved-a', reservedAt: 1000, childKind: 'agent-run' });
+    reserveChild(stateDir, { workflow: 'wf', run: 'reserved-b', reservedAt: 1000, childKind: 'agent-run' });
+    return { contexts: [f.candidate] };
+  };
+  const loop = createShiftLoop(f.options);
+  assert.equal(await loop.iterate(), 0);
+  assert.equal(f.offers.length, 0);
+  assert.equal(f.spawns.length, 0);
+  assert.equal(readChildReservations(stateDir).length, 2);
+  loop.stop(); await f.session.stop();
+});
+
+test('private handoff cleanup refuses a substituted file and never deletes its target', async () => {
+  const f = routingSessionFixture();
+  const session = await f.open();
+  const a = session.createHandoff(f.reserve('a'));
+  const target = join(stateDir, 'unrelated');
+  writeFileSync(target, 'retain');
+  unlinkSync(a.path);
+  symlinkSync(target, a.path);
+  assert.throws(() => a.terminal(), /routing/);
+  assert.equal(readFileSync(target, 'utf8'), 'retain');
+  await session.stop();
+  assert.equal(readFileSync(target, 'utf8'), 'retain');
+});
+
+test('another startup cannot permanently invalidate an empty active incarnation', async () => {
+  const f = routingSessionFixture();
+  const first = await f.open();
+  const second = await f.open();
+  const file = first.createHandoff(f.reserve('a'));
+  assert.ok(existsSync(file.path));
+  file.terminal();
+  await first.stop(); await second.stop();
+});
+
+test('real detached worker exit cleans its unconsumed private handoff through the production spawner', async () => {
+  const f = await routedLoopFixture();
+  const script = join(stateDir, 'handoff-worker.cjs');
+  writeFileSync(script, "const fs = require('node:fs'); process.exit(fs.existsSync(process.env.OWENLOOP_ROUTING_HANDOFF) ? 0 : 9);\n");
+  let loop: ShiftLoop;
+  let path: string | undefined;
+  let finish: (exit: WorkerExit) => void = () => {};
+  const exited = new Promise<WorkerExit>(resolve => { finish = resolve; });
+  const real = createDefaultSpawner('https://hub.example', 'selected-account', script, f.session.identity()!.shiftId,
+    failure => loop.noteWorkerFailure(failure), undefined, undefined,
+    exit => { loop.noteChildExited(exit); finish(exit); });
+  loop = createShiftLoop({ ...f.options, spawner: spec => { path = spec.routingHandoff; return real(spec); } });
+  assert.equal(await loop.iterate(), 1);
+  const result = await new Promise<WorkerExit>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('detached fixture did not exit')), 10_000);
+    void exited.then(value => { clearTimeout(timeout); resolve(value); }, reject);
+  });
+  assert.equal(result.exitStatus, 0);
+  assert.ok(path);
+  assert.equal(existsSync(path), false);
+  assert.equal(readChildRecords(stateDir).length, 0);
+  loop.stop(); await f.session.stop();
+});
+
+
+test('command claims consume a real shift offer with an open agent lane', async () => {
+  const f = await routedLoopFixture('command');
+  const loop = createShiftLoop(f.options);
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(f.offers.length, 1);
+  assert.equal(f.requests[0]!.routing?.kind, 'shift');
+  assert.equal(f.calls.filter(c => c.verb === 'release').length, 0);
+  assert.equal(f.spawns[0]!.kind, undefined);
+  f.spawns[0]!.onTerminal?.();
+  loop.stop(); await f.session.stop();
+});
+
+test('missing authored role policy at the offer endpoint still permits authenticated command routing', async () => {
+  const f = await routedLoopFixture('command');
+  const id = f.session.identity()!;
+  const transport: Array<{ url: string; headers: Headers; body: any }> = [];
+  const client = createHubClient({ origin: ORIGIN, getToken: async () => 'enrolled-base',
+    routingSession: { allowedOrigin: ORIGIN, get: () => ({ ...id, credential: f.f.credential }), now: () => 1000 },
+    fetchImpl: (async (url, init) => {
+      transport.push({ url: String(url), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+      // ab73: routingOfferTransport throws RoutingRefusal, which the edge's
+      // generic error handler returns as a 500; there is no public policy code.
+      if (String(url).endsWith('/routing_offer_context')) return Response.json({ error: 'internal_error', message: 'internal server error' }, { status: 500 });
+      if (String(url).endsWith('/whats_next')) return Response.json(await f.hub.whatsNext(JSON.parse(String(init?.body))));
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  f.session.hub.routingOfferContext = client.routingOfferContext;
+  f.edit(order => { order.routing!.preference.rolePolicy = null; order.routing!.preference.tuples = []; });
+  const loop = createShiftLoop({ ...f.options, hub: { ...f.hub, whatsNext: client.whatsNext } });
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(f.offers.length, 0);
+  assert.equal(transport.length, 2);
+  assert.equal(transport[1]!.body.routing.kind, 'ready_firing');
+  for (const request of transport) {
+    assert.equal(request.headers.get('X-Owenloop-Routing-Session'), f.f.credential);
+    assert.equal(request.headers.get('Authorization'), 'Bearer enrolled-base');
+  }
+  f.spawns[0]!.onTerminal?.();
+  loop.stop(); await f.session.stop();
+});
+
+test('session scope rotates after roster recovery, capability addition and crew changes without closing live handoffs', async () => {
+  let nextId = 0;
+  let refuseOpen = false;
+  const scopes = new Map<string, import('../src/hub/types.ts').RoutingScope>();
+  const closed: string[] = [];
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: [] }, now: () => 1000, getToken: async () => 'enrolled-base',
+    fetchImpl: (async (url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (String(url).endsWith('/routing_session_open')) {
+	if (refuseOpen) return Response.json({ error: 'forbidden' }, { status: 403 });
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++nextId).padStart(12, '0')}`;
+	scopes.set(sessionId, body.scope);
+	return Response.json({ sessionId, shiftId: `shf_${nextId}`, credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: 900_000 });
+      }
+      const id = new Headers(init?.headers).get('X-Owenloop-Routing-Session')!.split('.')[1]!;
+      if (String(url).endsWith('/routing_session_close')) { closed.push(id); return Response.json({ closed: true }); }
+      if (String(url).endsWith('/whats_next')) {
+	const scope = scopes.get(id)!;
+	assert.ok(body.serve_capabilities.every((cap: string) => scope.capabilities!.includes(cap)));
+	assert.ok(!scope.crews || (body.serve_crews.length && body.serve_crews.every((crew: string) => scope.crews!.includes(crew))));
+	return Response.json({ text: '', orders: [] });
+      }
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  const stableHub = session.hub;
+  const initialId = session.identity()!.sessionId;
+  await session.ensureScope({ capabilities: ['build'], crews: [] });
+  assert.notEqual(session.identity()!.sessionId, initialId);
+  assert.deepEqual(closed, [initialId]);
+  const oldId = session.identity()!.sessionId;
+  const handoff = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'old', reservedAt: 1000, childKind: 'agent-run' }).reservation);
+  const bytes = readFileSync(handoff.path, 'utf8');
+  refuseOpen = true;
+  await assert.rejects(session.ensureScope({ capabilities: ['build', 'test'], crews: [] }), error => error instanceof HubError && error.status === 403 && error.message === 'routing request refused');
+  assert.equal(session.identity()!.sessionId, oldId);
+  assert.equal(closed.includes(oldId), false);
+  refuseOpen = false;
+  for (const selection of [
+    { capabilities: ['build', 'test'], crews: [] },
+    { capabilities: ['test'], crews: ['review'] },
+    { capabilities: ['build'], crews: [] },
+  ]) {
+    await session.ensureScope(selection);
+    await stableHub.whatsNext({ workflow: 'wf', serve_capabilities: selection.capabilities, serve_crews: selection.crews, routing: { kind: 'ready_firing' } });
+    assert.equal(readFileSync(handoff.path, 'utf8'), bytes);
+    assert.equal(closed.includes(oldId), false);
+  }
+  assert.equal(nextId, 5);
+  await session.ensureScope({ capabilities: ['build'], crews: [] });
+  assert.equal(nextId, 5, 'unchanged selection does not reopen or renew offers');
+  await session.stop();
+  assert.equal(closed.includes(oldId), false);
+  handoff.terminal();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closed.filter(id => id === oldId).length, 1);
+});
+
+
+for (const status of [401, 403, 429, 503]) {
+  test(`offer context HTTP ${status} does not trigger command fallback`, async () => {
+    const f = await routedLoopFixture('command');
+    f.session.hub.routingOfferContext = async () => { throw new HubError(status, 'routing request refused'); };
+    const loop = createShiftLoop(f.options);
+    assert.equal(await loop.iterate(), 0);
+    assert.equal(f.requests.length, 0);
+    assert.equal(f.spawns.length, 0);
+    loop.stop(); await f.session.stop();
+  });
+}
+
+test('opaque offer refusal never authorizes an agent without willingness', async () => {
+  const f = await routedLoopFixture();
+  f.session.hub.routingOfferContext = async () => { throw new HubError(500, 'routing request refused'); };
+  const loop = createShiftLoop(f.options);
+  assert.equal(await loop.iterate(), 0);
+  assert.equal(f.requests[0]!.routing?.kind, 'ready_firing');
+  assert.equal(f.spawns.length, 0);
+  assert.equal(f.calls.filter(c => c.verb === 'release').length, 0);
+  loop.stop(); await f.session.stop();
+});
+
+test('loop reconciles recovered and changed scope before offer and claim requests, freezing each selection', async () => {
+  const f = await routedLoopFixture('command');
+  let capabilities: string[] = [];
+  let clock = 0;
+  const selections: Array<{ capabilities: string[]; crews: string[] }> = [];
+  const originalEnsure = f.session.ensureScope;
+  // This seam verifies loop sequencing separately from the real session
+  // rotation/strict server scope test above. Keep the fixture identity stable.
+  f.session.ensureScope = async selection => { selections.push(structuredClone(selection)); };
+  let offered = 0;
+  let loop: ShiftLoop;
+  f.session.hub.routingOfferContext = async request => {
+    offered++;
+    assert.deepEqual(request.serve_capabilities, selections.at(-1)!.capabilities);
+    assert.deepEqual(request.serve_crews, selections.at(-1)!.crews);
+    if (offered === 1) loop.setShift({ serveCrews: ['next'] });
+    return { contexts: [] };
+  };
+  f.hub.whatsNext = async request => {
+    assert.deepEqual(request.serve_capabilities, selections.at(-1)!.capabilities);
+    assert.deepEqual(request.serve_crews, selections.at(-1)!.crews);
+    return { text: '', orders: [] };
+  };
+  loop = createShiftLoop({ ...f.options, monotonicNow: () => clock, computeServeCapabilities: () => capabilities,
+    syncRosters: async () => { capabilities = ['build']; }, rosterSyncIntervalMs: 60_000 });
+  clock = 60_000;
+  await loop.iterate();
+  assert.ok(selections.some(s => s.capabilities.includes('build') && s.crews.length === 0));
+  capabilities = ['build', 'test'];
+  loop.setShift({ serveCrews: ['review'] });
+  await loop.iterate();
+  assert.deepEqual(selections.at(-1), { capabilities: ['build', 'test'], crews: ['review'] });
+  f.session.ensureScope = originalEnsure;
+  loop.stop(); await f.session.stop();
+});
+
+
+test('session rotation preserves HTTP 429 Retry-After and suppresses every periodic hub call until its deadline', async () => {
+  let clock = 0;
+  let opens = 0;
+  let offers = 0;
+  let syncs = 0;
+  const errors: string[] = [];
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => clock, getToken: async () => 'enrolled-base',
+    fetchImpl: (async (url, init) => {
+      if (String(url).endsWith('/routing_session_open')) {
+	opens++;
+	if (opens === 2) return Response.json({ error: 'rate_limited', message: 'private response must not escape' },
+	  { status: 429, headers: { 'Retry-After': '120' } });
+	const sessionId = `rs_12345678-1234-1234-1234-${String(opens).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${opens}`, credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: clock + 900_000 });
+      }
+      if (String(url).endsWith('/routing_offer_context')) { offers++; return Response.json({ contexts: [] }); }
+      if (String(url).endsWith('/routing_session_close')) return Response.json({ closed: true });
+      assert.fail(`unexpected session request ${String(url)} ${String(init?.method)}`);
+    }) as typeof fetch,
+  });
+  const initialId = session.identity()!.sessionId;
+  const { hub, calls } = mockHub({});
+  let capabilities = ['build'];
+  const loop = createShiftLoop(baseOpts(hub, () => { assert.fail('no work offered'); }, {
+    workflow: 'wf', routingSession: session, now: () => clock, monotonicNow: () => clock,
+    computeServeCapabilities: () => capabilities,
+    syncRosters: async () => { syncs++; }, rosterSyncIntervalMs: 5000, presenceIntervalMs: 5000,
+    err: message => { errors.push(message); },
+  }));
+  try {
+    await loop.iterate();
+    capabilities = ['build', 'test'];
+    loop.setShift({ serveCrews: [] });
+    clock = 5000;
+    await loop.iterate(); // the changed selection receives Retry-After: 120
+    assert.equal(opens, 2);
+    assert.equal(session.identity()!.sessionId, initialId);
+    const quiet = { calls: calls.length, offers, syncs };
+    for (clock of [10_000, 65_000, 124_999]) {
+      await loop.iterate();
+      assert.equal(opens, 2, 'rotation cannot retry at the ordinary polling interval');
+      assert.deepEqual({ calls: calls.length, offers, syncs }, quiet, 'backoff also suppresses roster, presence, wake and routing');
+    }
+    clock = 125_000;
+    await loop.iterate();
+    assert.equal(opens, 3, 'retry resumes at the server deadline');
+    assert.notEqual(session.identity()!.sessionId, initialId);
+    assert.equal(offers, quiet.offers + 1);
+    assert.equal(syncs, quiet.syncs + 1);
+    assert.ok(calls.length > quiet.calls);
+    assert.equal(errors.some(message => message.includes('private response')), false);
+  } finally { loop.stop(); await session.stop(); }
 });

@@ -50,6 +50,12 @@ export interface SpawnSpec {
   kind?: 'exec' | 'agent-run';
   /** Closed start gate created by the durable Shift reservation. */
   startGate?: string;
+  /** Private per-reservation handoff path; the capability stays in its file. */
+  routingHandoff?: string;
+  /** Authenticated service shift identity associated with this handoff. */
+  routingShiftId?: string;
+  /** Parent-only exact reservation cleanup, never passed to child code. */
+  onTerminal?: () => void;
   /** Stable shift name in force when this worker was dispatched. */
   shiftName?: string;
   /** Stable owner key for session reconciliation. */
@@ -240,6 +246,11 @@ export function buildSpawnPlan(
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
   const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env['OWENLOOP_ROUTING_HANDOFF'];
+  if (spec.routingHandoff !== undefined) {
+    env['OWENLOOP_ROUTING_HANDOFF'] = spec.routingHandoff;
+    delete env['OWENLOOP_TOKEN'];
+  }
   env['OWENLOOP_ACCOUNT'] = account;
   if (spec.startGate !== undefined) env['OWENLOOP_START_GATE'] = spec.startGate;
   if (spec.shiftName !== undefined && spec.shiftName !== '') env['OWENLOOP_SHIFT_NAME'] = spec.shiftName;
@@ -256,7 +267,7 @@ export function buildSpawnPlan(
       `${spec.workflow}/${spec.run}`,
       '--origin',
       origin,
-      ...(shiftId !== undefined && shiftId !== '' ? ['--shift', shiftId] : []),
+      ...((spec.routingShiftId ?? shiftId) ? ['--shift', (spec.routingShiftId ?? shiftId)!] : []),
     ],
     options: {
       detached: true,
@@ -359,6 +370,12 @@ export function createDefaultSpawner(
     // Untrusted is a reason not to REPEAT those bytes, never a reason to
     // discard them before an operator can read them — reading them is the whole
     // point of `<run>.log`.
+    let terminalReported = false;
+    const terminal = () => {
+      if (terminalReported) return;
+      terminalReported = true;
+      spec.onTerminal?.();
+    };
     let failureReported = false;
     let exitReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
@@ -381,10 +398,12 @@ export function createDefaultSpawner(
       onExit({ workflow: spec.workflow, run: spec.run, kind, pid: child.pid, exitStatus, signal });
     };
     child.once('error', () => {
+      terminal();
       report(null, null, 'worker process failed to start');
       reportExit(null, null);
     });
     child.once('exit', (code, signal) => {
+      terminal();
       reportExit(code, signal);
       if (code === 0) return;
       report(code, signal, 'worker exited without completing successfully');
@@ -407,6 +426,7 @@ export function createDefaultSpawner(
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
     const kill = (): void => {
+      terminal();
       try {
 	child.kill('SIGTERM');
       } catch {

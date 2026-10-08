@@ -6,15 +6,20 @@
  * that resolves settings, credentials, caches, child spawners, and signal
  * behavior. The retired shift stdio-MCP mount is intentionally absent.
  */
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { constants, closeSync, fstatSync, lstatSync, mkdirSync, openSync, opendirSync, readSync, rmdirSync, unlinkSync, writeFileSync, type Dir, type Stats } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-import { createHubClient } from '../hub/client.ts';
+import { createHubClient, type RoutingHubClient } from '../hub/client.ts';
+import { HubError, type RoutingScope, type RoutingSessionOpenResponse, type RoutingOfferCandidate, type LocalTupleEligibility, type LocalModelTuple } from '../hub/types.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
-import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
+import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, readHubRosterCache, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
+import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
+import { resolveCapabilityCandidates, type RosterCandidate } from '../agent/capability-model.ts';
+import { adapterFor } from '../harness/registry.ts';
 import { computeServeCapabilities } from '../settings/serving.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { checkDiskFloor, resolveDiskFloorBytes } from './disk-floor.ts';
@@ -30,7 +35,7 @@ import { createShiftLogSink } from './logsink.ts';
 import { prepareShiftLogDir, shiftLogFile } from './logretention.ts';
 import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protocol.ts';
 import { createDefaultSpawner, type Spawner, type WorkerExit, type WorkerFailure } from './spawn.ts';
-import { resolveStateDir, ensureStateDir, reconcileInFlight, type Liveness, type Reconciliation } from './state.ts';
+import { resolveStateDir, ensureStateDir, reconcileInFlight, readChildReservations, type ChildReservation, type Liveness, type Reconciliation } from './state.ts';
 import { FileLockTimeoutError, type AcquireFileLockOpts } from '../../../../src/lock.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
 import {
@@ -390,7 +395,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   }
   const env = process.env;
   let settings;
+  let routingEnabled: boolean;
   try {
+    routingEnabled = routingSessionEnabled(env);
     settings = loadSettings(env);
   } catch (err) {
     process.stderr.write(`${roleLabel}: ${errMsg(err)}\n`);
@@ -409,7 +416,10 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   }
   const account = parsed.as ?? 'default';
 
-  const bearer = await resolveBearer({ origin, account, env });
+  // A routed Shift and its detached children must resolve the same enrolled
+  // account. The ambient development token cannot authorize either side.
+  const bearer = await resolveBearer({ origin, account,
+    env: routingEnabled ? { ...env, OWENLOOP_TOKEN: undefined } : env });
   if (!bearer.ok) {
     process.stderr.write(`${roleLabel}: ${bearer.message}\n`);
     return bearer.code;
@@ -427,7 +437,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   }
 
   const now = () => Date.now();
-  const shiftId = `shf_${randomUUID()}`;
+  let shiftId = `shf_${randomUUID()}`;
   const startedAt = now();
   const name = resolveShiftName(parsed.name, { shiftId });
   // Explicit names are the human/stable identity. Unnamed shifts deliberately
@@ -523,7 +533,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     parsed.workRoots !== undefined && parsed.workRoots.length > 0
       ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
       : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
-  const hub = createHubClient({ origin, getToken: async () => token });
+  let hub = createHubClient({ origin, getToken: async () => token,
+    ...(routingEnabled ? { routingSession: { allowedOrigin: origin, get: () => undefined } } : {}) });
+  let routingSession: ShiftRoutingSession | undefined;
   const monotonicNow = () => performance.now();
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
@@ -622,6 +634,28 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     process.stderr.write(`${roleLabel}: ${startupRosterSyncFailure}\n`);
   }
 
+  if (routingEnabled) {
+    try {
+      const principal = await hub.whoami(AbortSignal.timeout(DEFAULT_HUB_CALL_TIMEOUT_MS));
+      if (!['token', 'oauth'].includes(principal.authMethod) || principal.tokenStatus !== 'active') {
+	throw new Error('routing requires an enrolled bearer');
+      }
+      routingSession = await openShiftRoutingSession({ origin, stateDir,
+	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
+	scope: {
+	  ...(parsed.workflow ? { workflows: [parsed.workflow] } : {}),
+	  ...(parsed.serveCrews?.length ? { crews: parsed.serveCrews } : {}),
+	  capabilities: computeServeCapabilities({ env, crews: parsed.serveCrews ?? [], hub: { origin, account } }),
+	},
+      });
+      hub = routingSession.hub;
+      shiftId = routingSession.identity()!.shiftId;
+    } catch {
+      process.stderr.write(`${roleLabel}: routing session initialization failed\n`);
+      return 1;
+    }
+  }
+
   const reportWorkerFailure = (failure: WorkerFailure): void => {
     // A worker failure is detected by the SPAWNER's `exit`/`error` listener, not
     // inside the loop's sweep, so it never passes through the loop's `emit()`.
@@ -666,8 +700,15 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
+  const selectRoutingTuples = (candidate: RoutingOfferCandidate): LocalTupleEligibility[] => {
+    const serving = loopRef.current?.getShift().serveCrews ?? parsed.serveCrews ?? [];
+    return selectLocalRoutingTuples(candidate, { env, origin, account, serving,
+      harnessAvailable: harness => adapterFor(harness) !== undefined });
+  };
+
   const loop = createShiftLoop({
     hub,
+    ...(routingSession ? { routingSession, selectRoutingTuples } : {}),
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now,
@@ -788,7 +829,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     } else {
       emitStartupRosterSyncFailure();
     }
-    return daemon.run();
+    try { return await daemon.run(); } finally { loop.stop(); await routingSession?.stop(); }
   }
 
   installSignalHandlers(loop, process, (line) => process.stderr.write(`${line}\n`));
@@ -799,7 +840,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   } else {
     emitStartupRosterSyncFailure();
   }
-  return loop.run();
+  try { return await loop.run(); } finally { loop.stop(); await routingSession?.stop(); }
 }
 
 export async function run(args: string[]): Promise<number> {
@@ -815,4 +856,337 @@ export async function run(args: string[]): Promise<number> {
     return 2;
   }
   return runShiftRuntime(parsed);
+}
+
+/** Private handoff wire for the later trusted role consumer. The base bearer
+ * remains in its existing account store. expiresAt is a consumption deadline,
+ * not a renewable lease; each sibling receives a different file and nonce. */
+export interface RoutingHandoffV1 {
+  version: 'routing-handoff-v1'; incarnation: string; nonce: string;
+  origin: string; orgId: string; sessionId: string; shiftId: string; credential: string;
+  reservation: ChildReservation; createdAt: number; expiresAt: number; sessionExpiresAt: number;
+}
+export interface RoutingHandoff {
+  path: string;
+  /** Exact reservation/incarnation owner callback; safe after child consumption. */
+  terminal(): void;
+}
+export interface ShiftRoutingSession {
+  hub: RoutingHubClient;
+  identity(): { orgId: string; principalId: string; sessionId: string; shiftId: string; expiresAt: number } | undefined;
+  createHandoff(reservation: ChildReservation): RoutingHandoff;
+  maintain(): Promise<void>;
+  /** Open new authority for changed serving selections; never widen a session. */
+  ensureScope(selection: { capabilities: string[]; crews: string[] }): Promise<void>;
+  /** Stop dispatch. Live detached workers preserve the shared session. */
+  stop(): Promise<void>;
+}
+const HANDOFF_BATCH = 64;
+const HANDOFF_MAX_BYTES = 16_384;
+const incarnationName = /^inc_[a-f0-9]{32}$/;
+const handoffName = /^([a-f0-9]{32})\.json$/;
+function sameInode(a: Stats, b: Stats): boolean { return a.dev === b.dev && a.ino === b.ino; }
+function privateDirectory(path: string, create = false): Stats {
+  if (create) {
+    try { mkdirSync(path, { mode: 0o700 }); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
+  }
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700
+    || (process.getuid && stat.uid !== process.getuid())) throw new Error('routing private directory refused');
+  return stat;
+}
+function removeExactHandoff(path: string, inode: Stats): void {
+  try {
+    const current = lstatSync(path);
+    if (!current.isFile() || current.isSymbolicLink() || !sameInode(current, inode)) throw new Error('routing handoff ownership changed');
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('routing handoff cleanup failed');
+  }
+}
+
+/** Bounded cursor over recognized private entries. No PID/tag grants deletion.
+ * If this application never starts again, expired files may physically remain. */
+function handoffMaintenance(root: string, now: () => number, preserved: Set<string>) {
+  const rootInode = privateDirectory(root);
+  let roots: Dir | undefined;
+  let entries: { directory: string; name: string; inode: Stats; dir: Dir } | undefined;
+  const close = () => {
+    entries?.dir.closeSync(); entries = undefined;
+    roots?.closeSync(); roots = undefined;
+  };
+  const sweep = () => {
+    if (!sameInode(privateDirectory(root), rootInode)) throw new Error('routing private root changed');
+    roots ??= opendirSync(root);
+    for (let scanned = 0; scanned < HANDOFF_BATCH; scanned++) {
+      if (!entries) {
+	const entry = roots.readSync();
+	if (!entry) { close(); break; }
+	if (!entry.isDirectory() || !incarnationName.test(entry.name)) continue;
+	const directory = join(root, entry.name);
+	try { entries = { directory, name: entry.name, inode: privateDirectory(directory), dir: opendirSync(directory) }; }
+	catch { continue; }
+      }
+      const entry = entries.dir.readSync();
+      if (!entry) {
+	const directory = entries.directory;
+	entries.dir.closeSync(); entries = undefined;
+	try { if (!preserved.has(directory)) rmdirSync(directory); } catch { /* Nonempty/live or already removed. Never recursive. */ }
+	continue;
+      }
+      const match = handoffName.exec(entry.name);
+      if (!match || !entry.isFile()) continue;
+      const path = join(entries.directory, entry.name);
+      let fd: number | undefined;
+      try {
+	if (!sameInode(privateDirectory(entries.directory), entries.inode)) continue;
+	const expected = lstatSync(path);
+	if (!expected.isFile() || expected.isSymbolicLink() || (expected.mode & 0o777) !== 0o600
+	  || (process.getuid && expected.uid !== process.getuid()) || expected.size > HANDOFF_MAX_BYTES) continue;
+	fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	if (!sameInode(fstatSync(fd), expected)) continue;
+	const bytes = Buffer.alloc(HANDOFF_MAX_BYTES + 1);
+	const count = readSync(fd, bytes, 0, bytes.length, 0);
+	if (count > HANDOFF_MAX_BYTES) continue;
+	const p = JSON.parse(bytes.subarray(0, count).toString('utf8')) as RoutingHandoffV1;
+	if (p.version !== 'routing-handoff-v1' || p.incarnation !== entries.name || p.nonce !== match[1]
+	  || !p.reservation || !/^[a-f0-9]{32}$/.test(p.reservation.token)
+	  || !Number.isSafeInteger(p.createdAt) || !Number.isSafeInteger(p.expiresAt)
+	  || !Number.isSafeInteger(p.sessionExpiresAt) || p.expiresAt > p.createdAt + 120_000
+	  || p.expiresAt > p.sessionExpiresAt || p.expiresAt <= p.createdAt) continue;
+	if (now() >= p.expiresAt && sameInode(privateDirectory(entries.directory), entries.inode)) removeExactHandoff(path, expected);
+      } catch { /* Unknown/substituted/unreadable entries never authorize broader cleanup. */ }
+      finally { if (fd !== undefined) closeSync(fd); }
+    }
+  };
+  return { sweep, close };
+}
+
+/** Opt-in trusted runtime closure. Neither this value nor its capability is an
+ * MCP argument, persisted dispatch event, global env variable or log payload. */
+interface ShiftRoutingSessionOptions {
+  stateDir: string; origin: string; orgId: string; principalId: string; scope: RoutingScope;
+  getToken: () => Promise<string>; fetchImpl?: typeof fetch; now?: () => number; nonce?: () => string;
+}
+
+export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions): Promise<ShiftRoutingSession> {
+  const normalize = (scope: RoutingScope): RoutingScope => Object.fromEntries(
+    Object.entries(scope).sort(([a], [b]) => a.localeCompare(b)).map(([key, values]) => [key, [...new Set(values)].sort()]));
+  const workflows = opts.scope.workflows && [...opts.scope.workflows];
+  let scope = normalize(structuredClone(opts.scope));
+  let active = await openRoutingIncarnation({ ...opts, scope });
+  let stopped = false;
+  let changing: Promise<void> = Promise.resolve();
+  // Callers keep this client, while each request resolves the current authority.
+  // In-flight calls and old handoffs retain their original incarnation closure.
+  const hub = new Proxy(active.hub, {
+    get: (_target, property) => Reflect.get(active.hub, property),
+    set: (_target, property, value) => Reflect.set(active.hub, property, value),
+  });
+  return {
+    hub,
+    identity: () => active.identity(),
+    createHandoff: reservation => {
+      if (stopped) throw new Error('routing session stopped');
+      return active.createHandoff(reservation);
+    },
+    async ensureScope(selection) {
+      const desired = normalize({
+	...(workflows ? { workflows } : {}),
+	...(selection.crews.length ? { crews: [...selection.crews] } : {}),
+	capabilities: [...selection.capabilities],
+      });
+      const change = changing.catch(() => {}).then(async () => {
+	if (stopped) throw new Error('routing session stopped');
+	if (JSON.stringify(scope) === JSON.stringify(desired)
+	  && (active.identity()?.expiresAt ?? 0) > (opts.now ?? Date.now)()) return;
+	// Never alter the old session, nor discard it on a failed open.
+	const next = await openRoutingIncarnation({ ...opts, scope: desired });
+	if (stopped) { await next.stop(); throw new Error('routing session stopped'); }
+	const previous = active;
+	active = next;
+	scope = desired;
+	// stop() defers close while any owned worker is live. Its existing
+	// terminal callbacks close that exact old session, not the new one.
+	await previous.stop();
+      });
+      changing = change;
+      await change;
+    },
+    async maintain() { await changing; await active.maintain(); },
+    async stop() {
+      stopped = true;
+      try { await changing; } catch { /* Failed scope changes retain active. */ }
+      await active.stop();
+    },
+  };
+}
+
+async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise<Omit<ShiftRoutingSession, 'ensureScope'>> {
+  const origin = new URL(opts.origin);
+  if (origin.protocol !== 'https:' || origin.origin !== opts.origin || origin.username || origin.password) throw new Error('routing origin refused');
+  const now = opts.now ?? Date.now;
+  ensureStateDir(opts.stateDir);
+  const root = join(opts.stateDir, '.routing-handoffs');
+  privateDirectory(root, true);
+  const preserved = new Set<string>();
+  const maintenance = handoffMaintenance(root, now, preserved);
+  maintenance.sweep();
+  let authority: RoutingSessionOpenResponse | undefined;
+  const hub = createHubClient({ origin: opts.origin, getToken: opts.getToken,
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    routingSession: { allowedOrigin: opts.origin, get: () => authority, now } });
+  try { authority = await hub.openRoutingSession({ scope: opts.scope }, AbortSignal.timeout(10_000)); }
+  catch (error) {
+    maintenance.close();
+    // scopedPost already sanitizes HTTP errors. Retain status/Retry-After so
+    // session rotation participates in the loop's existing server backoff.
+    if (error instanceof HubError) throw error;
+    throw new Error('routing session open failed');
+  }
+  if (!authority || !/^rs_[a-f0-9-]{36}$/.test(authority.sessionId)
+    || !authority.shiftId?.startsWith('shf_') || typeof authority.credential !== 'string'
+    || !authority.credential.startsWith(`rs1.${authority.sessionId}.`)
+    || !/^rs1\.rs_[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}$/.test(authority.credential)
+    || !Number.isSafeInteger(authority.expiresAt) || authority.expiresAt <= now()) {
+    authority = undefined; maintenance.close(); throw new Error('routing session response refused');
+  }
+  const incarnation = `inc_${randomBytes(16).toString('hex')}`;
+  const directory = join(root, incarnation);
+  let directoryInode: Stats;
+  try {
+    mkdirSync(directory, { mode: 0o700 }); // Exclusive incarnation ownership.
+    directoryInode = privateDirectory(directory);
+    preserved.add(directory);
+  } catch {
+    try { await hub.closeRoutingSession(AbortSignal.timeout(10_000)); } catch { /* Expiry remains the remote bound. */ }
+    authority = undefined; maintenance.close();
+    throw new Error('routing incarnation creation failed');
+  }
+  const rootInode = privateDirectory(root);
+  const ensureIncarnation = () => {
+    if (!sameInode(privateDirectory(root), rootInode)) throw new Error('routing private root changed');
+    try {
+      if (!sameInode(privateDirectory(directory), directoryInode)) throw new Error('routing incarnation changed');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // Another startup may reclaim an empty incarnation. Recreate only an
+      // absent entry exclusively; a substituted directory is never adopted.
+      mkdirSync(directory, { mode: 0o700 });
+      directoryInode = privateDirectory(directory);
+    }
+  };
+  const owned = new Map<string, RoutingHandoff>();
+  let stopped = false;
+  let renewing: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
+  const finish = (): Promise<void> => {
+    if (!stopped || owned.size > 0) return Promise.resolve();
+    closing ??= (async () => {
+      try {
+	await renewing;
+	if (authority) await hub.closeRoutingSession(AbortSignal.timeout(10_000));
+      } catch { /* Remote expiry bounds authority even if close cannot be delivered. */ }
+      finally {
+	authority = undefined;
+	maintenance.close();
+	try { if (sameInode(privateDirectory(directory), directoryInode)) rmdirSync(directory); } catch { /* Preserve substituted or nonempty entries. */ }
+      }
+    })();
+    return closing;
+  };
+  return {
+    hub,
+    identity: () => authority && ({ orgId: opts.orgId, principalId: opts.principalId,
+      sessionId: authority.sessionId, shiftId: authority.shiftId, expiresAt: authority.expiresAt }),
+    createHandoff(reservation) {
+      if (stopped || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
+	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token
+	  && r.workflow === reservation.workflow && r.run === reservation.run && r.reservedAt === reservation.reservedAt)) throw new Error('routing reservation unavailable');
+      ensureIncarnation();
+      const nonce = (opts.nonce ?? (() => randomBytes(16).toString('hex')))();
+      if (!/^[a-f0-9]{32}$/.test(nonce) || !sameInode(privateDirectory(directory), directoryInode)) throw new Error('routing handoff ownership refused');
+      const path = join(directory, `${nonce}.json`);
+      const createdAt = now();
+      const payload: RoutingHandoffV1 = { version: 'routing-handoff-v1', incarnation, nonce,
+	origin: opts.origin, orgId: opts.orgId, sessionId: authority.sessionId, shiftId: authority.shiftId,
+	credential: authority.credential, reservation: { ...reservation }, createdAt,
+	expiresAt: Math.min(createdAt + 120_000, authority.expiresAt), sessionExpiresAt: authority.expiresAt };
+      if (payload.expiresAt <= createdAt) throw new Error('routing handoff deadline expired');
+      let fd: number | undefined;
+      let inode: Stats | undefined;
+      try {
+	fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	inode = fstatSync(fd);
+	const bytes = JSON.stringify(payload);
+	if (Buffer.byteLength(bytes) > HANDOFF_MAX_BYTES) throw new Error('routing handoff too large');
+	writeFileSync(fd, bytes);
+      } catch {
+	if (inode) removeExactHandoff(path, inode);
+	throw new Error('routing handoff creation failed');
+      } finally { if (fd !== undefined) closeSync(fd); }
+      let terminal = false;
+      const handoff: RoutingHandoff = { path, terminal: () => {
+	if (terminal) return;
+	terminal = true;
+	try {
+	  if (!sameInode(privateDirectory(directory), directoryInode)) throw new Error('routing handoff ownership changed');
+	  removeExactHandoff(path, inode!);
+	} finally {
+	  owned.delete(reservation.token);
+	  void finish();
+	}
+      } };
+      owned.set(reservation.token, handoff);
+      return handoff;
+    },
+    async maintain() {
+      if (closing) return closing;
+      maintenance.sweep();
+      if (stopped || !authority || now() < authority.expiresAt - 60_000) return;
+      renewing ??= (async () => {
+	const renewed = await hub.renewRoutingSession(AbortSignal.timeout(10_000));
+	if (!authority || renewed.sessionId !== authority.sessionId || renewed.shiftId !== authority.shiftId
+	  || !Number.isSafeInteger(renewed.expiresAt) || renewed.expiresAt <= now()) throw new Error('routing renewal refused');
+	authority = { ...authority, expiresAt: renewed.expiresAt };
+      })();
+      try { await renewing; } finally { renewing = undefined; }
+    },
+    async stop() { stopped = true; maintenance.close(); await finish(); },
+  };
+}
+
+/** Nonsecret opt-in switch; its value is never a credential transport. */
+export function routingSessionEnabled(env: NodeJS.ProcessEnv): boolean {
+  const value = env['OWENLOOP_ROUTING_SESSION'];
+  if (value === undefined || value === '0') return false;
+  if (value === '1') return true;
+  throw new Error('OWENLOOP_ROUTING_SESSION must be 0 or 1');
+}
+
+export function selectShiftRoutingTuples(candidate: RoutingOfferCandidate, local: readonly RosterCandidate[], available: (tuple: LocalModelTuple) => boolean = () => true): LocalTupleEligibility[] {
+  const policy = candidate.rolePolicy;
+  if (!policy || policy.unknownRole !== 'refuse' || policy.revision !== candidate.context.rolePolicyRevision
+    || !['research', 'implementation', 'review', 'judge'].includes(candidate.role)) return [];
+  return candidate.tuples.filter(row => row.eligible && row.available && available(row.tuple)
+    && local.some(t => t.harness === row.tuple.harness && t.model === row.tuple.model && t.effort === row.tuple.effort)
+    && policy.rules.some(rule => rule.model === row.tuple.model && rule.roles.some(role => role === candidate.role)));
+}
+
+/** Local account and crew authority for one service offer context. */
+export function selectLocalRoutingTuples(candidate: RoutingOfferCandidate, opts: {
+  env: NodeJS.ProcessEnv; origin: string; account: string; serving: readonly string[];
+  harnessAvailable: (harness: string) => boolean;
+}): LocalTupleEligibility[] {
+  const cache = readHubRosterCache(opts.env, opts.origin, opts.account);
+  if (cache.kind !== 'hit' || cache.data.orgId !== candidate.context.orgId) return [];
+  const crew = cache.data.crews.find(row => row.crewId === candidate.context.crewId)?.crewName;
+  if (!crew || (opts.serving.length > 0 && !opts.serving.includes(crew))) return [];
+  const merged = mergeRosterLayers(effectiveRosterLayers(opts.env, crew, {
+    origin: opts.origin, account: opts.account,
+  }));
+  const rows = Object.fromEntries(Object.entries(merged).map(([key, row]) => [key, row.candidates]));
+  const selected = resolveCapabilityCandidates(rows, [candidate.context.capability]);
+  return selectShiftRoutingTuples(candidate, selected?.candidates ?? [])
+    .filter(row => opts.harnessAvailable(row.tuple.harness));
 }
