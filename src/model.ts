@@ -2833,6 +2833,16 @@ export function collectionLeaseSuccessors(
   // seal, a human intervention, or an input move.
   move('collection-close', new Map(state.arts), withoutLease);
 
+  // skip() checks producer authority, not the run's input CAS, and leaves a
+  // claimed task open. It can skip an owed, rejected, or already-green seal.
+  for (const path of sealPaths) {
+    const firing: Firing = { step: lease.step, key: lease.key, inputs: lease.inputs, outputs: [path] };
+    for (const arts of applyOutcome(def, state.arts, firing, 'skip',
+      { maxCollectionSize, modifier: state.modifier ?? modifier })) {
+      move('skip', arts, state.leases, undefined, path);
+    }
+  }
+
   const stale = lease.inputs.some((path) =>
     !isGreen(state.arts.get(path)) || state.arts.get(path)?.version !== lease.fingerprint[path]);
   const singletonPaths = singletonProduces(step)
