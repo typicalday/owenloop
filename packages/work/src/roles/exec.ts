@@ -160,6 +160,7 @@ export function exitCodeFor(outcome: ExecOutcome): number {
     case 'judge-no-verdict':
     case 'reject-failed':
     case 'stopped':
+    case 'routed-quarantined':
       return 1;
   }
 }
