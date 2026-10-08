@@ -17,6 +17,7 @@ import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/orig
 import { parseWorkdirFrom } from '../../../../src/paths.ts';
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
+import { bindTrustedRoutedInputV2, type RoutedInputPair, type RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
 import { validModelOrderFields, outputFor } from '../order-definition-binding.ts';
 import { createStoreInstructionResolver } from '../exec/instructions.ts';
 import { HubError, type GetOrderResponse, type OrderPacket, type WorkOrder } from '../hub/types.ts';
@@ -31,6 +32,9 @@ export interface RoutedDefinitionStage {
   digest: string;
   /** Parent-only, fresh full-order and current operator trust gate. */
   verifyOrder(response: GetOrderResponse): Promise<void>;
+  /** Full current trust plus exact Service input/value witness. */
+  verifyRoutedInput?(response: GetOrderResponse, pair: RoutedInputPair,
+    phase: RoutedInputPhase, started?: { wall: number; monotonic: number }): Promise<void>;
   /** Fixed-path submit remains restricted to singleton and judge outputs. */
   canSubmit(order: OrderPacket, path: string): boolean;
   /** The issued-member protocol requires an owed collection seal in signed source. */
@@ -372,7 +376,9 @@ export async function stageRoutedDefinition(args: {
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
       bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
-    const verifyOrder = async (response: GetOrderResponse): Promise<void> => {
+    const verifyOrderInternal = async (response: GetOrderResponse,
+      routed?: { pair: RoutedInputPair; phase: RoutedInputPhase;
+	started?: { wall: number; monotonic: number } }): Promise<void> => {
       const order = response.order;
       // The broker checks the exact original session incarnation around this
       // callback. The pre-start preference deadline must not terminate trust
@@ -432,8 +438,8 @@ export async function stageRoutedDefinition(args: {
 	  artifactPolicy: 'enforce' }), warn: () => {} });
       const verifiedStep = readOnlySource.getVerifiedStep(order.defDigest, order.step);
       const verifiedDefinition = readOnlySource.getVerifiedDefinition(order.defDigest, order.step);
-      if (!verifiedStep || !verifiedDefinition || !validModelOrderFields(verifiedStep, order,
-	verifiedDefinition.inputs.map(input => input.name)))
+	if (!verifiedStep || !verifiedDefinition || (!routed && !validModelOrderFields(verifiedStep, order,
+	  verifiedDefinition.inputs.map(input => input.name))))
 	throw new Error('routed order fields changed');
       // A declared optional input can set workdir without appearing in
       // `order.consumes`. Until Service supplies a canonical authenticated
@@ -441,8 +447,20 @@ export async function stageRoutedDefinition(args: {
       const workdirSource = verifiedStep.workdirFrom === undefined ? undefined
 	: parseWorkdirFrom(verifiedStep.workdirFrom, verifiedStep.consumes,
 	  verifiedDefinition.inputs.map(input => input.name));
-      if (workdirSource?.source === 'input') throw new Error('routed workdir witness unavailable');
-      if (order.worker === 'command') {
+      if (workdirSource?.source === 'input' && !routed) throw new Error('routed workdir witness unavailable');
+      if (routed) {
+	const admission = await bindTrustedRoutedInputV2({ phase: routed.phase, pair: routed.pair,
+	  privateOrder: order, instructions: resolver,
+	  consumedVerifier: createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
+	    artifactPolicy: 'enforce' }),
+	  expected: { workflow: args.order.routing?.claim.binding.runId ?? args.order.workflow,
+	    run: args.order.run },
+	  ...(routed.started ? { startedAt: routed.started.wall,
+	    startedMonotonic: routed.started.monotonic } : {}) });
+	if (!admission.ok || (order.worker === 'command'
+	  && (typeof verifiedStep.command !== 'string' || !verifiedStep.command.trim())))
+	  throw new Error('routed input witness refused');
+      } else if (order.worker === 'command') {
 	const checked = await resolver.resolveCommand(order);
 	if (!checked.ok) throw new Error('routed command definition refused');
       } else {
@@ -485,6 +503,11 @@ export async function stageRoutedDefinition(args: {
 	|| overlap(finalWorkdir, realpathSync(stagePath))
 	|| overlap(finalWorkdir, realpathSync(dirname(allowedSignersPath(args.sourceEnv)))))
 	throw new Error('routed definition custody changed');
+      if (routed && routed.started) {
+	const elapsed = performance.now() - routed.started.monotonic;
+	if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed >= 5_000)
+	  throw new Error('routed input observation expired');
+      }
     };
     const canReplay = (order: OrderPacket, path: string): boolean => {
       if (order.defDigest !== args.order.defDigest || order.step !== args.order.step
@@ -501,7 +524,10 @@ export async function stageRoutedDefinition(args: {
       const verified = source.getVerifiedStep(order.defDigest, order.step);
       return !!verified && outputFor(verified, order, sealPath)?.kind === 'collection';
     };
-    return { path: stagePath, digest: args.order.defDigest!, verifyOrder,
+    return { path: stagePath, digest: args.order.defDigest!,
+      verifyOrder: response => verifyOrderInternal(response),
+      verifyRoutedInput: (response, pair, phase, started) => verifyOrderInternal(response,
+	{ pair, phase, ...(started ? { started } : {}) }),
       canSubmit: canReplay, canReplay, canCollect, activate, markGateMayOpen, cleanup, cleanupAfterExit };
   } catch (error) {
     cleanup();

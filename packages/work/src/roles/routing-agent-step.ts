@@ -11,12 +11,15 @@ export function createRoutedAgentStepLoader(args: {
   instructions: InstructionResolver;
   instructionCwd: string;
   workflow: string; run: string;
+  /** True only after this exact packet passed the routed v2 input witness. */
+  admittedRoutedInputV2?: (order: OrderPacket) => boolean;
   err: (line: string) => void;
 }): (order: OrderPacket) => Promise<NormalizedStepSpec | null> {
   return async order => {
     try {
       const resolved = await args.instructions.resolveStep(order);
-      if (!resolved.ok || !validModelOrderFields(resolved.step, order, resolved.inputNames))
+      if (!resolved.ok || (!args.admittedRoutedInputV2?.(order)
+	&& !validModelOrderFields(resolved.step, order, resolved.inputNames)))
 	throw new Error();
       // The role installs its public-only process environment before calling
       // this loader. Only a verified bundle path may reach the provider child.

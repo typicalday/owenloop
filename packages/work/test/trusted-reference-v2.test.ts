@@ -203,6 +203,31 @@ test('v2 admission refuses forged private modifier and roster fields absent from
     { ok: false, reason: 'private-order-v2-mismatch' });
 });
 
+test('v2 admission keeps the ordinary backward-clock refusal and rejects nonfinite elapsed time', async () => {
+  const direct = available();
+  const step = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const base = { reader: { read: async () => direct }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false as const,
+      kind: 'unknown-step' as const, reason: 'unused' }),
+    resolveStep: async () => ({ ok: true as const, step }),
+    resolveHostedStep: async () => ({ ok: true as const, step,
+      inputNames: ['optional'], declaredInputs: [
+	{ name: 'optional', producer: 'human' as const, seedOwed: false }], callsProducers: {} }) },
+    consumedVerifier: async (order: typeof direct.order) => ({ ok: true as const, order, warnings: [] }) };
+  const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+    reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  let wallCalls = 0;
+  assert.deepEqual(await createTrustedInputV2Admission({ ...base,
+    now: () => wallCalls++ === 0 ? 1_000 : 999,
+    elapsedNow: () => 10 }).observe(privateOrder), { ok: false, reason: 'observation-expired' });
+  let monotonicCalls = 0;
+  assert.deepEqual(await createTrustedInputV2Admission({ ...base,
+    now: () => 1_000,
+    elapsedNow: () => monotonicCalls++ === 0 ? 10 : Number.NaN }).observe(privateOrder),
+  { ok: false, reason: 'observation-expired' });
+});
+
 test('authoritative v2 offer admits a locally allowed modifier and exact Service roster', async () => {
   const direct = available();
   direct.order.capabilities = ['build:deep'];

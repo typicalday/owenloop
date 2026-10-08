@@ -28,6 +28,7 @@ import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
 import { outputVersionForSubmission } from '../submit-proof.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
+import type { RoutedInputPair, RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
 
 // Service permits artifact values up to 25 MB. Leave bounded JSON overhead
 // while allowing a normal submit receipt through this private transport.
@@ -66,6 +67,7 @@ interface Grant {
     Promise<RoutedReferenceV2 | RoutedClaimV2>;
   routedLiveV2Read?: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
     Promise<RecordedReferenceV2 | RecordedClaimV2>;
+  inputAuthority?: RoutedInputAuthority;
   referenceOrderDigest?: string;
   referenceBinding?: RoutedReferenceBindingV2;
   reservationRequest?: LaunchReservationRequestV1;
@@ -90,12 +92,17 @@ export interface RoutedLaunchAuthority {
   /** Parent-owned current machine roster and adapter availability. */
   verifySelection(order: import('../hub/types.ts').OrderPacket, request: LaunchReservationRequestV1): Promise<void>;
 }
+/** Parent-owned input observation. The caller never supplies the phase or a URL. */
+export interface RoutedInputAuthority {
+  observe(response: GetOrderResponse, phase: RoutedInputPhase): Promise<RoutedInputPair>;
+}
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
     currentIdentity: () => Identity | undefined; hub: RoutingHubClient;
     routedV2Read?: Grant['routedV2Read'];
     routedLiveV2Read?: Grant['routedLiveV2Read'];
-    submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority }): {
+    submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority;
+    inputAuthority?: RoutedInputAuthority }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
       activate(record: ChildRecord): void;
       bindChild(record: ChildRecord, custody: RetainedChildCustody,
@@ -208,13 +215,18 @@ function validHolder(grant: Grant, scope: CapScope, value: unknown): value is Co
 function validOrderResponse(grant: Grant, value: unknown): value is GetOrderResponse {
   if (!value || typeof value !== 'object') return false;
   const response = value as Record<string, unknown>;
-  if (response.workflow !== grant.reservation.workflow || response.run !== grant.reservation.run
+  // The scoped request names the root workflow, but a nested native firing
+  // returns its actual frame. The new input gate binds that exact frame to
+  // the persisted claim; legacy strict grants keep their existing shape.
+  const expectedWorkflow = grant.inputAuthority
+    ? grant.routing.claim.binding.frameId : grant.reservation.workflow;
+  if (response.workflow !== expectedWorkflow || response.run !== grant.reservation.run
     || !response.lease || typeof response.lease !== 'object'
     || typeof (response.lease as { claimed?: unknown }).claimed !== 'boolean') return false;
   if (response.order === null) return true;
   if (!response.order || typeof response.order !== 'object') return false;
   const order = response.order as Record<string, unknown>;
-  return order.workflow === grant.reservation.workflow && order.run === grant.reservation.run
+  return order.workflow === expectedWorkflow && order.run === grant.reservation.run
     && Array.isArray(order.owes)
     && order.owes.every(owe => owe && typeof owe === 'object' && typeof owe.path === 'string')
     && Array.isArray(order.outputs) && order.outputs.every(path => typeof path === 'string');
@@ -253,6 +265,71 @@ async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, lau
     if (!valid()) throw new Error('routing broker grant expired');
     throw error;
   }
+}
+
+async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
+  phase: RoutedInputPhase, now: () => number): Promise<RoutedInputPair | undefined> {
+  const authority = grant.submissionAuthority;
+  if (!authority || !response.lease.claimed || !response.order)
+    throw new Error('routing order authority unavailable');
+  // The legacy strict verifier continues to cover the v1 path. Optional and
+  // human input admission requires this additional parent-owned Service pair.
+  if (!grant.inputAuthority) {
+    await checked(grant, authority.verifyOrder(response), now);
+    return undefined;
+  }
+  if (phase === 'recorded-live' && (!grant.acceptedLaunchReport || !liveChildValid(grant, now())))
+    throw new Error('routing recorded occurrence unavailable');
+  const pair = await checked(grant, grant.inputAuthority.observe(response, phase),
+    now, phase === 'prestart');
+  if (phase === 'prestart') {
+    const expected = { workflow: grant.reservation.workflow, run: grant.reservation.run };
+    const reference = parseRoutedReferenceV2(pair.reference, expected);
+    const claim = parseRoutedClaimV2(pair.claim, expected);
+    if (reference.state !== 'available' || claim.state !== 'available'
+      || reference.binding.frameWorkflow !== grant.routing.claim.binding.frameId
+      || reference.binding.sessionId !== grant.identity.sessionId
+      || reference.binding.shiftId !== grant.identity.shiftId
+      || reference.binding.claimId !== grant.routing.claim.claimId
+      || reference.binding.decisionId !== grant.routing.claim.decisionId
+      || reference.binding.routingDigest !== valueDigestHex(grant.routing)
+      || !isDeepStrictEqual(reference.binding, claim.binding)
+      || !isDeepStrictEqual(reference.order.routing, claim.routing)
+      || (grant.referenceBinding && !isDeepStrictEqual(grant.referenceBinding, reference.binding))
+      || (grant.referenceOrderDigest && grant.referenceOrderDigest !== reference.binding.orderDigest))
+      throw new Error('routing prestart input changed');
+    grant.referenceBinding = structuredClone(reference.binding);
+    grant.referenceOrderDigest = reference.binding.orderDigest;
+  } else {
+    const expected = { workflow: grant.reservation.workflow, run: grant.reservation.run };
+    const reference = parseRecordedReferenceV2(pair.reference, expected);
+    const claim = parseRecordedClaimV2(pair.claim, expected);
+    if (reference.state !== 'available' || claim.state !== 'available'
+      || !isDeepStrictEqual(reference.binding, claim.binding)
+      || !isDeepStrictEqual(reference.order.routing, claim.routing)
+      || !recordedBindingMatches(grant, reference.binding)
+      || !liveChildValid(grant, now()))
+      throw new Error('routing recorded input changed');
+  }
+  return pair;
+}
+
+async function verifyCurrentConsequence(grant: Grant, scope: CapScope,
+  now: () => number, signal: AbortSignal,
+  phase: RoutedInputPhase = 'recorded-live'): Promise<GetOrderResponse | undefined> {
+  if (!grant.inputAuthority) return undefined;
+  if (!grant.execHolderId) throw new Error('routing order holder unavailable');
+  if (phase === 'recorded-live' && !liveChildValid(grant, now()))
+    throw new Error('routing recorded occurrence unavailable');
+  const holder: ContactHolder = scope === 'role'
+    ? { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }
+    : { kind: 'session', id: grant.identity.sessionId, shiftId: grant.identity.shiftId };
+  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+    run: grant.reservation.run, holder }, signal), now, phase === 'prestart');
+  if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order)
+    throw new Error('routing current order unavailable');
+  await verifyParentOrder(grant, response, phase, now);
+  return response;
 }
 
 /** Only metadata the exact submit proof and target condition bind. The parent
@@ -296,7 +373,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       workflow: grant.reservation.workflow, run: grant.reservation.run, holder,
     }, signal), now);
     const binding = submissionBinding(fresh, path, grant);
-    await checked(grant, authority.verifyOrder(fresh), now);
+    await verifyParentOrder(grant, fresh, 'recorded-live', now);
     if (submissionBinding(fresh, path, grant) !== binding)
       throw new Error('routing submission order changed');
     if (authority.canSubmit?.(fresh.order!, path) !== true)
@@ -315,7 +392,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       }, signal), now);
       if (submissionBinding(current, path, grant) !== binding)
 	throw new Error('routing submission order changed');
-      await checked(grant, authority.verifyOrder(current), now);
+      await verifyParentOrder(grant, current, 'recorded-live', now);
       if (submissionBinding(current, path, grant) !== binding)
 	throw new Error('routing submission order changed');
       grant.pendingSubmit = { intent, binding, request: {
@@ -346,8 +423,17 @@ async function verifyParentLaunch(grant: Grant, request: LaunchReservationReques
       shiftId: grant.identity.shiftId } }, signal), now, true);
   if (!validOrderResponse(grant, fresh) || !fresh.lease.claimed || !fresh.order)
     throw new Error('routing launch order unavailable');
-  await checked(grant, grant.submissionAuthority.verifyOrder(fresh), now, true);
+  await verifyParentOrder(grant, fresh, 'prestart', now);
   await checked(grant, grant.launchAuthority.verifySelection(fresh.order, structuredClone(request)), now, true);
+  if (grant.inputAuthority) {
+    const final = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+      run: grant.reservation.run, holder: { kind: 'exec', id: grant.execHolderId,
+	shiftId: grant.identity.shiftId } }, signal), now, true);
+    if (!validOrderResponse(grant, final) || !final.lease.claimed || !final.order
+      || !isDeepStrictEqual(final.order, fresh.order))
+      throw new Error('routing launch order changed');
+    await verifyParentOrder(grant, final, 'prestart', now);
+  }
 }
 
 function collectionResponse(value: unknown, kind: 'member' | 'seal'): value is RoutedCollectionWriteResponse {
@@ -381,7 +467,7 @@ async function collectionOrder(grant: Grant, sealPath: string, holder: RoutedCol
     run: grant.reservation.run, holder }, signal), now);
   if (!response.lease.claimed || !response.order) throw new Error('routing collection claim unavailable');
   const binding = submissionBinding(response, sealPath, grant);
-  await checked(grant, authority.verifyOrder(response), now);
+  await verifyParentOrder(grant, response, 'recorded-live', now);
   if (authority.canCollect?.(response.order, sealPath) !== true
     || submissionBinding(response, sealPath, grant) !== binding)
     throw new Error('routing collection target unavailable');
@@ -550,7 +636,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	holder: body.holder }, signal), now);
       if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order
 	|| !grant.submissionAuthority) throw new Error('routing collection order unavailable');
-      await checked(grant, grant.submissionAuthority.verifyOrder(response), now);
+      await verifyParentOrder(grant, response, 'recorded-live', now);
       return { collection: grant.submissionAuthority.canCollect?.(response.order, body.path) === true };
     }
     case 'get_launch_order':
@@ -561,15 +647,26 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (prestart && (!grant.reservationRequest || !grant.acceptedLaunchReport || !grant.launchAuthority
 	|| grant.launchExpiresAt === undefined || now() >= grant.launchExpiresAt))
 	throw new Error('routing launch report unavailable');
-      const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, prestart);
+      let response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, prestart);
       if (!validOrderResponse(grant, response)) throw new Error('routing broker response refused');
       if (response.lease.claimed && response.order)
-	await checked(grant, grant.submissionAuthority.verifyOrder(response), now, prestart);
+	await verifyParentOrder(grant, response, prestart || scope === 'role'
+	  && (!grant.acceptedLaunchReport || !liveChildValid(grant, now()))
+	  ? 'prestart' : 'recorded-live', now);
       if (prestart) {
 	if (!response.lease.claimed || !response.order) throw new Error('routing launch order unavailable');
 	await checked(grant, grant.launchAuthority!.verifySelection(response.order,
 	  structuredClone(grant.reservationRequest!)), now, true);
 	if (now() >= grant.launchExpiresAt!) throw new Error('routing launch reservation expired');
+	if (grant.inputAuthority) {
+	  const final = await checked(grant,
+	    grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, true);
+	  if (!validOrderResponse(grant, final) || !final.lease.claimed || !final.order
+	    || !isDeepStrictEqual(final.order, response.order))
+	    throw new Error('routing launch order changed');
+	  await verifyParentOrder(grant, final, 'prestart', now);
+	  response = final;
+	}
       }
       const order = response.order;
       grant.allowedPaths = order && response.lease.claimed
@@ -589,6 +686,16 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (!exactKeys(body, []) || !grant.routedV2Read) throw new Error('routing broker request refused');
       const kind = method === 'read_routed_reference_v2' ? 'reference' : 'claim';
       const expected = { workflow, run };
+      if (grant.inputAuthority) {
+	if (!grant.execHolderId) throw new Error('routing order holder unavailable');
+	const holder: ContactHolder = scope === 'role'
+	  ? { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }
+	  : { kind: 'session', id: grant.identity.sessionId, shiftId: grant.identity.shiftId };
+	const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder }, signal), now, true);
+	const pair = await verifyParentOrder(grant, response, 'prestart', now);
+	if (!pair) throw new Error('routing input observation unavailable');
+	return kind === 'reference' ? pair.reference : pair.claim;
+      }
       const result = await checked(grant, grant.routedV2Read(kind, expected), now, true);
       if (kind === 'reference') {
 	const parsed = parseRoutedReferenceV2(result, expected);
@@ -616,6 +723,16 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| !liveChildValid(grant, now())) throw new Error('routing broker live read refused');
       const kind = method === 'read_live_routed_reference_v2' ? 'reference' : 'claim';
       const expected = { workflow, run };
+      if (grant.inputAuthority) {
+	if (!grant.execHolderId) throw new Error('routing order holder unavailable');
+	const holder: ContactHolder = { kind: 'exec', id: grant.execHolderId,
+	  shiftId: grant.identity.shiftId };
+	const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder }, signal), now);
+	const pair = await verifyParentOrder(grant, response, 'recorded-live', now);
+	if (!pair || !liveChildValid(grant, now()))
+	  throw new Error('routing recorded input changed');
+	return kind === 'reference' ? pair.reference : pair.claim;
+      }
       let result: RecordedReferenceV2 | RecordedClaimV2;
       try { result = await grant.routedLiveV2Read(kind, expected); }
       catch (error) {
@@ -705,6 +822,9 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
     case 'heartbeat':
       if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
       {
+	const phase: RoutedInputPhase = grant.acceptedLaunchReport && liveChildValid(grant, now())
+	  ? 'recorded-live' : 'prestart';
+	await verifyCurrentConsequence(grant, scope, now, signal, phase);
 	const response = await checked(grant, grant.hub.routingHeartbeat({ workflow, run, holder: body.holder }, signal), now);
 	if (!response || (response as { ok?: unknown }).ok !== true) throw new Error('routing broker response refused');
 	return response;
@@ -735,6 +855,9 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| typeof body.question !== 'string' || !body.question.trim()
 	|| (body.context !== undefined && typeof body.context !== 'string'))
 	throw new Error('routing broker request refused');
+      const current = await verifyCurrentConsequence(grant, scope, now, signal);
+      if (current?.order && !current.order.owes.some(owe => owe.path === body.path))
+	throw new Error('routing current ask target changed');
       const response = await checked(grant, grant.hub.routingAsk({ workflow, run, path: body.path,
 	question: body.question, ...(body.context === undefined ? {} : { context: body.context }) }, signal), now);
       if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
@@ -748,6 +871,9 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| typeof body.text !== 'string' || !body.text.trim()
 	|| (body.requested !== undefined && (typeof body.requested !== 'string' || !body.requested.trim())))
 	throw new Error('routing broker request refused');
+      const current = await verifyCurrentConsequence(grant, scope, now, signal);
+      if (current?.order && !Object.hasOwn(current.order.consumes ?? {}, body.path))
+	throw new Error('routing current reject target changed');
       const response = await checked(grant, grant.hub.routingReject({ workflow, run, path: body.path,
 	text: body.text, ...(body.requested === undefined ? {} : { requested: body.requested }) }, signal), now);
       if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
@@ -764,6 +890,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| typeof body.reason !== 'string' || !body.reason
 	|| (body.title !== undefined && typeof body.title !== 'string'))
 	throw new Error('routing broker request refused');
+      await verifyCurrentConsequence(grant, scope, now, signal);
       const response = await checked(grant, grant.hub.routingRequestApproval({ workflow, run,
 	tool_use_id: body.tool_use_id, tool_name: body.tool_name, tool_input: body.tool_input,
 	reason: body.reason, ...(body.title === undefined ? {} : { title: body.title }) }, signal), now);
@@ -898,6 +1025,13 @@ export async function createRoutingBroker(args: { now?: () => number;
 	      socket.once('close', gone);
 	    });
 	    try {
+	      const phase: RoutedInputPhase = grant.acceptedLaunchReport && liveChildValid(grant, now())
+		? 'recorded-live' : 'prestart';
+	      const current = await verifyCurrentConsequence(grant, entry.scope, now,
+		controller.signal, phase);
+	      if (current && !isDeepStrictEqual(
+		consumedFiles(current).get(`${request.body.path}\0${pointer.__file}`), pointer))
+		throw new Error('routing current file input changed');
 	      let result: Awaited<ReturnType<typeof grant.hub.routingGetFileArtifact>>;
 	      try {
 	        result = await grant.hub.routingGetFileArtifact({
@@ -930,6 +1064,8 @@ export async function createRoutingBroker(args: { now?: () => number;
 	      if (sent !== pointer.size || hash.digest('hex') !== pointer.hash
 	        || !validateSessionGrant(grant, now()) || controller.signal.aborted)
 	        throw new Error('routing broker file digest refused');
+	      if (grant.inputAuthority)
+		await verifyCurrentConsequence(grant, entry.scope, now, controller.signal, phase);
 	      socket.end();
 	    } catch (error) {
 	      if (started) socket.destroy();
@@ -967,11 +1103,15 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    upload = { remaining: body.size as number, stream };
 	    const keyPrefix = `orgs/${grant.identity.orgId}/artifacts/${grant.reservation.workflow}`
 	      + `/files/routed/${encodeURIComponent(grant.reservation.run)}/`;
-	    void checked(grant, grant.hub.routingPutFileArtifact({
-	      workflow: grant.reservation.workflow, run: grant.reservation.run,
-	      body: stream, size: body.size as number, contentType: body.contentType,
-	      ...(body.filename === undefined ? {} : { filename: body.filename }),
-	    }, controller.signal), now).then((value: PutFileArtifactResponse) => {
+	    void (async () => {
+	      await verifyCurrentConsequence(grant, entry.scope, now, controller.signal);
+	      return checked(grant, grant.hub.routingPutFileArtifact({
+		workflow: grant.reservation.workflow, run: grant.reservation.run,
+		body: stream, size: body.size as number, contentType: body.contentType as string,
+		...(body.filename === undefined ? {} : { filename: body.filename as string }),
+	      }, controller.signal), now);
+	    })().then(async (value: PutFileArtifactResponse) => {
+	      await verifyCurrentConsequence(grant, entry.scope, now, controller.signal);
 	      if (!value || typeof value.__file !== 'string' || !value.__file.startsWith(keyPrefix)
 		|| !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
 		  value.__file.slice(keyPrefix.length))
@@ -1018,12 +1158,12 @@ export async function createRoutingBroker(args: { now?: () => number;
   return {
     socketPath,
     issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, routedLiveV2Read,
-      submissionAuthority, launchAuthority }) {
+      submissionAuthority, launchAuthority, inputAuthority }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
 	identity: { ...identity }, currentIdentity, hub, routedV2Read, routedLiveV2Read,
-	submissionAuthority, launchAuthority };
+	submissionAuthority, launchAuthority, inputAuthority };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;

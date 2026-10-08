@@ -11,9 +11,10 @@ import { test } from 'node:test';
 import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
 import { createRoutingHolderClient } from '../src/hub/routing-holder-client.ts';
-import type { RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
+import { parseRoutedReferenceV2, type RoutedClaimV2,
+  type RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
 import { openRoutedFileSource } from '../src/hub/routed-file-source.ts';
-import type { DecisionBindingV1, ReferenceRouting } from '../src/hub/types.ts';
+import type { DecisionBindingV1, OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import type { ChildReservation } from '../src/shift/state.ts';
@@ -1324,5 +1325,79 @@ test('final role launch read checks accepted report and current selection withou
     await assert.rejects(client.getLaunchOrder(read), /routing broker unavailable/);
     now = 75_000;
     assert.equal((await client.getOrder(read)).order?.run, 'run', 'launch window is not the live claim lifetime');
+  } finally { await broker.close(); }
+});
+
+test('parent input gate binds the Service root to a nested frame and permits prestart heartbeat only with current witness', async () => {
+  let now = 2_000;
+  let witnessChanged = false;
+  const routes: string[] = [];
+  const framed = { ...routing, preference: { ...routing.preference,
+    rosterRevision: 'a'.repeat(64) } };
+  const packet = { ...parentOrder().order, workflow: 'frame', routing: framed,
+    owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0,
+      reasons: [] }] };
+  const current = { ...parentOrder(), workflow: 'frame', order: packet };
+  const referenceBinding = { rootWorkflow: 'wf', frameWorkflow: 'frame', run: 'run',
+    claimId: 'run', decisionId: 'decision', sessionId, shiftId: identity.shiftId,
+    orderDigest: 'b'.repeat(64), authorityRevision: 'c'.repeat(64),
+    rosterRevision: framed.preference.rosterRevision, routingDigest: valueDigestHex(framed),
+    preferenceExpiresAt: framed.preference.expiresAt };
+  const pair = (): { reference: RoutedReferenceV2; claim: RoutedClaimV2 } => {
+    const binding = { ...referenceBinding,
+      orderDigest: witnessChanged ? 'd'.repeat(64) : referenceBinding.orderDigest };
+    return { reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
+      workflow: 'wf', run: 'run', order: { ...packet,
+	owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
+      inputs: [], lease: { claimed: true }, binding },
+    claim: { protocol: 'routing-claim-read-v2', state: 'available', workflow: 'wf', run: 'run',
+      routing: framed, binding } };
+  };
+  const phases: string[] = [];
+  assert.equal(parseRoutedReferenceV2(pair().reference,
+    { workflow: 'wf', run: 'run' }).state, 'available');
+  let delayed: Promise<ReturnType<typeof pair>> | undefined;
+  let observing!: () => void;
+  const observed = new Promise<void>(resolve => { observing = resolve; });
+  let finish!: (value: ReturnType<typeof pair>) => void;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => now },
+    fetchImpl: (async url => {
+      const route = String(url).split('/api/')[1]!;
+      routes.push(route);
+      return Response.json(route === 'get_order' ? current : { ok: true, text: 'ok' });
+    }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => now });
+  try {
+    const grant = broker.issue({ reservation, routing: framed, identity,
+      currentIdentity: () => identity, hub, submissionAuthority: transportAuthority,
+      inputAuthority: { observe: async (response, phase) => {
+	assert.equal(response.workflow, 'frame');
+	phases.push(phase);
+	if (delayed) { observing(); return delayed; }
+	return pair();
+      } } });
+    grant.activate(child);
+    const send = (method: string, body: unknown) => request(grant.socketPath,
+      { cap: grant.cap, method, body });
+    assert.equal((await send('get_order', { holder })).ok, true);
+    assert.equal((await send('heartbeat', { holder })).ok, true);
+    assert.deepEqual(phases, ['prestart', 'prestart']);
+    assert.deepEqual(routes, ['get_order', 'get_order', 'heartbeat']);
+    witnessChanged = true;
+    assert.equal((await send('heartbeat', { holder })).ok, false);
+    assert.equal(routes.at(-1), 'get_order', 'changed witness cannot issue a heartbeat');
+    now = 75_000;
+    assert.equal((await send('heartbeat', { holder })).ok, false,
+      'startup preference does not become a fresh launch after expiry');
+    now = 2_000;
+    witnessChanged = false;
+    delayed = new Promise(resolve => { finish = resolve; });
+    const pending = send('get_order', { holder });
+    await observed;
+    grant.terminal();
+    finish(pair());
+    assert.equal((await pending).ok, false,
+      'a completed witness after grant revocation cannot return a packet');
   } finally { await broker.close(); }
 });

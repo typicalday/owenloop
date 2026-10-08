@@ -6,11 +6,16 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
+import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
+import { createConsumedVerifier } from '../src/consumed-verifier.ts';
 import { openRoutingRoleStage } from '../src/roles/routing-role-stage.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import { HubError, type GetOrderResponse, type WorkOrder } from '../src/hub/types.ts';
 import { packBundle } from '../../../src/bundle/index.ts';
 import { canonicalJsonBytes } from '../../../src/install.ts';
+import { valueDigestHex } from '../../../src/crypto/canonical.ts';
+import type { RoutedClaimV2, RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
+import type { OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
 import { DSSE_SSH_NAMESPACE, dsseSignPublication } from '../../../src/crypto/dsse.ts';
 import { createSshSigner } from '../../../src/crypto/ssh.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
@@ -137,6 +142,57 @@ test('parent full-order gate refuses input-derived workdir without an authentica
       owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] } };
   await assert.rejects(stage.verifyOrder(response), /routed workdir witness unavailable/);
   stage.cleanup();
+});
+
+test('parent signed stage admits an exact Service input-derived cwd witness and refuses changed values', async () => {
+  const f = await fixture('name: recovered\ninputs:\n  - name: target\nsteps:\n  - name: command\n' +
+    '    executor: command\n    consumes: []\n    produces: [out]\n    terminal: true\n' +
+    '    workdirFrom: target.path\n    command: echo recovered\n');
+  const routing = { claim: { claimId: 'run', decisionId: 'decision',
+    sessionId: 'rs_12345678-1234-1234-1234-123456789abc', shiftId: 'shf_service',
+    attemptId: 'attempt', binding: { runId: 'wf', frameId: 'wf' } },
+  decision: { decisionId: 'decision' },
+  preference: { rosterRevision: 'a'.repeat(64), expiresAt: Date.now() + 60_000 },
+  } as unknown as ReferenceRouting;
+  const stage = await stageRoutedDefinition({ ...f.args,
+    order: { ...f.args.order, routing } });
+  try {
+    const packet: OrderPacket = { workflow: 'wf', run: 'run', step: 'command', key: '',
+      defDigest: f.packed.digest, worker: 'command', workdir: f.args.workRoot,
+      inputs: [], outputs: ['out'], consumes: {}, consumedFingerprint: {},
+      owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }], routing };
+    const response: GetOrderResponse = { text: '', workflow: 'wf', run: 'run',
+      lease: { claimed: true }, order: packet };
+    const binding = { rootWorkflow: 'wf', frameWorkflow: 'wf', run: 'run',
+      claimId: 'run', decisionId: 'decision', sessionId: routing.claim.sessionId,
+      shiftId: routing.claim.shiftId, orderDigest: 'b'.repeat(64),
+      authorityRevision: 'c'.repeat(64), rosterRevision: routing.preference.rosterRevision,
+      routingDigest: valueDigestHex(routing), preferenceExpiresAt: routing.preference.expiresAt };
+    const pair: { reference: RoutedReferenceV2; claim: RoutedClaimV2 } = {
+      reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
+	workflow: 'wf', run: 'run', order: { ...packet,
+	  owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
+	inputs: [],
+	workdirInput: { stem: 'target', version: 1,
+	  value: { path: f.args.workRoot } }, lease: { claimed: true }, binding },
+      claim: { protocol: 'routing-claim-read-v2', state: 'available',
+	workflow: 'wf', run: 'run', routing, binding },
+    };
+    await assert.rejects(stage.verifyOrder(response), /routed order fields changed|routed workdir witness unavailable/);
+    const opened = openRoutingRoleStage({ definitionStage: { path: stage.path, digest: stage.digest },
+      reservation: { workflow: 'wf', run: 'run' } } as RoutingHandoffV1);
+    const direct = await bindTrustedRoutedInputV2({ phase: 'prestart', pair, privateOrder: packet,
+      instructions: opened.instructions, consumedVerifier: createConsumedVerifier({
+	env: opened.publicEnv, now: Date.now, artifactPolicy: 'enforce' }),
+      expected: { workflow: 'wf', run: 'run' } });
+    assert.equal(direct.ok, true, JSON.stringify(direct));
+    await stage.verifyRoutedInput!(response, pair, 'prestart');
+    const changed = structuredClone(pair);
+    if (changed.reference.state !== 'available') assert.fail('missing witness');
+    changed.reference.workdirInput!.value = { path: f.stateDir };
+    await assert.rejects(stage.verifyRoutedInput!(response, changed, 'prestart'),
+      /routed input witness refused/);
+  } finally { stage.cleanup(); }
 });
 
 test('routed role opens only the staged public definition store', async () => {

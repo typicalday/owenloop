@@ -1,13 +1,18 @@
 /** Credential-free routed agent composition, still held behind agent-run's
  * top-level startup fence until provider resume/terminal acceptance is proven. */
 import { dirname } from 'node:path';
+import { hostname } from 'node:os';
+import { performance } from 'node:perf_hooks';
+import { isDeepStrictEqual } from 'node:util';
 import { createAgentRunLoop, type AgentRunOutcome } from '../agent/loop.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import { adapterFor, registeredHarnessIds } from '../harness/registry.ts';
 import { appendSession, sessionsPath } from '../harness/session-store.ts';
 import { allocateRoutedFileCache } from '../hub/routed-file-cache.ts';
-import type { ContactHolder } from '../hub/types.ts';
+import type { ContactHolder, OrderPacket } from '../hub/types.ts';
+import { createTrustedRoutedInputV2Admission } from '../hosted/trusted-input-admission.ts';
+import { createBrokerRoutedReferenceV2Reader } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RoutingHandoffV1 } from '../shift/runtime.ts';
 import { createRoutedAgentSelection } from './routing-agent-launch.ts';
 import { createRoutedAgentStepLoader } from './routing-agent-step.ts';
@@ -60,7 +65,10 @@ export async function prepareRoutedAgentRunner(args: {
   let holderHandoff: ReturnType<typeof createRoutingHolderHandoff> | undefined;
   try {
   const workflow = handoff.reservation.workflow, run = handoff.reservation.run;
-  const holder: ContactHolder = { kind: 'session', id: handoff.sessionId, shiftId: handoff.shiftId };
+  // The role contacts with its exact retained PID. Only the nested MCP holder
+  // subcap uses the original routing session holder identity.
+  const holder: ContactHolder = { kind: 'exec', id: `${hostname()}:${process.pid}`,
+    shiftId: handoff.shiftId };
   const strictConsumed = createConsumedVerifier({ env: publicEnv,
     now: Date.now, artifactPolicy: 'enforce' });
   const consumedVerifier: ConsumedVerifier = async (order, opts) => {
@@ -72,6 +80,13 @@ export async function prepareRoutedAgentRunner(args: {
       return checked.ok ? checked : { ok: false, reason: 'routed consumed proof refused' };
     } catch { return { ok: false, reason: 'routed consumed proof refused' }; }
   };
+  let admittedPacket: OrderPacket | undefined;
+  const observedInput = createTrustedRoutedInputV2Admission({
+    reader: createBrokerRoutedReferenceV2Reader(client.routed, { workflow, run },
+      () => performance.now()),
+    instructions: stage.instructions, consumedVerifier,
+    expected: { workflow, run }, monotonicNow: () => performance.now(),
+  });
   const sessionsFile = sessionsPath(resolveCacheDir(publicEnv));
   const select = createRoutedAgentSelection({ child: client.routed, holder, workflow, run,
     beforeFinalCheck: (order) => {
@@ -85,7 +100,8 @@ export async function prepareRoutedAgentRunner(args: {
     ...(args.originalEnv.OWENLOOP_SHIFT_OWNER ? { shiftOwner: args.originalEnv.OWENLOOP_SHIFT_OWNER } : {}),
     cwd: planned.cwd, allowedWorkdirRoots: planned.allowedWorkdirRoots,
     loadStep: createRoutedAgentStepLoader({ instructions: stage.instructions,
-      instructionCwd: handoff.definitionStage.path, workflow, run, err: args.err }),
+      instructionCwd: handoff.definitionStage.path, workflow, run, err: args.err,
+      admittedRoutedInputV2: order => !!admittedPacket && isDeepStrictEqual(admittedPacket, order) }),
     resolveAdapter: (chosenHarness, stepHarness) => {
       const id = chosenHarness ?? stepHarness ?? '';
       const adapter = adapterFor(id);
@@ -96,6 +112,11 @@ export async function prepareRoutedAgentRunner(args: {
       detail: 'routed server selection required' }),
     harnessAvailable: id => adapterFor(id) !== undefined,
     consumedVerifier,
+    routedInputV2: { observe: async order => {
+      const result = await observedInput.observe(order);
+      admittedPacket = result.ok ? structuredClone(order) : undefined;
+      return result;
+    } },
     routedSelect: (order, signal) => select(order, signal),
     createRoutingHolderPath: () => {
       if (holderHandoff) throw refused();

@@ -59,7 +59,7 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingOfferCandidate, ShiftOffer, LocalTupleEligibility } from '../hub/types.ts';
 import type { ShiftRoutingSession, RoutingHandoff } from './runtime.ts';
-import type { RoutedLaunchAuthority, RoutingBroker } from './routing-broker.ts';
+import type { RoutedInputAuthority, RoutedLaunchAuthority, RoutingBroker } from './routing-broker.ts';
 import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
 import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
 import { performance } from 'node:perf_hooks';
@@ -114,6 +114,10 @@ export interface ShiftLoopOptions {
   stageRoutedDefinition?: (order: WorkOrder) => Promise<RoutedDefinitionStage>;
   /** Parent-owned signer and full-order verifier bound to the staged source. */
   createRoutingSubmissionAuthority?: (stage: RoutedDefinitionStage) => RoutedSubmissionAuthority;
+  /** Fixed original-session reads plus signed input and current trust gate. */
+  createRoutingInputAuthority?: (stage: RoutedDefinitionStage,
+    target: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>,
+    rootWorkflow: string) => RoutedInputAuthority;
   createRoutingLaunchAuthority?: (order: WorkOrder,
     offer: { candidate: RoutingOfferCandidate; offer: ShiftOffer; rosterSnapshot: string } | undefined) => RoutedLaunchAuthority;
   maintainDefinitionStages?: () => void;
@@ -1572,6 +1576,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  if (!target) throw new Error('routing broker incarnation unavailable');
 	  brokerGrant = opts.routingBroker.issue({ reservation, routing: c.order.routing!,
 	    ...target,
+	    ...(opts.createRoutingInputAuthority && definitionStage
+	      ? { inputAuthority: opts.createRoutingInputAuthority(definitionStage, target,
+		reservation.workflow) } : {}),
 	    ...(opts.createRoutingSubmissionAuthority && definitionStage
 	      ? { submissionAuthority: opts.createRoutingSubmissionAuthority(definitionStage) } : {}),
 	    ...(opts.createRoutingLaunchAuthority ? { launchAuthority: opts.createRoutingLaunchAuthority(

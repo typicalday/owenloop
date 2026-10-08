@@ -7,7 +7,10 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
+import { parseConsume, parseProduce } from '../../../src/paths.ts';
+import type { StepDef } from '../../../src/types.ts';
 import type { OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
+import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
 import {
   createBrokerRecordedRoutedV2Reader, createRecordedRoutedV2Reader,
   parseRecordedClaimV2, parseRecordedReferenceV2,
@@ -81,6 +84,56 @@ test('broker observation refuses a mixed recorded binding or routing sidecar', a
     readLiveRoutingClaimV2: async () => ({ protocol: 'routing-recorded-claim-read-v2',
       state: 'unavailable', ...expected }),
   }, expected).read(), /claim unavailable/);
+});
+
+test('recorded admission keeps human values and input-derived cwd after launch preference expires', async () => {
+  const wire = pair();
+  const reference = wire.reference as Extract<RecordedReferenceV2, { state: 'available' }>;
+  reference.order.inputs = ['human'];
+  reference.order.consumes = { human: { requested: 'approved' } };
+  reference.order.consumedFingerprint = { human: 2 };
+  reference.order.workdir = '/tmp/verified-workdir';
+  reference.inputs = [{ path: 'human', version: 2, present: true,
+    value: { requested: 'approved' } }];
+  reference.workdirInput = { stem: 'where', version: 4,
+    value: { cwd: '/tmp/verified-workdir' } };
+  const privateOrder = { ...reference.order, owes: [{ path: 'plan', version: 1,
+    reasons: [], judgmentRejects: 0, schemaRejects: 0 }] } as OrderPacket;
+  const step = { name: 'planner', consumes: [parseConsume('human')],
+    produces: [parseProduce('plan')], workdirFrom: 'where.cwd' } as StepDef;
+  let elapsed = 10;
+  const args = { phase: 'recorded-live' as const, pair: wire, privateOrder, expected,
+    now: () => 2_000, monotonicNow: () => elapsed,
+    instructions: { resolveCommand: async () => ({ ok: false as const,
+      kind: 'unknown-step' as const, reason: 'unused' }),
+    resolveStep: async () => ({ ok: true as const, step }),
+    resolveHostedStep: async () => ({ ok: true as const, step,
+      inputNames: ['human', 'where'], declaredInputs: [
+	{ name: 'human', producer: 'human' as const, seedOwed: true },
+	{ name: 'where', producer: 'human' as const, seedOwed: true }], callsProducers: {} }) },
+    consumedVerifier: async (order: OrderPacket) => ({ ok: true as const, order, warnings: [] }) };
+  const admitted = await bindTrustedRoutedInputV2(args);
+  assert.equal(admitted.ok, true);
+  if (admitted.ok) {
+    assert.equal(admitted.phase, 'recorded-live');
+    assert.ok(admitted.occurrenceDigest);
+    assert.equal(admitted.order.workdir, '/tmp/verified-workdir');
+  }
+  assert.deepEqual(await bindTrustedRoutedInputV2({ ...args, phase: 'prestart' }),
+    { ok: false, reason: 'routed-reference-v2-malformed' });
+  const changed = structuredClone(wire);
+  (changed.reference as Extract<RecordedReferenceV2, { state: 'available' }>).inputs[0]!.value =
+    { requested: 'changed' };
+  assert.deepEqual(await bindTrustedRoutedInputV2({ ...args, pair: changed }),
+    { ok: false, reason: 'witness-value-mismatch' });
+  const moved = structuredClone(wire);
+  (moved.reference as Extract<RecordedReferenceV2, { state: 'available' }>).workdirInput!.value =
+    { cwd: '/tmp/other' };
+  assert.deepEqual(await bindTrustedRoutedInputV2({ ...args, pair: moved }),
+    { ok: false, reason: 'workdir-value-mismatch' });
+  elapsed += 5_000;
+  assert.deepEqual(await bindTrustedRoutedInputV2({ ...args, startedMonotonic: 10 }),
+    { ok: false, reason: 'routed-observation-expired' });
 });
 
 test('recorded transport sends only fixed routes with original bearer and routing session', async () => {

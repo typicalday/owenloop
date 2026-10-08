@@ -292,6 +292,7 @@ interface BuildOpts {
   shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
   trustedInputV2?: AgentRunLoopOptions['trustedInputV2'];
+  routedInputV2?: AgentRunLoopOptions['routedInputV2'];
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   routedSelect?: AgentRunLoopOptions['routedSelect'];
   routingHolderPath?: string;
@@ -326,6 +327,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     harnessAvailable: (id) => id === 'fake',
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
     ...(b.trustedInputV2 === undefined ? {} : { trustedInputV2: b.trustedInputV2 }),
+    ...(b.routedInputV2 === undefined ? {} : { routedInputV2: b.routedInputV2 }),
     resolveCrewRosters: b.resolveCrewRosters ?? (() => ({ ok: true, rosters: [] })),
     ...(b.routedSelect === undefined ? {} : { routedSelect: b.routedSelect }),
     ...(b.routedSelect === undefined ? {} : {
@@ -461,6 +463,36 @@ test('routed worker refuses unscoped trusted input v2 before its reader runs', a
   assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
   assert.equal(observed, false);
   assert.equal(selected, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('scoped routed v2 input is admitted before step loading and refuses a changed witness before selection', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let selected = false;
+  let loaded = false;
+  const h = buildOpts({ hub, adapter,
+    loadStep: async () => { loaded = true; return baseSpec(); },
+    routedInputV2: { observe: async () => ({ ok: false, reason: 'input-version-moved' }) },
+    routedSelect: async () => { selected = true; throw new Error('must not select'); } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'unverified-consumed');
+  assert.equal(loaded, false);
+  assert.equal(selected, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('scoped routed v2 input reaches selection without the ordinary bearer reader', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let selected = false;
+  const h = buildOpts({ hub, adapter,
+    routedInputV2: { observe: async order => ({ ok: true, order,
+      step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+      packetDigest: 'packet', witnessDigest: 'witness', observedAt: 1, expiresAt: 5_000,
+      inputs: [] }) },
+    routedSelect: async () => { selected = true; throw new Error('later selection refused'); } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(selected, true);
   assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
 });
 

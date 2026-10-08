@@ -246,6 +246,8 @@ export interface AgentRunLoopOptions {
   consumedVerifier?: ConsumedVerifier;
   /** Explicit v2 mode; no v1 consume fallback when supplied. */
   trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
+  /** Routed v2 uses the original-session broker and is distinct from the ordinary reader. */
+  routedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** Append one session record. Wired to `appendSession` by the role. */
   appendSession: (rec: SessionRecord) => void;
   /**
@@ -899,18 +901,20 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       opts.err(`owenloop work agent-run: ${order} is not an agent order (misroute) — releasing`);
       return releaseWith('misroute', 'misroute');
     }
-    if (opts.routedSelect && opts.trustedInputV2) {
+    if (opts.routedSelect && opts.trustedInputV2
+      || !opts.routedSelect && opts.routedInputV2) {
       return releaseWith('routed-v2-authority-unavailable', 'routed-launch-refused');
     }
+    const inputAdmission = opts.routedSelect ? opts.routedInputV2 : opts.trustedInputV2;
 
     // Consume-side verification is the prompt boundary. Do this before loading
     // or rendering any step brief: `owes[].reasons` is dynamic text supplied by
     // the transport, and an unverified rejection thread must never reach a
     // provider session. The same whole-order gate also protects `consumes`.
     let v2Pin: { packetDigest: string; witnessDigest: string } | undefined;
-    if (opts.trustedInputV2 !== undefined) {
+    if (inputAdmission !== undefined) {
       let admission: TrustedInputAdmission;
-      try { admission = await opts.trustedInputV2.observe(packet); }
+      try { admission = await inputAdmission.observe(packet); }
       catch { admission = { ok: false, reason: 'reference-v2-unavailable' }; }
       if (!admission.ok) {
 	opts.err(`owenloop work agent-run: trusted input v2 refusal: ${admission.reason}`);
@@ -921,7 +925,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     const hasConsumedData =
       Object.keys(packet.consumes).length > 0
       || packet.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
-    if (opts.trustedInputV2 === undefined && hasConsumedData) {
+    if (inputAdmission === undefined && hasConsumedData) {
       if (opts.consumedVerifier === undefined) {
         const detail =
           `consume-side verifier is not configured; dynamic values cannot be admitted to an agent prompt`;
@@ -944,9 +948,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     const freshTrustedInputV2 = async (): Promise<void> => {
-      if (opts.trustedInputV2 === undefined || v2Pin === undefined) return;
+      if (inputAdmission === undefined || v2Pin === undefined) return;
       let fresh: TrustedInputAdmission;
-      try { fresh = await opts.trustedInputV2.observe(packet); }
+      try { fresh = await inputAdmission.observe(packet); }
       catch { throw new TrustedInputV2Refusal('reference-v2-unavailable'); }
       if (!fresh.ok) throw new TrustedInputV2Refusal(fresh.reason);
       if (fresh.packetDigest !== v2Pin.packetDigest || fresh.witnessDigest !== v2Pin.witnessDigest) {
@@ -1283,7 +1287,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       return releaseWith('routed-holder-unavailable', 'routed-launch-refused');
     let owenloopMcp = routedSelection && opts.createRoutingHolderPath
       ? undefined : buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath,
-	opts.trustedInputV2 !== undefined);
+	inputAdmission !== undefined);
     const holderMount = () => {
       if (!owenloopMcp) throw new Error('routed holder handoff unavailable');
       return owenloopMcp;

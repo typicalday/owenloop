@@ -806,6 +806,20 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	origin, env, now, verifyOrder: stage.verifyOrder,
 	canSubmit: stage.canSubmit, canReplay: stage.canReplay, canCollect: stage.canCollect,
       }),
+      createRoutingInputAuthority: (stage, target, rootWorkflow) => ({
+	observe: async (response, phase) => {
+	  if (!stage.verifyRoutedInput) throw new Error('routed input authority unavailable');
+	  const started = { wall: now(), monotonic: performance.now() };
+	  const expected = { workflow: rootWorkflow, run: response.run };
+	  const pair = phase === 'prestart'
+	    ? { reference: await target.routedV2Read('reference', expected) as RoutedReferenceV2,
+	      claim: await target.routedV2Read('claim', expected) as RoutedClaimV2 }
+	    : { reference: await target.routedLiveV2Read('reference', expected) as RecordedReferenceV2,
+	      claim: await target.routedLiveV2Read('claim', expected) as RecordedClaimV2 };
+	  await stage.verifyRoutedInput(response, pair, phase, started);
+	  return pair;
+	},
+      }),
       createRoutingLaunchAuthority: (order, offer) => createRoutedLaunchAuthority({
 	offered: order, ...(offer ? { offer } : {}),
 	currentTuples: candidate => selectLocalRoutingTuples(candidate, routingRosterOptions()),

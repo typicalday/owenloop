@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
@@ -9,6 +9,8 @@ import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
 import type { DecisionBindingV1, OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
+import type { RoutedClaimV2, RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
+import type { RecordedClaimV2, RecordedReferenceV2 } from '../src/hosted/trusted-routed-recorded-v2.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
 import { createDefaultSpawner, retainedChildLive } from '../src/shift/spawn.ts';
 import { finalizeChildReservation, reserveChild, startReservedChild } from '../src/shift/state.ts';
@@ -62,7 +64,8 @@ test('only the retained exact child after gate entry can read a recorded occurre
       const verb = String(url).split('/').at(-1)!;
       verbs.push(verb);
       if (verb === 'get_order') return Response.json({ text: 'ok', ...expected,
-	lease: { claimed: true }, order: { ...order, workflow: 'wf' } });
+	workflow: 'frame', lease: { claimed: true }, order });
+      if (verb === 'heartbeat') return Response.json({ text: 'ok', ok: true });
       if (verb === 'reserve_launch') return Response.json({ reservationId: 'lr_one',
 	orderId: 'run', expiresAt: 65_000 });
       if (verb === 'report_launch') {
@@ -107,14 +110,24 @@ test('only the retained exact child after gate entry can read a recorded occurre
       : { protocol: 'routing-recorded-claim-read-v2', state: 'available', ...expected,
 	routing, binding: fullBinding };
   };
+  const phases: string[] = [];
+  const prestartRead = async (kind: 'reference' | 'claim'): Promise<RoutedReferenceV2 | RoutedClaimV2> => kind === 'reference'
+    ? { protocol: 'trusted-routed-reference-read-v2', state: 'available', ...expected,
+	order, inputs: [], lease: { claimed: true }, binding: referenceBinding }
+    : { protocol: 'routing-claim-read-v2', state: 'available', ...expected,
+	routing, binding: referenceBinding };
   const grant = broker.issue({ reservation: reserved.reservation, routing, identity,
     currentIdentity: () => identity, hub,
-    routedV2Read: async kind => kind === 'reference'
-      ? { protocol: 'trusted-routed-reference-read-v2', state: 'available', ...expected,
-	order, inputs: [], lease: { claimed: true }, binding: referenceBinding } as const
-      : { protocol: 'routing-claim-read-v2', state: 'available', ...expected,
-	routing, binding: referenceBinding } as const,
+    routedV2Read: prestartRead,
     routedLiveV2Read: liveRead as NonNullable<Parameters<typeof broker.issue>[0]['routedLiveV2Read']>,
+    inputAuthority: { observe: async (_response, phase) => {
+	phases.push(phase);
+	return phase === 'prestart'
+	  ? { reference: await prestartRead('reference') as RoutedReferenceV2,
+	    claim: await prestartRead('claim') as RoutedClaimV2 }
+	  : { reference: await liveRead('reference') as RecordedReferenceV2,
+	    claim: await liveRead('claim') as RecordedClaimV2 };
+    } },
     submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => true, sign: async () => 'proof' },
     launchAuthority: { verifySelection: async () => {} } });
   handoff.broker.cap = grant.cap;
@@ -168,6 +181,9 @@ test('only the retained exact child after gate entry can read a recorded occurre
       nonce: 'f'.repeat(32), reservationToken: reserved.reservation.token })).ok, false,
       'a role-cap socket cannot impersonate the direct child IPC entry');
     await client.readRoutedReferenceV2(expected);
+    assert.equal((await client.heartbeat({ ...expected, holder: { kind: 'exec',
+	id: `${hostname()}:${record.pid}`, shiftId: 'shf_service' } })).text, 'ok');
+    assert.equal(phases.at(-1), 'prestart');
     const request = { version: 'launch-reservation-v1' as const, claimId: 'run',
       decisionId: 'decision', binding, orderId: 'run', attemptId: 'attempt_distinct',
       rosterRevision: routing.preference.rosterRevision, candidateIds: [selected.id], assessmentId: null,
@@ -186,6 +202,10 @@ test('only the retained exact child after gate entry can read a recorded occurre
       'successful IPC disconnect is not role exit');
     assert.deepEqual(terminalReasons, []);
     now = 70_000;
+    assert.equal((await client.heartbeat({ ...expected, holder: { kind: 'exec',
+	id: `${hostname()}:${record.pid}`, shiftId: 'shf_service' } })).text, 'ok',
+      'entered child can renew after the initial preference expires');
+    assert.equal(phases.at(-1), 'recorded-live');
     assert.equal((await client.readLiveRoutedReferenceV2(expected)).state, 'available',
       'elapsed startup preference does not end an entered child claim');
     assert.equal((await client.readLiveRoutingClaimV2(expected)).state, 'available');
@@ -206,7 +226,8 @@ test('only the retained exact child after gate entry can read a recorded occurre
     resolveDelayed(await liveRead('reference'));
     await assert.rejects(pending, /routing broker unavailable/);
     assert.equal(retainedChildLive(spawned.custody, spawned.pid), false);
-    assert.equal(verbs.length, previousCalls, 'live read never starts another launch');
+    assert.deepEqual(verbs.slice(previousCalls), ['get_order'],
+      'live read reobserves the claim without another reservation or report');
   } finally {
     spawned.cancel?.();
     let timer: ReturnType<typeof setTimeout> | undefined;

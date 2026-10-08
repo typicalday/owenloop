@@ -4,6 +4,7 @@ import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { createRoutedCommandPrestart } from '../src/roles/routing-command-launch.ts';
 import type { RoutingChildClient } from '../src/hub/routing-child-client.ts';
 import type { DecisionBindingV1, LaunchReportV1, OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
+import type { RoutedInputAdmission } from '../src/hosted/trusted-input-admission.ts';
 
 const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
 const binding: DecisionBindingV1 = { orgId: 'org', runId: 'wf', frameId: 'frame',
@@ -102,4 +103,26 @@ test('command launch aborts a pending consumed-file download before reserve', as
   controller.abort();
   await assert.rejects(result, /download aborted/);
   assert.deepEqual(calls, ['claim', 'files', 'cleanup']);
+});
+
+test('command launch reobserves the same prestart input witness after file preparation', async () => {
+  const calls: string[] = [];
+  let reads = 0;
+  const child = { readRoutingClaim: async () => { calls.push('claim'); return {
+    routing, freshness: 'fresh-at-read', atomicLaunch: false }; },
+  reserveLaunch: async () => { calls.push('reserve'); throw new Error('must not reserve'); },
+  } as unknown as RoutingChildClient;
+  const admission = { observe: async () => {
+    reads++;
+    return (reads === 1 ? { ok: true, phase: 'prestart', packetDigest: 'packet',
+      witnessDigest: 'witness', bindingDigest: 'binding' }
+      : { ok: false, reason: 'witness-value-mismatch' }) as RoutedInputAdmission;
+  } };
+  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run',
+    now: () => 2_000, inputAdmission: admission,
+    prepareFiles: async () => { calls.push('files'); return { envValue: '[]',
+      cleanup: async () => { calls.push('cleanup'); } }; } })(order),
+  /routed command launch refused/);
+  assert.deepEqual(calls, ['claim', 'files', 'cleanup']);
+  assert.equal(reads, 2);
 });
