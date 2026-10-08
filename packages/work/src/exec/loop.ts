@@ -510,12 +510,30 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     return 'submit-failed';
   }
 
+  /** Recheck the same claim/input observation after any signing or retry wait. */
+  async function checkV2Consequence(
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
+  ): Promise<ExecOutcome | undefined> {
+    if (revalidate === undefined) return undefined;
+    let reason: string | undefined;
+    try { reason = (await revalidate())?.reason; }
+    catch (error) { reason = `trusted input v2 consequence read failed: ${errMsg(error)}`; }
+    if (reason === undefined) return undefined;
+    opts.err(reason);
+    lease.stop('unresolved-instructions');
+    await leasePromise;
+    return 'unresolved-instructions';
+  }
+
   /** Deliver one reject verb and settle the lease after the response arrives. */
   async function issueReject(
     path: string,
     text: string,
     successOutcome: 'rejected' | 'judge-rejected',
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
+    const refused = await checkV2Consequence(revalidate);
+    if (refused !== undefined) return refused;
     try {
       const res = await hub.reject({ workflow, run: runId, path, text });
       if (res.ok !== true) {
@@ -575,10 +593,13 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     text: string,
     outputTail: string,
     owed: number,
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome | 'continue'> {
     const body = withCommandOutput(text, outputTail);
     let res;
     try {
+      const refused = await checkV2Consequence(revalidate);
+      if (refused !== undefined) return refused;
       res = await hub.reject({ workflow, run: runId, path, text: body });
     } catch (e) {
       opts.err(`owenloop work exec: reject of ${path} failed: ${errMsg(e)}`);
@@ -720,6 +741,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     receipt: CommandReceipt,
     order: OrderPacket,
     resolvedCommand: string,
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
     // run() returns misroute when order.owes is empty, so this index is safe.
     const path = order.owes[0]!.path;
@@ -741,6 +763,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 
     let res;
     try {
+      const refused = await checkV2Consequence(revalidate);
+      if (refused !== undefined) return refused;
       res = await hub.ask({
 	workflow,
 	run: runId,
@@ -772,6 +796,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     order: OrderPacket,
     resolvedCommand: string,
     payloadFile: string | undefined,
+    revalidateAfterRun?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
     if (signalled) {
       // The operator killed the work and the command settled before the lease
@@ -783,7 +808,6 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       await leasePromise;
       return 'killed';
     }
-
     // Before any of the branches below decide what to do about the failure.
     // Every one of them is reachable with a useless log otherwise.
     relayChildOutput(result, order.step);
@@ -797,6 +821,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       payloadOverCap: result.payloadOverCap,
       file: readPayloadFile(payloadFile),
     });
+    // The outer run() cleanup may unlink payloadFile on the first await in
+    // this function. Capture its bytes first, then make the v2 network read.
+    if (revalidateAfterRun !== undefined) {
+      const refused = await checkV2Consequence(revalidateAfterRun);
+      if (refused !== undefined) return refused;
+    }
     if (order.judge !== undefined) {
       if (result.exitCode === null) {
         // A signal or machinery failure is not a verdict. Leave the claim for
@@ -815,7 +845,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
           if (typeof reason === 'string' && reason.trim() !== '') text = reason;
         }
         if (text === '') text = `judge command exited with code ${result.exitCode}`;
-        return issueReject(order.judge, text, 'judge-rejected');
+	return issueReject(order.judge, text, 'judge-rejected', revalidateAfterRun);
       }
     }
 
@@ -877,11 +907,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         parsedPayload.reject.text,
         result.outputTail,
         order.owes.length,
+	revalidateAfterRun,
       );
       if (rejected !== 'continue') return rejected;
     }
 
-    if (!commandSucceeded(result)) return escalateCommandFailure(receipt, order, resolvedCommand);
+    if (!commandSucceeded(result)) return escalateCommandFailure(receipt, order, resolvedCommand, revalidateAfterRun);
 
     for (const owe of order.owes) {
       let proof: string | undefined;
@@ -920,6 +951,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       let res: Awaited<ReturnType<HubClient['submit']>> | undefined;
 
       for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
+	const refusedAttempt = await checkV2Consequence(revalidateAfterRun);
+	if (refusedAttempt !== undefined) return refusedAttempt;
         try {
           res = await hub.submit(submitRequest);
           break;
@@ -1067,6 +1100,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     let resolvedCommand: string;
     let resolvedBundleDir: string | undefined;
     let revalidate: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
+    let revalidateAfterRun: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     try {
       const resolved = await opts.instructions.resolveCommand(order);
       if (!resolved.ok) {
@@ -1078,6 +1112,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       resolvedCommand = resolved.command;
       resolvedBundleDir = resolved.bundleDir;
       revalidate = resolved.revalidate;
+      revalidateAfterRun = resolved.revalidateAfterRun;
     } catch (e) {
       opts.err(
         `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
@@ -1211,7 +1246,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 	}
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
-	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
+	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile, revalidateAfterRun);
       }
       running = cmd;
       opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
@@ -1240,7 +1275,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return mapLeaseDuringRun(outcome.o);
       }
 
-      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile);
+      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile, revalidateAfterRun);
     } finally {
       removeConsumesDir(consumesDir);
       removeConsumesDir(feedbackDir);

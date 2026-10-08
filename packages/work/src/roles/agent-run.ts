@@ -80,6 +80,8 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { owedSchema } from '../../../../src/model.ts';
 import { validModelOrderFields } from '../order-definition-binding.ts';
+import { createTrustedInputV2Admission } from '../hosted/trusted-input-admission.ts';
+import { createTrustedReferenceV2Reader, type TrustedReferenceV2Reader } from '../hosted/trusted-reference-v2.ts';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import {
@@ -132,6 +134,7 @@ interface ParsedArgs {
   jumpToleranceMs?: number;
   submitGraceMs?: number;
   confirmIntervalMs?: number;
+  trustedInputV2?: boolean;
   error?: string;
 }
 
@@ -195,6 +198,9 @@ export function parseArgs(args: string[]): ParsedArgs {
         }
         break;
       }
+      case '--trusted-input-v2':
+	parsed.trustedInputV2 = true;
+	break;
       default:
         return { error: `unknown option '${a}'` };
     }
@@ -207,6 +213,7 @@ function usage(): void {
     'usage: owenloop work agent-run <workflow>/<run> [--origin <url>] [--harness <id>] [--shift <id>]\n' +
       '                         [--heartbeat-interval <ms>] [--jump-tolerance <ms>]\n' +
       '                         [--submit-grace <ms>] [--confirm-interval <ms>]\n' +
+      '                         [--trusted-input-v2  (direct Service HTTPS witness)]\n' +
       '   or: owenloop work agent-run <run> --workflow <wf> [...]\n',
   );
 }
@@ -259,6 +266,8 @@ export interface RunDeps {
   instructions?: InstructionResolver;
   /** Consume-side verifier; injected tests may provide a fake. */
   consumedVerifier?: ConsumedVerifier;
+  /** Test-only read seam; production constructs its own HTTPS reader. */
+  trustedInputV2Reader?: TrustedReferenceV2Reader;
   /** Environment used to derive the global workflow-store root. */
   env?: Record<string, string | undefined>;
   /** cwd for an order that carries no `workdir` (default `process.cwd()`). */
@@ -365,6 +374,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     env,
     now: () => Date.now(),
   });
+  const trustedInputV2 = parsed.trustedInputV2 === true || env['OWENLOOP_TRUSTED_INPUT_V2'] === '1';
 
   const instructionCwd = deps.cwd ?? process.cwd();
   let instructions = deps.instructions;
@@ -465,6 +475,18 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     hub = createHubClient({ origin, getToken: async () => token! });
   }
   const client = hub;
+  let trustedAdmission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
+  if (trustedInputV2) {
+    try {
+      const reader = deps.trustedInputV2Reader ?? createTrustedReferenceV2Reader({ origin,
+	getToken: async () => token!, expected: target });
+      if (token === undefined && deps.trustedInputV2Reader === undefined) throw new Error('worker credential unavailable');
+      trustedAdmission = createTrustedInputV2Admission({ reader, instructions, consumedVerifier, expected: target });
+    } catch (e) {
+      err(`owenloop work agent-run: trusted input v2 unavailable: ${errMsg(e)}`);
+      return 1;
+    }
+  }
 
   await loadHarnessModule(env['OWENLOOP_HARNESS_MODULE'], err);
 
@@ -516,7 +538,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       err(`owenloop work agent-run: ${resolved.reason}`);
       return null;
     }
-    if (!validModelOrderFields(resolved.step, order, resolved.inputNames)) {
+    if (!trustedInputV2 && !validModelOrderFields(resolved.step, order, resolved.inputNames)) {
       err('owenloop work agent-run: model order refusal: fields differ from local definition');
       return null;
     }
@@ -652,6 +674,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     // may be a directory owenloop just created under the cache root.
     allowedWorkdirRoots: resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd()),
     loadStep,
+    ...(trustedAdmission === undefined ? {} : { trustedInputV2: trustedAdmission }),
     resolveAdapter,
     resolveCrewRosters,
     // Phase-1 availability means registry membership. A real binary or

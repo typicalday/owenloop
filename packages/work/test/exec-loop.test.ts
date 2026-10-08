@@ -1834,6 +1834,47 @@ test('a 429 submit honors Retry-After and replays the exact request', async () =
   assert.equal(only(calls, 'release').length, 0);
 });
 
+test('v2 witness movement during a 429 wait prevents the retry', async () => {
+  const clock = controlledClock();
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({ getOrder: [commandOrder()],
+    submit: [new HubError(429, 'rate limited'), 'green'] });
+  let observations = 0;
+  const instructions: InstructionResolver = { ...testInstructions(),
+    resolveCommand: async () => ({ ok: true, command: 'echo hi',
+      revalidateAfterRun: async () => ++observations === 3
+	? { ok: false, kind: 'unverified-consumed', reason: 'v2 witness changed' } : undefined }) };
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { instructions,
+    sleep: clock.sleep, now: clock.now, heartbeatIntervalMs: 1_000_000 }));
+  const pending = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  assert.equal(submits.length, 1);
+  clock.release(5_000);
+  assert.equal(await pending, 'unresolved-instructions');
+  assert.equal(observations, 3);
+  assert.equal(submits.length, 1);
+});
+
+test('v2 witness movement after the first owed submit prevents the second', async () => {
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({ getOrder: [commandOrder({ owes: ['a', 'b'] })],
+    submit: ['green', 'green'] });
+  let observations = 0;
+  const instructions: InstructionResolver = { ...testInstructions(),
+    resolveCommand: async () => ({ ok: true, command: 'echo hi',
+      revalidateAfterRun: async () => ++observations === 3
+	? { ok: false, kind: 'unverified-consumed', reason: 'v2 witness changed' } : undefined }) };
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { instructions }));
+  const pending = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await pending, 'unresolved-instructions');
+  assert.deepEqual(submits.map(submit => submit.path), ['a']);
+  assert.equal(observations, 3);
+});
+
 test('429 submit fallback delays are 5s then 10s and run the command once', async () => {
   const clock = controlledClock();
   const fr = fakeRunner();

@@ -59,6 +59,8 @@ import { createHoldMcp, HOLD_MCP_TOOL_NAMES, ROUTED_COLLECTION_TOOL_NAME,
   ROUTED_FILE_TOOL_NAME, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createDefaultHostedOrderAdapter, type HostedOrderResult } from '../hosted/order-adapter.ts';
 import { createVerifiedHostedHoldMcp } from '../hosted/verified-hold-mcp.ts';
+import { createTrustedInputV2Admission } from '../hosted/trusted-input-admission.ts';
+import { createTrustedReferenceV2Reader, type TrustedReferenceV2Reader } from '../hosted/trusted-reference-v2.ts';
 import { buildSubmitProof } from '../submit-proof.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
@@ -85,6 +87,7 @@ interface ParsedArgs {
   ignoreStdin: boolean;
   mcp: boolean;
   verifiedHosted?: boolean;
+  trustedInputV2?: boolean;
   mcpTools?: HoldMcpToolName[];
   /** Never hand the claim back — another process is the holder of record. */
   neverRelease?: boolean;
@@ -133,6 +136,9 @@ export function parseArgs(args: string[]): ParsedArgs {
         break;
       case '--verified-hosted':
 	parsed.verifiedHosted = true;
+	break;
+      case '--trusted-input-v2':
+	parsed.trustedInputV2 = true;
 	break;
       case '--never-release':
         parsed.neverRelease = true;
@@ -217,6 +223,7 @@ function usage(): void {
       '                     [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
       '                     [--mcp-tools <get_order,submit,reject>]\n' +
       '                     [--verified-hosted  (read-only by default; submit requires --mcp-tools get_order,submit)]\n' +
+      '                     [--trusted-input-v2  (MCP only; direct Service HTTPS witness)]\n' +
       '   or: owenloop work hold --order <run> --workflow <wf> [...]\n' +
       '  --mcp requires the order definition in the local workflow store (project cwd or global store).\n',
   );
@@ -296,6 +303,8 @@ export interface RunDeps {
   };
   /** Injected local resolver for model-field binding tests. */
   modelInstructionResolver?: InstructionResolver;
+  /** Test-only local read seam; production uses its own HTTPS reader. */
+  trustedInputV2Reader?: TrustedReferenceV2Reader;
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -357,6 +366,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     err('owenloop work hold: routed tools require a routed holder');
     return 1;
   }
+  const trustedInputV2 = parsed.trustedInputV2 === true || env['OWENLOOP_TRUSTED_INPUT_V2'] === '1';
+  if (trustedInputV2 && (!parsed.mcp || parsed.verifiedHosted || routed)) {
+    err('owenloop work hold: --trusted-input-v2 requires an ordinary --mcp holder');
+    return 2;
+  }
   // The marker alone never authorizes an account-store fallback. The nested
   // holder needs a one-use private handoff and is always a never-release MCP.
   if (!routed && (env['OWENLOOP_ROUTING_SESSION'] === '1'
@@ -382,7 +396,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     err('owenloop work hold: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
   }
-  if (parsed.verifiedHosted) {
+  if (parsed.verifiedHosted || trustedInputV2) {
     try {
       const url = new URL(origin);
       if (url.protocol !== 'https:' || url.username !== '' || url.password !== ''
@@ -461,6 +475,22 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // `agent-run` child is not and does not.
   if (parsed.mcp) {
     let modelResolver = deps.modelInstructionResolver;
+    const consumedVerifier = createConsumedVerifier({ env, now: () => Date.now() });
+    let trustedAdmission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
+    if (trustedInputV2) {
+      try {
+	modelResolver ??= createDefaultStoreInstructionResolver({
+	  cwd: parsed.neverRelease ? env['OWENLOOP_INSTRUCTION_CWD'] ?? process.cwd() : process.cwd(), env,
+	});
+	const reader = deps.trustedInputV2Reader ?? createTrustedReferenceV2Reader({ origin,
+	  getToken: async () => token!, expected: target });
+	trustedAdmission = createTrustedInputV2Admission({ reader, instructions: modelResolver,
+	  consumedVerifier, expected: target });
+      } catch (error) {
+	err(`owenloop work hold: trusted input v2 unavailable: ${errMsg(error)}`);
+	return 1;
+      }
+    }
     const modelOrderVerifier: NonNullable<Parameters<typeof createHoldMcp>[0]['modelOrderVerifier']> = async (order) => {
       try {
 	modelResolver ??= createDefaultStoreInstructionResolver({
@@ -491,11 +521,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	: parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),
       origin,
       env,
-      consumedVerifier: createConsumedVerifier({
-        env,
-        now: () => Date.now(),
-      }),
+      consumedVerifier,
       modelOrderVerifier,
+      ...(trustedAdmission === undefined ? {} : { trustedInputV2: trustedAdmission }),
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
       err,

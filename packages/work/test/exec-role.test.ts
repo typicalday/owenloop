@@ -16,6 +16,9 @@ import type { CommandReceipt } from '../src/exec/receipt.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
 import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
 import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { parseConsume, parseProduce } from '../../../src/paths.ts';
+import type { StepDef } from '../../../src/types.ts';
+import type { TrustedReferenceV2 } from '../src/hosted/trusted-reference-v2.ts';
 
 /**
  * Seed a hermetic owenloop v2 credential file at `<home>/.owenloop/
@@ -549,4 +552,76 @@ test('OWENLOOP_ACCOUNT selects a different agent slot (ci token, not default)', 
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
   }
+});
+
+test('opt-in command v2 admits omitted optional seed only after fresh prestart read', async () => {
+  process.env['OWENLOOP_TOKEN'] = 'tok';
+  const packet = commandOrder({ defDigest: 'a'.repeat(64) });
+  const order = packet.order!;
+  order.key = '';
+  order.inputs = ['optional'];
+  order.outputs = ['out'];
+  order.consumedFingerprint = { optional: 1 };
+  order.owes[0]!.version = 1;
+  const wire: TrustedReferenceV2 = { protocol: 'trusted-reference-read-v2', state: 'available',
+    workflow: 'wf1', run: 'run1', order: { workflow: 'wf1', run: 'run1', step: 'builder', key: '',
+      defDigest: 'a'.repeat(64), worker: 'command', inputs: ['optional'], outputs: ['out'], consumes: {},
+      consumedFingerprint: { optional: 1 }, owes: [{ path: 'out', version: 1,
+	reasons: [], judgmentRejects: 0, schemaRejects: 0 }] },
+    inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } };
+  const step = { name: 'builder', consumes: [parseConsume('optional')], produces: [parseProduce('out')],
+    executor: 'command', command: 'echo v2' } as StepDef;
+  const instructions: InstructionResolver = {
+    resolveCommand: async () => { throw new Error('legacy command resolver must not run'); },
+    resolveStep: async () => ({ ok: true, step }),
+    resolveHostedStep: async () => ({ ok: true, step, inputNames: ['optional'],
+      declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }),
+  };
+  let reads = 0;
+  let starts = 0;
+  const { hub } = roleHub({ getOrder: packet });
+  const code = await run([...WIRE_ARGS, '--trusted-input-v2'], { hub, instructions,
+    trustedInputV2Reader: { read: async () => { reads++; return wire; } },
+    runner: { start: () => { starts++; return { done: Promise.resolve(fixedResult(0)), kill: async () => {} }; } },
+    cwd: home, out: () => {}, err: () => {}, signalHost: fakeSignalHost().host });
+  assert.equal(code, 0);
+  assert.equal(starts, 1);
+  assert.equal(reads, 4, 'initial, prestart, postrun and immediate pre-submit reads are required');
+
+  reads = 0;
+  starts = 0;
+  const changed = structuredClone(wire);
+  changed.inputs[0]!.version = 2;
+  changed.order.consumedFingerprint!.optional = 2;
+  const refused = await run([...WIRE_ARGS, '--trusted-input-v2'], { hub, instructions,
+    trustedInputV2Reader: { read: async () => ++reads === 1 ? wire : changed },
+    runner: { start: () => { starts++; return { done: Promise.resolve(fixedResult(0)), kill: async () => {} }; } },
+    cwd: home, out: () => {}, err: () => {}, signalHost: fakeSignalHost().host });
+  assert.equal(refused, 1);
+  assert.equal(starts, 0);
+  assert.equal(reads, 2);
+
+  reads = 0;
+  starts = 0;
+  const consequenceHub = roleHub({ getOrder: packet });
+  const noSubmit = await run([...WIRE_ARGS, '--trusted-input-v2'], { hub: consequenceHub.hub, instructions,
+    trustedInputV2Reader: { read: async () => ++reads < 3 ? wire : changed },
+    runner: { start: () => { starts++; return { done: Promise.resolve(fixedResult(0)), kill: async () => {} }; } },
+    cwd: home, out: () => {}, err: () => {}, signalHost: fakeSignalHost().host });
+  assert.equal(noSubmit, 1);
+  assert.equal(starts, 1);
+  assert.equal(reads, 3);
+  assert.equal(consequenceHub.submits.length, 0);
+
+  reads = 0;
+  starts = 0;
+  const finalSubmitHub = roleHub({ getOrder: packet });
+  const noLateSubmit = await run([...WIRE_ARGS, '--trusted-input-v2'], { hub: finalSubmitHub.hub, instructions,
+    trustedInputV2Reader: { read: async () => ++reads < 4 ? wire : changed },
+    runner: { start: () => { starts++; return { done: Promise.resolve(fixedResult(0)), kill: async () => {} }; } },
+    cwd: home, out: () => {}, err: () => {}, signalHost: fakeSignalHost().host });
+  assert.equal(noLateSubmit, 1);
+  assert.equal(starts, 1);
+  assert.equal(reads, 4);
+  assert.equal(finalSubmitHub.submits.length, 0, 'input movement after the postrun read must still block submission');
 });

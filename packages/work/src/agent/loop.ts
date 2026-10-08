@@ -68,6 +68,7 @@ import { createLeaseLoop, type LeaseLoop, type LeaseLoopOptions, type LeaseOutco
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, LocalModelTuple, OrderPacket, ResolutionPayload } from '../hub/types.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
+import type { TrustedInputAdmission } from '../hosted/trusted-input-admission.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import type {
   AgentEvent,
@@ -184,6 +185,7 @@ const DEFAULT_RECOVERY_STOP_GRACE_MS = 5_000;
 const HARNESS_FAILURE_TAIL_SIZE = 4;
 const HARNESS_FAILURE_FRAGMENT_CAP = 700;
 const HARNESS_FAILURE_TAIL_CAP = 2_000;
+class TrustedInputV2Refusal extends Error {}
 
 export interface AgentRunLoopOptions {
   hub: HubClient;
@@ -242,6 +244,8 @@ export interface AgentRunLoopOptions {
   routedFileCacheRoot?: string;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
+  /** Explicit v2 mode; no v1 consume fallback when supplied. */
+  trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** Append one session record. Wired to `appendSession` by the role. */
   appendSession: (rec: SessionRecord) => void;
   /**
@@ -895,15 +899,29 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       opts.err(`owenloop work agent-run: ${order} is not an agent order (misroute) — releasing`);
       return releaseWith('misroute', 'misroute');
     }
+    if (opts.routedSelect && opts.trustedInputV2) {
+      return releaseWith('routed-v2-authority-unavailable', 'routed-launch-refused');
+    }
 
     // Consume-side verification is the prompt boundary. Do this before loading
     // or rendering any step brief: `owes[].reasons` is dynamic text supplied by
     // the transport, and an unverified rejection thread must never reach a
     // provider session. The same whole-order gate also protects `consumes`.
+    let v2Pin: { packetDigest: string; witnessDigest: string } | undefined;
+    if (opts.trustedInputV2 !== undefined) {
+      let admission: TrustedInputAdmission;
+      try { admission = await opts.trustedInputV2.observe(packet); }
+      catch { admission = { ok: false, reason: 'reference-v2-unavailable' }; }
+      if (!admission.ok) {
+	opts.err(`owenloop work agent-run: trusted input v2 refusal: ${admission.reason}`);
+	return releaseWith('unverified-consumed', 'unverified-consumed');
+      }
+      v2Pin = { packetDigest: admission.packetDigest, witnessDigest: admission.witnessDigest };
+    }
     const hasConsumedData =
       Object.keys(packet.consumes).length > 0
       || packet.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
-    if (hasConsumedData) {
+    if (opts.trustedInputV2 === undefined && hasConsumedData) {
       if (opts.consumedVerifier === undefined) {
         const detail =
           `consume-side verifier is not configured; dynamic values cannot be admitted to an agent prompt`;
@@ -924,6 +942,17 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return releaseWith('unverified-consumed', 'unverified-consumed');
       }
     }
+
+    const freshTrustedInputV2 = async (): Promise<void> => {
+      if (opts.trustedInputV2 === undefined || v2Pin === undefined) return;
+      let fresh: TrustedInputAdmission;
+      try { fresh = await opts.trustedInputV2.observe(packet); }
+      catch { throw new TrustedInputV2Refusal('reference-v2-unavailable'); }
+      if (!fresh.ok) throw new TrustedInputV2Refusal(fresh.reason);
+      if (fresh.packetDigest !== v2Pin.packetDigest || fresh.witnessDigest !== v2Pin.witnessDigest) {
+	throw new TrustedInputV2Refusal('claim-input-observation-changed');
+      }
+    };
 
     stepName = packet.step;
     stepKey = packet.key;
@@ -1253,7 +1282,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       && (!opts.routingHolderPath || !isAbsolute(opts.routingHolderPath)))
       return releaseWith('routed-holder-unavailable', 'routed-launch-refused');
     let owenloopMcp = routedSelection && opts.createRoutingHolderPath
-      ? undefined : buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath);
+      ? undefined : buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath,
+	opts.trustedInputV2 !== undefined);
     const holderMount = () => {
       if (!owenloopMcp) throw new Error('routed holder handoff unavailable');
       return owenloopMcp;
@@ -1512,6 +1542,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							return { outcome: await sessionStoreFailedAfterDispatch() };
 					}
 					const failure = 'failure' in raced ? raced.failure : undefined;
+					if (failure instanceof TrustedInputV2Refusal) {
+						opts.err(`owenloop work agent-run: trusted input v2 prestart refusal: ${failure.message}`);
+						return { outcome: await releaseWith('unverified-consumed', 'unverified-consumed') };
+					}
 					if (failure !== undefined) {
 						setFailure(failure);
 						if (isHarnessTurnError(failure)) {
@@ -1645,10 +1679,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						if (resumable && prev !== null) {
 							sessionRef = { harness: prev.harness, token: prev.token };
 							createdAt = prev.createdAt;
+							await freshTrustedInputV2();
 							await active.deliver(sessionRef, delta.message, deliverArgs(), onEvent);
 							markDelivered();
 							return;
 						}
+						await freshTrustedInputV2();
 						const ref = await active.start(coldArgs(), onEvent);
 						sessionRef = ref;
 						markDelivered();
@@ -1670,6 +1706,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						next = 'cold-restart';
 					} else {
 						const wake = await dispatch('wake', { wakeUsed: true }, async () => {
+							await freshTrustedInputV2();
 							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs(), onEvent);
 						});
 							if ('outcome' in wake) return wake.outcome;
@@ -1692,6 +1729,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							packet,
 							...(prev?.deliveredReasonAt !== undefined ? { deliveredReasonAt: prev.deliveredReasonAt } : {}),
 						});
+						await freshTrustedInputV2();
 						const ref = await active.start(
 							{ ...coldArgs(), brief: `${base}\n\n---\n\n${renderColdRecoveryAppendix(recovery!)}` },
 							onEvent,
@@ -1742,6 +1780,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       activePersistenceFailure = undefined;
       if (!await beforeColdStart()) return { t: 'turn', routedRefused: true };
       try {
+	await freshTrustedInputV2();
         const ref = await active.start(coldArgs(), onEvent);
         sessionRef = ref;
         // The replay brief carried the reasons, and the turn it opened has now
@@ -1790,6 +1829,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       }
 
       try {
+	await freshTrustedInputV2();
 	await active.deliver(sessionRef, delta.message, deliverArgs(), onEvent);
         markDelivered();
         return { t: 'turn' };
@@ -1841,6 +1881,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     if (raced.routedRefused) {
       opts.err('owenloop work agent-run: routed launch authorization refused before provider start');
       return releaseWith('routed-launch-refused', 'routed-launch-refused');
+    }
+    if (raced.failure instanceof TrustedInputV2Refusal) {
+      opts.err(`owenloop work agent-run: trusted input v2 prestart refusal: ${raced.failure.message}`);
+      return releaseWith('unverified-consumed', 'unverified-consumed');
     }
 
     // TURN END — NOT task end. Log the failure shape for humans, then confirm.
