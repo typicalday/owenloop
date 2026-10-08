@@ -241,8 +241,12 @@ For each entry in `order.consumes`, `verifyConsumed` applies this fixed order:
    signed record's `producerKeyId`.
 4. The signed `produced[]` entry must cover the consumed artifact path. The
    driver compares `valueDigestHex(deliveredValue)` with the signed
-   `valueDigest`, and compares the signed version with
-   `order.consumedFingerprint[path]` when that claim is present.
+   `valueDigest`, compares the signed version with the required
+   `order.consumedFingerprint[path]`, and compares the signed workflow with
+   the order's workflow for a direct submission. The order's runtime instance
+   ID is Service-supplied; this last comparison checks packet/proof coherence,
+   not independent instance authority. A `calls:` relay instead checks the
+   child's record against the verified child definition and outcome mapping.
 5. The authenticated producer key must chain through locally loaded enrollment
    grants to the locally configured organization-root public key. Every grant
    link is signature-checked, scope attenuation is enforced, and effective
@@ -251,19 +255,24 @@ For each entry in `order.consumes`, `verifyConsumed` applies this fixed order:
    must satisfy that demand. A child grant can only narrow a parent grant; it
    cannot widen pools, labels, namespaces, or delegation.
 
-The same verification applies to an `owes[]` rejection thread when
-`owes[].proof` is present. The proof is a `submission.v1` envelope whose one
-`produced[]` entry names the owed artifact path and whose signed value digest
-covers the complete `owes[].reasons` array. Verification therefore happens
-before `REPLAY_TOKEN_BUDGET` truncates the thread for a resumed prompt.
+An `owes[].proof` is not a verified rejection-reason channel. When present,
+the gate still checks its `submission.v1` signature, path, complete reasons
+array digest, order-workflow coherence, target version, producer chain, and revocation before replay
+truncation; invalid evidence refuses. An otherwise valid producer proof only
+authenticates producer-signed bytes. It cannot establish the rejecting actor,
+reason revision, or a fresh head, so the owed thread remains `unverifiable`
+with a `reason-authority` diagnostic. Hard-rule and `enforce` consumers refuse;
+`warn` reports the gap and `off` may admit unverified feedback under the
+existing policy. Service #329 tracks actor-signed reason events and a fresh
+head before any verified-feedback claim.
 
 The pure verifier returns four explicit verdicts:
 
 | verdict | meaning |
 | --- | --- |
-| `verified` | DSSE, schema, path, value digest, version, enrollment chain, revocation, and any supplied-demand scope checks passed. |
+| `verified` | For a directly consumed producer value, DSSE, schema, path, value digest, expected workflow/version, enrollment chain, revocation, and any supplied-demand scope checks passed. A `calls:` relay checks its child workflow against the verified child definition when one is declared; it does not independently authenticate a child instance ID. Neither verdict authenticates a rejection actor. |
 | `absent` | No proof was supplied. |
-| `unverifiable` | A required local prerequisite or verifier setup is unavailable. |
+| `unverifiable` | A required trust link cannot be established, including missing local setup, an omitted direct-workflow expectation, or owed feedback without rejecting-actor authority. |
 | `invalid` | Evidence was supplied but failed signature, schema, path, digest, version, chain, revocation, or scope validation. |
 
 The consuming driver maps those verdicts according to `artifactPolicy`:
@@ -285,8 +294,9 @@ consume-side verifier is configured.
 
 A refusal is an operator-facing integrity event, not an error to suppress or
 work around. The refusal names the failed link and the artifact, using link
-names such as `no-proof`, `signature`, `value-digest`, `version`, `chain`,
-`scope`, or `prerequisite`, together with the workflow, run, and step. The gate
+names such as `no-proof`, `signature`, `workflow`, `reason-authority`,
+`value-digest`, `version`, `chain`, `scope`, or `prerequisite`, together with the
+workflow, run, and step. The gate
 refuses the complete order; it never drops the offending path and serves a
 partial packet.
 
@@ -333,10 +343,11 @@ tells it to and records them, and each scenario asserts three things: that the
 tampered payload really was served, that the specific named refusal kind or
 link fired, and that an untampered control run still reaches the executable
 surface. The properties covered are that a hostile hub cannot alter an
-executing instruction or shell command, cannot forge a consumed artifact value
-or a judge rejection reason that reaches an agent prompt or a shell, and cannot
-introduce a trusted signer; and that when it withholds, the driver stalls
+executing instruction or shell command, cannot forge a verified consumed
+artifact value, and cannot introduce a trusted signer; and that when it withholds, the driver stalls
 without executing anything rather than degrading to unverified execution.
+Rejection reasons remain unverified under this producer-proof protocol; the
+`warn` and `off` policies can still admit unverified reason text to an agent.
 
 ### Reusing an existing SSH key (human only)
 

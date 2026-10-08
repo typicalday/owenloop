@@ -166,14 +166,14 @@ test('launch gate: an un-enrolled signer cannot deliver a consumed value to the 
   trusts.push(trust);
   installProducerGrant(trust);
   const value = 'signed-by-enrolled-producer';
-  const cleanProof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 1 });
+  const cleanProof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 1, workflow: 'wf-launch-gate-signer' });
 
   const clean = await runCommand(installed, trust, order({ defDigest: installed.defDigest, run: 'run-signer-clean', value, proof: cleanProof }));
   assert.equal(clean.outcome, 'submitted', 'L3: the enrolled producer value must reach the command surface');
   assert.equal(pathExists(marker), true);
   rmSync(marker, { force: true });
 
-  const introducedProof = submissionProof({ artifact: 'input', value, producer: trust.alternate, version: 1 });
+  const introducedProof = submissionProof({ artifact: 'input', value, producer: trust.alternate, version: 1, workflow: 'wf-launch-gate-signer' });
   const hostile = await runCommand(
     installed,
     trust,
@@ -197,7 +197,7 @@ test('launch gate: a revoked signer cannot deliver a consumed value to the shell
   trusts.push(trust);
   installProducerGrant(trust);
   const value = 'signed-by-producer';
-  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 1 });
+  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 1, workflow: 'wf-launch-gate-signer' });
 
   const clean = await runCommand(installed, trust, order({ defDigest: installed.defDigest, run: 'run-revocation-clean', value, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: the enrolled producer value must reach the command surface before revocation');
@@ -232,7 +232,7 @@ test('scope narrowing refuses a widened grant — VERIFIER-LEVEL: production dri
     delegation: { allowed: false },
   });
   const value = 'scope-tested-value';
-  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 1 });
+  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 1, workflow: 'wf-launch-gate-signer' });
   const packet = order({ defDigest: 'scope-test', run: 'run-scope', value, proof }).order!;
 
   const verifier = createConsumedVerifier({

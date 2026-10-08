@@ -135,6 +135,11 @@ test('calls relay: the child record verifies for the parent path with the child 
   assert.deepEqual(verdict.principal, { kind: 'machine', id: 'child-producer' });
 });
 
+test('calls relay keeps the child workflow distinct from a parent workflow expectation', async () => {
+  const verdict = await verifyConsumed(input({ expectedWorkflow: 'wf-parent' }), options);
+  assert.equal(verdict.kind, 'verified', JSON.stringify(verdict));
+});
+
 test('calls relay: a root-key child producer verifies without an enrollment roster', async () => {
   const value = 'root-produced-unit';
   const verdict = await verifyConsumed(input({

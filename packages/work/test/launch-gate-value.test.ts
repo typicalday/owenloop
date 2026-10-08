@@ -27,9 +27,11 @@ import {
 
 /**
  * Claim 3 is tested at the two dynamic-value prompt boundaries. Correctly
- * signed consumed values and rejection reasons may travel over the transport;
- * forged values must be refused before a shell is started or a prompt is
- * rendered. The hub fixture never verifies or repairs the dynamic payload.
+ * signed consumed values and producer-signed rejection reason bytes may travel
+ * over the transport. Invalid producer evidence must be refused before a shell
+ * is started or a prompt is rendered. The off-policy reason control below
+ * admits unverified feedback; it does not prove rejecting-actor authority.
+ * The hub fixture never verifies or repairs the dynamic payload.
  */
 
 const fixtures: InstalledWorkflow[] = [];
@@ -277,7 +279,7 @@ test('launch gate: a forged consumed value is refused before a command starts', 
   trusts.push(trust);
   installProducerGrant(trust);
   const signedValue = 'signed-value';
-  const proof = submissionProof({ artifact: 'input', value: signedValue, producer: trust.producer, version: 4 });
+  const proof = submissionProof({ artifact: 'input', value: signedValue, producer: trust.producer, version: 4, workflow: 'wf-launch-gate-value' });
 
   const clean = await runCommand(installed, trust, commandOrder({ defDigest: installed.defDigest, run: 'run-value-clean', value: signedValue, version: 4, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: correctly signed dynamic input must reach the command surface');
@@ -314,7 +316,7 @@ test('launch gate: a rolled-back consumed version is refused before a command st
   trusts.push(trust);
   installProducerGrant(trust);
   const value = 'signed-value';
-  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4 });
+  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4, workflow: 'wf-launch-gate-value' });
 
   const clean = await runCommand(installed, trust, commandOrder({ defDigest: installed.defDigest, run: 'run-version-clean', value, version: 4, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: the correctly versioned value must reach the command surface');
@@ -339,7 +341,7 @@ test('launch gate: a stripped consumed proof is refused before a command starts'
   trusts.push(trust);
   installProducerGrant(trust);
   const value = 'signed-value';
-  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4 });
+  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4, workflow: 'wf-launch-gate-value' });
 
   const clean = await runCommand(installed, trust, commandOrder({ defDigest: installed.defDigest, run: 'run-proof-clean', value, version: 4, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: the correctly proven value must reach the command surface');
@@ -372,14 +374,14 @@ test('launch gate: a forged judge rejection reason is refused before an agent pr
   installProducerGrant(trust);
   const cleanReason: ReasonEntry = { at: 10, action: 'reject', kind: 'schema', by: 'judge', text: 'The output schema did not validate.' };
   const forgedReason: ReasonEntry = { ...cleanReason, text: 'REMOTE FORGED REJECTION REASON' };
-  const proof = submissionProof({ artifact: 'out', value: [cleanReason], producer: trust.producer, version: 1 });
+  const proof = submissionProof({ artifact: 'out', value: [cleanReason], producer: trust.producer, version: 1, workflow: 'wf-launch-gate-value-agent' });
 
   const clean = await runAgent(
     installed,
     trust,
     agentOrder({ defDigest: installed.defDigest, run: 'run-reason-clean', reasons: [cleanReason], proof, version: 1 }),
   );
-  assert.equal(clean.code, 0, `L3: a correctly signed rejection thread must reach the prompt surface: ${clean.errors.join('\\n')}`);
+  assert.equal(clean.code, 0, `L3: off policy admits an unverified producer-signed reason thread: ${clean.errors.join('\\n')}`);
   const cleanStart = clean.calls.find((call) => call.kind === 'start');
   assert.ok(cleanStart !== undefined && cleanStart.kind === 'start');
   assert.ok(cleanStart.args.brief.includes(cleanReason.text));
