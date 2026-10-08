@@ -329,7 +329,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       const handoff = consumeRoutingHandoff({ env, origin: parsed.origin, target, kind: 'agent-run' });
       if (!handoff) throw new Error('missing routing handoff');
       createRoutingRoleClient(handoff);
-      openRoutingRoleStage(handoff);
+      const stage = openRoutingRoleStage(handoff);
       // Validate the Shift-pinned fallback and machine roots without creating
       // a directory: git worktree provisioning can run repository hooks and
       // belongs after accepted launch report plus a final broker order read.
@@ -337,6 +337,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	...(handoff.workRepo ? { workRepo: handoff.workRepo } : {}),
 	workflow: target.workflow, run: target.run,
 	definitionStagePath: handoff.definitionStage!.path, originalEnv: env,
+	publicEnv: { HOME: stage.publicEnv.HOME!,
+	  OWENLOOP_CONFIG_DIR: stage.publicEnv.OWENLOOP_CONFIG_DIR! },
 	...(deps.cwd ? { cwd: deps.cwd } : {}) });
     } catch {
       err('owenloop work agent-run: routing handoff refused');
