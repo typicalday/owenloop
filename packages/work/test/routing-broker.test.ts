@@ -5,7 +5,7 @@ import { open } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { test } from 'node:test';
 
 import { createHubClient } from '../src/hub/client.ts';
@@ -128,6 +128,121 @@ test('private routed broker binds one dispatch and proxies only scoped requests'
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('role quiesce freezes holder and role writes, waits for a known ask ACK, and permits heartbeat', async () => {
+  let beginAsk!: () => void;
+  let completeAsk!: () => void;
+  const askStarted = new Promise<void>(resolve => { beginAsk = resolve; });
+  const askReply = new Promise<void>(resolve => { completeAsk = resolve; });
+  const calls: string[] = [];
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url) => {
+      const parts = String(url).split('/');
+      const verb = parts.at(-1) === 'v1' ? parts.at(-2)! : parts.at(-1)!;
+      calls.push(verb);
+      if (verb === 'routing_ask') { beginAsk(); await askReply; return Response.json({ text: 'answer', ok: true }); }
+      if (verb === 'get_order') return Response.json(orderResponse);
+      if (verb === 'heartbeat') return Response.json({ text: 'ok', ok: true });
+      throw new Error(`unexpected routed mutation ${verb}`);
+    }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation: { ...reservation, childKind: 'agent-run' },
+      routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    assert.equal((await request(grant.socketPath, { cap: grant.cap,
+      method: 'quiesce', body: {} })).ok, false, 'pending cap cannot freeze an unstarted dispatch');
+    grant.activate({ ...child, kind: 'agent-run' });
+    const role = createRoutingChildClient(handoffFor(grant, { ...reservation, childKind: 'agent-run' }));
+    const holderCap = grant.holder!.cap;
+    assert.equal((await request(grant.socketPath, { cap: holderCap, method: 'quiesce', body: {} })).ok, false);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap,
+      method: 'quiesce', body: { seal: true } })).ok, false);
+    await role.getOrder({ workflow: 'wf', run: 'run', holder });
+    const pendingAsk = role.ask({ workflow: 'wf', run: 'run', path: 'out', question: 'question' });
+    await askStarted;
+    const pendingFreeze = role.quiesce();
+    const frozen = grant.quiesce();
+    await assert.rejects(role.release({ workflow: 'wf', run: 'run' }), /routing broker unavailable/);
+    assert.equal((await request(grant.socketPath, { cap: holderCap, method: 'ask',
+      body: { path: 'out', question: 'later' } })).ok, false);
+    assert.equal(calls.filter(verb => verb === 'routing_ask').length, 1);
+    completeAsk();
+    assert.equal((await pendingAsk).ok, true);
+    assert.deepEqual(await frozen, { quiescing: true, effects: 'settled' });
+    assert.deepEqual(await pendingFreeze, { quiescing: true, effects: 'settled' });
+    assert.equal((await role.heartbeat({ workflow: 'wf', run: 'run', holder })).text, 'ok');
+  } finally { await broker.close(); }
+});
+
+test('quiesce reports an uncertain already-dispatched ask when its ACK is lost', async () => {
+  let beginAsk!: () => void;
+  let loseAsk!: () => void;
+  const askStarted = new Promise<void>(resolve => { beginAsk = resolve; });
+  const lost = new Promise<void>(resolve => { loseAsk = resolve; });
+  let writes = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url) => {
+      const parts = String(url).split('/');
+      const verb = parts.at(-1) === 'v1' ? parts.at(-2)! : parts.at(-1)!;
+      if (verb === 'get_order') return Response.json(orderResponse);
+      if (verb === 'routing_ask') { writes++; beginAsk(); await lost; throw new Error('lost ACK'); }
+      throw new Error(`unexpected routed mutation ${verb}`);
+    }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity,
+      hub, submissionAuthority: transportAuthority });
+    grant.activate(child);
+    const role = createRoutingChildClient(handoffFor(grant));
+    await role.getOrder({ workflow: 'wf', run: 'run', holder });
+    const pendingAsk = role.ask({ workflow: 'wf', run: 'run', path: 'out', question: 'question' });
+    await askStarted;
+    const freeze = grant.quiesce();
+    loseAsk();
+    await assert.rejects(pendingAsk, /routing broker unavailable/);
+    assert.deepEqual(await freeze, { quiescing: true, effects: 'uncertain' });
+    await assert.rejects(role.ask({ workflow: 'wf', run: 'run', path: 'out', question: 'retry' }),
+      /routing broker unavailable/);
+    assert.equal(writes, 1);
+  } finally { await assert.rejects(broker.close(), /quarantined/); }
+});
+
+test('quiesce aborts an active holder upload and never calls it settled', async () => {
+  let beginUpload!: () => void;
+  const uploadStarted = new Promise<void>(resolve => { beginUpload = resolve; });
+  const reserved = { ...reservation, childKind: 'agent-run' as const };
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      if (route === 'get_order') return Response.json(orderResponse);
+      if (route.startsWith('routing_file_artifacts/v1?')) {
+	beginUpload();
+	return new Promise<Response>((_resolve, reject) => {
+	  init!.signal!.addEventListener('abort', () => reject(new Error('upload aborted')), { once: true });
+	});
+      }
+      throw new Error(`unexpected route ${route}`);
+    }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  const source = new PassThrough();
+  try {
+    const grant = broker.issue({ reservation: reserved, routing, identity,
+      currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    grant.activate({ ...child, kind: 'agent-run' });
+    const owner = createRoutingChildClient(handoffFor(grant.holder!, reserved));
+    await owner.getOrder({ workflow: 'wf', run: 'run', holder: {
+      kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+    source.write(Buffer.from('a'));
+    const pending = owner.putFileArtifactStream({ workflow: 'wf', size: 2,
+      chunks: source, contentType: 'text/plain' });
+    await uploadStarted;
+    assert.deepEqual(await grant.quiesce(), { quiescing: true, effects: 'uncertain' });
+    await assert.rejects(pending, /routing broker unavailable/);
+  } finally { source.destroy(); await assert.rejects(broker.close(), /quarantined/); }
 });
 
 test('broker redacts upstream failures and rejects an expired incarnation before fetch', async () => {
@@ -529,7 +644,7 @@ test('revoking a holder grant aborts an in-flight streamed upload', async () => 
     await assert.rejects(pending, /routing broker unavailable|routing request refused/);
     assert.equal(aborted, true);
     assert.equal(source.destroyed, true, 'client stops reading the local file source');
-  } finally { await broker.close(); }
+  } finally { await assert.rejects(broker.close(), /quarantined/); }
 });
 
 test('holder upload waits for a delayed helper exit after broker acknowledges exact bytes', async () => {
@@ -672,7 +787,7 @@ test('broker rejects malformed upload pointers and a role-cap upload', async () 
       contentType: 'text/plain' }), /routing broker unavailable/);
     assert.equal(uploadCalls, 3, 'role cap never reaches the scoped upload route');
     grant.terminal();
-  } finally { await broker.close(); }
+  } finally { await assert.rejects(broker.close(), /quarantined/); }
 });
 
 test('broker upload absolute deadline aborts the parent request and child stream', async () => {
@@ -706,7 +821,7 @@ test('broker upload absolute deadline aborts the parent request and child stream
       chunks: slowBytes(), contentType: 'application/octet-stream' }), /routing broker unavailable/);
     assert.equal(aborted, true);
     grant.terminal();
-  } finally { await broker.close(); }
+  } finally { await assert.rejects(broker.close(), /quarantined/); }
 });
 
 test('malformed lifecycle replies and rotated sessions refuse through the child transport', async () => {
@@ -975,12 +1090,14 @@ test('session rotation revokes locally during an in-flight member write and quar
       body: { sealPath: 'items.sealed', emissionId: 'd'.repeat(32), value: { id: 1 },
 	done: false, holder } });
     await started;
+    const frozen = grant.quiesce();
     const revoked = broker.revokeSession(sessionId);
     const revokedAssertion = assert.rejects(revoked, /quarantined/);
     assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'heartbeat',
       body: { holder } })).ok, false);
     finishEmit(Response.json({ outcome: 'emitted', closed: false,
       conditionApplied: 'routed-collection-member-v1' }));
+    assert.deepEqual(await frozen, { quiescing: true, effects: 'uncertain' });
     await revokedAssertion;
     assert.equal((await pending).ok, false);
     assert.equal(revokes, 1);
@@ -1118,7 +1235,10 @@ test('uncertain singleton retry preserves exact parent signature and refuses cha
       assert.equal(signatures, 1);
       assert.equal(writes.length, canReplay ? 2 : 1);
       if (canReplay) assert.equal(writes[0], writes[1], 'signature, target and value bytes identical');
-    } finally { await broker.close(); }
+    } finally {
+      if (canReplay) await broker.close();
+      else await assert.rejects(broker.close(), /quarantined/);
+    }
   }
 });
 
@@ -1262,7 +1382,10 @@ test('prestart report rechecks parent selection and exact acknowledgement after 
       assert.equal((await send('get_launch_order', { holder })).ok, false);
       assert.equal(selections, 2);
       assert.equal(reports, mode === 'drift' ? 0 : 1);
-    } finally { await broker.close(); }
+    } finally {
+      if (mode === 'bad-ack') await assert.rejects(broker.close(), /quarantined/);
+      else await broker.close();
+    }
   }
 });
 

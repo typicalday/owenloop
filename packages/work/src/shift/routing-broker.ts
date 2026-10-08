@@ -4,6 +4,7 @@
  * No caller may choose a URL, header, verb, workflow, run or session.
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { chmodSync, lstatSync, mkdtempSync, rmdirSync, unlinkSync, type Stats } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { PassThrough } from 'node:stream';
@@ -40,14 +41,16 @@ const MAX_UPLOAD_HEADER = 4096;
 const UPLOAD_IDLE_MS = 4 * 60_000;
 const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_SOCKETS = 16;
+const QUIESCE_DRAIN_MS = 10_000;
 const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
-  | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection';
+  | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection' | 'quiesce';
 type CapScope = 'role' | 'holder';
+export type RoutedQuiesceResult = { quiescing: true; effects: 'settled' | 'uncertain' };
 interface Grant {
   active: boolean;
   ready: boolean;
@@ -58,6 +61,15 @@ interface Grant {
   consumedPaths?: Set<string>;
   consumedFiles?: Map<string, FileArtifactPointer>;
   uploadControllers: Set<AbortController>;
+  /** Active mutation streams; downloads are cancelled but are not writes. */
+  uploadEffectControllers: Set<AbortController>;
+  /** Local irreversible freeze. This is not a native/fleet terminal seal. */
+  quiescing: boolean;
+  inFlightEffects: Set<Promise<void>>;
+  uncertainEffects: Set<Method | 'upload_file'>;
+  syncUncertainty?: () => void;
+  quiesceResult?: Promise<RoutedQuiesceResult>;
+  observeQuiesce?: (result: Promise<RoutedQuiesceResult>) => void;
   reservation: ChildReservation;
   routing: ReferenceRouting;
   identity: Identity;
@@ -110,6 +122,8 @@ export interface RoutingBroker {
       markGateSignalled(record: ChildRecord): void;
       markChildEntered(record: ChildRecord): void;
       canAllowEntry(record: ChildRecord): boolean;
+      /** Parent-initiated local freeze; no child packet is required. */
+      quiesce(): Promise<RoutedQuiesceResult>;
       terminal(reason?: 'normal-close' | 'child-exit' | 'revoked'): Promise<void> | void;
     };
   close(options?: { revokeNormalReceipts?: boolean }): Promise<void>;
@@ -267,6 +281,74 @@ async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, lau
   }
 }
 
+/** Refuse a Hub mutation that reached its wire boundary after parent freeze. */
+const effectContext = new AsyncLocalStorage<{ dispatched: boolean }>();
+function startEffect<T>(grant: Grant, send: () => Promise<T>): Promise<T> {
+  if (grant.quiescing) throw new Error('routing broker quiescing');
+  const context = effectContext.getStore();
+  if (context) context.dispatched = true;
+  return send();
+}
+
+/** Track the whole validated broker operation, not just the fetch. A malformed
+ * or lost ACK after Service commit remains uncertain at the quiesce boundary. */
+function trackEffect<T>(grant: Grant, method: Method, send: () => Promise<T>): Promise<T> {
+  const context = { dispatched: false };
+  const operation = effectContext.run(context, send);
+  const settled = operation.then(() => {
+    // These three operations have an exact conditional replay/receipt path.
+    // A later acknowledged replay resolves only its original frozen intent.
+    if (method === 'submit' || method === 'emit_member' || method === 'seal_collection') {
+      grant.uncertainEffects.delete(method);
+      grant.syncUncertainty?.();
+    }
+  }, () => {
+    if (context.dispatched) {
+      grant.uncertainEffects.add(method);
+      grant.syncUncertainty?.();
+    }
+  });
+  grant.inFlightEffects.add(settled);
+  void settled.finally(() => { grant.inFlightEffects.delete(settled); });
+  return operation;
+}
+
+/** Parent-owned irreversible local effect freeze. A successful reply proves
+ * only the broker's state and bounded in-flight observations, never process
+ * death, native release or permission to publish a postrun result. */
+function quiesceGrant(grant: Grant): Promise<RoutedQuiesceResult> {
+  if (grant.quiesceResult) return grant.quiesceResult;
+  grant.quiescing = true;
+  if (grant.uploadEffectControllers.size > 0) grant.uncertainEffects.add('upload_file');
+  for (const controller of grant.uploadControllers) controller.abort();
+  grant.quiesceResult = (async () => {
+    const pending = [...grant.inFlightEffects];
+    if (pending.length > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'timeout'>(resolve => {
+	timer = setTimeout(() => resolve('timeout'), QUIESCE_DRAIN_MS);
+	timer.unref();
+      });
+      const result = await Promise.race([
+	Promise.allSettled(pending).then(() => 'settled' as const), timeout,
+      ]);
+      if (timer) clearTimeout(timer);
+      if (result === 'timeout' || grant.inFlightEffects.size > 0)
+	grant.uncertainEffects.add('upload_file');
+    }
+    // These exact requests are retained for the existing bounded replay or
+    // receipt path. An unknown outcome never becomes a fresh child write.
+    if (grant.collectionMember?.emit && !grant.collectionMember.result)
+      grant.uncertainEffects.add('emit_member');
+    if (grant.collectionSeal?.request && !grant.collectionSeal.result)
+      grant.uncertainEffects.add('seal_collection');
+    grant.syncUncertainty?.();
+    return { quiescing: true, effects: grant.uncertainEffects.size ? 'uncertain' : 'settled' };
+  })();
+  grant.observeQuiesce?.(grant.quiesceResult);
+  return grant.quiesceResult;
+}
+
 async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
   phase: RoutedInputPhase, now: () => number): Promise<RoutedInputPair | undefined> {
   const authority = grant.submissionAuthority;
@@ -355,6 +437,7 @@ function submissionBinding(response: GetOrderResponse, path: string, grant: Gran
 
 async function submitFromParent(grant: Grant, body: Record<string, unknown>, now: () => number,
   signal: AbortSignal): Promise<unknown> {
+  if (grant.quiescing) throw new Error('routing broker quiescing');
   const authority = grant.submissionAuthority;
   if (!authority || grant.submitBusy) throw new Error('routing submission authority unavailable');
   grant.submitBusy = true;
@@ -402,7 +485,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       } };
     }
     const response = await checked(grant,
-      grant.hub.routingSubmitConditional(grant.pendingSubmit.request, signal), now);
+      startEffect(grant, () => grant.hub.routingSubmitConditional(grant.pendingSubmit!.request, signal)), now);
     if (!response || response.conditionApplied !== 'expected-version-v1'
       || typeof response.outcome !== 'string' || !response.outcome
       || (response.closed !== undefined && typeof response.closed !== 'boolean'))
@@ -528,10 +611,12 @@ async function collectionSeal(grant: Grant, sealPath: string, sealId: string,
     grant.collectionSeal.request = { workflow: grant.reservation.workflow, run: grant.reservation.run,
       sealPath, sealTargetVersion: version, sealId, proof, holder };
   }
-  const result = await grant.hub.routingCollectionSeal(grant.collectionSeal.request, signal);
+  const result = await startEffect(grant, () => grant.hub.routingCollectionSeal(grant.collectionSeal!.request!, signal));
   if (!collectionResponse(result, 'seal') || (!validateSessionGrant(grant, now())
     && !collectionReceiptOnly(grant, now))) throw new Error('routing collection seal outcome unresolved');
   grant.collectionSeal.result = result;
+  grant.uncertainEffects.delete('seal_collection');
+  grant.syncUncertainty?.();
   return result;
 }
 
@@ -561,7 +646,8 @@ async function collectionEmit(grant: Grant, body: Record<string, unknown>, now: 
       pending.result = await collectionReconcile(grant, 'member', now, signal);
     } else {
       const { response, binding, version } = await collectionOrder(grant, sealPath, holder, now, signal);
-      pending.issued ??= await checked(grant, grant.hub.routingCollectionIssue(pending.issue, signal), now);
+      pending.issued ??= await checked(grant,
+	startEffect(grant, () => grant.hub.routingCollectionIssue(pending.issue, signal)), now);
       const issued = pending.issued;
       if (!issued || issued.emissionId !== emissionId || issued.sealPath !== sealPath
 	|| issued.sealTargetVersion !== version || issued.memberVersion !== 1
@@ -581,10 +667,12 @@ async function collectionEmit(grant: Grant, body: Record<string, unknown>, now: 
       }
       const emitRequest = pending.emit;
       if (!emitRequest) throw new Error('routing collection request unavailable');
-      const result = await grant.hub.routingCollectionEmit(emitRequest, signal);
+      const result = await startEffect(grant, () => grant.hub.routingCollectionEmit(emitRequest, signal));
       if (!collectionResponse(result, 'member') || (!validateSessionGrant(grant, now())
 	&& !collectionReceiptOnly(grant, now))) throw new Error('routing collection outcome unresolved');
       pending.result = result;
+      grant.uncertainEffects.delete('emit_member');
+      grant.syncUncertainty?.();
     }
   }
   const member = pending.result;
@@ -597,6 +685,14 @@ async function collectionEmit(grant: Grant, body: Record<string, unknown>, now: 
 
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
+  if (method === 'quiesce') {
+    if (scope !== 'role' || !exactKeys(body, []) || !grant.ready
+      || !validateSessionGrant(grant, now())) throw new Error('routing broker request refused');
+    return quiesceGrant(grant);
+  }
+  if (grant.quiescing && method !== 'heartbeat'
+    && !((method === 'emit_member' || method === 'seal_collection')
+      && collectionReceiptOnly(grant, now))) throw new Error('routing broker quiescing');
   if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit'
     && method !== 'ask' && method !== 'reject' && method !== 'emit_member'
     && method !== 'seal_collection' && method !== 'collection_target')
@@ -781,7 +877,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (grant.reservationRequest && !isDeepStrictEqual(grant.reservationRequest, request))
 	throw new Error('routing broker reservation changed');
       await verifyParentLaunch(grant, request, now, signal);
-      const response = await checked(grant, grant.hub.reserveLaunch({ workflow, request }, signal), now, true);
+      const response = await checked(grant,
+	startEffect(grant, () => grant.hub.reserveLaunch({ workflow, request }, signal)), now, true);
       const current = grant.currentIdentity();
       if (!response || response.orderId !== run || typeof response.reservationId !== 'string'
 	|| !response.reservationId || !Number.isSafeInteger(response.expiresAt) || response.expiresAt <= now()
@@ -810,7 +907,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	throw new Error('routing broker request refused');
       await verifyParentLaunch(grant, grant.reservationRequest, now, signal);
       {
-	const response = await checked(grant, grant.hub.reportLaunch({ workflow, report }, signal), now, true);
+	const response = await checked(grant,
+	  startEffect(grant, () => grant.hub.reportLaunch({ workflow, report }, signal)), now, true);
 	if (!response || response.orderId !== run || response.digest !== valueDigestHex(report)
 	  || response.provenance !== 'authenticated-worker-report'
 	  || !Number.isSafeInteger(response.recordedAt) || response.recordedAt < 0)
@@ -843,8 +941,9 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (body.reason !== undefined && (typeof body.reason !== 'string' || [...body.reason].length > 1024))
 	throw new Error('routing broker request refused');
       {
-	const response = await checked(grant, grant.hub.routingRelease({ workflow, run,
-	  ...(body.reason === undefined ? {} : { reason: body.reason }) }, signal), now);
+	const reason = body.reason as string | undefined;
+	const response = await checked(grant, startEffect(grant, () => grant.hub.routingRelease({ workflow, run,
+	  ...(reason === undefined ? {} : { reason }) }, signal)), now);
 	if (!response || typeof response.released !== 'boolean') throw new Error('routing broker response refused');
 	return response;
       }
@@ -858,8 +957,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       const current = await verifyCurrentConsequence(grant, scope, now, signal);
       if (current?.order && !current.order.owes.some(owe => owe.path === body.path))
 	throw new Error('routing current ask target changed');
-      const response = await checked(grant, grant.hub.routingAsk({ workflow, run, path: body.path,
-	question: body.question, ...(body.context === undefined ? {} : { context: body.context }) }, signal), now);
+      const path = body.path as string;
+      const question = body.question as string;
+      const context = body.context as string | undefined;
+      const response = await checked(grant, startEffect(grant, () => grant.hub.routingAsk({ workflow, run, path,
+	question, ...(context === undefined ? {} : { context }) }, signal)), now);
       if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
 	throw new Error('routing broker response refused');
       return response;
@@ -874,8 +976,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       const current = await verifyCurrentConsequence(grant, scope, now, signal);
       if (current?.order && !Object.hasOwn(current.order.consumes ?? {}, body.path))
 	throw new Error('routing current reject target changed');
-      const response = await checked(grant, grant.hub.routingReject({ workflow, run, path: body.path,
-	text: body.text, ...(body.requested === undefined ? {} : { requested: body.requested }) }, signal), now);
+      const path = body.path as string;
+      const value = body.text as string;
+      const requested = body.requested as string | undefined;
+      const response = await checked(grant, startEffect(grant, () => grant.hub.routingReject({ workflow, run, path,
+	text: value, ...(requested === undefined ? {} : { requested }) }, signal)), now);
       if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
 	throw new Error('routing broker response refused');
       return response;
@@ -891,9 +996,13 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| (body.title !== undefined && typeof body.title !== 'string'))
 	throw new Error('routing broker request refused');
       await verifyCurrentConsequence(grant, scope, now, signal);
-      const response = await checked(grant, grant.hub.routingRequestApproval({ workflow, run,
-	tool_use_id: body.tool_use_id, tool_name: body.tool_name, tool_input: body.tool_input,
-	reason: body.reason, ...(body.title === undefined ? {} : { title: body.title }) }, signal), now);
+      const toolUseId = body.tool_use_id as string;
+      const toolName = body.tool_name as string;
+      const reason = body.reason as string;
+      const title = body.title as string | undefined;
+      const response = await checked(grant, startEffect(grant, () => grant.hub.routingRequestApproval({ workflow, run,
+	tool_use_id: toolUseId, tool_name: toolName, tool_input: body.tool_input,
+	reason, ...(title === undefined ? {} : { title }) }, signal)), now);
       if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
 	throw new Error('routing broker response refused');
       return response;
@@ -937,6 +1046,8 @@ export async function createRoutingBroker(args: { now?: () => number;
   const grants = new Map<string, { grant: Grant; scope: CapScope }>();
   const terminators = new Map<Grant, (reason?: 'normal-close' | 'child-exit' | 'revoked') => Promise<void> | void>();
   const revocations = new Set<Promise<void>>();
+  const effectDrains = new Set<Promise<RoutedQuiesceResult>>();
+  const unresolvedEffects = new Set<Grant>();
   let revocationFailed = false;
   let outcomeUncertain = false;
   const now = args.now ?? Date.now;
@@ -1002,7 +1113,7 @@ export async function createRoutingBroker(args: { now?: () => number;
 	  const entry = grants.get(request.cap);
 	  if (!entry || closed) throw new Error();
 	  if (request.method === 'download_file') {
-	    if (tail.length > 0 || !entry.grant.ready || !validateSessionGrant(entry.grant, now())
+	    if (tail.length > 0 || entry.grant.quiescing || !entry.grant.ready || !validateSessionGrant(entry.grant, now())
 	      || !exactKeys(request.body, ['path', 'pointer'])
 	      || typeof request.body.path !== 'string' || !request.body.path
 	      || !request.body.pointer || typeof request.body.pointer !== 'object'
@@ -1079,6 +1190,7 @@ export async function createRoutingBroker(args: { now?: () => number;
 	  }
 	  if (request.method === 'upload_file') {
 	    if (newline > MAX_UPLOAD_HEADER || entry.scope !== 'holder'
+	      || entry.grant.quiescing
 	      || entry.grant.reservation.childKind !== 'agent-run'
 	      || !entry.grant.ready || !validateSessionGrant(entry.grant, now())
 	      || !entry.grant.allowedPaths?.size
@@ -1100,16 +1212,21 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    socket.once('close', () => clearTimeout(totalTimer));
 	    controller.signal.addEventListener('abort', () => { stream.destroy(); socket.destroy(); }, { once: true });
 	    grant.uploadControllers.add(controller);
+	    grant.uploadEffectControllers.add(controller);
 	    upload = { remaining: body.size as number, stream };
 	    const keyPrefix = `orgs/${grant.identity.orgId}/artifacts/${grant.reservation.workflow}`
 	      + `/files/routed/${encodeURIComponent(grant.reservation.run)}/`;
+	    let uploadDispatched = false;
 	    void (async () => {
 	      await verifyCurrentConsequence(grant, entry.scope, now, controller.signal);
-	      return checked(grant, grant.hub.routingPutFileArtifact({
+	      return checked(grant, startEffect(grant, () => {
+		uploadDispatched = true;
+		return grant.hub.routingPutFileArtifact({
 		workflow: grant.reservation.workflow, run: grant.reservation.run,
 		body: stream, size: body.size as number, contentType: body.contentType as string,
 		...(body.filename === undefined ? {} : { filename: body.filename as string }),
-	      }, controller.signal), now);
+		}, controller.signal);
+	      }), now);
 	    })().then(async (value: PutFileArtifactResponse) => {
 	      await verifyCurrentConsequence(grant, entry.scope, now, controller.signal);
 	      if (!value || typeof value.__file !== 'string' || !value.__file.startsWith(keyPrefix)
@@ -1120,8 +1237,15 @@ export async function createRoutingBroker(args: { now?: () => number;
 		|| value.filename !== body.filename
 		|| typeof value.text !== 'string') throw new Error('routing broker response refused');
 	      if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
-	    }).catch(refuse).finally(() => {
+	    }).catch(error => {
+	      if (uploadDispatched) {
+		grant.uncertainEffects.add('upload_file');
+		grant.syncUncertainty?.();
+	      }
+	      refuse(error);
+	    }).finally(() => {
 	      grant.uploadControllers.delete(controller);
+	      grant.uploadEffectControllers.delete(controller);
 	      stream.destroy();
 	    });
 	    feedUpload(tail);
@@ -1132,9 +1256,13 @@ export async function createRoutingBroker(args: { now?: () => number;
       'read_routed_reference_v2', 'read_routing_claim_v2', 'assess_local_model',
       'read_live_routed_reference_v2', 'read_live_routing_claim_v2',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
-	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection'];
+	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection',
+	    'quiesce'];
 	  if (!methods.includes(request.method)) throw new Error();
-	  const value = await invoke(entry.grant, entry.scope, request.method as Method, request.body, now, controller.signal);
+	  const effect = ['reserve_launch', 'report_launch', 'submit', 'release', 'ask', 'reject',
+	    'request_approval', 'emit_member', 'seal_collection'].includes(request.method);
+	  const send = () => invoke(entry.grant, entry.scope, request.method as Method, request.body, now, controller.signal);
+	  const value = await (effect ? trackEffect(entry.grant, request.method as Method, send) : send());
 	  if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
 	} catch (error) {
 	  refuse(error);
@@ -1160,10 +1288,24 @@ export async function createRoutingBroker(args: { now?: () => number;
     issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, routedLiveV2Read,
       submissionAuthority, launchAuthority, inputAuthority }) {
       if (closed) throw new Error('routing broker closed');
-      const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
+      const grant: Grant = { active: true, ready: false, quiescing: false,
+	inFlightEffects: new Set(), uncertainEffects: new Set(), uploadControllers: new Set(),
+	uploadEffectControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
 	identity: { ...identity }, currentIdentity, hub, routedV2Read, routedLiveV2Read,
 	submissionAuthority, launchAuthority, inputAuthority };
+      grant.syncUncertainty = () => {
+	if (grant.uncertainEffects.size) unresolvedEffects.add(grant);
+	else unresolvedEffects.delete(grant);
+      };
+      grant.observeQuiesce = pending => {
+	effectDrains.add(pending);
+	void pending.then(() => { effectDrains.delete(pending); }, () => {
+	  grant.uncertainEffects.add('upload_file');
+	  grant.syncUncertainty?.();
+	  effectDrains.delete(pending);
+	});
+      };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;
@@ -1174,6 +1316,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       let settleTombstone: ((error?: Error) => void) | undefined;
       let tombstoneWait: Promise<void> | undefined;
       const terminate = (requested: 'normal-close' | 'child-exit' | 'revoked' = 'revoked'): Promise<void> | void => {
+	void quiesceGrant(grant);
 	if (grant.liveChild) grant.liveChild.terminal = true;
 	const frozen = !!(grant.collectionMember?.emit || grant.collectionSeal?.request);
 	const reason = requested === 'child-exit'
@@ -1220,6 +1363,8 @@ export async function createRoutingBroker(args: { now?: () => number;
 		const result = await collectionReconcile(grant, kind, now, AbortSignal.timeout(10_000));
 		if (kind === 'member' && grant.collectionMember) grant.collectionMember.result = result;
 		if (kind === 'seal' && grant.collectionSeal) grant.collectionSeal.result = result;
+		grant.uncertainEffects.delete(kind === 'member' ? 'emit_member' : 'seal_collection');
+		grant.syncUncertainty?.();
 		delay = 100;
 	      } catch (error) {
 		if (error instanceof HubError && error.status === 429 && error.retryAfterMs)
@@ -1299,15 +1444,17 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    && record.workflow === reservation.workflow && record.run === reservation.run
 	    && record.gateToken === reservation.token && record.pid === child.pid
 	    && record.spawnedAt === child.spawnedAt && retainedChildLive(child.custody, child.pid);
-      }, terminal: terminate };
+      }, quiesce: () => quiesceGrant(grant), terminal: terminate };
     },
     async revokeSession(sessionId) {
       const affected = [...terminators.entries()].filter(([grant]) => grant.identity.sessionId === sessionId);
       const pending = affected.map(([, terminate]) => terminate('revoked')).filter(
 	(value): value is Promise<void> => value !== undefined);
-      const results = await Promise.allSettled([...pending, ...revocations]);
-      if (outcomeUncertain || revocationFailed || results.some(result => result.status === 'rejected'))
-	throw new Error('routing collection outcome quarantined');
+      const results = await Promise.allSettled([...pending, ...revocations, ...effectDrains]);
+      if (outcomeUncertain || revocationFailed
+	|| [...unresolvedEffects].some(grant => grant.identity.sessionId === sessionId)
+	|| results.some(result => result.status === 'rejected'))
+	throw new Error('routing effect outcome quarantined');
     },
     close(options = {}) {
       if (closePromise) return closePromise;
@@ -1330,6 +1477,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       const drained = await Promise.allSettled([
 	...pending.filter((value): value is Promise<void> => value !== undefined),
 	...revocations,
+	...effectDrains,
 	...receiptChecks,
       ]);
       for (const entry of grants.values()) {
@@ -1344,9 +1492,9 @@ export async function createRoutingBroker(args: { now?: () => number;
 	if (current.dev === inode.dev && current.ino === inode.ino) unlinkSync(socketPath);
       } catch { /* Replaced or already removed. */ }
       try { rmdirSync(directory); } catch { /* Preserve substituted/nonempty directory. */ }
-      if (outcomeUncertain || revocationFailed
+      if (outcomeUncertain || revocationFailed || unresolvedEffects.size > 0
 	|| drained.some(result => result.status === 'rejected'))
-	throw new Error('routing collection outcome quarantined');
+	throw new Error('routing effect outcome quarantined');
       })();
       return closePromise;
     },
