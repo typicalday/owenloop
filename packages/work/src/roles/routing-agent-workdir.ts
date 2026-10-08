@@ -33,12 +33,12 @@ export function assertRoutedAgentWorkdirDisjoint(workdir: string, privateBase: s
   } catch { throw refused(); }
 }
 
-export function prepareRoutedAgentWorkdir(args: {
+export function planRoutedAgentWorkdir(args: {
   workRoot: string | undefined; workRepo?: string;
   workflow: string; run: string; definitionStagePath: string;
   originalEnv: Record<string, string | undefined>;
   cwd?: string; err?: (line: string) => void;
-}): { cwd: string; allowedWorkdirRoots: string[] } {
+}): { cwd: string; allowedWorkdirRoots: string[]; materialize(): string } {
   const { workRoot, workRepo } = args;
   if (!workRoot || !isAbsolute(workRoot) || resolve(workRoot) !== workRoot
     || (workRepo !== undefined && (!isAbsolute(workRepo) || resolve(workRepo) !== workRepo)))
@@ -51,8 +51,13 @@ export function prepareRoutedAgentWorkdir(args: {
   // environment is replaced with the public stage HOME/config.
   const allowedWorkdirRoots = resolveAllowedWorkdirRoots(args.originalEnv, undefined,
     args.cwd ?? process.cwd());
-  const cwd = ensureWorkDir({ workRoot, workflow: args.workflow, run: args.run,
-    ...(workRepo ? { workRepo } : {}), ...(args.err ? { err: args.err } : {}) });
-  assertRoutedAgentWorkdirDisjoint(cwd, privateBase);
-  return { cwd, allowedWorkdirRoots };
+  return { cwd: planned, allowedWorkdirRoots, materialize() {
+    // Only the one-use post-report path may invoke git worktree add: it can run
+    // repository hooks. Recheck custody immediately before and after creation.
+    assertRoutedAgentWorkdirDisjoint(planned, privateBase);
+    const cwd = ensureWorkDir({ workRoot, workflow: args.workflow, run: args.run,
+      ...(workRepo ? { workRepo } : {}), ...(args.err ? { err: args.err } : {}) });
+    assertRoutedAgentWorkdirDisjoint(cwd, privateBase);
+    return cwd;
+  } };
 }

@@ -126,7 +126,9 @@ test('complete routed role preflight opens public stage, then retains the launch
   const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-stage-role-'));
   const now = Date.now();
   try {
-    const session = await openShiftRoutingSession({ stateDir: root, origin, orgId: 'org', principalId: 'actor',
+    const workRoot = join(root, 'work');
+    const session = await openShiftRoutingSession({ stateDir: root, workRoot,
+      origin, orgId: 'org', principalId: 'actor',
       scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
       fetchImpl: (async url => String(url).endsWith('/routing_session_open')
 	? Response.json({ sessionId, shiftId: 'shf_service', credential, expiresAt: now + 900_000 })
@@ -160,6 +162,7 @@ test('complete routed role preflight opens public stage, then retains the launch
       assert.equal(status, 1);
       assert.match(errors.at(-1)!, /routed launch fence unavailable/);
       assert.equal(existsSync(handoff.path), false);
+      if (kind === 'agent-run') assert.equal(existsSync(join(workRoot, 'wf', 'agent')), false);
       handoff.terminal();
       stage.cleanup();
     }

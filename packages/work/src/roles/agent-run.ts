@@ -96,6 +96,7 @@ import { createHubClient, type HubClient } from '../hub/client.ts';
 import { consumeRoutingHandoff } from './routing-handoff.ts';
 import { createRoutingRoleClient } from './routing-role-client.ts';
 import { openRoutingRoleStage } from './routing-role-stage.ts';
+import { planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { effectiveRosterLayers, mergeRosterLayers, type MergedRoster } from '../settings/roster.ts';
@@ -329,6 +330,14 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       if (!handoff) throw new Error('missing routing handoff');
       createRoutingRoleClient(handoff);
       openRoutingRoleStage(handoff);
+      // Validate the Shift-pinned fallback and machine roots without creating
+      // a directory: git worktree provisioning can run repository hooks and
+      // belongs after accepted launch report plus a final broker order read.
+      planRoutedAgentWorkdir({ workRoot: handoff.workRoot,
+	...(handoff.workRepo ? { workRepo: handoff.workRepo } : {}),
+	workflow: target.workflow, run: target.run,
+	definitionStagePath: handoff.definitionStage!.path, originalEnv: env,
+	...(deps.cwd ? { cwd: deps.cwd } : {}) });
     } catch {
       err('owenloop work agent-run: routing handoff refused');
       return 1;
