@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { PassThrough, Readable } from 'node:stream';
 import type { RoutedClaimV2, RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import type { RecordedClaimV2, RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
   type LaunchReportV1, type LaunchReportResponse, type LaunchReservationRequestV1,
@@ -24,6 +25,7 @@ const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_DOWNLOAD_HEADER = 4096;
 type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
+  | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject'
   | 'request_approval' | 'read_invocation_binding';
 type CollectionVerb = Verb | 'collection_target' | 'emit_member' | 'seal_collection';
@@ -36,6 +38,8 @@ export interface RoutingChildClient {
   readRoutingClaim(req: { workflow: string; run: string }): Promise<RoutingClaimReadResponse>;
   readRoutedReferenceV2(req: { workflow: string; run: string }): Promise<RoutedReferenceV2>;
   readRoutingClaimV2(req: { workflow: string; run: string }): Promise<RoutedClaimV2>;
+  readLiveRoutedReferenceV2(req: { workflow: string; run: string }): Promise<RecordedReferenceV2>;
+  readLiveRoutingClaimV2(req: { workflow: string; run: string }): Promise<RecordedClaimV2>;
   assessLocalModel(req: LocalModelRequest): Promise<LocalModelResponse>;
   reserveLaunch(req: { workflow: string; request: LaunchReservationRequestV1 }): Promise<LaunchReservationResponse>;
   reportLaunch(req: { workflow: string; report: LaunchReportV1 }): Promise<LaunchReportResponse>;
@@ -313,6 +317,8 @@ export function createRoutingChildClient(handoff: {
     readRoutingClaim(req) { bound(req); return exchange('read_routing_claim', {}); },
     readRoutedReferenceV2(req) { bound(req); return exchange('read_routed_reference_v2', {}, 5_000); },
     readRoutingClaimV2(req) { bound(req); return exchange('read_routing_claim_v2', {}, 5_000); },
+    readLiveRoutedReferenceV2(req) { bound(req); return exchange('read_live_routed_reference_v2', {}, 5_000); },
+    readLiveRoutingClaimV2(req) { bound(req); return exchange('read_live_routing_claim_v2', {}, 5_000); },
     assessLocalModel(req) { bound(req); return exchange('assess_local_model', { candidateIds: req.candidateIds }); },
     reserveLaunch(req) {
       if (req.workflow !== workflow || req.request.orderId !== run

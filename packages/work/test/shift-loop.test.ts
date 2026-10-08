@@ -4741,6 +4741,22 @@ test('routed staging that finishes after session stop cannot reserve or spawn', 
   loop.stop();
 });
 
+test('a routed child without a broker grant cannot receive gate-entry allow', async () => {
+  const f = await routedLoopFixture();
+  const loop = createShiftLoop(f.options);
+  try {
+    assert.equal(await loop.iterate(), 1);
+    const spec = f.spawns[0]!;
+    assert.ok(spec.routingHandoff && spec.dispatchToken && spec.onGateEntered);
+    assert.throws(() => spec.onGateEntered!({ dispatchToken: spec.dispatchToken!,
+      routingHandoff: spec.routingHandoff!, pid: 9001 }), /generation changed/);
+    spec.onTerminal?.('exit');
+    loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'exec', pid: 9001,
+      routingHandoff: spec.routingHandoff, dispatchToken: spec.dispatchToken,
+      exitStatus: 0, signal: null });
+  } finally { loop.stop(); await f.session.stop(); }
+});
+
 test('routed terminal and Shift stop revoke access but retain post-gate stage after clean role exit', async () => {
   const f = await routedLoopFixture();
   let stagePath = '';

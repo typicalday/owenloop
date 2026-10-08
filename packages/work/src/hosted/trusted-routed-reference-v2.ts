@@ -190,13 +190,18 @@ function postHttps(url: URL, token: string, session: string, body: string, remai
 
 /** Production callers have no fetch override. The original session credential
  * remains in Shift and never enters a child request body or broker result. */
-export function createTrustedRoutedReferenceV2Reader(options: {
+export interface RoutedV2TransportOptions {
   origin: string; getToken: () => Promise<string>; getSession: () => Promise<string>;
   expected: { workflow: string; run: string }; trustedCa?: string | Buffer;
   now?: () => number;
   beforeRequest?: () => void;
   onRateLimit?: (error: HubError) => void;
-}): RoutedReferenceV2Reader {
+}
+
+/** Shared original-session transport for separate prestart and recorded reads. */
+export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
+  now: () => number; request: (path: string, started: number) => Promise<unknown>;
+} {
   const origin = new URL(options.origin);
   if (origin.protocol !== 'https:' || origin.origin !== options.origin || !id(options.expected.workflow)
     || !id(options.expected.run)) throw new Error('routed v2 requires exact HTTPS origin and bound order');
@@ -233,6 +238,11 @@ export function createTrustedRoutedReferenceV2Reader(options: {
       throw new Error('routed v2 transport refused');
     return JSON.parse(response.body) as unknown;
   };
+  return { now, request };
+}
+
+export function createTrustedRoutedReferenceV2Reader(options: RoutedV2TransportOptions): RoutedReferenceV2Reader {
+  const { now, request } = createRoutedV2Requester(options);
   const readReference = async (started = now()) => parseRoutedReferenceV2(
     await request('/api/routing_reference_order/v2', started), options.expected);
   const readClaim = async (started = now()) => parseRoutedClaimV2(

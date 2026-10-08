@@ -96,7 +96,7 @@ import { withHubCallTimeout } from '../hub/deadline.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import { checkHost, type HostFault } from './host-preflight.ts';
 import { formatBytes, type DiskSpace } from './disk-floor.ts';
-import type { Spawner, WorkerFailure } from './spawn.ts';
+import type { RetainedChildCustody, Spawner, WorkerFailure } from './spawn.ts';
 import {
   stampShiftEvent,
   type OrderDroppedEvent,
@@ -417,6 +417,7 @@ export interface ShiftLoop {
     kind: 'exec' | 'agent-run';
     pid: number;
     routingHandoff?: string;
+    dispatchToken?: string;
     exitStatus?: number | null;
     signal?: NodeJS.Signals | null;
   }): void;
@@ -1319,7 +1320,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   const routingAttempts = new Map<string, number>();
   const routingRefusals = new Map<string, number>();
   const routingHandoffs = new Map<string, { handoff: RoutingHandoff; stage?: RoutedDefinitionStage;
-    pid?: number; spawnedAt?: number; gateMayHaveOpened?: boolean; normalClosed?: boolean }>();
+    pid?: number; spawnedAt?: number; custody?: RetainedChildCustody; dispatchToken: string;
+    gateMayHaveOpened?: boolean; normalClosed?: boolean }>();
   const knownRole = (role: string) => ['research', 'implementation', 'review', 'judge'].includes(role);
   const localModelProtocol = 'local-model-assessment-v1' as const;
 
@@ -1541,6 +1543,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let definitionStage: RoutedDefinitionStage | undefined;
     let terminalBeforeStart = false;
     let cancel: (() => void) | undefined;
+    let gateRecord: ChildRecord | undefined;
     try {
       if (opts.routingSession) {
 	if (!opts.stageRoutedDefinition) throw new Error('routed definition staging unavailable');
@@ -1583,7 +1586,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	const privateHandoff = opts.routingSession.createHandoff(reservation,
 	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap,
 	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) }, definitionStage);
-	handoff = { path: privateHandoff.path, terminal: (reason) => {
+	handoff = { path: privateHandoff.path, incarnation: privateHandoff.incarnation,
+	  nonce: privateHandoff.nonce, terminal: (reason) => {
 	  const drained = brokerGrant?.terminal(reason);
 	  if (drained) {
 	    void drained.then(() => privateHandoff.terminal(), () => {
@@ -1591,7 +1595,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    });
 	  } else privateHandoff.terminal();
 	} };
-	routingHandoffs.set(c.order.run, { handoff, ...(definitionStage ? { stage: definitionStage } : {}) });
+	routingHandoffs.set(c.order.run, { handoff, dispatchToken: reservation.token,
+	  ...(definitionStage ? { stage: definitionStage } : {}) });
       }
       const terminal = (reason?: 'exit' | 'start-failure' | 'cancel') => {
 	terminalBeforeStart = true;
@@ -1608,7 +1613,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	...(childKind === 'agent-run' ? { shiftName } : {}),
 	...(childKind === 'agent-run' && opts.shiftOwner !== undefined ? { shiftOwner: opts.shiftOwner } : {}),
 	startGate: reserved.gatePath,
-	...(handoff ? { routingHandoff: handoff.path, routingShiftId: opts.routingSession!.identity()!.shiftId, onTerminal: terminal } : {}),
+	...(handoff ? { routingHandoff: handoff.path, dispatchToken: reservation.token,
+	  routingShiftId: opts.routingSession!.identity()!.shiftId, onTerminal: terminal,
+	  onGateEntered: (entry: { dispatchToken: string; routingHandoff: string; pid: number }) => {
+	    if (terminalBeforeStart || !gateRecord || !brokerGrant || !spawned.custody
+	      || entry.dispatchToken !== reservation!.token
+	      || entry.routingHandoff !== handoff!.path || entry.pid !== gateRecord.pid)
+	      throw new Error('routing child generation changed');
+	    brokerGrant.markChildEntered(gateRecord);
+	  }, canAllowGateEntry: () => !!gateRecord && brokerGrant?.canAllowEntry(gateRecord) === true } : {}),
       });
       cancel = spawned.cancel ?? spawned.terminate;
       if (terminalBeforeStart) throw new Error('routing worker terminated before start');
@@ -1620,6 +1633,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (ownedBeforeGate && ownedBeforeGate.handoff === handoff) {
 	ownedBeforeGate.pid = spawned.pid;
 	ownedBeforeGate.spawnedAt = spawnedAt;
+	ownedBeforeGate.custody = spawned.custody;
       }
       const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
       let rec: ChildRecord;
@@ -1632,12 +1646,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  ...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
 	  ...(childKind === 'agent-run' ? { step: c.order.step } : {}),
 	});
+	gateRecord = rec;
 	brokerGrant?.activate(rec);
+	if (spawned.custody && handoff?.incarnation && handoff.nonce)
+	  brokerGrant?.bindChild(rec, spawned.custody,
+	    { incarnation: handoff.incarnation, nonce: handoff.nonce });
 	if (terminalBeforeStart) throw new Error('routing worker terminated before gate');
 	definitionStage?.markGateMayOpen({ workflow: c.workflow, run: c.order.run,
 	  pid: rec.pid, spawnedAt: rec.spawnedAt });
 	if (ownedBeforeGate && ownedBeforeGate.handoff === handoff) ownedBeforeGate.gateMayHaveOpened = true;
-	startReservedChild(opts.stateDir, rec);
+	if (opts.routingSession && !startReservedChild(opts.stateDir, rec))
+	  throw new Error('routing child start gate unavailable');
+	else if (!opts.routingSession) startReservedChild(opts.stateDir, rec);
+	if (spawned.custody && handoff?.incarnation && handoff.nonce)
+	  brokerGrant?.markGateSignalled(rec);
+	if (handoff && spawned.custody) spawned.armGateEntry?.();
 	const owned = routingHandoffs.get(c.order.run);
 	if (owned) { owned.pid = rec.pid; owned.spawnedAt = rec.spawnedAt; }
       } finally {
@@ -2624,11 +2647,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	removeRecordUnderDispatchLock(run);
     },
     noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number;
-      routingHandoff?: string; exitStatus?: number | null; signal?: NodeJS.Signals | null }) => {
+      routingHandoff?: string; dispatchToken?: string;
+      exitStatus?: number | null; signal?: NodeJS.Signals | null }) => {
       const owned = routingHandoffs.get(exit.run);
       // A late old exit can reuse the same PID after a new dispatch. Its
       // per-dispatch handoff path must match before touching stage or slot.
-      if (owned && owned.handoff.path !== exit.routingHandoff) return;
+      if (owned && (owned.handoff.path !== exit.routingHandoff
+	|| (owned.custody && owned.dispatchToken !== exit.dispatchToken))) return;
       pendingCandidates.delete(exit.run);
       if (owned?.pid === exit.pid && owned.handoff.path === exit.routingHandoff) {
 	try { owned.handoff.terminal(owned.normalClosed ? 'normal-close' : 'child-exit'); }

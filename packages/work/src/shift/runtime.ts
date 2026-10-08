@@ -17,6 +17,8 @@ import { HubError, type RoutingScope, type RoutingSessionOpenResponse, type Rout
 import { resolveBearer } from '../credentials/resolve.ts';
 import { createTrustedRoutedReferenceV2Reader, type RoutedClaimV2,
   type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import { createRecordedRoutedV2Reader, type RecordedClaimV2,
+  type RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, readHubRosterCache, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
@@ -987,6 +989,9 @@ export interface RoutingHandoffV1 {
 }
 export interface RoutingHandoff {
   path: string;
+  /** Parent-owned generation of the exact one-use handoff file. */
+  incarnation?: string;
+  nonce?: string;
   /** Exact reservation/incarnation owner callback; safe after child consumption. */
   terminal(reason?: 'normal-close' | 'child-exit' | 'revoked'): void;
 }
@@ -997,7 +1002,9 @@ export interface ShiftRoutingSession {
   brokerTarget(): { hub: RoutingHubClient; identity: NonNullable<ReturnType<ShiftRoutingSession['identity']>>;
     currentIdentity: ShiftRoutingSession['identity'];
     routedV2Read: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
-      Promise<RoutedReferenceV2 | RoutedClaimV2> } | undefined;
+      Promise<RoutedReferenceV2 | RoutedClaimV2>;
+    routedLiveV2Read: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
+      Promise<RecordedReferenceV2 | RecordedClaimV2> } | undefined;
   createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string;
     holder?: { socketPath: string; cap: string } }, definitionStage?: RoutedDefinitionStage): RoutingHandoff;
   maintain(): Promise<void>;
@@ -1158,7 +1165,8 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       const incarnation = active;
       const identity = incarnation.identity();
       return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity,
-	routedV2Read: incarnation.readRoutedV2 } : undefined;
+	routedV2Read: incarnation.readRoutedV2,
+	routedLiveV2Read: incarnation.readRecordedV2 } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: (reservation, broker, definitionStage) => {
@@ -1252,6 +1260,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 }): Promise<
   Omit<ShiftRoutingSession, 'brokerTarget' | 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & {
     readRoutedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2Read'];
+    readRecordedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedLiveV2Read'];
     stop(): Promise<HubError | undefined>;
   }
 > {
@@ -1354,6 +1363,20 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	} });
       return kind === 'reference' ? reader.readReference() : reader.readClaim();
     },
+    async readRecordedV2(kind, expected) {
+      if (renewalDenied || !authority || now() >= authority.expiresAt)
+	throw new Error('routed recorded session unavailable');
+      const sessionId = authority.sessionId, shiftId = authority.shiftId;
+      const reader = createRecordedRoutedV2Reader({ origin: opts.origin,
+	getToken: opts.getToken, expected, beforeRequest: opts.beforeRequest,
+	onRateLimit: opts.onRateLimit,
+	getSession: async () => {
+	  if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+	    || now() >= authority.expiresAt) throw new Error('routed recorded session changed');
+	  return authority.credential;
+	} });
+      return kind === 'reference' ? reader.readReference() : reader.readClaim();
+    },
     createHandoff(reservation, broker, definitionStage) {
       if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
 	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token
@@ -1390,7 +1413,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	throw new Error('routing handoff creation failed');
       } finally { if (fd !== undefined) closeSync(fd); }
       let terminal = false;
-      const handoff: RoutingHandoff = { path, terminal: () => {
+      const handoff: RoutingHandoff = { path, incarnation, nonce, terminal: () => {
 	if (terminal) return;
 	terminal = true;
 	try {

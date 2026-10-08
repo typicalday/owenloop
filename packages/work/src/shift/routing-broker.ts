@@ -12,13 +12,18 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingHubClient } from '../hub/client.ts';
 import { parseRoutedClaimV2, parseRoutedReferenceV2,
-  type RoutedClaimV2, type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
+  type RoutedClaimV2, type RoutedReferenceV2,
+  type RoutedReferenceBindingV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import { parseRecordedClaimV2, parseRecordedReferenceV2,
+  type RecordedClaimV2, type RecordedReferenceV2,
+  type RecordedBindingV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { HubError, type ContactHolder, type FileArtifactPointer, type GetOrderResponse, type LaunchReportV1,
   type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse,
   type RoutedCollectionHolder, type RoutedMemberIssueRequest, type RoutedMemberIssueResponse,
   type RoutedMemberEmitRequest, type RoutedCollectionSealRequest,
   type RoutedCollectionWriteResponse } from '../hub/types.ts';
 import type { ChildRecord, ChildReservation } from './state.ts';
+import { retainedChildLive, type RetainedChildCustody } from './spawn.ts';
 import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
 import { outputVersionForSubmission } from '../submit-proof.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
@@ -38,12 +43,15 @@ const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
+  | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
   | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection';
 type CapScope = 'role' | 'holder';
 interface Grant {
   active: boolean;
   ready: boolean;
+  liveChild?: { custody: RetainedChildCustody; pid: number; spawnedAt: number;
+    incarnation: string; nonce: string; gateSignalled: boolean; entered: boolean; terminal: boolean };
   execHolderId?: string;
   allowedPaths?: Set<string>;
   consumedPaths?: Set<string>;
@@ -56,6 +64,10 @@ interface Grant {
   hub: RoutingHubClient;
   routedV2Read?: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
     Promise<RoutedReferenceV2 | RoutedClaimV2>;
+  routedLiveV2Read?: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
+    Promise<RecordedReferenceV2 | RecordedClaimV2>;
+  referenceOrderDigest?: string;
+  referenceBinding?: RoutedReferenceBindingV2;
   reservationRequest?: LaunchReservationRequestV1;
   launchReservationId?: string;
   launchExpiresAt?: number;
@@ -82,15 +94,42 @@ export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
     currentIdentity: () => Identity | undefined; hub: RoutingHubClient;
     routedV2Read?: Grant['routedV2Read'];
+    routedLiveV2Read?: Grant['routedLiveV2Read'];
     submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
       activate(record: ChildRecord): void;
+      bindChild(record: ChildRecord, custody: RetainedChildCustody,
+	handoff: { incarnation: string; nonce: string }): void;
+      markGateSignalled(record: ChildRecord): void;
+      markChildEntered(record: ChildRecord): void;
+      canAllowEntry(record: ChildRecord): boolean;
       terminal(reason?: 'normal-close' | 'child-exit' | 'revoked'): Promise<void> | void;
     };
   close(options?: { revokeNormalReceipts?: boolean }): Promise<void>;
   /** Extinguish one incarnation locally before awaiting its Service revocation. */
   revokeSession(sessionId: string): Promise<void>;
   socketPath: string;
+}
+
+function liveChildValid(grant: Grant, now: number): boolean {
+  const child = grant.liveChild;
+  return !!child && child.gateSignalled && child.entered && !child.terminal
+    && retainedChildLive(child.custody, child.pid) && grant.ready && validateSessionGrant(grant, now);
+}
+
+function recordedBindingMatches(grant: Grant, binding: RecordedBindingV2): boolean {
+  const claim = grant.routing.claim;
+  const { recordedOccurrence, ...initial } = binding;
+  return binding.rootWorkflow === grant.reservation.workflow && binding.run === grant.reservation.run
+    && binding.frameWorkflow === claim.binding.frameId
+    && binding.claimId === claim.claimId && binding.decisionId === claim.decisionId
+    && binding.sessionId === grant.identity.sessionId && binding.shiftId === grant.identity.shiftId
+    && !!grant.referenceBinding && isDeepStrictEqual(initial, grant.referenceBinding)
+    && binding.orderDigest === grant.referenceOrderDigest
+    && binding.routingDigest === valueDigestHex(grant.routing)
+    && recordedOccurrence.reservationId === grant.launchReservationId
+    && recordedOccurrence.reportDigest === grant.acceptedLaunchReport
+    && recordedOccurrence.attemptId === claim.attemptId;
 }
 
 function exactKeys(value: unknown, keys: string[]): value is Record<string, unknown> {
@@ -551,7 +590,51 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       const kind = method === 'read_routed_reference_v2' ? 'reference' : 'claim';
       const expected = { workflow, run };
       const result = await checked(grant, grant.routedV2Read(kind, expected), now, true);
-      return kind === 'reference' ? parseRoutedReferenceV2(result, expected) : parseRoutedClaimV2(result, expected);
+      if (kind === 'reference') {
+	const parsed = parseRoutedReferenceV2(result, expected);
+	if (parsed.state === 'available') {
+	  if (parsed.binding.sessionId !== grant.identity.sessionId
+	    || parsed.binding.shiftId !== grant.identity.shiftId
+	    || parsed.binding.claimId !== grant.routing.claim.claimId
+	    || parsed.binding.decisionId !== grant.routing.claim.decisionId
+	    || parsed.binding.routingDigest !== valueDigestHex(grant.routing)
+	    || (grant.referenceOrderDigest && grant.referenceOrderDigest !== parsed.binding.orderDigest))
+	    throw new Error('routing broker reference changed');
+	  if (grant.referenceBinding && !isDeepStrictEqual(grant.referenceBinding, parsed.binding))
+	    throw new Error('routing broker reference changed');
+	  grant.referenceOrderDigest = parsed.binding.orderDigest;
+	  grant.referenceBinding = structuredClone(parsed.binding);
+	}
+	return parsed;
+      }
+      return parseRoutedClaimV2(result, expected);
+    }
+    case 'read_live_routed_reference_v2':
+    case 'read_live_routing_claim_v2': {
+      if (scope !== 'role' || !exactKeys(body, []) || !grant.routedLiveV2Read
+	|| !grant.referenceOrderDigest || !grant.launchReservationId || !grant.acceptedLaunchReport
+	|| !liveChildValid(grant, now())) throw new Error('routing broker live read refused');
+      const kind = method === 'read_live_routed_reference_v2' ? 'reference' : 'claim';
+      const expected = { workflow, run };
+      let result: RecordedReferenceV2 | RecordedClaimV2;
+      try { result = await grant.routedLiveV2Read(kind, expected); }
+      catch (error) {
+	if (!liveChildValid(grant, now())) throw new Error('routing broker live read revoked');
+	throw error;
+      }
+      if (!liveChildValid(grant, now())) throw new Error('routing broker live read revoked');
+      if (kind === 'reference') {
+	const parsed = parseRecordedReferenceV2(result, expected);
+	if (parsed.state === 'available' && !recordedBindingMatches(grant, parsed.binding))
+	  throw new Error('routing broker recorded occurrence changed');
+	if (!liveChildValid(grant, now())) throw new Error('routing broker live read revoked');
+	return parsed;
+      }
+      const parsed = parseRecordedClaimV2(result, expected);
+      if (parsed.state === 'available' && !recordedBindingMatches(grant, parsed.binding))
+	throw new Error('routing broker recorded occurrence changed');
+      if (!liveChildValid(grant, now())) throw new Error('routing broker live read revoked');
+      return parsed;
     }
     case 'assess_local_model':
       if (!exactKeys(body, ['candidateIds']) || !orderedCandidates(grant, body.candidateIds)
@@ -907,6 +990,7 @@ export async function createRoutingBroker(args: { now?: () => number;
 	  if (tail.length > 0) throw new Error();
   const methods: readonly string[] = ['get_order', 'get_launch_order', 'read_routing_claim',
       'read_routed_reference_v2', 'read_routing_claim_v2', 'assess_local_model',
+      'read_live_routed_reference_v2', 'read_live_routing_claim_v2',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection'];
 	  if (!methods.includes(request.method)) throw new Error();
@@ -933,11 +1017,13 @@ export async function createRoutingBroker(args: { now?: () => number;
   const inode: Stats = lstatSync(socketPath);
   return {
     socketPath,
-    issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, submissionAuthority, launchAuthority }) {
+    issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, routedLiveV2Read,
+      submissionAuthority, launchAuthority }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
-	identity: { ...identity }, currentIdentity, hub, routedV2Read, submissionAuthority, launchAuthority };
+	identity: { ...identity }, currentIdentity, hub, routedV2Read, routedLiveV2Read,
+	submissionAuthority, launchAuthority };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;
@@ -948,6 +1034,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       let settleTombstone: ((error?: Error) => void) | undefined;
       let tombstoneWait: Promise<void> | undefined;
       const terminate = (requested: 'normal-close' | 'child-exit' | 'revoked' = 'revoked'): Promise<void> | void => {
+	if (grant.liveChild) grant.liveChild.terminal = true;
 	const frozen = !!(grant.collectionMember?.emit || grant.collectionSeal?.request);
 	const reason = requested === 'child-exit'
 	  ? frozen ? 'receipt-pending' : 'revoked' : requested;
@@ -1037,6 +1124,41 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    || !Number.isSafeInteger(record.spawnedAt)) throw new Error('routing broker grant unavailable');
 	  grant.execHolderId = `${hostname()}:${record.pid}`;
 	  grant.ready = true;
+      }, bindChild(record, custody, handoff) {
+	  if (!grant.ready || grant.liveChild || !validateLaunchGrant(grant, now())
+	    || record.workflow !== reservation.workflow || record.run !== reservation.run
+	    || record.gateToken !== reservation.token || record.pid !== custody.pid
+	    || !retainedChildLive(custody, record.pid)
+	    || !/^inc_[a-f0-9]{32}$/.test(handoff.incarnation)
+	    || !/^[a-f0-9]{32}$/.test(handoff.nonce))
+	    throw new Error('routing broker child custody unavailable');
+	  grant.liveChild = { custody, pid: record.pid, spawnedAt: record.spawnedAt,
+	    incarnation: handoff.incarnation, nonce: handoff.nonce,
+	    gateSignalled: false, entered: false, terminal: false };
+      }, markGateSignalled(record) {
+	  const child = grant.liveChild;
+	  if (!child || child.terminal || child.gateSignalled || !grant.ready
+	    || record.workflow !== reservation.workflow || record.run !== reservation.run
+	    || record.gateToken !== reservation.token || record.pid !== child.pid
+	    || record.spawnedAt !== child.spawnedAt || !retainedChildLive(child.custody, child.pid))
+	    throw new Error('routing broker child gate unavailable');
+	  child.gateSignalled = true;
+      }, markChildEntered(record) {
+	  const child = grant.liveChild;
+	  if (!child || child.terminal || child.entered || !child.gateSignalled || !grant.ready
+	    || !validateLaunchGrant(grant, now()) || record.workflow !== reservation.workflow
+	    || record.run !== reservation.run || record.gateToken !== reservation.token
+	    || record.pid !== child.pid || record.spawnedAt !== child.spawnedAt
+	    || !retainedChildLive(child.custody, child.pid))
+	    throw new Error('routing broker child entry unavailable');
+	  child.entered = true;
+      }, canAllowEntry(record) {
+	  const child = grant.liveChild;
+	  return !!child && child.entered && !child.terminal && grant.ready
+	    && validateLaunchGrant(grant, now())
+	    && record.workflow === reservation.workflow && record.run === reservation.run
+	    && record.gateToken === reservation.token && record.pid === child.pid
+	    && record.spawnedAt === child.spawnedAt && retainedChildLive(child.custody, child.pid);
       }, terminal: terminate };
     },
     async revokeSession(sessionId) {
