@@ -47,7 +47,7 @@ import { basename, extname } from 'node:path';
 
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket, PutFileArtifactResponse } from '../hub/types.ts';
+import type { ContactHolder, FileArtifactPointer, GetOrderResponse, OrderPacket, PutFileArtifactResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -58,7 +58,33 @@ import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
-export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number];
+export const ROUTED_FILE_TOOL_NAME = 'get_file_artifact' as const;
+export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number] | typeof ROUTED_FILE_TOOL_NAME;
+
+function consumedFile(order: OrderPacket, path: string, key: string): FileArtifactPointer | undefined {
+  if (!order.inputs.includes(path) || !Object.hasOwn(order.consumes, path)) return undefined;
+  let found: FileArtifactPointer | undefined;
+  let conflicting = false;
+  const walk = (value: unknown, depth: number): void => {
+    if (depth > 32 || !value || typeof value !== 'object') return;
+    const row = value as Record<string, unknown>;
+    if (Object.hasOwn(row, '__file')) {
+      if (row.__file !== key) return;
+      if (typeof row.hash !== 'string' || !/^[a-f0-9]{64}$/.test(row.hash)
+        || typeof row.size !== 'number' || !Number.isSafeInteger(row.size)
+        || row.size < 1 || row.size > 500_000_000
+        || typeof row.contentType !== 'string' || !row.contentType) return;
+      const pointer = row as unknown as FileArtifactPointer;
+      if (found && JSON.stringify(found) !== JSON.stringify(pointer)) conflicting = true;
+      else found = pointer;
+      return;
+    }
+    if (Array.isArray(value)) for (const item of value) walk(item, depth + 1);
+    else for (const item of Object.values(row)) walk(item, depth + 1);
+  };
+  walk(order.consumes[path], 0);
+  return conflicting ? undefined : found;
+}
 
 export interface HoldMcpDeps {
   hub: HubClient;
@@ -69,6 +95,12 @@ export interface HoldMcpDeps {
   /** Routed holder streams a contained local file without materializing all bytes. */
   uploadFile?: (req: { workflow: string; workdir: string; file: string; contentType: string;
     filename?: string }) => Promise<PutFileArtifactResponse>;
+  /** Routed only: a file must be pinned in this run's gated consumed values. */
+  downloadFile?: (req: { workflow: string; run: string; path: string; pointer: FileArtifactPointer },
+    signal?: AbortSignal) => Promise<{ file: string; size: number; contentType: string }>;
+  discardDownloadedFile?: (file: string) => Promise<void>;
+  /** Routed child submissions are broker-authorized and carry no local machine proof. */
+  routedSubmit?: true;
   /** Positive registration list. Absent exposes every tool in `HOLD_MCP_TOOL_NAMES`. */
   tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
@@ -199,6 +231,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // registered tools fast-fail with isError and never touch the hub again (plan section 4
   // — a lost claim must not be worked or double-submitted).
   let terminal: HoldOutcome | undefined;
+  const fileTransfers = new Set<AbortController>();
+  const abortFiles = () => { for (const transfer of fileTransfers) transfer.abort(); };
 
   const inner = createHoldLoop({
     hub,
@@ -226,12 +260,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     run: async () => {
       const outcome = await inner.run();
       terminal = outcome;
+      abortFiles();
       return outcome;
     },
     stop: (reason?: string, stopOpts?: StopOptions) => {
       // A closing submit or signal must revoke the model-facing packet before
       // the asynchronous lease loop has finished settling.
       stopping = true;
+      abortFiles();
       inner.stop(reason, stopOpts);
     },
   };
@@ -395,7 +431,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         captured = orderResponse;
 
         let proof: string | undefined;
-        if (deps.origin !== undefined && orderResponse.order !== null) {
+        if (!deps.routedSubmit && deps.origin !== undefined && orderResponse.order !== null) {
           proof = await buildSubmitProof({
             origin: deps.origin,
             order: orderResponse.order,
@@ -605,14 +641,52 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
   };
 
+  const getFileArtifactTool: ToolRegistration = {
+    name: ROUTED_FILE_TOOL_NAME,
+    description: 'Materialize one file pointer from the current consumed inputs. Call get_order first, then pass the consumed artifact path and the envelope __file key. Returns a local file path only after every byte and its SHA-256 have verified.',
+    inputSchema: { type: 'object', required: ['path', 'key'], properties: {
+      path: { type: 'string', description: 'Declared consumed artifact path.' },
+      key: { type: 'string', description: 'The __file key in that consumed value.' },
+    }, additionalProperties: false },
+    handler: async (args, ctx) => {
+      const gone = terminalGuard();
+      if (gone !== undefined) return gone;
+      if (!deps.downloadFile || !deps.discardDownloadedFile)
+        return textResult({ error: 'file-artifact-download-unavailable' }, true);
+      const path = args['path'], key = args['key'];
+      if (typeof path !== 'string' || !path || typeof key !== 'string' || !key
+        || !captured?.order)
+        return textResult({ error: 'file-artifact-download-refused: call get_order and choose a consumed pointer' }, true);
+      const pointer = consumedFile(captured.order, path, key);
+      if (!pointer) return textResult({ error: 'file-artifact-download-refused: pointer is not consumed by this run' }, true);
+      const controller = new AbortController();
+      fileTransfers.add(controller);
+      ctx.onCancel(() => controller.abort());
+      try {
+        const result = await deps.downloadFile({ workflow, run, path, pointer }, controller.signal);
+        const after = terminalGuard();
+        if (after !== undefined || ctx.cancelled || controller.signal.aborted) {
+          await deps.discardDownloadedFile(result.file);
+          return after ?? textResult({ error: 'file-artifact-download-cancelled' }, true);
+        }
+        return textResult({ file: result.file, size: result.size, contentType: result.contentType,
+          hash: pointer.hash });
+      } catch (e) {
+        return textResult({ error: errMsg(e) }, true);
+      } finally { fileTransfers.delete(controller); }
+    },
+  };
+
   const registrations: Record<HoldMcpToolName, ToolRegistration> = {
     get_order: getOrderTool,
     submit: submitTool,
     reject: rejectTool,
     ask: askTool,
     put_file_artifact: putFileArtifactTool,
+    get_file_artifact: getFileArtifactTool,
   };
-  const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
+  const selected = deps.tools ?? (deps.downloadFile
+    ? [...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME] : HOLD_MCP_TOOL_NAMES);
   return {
     tools: selected.map((name) => registrations[name]), loop,
     readGatedOrder: () => terminal === undefined && !stopping ? captured : undefined,

@@ -43,7 +43,7 @@ export interface RoutingChildClient {
     contentType: string; filename?: string }): Promise<PutFileArtifactResponse>;
   /** Chunks are provisional until `verified` resolves after exact EOF/hash. */
   getFileArtifactStream(req: { workflow: string; run: string; path: string;
-    pointer: FileArtifactPointer }): Promise<{ size: number; contentType: string;
+    pointer: FileArtifactPointer }, signal?: AbortSignal): Promise<{ size: number; contentType: string;
       chunks: AsyncIterable<Uint8Array>; verified: Promise<void> }>;
 }
 
@@ -198,7 +198,7 @@ export function createRoutingChildClient(handoff: {
       socket.once('close', () => { if (!accepted) finish(refused()); });
     });
   };
-  const download = (req: { workflow: string; run: string; path: string; pointer: FileArtifactPointer }) => {
+  const download = (req: { workflow: string; run: string; path: string; pointer: FileArtifactPointer }, signal?: AbortSignal) => {
     bound(req);
     const pointer = req.pointer;
     if (!req.path || !pointer || typeof pointer.__file !== 'string' || !pointer.__file
@@ -225,15 +225,19 @@ export function createRoutingChildClient(handoff: {
       let received = 0;
       const timer = setTimeout(() => fail(refused()), UPLOAD_ABSOLUTE_MS);
       timer.unref();
+      const onAbort = () => fail(refused());
       const fail = (error: Error) => {
         if (completed) return;
         completed = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         socket.destroy();
         output.destroy(error);
         verifyReject(error);
         if (!started) reject(error);
       };
+      if (signal?.aborted) { fail(refused()); return; }
+      signal?.addEventListener('abort', onAbort, { once: true });
       output.once('close', () => { if (!completed) fail(refused()); });
       const take = (bytes: Buffer) => {
         if (completed || received + bytes.length > pointer.size) { fail(refused()); return; }
@@ -276,6 +280,7 @@ export function createRoutingChildClient(handoff: {
         }
         completed = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         output.end();
         verifyResolve();
       });
