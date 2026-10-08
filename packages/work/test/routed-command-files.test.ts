@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { materializeRoutedCommandFiles } from '../src/hub/routed-command-files.ts';
+import { hasConsumedFilePointers, materializeRoutedCommandFiles } from '../src/hub/routed-command-files.ts';
 import { createDefaultRunner } from '../src/exec/runner.ts';
 import type { RoutingChildClient } from '../src/hub/routing-child-client.ts';
 import type { FileArtifactPointer, GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
@@ -17,6 +17,14 @@ const pointer: FileArtifactPointer = {
   size: bytes.length, contentType: 'application/octet-stream',
 };
 const holder = { kind: 'exec' as const, id: 'host:1234' };
+
+test('agent pointer detector distinguishes exact file values from ordinary JSON', () => {
+  assert.equal(hasConsumedFilePointers({ ...order(), worker: 'agent' }), true);
+  assert.equal(hasConsumedFilePointers({ ...order({ 'seed.value': { text: 'ordinary JSON' } }),
+    worker: 'agent' }), false);
+  assert.throws(() => hasConsumedFilePointers({ ...order({ 'seed.value': { __file: pointer.__file } }),
+    worker: 'agent' }), /routed consumed files refused/);
+});
 
 function order(consumes: Record<string, unknown> = { 'seed.value': { nested: [pointer] } }): OrderPacket {
   return { workflow: 'wf', run: 'run', step: 'command', key: 'k', defDigest: 'digest',

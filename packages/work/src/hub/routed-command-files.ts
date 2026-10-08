@@ -14,7 +14,7 @@ const refused = (): Error => new Error('routed consumed files refused');
 interface SelectedFile { artifactPath: string; pointerKey: string; pointer: FileArtifactPointer }
 
 function selectedFiles(order: OrderPacket): SelectedFile[] {
-  if (order.worker !== 'command' || !Array.isArray(order.inputs)
+  if (!Array.isArray(order.inputs)
     || !order.consumes || typeof order.consumes !== 'object' || Array.isArray(order.consumes)) throw refused();
   const found = new Map<string, SelectedFile>();
   let nodes = 0;
@@ -49,6 +49,12 @@ function selectedFiles(order: OrderPacket): SelectedFile[] {
     || a.pointerKey.localeCompare(b.pointerKey));
 }
 
+/** Parent-side bounded detector for agent cache policy selection. Malformed
+ * pointer-shaped inputs throw, so callers cannot silently omit file authority. */
+export function hasConsumedFilePointers(order: OrderPacket): boolean {
+  return selectedFiles(order).length > 0;
+}
+
 /** Refresh the parent-verified current order through the scoped broker, then
  * stage every current pointer before returning any path to the shell. The
  * caller owns cleanup after the command exits or the lease terminates. */
@@ -65,7 +71,8 @@ export async function materializeRoutedCommandFiles(args: {
   if (args.signal?.aborted || current.workflow !== args.order.workflow
     || current.run !== args.order.run || !current.lease.claimed
     || current.lease.outcome !== undefined || !current.order
-    || !isDeepStrictEqual(current.order, args.order)) throw refused();
+    || !isDeepStrictEqual(current.order, args.order)
+    || current.order.worker !== 'command') throw refused();
   const pointers = selectedFiles(current.order);
   if (pointers.length === 0) return { envValue: '[]', cleanup: async () => {} };
   const allocation = allocateRoutedFileCache(args.privateBase);
