@@ -54,7 +54,8 @@ async function fixture(kind: 'exec' | 'agent-run', pointer: FileArtifactPointer,
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   const verifiedOrder: GetOrderResponse = { text: 'ok', workflow: 'wf', run: 'run',
     lease: { claimed: true }, order: { workflow: 'wf', run: 'run', step: 'work', key: '', defDigest: 'digest',
-      inputs: ['seed'], outputs: ['out'], owes: [{ path: 'out' }],
+      inputs: ['seed'], outputs: ['out'], owes: [{ path: 'out', version: 1,
+	judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
       consumes: { seed: { nested: { file: pointer } } } } };
   const hub = createHubClient({ origin, getToken: async () => 'enrolled',
     routingSession: { allowedOrigin: origin, get: () => live && ({ ...live, credential }), now: () => 2_000 },
