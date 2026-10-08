@@ -15,6 +15,8 @@ import { performance } from 'node:perf_hooks';
 import { createHubClient, type RoutingHubClient } from '../hub/client.ts';
 import { HubError, type RoutingScope, type RoutingSessionOpenResponse, type RoutingOfferCandidate, type LocalTupleEligibility, type LocalModelTuple } from '../hub/types.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
+import { createTrustedRoutedReferenceV2Reader, type RoutedClaimV2,
+  type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, readHubRosterCache, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
@@ -993,7 +995,9 @@ export interface ShiftRoutingSession {
   identity(): { orgId: string; principalId: string; sessionId: string; shiftId: string; expiresAt: number } | undefined;
   /** Captures the exact incarnation, including after later scope rotation. */
   brokerTarget(): { hub: RoutingHubClient; identity: NonNullable<ReturnType<ShiftRoutingSession['identity']>>;
-    currentIdentity: ShiftRoutingSession['identity'] } | undefined;
+    currentIdentity: ShiftRoutingSession['identity'];
+    routedV2Read: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
+      Promise<RoutedReferenceV2 | RoutedClaimV2> } | undefined;
   createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string;
     holder?: { socketPath: string; cap: string } }, definitionStage?: RoutedDefinitionStage): RoutingHandoff;
   maintain(): Promise<void>;
@@ -1153,7 +1157,8 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	if (quarantined || rotating) return undefined;
       const incarnation = active;
       const identity = incarnation.identity();
-      return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity } : undefined;
+      return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity,
+	routedV2Read: incarnation.readRoutedV2 } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: (reservation, broker, definitionStage) => {
@@ -1245,7 +1250,10 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
   beforeRequest?: () => void; onRateLimit?: (error: HubError) => void;
 }): Promise<
-  Omit<ShiftRoutingSession, 'brokerTarget' | 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & { stop(): Promise<HubError | undefined> }
+  Omit<ShiftRoutingSession, 'brokerTarget' | 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & {
+    readRoutedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2Read'];
+    stop(): Promise<HubError | undefined>;
+  }
 > {
   const origin = new URL(opts.origin);
   if (origin.protocol !== 'https:' || origin.origin !== opts.origin || origin.username || origin.password) throw new Error('routing origin refused');
@@ -1331,6 +1339,20 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
     hub,
     identity: () => renewalDenied ? undefined : authority && ({ orgId: opts.orgId, principalId: opts.principalId,
       sessionId: authority.sessionId, shiftId: authority.shiftId, expiresAt: authority.expiresAt }),
+    async readRoutedV2(kind, expected) {
+      // Shift stop forbids new handoffs but an already owned detached worker
+      // retains its original incarnation until terminal/remote expiry.
+      if (renewalDenied || !authority || now() >= authority.expiresAt) throw new Error('routed v2 session unavailable');
+      const sessionId = authority.sessionId, shiftId = authority.shiftId;
+      const reader = createTrustedRoutedReferenceV2Reader({ origin: opts.origin,
+	getToken: opts.getToken, expected,
+	getSession: async () => {
+	  if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+	    || now() >= authority.expiresAt) throw new Error('routed v2 session changed');
+	  return authority.credential;
+	} });
+      return kind === 'reference' ? reader.readReference() : reader.readClaim();
+    },
     createHandoff(reservation, broker, definitionStage) {
       if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
 	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token

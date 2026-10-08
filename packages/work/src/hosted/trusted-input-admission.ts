@@ -132,7 +132,7 @@ export function createTrustedInputV2Admission(args: {
  * persisted claim binding. It does not admit continuation after preference
  * expiry, or any feedback-bearing reoffer. */
 export function createTrustedRoutedInputV2Admission(args: {
-  reader: RoutedReferenceV2Reader;
+  reader: Pick<RoutedReferenceV2Reader, 'read'>;
   instructions: InstructionResolver;
   consumedVerifier: ConsumedVerifier;
   expected: { workflow: string; run: string }; // root workflow, exact run

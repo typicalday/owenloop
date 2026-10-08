@@ -10,7 +10,8 @@ import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { parseConsume, parseProduce } from '../../../src/paths.ts';
 import type { StepDef } from '../../../src/types.ts';
 import { createTrustedRoutedInputV2Admission } from '../src/hosted/trusted-input-admission.ts';
-import { createTrustedRoutedReferenceV2Reader, parseRoutedClaimV2, parseRoutedReferenceV2,
+import { createBrokerRoutedReferenceV2Reader, createTrustedRoutedReferenceV2Reader,
+  parseRoutedClaimV2, parseRoutedReferenceV2,
   type RoutedClaimV2, type RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
 import type { OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
 
@@ -142,4 +143,26 @@ test('routed v2 binder binds both Service reads and local optional input without
     orderDigest: 'f'.repeat(64) } } as RoutedClaimV2;
   assert.deepEqual(await admission.observe(privateOrder), { ok: false, reason: 'routed-binding-changed' });
   assert.equal(verifications, 1);
+});
+
+test('child broker reader accepts only its fixed root/run and rechecks elapsed observation time', async () => {
+  const value = pair();
+  let clock = 1_000;
+  const calls: string[] = [];
+  const client = {
+    readRoutedReferenceV2: async (req: typeof expected) => {
+      calls.push('reference'); assert.deepEqual(req, expected); return value.reference;
+    },
+    readRoutingClaimV2: async (req: typeof expected) => {
+      calls.push('claim'); assert.deepEqual(req, expected); return value.claim;
+    },
+  };
+  const reader = createBrokerRoutedReferenceV2Reader(client, expected, () => clock);
+  assert.deepEqual(await reader.read(), value);
+  assert.deepEqual(calls, ['reference', 'claim']);
+  client.readRoutingClaimV2 = async () => { clock += 5_000; return value.claim; };
+  await assert.rejects(reader.read(), /observation expired/);
+  client.readRoutingClaimV2 = async () => ({ ...value.claim, workflow: 'wf_wrong' });
+  clock = 1_000;
+  await assert.rejects(reader.read(), /envelope mismatch/);
 });

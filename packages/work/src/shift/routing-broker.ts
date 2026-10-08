@@ -11,6 +11,8 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingHubClient } from '../hub/client.ts';
+import { parseRoutedClaimV2, parseRoutedReferenceV2,
+  type RoutedClaimV2, type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import { HubError, type ContactHolder, type FileArtifactPointer, type GetOrderResponse, type LaunchReportV1,
   type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse,
   type RoutedCollectionHolder, type RoutedMemberIssueRequest, type RoutedMemberIssueResponse,
@@ -35,6 +37,7 @@ const MAX_SOCKETS = 16;
 const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
+  | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
   | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection';
 type CapScope = 'role' | 'holder';
@@ -51,6 +54,8 @@ interface Grant {
   identity: Identity;
   currentIdentity: () => Identity | undefined;
   hub: RoutingHubClient;
+  routedV2Read?: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
+    Promise<RoutedReferenceV2 | RoutedClaimV2>;
   reservationRequest?: LaunchReservationRequestV1;
   launchReservationId?: string;
   launchExpiresAt?: number;
@@ -76,6 +81,7 @@ export interface RoutedLaunchAuthority {
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
     currentIdentity: () => Identity | undefined; hub: RoutingHubClient;
+    routedV2Read?: Grant['routedV2Read'];
     submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
       activate(record: ChildRecord): void;
@@ -491,7 +497,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
     } finally { grant.collectionBusy = false; }
   }
   const launch = method === 'get_launch_order' || method === 'assess_local_model'
-    || method === 'reserve_launch' || method === 'report_launch';
+    || method === 'reserve_launch' || method === 'report_launch'
+    || method === 'read_routed_reference_v2' || method === 'read_routing_claim_v2';
   if (!grant.ready || !(launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now())))
     throw new Error('routing broker grant expired');
   const { workflow, run, childKind } = grant.reservation;
@@ -538,6 +545,14 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
     case 'read_routing_claim':
       if (!exactKeys(body, [])) throw new Error('routing broker request refused');
       return checked(grant, grant.hub.readRoutingClaim({ workflow, run }, signal), now);
+    case 'read_routed_reference_v2':
+    case 'read_routing_claim_v2': {
+      if (!exactKeys(body, []) || !grant.routedV2Read) throw new Error('routing broker request refused');
+      const kind = method === 'read_routed_reference_v2' ? 'reference' : 'claim';
+      const expected = { workflow, run };
+      const result = await checked(grant, grant.routedV2Read(kind, expected), now, true);
+      return kind === 'reference' ? parseRoutedReferenceV2(result, expected) : parseRoutedClaimV2(result, expected);
+    }
     case 'assess_local_model':
       if (!exactKeys(body, ['candidateIds']) || !orderedCandidates(grant, body.candidateIds)
 	|| childKind !== 'agent-run' || !grant.routing.preference.localModel
@@ -890,7 +905,8 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    return;
 	  }
 	  if (tail.length > 0) throw new Error();
-  const methods: readonly string[] = ['get_order', 'get_launch_order', 'read_routing_claim', 'assess_local_model',
+  const methods: readonly string[] = ['get_order', 'get_launch_order', 'read_routing_claim',
+      'read_routed_reference_v2', 'read_routing_claim_v2', 'assess_local_model',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection'];
 	  if (!methods.includes(request.method)) throw new Error();
@@ -917,11 +933,11 @@ export async function createRoutingBroker(args: { now?: () => number;
   const inode: Stats = lstatSync(socketPath);
   return {
     socketPath,
-    issue({ reservation, routing, identity, currentIdentity, hub, submissionAuthority, launchAuthority }) {
+    issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, submissionAuthority, launchAuthority }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
-	identity: { ...identity }, currentIdentity, hub, submissionAuthority, launchAuthority };
+	identity: { ...identity }, currentIdentity, hub, routedV2Read, submissionAuthority, launchAuthority };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;

@@ -4,6 +4,7 @@ import type { IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
+import type { RoutingChildClient } from '../hub/routing-child-client.ts';
 import type { OrderPacket, ReferenceRouting } from '../hub/types.ts';
 import { parseTrustedReferenceV2, type TrustedInputWitness } from './trusted-reference-v2.ts';
 
@@ -47,7 +48,11 @@ export type RoutedClaimV2 = {
 } | {
   protocol: 'routing-claim-read-v2'; state: 'unavailable'; workflow: string; run: string;
 };
-export interface RoutedReferenceV2Reader { read(): Promise<{ reference: RoutedReferenceV2; claim: RoutedClaimV2 }> }
+export interface RoutedReferenceV2Reader {
+  readReference(): Promise<RoutedReferenceV2>;
+  readClaim(): Promise<RoutedClaimV2>;
+  read(): Promise<{ reference: RoutedReferenceV2; claim: RoutedClaimV2 }>;
+}
 
 function bounded(value: unknown): boolean {
   const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
@@ -190,8 +195,7 @@ export function createTrustedRoutedReferenceV2Reader(options: {
   if (origin.protocol !== 'https:' || origin.origin !== options.origin || !id(options.expected.workflow)
     || !id(options.expected.run)) throw new Error('routed v2 requires exact HTTPS origin and bound order');
   const now = options.now ?? Date.now;
-  return { async read() {
-    const started = now();
+  const request = async (path: string, started: number): Promise<unknown> => {
     const remaining = () => MAX_MS - (now() - started);
     let credentialTimer: ReturnType<typeof setTimeout> | undefined;
     const credential = await Promise.race([Promise.all([options.getToken(), options.getSession()]),
@@ -201,20 +205,41 @@ export function createTrustedRoutedReferenceV2Reader(options: {
     const [token, session] = credential;
     if (!token || /[\r\n]/.test(token) || !/^rs1\.rs_[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}$/.test(session))
       throw new Error('routed v2 credential unavailable');
-    const request = JSON.stringify(options.expected);
-    const call = async (path: string) => {
-      if (remaining() <= 0) throw new Error('routed v2 deadline exceeded');
-      const response = await postHttps(new URL(path, origin), token, session, request, remaining(), options.trustedCa);
-      if (remaining() <= 0 || response.status !== 200
-	|| !String(response.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')
-	|| !String(response.headers['cache-control'] ?? '').toLowerCase().split(',').map(part => part.trim()).includes('no-store'))
-	throw new Error('routed v2 transport refused');
-      return JSON.parse(response.body) as unknown;
-    };
-    const reference = parseRoutedReferenceV2(await call('/api/routing_reference_order/v2'), options.expected);
+    if (remaining() <= 0) throw new Error('routed v2 deadline exceeded');
+    const response = await postHttps(new URL(path, origin), token, session,
+      JSON.stringify(options.expected), remaining(), options.trustedCa);
+    if (remaining() <= 0 || response.status !== 200
+      || !String(response.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')
+      || !String(response.headers['cache-control'] ?? '').toLowerCase().split(',').map(part => part.trim()).includes('no-store'))
+      throw new Error('routed v2 transport refused');
+    return JSON.parse(response.body) as unknown;
+  };
+  const readReference = async (started = now()) => parseRoutedReferenceV2(
+    await request('/api/routing_reference_order/v2', started), options.expected);
+  const readClaim = async (started = now()) => parseRoutedClaimV2(
+    await request('/api/read_routing_claim/v2', started), options.expected);
+  return { readReference, readClaim, async read() {
+    const started = now();
+    const reference = await readReference(started);
     if (reference.state !== 'available') return { reference,
       claim: { protocol: 'routing-claim-read-v2', state: 'unavailable', ...options.expected } as RoutedClaimV2 };
-    const claim = parseRoutedClaimV2(await call('/api/read_routing_claim/v2'), options.expected);
+    return { reference, claim: await readClaim(started) };
+  } };
+}
+
+/** Child-side adapter to the parent broker's two fixed, claim-bound verbs.
+ * It has no origin, bearer, session credential, or generic Hub method. */
+export function createBrokerRoutedReferenceV2Reader(client: Pick<RoutingChildClient,
+  'readRoutedReferenceV2' | 'readRoutingClaimV2'>, expected: { workflow: string; run: string },
+now = Date.now): Pick<RoutedReferenceV2Reader, 'read'> {
+  return { async read() {
+    const started = now();
+    const reference = parseRoutedReferenceV2(await client.readRoutedReferenceV2(expected), expected);
+    if (now() - started >= MAX_MS) throw new Error('routed v2 broker observation expired');
+    if (reference.state !== 'available') return { reference,
+      claim: { protocol: 'routing-claim-read-v2', state: 'unavailable', ...expected } as RoutedClaimV2 };
+    const claim = parseRoutedClaimV2(await client.readRoutingClaimV2(expected), expected);
+    if (now() - started >= MAX_MS) throw new Error('routed v2 broker observation expired');
     return { reference, claim };
   } };
 }

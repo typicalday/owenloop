@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
 import { createRoutingHolderClient } from '../src/hub/routing-holder-client.ts';
+import type { RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
 import { openRoutedFileSource } from '../src/hub/routed-file-source.ts';
 import type { DecisionBindingV1, ReferenceRouting } from '../src/hub/types.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
@@ -155,6 +156,73 @@ test('broker redacts upstream failures and rejects an expired incarnation before
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('routed v2 broker verbs stay on the original grant and never use generic Hub fetch', async () => {
+  let now = 2_000;
+  let live = { ...identity };
+  let genericCalls = 0;
+  const observed: Array<{ kind: string; expected: { workflow: string; run: string } }> = [];
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...live, credential }), now: () => now },
+    fetchImpl: (async () => { genericCalls++; throw new Error('generic Hub fetch forbidden'); }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => now });
+  try {
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub,
+      routedV2Read: async (kind, expected) => {
+	observed.push({ kind, expected });
+	return kind === 'reference'
+	  ? { protocol: 'trusted-routed-reference-read-v2', state: 'unavailable', ...expected }
+	  : { protocol: 'routing-claim-read-v2', state: 'unavailable', ...expected };
+      } });
+    const routed = createRoutingChildClient(handoffFor(grant));
+    assert.equal((await request(grant.socketPath, { cap: grant.cap,
+      method: 'read_routed_reference_v2', body: {} })).ok, false, 'pending grant has no read authority');
+    grant.activate(child);
+    assert.deepEqual(await routed.readRoutedReferenceV2({ workflow: 'wf', run: 'run' }),
+      { protocol: 'trusted-routed-reference-read-v2', state: 'unavailable', workflow: 'wf', run: 'run' });
+    assert.deepEqual(await routed.readRoutingClaimV2({ workflow: 'wf', run: 'run' }),
+      { protocol: 'routing-claim-read-v2', state: 'unavailable', workflow: 'wf', run: 'run' });
+    assert.deepEqual(observed, [{ kind: 'reference', expected: { workflow: 'wf', run: 'run' } },
+      { kind: 'claim', expected: { workflow: 'wf', run: 'run' } }]);
+    assert.throws(() => routed.readRoutedReferenceV2({ workflow: 'foreign', run: 'run' }), /binding refused/);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap,
+      method: 'read_routed_reference_v2', body: { workflow: 'foreign' } })).ok, false);
+    assert.equal((await request(grant.socketPath, { cap: 'f'.repeat(64),
+      method: 'read_routed_reference_v2', body: {} })).ok, false);
+    assert.equal(observed.length, 2);
+    assert.equal(genericCalls, 0);
+    now = 70_000;
+    await assert.rejects(routed.readRoutingClaimV2({ workflow: 'wf', run: 'run' }), /routing broker unavailable/);
+    assert.equal(observed.length, 2);
+    now = 2_000;
+    live = { ...live, sessionId: 'rs_revoked' };
+    await assert.rejects(routed.readRoutedReferenceV2({ workflow: 'wf', run: 'run' }), /routing broker unavailable/);
+    assert.equal(observed.length, 2);
+  } finally { await broker.close(); }
+});
+
+test('routed v2 broker drops a reference that resolves after original grant revocation', async () => {
+  let started!: () => void;
+  let complete!: (value: { protocol: 'trusted-routed-reference-read-v2'; state: 'unavailable';
+    workflow: string; run: string }) => void;
+  const called = new Promise<void>(resolve => { started = resolve; });
+  const pending = new Promise<RoutedReferenceV2>(resolve => { complete = resolve; });
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async () => { throw new Error('generic Hub fetch forbidden'); }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+      routedV2Read: async () => { started(); return pending; } });
+    grant.activate(child);
+    const client = createRoutingChildClient(handoffFor(grant));
+    const read = client.readRoutedReferenceV2({ workflow: 'wf', run: 'run' });
+    await called;
+    grant.terminal();
+    complete({ protocol: 'trusted-routed-reference-read-v2', state: 'unavailable', workflow: 'wf', run: 'run' });
+    await assert.rejects(read, /routing broker unavailable/);
+  } finally { await broker.close(); }
 });
 
 test('broker refuses overlong reservations and a response that finishes after grant revocation', async () => {
