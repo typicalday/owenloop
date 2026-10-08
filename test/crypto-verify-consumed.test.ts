@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
+  DSSE_SSH_NAMESPACE,
+  dsseSignSubmission,
   encodeBase64,
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_REVOCATION,
@@ -9,6 +15,7 @@ import {
 } from '../src/crypto/dsse.ts';
 import { keyidFromBlob, publicKeyDescriptor } from '../src/crypto/keys.ts';
 import { valueDigestHex } from '../src/crypto/canonical.ts';
+import { createSshSigner } from '../src/crypto/ssh.ts';
 import type { EnrollmentGrantRecord, GrantScope, RevocationRecord } from '../src/crypto/records.ts';
 import {
   verifyConsumed,
@@ -33,6 +40,15 @@ function fixtureKey(name: string): FixtureKey {
 const root = fixtureKey('root');
 const producer = fixtureKey('producer');
 const alternateProducer = fixtureKey('alternate-producer');
+function sshKeygenWorks(): boolean {
+  try {
+    execFileSync('ssh-keygen', ['-Y', 'find-principals'], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch (error) {
+    return typeof (error as { status?: unknown }).status === 'number';
+  }
+}
+const OPENSSH_SKIP = !sshKeygenWorks() && 'host ssh-keygen lacks -Y support';
 const unrestrictedScope: GrantScope = {
   pools: '*',
   labels: '*',
@@ -58,6 +74,7 @@ function submission(
   value: unknown,
   overrides: Partial<{
     artifact: string;
+    workflow: string;
     version: number;
     producerKeyId: string;
     consumedFingerprint: Record<string, number>;
@@ -67,7 +84,7 @@ function submission(
   const artifact = overrides.artifact ?? 'input';
   return {
     run: 'run-consumed',
-    workflow: 'wf-consumed',
+    workflow: overrides.workflow ?? 'wf-consumed',
     defDigest: 'def-consumed',
     step: 'producer',
     key: 'producer-key',
@@ -128,6 +145,7 @@ function input(overrides: Partial<VerifyConsumedInput> = {}): VerifyConsumedInpu
   const value = overrides.value ?? { answer: 42 };
   return {
     path: 'input',
+    expectedWorkflow: 'wf-consumed',
     value,
     proof: overrides.proof ?? proofFor(value),
     expectedVersion: 4,
@@ -207,6 +225,31 @@ test('a signed version that differs from the consumer fingerprint fails the vers
   assert.match(verdict.reason, /expected version 4/);
 });
 
+test('a real signed direct submission for another workflow is refused', { skip: OPENSSH_SKIP }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-consumed-workflow-'));
+  try {
+    const keyPath = join(dir, 'producer');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', keyPath], { stdio: 'ignore', timeout: 15_000 });
+    const publicKey = readFileSync(`${keyPath}.pub`, 'utf8');
+    const keyid = publicKeyDescriptor(publicKey).keyid;
+    const value = { answer: 42 };
+    const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
+    const { envelope } = await dsseSignSubmission(
+      Buffer.from(JSON.stringify(submission(value, { workflow: 'wf-other', producerKeyId: keyid }))),
+      signer,
+    );
+    signer.dispose?.();
+    const verdict = await verifyConsumed({
+      ...input({ value, proof: JSON.stringify(envelope), orgRootPublicKey: publicKey, grants: [] }),
+      expectedWorkflow: 'wf-consumed',
+    });
+    assertFailure(verdict, 'invalid');
+    assert.match(verdict.reason, /workflow/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a valid historical proof without claim-time expected-version metadata is never verified', async () => {
   const value = { answer: 42 };
   const verdict = await verifyConsumed(input({
@@ -215,6 +258,12 @@ test('a valid historical proof without claim-time expected-version metadata is n
   }), options);
   assertFailure(verdict, 'unverifiable');
   assert.match(verdict.reason, /claim omitted its authoritative expected version/);
+});
+
+test('a direct submission without a consumer-expected workflow is never verified', async () => {
+  const verdict = await verifyConsumed(input({ expectedWorkflow: undefined }), options);
+  assertFailure(verdict, 'unverifiable');
+  assert.match(verdict.reason, /consumer omitted its expected workflow/);
 });
 
 test('a target key absent from an available local roster is an invalid chain link', async () => {

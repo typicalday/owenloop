@@ -116,10 +116,10 @@ function proofEnvelope(payloadType: string, payload: unknown): string {
 }
 
 /** A submission envelope naming exactly the version the producer would sign. */
-function syntheticProof(artifact: string, version: number, value: unknown): string {
+function syntheticProof(artifact: string, version: number, value: unknown, workflow: string): string {
   return proofEnvelope(PAYLOAD_TYPE_SUBMISSION, {
     run: 'run-synthetic',
-    workflow: 'wf-synthetic',
+    workflow,
     defDigest: 'def-synthetic',
     step: 'planner',
     key: '',
@@ -383,8 +383,9 @@ test('a reject that re-arms an OPEN claim re-stamps the owed target, so the sign
     {
       path: 'plan',
       value,
-      proof: syntheticProof('plan', signed!, value),
+      proof: syntheticProof('plan', signed!, value, wf),
       expectedVersion: committed,
+      expectedWorkflow: wf,
       orgRootPublicKey: PROOF_ROOT.publicKey,
       grants: [syntheticGrant()],
       at: 50,
@@ -404,8 +405,9 @@ test('a reject that re-arms an OPEN claim re-stamps the owed target, so the sign
     {
       path: 'plan',
       value,
-      proof: syntheticProof('plan', committed - 1, value),
+      proof: syntheticProof('plan', committed - 1, value, wf),
       expectedVersion: committed,
+      expectedWorkflow: wf,
       orgRootPublicKey: PROOF_ROOT.publicKey,
       grants: [syntheticGrant()],
       at: 50,

@@ -277,7 +277,7 @@ test('launch gate: a forged consumed value is refused before a command starts', 
   trusts.push(trust);
   installProducerGrant(trust);
   const signedValue = 'signed-value';
-  const proof = submissionProof({ artifact: 'input', value: signedValue, producer: trust.producer, version: 4 });
+  const proof = submissionProof({ artifact: 'input', value: signedValue, producer: trust.producer, version: 4, workflow: 'wf-launch-gate-value' });
 
   const clean = await runCommand(installed, trust, commandOrder({ defDigest: installed.defDigest, run: 'run-value-clean', value: signedValue, version: 4, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: correctly signed dynamic input must reach the command surface');
@@ -314,7 +314,7 @@ test('launch gate: a rolled-back consumed version is refused before a command st
   trusts.push(trust);
   installProducerGrant(trust);
   const value = 'signed-value';
-  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4 });
+  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4, workflow: 'wf-launch-gate-value' });
 
   const clean = await runCommand(installed, trust, commandOrder({ defDigest: installed.defDigest, run: 'run-version-clean', value, version: 4, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: the correctly versioned value must reach the command surface');
@@ -339,7 +339,7 @@ test('launch gate: a stripped consumed proof is refused before a command starts'
   trusts.push(trust);
   installProducerGrant(trust);
   const value = 'signed-value';
-  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4 });
+  const proof = submissionProof({ artifact: 'input', value, producer: trust.producer, version: 4, workflow: 'wf-launch-gate-value' });
 
   const clean = await runCommand(installed, trust, commandOrder({ defDigest: installed.defDigest, run: 'run-proof-clean', value, version: 4, proof }));
   assert.equal(clean.outcome, 'submitted', 'L3: the correctly proven value must reach the command surface');

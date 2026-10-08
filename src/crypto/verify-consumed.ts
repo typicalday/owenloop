@@ -40,6 +40,9 @@ export interface CallsRelayExpectation {
 export interface VerifyConsumedInput {
   /** Artifact path being consumed. */
   path: string;
+  /** Consumer's expected instance for a direct submission. This checks
+   * packet/proof coherence; the expectation needs its own authority. */
+  expectedWorkflow?: string;
   /** Exact dynamic value delivered by the transport. */
   value: unknown;
   /** Serialized DSSE submission envelope for this artifact. */
@@ -263,6 +266,10 @@ export async function verifyConsumed(
     signer.dispose?.();
   }
 
+  if (input.relay === undefined && input.expectedWorkflow !== undefined && record.workflow !== input.expectedWorkflow) {
+    return invalid(`workflow: signed submission workflow '${record.workflow}' does not match expected workflow '${input.expectedWorkflow}'`);
+  }
+
   // Calls boundary: a relayed record was signed by the CHILD for its own
   // outcome. It is admitted for the parent path only when it was signed for
   // exactly the child definition the verified parent pins, and only under the
@@ -323,6 +330,9 @@ export async function verifyConsumed(
     return unverifiable(
       `version: artifact '${input.path}' has a valid historical proof, but the claim omitted its authoritative expected version${boundary}`,
     );
+  }
+  if (relay === undefined && input.expectedWorkflow === undefined) {
+    return unverifiable(`workflow: direct artifact '${input.path}' has a valid submission proof, but the consumer omitted its expected workflow`);
   }
   return { kind: 'verified', producerKeyId: verifiedKeyId, principal: chain.principal, version: produced.version };
 }

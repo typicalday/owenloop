@@ -46,10 +46,10 @@ function envelope(payloadType: string, payload: unknown): string {
   });
 }
 
-function submission(artifact: string, value: unknown, version = 4, producerKeyId = root.keyid): Record<string, unknown> {
+function submission(artifact: string, value: unknown, version = 4, producerKeyId = root.keyid, workflow = 'wf-policy'): Record<string, unknown> {
   return {
     run: 'run-policy',
-    workflow: 'wf-policy',
+    workflow,
     defDigest: 'def-policy',
     step: 'producer',
     key: 'producer-key',
@@ -60,8 +60,8 @@ function submission(artifact: string, value: unknown, version = 4, producerKeyId
   };
 }
 
-function proof(artifact: string, value: unknown, version = 4, producerKeyId = root.keyid): string {
-  return envelope(PAYLOAD_TYPE_SUBMISSION, submission(artifact, value, version, producerKeyId));
+function proof(artifact: string, value: unknown, version = 4, producerKeyId = root.keyid, workflow = 'wf-policy'): string {
+  return envelope(PAYLOAD_TYPE_SUBMISSION, submission(artifact, value, version, producerKeyId, workflow));
 }
 
 function rootOrder(overrides: Partial<OrderPacket> = {}): OrderPacket {
@@ -167,6 +167,30 @@ test('verified consumed evidence passes at every artifact-policy level', async (
     assert.equal(result.ok, true, artifactPolicy);
     if (result.ok) assert.deepEqual(result.warnings, [], artifactPolicy);
   }
+});
+
+test('direct consumed proof for another workflow is refused even when its value and version match', async () => {
+  const value = { answer: 42 };
+  const verifier = createConsumedVerifier({
+    env: trustRootEnv(), artifactPolicy: 'enforce', now: () => 100, signerForPrincipal,
+  });
+  const result = await verifier(rootOrder({
+    consumesProof: JSON.stringify({ input: proof('input', value, 4, root.keyid, 'wf-other') }),
+  }), { hardRule: true });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /signed submission workflow 'wf-other' does not match expected workflow 'wf-policy'/);
+});
+
+test('direct consumed proof accepts the canonical child workflow of an order', async () => {
+  const value = { answer: 42 };
+  const verifier = createConsumedVerifier({
+    env: trustRootEnv(), artifactPolicy: 'enforce', now: () => 100, signerForPrincipal,
+  });
+  const result = await verifier(rootOrder({
+    workflow: 'child-wf',
+    consumesProof: JSON.stringify({ input: proof('input', value, 4, root.keyid, 'child-wf') }),
+  }), { hardRule: true });
+  assert.equal(result.ok, true);
 });
 
 test('absent proof follows the artifact-policy matrix', async () => {

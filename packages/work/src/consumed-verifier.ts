@@ -93,7 +93,7 @@ function errorText(error: unknown): string {
 }
 
 function linkFor(verdict: Exclude<ConsumedVerdict, { kind: 'verified' | 'absent' }>): string {
-  const match = verdict.reason.match(/^(no-proof|signature|value-digest|version|chain|scope|prerequisite|calls):/);
+  const match = verdict.reason.match(/^(no-proof|signature|workflow|value-digest|version|chain|scope|prerequisite|calls):/);
   if (match !== null) return match[1]!;
   return verdict.kind === 'invalid' ? 'signature' : 'prerequisite';
 }
@@ -384,6 +384,10 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
         } else {
           verdict = await verifyConsumed({
             path,
+            // Direct submissions are stored under the consuming instance.
+            // This checks packet/proof coherence; the packet's instance ID
+            // remains Service-supplied and is not independent authority.
+            expectedWorkflow: order.workflow,
             value,
             ...(proofs.proofs[path] === undefined ? {} : { proof: proofs.proofs[path] }),
             ...(order.consumedFingerprint?.[path] === undefined ? {} : { expectedVersion: order.consumedFingerprint[path] }),

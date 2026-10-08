@@ -141,11 +141,11 @@ function envelope(record: Record<string, unknown>): string {
 function childProof(
   value: unknown,
   childDigest: string,
-  overrides: Partial<{ defDigest: string; artifact: string; version: number }> = {},
+  overrides: Partial<{ workflow: string; defDigest: string; artifact: string; version: number }> = {},
 ): string {
   return envelope({
     run: 'run-change-unit',
-    workflow: 'wf-change-unit',
+    workflow: overrides.workflow ?? 'wf-change-unit',
     defDigest: overrides.defDigest ?? childDigest,
     step: 'change',
     key: 'change',
@@ -270,11 +270,11 @@ test('calls relay e2e: the child record without the relay is refused at the call
 /**
  * The record a hostile hub would replay: validly signed by a trusted producer,
  * covering the PARENT path `u1` itself with the consumed value's digest and the
- * parent's own fingerprint version, but signed for an unrelated definition.
+ * parent's own workflow/fingerprint version, but signed for an unrelated definition.
  * Ordinary verification never looks at `defDigest`, so it would admit this.
  */
 function replayedParentPathProof(fixtureData: Fixture): string {
-  return childProof(U1_VALUE, fixtureData.childDigest, { defDigest: OTHER_DIGEST, artifact: 'u1', version: 1 });
+  return childProof(U1_VALUE, fixtureData.childDigest, { workflow: 'wf-calls-relay', defDigest: OTHER_DIGEST, artifact: 'u1', version: 1 });
 }
 
 test('calls relay e2e: a trusted record covering the parent path under an unrelated definition is refused without a relay', async () => {
