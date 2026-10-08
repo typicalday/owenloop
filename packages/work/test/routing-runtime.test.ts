@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -72,7 +72,7 @@ test('spawn plans transport only an explicit handoff and strip ambient bearer fo
   }
 });
 
-test('role startup consumes a private session handoff, then stops before any legacy effects', async () => {
+test('role startup consumes an incomplete private handoff before any legacy effects', async () => {
   const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-role-'));
   const now = Date.now();
   const calls: string[] = [];
@@ -92,11 +92,13 @@ test('role startup consumes a private session handoff, then stops before any leg
       workflow: 'wf', run, childKind: kind, reservedAt: now,
     }).reservation;
     const agent = session.createHandoff(reserve('agent', 'agent-run'));
+    mkdirSync(join(root, '.owenloop'), { recursive: true });
+    writeFileSync(join(root, '.owenloop', 'settings.json'), '{malformed-json');
     const env: Record<string, string | undefined> = { HOME: root, OWENLOOP_ROUTING_HANDOFF: agent.path,
       OWENLOOP_ROUTING_SESSION: '1', OWENLOOP_TOKEN: 'ambient-secret' };
     const errors: string[] = [];
     assert.equal(await runAgent(['wf/agent', '--origin', origin], { env, err: line => errors.push(line) }), 1);
-    assert.match(errors.at(-1)!, /routed launch fence unavailable/);
+    assert.match(errors.at(-1)!, /routing handoff refused/);
     assert.equal(env.OWENLOOP_TOKEN, undefined);
     assert.equal(env.OWENLOOP_ROUTING_HANDOFF, undefined);
     assert.equal(existsSync(agent.path), false);
@@ -105,16 +107,59 @@ test('role startup consumes a private session handoff, then stops before any leg
     const command = session.createHandoff(reserve('command', 'exec'));
     const commandEnv: Record<string, string | undefined> = { HOME: root, OWENLOOP_ROUTING_HANDOFF: command.path };
     assert.equal(await runExec(['wf/command', '--origin', origin], { env: commandEnv, err: line => errors.push(line) }), 1);
-    assert.match(errors.at(-1)!, /routed launch fence unavailable/);
+    assert.match(errors.at(-1)!, /routing handoff refused/);
     assert.equal(existsSync(command.path), false);
     command.terminal();
 
     const missing = { HOME: root, OWENLOOP_ROUTING_SESSION: '1' };
     assert.equal(await runAgent(['wf/missing', '--origin', origin], { env: missing, err: line => errors.push(line) }), 1);
-    assert.match(errors.at(-1)!, /routed launch fence unavailable/);
+    assert.match(errors.at(-1)!, /routing handoff refused/);
     assert.deepEqual(calls, ['routing_session_open']);
     await session.stop();
     assert.deepEqual(calls, ['routing_session_open', 'routing_session_close']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('complete routed role preflight opens public stage, then retains the launch fence', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-stage-role-'));
+  const now = Date.now();
+  try {
+    const session = await openShiftRoutingSession({ stateDir: root, origin, orgId: 'org', principalId: 'actor',
+      scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
+      fetchImpl: (async url => String(url).endsWith('/routing_session_open')
+	? Response.json({ sessionId, shiftId: 'shf_service', credential, expiresAt: now + 900_000 })
+	: Response.json({ closed: true })) as typeof fetch });
+    const stageRoot = join(root, '.routing-definitions');
+    mkdirSync(stageRoot, { mode: 0o700 });
+    const makeStage = (run: string) => {
+      const path = mkdtempSync(join(stageRoot, '.routing-def-'));
+      mkdirSync(join(path, 'public'), { mode: 0o700 });
+      mkdirSync(join(path, 'home'), { mode: 0o700 });
+      const digest = 'a'.repeat(64);
+      writeFileSync(join(path, 'stage.json'), JSON.stringify({ version: 'routing-definition-stage-v1',
+	workflow: 'wf', run, step: 'build', digest, bundleDigest: 'b'.repeat(64),
+	originRules: {}, nonce: 'c'.repeat(32) }), { mode: 0o600 });
+      return { path, digest, verifyOrder: async () => {}, canSubmit: () => false,
+	canReplay: () => false, cleanup: () => rmSync(path, { recursive: true, force: true }) };
+    };
+    const broker = { socketPath: join(tmpdir(), 'ol-rb-ABCDEF', 'broker.sock'), cap: 'd'.repeat(64) };
+    for (const kind of ['agent-run', 'exec'] as const) {
+      const run = kind === 'agent-run' ? 'agent' : 'command';
+      const stage = makeStage(run);
+      const reservation = reserveChild(root, { workflow: 'wf', run, childKind: kind, reservedAt: now }).reservation;
+      const handoff = session.createHandoff(reservation, broker, stage);
+      const env = { HOME: root, OWENLOOP_ROUTING_HANDOFF: handoff.path };
+      const errors: string[] = [];
+      const status = kind === 'agent-run'
+	? await runAgent([`wf/${run}`, '--origin', origin], { env, err: line => errors.push(line) })
+	: await runExec([`wf/${run}`, '--origin', origin], { env, err: line => errors.push(line) });
+      assert.equal(status, 1);
+      assert.match(errors.at(-1)!, /routed launch fence unavailable/);
+      assert.equal(existsSync(handoff.path), false);
+      handoff.terminal();
+      stage.cleanup();
+    }
+    await session.stop();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

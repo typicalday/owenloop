@@ -3,16 +3,21 @@
  * store. Current roles remain fenced. Their future consume path must recheck
  * fresh parent trust and the full order's workdir against stage custody. */
 import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync,
   openSync, opendirSync, readdirSync, realpathSync, rmSync, writeFileSync, type Dir } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { readRegularFileNoFollow } from '../../../../src/install.ts';
 import { allowedSignersPath } from '../../../../src/crypto/trust-roots.ts';
 import { grantsDir, orgRootPublicKeyPath, revocationsDir } from '../../../../src/crypto/org-root.ts';
 import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
+import { parseWorkdirFrom } from '../../../../src/paths.ts';
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
-import { HubError, type WorkOrder } from '../hub/types.ts';
+import { createConsumedVerifier } from '../consumed-verifier.ts';
+import { validModelOrderFields, outputFor } from '../order-definition-binding.ts';
+import { createStoreInstructionResolver } from '../exec/instructions.ts';
+import { HubError, type GetOrderResponse, type OrderPacket, type WorkOrder } from '../hub/types.ts';
 import {
   createBundleIngestor, createExecutionDefinitionVerifier, createExecutionOriginVerifier,
   createPreCommitVerifier, createStoreInstructionSource, globalStoreRoot,
@@ -22,6 +27,12 @@ import {
 export interface RoutedDefinitionStage {
   path: string;
   digest: string;
+  /** Parent-only, fresh full-order and current operator trust gate. */
+  verifyOrder(response: GetOrderResponse): Promise<void>;
+  /** Member emissions lack a Service proof path; admit only exact scalar targets. */
+  canSubmit(order: OrderPacket, path: string): boolean;
+  /** Only a verified singleton or judge output has replay-safe submit semantics. */
+  canReplay(order: OrderPacket, path: string): boolean;
   cleanup(): void;
 }
 
@@ -256,7 +267,138 @@ export async function stageRoutedDefinition(args: {
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
       bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
-    return { path: stagePath, digest: args.order.defDigest!, cleanup };
+    const verifyOrder = async (response: GetOrderResponse): Promise<void> => {
+      const order = response.order;
+      // The broker checks the exact original session incarnation around this
+      // callback. The pre-start preference deadline must not terminate trust
+      // checks for a long-running child after a launch report was accepted.
+      if (!order || !response.lease.claimed || response.lease.outcome !== undefined
+	|| response.workflow !== args.order.workflow || response.run !== args.order.run
+	|| order.workflow !== args.order.workflow || order.run !== args.order.run
+	|| order.step !== args.order.step || order.defDigest !== args.order.defDigest
+	|| (args.order.key !== undefined && order.key !== args.order.key)
+	|| (args.order.index !== undefined && order.index !== args.order.index)
+	|| !isDeepStrictEqual(order.routing, args.order.routing)
+	|| order.worker !== (args.order.worker ?? 'agent'))
+	throw new Error('routed order changed');
+      const currentStage = lstatSync(stagePath);
+      if (!currentStage.isDirectory() || currentStage.isSymbolicLink()
+	|| currentStage.dev !== inode.dev || currentStage.ino !== inode.ino)
+	throw new Error('routed definition stage changed');
+      // The full packet alone reveals workdir. A workdir containing the stage,
+      // or contained by it, would give authored code a mutable trust snapshot.
+      // For an unspecified command workdir the shell inherits Shift's cwd.
+      const actualWorkdir = order.workdir ?? (order.worker === 'command' ? process.cwd() : args.workRoot);
+      const checkedWorkdir = order.workdir !== undefined || order.worker === 'command'
+	? realpathSync(actualWorkdir) : (() => { try { return realpathSync(actualWorkdir); }
+	  catch { return resolve(actualWorkdir); } })();
+      if (overlap(checkedWorkdir, realpathSync(stagePath))
+	|| overlap(checkedWorkdir, realpathSync(dirname(allowedSignersPath(args.sourceEnv)))))
+	throw new Error('routed workdir overlaps definition trust');
+      const freshRules = resolveOriginRules(args.sourceEnv);
+      const freshIndex = readWorkflowStoreIndex(storeIndexPath(root));
+      const freshDefinition = createExecutionDefinitionVerifier({ env: args.sourceEnv });
+      const freshOrigin = createExecutionOriginVerifier({ env: args.sourceEnv });
+      // Reopen the private bytes without the staging recovery hook. A stale
+      // or removed object at execution time must refuse, never trigger a new
+      // broad-bearer download from a submit/get_order callback.
+      const readOnlySource = createStoreInstructionSource({ globalRoot: root,
+	verifier: createBundleIngestor() });
+      if (await readOnlySource.prime(order.defDigest) !== 'resolved')
+	throw new Error('routed definition object changed');
+      const currentSupport = readOnlySource.getVerifiedSupport?.(order.defDigest, order.step);
+      if (!currentSupport?.length) throw new Error('routed definition closure unavailable');
+      for (const object of currentSupport) {
+	if ((await freshDefinition(object)).kind !== 'verified')
+	  throw new Error('routed definition trust changed');
+	const verdict = await freshOrigin(object);
+	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
+	const coordinates = Object.entries(freshIndex.entries)
+	  .filter(([, entry]) => entry.digest === object.bundleDigest)
+	  .map(([coordinate]) => coordinate);
+	if (coordinates.length === 0) throw new Error('routed definition index changed');
+	for (const coordinate of coordinates) {
+	  const rule = matchOriginRule(freshRules, parseWorkflowCoordinate(coordinate).namespace);
+	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
+	    throw new Error('routed definition origin changed');
+	}
+      }
+      const resolver = createStoreInstructionResolver({ globalRoot: root, source: readOnlySource,
+	verifier: createBundleIngestor(), env: args.sourceEnv, defPolicy: 'enforce',
+	originPolicy: 'enforce', originRules: freshRules,
+	definitionVerifier: freshDefinition, originVerifier: freshOrigin,
+	consumedVerifier: createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
+	  artifactPolicy: 'enforce' }), warn: () => {} });
+      const verifiedStep = readOnlySource.getVerifiedStep(order.defDigest, order.step);
+      const verifiedDefinition = readOnlySource.getVerifiedDefinition(order.defDigest, order.step);
+      if (!verifiedStep || !verifiedDefinition || !validModelOrderFields(verifiedStep, order,
+	verifiedDefinition.inputs.map(input => input.name)))
+	throw new Error('routed order fields changed');
+      // A declared optional input can set workdir without appearing in
+      // `order.consumes`. Until Service supplies a canonical authenticated
+      // input-value witness, the parent cannot bind that path before start.
+      const workdirSource = verifiedStep.workdirFrom === undefined ? undefined
+	: parseWorkdirFrom(verifiedStep.workdirFrom, verifiedStep.consumes,
+	  verifiedDefinition.inputs.map(input => input.name));
+      if (workdirSource?.source === 'input') throw new Error('routed workdir witness unavailable');
+      if (order.worker === 'command') {
+	const checked = await resolver.resolveCommand(order);
+	if (!checked.ok) throw new Error('routed command definition refused');
+      } else {
+	const checked = await resolver.resolveHostedStep!(order);
+	if (!checked.ok || !validModelOrderFields(checked.step, order, checked.inputNames))
+	  throw new Error('routed agent definition refused');
+	const dynamic = Object.keys(order.consumes).length > 0
+	  || order.owes.some(owed => owed.reasons.length > 0 || owed.proof !== undefined);
+	if (dynamic) {
+	  const consumed = await createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
+	    artifactPolicy: 'enforce' })(order, { hardRule: true,
+	    callsProducers: checked.callsProducers });
+	  if (!consumed.ok) throw new Error('routed consumed proof refused');
+	}
+      }
+      // Consume verification can await external signature checks. Read the
+      // current operator trust again at the final parent boundary, after all
+      // such awaits, so a mid-check revocation cannot authorize a broker reply.
+      const finalRules = resolveOriginRules(args.sourceEnv);
+      const finalIndex = readWorkflowStoreIndex(storeIndexPath(root));
+      const finalDefinition = createExecutionDefinitionVerifier({ env: args.sourceEnv });
+      const finalOrigin = createExecutionOriginVerifier({ env: args.sourceEnv });
+      for (const object of currentSupport) {
+	if ((await finalDefinition(object)).kind !== 'verified')
+	  throw new Error('routed definition trust changed');
+	const verdict = await finalOrigin(object);
+	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
+	const coordinates = Object.entries(finalIndex.entries)
+	  .filter(([, entry]) => entry.digest === object.bundleDigest)
+	  .map(([coordinate]) => coordinate);
+	if (coordinates.length === 0) throw new Error('routed definition index changed');
+	for (const coordinate of coordinates) {
+	  const rule = matchOriginRule(finalRules, parseWorkflowCoordinate(coordinate).namespace);
+	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
+	    throw new Error('routed definition origin changed');
+	}
+      }
+      const finalStage = lstatSync(stagePath);
+      const finalWorkdir = order.workdir !== undefined || order.worker === 'command'
+	? realpathSync(actualWorkdir) : (() => { try { return realpathSync(actualWorkdir); }
+	  catch { return resolve(actualWorkdir); } })();
+      if (!finalStage.isDirectory() || finalStage.isSymbolicLink()
+	|| finalStage.dev !== inode.dev || finalStage.ino !== inode.ino
+	|| overlap(finalWorkdir, realpathSync(stagePath))
+	|| overlap(finalWorkdir, realpathSync(dirname(allowedSignersPath(args.sourceEnv)))))
+	throw new Error('routed definition custody changed');
+    };
+    const canReplay = (order: OrderPacket, path: string): boolean => {
+      if (order.defDigest !== args.order.defDigest || order.step !== args.order.step
+	|| order.workflow !== args.order.workflow || order.run !== args.order.run
+	|| !order.owes.some(owed => owed.path === path)) return false;
+      const verified = source.getVerifiedStep(order.defDigest, order.step);
+      if (!verified) return false;
+      return verified.judges === path || outputFor(verified, order, path)?.kind === 'singleton';
+    };
+    return { path: stagePath, digest: args.order.defDigest!, verifyOrder,
+      canSubmit: canReplay, canReplay, cleanup };
   } catch (error) {
     cleanup();
     if (error instanceof HubError) throw error;

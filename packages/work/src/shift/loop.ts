@@ -59,8 +59,9 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingOfferCandidate, ShiftOffer, LocalTupleEligibility } from '../hub/types.ts';
 import type { ShiftRoutingSession, RoutingHandoff } from './runtime.ts';
-import type { RoutingBroker } from './routing-broker.ts';
+import type { RoutedLaunchAuthority, RoutingBroker } from './routing-broker.ts';
 import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
+import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -109,10 +110,16 @@ export interface ShiftLoopOptions {
   routingBroker?: RoutingBroker;
   /** Required for routed dispatch; prepares exact signed bytes without a role credential. */
   stageRoutedDefinition?: (order: WorkOrder) => Promise<RoutedDefinitionStage>;
+  /** Parent-owned signer and full-order verifier bound to the staged source. */
+  createRoutingSubmissionAuthority?: (stage: RoutedDefinitionStage) => RoutedSubmissionAuthority;
+  createRoutingLaunchAuthority?: (order: WorkOrder,
+    offer: { candidate: RoutingOfferCandidate; offer: ShiftOffer; rosterSnapshot: string } | undefined) => RoutedLaunchAuthority;
   maintainDefinitionStages?: () => void;
   closeDefinitionStages?: () => void;
   /** Intersect service-authorized tuples with this account's current local roster. */
   selectRoutingTuples?: (candidate: RoutingOfferCandidate) => readonly LocalTupleEligibility[];
+  /** Digest of the exact ordered machine roster row used to make an offer. */
+  routingRosterSnapshot?: (candidate: RoutingOfferCandidate) => string | undefined;
   hub: HubClient;
   spawner: Spawner;
   /** Injected sleep — tests pass an instant/scriptable stub (no real timers). */
@@ -1297,7 +1304,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * state-directory-wide lock. The lock ends before spawn: the durable
    * reservation, not a long critical section, protects capacity during spawn.
    */
-  const routingOffers = new Map<string, { candidate: RoutingOfferCandidate; offer: ShiftOffer; spentBy?: string }>();
+  const routingOffers = new Map<string, { candidate: RoutingOfferCandidate; offer: ShiftOffer;
+    rosterSnapshot: string; spentBy?: string }>();
   const routingAttempts = new Map<string, number>();
   const routingRefusals = new Map<string, number>();
   const routingHandoffs = new Map<string, { handoff: RoutingHandoff; pid?: number; spawnedAt?: number }>();
@@ -1351,12 +1359,16 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	&& candidate.tuples.some(allowed => allowed.eligible && allowed.available && isDeepStrictEqual(t.tuple, allowed.tuple))
 	&& candidate.rolePolicy.rules.some(rule => rule.model === t.tuple.model && rule.roles.some(role => role === candidate.role)));
       if (!tuples.length) continue;
+      const rosterSnapshot = opts.routingRosterSnapshot
+	? opts.routingRosterSnapshot(candidate) : JSON.stringify(tuples);
+      if (!rosterSnapshot) continue;
       const key = JSON.stringify([workflow, candidate.frameId, candidate.step, candidate.key, candidate.evidenceGeneration, identity.sessionId]);
       let existing = routingOffers.get(key);
       if (existing && (existing.spentBy || existing.offer.expiresAt <= opts.now()
 	|| existing.offer.rosterRevision !== c.rosterRevision || existing.offer.rolePolicyRevision !== c.rolePolicyRevision
 	|| existing.candidate.candidateId !== candidate.candidateId
 	|| existing.candidate.localModelProtocol !== candidateProtocol
+	|| existing.rosterSnapshot !== rosterSnapshot
 	|| !isDeepStrictEqual(existing.candidate.rolePolicy, candidate.rolePolicy)
 	|| !existing.offer.tuples.every(t => tuples.some(current => isDeepStrictEqual(t, current))))) continue;
       if (existing) {
@@ -1383,7 +1395,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  rosterRevision: c.rosterRevision, rolePolicyRevision: c.rolePolicyRevision,
 	  tuples: structuredClone(tuples), issuedAt: c.now, expiresAt };
 	if (candidateProtocol === localModelProtocol) offer.localModelProtocol = localModelProtocol;
-	existing = { candidate: structuredClone(candidate), offer };
+	existing = { candidate: structuredClone(candidate), offer, rosterSnapshot };
 	routingOffers.set(key, existing);
       }
       // Keep bytes/ID/deadline on an uncertain retry. Replacing any of these is
@@ -1442,6 +1454,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	|| candidateProtocol !== localModelProtocol) return false;
     } else if (candidateProtocol !== undefined) return false;
     const current = opts.selectRoutingTuples?.(local.candidate) ?? [];
+    const currentSnapshot = opts.routingRosterSnapshot
+	? opts.routingRosterSnapshot(local.candidate) : JSON.stringify(current);
+    if (!currentSnapshot || currentSnapshot !== local.rosterSnapshot) return false;
     if (!preference.tuples.some(t => current.some(allowed => allowed.eligible && allowed.available && isDeepStrictEqual(t.tuple, allowed.tuple)))) return false;
     local.spentBy = c.order.run;
     return true;
@@ -1542,7 +1557,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  const target = opts.routingSession.brokerTarget();
 	  if (!target) throw new Error('routing broker incarnation unavailable');
 	  brokerGrant = opts.routingBroker.issue({ reservation, routing: c.order.routing!,
-	    ...target });
+	    ...target,
+	    ...(opts.createRoutingSubmissionAuthority && definitionStage
+	      ? { submissionAuthority: opts.createRoutingSubmissionAuthority(definitionStage) } : {}),
+	    ...(opts.createRoutingLaunchAuthority ? { launchAuthority: opts.createRoutingLaunchAuthority(
+	      c.order, (() => {
+		const offerId = c.order.routing?.preference.offer?.offerId;
+		if (!offerId) return undefined;
+		const local = [...routingOffers.values()].find(entry => entry.offer.offerId === offerId);
+		return local ? { candidate: local.candidate, offer: local.offer,
+		  rosterSnapshot: local.rosterSnapshot } : undefined;
+	      })()) } : {}) });
 	}
 	const privateHandoff = opts.routingSession.createHandoff(reservation,
 	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap,

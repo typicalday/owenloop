@@ -54,6 +54,7 @@ import type { InstructionResolver } from './instructions.ts';
 import { PAYLOAD_FILE_ENV, PAYLOAD_MAX_BYTES, readPayloadFile, resolvePayload } from './payload.ts';
 import { buildReceipt, type CommandReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import { routedWorkerEnv } from '../roles/routing-role-env.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
@@ -129,6 +130,12 @@ export interface ExecLoopOptions {
   holder: ContactHolder;
   /** Resolves command text from a verified local workflow-store object. */
   instructions: InstructionResolver;
+  /** Routed-only awaited reservation/report/fresh-claim gate immediately before shell start. */
+  routedPrestart?: (order: OrderPacket, signal: AbortSignal) => Promise<void | {
+    consumedFilePathsJson?: string; cleanup?: () => Promise<void>;
+  }>;
+  /** Public-only stage paths for the command process; removes inherited account-store handles. */
+  routedPublicEnv?: { HOME: string; OWENLOOP_CONFIG_DIR: string };
   /** cwd for the command when the order packet carries no `workdir`. */
   cwd: string;
   /**
@@ -416,6 +423,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   let running: RunningCommand | undefined;
   let signalled = false;
   let leasePromise: Promise<LeaseOutcome> | undefined;
+  const routedPrestartAbort = new AbortController();
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -970,6 +978,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 
   async function run(): Promise<ExecOutcome> {
     leasePromise = lease.run();
+    // A terminal lease cancels a pending scoped file stream before a shell can
+    // start. Normal completion happens only after the command is already done.
+    void leasePromise.then(() => routedPrestartAbort.abort(), () => routedPrestartAbort.abort());
 
     // First contact race: the order arrives (hold established), or the lease
     // resolves terminally before we ever established it.
@@ -1092,6 +1103,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // that assumes the child is gone.
     let consumesDir: string | undefined;
     let feedbackDir: string | undefined;
+    let routedFilesCleanup: (() => Promise<void>) | undefined;
+    let routedCommandDone = false;
+    let routedCleanupPromise: Promise<void> | undefined;
     // The payload directory differs from the two above: it is created on EVERY
     // command spawn, not only on overflow, because the command has to be told
     // where it may write before anyone knows whether it will.
@@ -1103,7 +1117,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         // spawn's env replaces the child environment. Start from the actual exec
         // process environment so config-only opts.env cannot strip PATH/HOME, then
         // explicitly remove bundle provenance for loose definitions.
-        const childEnv: Record<string, string | undefined> = { ...process.env };
+	const childEnv: Record<string, string | undefined> = opts.routedPublicEnv
+	  ? routedWorkerEnv(process.env, opts.routedPublicEnv) : { ...process.env };
         if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
         else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
         // Run identity is engine-derived from ExecLoopOptions, never a consumed
@@ -1173,6 +1188,27 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
             return 'unresolved-instructions';
           }
         }
+	if (opts.routedPrestart) {
+	  try {
+	    const prepared = await opts.routedPrestart(order, routedPrestartAbort.signal);
+	    if (prepared) {
+	      if (prepared.consumedFilePathsJson !== undefined)
+		childEnv['OWENLOOP_CONSUMED_FILE_PATHS_JSON'] = prepared.consumedFilePathsJson;
+	      routedFilesCleanup = prepared.cleanup;
+	    }
+	  } catch {
+	    opts.err('owenloop work exec: routed launch refused before shell start');
+	    const revoked = routedPrestartAbort.signal.aborted;
+	    lease.stop('routed-launch-refused');
+	    const terminal = await leasePromise;
+	    return signalled ? 'killed' : revoked
+	      ? mapLeaseDuringRun(terminal) : 'unresolved-instructions';
+	  }
+	  if (signalled || routedPrestartAbort.signal.aborted) {
+	    const terminal = await leasePromise;
+	    return signalled ? 'killed' : mapLeaseDuringRun(terminal);
+	  }
+	}
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
 	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
@@ -1180,8 +1216,17 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       running = cmd;
       opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
 
+      const afterCommandExit = () => {
+	routedCommandDone = true;
+	if (routedFilesCleanup && !routedCleanupPromise)
+	  routedCleanupPromise = routedFilesCleanup().catch(() => {
+	    opts.err('owenloop work exec: routed file cache cleanup failed');
+	  });
+      };
+
       const outcome = await Promise.race([
-        cmd.done.then((r) => ({ t: 'done' as const, r })).catch((e: unknown) => ({ t: 'done' as const, r: machineryFailure(e) })),
+	cmd.done.then((r) => { afterCommandExit(); return { t: 'done' as const, r }; })
+	  .catch((e: unknown) => { afterCommandExit(); return { t: 'done' as const, r: machineryFailure(e) }; }),
         leasePromise.then((o) => ({ t: 'lease' as const, o })),
       ]);
 
@@ -1200,12 +1245,21 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       removeConsumesDir(consumesDir);
       removeConsumesDir(feedbackDir);
       removeConsumesDir(payloadDir);
+      // `runner.kill()` may return before a signalled process group exits.
+      // Preserve the private cache on that uncertain path for a reaper instead
+      // of deleting a file a still-live command could be reading.
+      if (!running && routedFilesCleanup && !routedCleanupPromise)
+	routedCleanupPromise = routedFilesCleanup().catch(() => {
+	  opts.err('owenloop work exec: routed file cache cleanup failed');
+	});
+      if (routedCommandDone && routedCleanupPromise) await routedCleanupPromise;
     }
   }
 
   function stop(reason?: string): void {
     if (signalled) return;
     signalled = true;
+    routedPrestartAbort.abort();
     if (running !== undefined) void running.kill();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

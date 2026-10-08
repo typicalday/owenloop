@@ -47,6 +47,9 @@ import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
 import { createRoutingBroker, type RoutingBroker } from './routing-broker.ts';
 import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from './routing-definition-stage.ts';
+import { createRoutedSubmissionAuthority } from './routing-submit-authority.ts';
+import { createRoutedLaunchAuthority } from './routing-launch-authority.ts';
+import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
 import {
   createBundleIngestor,
@@ -727,15 +730,22 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
+  const localSelection = new WeakMap<RoutingOfferCandidate, { tuples: LocalTupleEligibility[]; snapshot: string }>();
+  const routingRosterOptions = () => ({ env, origin, account,
+    serving: loopRef.current?.getShift().serveCrews ?? parsed.serveCrews ?? [],
+    harnessAvailable: (harness: string) => adapterFor(harness) !== undefined });
   const selectRoutingTuples = (candidate: RoutingOfferCandidate): LocalTupleEligibility[] => {
-    const serving = loopRef.current?.getShift().serveCrews ?? parsed.serveCrews ?? [];
-    return selectLocalRoutingTuples(candidate, { env, origin, account, serving,
-      harnessAvailable: harness => adapterFor(harness) !== undefined });
+    const selected = selectLocalRoutingTuplesWithSnapshot(candidate, routingRosterOptions());
+    if (selected) localSelection.set(candidate, selected);
+    return selected?.tuples ?? [];
   };
+  const routingRosterSnapshot = (candidate: RoutingOfferCandidate) =>
+    localSelection.get(candidate)?.snapshot
+      ?? selectLocalRoutingTuplesWithSnapshot(candidate, routingRosterOptions())?.snapshot;
 
   const loop = createShiftLoop({
     hub,
-    ...(routingSession ? { routingSession, selectRoutingTuples,
+    ...(routingSession ? { routingSession, selectRoutingTuples, routingRosterSnapshot,
       maintainDefinitionStages: definitionMaintenance!.sweep,
       closeDefinitionStages: definitionMaintenance!.close,
       stageRoutedDefinition: (order: import('../hub/types.ts').WorkOrder) => stageRoutedDefinition({
@@ -753,6 +763,16 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	    && now() < Math.min(identity.expiresAt, routing.decision.binding.expiresAt,
 	      routing.preference.expiresAt);
 	},
+      }),
+      createRoutingSubmissionAuthority: stage => createRoutedSubmissionAuthority({
+	origin, env, now, verifyOrder: stage.verifyOrder,
+	canSubmit: stage.canSubmit, canReplay: stage.canReplay,
+      }),
+      createRoutingLaunchAuthority: (order, offer) => createRoutedLaunchAuthority({
+	offered: order, ...(offer ? { offer } : {}),
+	currentTuples: candidate => selectLocalRoutingTuples(candidate, routingRosterOptions()),
+	currentRosterSnapshot: candidate =>
+	  selectLocalRoutingTuplesWithSnapshot(candidate, routingRosterOptions())?.snapshot,
       }) } : {}),
     ...(routingBroker ? { routingBroker } : {}),
     spawner,
@@ -1342,19 +1362,29 @@ export function selectShiftRoutingTuples(candidate: RoutingOfferCandidate, local
 }
 
 /** Local account and crew authority for one service offer context. */
-export function selectLocalRoutingTuples(candidate: RoutingOfferCandidate, opts: {
+function selectLocalRoutingTuplesWithSnapshot(candidate: RoutingOfferCandidate, opts: {
   env: NodeJS.ProcessEnv; origin: string; account: string; serving: readonly string[];
   harnessAvailable: (harness: string) => boolean;
-}): LocalTupleEligibility[] {
+}): { tuples: LocalTupleEligibility[]; snapshot: string } | undefined {
   const cache = readHubRosterCache(opts.env, opts.origin, opts.account);
-  if (cache.kind !== 'hit' || cache.data.orgId !== candidate.context.orgId) return [];
+  if (cache.kind !== 'hit' || cache.data.orgId !== candidate.context.orgId) return undefined;
   const crew = cache.data.crews.find(row => row.crewId === candidate.context.crewId)?.crewName;
-  if (!crew || (opts.serving.length > 0 && !opts.serving.includes(crew))) return [];
+  if (!crew || (opts.serving.length > 0 && !opts.serving.includes(crew))) return undefined;
   const merged = mergeRosterLayers(effectiveRosterLayers(opts.env, crew, {
     origin: opts.origin, account: opts.account,
   }));
   const rows = Object.fromEntries(Object.entries(merged).map(([key, row]) => [key, row.candidates]));
   const selected = resolveCapabilityCandidates(rows, [candidate.context.capability]);
-  return selectShiftRoutingTuples(candidate, selected?.candidates ?? [])
-    .filter(row => opts.harnessAvailable(row.tuple.harness));
+  if (!selected) return undefined;
+  return { tuples: selectShiftRoutingTuples(candidate, selected.candidates)
+    .filter(row => opts.harnessAvailable(row.tuple.harness)),
+    snapshot: valueDigestHex({ crew, capability: selected.capability, match: selected.match,
+      candidates: selected.candidates }) };
+}
+
+export function selectLocalRoutingTuples(candidate: RoutingOfferCandidate, opts: {
+  env: NodeJS.ProcessEnv; origin: string; account: string; serving: readonly string[];
+  harnessAvailable: (harness: string) => boolean;
+}): LocalTupleEligibility[] {
+  return selectLocalRoutingTuplesWithSnapshot(candidate, opts)?.tuples ?? [];
 }

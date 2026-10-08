@@ -301,6 +301,71 @@ function baseOpts(hub: HubClient, runner: CommandRunner, extra: Partial<ExecLoop
   };
 }
 
+test('routed prestart refusal leaves the shell unstarted', async () => {
+  const { hub } = mockHub({ getOrder: [commandOrder()] });
+  const command = fakeRunner();
+  let called = 0;
+  const loop = createExecLoop(baseOpts(hub, command.runner, {
+    routedPrestart: async () => { called++; throw new Error('private credential marker'); },
+  }));
+  assert.equal(await loop.run(), 'unresolved-instructions');
+  assert.equal(called, 1);
+  assert.equal(command.starts.length, 0);
+});
+
+test('stop aborts an in-flight routed prestart before any shell start', async () => {
+  const { hub } = mockHub({ getOrder: [commandOrder()] });
+  const command = fakeRunner();
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { entered = resolve; });
+  const loop = createExecLoop(baseOpts(hub, command.runner, {
+    routedPrestart: async (_order, signal) => {
+      entered();
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+      throw new Error('download aborted');
+    },
+  }));
+  const outcome = loop.run();
+  await pending;
+  loop.stop();
+  assert.equal(await outcome, 'killed');
+  assert.equal(command.starts.length, 0);
+});
+
+test('routed command child gets public stage HOME without account credential selectors', async () => {
+  const saved = { HOME: process.env.HOME, OWENLOOP_TOKEN: process.env.OWENLOOP_TOKEN,
+    OWENLOOP_CONFIG_DIR: process.env.OWENLOOP_CONFIG_DIR,
+    OWENLOOP_CREDENTIAL_COMMAND: process.env.OWENLOOP_CREDENTIAL_COMMAND };
+  try {
+    process.env.HOME = '/private/operator';
+    process.env.OWENLOOP_TOKEN = 'private-token';
+    process.env.OWENLOOP_CONFIG_DIR = '/private/operator/config';
+    process.env.OWENLOOP_CREDENTIAL_COMMAND = 'private-command';
+    const { hub } = mockHub({ getOrder: [commandOrder()] });
+    const command = fakeRunner();
+    let cleanups = 0;
+    const loop = createExecLoop(baseOpts(hub, command.runner, {
+      routedPrestart: async () => ({ consumedFilePathsJson: '[]', cleanup: async () => { cleanups++; } }),
+      routedPublicEnv: { HOME: '/private/stage/home', OWENLOOP_CONFIG_DIR: '/private/stage/public' },
+    }));
+    const outcome = loop.run();
+    await macrotaskSleep();
+    const child = command.starts[0]!.env!;
+    assert.equal(child.HOME, '/private/stage/home');
+    assert.equal(child.OWENLOOP_CONFIG_DIR, '/private/stage/public');
+    assert.equal(child.OWENLOOP_TOKEN, undefined);
+    assert.equal(child.OWENLOOP_CREDENTIAL_COMMAND, undefined);
+    assert.equal(child.OWENLOOP_CONSUMED_FILE_PATHS_JSON, '[]');
+    command.resolve(result(0));
+    assert.equal(await outcome, 'submitted');
+    assert.equal(cleanups, 1);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+});
+
 /** A manually advanced clock so submit-backoff tests never need real timers. */
 function controlledClock(): {
   sleep: (ms: number) => Promise<void>;

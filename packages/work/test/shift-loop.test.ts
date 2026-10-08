@@ -4695,7 +4695,9 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
   const options = baseOpts(hub, spawner, { workflow: 'wf', now: () => 1000, routingSession: session,
     stageRoutedDefinition: async order => {
       const path = mkdtempSync(join(stateDir, '.routing-def-'));
-      return { path, digest: order.defDigest!, cleanup: () => rmSync(path, { recursive: true, force: true }) };
+      return { path, digest: order.defDigest!, verifyOrder: async () => {},
+	canSubmit: () => false, canReplay: () => false,
+	cleanup: () => rmSync(path, { recursive: true, force: true }) };
     },
     selectRoutingTuples: c => c.tuples, computeServeCapabilities: () => ['build'],
     resolveOrderStep: async () => ({ name: 'builder', executor: 'command' }),
@@ -4714,7 +4716,9 @@ test('routed staging that finishes after session stop cannot reserve or spawn', 
     entered();
     await pending;
     stagedPath = mkdtempSync(join(stateDir, '.routing-def-'));
-    return { path: stagedPath, digest: order.defDigest!, cleanup: () => rmSync(stagedPath, { recursive: true, force: true }) };
+    return { path: stagedPath, digest: order.defDigest!, verifyOrder: async () => {},
+	canSubmit: () => false, canReplay: () => false,
+	cleanup: () => rmSync(stagedPath, { recursive: true, force: true }) };
   } });
   const iteration = loop.iterate();
   await started;

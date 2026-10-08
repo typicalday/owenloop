@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
-import { HubError, type WorkOrder } from '../src/hub/types.ts';
+import { openRoutingRoleStage } from '../src/roles/routing-role-stage.ts';
+import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
+import { HubError, type GetOrderResponse, type WorkOrder } from '../src/hub/types.ts';
 import { packBundle } from '../../../src/bundle/index.ts';
 import { canonicalJsonBytes } from '../../../src/install.ts';
 import { DSSE_SSH_NAMESPACE, dsseSignPublication } from '../../../src/crypto/dsse.ts';
@@ -17,11 +19,11 @@ import { writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 const temp = (prefix: string) => mkdtempSync(join(tmpdir(), prefix));
 const workflow = 'name: recovered\ninputs: []\nsteps:\n  - name: command\n    consumes: []\n    produces: [out]\n    terminal: true\n    command: echo recovered\n';
 
-async function fixture() {
+async function fixture(workflowSource = workflow) {
   const home = temp('routing-stage-home-');
   const stateDir = temp('routing-stage-state-');
   const workRoot = temp('routing-stage-work-');
-  const packed = packBundle(writeBundleSource({ name: 'recovered', workflow }));
+  const packed = packBundle(writeBundleSource({ name: 'recovered', workflow: workflowSource }));
   const keyPath = join(home, 'publisher');
   execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', keyPath], { stdio: 'ignore' });
   const publicKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
@@ -68,6 +70,55 @@ test('routed staging keeps signed exact bytes and public trust private without m
   assert.equal(JSON.stringify(descriptor).includes('secret-marker'), false);
   stage.cleanup();
   assert.equal(existsSync(stage.path), false);
+});
+
+test('parent full-order gate rechecks current publication trust and actual workdir', async () => {
+  const f = await fixture();
+  let prestartAuthorized = true;
+  const stage = await stageRoutedDefinition({ ...f.args, stillAuthorized: () => prestartAuthorized });
+  const response: GetOrderResponse = { text: '', workflow: 'wf', run: 'run', lease: { claimed: true },
+    order: { workflow: 'wf', run: 'run', step: 'command', key: '', defDigest: f.packed.digest,
+      worker: 'command', inputs: [], outputs: ['out'], consumes: {},
+      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] } };
+  await stage.verifyOrder(response);
+  prestartAuthorized = false;
+  await stage.verifyOrder(response); // Broker, not pre-start preference, gates the live original session.
+  assert.equal(stage.canReplay(response.order!, 'out'), true);
+  await assert.rejects(stage.verifyOrder({ ...response, order: { ...response.order!, workdir: stage.path } }),
+    /routed workdir overlaps definition trust/);
+  writeFileSync(join(f.config, 'allowed_signers'), '', { mode: 0o600 });
+  await assert.rejects(stage.verifyOrder(response), /routed definition trust changed|routed command definition refused/);
+  stage.cleanup();
+});
+
+test('parent full-order gate refuses input-derived workdir without an authenticated input witness', async () => {
+  const f = await fixture('name: recovered\ninputs:\n  - name: target\nsteps:\n  - name: command\n' +
+    '    consumes: []\n    produces: [out]\n    terminal: true\n' +
+    '    workdirFrom: target.path\n    command: echo recovered\n');
+  const stage = await stageRoutedDefinition(f.args);
+  const response: GetOrderResponse = { text: '', workflow: 'wf', run: 'run', lease: { claimed: true },
+    order: { workflow: 'wf', run: 'run', step: 'command', key: '', defDigest: f.packed.digest,
+      worker: 'command', workdir: f.args.workRoot, inputs: [], outputs: ['out'], consumes: {},
+      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] } };
+  await assert.rejects(stage.verifyOrder(response), /routed workdir witness unavailable/);
+  stage.cleanup();
+});
+
+test('routed role opens only the staged public definition store', async () => {
+  const f = await fixture();
+  const stage = await stageRoutedDefinition(f.args);
+  const handoff = { definitionStage: { path: stage.path, digest: stage.digest },
+    reservation: { workflow: 'wf', run: 'run' } } as RoutingHandoffV1;
+  const opened = openRoutingRoleStage(handoff);
+  assert.equal(opened.publicEnv.OWENLOOP_CONFIG_DIR, join(stage.path, 'public'));
+  assert.equal(opened.publicEnv.HOME, join(stage.path, 'home'));
+  assert.equal(JSON.stringify(opened.publicEnv).includes('secret-marker'), false);
+  const command = await opened.instructions.resolveCommand({ workflow: 'wf', run: 'run', step: 'command',
+    key: '', defDigest: f.packed.digest, worker: 'command', inputs: [], outputs: ['out'], consumes: {},
+    owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] });
+  assert.equal(command.ok, true);
+  stage.cleanup();
+  assert.throws(() => openRoutingRoleStage(handoff), /routing definition stage refused/);
 });
 
 test('routed staging applies matched origin rules but permits namespaces without a rule', async () => {

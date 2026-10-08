@@ -94,6 +94,8 @@ import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verif
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { consumeRoutingHandoff } from './routing-handoff.ts';
+import { createRoutingRoleClient } from './routing-role-client.ts';
+import { openRoutingRoleStage } from './routing-role-stage.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { effectiveRosterLayers, mergeRosterLayers, type MergedRoster } from '../settings/roster.ts';
@@ -314,6 +316,25 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const env = deps.env ?? process.env;
+  const routingExpected = env['OWENLOOP_ROUTING_SESSION'] === '1'
+    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined;
+  if (routingExpected) {
+    // The private handoff is consumed before reading an operator settings or
+    // credential path. A routed child must carry Shift's exact origin.
+    if (!parsed.origin) { err('owenloop work agent-run: routing handoff refused'); return 1; }
+    try {
+      const handoff = consumeRoutingHandoff({ env, origin: parsed.origin, target, kind: 'agent-run' });
+      if (!handoff) throw new Error('missing routing handoff');
+      createRoutingRoleClient(handoff);
+      openRoutingRoleStage(handoff);
+    } catch {
+      err('owenloop work agent-run: routing handoff refused');
+      return 1;
+    }
+    err('owenloop work agent-run: routed launch fence unavailable');
+    return 1;
+  }
   let settings;
   try {
     settings = loadSettings(env);
@@ -326,22 +347,6 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
-  }
-
-  const routingExpected = env['OWENLOOP_ROUTING_SESSION'] === '1'
-    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
-    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined;
-  try {
-    const handoff = consumeRoutingHandoff({ env, origin, target, kind: 'agent-run' });
-    if (routingExpected || handoff) {
-      // This slice establishes private startup authority. The agent's final
-      // read/reservation/adapter fence is installed in the next slice.
-      err('owenloop work agent-run: routed launch fence unavailable');
-      return 1;
-    }
-  } catch {
-    err('owenloop work agent-run: routing handoff refused');
-    return 1;
   }
 
   const consumedVerifier = deps.consumedVerifier ?? createConsumedVerifier({
