@@ -56,7 +56,7 @@
  * cold replay WITHIN THE SAME FIRING — the order is still leased, so handing it
  * back would waste a whole re-offer cycle to learn something already known.
  */
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { isExistingDirectory, isWorkdirAllowed } from './workdir.ts';
@@ -230,6 +230,9 @@ export interface AgentRunLoopOptions {
     selected: LocalModelTuple;
     authorize(signal: AbortSignal): Promise<{ selected: LocalModelTuple; expiresAt: number }>;
   }>;
+  /** One-use private holder subcap for nested MCP. Required for routed starts;
+   * never substitute the operator account selector or a bearer fallback. */
+  routingHolderPath?: string;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
@@ -1230,7 +1233,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       if (delta.deliveredReasonAt !== undefined) deliveredReasonAt = delta.deliveredReasonAt;
     }
 
-    const owenloopMcp = buildOwenloopMcp(spec);
+    if (routedSelection && (!opts.routingHolderPath || !isAbsolute(opts.routingHolderPath)))
+      return releaseWith('routed-holder-unavailable', 'routed-launch-refused');
+    const owenloopMcp = buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath);
     /**
      * The human approval channel for this session's escalated tool calls.
      *

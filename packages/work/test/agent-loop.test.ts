@@ -291,6 +291,7 @@ interface BuildOpts {
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   routedSelect?: AgentRunLoopOptions['routedSelect'];
+  routingHolderPath?: string;
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
 	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
@@ -321,6 +322,9 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
     resolveCrewRosters: b.resolveCrewRosters ?? (() => ({ ok: true, rosters: [] })),
     ...(b.routedSelect === undefined ? {} : { routedSelect: b.routedSelect }),
+    ...(b.routedSelect === undefined ? {} : {
+      routingHolderPath: b.routingHolderPath ?? '/private/routed-holder.json',
+    }),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
@@ -393,6 +397,11 @@ test('routed single-output first start awaits authorization after adapter policy
   assert.deepEqual(starts[0]?.kind === 'start' &&
     { model: starts[0].args.model, effort: starts[0].args.effort },
     { model: 'service-model', effort: 'high' });
+  if (starts[0]?.kind !== 'start') assert.fail('missing routed start');
+  assert.ok(starts[0].args.owenloopMcp.args.includes('--routing-holder'));
+  assert.ok(starts[0].args.owenloopMcp.args.includes('/private/routed-holder.json'));
+  assert.equal(starts[0].args.owenloopMcp.args.includes('--as'), false);
+  assert.equal(starts[0].args.owenloopMcp.args.includes('acct-1'), false);
   assert.equal(adapter.calls.filter(call => call.kind === 'deliver').length, 0);
   assert.equal(verbs(calls).includes('report_resolution'), false);
 });
@@ -408,6 +417,19 @@ test('routed authorization refusal starts no provider process', async () => {
   assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
   assert.ok(h.errs.some(line => line.includes('routed launch authorization refused')));
   assert.ok(h.errs.every(line => !line.includes('private broker failed')));
+});
+
+test('routed start refuses missing holder subcap before report and provider work', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let authorized = false;
+  const h = buildOpts({ hub, adapter, routingHolderPath: '', routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => { authorized = true; throw new Error('must not authorize'); },
+  }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(authorized, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
 });
 
 test('routed authorization tuple mismatch starts no provider process', async () => {
