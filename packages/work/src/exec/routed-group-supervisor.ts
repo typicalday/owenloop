@@ -8,6 +8,7 @@
 export const ROUTED_GROUP_SUPERVISOR = String.raw`
 const { spawn, execFileSync } = require('node:child_process');
 const { existsSync } = require('node:fs');
+const { performance } = require('node:perf_hooks');
 
 let token;
 let shell;
@@ -16,6 +17,9 @@ let shellExit;
 let shellResultSent = false;
 let forwardedStdoutBytes = 0;
 let forwardedStderrBytes = 0;
+let lastOutputAt = performance.now();
+let shellExitedAt;
+let outputTimer;
 let settling = false;
 let graceMs = 5000;
 
@@ -31,6 +35,7 @@ function fail(type) {
 function sendShellResult() {
   if (shellResultSent || !shellExit) return;
   shellResultSent = true;
+  clearTimeout(outputTimer);
   // The shell's pipes may stay open through a background descendant. Bound
   // direct-result capture after the shell exits; settlement owns that group.
   shell.stdout?.destroy();
@@ -41,6 +46,26 @@ function sendShellResult() {
   };
   process.stdout.write('', flushed);
   process.stderr.write('', flushed);
+}
+
+function checkOutputAfterExit() {
+  if (shellResultSent || !shellExit) return;
+  if (shell.stdout.readableEnded && shell.stderr.readableEnded) {
+    sendShellResult();
+    return;
+  }
+  const now = performance.now();
+  const exceededBound = now - shellExitedAt >= 5000;
+  const idleWithoutBackpressure = !process.stdout.writableNeedDrain && !process.stderr.writableNeedDrain &&
+    now - lastOutputAt >= 200;
+  if (exceededBound || idleWithoutBackpressure) {
+    // A descendant may have inherited a pipe, or direct output may still be
+    // backlogged. Neither can be called a complete successful shell result.
+    shellExit = { type: 'shell-result', code: null, signal: null, error: 'output-incomplete' };
+    sendShellResult();
+    return;
+  }
+  outputTimer = setTimeout(checkOutputAfterExit, 50);
 }
 
 function ownGroup() {
@@ -97,8 +122,8 @@ process.on('message', (message) => {
     }
     shell.stdout.pipe(process.stdout, { end: false });
     shell.stderr.pipe(process.stderr, { end: false });
-    shell.stdout.on('data', (chunk) => { forwardedStdoutBytes += chunk.length; });
-    shell.stderr.on('data', (chunk) => { forwardedStderrBytes += chunk.length; });
+    shell.stdout.on('data', (chunk) => { forwardedStdoutBytes += chunk.length; lastOutputAt = performance.now(); });
+    shell.stderr.on('data', (chunk) => { forwardedStderrBytes += chunk.length; lastOutputAt = performance.now(); });
     shell.on('error', (error) => {
       if (!shellResult) {
         shellResult = { type: 'shell-result', code: null, signal: null, error: String(error) };
@@ -119,9 +144,9 @@ process.on('message', (message) => {
       if (!shellResult) {
         shellResult = { type: 'shell-result', code, signal };
         shellExit = shellResult;
-        // A descendant inheriting stdout/stderr must not hold direct-shell
-        // completion open. Normal shell output drains before this fallback.
-        setTimeout(sendShellResult, 200).unref();
+        shellExitedAt = performance.now();
+        lastOutputAt = shellExitedAt;
+        checkOutputAfterExit();
       }
     });
     shell.on('close', (code, signal) => {

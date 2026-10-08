@@ -73,12 +73,87 @@ test('inherited output pipes cannot prevent direct shell result or group settlem
       `${quote(process.execPath)} -e ${quote(background)} & echo direct`, { cwd },
     );
     const direct = await Promise.race([running.done, sleep(2_000).then(() => { throw new Error('direct result hung'); })]);
-    assert.equal(direct.exitCode, 0, JSON.stringify(direct));
+    assert.equal(direct.exitCode, null, JSON.stringify(direct));
+    assert.equal(direct.error, 'output-incomplete');
     assert.equal(direct.outputTail, 'direct\n');
     const settled = await running.settleEffects({ reason: 'natural-exit', deadlineAt: performance.now() + 5_000 });
     assert.equal(settled.state, 'empty', JSON.stringify(settled));
   } finally {
     if (running) await running.settleEffects({ reason: 'stop', deadlineAt: performance.now() + 5_000 });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('slow consumer never receives success for truncated direct output', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-routed-group-'));
+  const child = spawn(process.execPath, ['--eval', ROUTED_GROUP_SUPERVISOR], {
+    cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  const token = 'fedcba9876543210fedcba9876543210';
+  const size = 512 * 1024;
+  let bytes = 0;
+  child.stdout!.pause();
+  child.stdout!.on('data', (chunk: Buffer) => { bytes += chunk.length; });
+  try {
+    const result = new Promise<{ code: number | null; error?: string; stdoutBytes: number }>((resolve, reject) => {
+      child.on('message', (raw: unknown) => {
+        const msg = raw as { token?: string; type?: string; code: number | null; error?: string; stdoutBytes: number };
+        if (msg.token === token && msg.type === 'shell-result') resolve(msg);
+      });
+      child.on('error', reject);
+    });
+    child.send({ type: 'start', token, command: `head -c ${size} /dev/zero`, cwd, env: process.env, graceMs: 30 });
+    await sleep(500); // deliberately hold the parent output pipe beyond the old 200 ms cutoff
+    child.stdout!.resume();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const observed = await Promise.race([
+      result,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error('output result hung')), 5_000);
+      }),
+    ]).finally(() => { if (timeout) clearTimeout(timeout); });
+    assert.equal(observed.code === 0 ? observed.stdoutBytes === size : observed.error === 'output-incomplete', true,
+      JSON.stringify(observed));
+    if (observed.code === 0) assert.equal(bytes, size);
+    child.send({ type: 'settle', token, reason: 'natural-exit' });
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('post-exit pipe deadline is monotonic under a regressed wall clock', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-routed-group-'));
+  const child = spawn(process.execPath, ['--eval', `Date.now=()=>-1000000000000;\n${ROUTED_GROUP_SUPERVISOR}`], {
+    cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  const token = 'abcdef0123456789abcdef0123456789';
+  child.stdout!.resume();
+  child.stderr!.resume();
+  try {
+    const result = new Promise<{ code: number | null; error?: string }>((resolve, reject) => {
+      child.on('message', (raw: unknown) => {
+        const msg = raw as { token?: string; type?: string; code: number | null; error?: string };
+        if (msg.token === token && msg.type === 'shell-result') resolve(msg);
+      });
+      child.on('error', reject);
+    });
+    child.send({ type: 'start', token, command: 'sleep 30 & exit 0', cwd, env: process.env, graceMs: 30 });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const observed = await Promise.race([
+      result,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error('post-exit cutoff hung')), 2_000);
+      }),
+    ]).finally(() => { if (timeout) clearTimeout(timeout); });
+    assert.equal(observed.code, null);
+    assert.equal(observed.error, 'output-incomplete');
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    child.send({ type: 'settle', token, reason: 'natural-exit' });
+    await exited;
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     rmSync(cwd, { recursive: true, force: true });
   }
 });
