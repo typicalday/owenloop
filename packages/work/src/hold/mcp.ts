@@ -71,9 +71,9 @@ function consumedFile(order: OrderPacket, path: string, key: string): FileArtifa
     if (Object.hasOwn(row, '__file')) {
       if (row.__file !== key) return;
       if (typeof row.hash !== 'string' || !/^[a-f0-9]{64}$/.test(row.hash)
-        || typeof row.size !== 'number' || !Number.isSafeInteger(row.size)
-        || row.size < 1 || row.size > 500_000_000
-        || typeof row.contentType !== 'string' || !row.contentType) return;
+	|| typeof row.size !== 'number' || !Number.isSafeInteger(row.size)
+	|| row.size < 1 || row.size > 500_000_000
+	|| typeof row.contentType !== 'string' || !row.contentType) return;
       const pointer = row as unknown as FileArtifactPointer;
       if (found && JSON.stringify(found) !== JSON.stringify(pointer)) conflicting = true;
       else found = pointer;
@@ -431,7 +431,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         captured = orderResponse;
 
         let proof: string | undefined;
-        if (!deps.routedSubmit && deps.origin !== undefined && orderResponse.order !== null) {
+	if (!deps.routedSubmit && deps.origin !== undefined && orderResponse.order !== null) {
           proof = await buildSubmitProof({
             origin: deps.origin,
             order: orderResponse.order,
@@ -652,27 +652,27 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       const gone = terminalGuard();
       if (gone !== undefined) return gone;
       if (!deps.downloadFile || !deps.discardDownloadedFile)
-        return textResult({ error: 'file-artifact-download-unavailable' }, true);
+	return textResult({ error: 'file-artifact-download-unavailable' }, true);
       const path = args['path'], key = args['key'];
       if (typeof path !== 'string' || !path || typeof key !== 'string' || !key
-        || !captured?.order)
-        return textResult({ error: 'file-artifact-download-refused: call get_order and choose a consumed pointer' }, true);
+	|| !captured?.order)
+	return textResult({ error: 'file-artifact-download-refused: call get_order and choose a consumed pointer' }, true);
       const pointer = consumedFile(captured.order, path, key);
       if (!pointer) return textResult({ error: 'file-artifact-download-refused: pointer is not consumed by this run' }, true);
       const controller = new AbortController();
       fileTransfers.add(controller);
       ctx.onCancel(() => controller.abort());
       try {
-        const result = await deps.downloadFile({ workflow, run, path, pointer }, controller.signal);
-        const after = terminalGuard();
-        if (after !== undefined || ctx.cancelled || controller.signal.aborted) {
-          await deps.discardDownloadedFile(result.file);
-          return after ?? textResult({ error: 'file-artifact-download-cancelled' }, true);
-        }
-        return textResult({ file: result.file, size: result.size, contentType: result.contentType,
-          hash: pointer.hash });
+	const result = await deps.downloadFile({ workflow, run, path, pointer }, controller.signal);
+	const after = terminalGuard();
+	if (after !== undefined || ctx.cancelled || controller.signal.aborted) {
+	  await deps.discardDownloadedFile(result.file);
+	  return after ?? textResult({ error: 'file-artifact-download-cancelled' }, true);
+	}
+	return textResult({ file: result.file, size: result.size, contentType: result.contentType,
+	  hash: pointer.hash });
       } catch (e) {
-        return textResult({ error: errMsg(e) }, true);
+	return textResult({ error: errMsg(e) }, true);
       } finally { fileTransfers.delete(controller); }
     },
   };

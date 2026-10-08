@@ -107,46 +107,46 @@ export function openRoutedFileCache(
       let handle: Awaited<ReturnType<typeof open>> | undefined;
       let committed = false;
       try {
-        if (signal?.aborted || closed) throw new Error('file-artifact-download-cancelled');
-        source = await download(req, controller.signal);
-        // The broker may discover a bad digest while the writer is still
-        // draining buffered chunks. Observe early refusal before awaiting it.
-        void source.verified.catch(() => {});
-        if (closed || controller.signal.aborted || source.size !== size
-          || source.contentType !== req.pointer.contentType)
-          throw new Error('file-artifact-download-refused');
-        handle = await open(stage, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-        let count = 0;
-        for await (const chunk of source.chunks) {
-          if (closed || controller.signal.aborted || !(chunk instanceof Uint8Array)
-            || count + chunk.byteLength > size) throw new Error('file-artifact-download-refused');
-          let offset = 0;
-          while (offset < chunk.byteLength) {
-            const wrote = await handle.write(chunk, offset, chunk.byteLength - offset);
-            if (wrote.bytesWritten < 1) throw new Error('file-artifact-cache-write-failed');
-            offset += wrote.bytesWritten;
-          }
-          count += chunk.byteLength;
-        }
-        await source.verified;
-        if (count !== size || closed || controller.signal.aborted)
-          throw new Error('file-artifact-download-refused');
-        await handle.close();
-        handle = undefined;
-        await chmod(stage, 0o400);
-        if (closed || controller.signal.aborted) throw new Error('file-artifact-download-cancelled');
-        await rename(stage, final);
-        committed = true;
-        published.set(final, size);
-        return { file: final, size, contentType: req.pointer.contentType };
+	if (signal?.aborted || closed) throw new Error('file-artifact-download-cancelled');
+	source = await download(req, controller.signal);
+	// The broker may discover a bad digest while the writer is still
+	// draining buffered chunks. Observe early refusal before awaiting it.
+	void source.verified.catch(() => {});
+	if (closed || controller.signal.aborted || source.size !== size
+	  || source.contentType !== req.pointer.contentType)
+	  throw new Error('file-artifact-download-refused');
+	handle = await open(stage, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	let count = 0;
+	for await (const chunk of source.chunks) {
+	  if (closed || controller.signal.aborted || !(chunk instanceof Uint8Array)
+	    || count + chunk.byteLength > size) throw new Error('file-artifact-download-refused');
+	  let offset = 0;
+	  while (offset < chunk.byteLength) {
+	    const wrote = await handle.write(chunk, offset, chunk.byteLength - offset);
+	    if (wrote.bytesWritten < 1) throw new Error('file-artifact-cache-write-failed');
+	    offset += wrote.bytesWritten;
+	  }
+	  count += chunk.byteLength;
+	}
+	await source.verified;
+	if (count !== size || closed || controller.signal.aborted)
+	  throw new Error('file-artifact-download-refused');
+	await handle.close();
+	handle = undefined;
+	await chmod(stage, 0o400);
+	if (closed || controller.signal.aborted) throw new Error('file-artifact-download-cancelled');
+	await rename(stage, final);
+	committed = true;
+	published.set(final, size);
+	return { file: final, size, contentType: req.pointer.contentType };
       } finally {
-        if (handle) await handle.close().catch(() => {});
-        if (!committed) {
-          if (source?.chunks instanceof Readable) source.chunks.destroy();
-          await rm(stage, { force: true }).catch(() => {});
-          reservedFiles--;
-          reservedBytes -= size;
-        }
+	if (handle) await handle.close().catch(() => {});
+	if (!committed) {
+	  if (source?.chunks instanceof Readable) source.chunks.destroy();
+	  await rm(stage, { force: true }).catch(() => {});
+	  reservedFiles--;
+	  reservedBytes -= size;
+	}
       }
     })();
     pending.add(work);

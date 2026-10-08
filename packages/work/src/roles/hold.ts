@@ -482,7 +482,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       workdir: process.cwd(),
       ...(routedUploadFile ? { uploadFile: routedUploadFile } : {}),
       ...(routedFileClient ? { downloadFile: routedFileClient.downloadFile,
-        discardDownloadedFile: routedFileClient.discardDownloadedFile } : {}),
+	discardDownloadedFile: routedFileClient.discardDownloadedFile } : {}),
       ...(routed ? { routedSubmit: true as const } : {}),
       ...(parsed.verifiedHosted ? { tools: ['get_order' as const] }
 	: parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),

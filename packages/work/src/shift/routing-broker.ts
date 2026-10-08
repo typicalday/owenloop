@@ -31,7 +31,7 @@ const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_SOCKETS = 16;
 const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
-type Method = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
+type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
   | 'read_invocation_binding';
 type CapScope = 'role' | 'holder';
@@ -50,6 +50,8 @@ interface Grant {
   hub: RoutingHubClient;
   reservationRequest?: LaunchReservationRequestV1;
   launchReservationId?: string;
+  launchExpiresAt?: number;
+  acceptedLaunchReport?: string;
   submissionAuthority?: RoutedSubmissionAuthority;
   submitBusy?: boolean;
   pendingSubmit?: { intent: string; binding: string; request: import('../hub/types.ts').ConditionalSubmitRequest };
@@ -119,7 +121,8 @@ function validateSessionGrant(grant: Grant, now: number): boolean {
     && claim.state === 'claimed'
     && /^[a-f0-9]{32}$/.test(reservation.token)
     && (reservation.childKind === 'exec' || reservation.childKind === 'agent-run')
-    && claim.claimId === reservation.run && claim.orderId === reservation.run && claim.attemptId === reservation.run
+    && claim.claimId === reservation.run && claim.orderId === reservation.run
+    && typeof claim.attemptId === 'string' && claim.attemptId.length > 0 && claim.attemptId.length <= 512
     && claim.sessionId === identity.sessionId && claim.shiftId === identity.shiftId
     && claim.principalId === identity.principalId && claim.binding.orgId === identity.orgId
     && claim.binding.runId === reservation.workflow
@@ -292,18 +295,30 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
   if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit'
     && method !== 'ask' && method !== 'reject')
     throw new Error('routing broker request refused');
-  const launch = method === 'assess_local_model' || method === 'reserve_launch' || method === 'report_launch';
+  const launch = method === 'get_launch_order' || method === 'assess_local_model'
+    || method === 'reserve_launch' || method === 'report_launch';
   if (!grant.ready || !(launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now())))
     throw new Error('routing broker grant expired');
   const { workflow, run, childKind } = grant.reservation;
   switch (method) {
+    case 'get_launch_order':
     case 'get_order': {
       if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
       if (!grant.submissionAuthority) throw new Error('routing order authority unavailable');
-      const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now);
+      const prestart = method === 'get_launch_order';
+      if (prestart && (!grant.reservationRequest || !grant.acceptedLaunchReport || !grant.launchAuthority
+	|| grant.launchExpiresAt === undefined || now() >= grant.launchExpiresAt))
+	throw new Error('routing launch report unavailable');
+      const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, prestart);
       if (!validOrderResponse(grant, response)) throw new Error('routing broker response refused');
       if (response.lease.claimed && response.order)
-	await checked(grant, grant.submissionAuthority.verifyOrder(response), now);
+	await checked(grant, grant.submissionAuthority.verifyOrder(response), now, prestart);
+      if (prestart) {
+	if (!response.lease.claimed || !response.order) throw new Error('routing launch order unavailable');
+	await checked(grant, grant.launchAuthority!.verifySelection(response.order,
+	  structuredClone(grant.reservationRequest!)), now, true);
+	if (now() >= grant.launchExpiresAt!) throw new Error('routing launch reservation expired');
+      }
       const order = response.order;
       grant.allowedPaths = order && response.lease.claimed
 	? new Set((order.owes.length ? order.owes.map(owe => owe.path) : order.outputs))
@@ -354,6 +369,10 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	throw new Error('routing broker reservation refused');
       grant.reservationRequest = structuredClone(request);
       grant.launchReservationId = response.reservationId;
+      grant.launchExpiresAt = response.expiresAt;
+      // An idempotent reservation refresh still needs its matching report ACK
+      // before a launch read; an older accepted report cannot authorize it.
+      grant.acceptedLaunchReport = undefined;
       return response;
     }
     case 'report_launch': {
@@ -375,6 +394,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	  || response.provenance !== 'authenticated-worker-report'
 	  || !Number.isSafeInteger(response.recordedAt) || response.recordedAt < 0)
 	  throw new Error('routing launch report acknowledgement refused');
+	grant.acceptedLaunchReport = response.digest;
 	return response;
       }
     }
@@ -659,7 +679,7 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    return;
 	  }
 	  if (tail.length > 0) throw new Error();
-	  const methods: readonly string[] = ['get_order', 'read_routing_claim', 'assess_local_model',
+  const methods: readonly string[] = ['get_order', 'get_launch_order', 'read_routing_claim', 'assess_local_model',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding'];
 	  if (!methods.includes(request.method)) throw new Error();

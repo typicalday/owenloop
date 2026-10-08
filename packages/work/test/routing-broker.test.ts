@@ -334,6 +334,7 @@ test('agent-run session holder is pinned to the original routing session', async
     await assert.rejects(client.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
     await assert.rejects(holderClient.release({ workflow: 'wf', run: 'run' }), /broker unavailable/);
     await assert.rejects(holderClient.readRoutingClaim({ workflow: 'wf', run: 'run' }), /broker unavailable/);
+    await assert.rejects(holderClient.getLaunchOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
     assert.equal(seen.length, 3, 'holder cap cannot invoke role methods or spoof the exec holder');
     grant.terminal();
     await assert.rejects(holderClient.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
@@ -945,8 +946,71 @@ test('prestart report rechecks parent selection and exact acknowledgement after 
       assert.equal((await send('reserve_launch', { request: launch })).ok, true);
       drift = mode === 'drift';
       assert.equal((await send('report_launch', { report })).ok, false);
+      assert.equal((await send('get_launch_order', { holder })).ok, false);
       assert.equal(selections, 2);
       assert.equal(reports, mode === 'drift' ? 0 : 1);
     } finally { await broker.close(); }
   }
+});
+
+test('final role launch read checks accepted report and current selection without expiring ordinary holder reads', async () => {
+  let now = 2_000, drift = false, expireDuringSelection = false, selections = 0;
+  const pinned = { ...routing, claim: { ...routing.claim, attemptId: 'attempt_distinct' } };
+  const launch = { version: 'launch-reservation-v1' as const, claimId: 'run', decisionId: 'decision',
+    binding, orderId: 'run', attemptId: 'attempt_distinct', rosterRevision: 'roster-v1', candidateIds: [],
+    assessmentId: null, requested: null, selected: null };
+  const calls: string[] = [];
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => now },
+    fetchImpl: (async (url, init) => {
+      const verb = String(url).split('/').at(-1)!;
+      calls.push(verb);
+      if (verb === 'get_order') {
+	const current = parentOrder();
+	current.order.routing = pinned;
+	return Response.json(current);
+      }
+      if (verb === 'reserve_launch') return Response.json({ reservationId: 'lr_distinct', orderId: 'run', expiresAt: 40_000 });
+      const report = JSON.parse(String(init!.body)).report;
+      return Response.json({ orderId: 'run', digest: valueDigestHex(report), recordedAt: now,
+	provenance: 'authenticated-worker-report' });
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => now });
+  try {
+    const grant = broker.issue({ reservation, routing: pinned, identity, currentIdentity: () => identity, hub,
+      submissionAuthority: transportAuthority, launchAuthority: { verifySelection: async (_order, selected) => {
+	selections++;
+	assert.deepEqual(selected, launch);
+	if (drift) throw new Error('current parent roster changed');
+	if (expireDuringSelection) now = 45_000;
+      } } });
+    grant.activate(child);
+    const client = createRoutingChildClient({ broker: grant, reservation });
+    const read = { workflow: 'wf', run: 'run', holder };
+    await assert.rejects(client.getLaunchOrder(read), /routing broker unavailable/);
+    assert.equal(calls.length, 0, 'no final launch read without an accepted reservation/report');
+    await client.reserveLaunch({ workflow: 'wf', request: launch });
+    await assert.rejects(client.getLaunchOrder(read));
+    const report = { version: 'launch-v1' as const, reservationId: 'lr_distinct', decisionId: 'decision',
+      binding, claimId: 'run', orderId: 'run', attemptId: 'attempt_distinct', requested: null,
+      selected: null, observation: { state: 'unknown' as const } };
+    await client.reportLaunch({ workflow: 'wf', report });
+    assert.equal((await client.getLaunchOrder(read)).order?.run, 'run');
+    assert.equal(selections, 3, 'reserve, report, and final read each verify current parent selection');
+    const prior = calls.length;
+    await assert.rejects(client.reserveLaunch({ workflow: 'wf', request: { ...launch, attemptId: 'invented' } }));
+    assert.equal(calls.length, prior, 'opaque attempt must still match the pinned Service claim');
+    drift = true;
+    await assert.rejects(client.getLaunchOrder(read));
+    assert.equal((await client.getOrder(read)).order?.run, 'run', 'ordinary scoped reads do not grant a new start');
+    drift = false;
+    expireDuringSelection = true;
+    await assert.rejects(client.getLaunchOrder(read), /routing broker unavailable/);
+    expireDuringSelection = false;
+    now = 45_000;
+    await assert.rejects(client.getLaunchOrder(read), /routing broker unavailable/);
+    now = 75_000;
+    assert.equal((await client.getOrder(read)).order?.run, 'run', 'launch window is not the live claim lifetime');
+  } finally { await broker.close(); }
 });

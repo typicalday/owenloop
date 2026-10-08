@@ -20,12 +20,15 @@ const MAX_FILE = 500_000_000;
 const UPLOAD_IDLE_MS = 4 * 60_000;
 const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_DOWNLOAD_HEADER = 4096;
-type Verb = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
+type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject'
   | 'request_approval' | 'read_invocation_binding';
 
 export interface RoutingChildClient {
   getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
+  /** Role-only final launch read; requires an accepted report and fresh parent
+   * selection. Ordinary holder reads retain their independent claim lifetime. */
+  getLaunchOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
   readRoutingClaim(req: { workflow: string; run: string }): Promise<RoutingClaimReadResponse>;
   assessLocalModel(req: LocalModelRequest): Promise<LocalModelResponse>;
   reserveLaunch(req: { workflow: string; request: LaunchReservationRequestV1 }): Promise<LaunchReservationResponse>;
@@ -230,7 +233,7 @@ export function createRoutingChildClient(handoff: {
         if (completed) return;
         completed = true;
         clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
+	signal?.removeEventListener('abort', onAbort);
         socket.destroy();
         output.destroy(error);
         verifyReject(error);
@@ -280,7 +283,7 @@ export function createRoutingChildClient(handoff: {
         }
         completed = true;
         clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
+	signal?.removeEventListener('abort', onAbort);
         output.end();
         verifyResolve();
       });
@@ -290,15 +293,18 @@ export function createRoutingChildClient(handoff: {
   };
   return {
     getOrder(req) { bound(req); return exchange('get_order', { holder: req.holder }); },
+    getLaunchOrder(req) { bound(req); return exchange('get_launch_order', { holder: req.holder }); },
     readRoutingClaim(req) { bound(req); return exchange('read_routing_claim', {}); },
     assessLocalModel(req) { bound(req); return exchange('assess_local_model', { candidateIds: req.candidateIds }); },
     reserveLaunch(req) {
-      if (req.workflow !== workflow || req.request.orderId !== run || req.request.attemptId !== run)
+      if (req.workflow !== workflow || req.request.orderId !== run
+	|| typeof req.request.attemptId !== 'string' || !req.request.attemptId)
 	throw new Error('routing order binding refused');
       return exchange('reserve_launch', { request: req.request });
     },
     reportLaunch(req) {
-      if (req.workflow !== workflow || req.report.orderId !== run || req.report.attemptId !== run)
+      if (req.workflow !== workflow || req.report.orderId !== run
+	|| typeof req.report.attemptId !== 'string' || !req.report.attemptId)
 	throw new Error('routing order binding refused');
       return exchange('report_launch', { report: req.report });
     },
