@@ -107,7 +107,14 @@ test('owenloop#236: map with a member reduce can exhaust the finite width-two mo
       }),
     ],
   );
-  const report = modelCheck(fixture, { maxStates: 5_000, maxCollectionSize: 2, assumeProvided: true });
+  // Seal-skip paths expand this graph past 5,000 states. Confirm that smaller
+  // search is bounded, then exhaust the same finite-width graph at 10,000.
+  const atFiveThousand = modelCheck(fixture, {
+    maxStates: 5_000, maxCollectionSize: 2, assumeProvided: true,
+  });
+  assert.equal(atFiveThousand.bounded, true);
+  assert.ok(atFiveThousand.boundsHit.includes('maxStates'));
+  const report = modelCheck(fixture, { maxStates: 10_000, maxCollectionSize: 2, assumeProvided: true });
 
   assert.equal(report.completable, true);
   assert.equal(report.bounded, false);

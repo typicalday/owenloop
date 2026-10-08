@@ -111,6 +111,39 @@ test('collection lease: emit, later schema refusal, same-run correction after ca
   assert.deepEqual(model.leases, []);
 });
 
+test('collection lease: producer skip of its seal keeps the run open and reaches a done-state invariant', () => {
+  const definition = def('skip-collection-seal', [input('q', { seedOwed: false })], [
+    step({ name: 'gather', consumes: ['q'], produces: ['items[]'] }),
+  ]);
+  definition.invariants = [{
+    name: 'done-requires-seal', when: { state: 'done' },
+    requires: { path: 'items.sealed', is: 'green' },
+  }];
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const run = engine.tick(wf).orders.find((order) => order.step === 'gather');
+  assert.ok(run);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const lease: CollectionLease = {
+    step: 'gather', key: run.key, stem: 'items', inputs: ['q'],
+    fingerprint: computeFingerprint(arts(), ['q']),
+  };
+  const before: CollectionCheckState = { arts: arts(), leases: [lease] };
+  engine.skip(wf, 'items.sealed', 'gather', 'no items to emit');
+  const skipped = collectionLeaseSuccessors(definition, before, lease, 1).find((move) =>
+    move.step.outcome === 'skip' && move.step.path === 'items.sealed');
+  assert.ok(skipped, 'a claimed collection producer may skip its seal');
+  assert.deepEqual(fields(skipped.state.arts), fields(arts()));
+  assert.deepEqual(skipped.state.leases, [lease], 'skip does not close the claimed run');
+  assert.equal(engine.status(wf).done, true);
+  engine.close(wf, run.run);
+
+  const report = modelCheck(definition, { maxStates: 100, maxDepth: 5, maxCollectionSize: 1 });
+  const violation = report.invariantViolations.find((entry) => entry.invariant === 'done-requires-seal');
+  assert.ok(violation?.path.some((move) => move.outcome === 'skip' && move.path === 'items.sealed'));
+});
+
 test('collection lease: rejected seal reoffers producer for another emit and reseal', () => {
   const definition = def('reseal-after-reducer-reject', [input('request', { seedOwed: false })], [
     step({ name: 'produce', consumes: ['request'], produces: ['items[]'] }),
