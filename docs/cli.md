@@ -296,9 +296,12 @@ need no Jev installation, credentials, or model selection. The current source
 still refuses routed child startup; this is not a deployed launch capability.
 Its private Shift broker restricts a child to one bound dispatch and an
 allowlisted set of Hub requests while Shift retains the account credential.
-That protocol boundary does not isolate processes running under the same OS
-user ID; hostile child code needs a separate OS isolation design before such
-an isolation claim can be made.
+Shift may prepare a provisional, signed definition snapshot in a private
+operator state subdirectory. A future routed role must check the fresh full
+order's workdir and current operator trust before using that snapshot; the
+current routed role startup fence remains in force. Snapshot validation, Unix
+directory permissions, and the broker protocol do not isolate processes under
+the same user ID; hostile child code needs a separate OS isolation design.
 
 Routed holder file uploads require a server administrator to run
 `owenloop-routing-helper-build` from a trusted package installation on macOS

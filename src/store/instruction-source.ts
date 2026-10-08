@@ -106,6 +106,8 @@ export interface StoreInstructionSource extends OrderInstructionSource {
   getVerifiedDefinition(defDigest: string, step?: string): WorkflowDef | undefined;
   /** Return the installed bundle identity and object path cached by `prime`. */
   getVerifiedObject(defDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined;
+  /** Exact objects whose verified bytes support the primed definition, including locked calls children. */
+  getVerifiedSupport?(defDigest: string, step: string): readonly { bundleDigest: DefDigest; objectPath: string }[] | undefined;
   /** Return the verified `calls:` child that step `callsStep` of the definition
    *  serving `step` invokes, resolved in the same finalized closure the
    *  definition was verified in. Optional so a source without a dependency
@@ -699,6 +701,8 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       const cached = cache.get(requestedDigest)?.[0];
       return cached === undefined ? undefined : { bundleDigest: cached.bundleDigest, objectPath: cached.objectPath };
     },
+    getVerifiedSupport: (requestedDigest: string, stepName: string) =>
+      definitionForStep(requestedDigest, stepName)?.support.map(({ bundleDigest, objectPath }) => ({ bundleDigest, objectPath })),
     getVerifiedCallsChild: (requestedDigest: string, stepName: string, callsStep: string): VerifiedCallsChild | undefined => {
       const cached = cache.get(requestedDigest)?.filter((entry) => entry.def.steps.some((step) => step.name === stepName));
       return cached?.length === 1 ? cached[0]!.callsChildren.get(callsStep) : undefined;

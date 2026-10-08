@@ -60,6 +60,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { RoutingOfferCandidate, ShiftOffer, LocalTupleEligibility } from '../hub/types.ts';
 import type { ShiftRoutingSession, RoutingHandoff } from './runtime.ts';
 import type { RoutingBroker } from './routing-broker.ts';
+import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -106,6 +107,10 @@ export interface ShiftLoopOptions {
   /** Explicit opt-in; absence preserves legacy serving. */
   routingSession?: ShiftRoutingSession;
   routingBroker?: RoutingBroker;
+  /** Required for routed dispatch; prepares exact signed bytes without a role credential. */
+  stageRoutedDefinition?: (order: WorkOrder) => Promise<RoutedDefinitionStage>;
+  maintainDefinitionStages?: () => void;
+  closeDefinitionStages?: () => void;
   /** Intersect service-authorized tuples with this account's current local roster. */
   selectRoutingTuples?: (candidate: RoutingOfferCandidate) => readonly LocalTupleEligibility[];
   hub: HubClient;
@@ -1006,6 +1011,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * one that never settles is exactly what the watchdog below is for.
    */
   async function cycle(): Promise<number> {
+    try { opts.maintainDefinitionStages?.(); }
+    catch { opts.err('routed definition stage maintenance failed'); }
     const dispatched = await iteration();
     cyclesCompleted += 1;
     lastPollAt = opts.now();
@@ -1470,7 +1477,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
   }
 
-  function dispatchCandidate(c: Candidate): DispatchResult {
+  async function dispatchCandidate(c: Candidate): Promise<DispatchResult> {
     if (opts.routingSession) {
       if (routingAttempts.has(c.order.run) || routingRefusals.has(c.order.run)) return 'duplicate';
       if (stopped || !routingClaimAllowed(c)) {
@@ -1505,11 +1512,29 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let reservation: ChildReservation | undefined;
     let handoff: RoutingHandoff | undefined;
     let brokerGrant: ReturnType<RoutingBroker['issue']> | undefined;
+    let definitionStage: RoutedDefinitionStage | undefined;
     let terminalBeforeStart = false;
     let cancel: (() => void) | undefined;
     try {
+      if (opts.routingSession) {
+	if (!opts.stageRoutedDefinition) throw new Error('routed definition staging unavailable');
+	definitionStage = await opts.stageRoutedDefinition(c.order);
+	if (definitionStage.digest !== c.order.defDigest) throw new Error('routed definition digest changed');
+	// Stage downloads can outlive a decision or session. Re-read the
+	// authoritative claim after every staging await, then re-check local
+	// willingness, roster and deadlines before reserving child capacity.
+	const fresh = await opts.routingSession.hub.readRoutingClaim({ workflow: c.workflow,
+	  run: c.order.run }, AbortSignal.timeout(DEFAULT_HUB_CALL_TIMEOUT_MS));
+	if (fresh.freshness !== 'fresh-at-read' || fresh.atomicLaunch !== false
+	  || !isDeepStrictEqual(fresh.routing, c.order.routing)
+	  || stopped || !routingClaimAllowed(c))
+	  throw new Error('routed definition claim changed');
+      }
       const reserved = reserveCandidate(c);
-      if (typeof reserved === 'string') return reserved;
+      if (typeof reserved === 'string') {
+	definitionStage?.cleanup();
+	return reserved;
+      }
       reservation = reserved.reservation;
       if (opts.routingSession) {
 	routingAttempts.set(c.order.run, c.order.routing!.preference.expiresAt);
@@ -1521,10 +1546,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	}
 	const privateHandoff = opts.routingSession.createHandoff(reservation,
 	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap,
-	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) });
+	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) }, definitionStage);
 	handoff = { path: privateHandoff.path, terminal: () => {
 	  brokerGrant?.terminal();
-	  privateHandoff.terminal();
+	  try { privateHandoff.terminal(); }
+	  finally { definitionStage?.cleanup(); }
 	} };
 	routingHandoffs.set(c.order.run, { handoff });
       }
@@ -1588,6 +1614,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       cancel?.();
       brokerGrant?.terminal();
       try { handoff?.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+      definitionStage?.cleanup();
       if (routingHandoffs.get(c.order.run)?.handoff === handoff) routingHandoffs.delete(c.order.run);
       if (reservation !== undefined) {
 	try {
@@ -1676,7 +1703,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   /** Dispatch already-claimed orders when local child capacity becomes free. */
-  function drainPending(live: ChildRecord[], reserved: ChildReservation[]): number {
+  async function drainPending(live: ChildRecord[], reserved: ChildReservation[]): Promise<number> {
     let remaining = cap - live.length - reserved.length;
     if (pendingCandidates.size === 0) return 0;
 
@@ -1705,7 +1732,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       // blocked agent does not head-of-line-block the whole queue.
       if (candidate.kind === 'agent' && agentRoom <= 0) continue;
 
-      const result = dispatchCandidate(candidate);
+      const result = await dispatchCandidate(candidate);
       if (result === 'total-capacity') {
 	remaining = 0;
 	continue;
@@ -2139,7 +2166,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // instead of sitting INFLIGHT behind a heartbeat that will never tick.
     for (const candidate of candidates) {
       if (discardExpiredCandidate(candidate, false)) continue;
-      const result = dispatchCandidate(candidate);
+      const result = await dispatchCandidate(candidate);
       if (result === 'dispatched') {
 	dispatched++;
 	continue;
@@ -2293,7 +2320,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // so use the freed slot to dispatch claims retained from an earlier sweep
     // before consulting the wake cursor.
     let inFlight = reconcile();
-    let dispatched = drainPending(inFlight.live, inFlight.reserved);
+    let dispatched = await drainPending(inFlight.live, inFlight.reserved);
     if (dispatched > 0) inFlight = reconcile();
     const live = inFlight.live;
     const reserved = inFlight.reserved;
@@ -2484,6 +2511,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
   function stop(): void {
     stopped = true;
+    opts.closeDefinitionStages?.();
     stopTimers();
     void opts.routingSession?.stop();
   }

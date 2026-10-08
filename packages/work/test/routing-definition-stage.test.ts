@@ -1,0 +1,236 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+
+import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
+import { HubError, type WorkOrder } from '../src/hub/types.ts';
+import { packBundle } from '../../../src/bundle/index.ts';
+import { canonicalJsonBytes } from '../../../src/install.ts';
+import { DSSE_SSH_NAMESPACE, dsseSignPublication } from '../../../src/crypto/dsse.ts';
+import { createSshSigner } from '../../../src/crypto/ssh.ts';
+import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
+import { writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+
+const temp = (prefix: string) => mkdtempSync(join(tmpdir(), prefix));
+const workflow = 'name: recovered\ninputs: []\nsteps:\n  - name: command\n    consumes: []\n    produces: [out]\n    terminal: true\n    command: echo recovered\n';
+
+async function fixture() {
+  const home = temp('routing-stage-home-');
+  const stateDir = temp('routing-stage-state-');
+  const workRoot = temp('routing-stage-work-');
+  const packed = packBundle(writeBundleSource({ name: 'recovered', workflow }));
+  const keyPath = join(home, 'publisher');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', keyPath], { stdio: 'ignore' });
+  const publicKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
+  const config = join(home, '.owenloop');
+  mkdirSync(config, { mode: 0o700 });
+  writeFileSync(join(config, 'allowed_signers'), `publisher ${publicKey.openSshPublicKey}\n`, { mode: 0o600 });
+  writeFileSync(join(config, 'credentials.json'), 'private-credential-marker', { mode: 0o600 });
+  const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
+  const signed = await dsseSignPublication(Buffer.from(canonicalJsonBytes({
+    digest: packed.digest, name: packed.manifest.package.name,
+    version: packed.manifest.package.version, publisherKeyId: publicKey.keyid, timestamp: Date.now(),
+  })), signer);
+  const publication = canonicalJsonBytes(signed.envelope);
+  const order: WorkOrder = { workflow: 'wf', run: 'run', step: 'command', worker: 'command',
+    defDigest: packed.digest, consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
+  const seen: string[] = [];
+  const fetchImpl: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname;
+    seen.push(path);
+    if (path === `/api/bundles/${packed.digest}`) return new Response(packed.bytes, { status: 200 });
+    if (path === `/api/publications/${packed.digest}`) return new Response(publication, { status: 200,
+      headers: { 'x-owenloop-publication-state': 'signed' } });
+    if (path === `/api/origins/${packed.digest}`) return new Response(null, { status: 404 });
+    throw new Error('unexpected request');
+  };
+  const args = { order, origin: 'https://hub.example', token: 'secret-marker', stateDir, workRoot,
+    sourceEnv: { HOME: home }, beforeRequest: () => {}, onRateLimit: (_error: HubError) => {},
+    stillAuthorized: () => true, fetchImpl };
+  return { args, config, home, stateDir, seen, packed, keyPath, publicKey };
+}
+
+test('routed staging keeps signed exact bytes and public trust private without mutating ordinary store', async () => {
+  const f = await fixture();
+  const stage = await stageRoutedDefinition(f.args);
+  assert.equal(stage.digest, f.packed.digest);
+  assert.deepEqual(f.seen, [
+    `/api/bundles/${f.packed.digest}`, `/api/publications/${f.packed.digest}`, `/api/origins/${f.packed.digest}`,
+  ]);
+  assert.equal(existsSync(join(stage.path, 'public', 'allowed_signers')), true);
+  assert.equal(existsSync(join(stage.path, 'public', 'credentials.json')), false);
+  assert.equal(existsSync(join(f.home, '.owenloop', 'store')), false);
+  const descriptor = JSON.parse(readFileSync(join(stage.path, 'stage.json'), 'utf8'));
+  assert.equal(descriptor.digest, f.packed.digest);
+  assert.equal(JSON.stringify(descriptor).includes('secret-marker'), false);
+  stage.cleanup();
+  assert.equal(existsSync(stage.path), false);
+});
+
+test('routed staging applies matched origin rules but permits namespaces without a rule', async () => {
+  const f = await fixture();
+  writeFileSync(join(f.config, 'settings.json'), JSON.stringify({ originRules: { '*': 'git' } }));
+  await assert.rejects(stageRoutedDefinition(f.args), /routed definition staging refused/);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+});
+
+test('routed staging propagates sanitized 429 and refuses further bundle requests', async () => {
+  const f = await fixture();
+  const observed: HubError[] = [];
+  const fetchImpl: typeof fetch = async input => {
+    f.seen.push(new URL(String(input)).pathname);
+    return new Response('secret-marker', { status: 429, headers: { 'retry-after': '7' } });
+  };
+  await assert.rejects(stageRoutedDefinition({ ...f.args, fetchImpl, onRateLimit: error => observed.push(error) }),
+    (error: unknown) => error instanceof HubError && error.status === 429 && error.retryAfterMs === 7_000
+      && !error.message.includes('secret-marker'));
+  assert.equal(f.seen.length, 1);
+  assert.equal(observed.length, 1);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+});
+
+test('routed staging rejects a lost local claim before recovery fetch', async () => {
+  const f = await fixture();
+  await assert.rejects(stageRoutedDefinition({ ...f.args, stillAuthorized: () => false }),
+    /routed definition staging refused/);
+  assert.equal(f.seen.length, 0);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+});
+
+test('routed staging refuses a state root within the worker root before any fetch', async () => {
+  const f = await fixture();
+  await assert.rejects(stageRoutedDefinition({ ...f.args, workRoot: f.stateDir }),
+    /routed definition staging refused/);
+  assert.equal(f.seen.length, 0);
+  assert.equal(readdirSync(f.stateDir).length, 0);
+});
+
+test('routed staging rejects signer trust revoked after private install', async () => {
+  const f = await fixture();
+  let checks = 0;
+  await assert.rejects(stageRoutedDefinition({ ...f.args, stillAuthorized: () => {
+    checks++;
+    if (checks === 4) writeFileSync(join(f.config, 'allowed_signers'), '', { mode: 0o600 });
+    return true;
+  } }), /routed definition staging refused/);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+  assert.equal(existsSync(join(f.home, '.owenloop', 'store')), false);
+});
+
+test('routed staging applies a newly configured origin rule before returning the snapshot', async () => {
+  const f = await fixture();
+  let checks = 0;
+  await assert.rejects(stageRoutedDefinition({ ...f.args, stillAuthorized: () => {
+    checks++;
+    if (checks === 4) writeFileSync(join(f.config, 'settings.json'),
+      JSON.stringify({ originRules: { '*': 'git' } }));
+    return true;
+  } }), /routed definition staging refused/);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+});
+
+test('bounded stage maintenance removes an old crash orphan but preserves a fresh snapshot', async () => {
+  const f = await fixture();
+  const old = await stageRoutedDefinition(f.args);
+  const fresh = await stageRoutedDefinition(f.args);
+  const age = new Date(Date.now() - 25 * 60 * 60_000);
+  utimesSync(old.path, age, age);
+  const maintenance = createRoutedDefinitionMaintenance({ stateDir: f.stateDir, workRoot: f.args.workRoot });
+  maintenance.sweep();
+  maintenance.close();
+  assert.equal(existsSync(old.path), false);
+  assert.equal(existsSync(fresh.path), true);
+  fresh.cleanup();
+});
+
+test('routed staging fetches the signed locked child and refuses child-only unsigned evidence', async () => {
+  const f = await fixture();
+  const child = packBundle(writeBundleSource({ name: 'child', workflow: `name: child
+inputs:
+  - name: data
+    seedOwed: true
+steps:
+  - name: child-runner
+    consumes: [data]
+    produces: [delivered]
+    terminal: true
+    command: echo child
+outputs: [delivered]
+` }));
+  const target = 'child/child@1.0.0';
+  const childKeyPath = join(f.home, 'child-publisher');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', childKeyPath], { stdio: 'ignore' });
+  const childKey = publicKeyDescriptor(readFileSync(`${childKeyPath}.pub`, 'utf8'));
+  const parentSignerLine = `publisher ${f.publicKey.openSshPublicKey}\n`;
+  writeFileSync(join(f.config, 'allowed_signers'),
+    parentSignerLine + `child-publisher ${childKey.openSshPublicKey}\n`, { mode: 0o600 });
+  const parent = packBundle(writeBundleSource({ name: 'parent', lock: { [target]: child.digest }, workflow: `name: parent
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: ordinary
+    consumes: [seed]
+    produces: [ordinary-out]
+    command: echo parent
+  - name: invoke-child
+    calls: ${target}
+    inputs:
+      data: seed
+    produces: [delivered]
+  - name: finish
+    consumes: [ordinary-out, delivered]
+    produces: [out]
+    terminal: true
+    body: ""
+outputs: [out]
+` }));
+  const publication = async (packed: typeof child, signKeyPath: string, publisherKeyId: string) => {
+    const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath });
+    const signed = await dsseSignPublication(Buffer.from(canonicalJsonBytes({
+      digest: packed.digest, name: packed.manifest.package.name,
+      version: packed.manifest.package.version, publisherKeyId, timestamp: Date.now(),
+    })), signer);
+    return canonicalJsonBytes(signed.envelope);
+  };
+  const evidence = new Map([[child.digest, await publication(child, childKeyPath, childKey.keyid)],
+    [parent.digest, await publication(parent, f.keyPath, f.publicKey.keyid)]]);
+  const bundles = new Map([[child.digest, child.bytes], [parent.digest, parent.bytes]]);
+  let unsignedChild = false;
+  const fetchImpl: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname;
+    f.seen.push(path);
+    const [, , resource, digest] = path.split('/');
+    if (resource === 'bundles') return new Response(bundles.get(digest!) ?? null, { status: bundles.has(digest!) ? 200 : 404 });
+    if (resource === 'publications') return unsignedChild && digest === child.digest
+      ? new Response('unsigned', { status: 200, headers: { 'x-owenloop-publication-state': 'unsigned' } })
+      : new Response(evidence.get(digest!) ?? null, { status: evidence.has(digest!) ? 200 : 404,
+	headers: { 'x-owenloop-publication-state': 'signed' } });
+    if (resource === 'origins') return new Response(null, { status: 404 });
+    throw new Error('unexpected request');
+  };
+  const args = { ...f.args, order: { ...f.args.order, step: 'ordinary', defDigest: parent.digest }, fetchImpl };
+  const stage = await stageRoutedDefinition(args);
+  assert.ok(f.seen.includes(`/api/bundles/${child.digest}`));
+  assert.ok(f.seen.includes(`/api/publications/${child.digest}`));
+  stage.cleanup();
+  let checks = 0;
+  await assert.rejects(stageRoutedDefinition({ ...args, stillAuthorized: () => {
+    checks++;
+    if (checks === 7) {
+      const root = join(f.stateDir, '.routing-definitions');
+      const current = readdirSync(root).find(name => name.startsWith('.routing-def-'))!;
+      writeFileSync(join(root, current, 'public', 'allowed_signers'), parentSignerLine);
+    }
+    return true;
+  } }), /routed definition staging refused/);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0,
+    'child-only trust loss after download invalidates the complete calls closure');
+  unsignedChild = true;
+  f.seen.length = 0;
+  await assert.rejects(stageRoutedDefinition(args), /routed definition staging refused/);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+});

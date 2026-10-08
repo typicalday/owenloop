@@ -46,6 +46,8 @@ import {
 import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
 import { createRoutingBroker, type RoutingBroker } from './routing-broker.ts';
+import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from './routing-definition-stage.ts';
+import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
 import {
   createBundleIngestor,
   createStoreInstructionSource,
@@ -543,6 +545,14 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     parsed.workRoots !== undefined && parsed.workRoots.length > 0
       ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
       : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
+  let definitionMaintenance: ReturnType<typeof createRoutedDefinitionMaintenance> | undefined;
+  if (routingEnabled) {
+    try { definitionMaintenance = createRoutedDefinitionMaintenance({ stateDir, workRoot, now }); }
+    catch {
+      process.stderr.write(`${roleLabel}: routed definition stage root unavailable\n`);
+      return 1;
+    }
+  }
   const monotonicNow = () => performance.now();
   const routingBackoff = routingEnabled ? createRoutingBackoff(monotonicNow) : undefined;
   let hub = createHubClient({ origin, getToken: async () => token,
@@ -725,7 +735,25 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 
   const loop = createShiftLoop({
     hub,
-    ...(routingSession ? { routingSession, selectRoutingTuples } : {}),
+    ...(routingSession ? { routingSession, selectRoutingTuples,
+      maintainDefinitionStages: definitionMaintenance!.sweep,
+      closeDefinitionStages: definitionMaintenance!.close,
+      stageRoutedDefinition: (order: import('../hub/types.ts').WorkOrder) => stageRoutedDefinition({
+	order, origin, token, stateDir, workRoot, sourceEnv: env,
+	beforeRequest: routingBackoff!.beforeRequest,
+	onRateLimit: routingBackoff!.onRateLimit,
+	stillAuthorized: () => {
+	  const identity = routingSession.identity();
+	  const routing = order.routing;
+	  return !!identity && !!routing
+	    && identity.orgId === routing.decision.binding.orgId
+	    && identity.principalId === routing.claim.principalId
+	    && identity.sessionId === routing.claim.sessionId
+	    && identity.shiftId === routing.claim.shiftId
+	    && now() < Math.min(identity.expiresAt, routing.decision.binding.expiresAt,
+	      routing.preference.expiresAt);
+	},
+      }) } : {}),
     ...(routingBroker ? { routingBroker } : {}),
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
@@ -885,6 +913,8 @@ export interface RoutingHandoffV1 {
   broker?: { socketPath: string; cap: string };
   /** Narrower cap for the agent's separate born-bound holder process. */
   holderBroker?: { socketPath: string; cap: string };
+  /** Private signed snapshot. No bearer, signer or operator HOME path. */
+  definitionStage?: { path: string; digest: string };
   reservation: ChildReservation; createdAt: number; expiresAt: number; sessionExpiresAt: number;
 }
 export interface RoutingHandoff {
@@ -899,7 +929,7 @@ export interface ShiftRoutingSession {
   brokerTarget(): { hub: RoutingHubClient; identity: NonNullable<ReturnType<ShiftRoutingSession['identity']>>;
     currentIdentity: ShiftRoutingSession['identity'] } | undefined;
   createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string;
-    holder?: { socketPath: string; cap: string } }): RoutingHandoff;
+    holder?: { socketPath: string; cap: string } }, definitionStage?: RoutedDefinitionStage): RoutingHandoff;
   maintain(): Promise<void>;
   /** Monotonic service deadline shared with Shift's other Hub requests. */
   nextRequestAllowedAt(): number;
@@ -1054,9 +1084,9 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
-    createHandoff: (reservation, broker) => {
+    createHandoff: (reservation, broker, definitionStage) => {
       if (stopped) throw new Error('routing session stopped');
-      return active.createHandoff(reservation, broker);
+      return active.createHandoff(reservation, broker, definitionStage);
     },
     async ensureScope(selection) {
       const desired = normalize({
@@ -1220,7 +1250,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
     hub,
     identity: () => renewalDenied ? undefined : authority && ({ orgId: opts.orgId, principalId: opts.principalId,
       sessionId: authority.sessionId, shiftId: authority.shiftId, expiresAt: authority.expiresAt }),
-    createHandoff(reservation, broker) {
+    createHandoff(reservation, broker, definitionStage) {
       if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
 	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token
 	  && r.workflow === reservation.workflow && r.run === reservation.run && r.reservedAt === reservation.reservedAt)) throw new Error('routing reservation unavailable');
@@ -1233,6 +1263,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	origin: opts.origin, orgId: opts.orgId, sessionId: authority.sessionId, shiftId: authority.shiftId,
 	...(broker ? { broker: { socketPath: broker.socketPath, cap: broker.cap },
 	  ...(broker.holder ? { holderBroker: broker.holder } : {}) } : {}),
+	...(definitionStage ? { definitionStage: { path: definitionStage.path, digest: definitionStage.digest } } : {}),
 	reservation: { ...reservation }, createdAt,
 	expiresAt: Math.min(createdAt + 120_000, authority.expiresAt), sessionExpiresAt: authority.expiresAt };
       if (payload.expiresAt <= createdAt) throw new Error('routing handoff deadline expired');

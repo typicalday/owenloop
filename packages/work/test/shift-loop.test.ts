@@ -4673,12 +4673,19 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
       decision: { decisionId: 'decision', binding, status: 'applied', applied: offer ? { kind: 'shift', target: { candidateId: 'selected', shiftId: id.shiftId, offerId: offer.offerId } } : { kind: 'ready_firing', target: { candidateId: 'candidate', firingId: 'firing', step: 'builder', key: '' } }, effect: offer ? { kind: 'shift', claimId: 'run_routed', orderId: 'run_routed', attemptId: 'run_routed' } : { kind: 'ready_firing', firingId: 'firing' } },
       preference: { offer, tuples: candidate.tuples, role: candidate.role, rolePolicy: candidate.rolePolicy, rosterRevision: 'roster', expiresAt: 100_000 },
     };
-    const order: WorkOrder = { ...modernWo('run_routed', 'builder', kind), workflow: 'wf', capabilities: ['build'], crews: ['crew'], routing };
+    const order: WorkOrder = { ...modernWo('run_routed', 'builder', kind, 'a'.repeat(64)), workflow: 'wf', capabilities: ['build'], crews: ['crew'], routing };
     editOrder(order);
     replay = order;
     return { text: '', orders: [order] };
   };
   const spawns: SpawnSpec[] = [];
+  let preflightRead = false;
+  session.hub.readRoutingClaim = async req => {
+    f.calls.push({ verb: 'read_routing_claim', body: req, headers: new Headers() });
+    if (preflightRead) throw new Error('fixture broker read unavailable');
+    preflightRead = true;
+    return { routing: structuredClone(replay!.routing!), freshness: 'fresh-at-read', atomicLaunch: false };
+  };
   const spawner: Spawner = spec => {
     assert.equal(readChildReservations(stateDir).length, 1);
     assert.ok(spec.routingHandoff && existsSync(spec.routingHandoff));
@@ -4686,11 +4693,39 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
     return { pid: 9001 };
   };
   const options = baseOpts(hub, spawner, { workflow: 'wf', now: () => 1000, routingSession: session,
+    stageRoutedDefinition: async order => {
+      const path = mkdtempSync(join(stateDir, '.routing-def-'));
+      return { path, digest: order.defDigest!, cleanup: () => rmSync(path, { recursive: true, force: true }) };
+    },
     selectRoutingTuples: c => c.tuples, computeServeCapabilities: () => ['build'],
     resolveOrderStep: async () => ({ name: 'builder', executor: 'command' }),
   });
   return { f, session, candidate, offers, requests, hub, calls, spawns, options, edit: (fn: typeof editOrder) => { editOrder = fn; } };
 }
+
+test('routed staging that finishes after session stop cannot reserve or spawn', async () => {
+  const f = await routedLoopFixture();
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let stagedPath = '';
+  const loop = createShiftLoop({ ...f.options, stageRoutedDefinition: async order => {
+    entered();
+    await pending;
+    stagedPath = mkdtempSync(join(stateDir, '.routing-def-'));
+    return { path: stagedPath, digest: order.defDigest!, cleanup: () => rmSync(stagedPath, { recursive: true, force: true }) };
+  } });
+  const iteration = loop.iterate();
+  await started;
+  await f.session.stop();
+  release();
+  await iteration;
+  assert.equal(f.spawns.length, 0);
+  assert.equal(readChildReservations(stateDir).length, 0);
+  assert.equal(existsSync(stagedPath), false);
+  loop.stop();
+});
 
 test('willing offers use service identities before reserving; claimed allowance launches once even after terminal replay', async () => {
   const f = await routedLoopFixture();

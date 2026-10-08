@@ -80,6 +80,12 @@ export function consumeRoutingHandoff(args: {
 	|| p.holderBroker.socketPath !== p.broker.socketPath
 	|| typeof p.holderBroker.cap !== 'string' || !/^[a-f0-9]{64}$/.test(p.holderBroker.cap)
 	|| p.holderBroker.cap === p.broker.cap))
+      || (p.definitionStage !== undefined && (!p.definitionStage
+	|| typeof p.definitionStage.path !== 'string' || !isAbsolute(p.definitionStage.path)
+	|| normalize(p.definitionStage.path) !== p.definitionStage.path
+	|| !basename(p.definitionStage.path).startsWith('.routing-def-')
+	|| typeof p.definitionStage.digest !== 'string'
+	|| !/^[0-9a-f]{64}$/.test(p.definitionStage.digest)))
       || !Number.isSafeInteger(p.createdAt) || !Number.isSafeInteger(p.expiresAt)
       || !Number.isSafeInteger(p.sessionExpiresAt) || p.createdAt > now || p.expiresAt <= now
       || p.expiresAt > p.createdAt + 120_000 || p.expiresAt > p.sessionExpiresAt
