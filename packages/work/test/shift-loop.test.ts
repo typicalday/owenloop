@@ -5367,3 +5367,130 @@ test('delayed handoff close 429 suppresses due roster sync before the next Shift
     assert.equal(offers, quiet.offers + 1);
   } finally { handoff?.terminal(); loop.stop(); await session.stop(); }
 });
+
+test('delayed close 429 between offer context and submission blocks the same-iteration request', async () => {
+  let clock = 1_000;
+  let opens = 0;
+  let closes = 0;
+  let contexts = 0;
+  let wakes = 0;
+  let submissions = 0;
+  let claims = 0;
+  const errors: string[] = [];
+  let oldHandoff: ReturnType<ShiftRoutingSession['createHandoff']> | undefined;
+  let candidate: import('../src/hub/types.ts').RoutingOfferCandidate;
+  const tuple = { id: 'service-tuple', harness: 'codex', model: 'approved-model', effort: 'high' as const };
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => clock,
+    monotonicNow: () => clock, getToken: async () => 'enrolled-base',
+    fetchImpl: (async url => {
+      const verb = new URL(String(url)).pathname.split('/').at(-1);
+      if (verb === 'routing_session_open') {
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++opens).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${opens}`,
+	  credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: clock + 900_000 });
+      }
+      if (verb === 'routing_session_close') {
+	if (++closes === 1) return Response.json({ error: 'rate_limited' },
+	  { status: 429, headers: { 'Retry-After': '30' } });
+	return Response.json({ closed: true });
+      }
+      if (verb === 'wake') { wakes++; return Response.json({ text: '', cursor: contexts + 1, changed: true }); }
+      if (verb === 'routing_offer_context') {
+	contexts++;
+	if (contexts === 1) {
+	  oldHandoff!.terminal();
+	  await settle(() => session.nextRequestAllowedAt() === 35_000, 'close 429 during offer context');
+	}
+	return Response.json({ contexts: [candidate] });
+      }
+      if (verb === 'put_shift_offer') { submissions++; return Response.json({ contexts: [candidate] }); }
+      if (verb === 'whats_next') { claims++; return Response.json({ text: '', orders: [] }); }
+      assert.fail(`unexpected session request ${String(url)}`);
+    }) as typeof fetch,
+  });
+  oldHandoff = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'context-close',
+    reservedAt: clock, childKind: 'agent-run' }).reservation);
+  clock = 5_000;
+  await session.ensureScope({ capabilities: ['build', 'test'], crews: [] });
+  const id = session.identity()!;
+  candidate = {
+    candidateId: 'candidate', frameId: 'wf', step: 'builder', key: '', evidenceGeneration: 'generation-1',
+    context: { now: clock, maxTtlMs: 300_000, ...id, rosterRevision: 'roster',
+      rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew-id', capability: 'build' },
+    role: 'implementation', rolePolicy: { revision: 'policy', unknownRole: 'refuse',
+      rules: [{ model: tuple.model, roles: ['implementation'] }] },
+    tuples: [{ tuple, eligible: true, available: true }],
+  };
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(session.hub, spawner, {
+    workflow: 'wf', routingSession: session, now: () => clock, monotonicNow: () => clock,
+    computeServeCapabilities: () => ['build', 'test'], selectRoutingTuples: c => c.tuples,
+    err: message => { errors.push(message); },
+  }));
+  try {
+    await loop.iterate();
+    assert.equal(contexts, 1);
+    assert.equal(submissions, 0, 'transport refuses the later offer request in this same iteration');
+    assert.equal(claims, 0);
+    await assert.rejects(session.hub.wake(), error => error instanceof HubError && error.status === 429);
+    assert.equal(wakes, 1, 'routed GET is blocked before transport too');
+    clock = 34_999;
+    await loop.iterate();
+    assert.equal(contexts, 1);
+    clock = 35_000;
+    await loop.iterate();
+    assert.equal(submissions, 1, JSON.stringify({ contexts, claims, errors }));
+    assert.equal(claims, 1);
+  } finally { oldHandoff.terminal(); loop.stop(); await session.stop(); }
+});
+
+for (const source of ['routing_offer_context', 'wake'] as const) {
+test(`${source} 429 without Retry-After blocks a later retired-session close`, async () => {
+  let now = 1_000;
+  let monotonic = 0;
+  let opens = 0;
+  let closes = 0;
+  let wakes = 0;
+  let rateLimited = false;
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now,
+    monotonicNow: () => monotonic, getToken: async () => 'enrolled-base',
+    fetchImpl: (async url => {
+      const verb = new URL(String(url)).pathname.split('/').at(-1);
+      if (verb === 'routing_session_open') {
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++opens).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${opens}`,
+	  credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
+      }
+      if (verb === source && !rateLimited) {
+	rateLimited = true;
+	return Response.json({ error: 'rate_limited' }, { status: 429 });
+      }
+      if (verb === 'routing_session_close') { closes++; return Response.json({ closed: true }); }
+      if (verb === 'wake') { wakes++; return Response.json({ text: '', cursor: 1, changed: false }); }
+      if (verb === 'routing_offer_context') return Response.json({ contexts: [] });
+      assert.fail(`unexpected session request ${String(url)}`);
+    }) as typeof fetch,
+  });
+  const oldHandoff = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'offer-429-close',
+    reservedAt: now, childKind: 'agent-run' }).reservation);
+  try {
+    now = 2_000;
+    await session.ensureScope({ capabilities: ['build', 'test'], crews: [] });
+    await assert.rejects(source === 'wake' ? session.hub.wake()
+      : session.hub.routingOfferContext({ workflow: 'wf', serve_capabilities: ['build', 'test'], serve_crews: [] }),
+      error => error instanceof HubError && error.status === 429);
+    assert.equal(session.nextRequestAllowedAt(), 30_000, 'missing header uses a bounded default');
+    oldHandoff.terminal();
+    await settle(() => !existsSync(join(oldHandoff.path, '..')), 'retired close cleanup');
+    assert.equal(closes, 0, 'retired close cannot start during routed backoff');
+    monotonic = 29_999;
+    await assert.rejects(session.hub.wake(), error => error instanceof HubError && error.status === 429);
+    assert.equal(wakes, 0);
+    monotonic = 30_000;
+    await session.hub.wake();
+    assert.equal(wakes, 1);
+  } finally { oldHandoff.terminal(); await session.stop(); }
+});
+}

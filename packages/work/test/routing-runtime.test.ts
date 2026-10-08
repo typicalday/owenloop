@@ -8,13 +8,46 @@ import { run as runExec } from '../src/roles/exec.ts';
 import { consumeRoutingHandoff } from '../src/roles/routing-handoff.ts';
 import { reserveChild } from '../src/shift/state.ts';
 import { buildSpawnPlan } from '../src/shift/spawn.ts';
-import { openShiftRoutingSession, selectLocalRoutingTuples } from '../src/shift/runtime.ts';
+import { createRoutingBackoff, openShiftRoutingSession, selectLocalRoutingTuples } from '../src/shift/runtime.ts';
+import { createHubClient } from '../src/hub/client.ts';
+import { HubError } from '../src/hub/types.ts';
 import { writeHubRosterCache } from '../src/settings/hub-roster-cache.ts';
 import type { RoutingOfferCandidate } from '../src/hub/types.ts';
 
 const origin = 'https://hub.example.test';
 const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
 const credential = `rs1.${sessionId}.${'x'.repeat(43)}`;
+
+test('routed bootstrap roster 429 blocks whoami and session open until Retry-After', async () => {
+  let monotonic = 0;
+  const calls: string[] = [];
+  const backoff = createRoutingBackoff(() => monotonic);
+  const client = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => undefined,
+      beforeRequest: backoff.beforeRequest, onRateLimit: backoff.onRateLimit },
+    fetchImpl: (async url => {
+      const verb = new URL(String(url)).pathname.split('/').at(-1)!;
+      calls.push(verb);
+      if (verb === 'rosters') return Response.json({ error: 'rate_limited' },
+	{ status: 429, headers: { 'Retry-After': '120' } });
+      if (verb === 'whoami') return Response.json({});
+      if (verb === 'routing_session_open') return Response.json({ sessionId, shiftId: 'shf_service', credential, expiresAt: 900_000 });
+      throw new Error(`unexpected ${verb}`);
+    }) as typeof fetch,
+  });
+  await assert.rejects(client.getRosters!(), error => error instanceof HubError && error.status === 429);
+  await assert.rejects(client.whoami(), error => error instanceof HubError && error.status === 429);
+  await assert.rejects(client.openRoutingSession({ scope: { workflows: ['wf'] } }),
+    error => error instanceof HubError && error.status === 429);
+  assert.deepEqual(calls, ['rosters']);
+  monotonic = 119_999;
+  await assert.rejects(client.whoami(), error => error instanceof HubError && error.status === 429);
+  assert.deepEqual(calls, ['rosters']);
+  monotonic = 120_000;
+  await client.whoami();
+  await client.openRoutingSession({ scope: { workflows: ['wf'] } });
+  assert.deepEqual(calls, ['rosters', 'whoami', 'routing_session_open']);
+});
 
 test('spawn plans transport only an explicit handoff and strip ambient bearer for routed workers', () => {
   const previous = { handoff: process.env.OWENLOOP_ROUTING_HANDOFF, token: process.env.OWENLOOP_TOKEN };

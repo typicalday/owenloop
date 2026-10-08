@@ -495,3 +495,17 @@ test('session bootstrap identity refuses redirects and mismatched origins before
   assert.equal(request?.redirect, 'error');
   assert.equal(new Headers(request?.headers).has('X-Owenloop-Routing-Session'), false);
 });
+
+test('routed GET failures never reveal transport or response text', async () => {
+  const create = (fetchImpl: typeof fetch) => createHubClient({ origin: 'https://hub.example',
+    getToken: async () => 'cap-secret',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => undefined }, fetchImpl });
+  for (const fetchImpl of [
+    (async () => { throw new Error('transport echoed cap-secret'); }) as typeof fetch,
+    (async () => new Response('malformed cap-secret', { status: 200 })) as typeof fetch,
+    (async () => new Response('error echoed cap-secret', { status: 503 })) as typeof fetch,
+  ]) {
+    await assert.rejects(create(fetchImpl).whoami(), error =>
+      error instanceof Error && !error.message.includes('cap-secret') && error.message.startsWith('routing request'));
+  }
+});

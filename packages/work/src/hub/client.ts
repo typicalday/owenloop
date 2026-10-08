@@ -84,6 +84,10 @@ export interface HubClientOptions {
     allowedOrigin: string;
     get: () => RoutingSessionOpenResponse | undefined;
     now?: () => number;
+    /** Shared monotonic Retry-After fence, checked immediately before transport. */
+    beforeRequest?: () => void;
+    /** Observe a routed 429 as soon as its response arrives. */
+    onRateLimit?: (error: HubError) => void;
   };
 }
 
@@ -243,13 +247,18 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     try {
       const headers = await authHeaders();
       if (session) headers['X-Owenloop-Routing-Session'] = session.credential;
+      routing.beforeRequest?.();
       const res = await fetchImpl(`${base}/api/${verb}`, {
 	method: 'POST', headers, body: JSON.stringify(body), redirect: 'error',
 	...(signal === undefined ? {} : { signal }),
       });
       // Response bodies and fetch errors can echo credentials. Keep them out
       // of persisted worker diagnostics while retaining status/backoff metadata.
-      if (!res.ok) throw new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+      if (!res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) routing.onRateLimit?.(error);
+	throw error;
+      }
       return await res.json() as T;
     } catch (error) {
       if (error instanceof HubError) throw error;
@@ -265,13 +274,24 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
 	|| origin.username || origin.password) throw new Error('routing origin refused');
     }
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
-    const res = await fetchImpl(url, {
-      method: 'GET',
-      headers: await authHeaders(),
-      ...(opts.routingSession ? { redirect: 'error' as const } : {}),
-      ...(signal === undefined ? {} : { signal }),
-    });
-    return parse<T>(res);
+    try {
+      const headers = await authHeaders();
+      opts.routingSession?.beforeRequest?.();
+      const res = await fetchImpl(url, {
+	method: 'GET', headers,
+	...(opts.routingSession ? { redirect: 'error' as const } : {}),
+	...(signal === undefined ? {} : { signal }),
+      });
+      if (opts.routingSession && !res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) opts.routingSession.onRateLimit?.(error);
+	throw error;
+      }
+      return await parse<T>(res);
+    } catch (error) {
+      if (opts.routingSession && !(error instanceof HubError)) throw new Error('routing request failed');
+      throw error;
+    }
   }
 
   async function postBytes<T>(path: string, req: PutFileArtifactRequest): Promise<T> {

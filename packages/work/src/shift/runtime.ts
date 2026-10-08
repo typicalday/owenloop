@@ -533,10 +533,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     parsed.workRoots !== undefined && parsed.workRoots.length > 0
       ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
       : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
-  let hub = createHubClient({ origin, getToken: async () => token,
-    ...(routingEnabled ? { routingSession: { allowedOrigin: origin, get: () => undefined } } : {}) });
-  let routingSession: ShiftRoutingSession | undefined;
   const monotonicNow = () => performance.now();
+  const routingBackoff = routingEnabled ? createRoutingBackoff(monotonicNow) : undefined;
+  let hub = createHubClient({ origin, getToken: async () => token,
+    ...(routingBackoff ? { routingSession: { allowedOrigin: origin, get: () => undefined,
+      beforeRequest: routingBackoff.beforeRequest, onRateLimit: routingBackoff.onRateLimit } } : {}) });
+  let routingSession: ShiftRoutingSession | undefined;
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
   );
@@ -640,7 +642,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       if (!['token', 'oauth'].includes(principal.authMethod) || principal.tokenStatus !== 'active') {
 	throw new Error('routing requires an enrolled bearer');
       }
-      routingSession = await openShiftRoutingSession({ origin, stateDir, monotonicNow,
+      routingSession = await openShiftRoutingSession({ origin, stateDir, monotonicNow, routingBackoff,
 	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
 	onMaintenanceError: () => process.stderr.write(`${roleLabel}: parked routing session maintenance failed\n`),
 	scope: {
@@ -965,16 +967,32 @@ function handoffMaintenance(root: string, now: () => number, preserved: Set<stri
   return { sweep, close };
 }
 
+/** One clock and deadline for every request from a routed Shift origin. */
+export function createRoutingBackoff(monotonicNow: () => number = () => performance.now()) {
+  let nextAllowedAt = Number.NEGATIVE_INFINITY;
+  return {
+    nextAllowedAt: () => nextAllowedAt,
+    onRateLimit: (error: HubError) => {
+      if (error.status === 429) nextAllowedAt = Math.max(nextAllowedAt, monotonicNow() + (error.retryAfterMs ?? 30_000));
+    },
+    beforeRequest: () => {
+      const remainingMs = nextAllowedAt - monotonicNow();
+      if (remainingMs > 0) throw new HubError(429, 'routing backoff active', undefined, remainingMs);
+    },
+  };
+}
+
 /** Opt-in trusted runtime closure. Neither this value nor its capability is an
  * MCP argument, persisted dispatch event, global env variable or log payload. */
 interface ShiftRoutingSessionOptions {
   stateDir: string; origin: string; orgId: string; principalId: string; scope: RoutingScope;
   getToken: () => Promise<string>; fetchImpl?: typeof fetch; now?: () => number; nonce?: () => string;
   monotonicNow?: () => number;
+  routingBackoff?: ReturnType<typeof createRoutingBackoff>;
   /** Keeps a stopped Shift alive while detached workers still own sessions. */
   postStopSchedule?: (fn: () => void, everyMs: number) => () => void;
   onMaintenanceError?: () => void;
-  onClosed?: (closeRateLimit?: HubError) => void;
+  onClosed?: () => void;
 }
 
 export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions): Promise<ShiftRoutingSession> {
@@ -987,21 +1005,15 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const retired = new Set<Incarnation>();
   let stopped = false;
   let changing: Promise<void> = Promise.resolve();
-  let renewalBackoffUntil = Number.NEGATIVE_INFINITY;
   const monotonicNow = opts.monotonicNow ?? (() => performance.now());
-  const noteRenewalBackoff = (error: unknown) => {
-    if (error instanceof HubError && error.status === 429) {
-      renewalBackoffUntil = Math.max(renewalBackoffUntil, monotonicNow() + (error.retryAfterMs ?? 30_000));
-    }
-  };
+  const backoff = opts.routingBackoff ?? createRoutingBackoff(monotonicNow);
   let cancelParked: (() => void) | undefined;
   const live = () => Boolean(active.identity()) || [...retired].some(incarnation => Boolean(incarnation.identity()));
-  const onClosed = (closeRateLimit?: HubError) => {
-    if (closeRateLimit) noteRenewalBackoff(closeRateLimit);
+  const onClosed = () => {
     for (const incarnation of retired) if (!incarnation.identity()) retired.delete(incarnation);
     if (stopped && !live()) { cancelParked?.(); cancelParked = undefined; }
   };
-  const incarnationOptions = { ...opts, onClosed };
+  const incarnationOptions = { ...opts, onClosed, beforeRequest: backoff.beforeRequest, onRateLimit: backoff.onRateLimit };
   active = await openRoutingIncarnation({ ...incarnationOptions, scope });
   // Callers keep this client, while each request resolves the current authority.
   // In-flight calls and old handoffs retain their original incarnation closure.
@@ -1013,7 +1025,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const session: ShiftRoutingSession = {
     hub,
     identity: () => active.identity(),
-    nextRequestAllowedAt: () => renewalBackoffUntil,
+    nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: reservation => {
       if (stopped) throw new Error('routing session stopped');
       return active.createHandoff(reservation);
@@ -1026,7 +1038,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       });
       const change = changing.catch(() => {}).then(async () => {
 	if (stopped) throw new Error('routing session stopped');
-	if (monotonicNow() < renewalBackoffUntil) throw new Error('routing backoff active');
+	backoff.beforeRequest();
 	if (JSON.stringify(scope) === JSON.stringify(desired)
 	  && (active.identity()?.expiresAt ?? 0) > (opts.now ?? Date.now)()) return;
 	// Never alter the old session, nor discard it on a failed open.
@@ -1040,7 +1052,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	const closeRateLimit = await previous.stop();
 	if (previous.identity()) retired.add(previous);
 	if (closeRateLimit) throw closeRateLimit;
-      }).catch(error => { noteRenewalBackoff(error); throw error; });
+      });
       changing = change;
       await change;
     },
@@ -1048,7 +1060,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       // A failed scope expansion rejects its caller, but never poisons the
       // still-valid authority's independent renewal path.
       await changing.catch(() => {});
-      if (monotonicNow() < renewalBackoffUntil) return;
+      if (monotonicNow() < backoff.nextAllowedAt()) return;
       // An older worker's session normally expires first. Renew in deadline
       // order so a slow or rate-limited newer session cannot starve it.
       const incarnations = [active, ...retired].sort((a, b) =>
@@ -1059,7 +1071,6 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	try { await incarnation.maintain(); }
 	catch (error) {
 	  if (error instanceof HubError && error.status === 429) {
-	    noteRenewalBackoff(error);
 	    throw error; // Service forbids further requests until Retry-After.
 	  }
 	  if (firstError === undefined) firstError = error;
@@ -1080,7 +1091,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	});
 	cancelParked = schedule(() => {
 	  if (!live()) { onClosed(); return; }
-	  if (parkedInFlight || monotonicNow() < renewalBackoffUntil) return;
+	  if (parkedInFlight || monotonicNow() < backoff.nextAllowedAt()) return;
 	  parkedInFlight = true;
 	  void session.maintain().catch(() => {
 	    opts.onMaintenanceError?.();
@@ -1092,7 +1103,9 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   return session;
 }
 
-async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise<
+async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
+  beforeRequest?: () => void; onRateLimit?: (error: HubError) => void;
+}): Promise<
   Omit<ShiftRoutingSession, 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & { stop(): Promise<HubError | undefined> }
 > {
   const origin = new URL(opts.origin);
@@ -1107,7 +1120,8 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
   let authority: RoutingSessionOpenResponse | undefined;
   const hub = createHubClient({ origin: opts.origin, getToken: opts.getToken,
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-    routingSession: { allowedOrigin: opts.origin, get: () => authority, now } });
+    routingSession: { allowedOrigin: opts.origin, get: () => authority, now,
+      beforeRequest: opts.beforeRequest, onRateLimit: opts.onRateLimit } });
   try { authority = await hub.openRoutingSession({ scope: opts.scope }, AbortSignal.timeout(10_000)); }
   catch (error) {
     maintenance.close();
@@ -1168,7 +1182,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
 	authority = undefined;
 	maintenance.close();
 	try { if (sameInode(privateDirectory(directory), directoryInode)) rmdirSync(directory); } catch { /* Preserve substituted or nonempty entries. */ }
-	opts.onClosed?.(closeRateLimit);
+	opts.onClosed?.();
       }
       return closeRateLimit;
     })();
