@@ -61,12 +61,12 @@ test('routed nested credential read cannot reach populated operator file or Keyc
     mkdirSync(publicHome, { recursive: true });
     writeFileSync(join(operator, 'credentials.json'), JSON.stringify({
       version: 2, hubs: { 'https://hub.example': {
-        'agent:default': { kind: 'agent', accessToken: 'operator-bearer' },
+		'agent:default': { kind: 'agent', accessToken: 'operator-bearer' },
       } },
     }));
     assert.deepEqual(readStoredCredential('https://hub.example', {
       principal: 'agent', env: { HOME: root, OWENLOOP_CONFIG_DIR: operator,
-        OWENLOOP_NO_KEYCHAIN: '1' },
+		OWENLOOP_NO_KEYCHAIN: '1' },
     }), { kind: 'agent', accessToken: 'operator-bearer' });
     const safe: Record<string, string | undefined> = routedWorkerEnv({ HOME: root,
       OWENLOOP_CONFIG_DIR: operator, OWENLOOP_CREDENTIAL_COMMAND: '/operator/get-token' },
