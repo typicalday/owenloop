@@ -32,6 +32,7 @@ import {
   resolveOriginRules,
 } from '../../../../src/store/pre-commit-verifier.ts';
 import type { OrderPacket } from '../hub/types.ts';
+import { validFixedWorkdir } from '../order-definition-binding.ts';
 import type { ConsumedVerifier, VerifiedCallsProducer } from '../consumed-verifier.ts';
 
 export type InstructionRefusalKind =
@@ -222,6 +223,9 @@ export function createStoreInstructionResolver(
       const step = source.getVerifiedStep(digest, order.step);
       if (step === undefined) {
 	return refusal('integrity', order, 'the resolved workflow step is unavailable after instruction lookup');
+      }
+      if (!validFixedWorkdir(step, order)) {
+	return refusal('integrity', order, 'order workdir differs from the locally verified step');
       }
       const definition = source.getVerifiedDefinition(digest, order.step);
       if (definition === undefined) return refusal('integrity', order, 'the verified workflow definition is unavailable after priming');

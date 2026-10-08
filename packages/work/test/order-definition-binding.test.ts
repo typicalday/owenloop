@@ -44,6 +44,25 @@ test('local binding accepts route siblings and legacy outputs but refuses undecl
   }] }), false);
 });
 
+test('local model order binds an authored static workdir and rejects a forged sibling or omission', () => {
+  const local = step({ name: 'route', produces: ['out'], workdir: '/allowed/project-a' });
+  const offered = { ...packet('route', ['out']), workdir: '/allowed/project-a' };
+  assert.equal(validModelOrderFields(local, offered), true);
+  assert.equal(validModelOrderFields(local, { ...offered, workdir: '/allowed/project-b' }), false);
+  assert.equal(validModelOrderFields(local, { ...offered, workdir: undefined }), false);
+
+  const inherited = step({ name: 'inherited', produces: ['out'] });
+  assert.equal(validModelOrderFields(inherited, packet('inherited', ['out'])), true);
+  assert.equal(validModelOrderFields(inherited, { ...packet('inherited', ['out']), workdir: '/allowed/project-b' }), false);
+
+  const dynamic = step({ name: 'dynamic', consumes: ['seed'], produces: ['out'], workdirFrom: 'seed.cwd' });
+  assert.equal(validModelOrderFields(dynamic, {
+    ...packet('dynamic', ['out'], ['seed']),
+    consumes: { seed: { cwd: '/allowed/project-b' } },
+    workdir: '/allowed/project-b',
+  }), true, 'dynamic value binding is a separate gate');
+});
+
 test('local binding accepts a collection seal and bound map member, then refuses key/index/path drift', () => {
   const collect = step({ name: 'collect', produces: ['items[]'] });
   assert.equal(validModelOrderFields(collect, packet('collect', ['items.sealed'])), true);

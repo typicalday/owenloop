@@ -39,8 +39,8 @@ interface Fixture {
   globalRoot: string;
 }
 
-async function fixture(): Promise<Fixture> {
-  const sourceDir = writeBundleSource({ name: 'policy-fixture', workflow: WORKFLOW });
+async function fixture(workflow = WORKFLOW): Promise<Fixture> {
+  const sourceDir = writeBundleSource({ name: 'policy-fixture', workflow });
   const installed = await installBundleFixture({ sourceDir, root: tempDir('owenloop-policy-project-') });
   const loaded = loadDefFile(`${installed.result.objectPath}/workflow.yaml`);
   const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
@@ -51,6 +51,35 @@ async function fixture(): Promise<Fixture> {
     globalRoot: tempDir('owenloop-policy-global-'),
   };
 }
+
+test('verified command refuses a packet workdir that differs from its locally authored static workdir', async () => {
+  const authored = '/allowed/project-a';
+  const installed = await fixture(WORKFLOW.replace(`    command: '${COMMAND}'`, `    command: '${COMMAND}'\n    workdir: ${authored}`));
+  const resolver = createStoreInstructionResolver({
+    projectRoot: installed.projectRoot,
+    globalRoot: installed.globalRoot,
+    verifier: createBundleIngestor(),
+    definitionVerifier: () => verdict('verified'),
+  });
+  const genuine = { ...order(installed.defDigest, 'command-step', 'command'), workdir: authored };
+  assert.equal((await resolver.resolveCommand(genuine)).ok, true);
+  const sibling = await resolver.resolveCommand({ ...genuine, workdir: '/allowed/project-b' });
+  assert.equal(sibling.ok, false);
+  const omitted = await resolver.resolveCommand({ ...genuine, workdir: undefined });
+  assert.equal(omitted.ok, false);
+
+  const noCwd = await fixture();
+  const noCwdResolver = createStoreInstructionResolver({
+    projectRoot: noCwd.projectRoot,
+    globalRoot: noCwd.globalRoot,
+    verifier: createBundleIngestor(),
+    definitionVerifier: () => verdict('verified'),
+  });
+  const injected = await noCwdResolver.resolveCommand({
+    ...order(noCwd.defDigest, 'command-step', 'command'), workdir: '/allowed/project-b',
+  });
+  assert.equal(injected.ok, false);
+});
 
 function order(defDigest: string, step: string, worker?: 'command'): OrderPacket {
   return {

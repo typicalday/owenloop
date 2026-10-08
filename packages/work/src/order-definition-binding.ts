@@ -45,10 +45,17 @@ export function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
   }));
 }
 
+/** A static cwd is an instruction from the local definition, not the relay.
+ * Dynamic `workdirFrom` paths need their own value/proof binding and are not
+ * covered by this comparison. A step declaring neither must receive neither. */
+export function validFixedWorkdir(step: StepDef, order: OrderPacket): boolean {
+  return step.workdirFrom !== undefined || order.workdir === step.workdir;
+}
+
 /** The old packet fallback has outputs but no owes; every present path still
  * has to be declared by the local step. Current get_order projects both sets. */
 export function validModelOrderFields(step: StepDef, order: OrderPacket): boolean {
-  if (order.step !== step.name || !validConsumedPaths(step, order)
+  if (order.step !== step.name || !validConsumedPaths(step, order) || !validFixedWorkdir(step, order)
     || !Array.isArray(order.outputs) || !Array.isArray(order.owes)) return false;
   const outputs = order.outputs;
   if (order.owes.some((owed) => owed === null || typeof owed !== 'object'
