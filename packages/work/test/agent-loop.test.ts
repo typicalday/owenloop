@@ -46,6 +46,7 @@ import { HubError, type ContactHolder, type GetOrderResponse, type ReasonEntry }
 import type { HubClient } from '../src/hub/client.ts';
 import type { LeaseLoop, LeaseOutcome } from '../src/lease/loop.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import type { TrustedInputAdmission } from '../src/hosted/trusted-input-admission.ts';
 import { projectSession } from '../src/roles/sessions.ts';
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
@@ -289,6 +290,7 @@ interface BuildOpts {
   shiftName?: string;
   shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
+  trustedInputV2?: AgentRunLoopOptions['trustedInputV2'];
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
@@ -318,6 +320,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     resolveAdapter: () => resolution,
     harnessAvailable: (id) => id === 'fake',
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
+    ...(b.trustedInputV2 === undefined ? {} : { trustedInputV2: b.trustedInputV2 }),
     resolveCrewRosters: b.resolveCrewRosters ?? (() => ({ ok: true, rosters: [] })),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
@@ -363,6 +366,35 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
     adapter.calls.filter((c) => c.kind === 'stop').length,
     1,
   );
+});
+
+test('opt-in agent v2 gates before brief and again before provider start, with no legacy consume downgrade', async () => {
+  const success = (order: NonNullable<GetOrderResponse['order']>): TrustedInputAdmission => ({
+    ok: true, order, step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+    packetDigest: 'packet-a', witnessDigest: 'witness-a', observedAt: 0, expiresAt: 5000, inputs: [],
+  });
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({ getOrder: [agentOrder(), agentOrder({ claimed: false, outcome: 'green' })] });
+  let reads = 0;
+  const h = buildOpts({ hub, adapter,
+    consumedVerifier: async () => { throw new Error('v1 verifier must not run'); },
+    trustedInputV2: { observe: async order => { reads++; return success(order); } },
+  });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.equal(reads, 2);
+  const started = adapter.calls.find(call => call.kind === 'start');
+  assert.ok(started?.kind === 'start');
+  assert.ok(started.args.owenloopMcp.args.includes('--trusted-input-v2'));
+
+  const refusedAdapter = createFakeAdapter();
+  reads = 0;
+  const refused = buildOpts({ hub: mockHub({ getOrder: [agentOrder()] }).hub, adapter: refusedAdapter,
+    trustedInputV2: { observe: async order => ++reads === 1 ? success(order)
+      : { ok: false, reason: 'input-version-moved' } },
+  });
+  assert.equal(await createAgentRunLoop(refused.opts).run(), 'unverified-consumed');
+  assert.equal(reads, 2);
+  assert.equal(refusedAdapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
 });
 
 test('idle recovery is bounded to primary, one wake, one cold start, then one producer ask', async () => {

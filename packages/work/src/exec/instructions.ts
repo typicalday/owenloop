@@ -16,7 +16,7 @@ import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource } fro
 import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
 import { compareStoreText, parseWorkflowCoordinate } from '../../../../src/store/types.ts';
-import type { StepDef, WorkflowDef } from '../../../../src/types.ts';
+import type { InputDef, StepDef, WorkflowDef } from '../../../../src/types.ts';
 import type { DefPolicy, DefVerdict } from '../../../../src/crypto/verify-publication.ts';
 import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
 import type { OriginRuleMatch, OriginRules } from '../../../../src/crypto/origin-rules.ts';
@@ -55,6 +55,8 @@ export interface InstructionRefusal {
 export interface ResolvedCommand {
   /** Trusted capability, called after payload preparation immediately before start. */
   revalidate?: () => Promise<InstructionRefusal | undefined>;
+  /** Opt-in v2 consequence fence after the child exits, before any submit/reject/ask. */
+  revalidateAfterRun?: () => Promise<InstructionRefusal | undefined>;
   ok: true;
   command: string;
   /** Verified installed bundle root, when resolution has bundle provenance. */
@@ -73,6 +75,8 @@ export interface ResolvedStep {
 /** Static step and calls-boundary facts from one verified local publication. */
 export interface ResolvedHostedStep extends ResolvedStep {
   callsProducers: Readonly<Record<string, VerifiedCallsProducer>>;
+  /** From the same verified local publication as step and calls closure. */
+  declaredInputs: readonly InputDef[];
 }
 
 export interface InstructionResolver {
@@ -518,6 +522,7 @@ export function createStoreInstructionResolver(
 	  ok: true,
 	  step: resolved.step,
 	  inputNames: resolved.definition.inputs.map((input) => input.name),
+	  declaredInputs: resolved.definition.inputs,
 	  callsProducers: calls.producers ?? {},
 	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
       };

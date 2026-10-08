@@ -764,6 +764,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     order: OrderPacket,
     resolvedCommand: string,
     payloadFile: string | undefined,
+    revalidateAfterRun?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
     if (signalled) {
       // The operator killed the work and the command settled before the lease
@@ -774,6 +775,17 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       opts.err(`owenloop work exec: signalled — killed work gets no receipt, released ${workflow}/${runId}`);
       await leasePromise;
       return 'killed';
+    }
+    if (revalidateAfterRun !== undefined) {
+      let reason: string | undefined;
+      try { reason = (await revalidateAfterRun())?.reason; }
+      catch (error) { reason = `trusted input v2 consequence read failed: ${errMsg(error)}`; }
+      if (reason !== undefined) {
+	opts.err(reason);
+	lease.stop('unresolved-instructions');
+	await leasePromise;
+	return 'unresolved-instructions';
+      }
     }
 
     // Before any of the branches below decide what to do about the failure.
@@ -1056,6 +1068,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     let resolvedCommand: string;
     let resolvedBundleDir: string | undefined;
     let revalidate: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
+    let revalidateAfterRun: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     try {
       const resolved = await opts.instructions.resolveCommand(order);
       if (!resolved.ok) {
@@ -1067,6 +1080,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       resolvedCommand = resolved.command;
       resolvedBundleDir = resolved.bundleDir;
       revalidate = resolved.revalidate;
+      revalidateAfterRun = resolved.revalidateAfterRun;
     } catch (e) {
       opts.err(
         `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
@@ -1175,7 +1189,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         }
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
-	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
+	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile, revalidateAfterRun);
       }
       running = cmd;
       opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
@@ -1195,7 +1209,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return mapLeaseDuringRun(outcome.o);
       }
 
-      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile);
+      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile, revalidateAfterRun);
     } finally {
       removeConsumesDir(consumesDir);
       removeConsumesDir(feedbackDir);

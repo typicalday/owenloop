@@ -6,9 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { Engine } from '../../../src/engine.ts';
+import { openStore } from '../../../src/store.ts';
 import { parseConsume, parseProduce } from '../../../src/paths.ts';
 import type { StepDef } from '../../../src/types.ts';
+import { def, input, step as testStep } from '../../../test/helpers.ts';
 import { bindTrustedReferenceV2 } from '../src/hosted/trusted-input-binding.ts';
+import { createTrustedInputV2Admission } from '../src/hosted/trusted-input-admission.ts';
 import { createTrustedReferenceV2Reader, parseTrustedReferenceV2 } from '../src/hosted/trusted-reference-v2.ts';
 import type { TrustedReferenceV2 } from '../src/hosted/trusted-reference-v2.ts';
 
@@ -172,4 +176,49 @@ test('local v2 gate retains map/cause structure and unconsumed dotted cwd source
   assert.equal((await bindTrustedReferenceV2({ response: parseTrustedReferenceV2(mapOrder, expected) as TrustedReferenceV2,
     expected: { ...expected, defDigest: 'a'.repeat(64), step: 'planner', key: '' }, step: mapStep,
     declaredInputs: [], consumedVerifier: async order => ({ ok: true, order, warnings: [] }), callsProducers: {} })).ok, false);
+});
+
+test('v2 admission refuses forged private modifier and roster fields absent from direct Service witness', async () => {
+  const direct = available();
+  const step = { name: 'planner', consumes: [parseConsume('optional')], produces: [parseProduce('plan')] } as StepDef;
+  const admission = createTrustedInputV2Admission({ reader: { read: async () => direct }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step }),
+      resolveHostedStep: async () => ({ ok: true, step, inputNames: ['optional'],
+	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }) });
+  const privateOrder = { ...direct.order,
+    owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  assert.equal((await admission.observe(privateOrder)).ok, true);
+  assert.deepEqual(await admission.observe({ ...privateOrder, modifier: 'deep' }),
+    { ok: false, reason: 'private-order-unwitnessed-field' });
+  assert.deepEqual(await admission.observe({ ...privateOrder, capabilities: ['build'], crews: ['other'] }),
+    { ok: false, reason: 'private-order-unwitnessed-field' });
+  assert.deepEqual(await admission.observe({ ...privateOrder, workdir: '/forged' }),
+    { ok: false, reason: 'private-order-v2-mismatch' });
+});
+
+test('a real capability claim remains unsupported until Service v2 witnesses the offer', async () => {
+  const definition = def('capability-v2', [input('proposal')],
+    [testStep({ name: 'planner', consumes: ['proposal'], produces: ['plan'], capabilities: ['build'] })]);
+  const store = openStore(':memory:');
+  try {
+    const engine = new Engine(store, () => definition);
+    const workflow = engine.createInstance(definition.name);
+    const privateOrder = engine.tick(workflow, { now: 0, capabilities: ['build'] }).orders[0]!;
+    assert.deepEqual(privateOrder.capabilities, ['build']);
+    const { capabilities: _unwitnessed, ...projected } = privateOrder;
+    const admission = createTrustedInputV2Admission({
+      reader: { read: async () => ({ protocol: 'trusted-reference-read-v2', state: 'available',
+	workflow, run: privateOrder.run, order: projected, inputs: [], lease: { claimed: true } }) as TrustedReferenceV2 },
+      expected: { workflow, run: privateOrder.run },
+      instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+	resolveStep: async () => ({ ok: true, step: definition.steps[0]! }),
+	resolveHostedStep: async () => ({ ok: true, step: definition.steps[0]!, inputNames: ['proposal'],
+	  declaredInputs: definition.inputs, callsProducers: {} }) },
+      consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    });
+    assert.deepEqual(await admission.observe(privateOrder),
+      { ok: false, reason: 'private-order-unwitnessed-field' });
+  } finally { store.close(); }
 });

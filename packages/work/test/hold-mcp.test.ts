@@ -15,6 +15,7 @@ import type { SubmissionKeyManager } from '../src/submit-proof.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { ToolCallContext, ToolRegistration } from '../src/mcp/server.ts';
+import type { TrustedInputAdmission } from '../src/hosted/trusted-input-admission.ts';
 
 // ---- fakes ------------------------------------------------------------------
 
@@ -221,6 +222,30 @@ test('a positive restricted selection exposes exactly get_order and submit', () 
   const { hub } = mockHub({});
   const mount = createHoldMcp(deps(hub, { tools: ['get_order', 'submit'] }));
   assert.deepEqual(mount.tools.map((t) => t.name), ['get_order', 'submit']);
+});
+
+test('opt-in held v2 shows only gated optional presence and refuses changed witness before submit', async () => {
+  const response = producerOrderResponse();
+  response.order!.inputs = ['optional'];
+  response.order!.consumedFingerprint = { optional: 1 };
+  const { hub, calls } = mockHub({ getOrder: response });
+  let observations = 0;
+  const mount = createHoldMcp(deps(hub, {
+    modelOrderVerifier: async () => { throw new Error('v1 model verifier must not run'); },
+    consumedVerifier: async () => { throw new Error('v1 consumed verifier must not run'); },
+    trustedInputV2: { observe: async order => ({
+      ok: true, order, step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+      packetDigest: 'packet-a', witnessDigest: ++observations === 1 ? 'witness-a' : 'witness-b',
+      observedAt: 0, expiresAt: 5000, inputs: [{ path: 'optional', version: 1, present: false }],
+    }) },
+  }));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, undefined);
+  assert.deepEqual(parse(shown).order.inputWitnesses, [{ path: 'optional', version: 1, present: false }]);
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'result', value: { ok: true } }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.match(parse(submitted).error, /claim input observation changed/);
+  assert.equal(calls.filter(call => call.verb === 'submit').length, 0);
 });
 
 // ---- get_order --------------------------------------------------------------

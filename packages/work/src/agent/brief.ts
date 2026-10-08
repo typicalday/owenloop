@@ -513,6 +513,7 @@ export function buildOwenloopMcp(
   spec: BriefSpec,
   binPath: string = resolveOwenloopBin(),
   execPath: string = process.execPath,
+  trustedInputV2 = false,
 ): { command: string; args: string[] } {
   return {
     command: execPath,
@@ -529,6 +530,7 @@ export function buildOwenloopMcp(
       `--shift=${spec.shiftId ?? ''}`,
       '--mcp',
       '--never-release',
+      ...(trustedInputV2 ? ['--trusted-input-v2'] : []),
     ],
   };
 }
