@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { materializeRoutedCommandFiles } from '../src/hub/routed-command-files.ts';
+import { createDefaultRunner } from '../src/exec/runner.ts';
 import type { RoutingChildClient } from '../src/hub/routing-child-client.ts';
 import type { FileArtifactPointer, GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
 
@@ -76,6 +77,25 @@ test('a routed command with no present file pointer keeps an empty side map', as
     assert.deepEqual(seen, []);
     assert.deepEqual(readdirSync(base), []);
     await result.cleanup();
+  });
+});
+
+test('an actual shell child reads a completed cache path from the env map', async () => {
+  await withBase(async base => {
+    const submitted = order();
+    const { child } = client(submitted);
+    const prepared = await materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base });
+    try {
+      const runner = createDefaultRunner();
+      const command = `node -e 'const fs = require("node:fs"); `
+		+ `const rows = JSON.parse(process.env.OWENLOOP_CONSUMED_FILE_PATHS_JSON); `
+		+ `process.stdout.write(fs.readFileSync(rows[0].file, "utf8"))'`;
+      const result = await runner.start(command, { cwd: base,
+		env: { ...process.env, OWENLOOP_CONSUMED_FILE_PATHS_JSON: prepared.envValue } }).done;
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.stdoutBytes, bytes.length);
+      assert.equal(result.outputTail, bytes.toString());
+    } finally { await prepared.cleanup(); }
   });
 });
 
