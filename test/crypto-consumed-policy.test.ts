@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 
 import {
+  DSSE_SSH_NAMESPACE,
+  dsseSignSubmission,
   encodeBase64,
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_REVOCATION,
@@ -12,6 +15,8 @@ import {
 } from '../src/crypto/dsse.ts';
 import { keyidFromBlob, publicKeyDescriptor } from '../src/crypto/keys.ts';
 import { valueDigestHex } from '../src/crypto/canonical.ts';
+import { createSshSigner } from '../src/crypto/ssh.ts';
+import { verifyConsumed } from '../src/crypto/verify-consumed.ts';
 import type { EnrollmentGrantRecord, GrantScope, RevocationRecord } from '../src/crypto/records.ts';
 import { createConsumedVerifier, resetConsumedVerifierWarningsForTests } from '../packages/work/src/consumed-verifier.ts';
 import type { OrderPacket } from '../packages/work/src/hub/types.ts';
@@ -31,6 +36,15 @@ function fixtureKey(name: string): FixtureKey {
 
 const root = fixtureKey('root');
 const producer = fixtureKey('producer');
+function sshKeygenWorks(): boolean {
+  try {
+    execFileSync('ssh-keygen', ['-Y', 'find-principals'], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch (error) {
+    return typeof (error as { status?: unknown }).status === 'number';
+  }
+}
+const OPENSSH_SKIP = !sshKeygenWorks() && 'host ssh-keygen lacks -Y support';
 const unrestrictedScope: GrantScope = {
   pools: '*',
   labels: '*',
@@ -287,6 +301,75 @@ test('owed rejection proof binds to the owed claim-time version', async () => {
   }), { hardRule: false });
   assert.equal(result.ok, false);
   if (!result.ok) assert.match(result.reason, /signed version 4, expected version 5/);
+});
+
+test('a real producer-signed reason array remains unverified feedback under each policy', { skip: OPENSSH_SKIP }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-owed-proof-'));
+  try {
+    const keyPath = join(dir, 'producer');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', keyPath], { stdio: 'ignore', timeout: 15_000 });
+    const publicKey = readFileSync(`${keyPath}.pub`, 'utf8');
+    const keyid = publicKeyDescriptor(publicKey).keyid;
+    const reasons = [{ at: 20, action: 'reject', kind: 'structural', by: 'engine', text: 'fix it' }];
+    const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
+    const sign = async (artifact: string, version: number, workflow = 'wf-policy'): Promise<string> => {
+      const { envelope: signed } = await dsseSignSubmission(
+        Buffer.from(JSON.stringify(submission(artifact, reasons, version, keyid, workflow))), signer,
+      );
+      return JSON.stringify(signed);
+    };
+    const signedProof = await sign('output', 5);
+    const wrongPathProof = await sign('other', 5);
+    const wrongVersionProof = await sign('output', 4);
+    const wrongWorkflowProof = await sign('output', 5, 'another-workflow');
+    signer.dispose?.();
+    const signed = JSON.parse(signedProof) as { payloadType: string; payload: string; signatures: Array<{ keyid?: string; sig: string }> };
+    const badSignatureProof = JSON.stringify({ ...signed, signatures: signed.signatures.map((entry) => ({ ...entry, sig: 'YmFk' })) });
+    const env = trustRootEnv();
+    writeFileSync(join(env.HOME!, '.owenloop', 'org-root.pub'), publicKey);
+    const producerVerdict = await verifyConsumed({
+      path: 'output', value: reasons, proof: signedProof, expectedVersion: 5,
+      expectedWorkflow: 'wf-policy', orgRootPublicKey: publicKey, grants: [], at: 100, demand: {},
+    });
+    assert.equal(producerVerdict.kind, 'verified', JSON.stringify(producerVerdict));
+
+    const order = rootOrder({
+      consumes: {}, consumedFingerprint: {}, consumesProof: undefined,
+      owes: [{ path: 'output', version: 5, judgmentRejects: 1, schemaRejects: 0, reasons, proof: signedProof }],
+    });
+    for (const [artifactPolicy, hardRule, expected] of [
+      ['enforce', false, 'refuse'], ['off', true, 'refuse'], ['warn', false, 'warn'], ['off', false, 'pass'],
+    ] as const) {
+      const verifier = createConsumedVerifier({ env, artifactPolicy, now: () => 100 });
+      const result = await verifier(order, { hardRule });
+      if (expected === 'refuse') {
+        assert.equal(result.ok, false, `${artifactPolicy}, hard=${hardRule}`);
+        if (!result.ok) assert.match(result.reason, /\(reason-authority\).*submission\.v1 does not authenticate the rejecting actor/);
+      } else {
+        assert.equal(result.ok, true, `${artifactPolicy}, hard=${hardRule}`);
+        if (result.ok) {
+          assert.equal(result.warnings.length, expected === 'warn' ? 1 : 0);
+          if (expected === 'warn') assert.match(result.warnings[0]!, /\(reason-authority\)/);
+        }
+      }
+    }
+
+    const offVerifier = createConsumedVerifier({ env, artifactPolicy: 'off', now: () => 100 });
+    const invalidOwedCases: Array<[string, OrderPacket['owes'][number], string]> = [
+      ['signature', { ...order.owes[0]!, proof: badSignatureProof }, 'signature'],
+      ['path', { ...order.owes[0]!, proof: wrongPathProof }, 'signature'],
+      ['digest', { ...order.owes[0]!, reasons: [{ ...reasons[0]!, text: 'changed' }] }, 'value-digest'],
+      ['version', { ...order.owes[0]!, proof: wrongVersionProof }, 'version'],
+      ['workflow', { ...order.owes[0]!, proof: wrongWorkflowProof }, 'workflow'],
+    ];
+    for (const [name, owed, link] of invalidOwedCases) {
+      const result = await offVerifier({ ...order, owes: [owed] }, { hardRule: false });
+      assert.equal(result.ok, false, `${name}: invalid producer evidence must still refuse under off`);
+      if (!result.ok) assert.match(result.reason, new RegExp(`\\(${link}\\)`));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('invalid evidence refuses even when artifact policy is off', async () => {

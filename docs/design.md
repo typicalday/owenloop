@@ -1849,24 +1849,27 @@ shape and no verify-mode branch anywhere in the path.
 
 ### §29.5 Consume-side dynamic evidence
 
-The target wire shape defines two signed-evidence channels for dynamic data:
 `consumesProof` is a JSON-serialized map from consumed artifact path to a
-serialized DSSE `submission.v1` envelope, and `owes[].proof` is a serialized
-DSSE envelope for the complete rejection-reason thread on one owed artifact. A
-compatible hub stores and relays these strings but does not verify, repair, or
-authorize them. The production hub deployed as of 2026-08-10 omits these fields
-and drops submit proofs, so these channels are not yet end-to-end production
-capabilities.
+serialized DSSE `submission.v1` envelope. A hub can store and relay these
+producer proofs but does not verify or authorize them. The `owes[].proof`
+field can carry a serialized producer envelope over the complete
+rejection-reason thread, but `submission.v1` grants no rejecting-actor
+authority. Current Service does not issue an actor-signed reason event or an
+independently fresh reason head; verified feedback remains a separate contract.
 
 A consuming driver gates the complete order before the order reaches a prompt,
 MCP model context, or command. For each consumed value, the gate verifies the
 DSSE envelope first, validates the signed submission record, cross-checks the
 authenticated signer key with `producerKeyId`, checks the path, canonical value
-digest, and supplied claim-time version, then validates the local enrollment
-chain, revocations, and any supplied demand's scope. For an `owes[].proof`
-envelope, the signed produced value is the complete `owes[].reasons` array;
-the gate runs before replay truncation so the verified bytes are the full
-thread.
+digest, expected workflow and claim-time version, then validates the local
+enrollment chain, revocations, and any supplied demand's scope. The workflow
+expectation comes from the order packet and checks packet/proof coherence, not
+independent instance authority. Calls relays keep the child workflow separate.
+For an `owes[].proof`, the gate detects invalid producer evidence before replay
+truncation, but an otherwise valid producer-signed reasons array remains
+`unverifiable` as rejection feedback: no rejecting actor, reason revision, or
+fresh head is authenticated. Hard-rule and `enforce` refuse it; `warn` warns
+and `off` may admit the unverified text under their existing policy.
 
 The built-in production `exec`, `agent-run`, and `hold` roles currently pass no
 pool, label, or namespace demand. `OrderPacket` has no demand field from which

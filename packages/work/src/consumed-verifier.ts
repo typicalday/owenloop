@@ -93,7 +93,7 @@ function errorText(error: unknown): string {
 }
 
 function linkFor(verdict: Exclude<ConsumedVerdict, { kind: 'verified' | 'absent' }>): string {
-  const match = verdict.reason.match(/^(no-proof|signature|workflow|value-digest|version|chain|scope|prerequisite|calls):/);
+  const match = verdict.reason.match(/^(no-proof|signature|workflow|reason-authority|value-digest|version|chain|scope|prerequisite|calls):/);
   if (match !== null) return match[1]!;
   return verdict.kind === 'invalid' ? 'signature' : 'prerequisite';
 }
@@ -411,17 +411,25 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
       } else if (proofs.kind === 'unverifiable') {
         verdict = { kind: 'unverifiable', reason: proofs.reason };
       } else {
-        verdict = await verifyConsumed({
+        const submissionVerdict = await verifyConsumed({
           path: owed.path,
+          expectedWorkflow: order.workflow,
           value: owed.reasons,
           ...(owed.proof === undefined ? {} : { proof: owed.proof }),
-	  ...(owed.version === undefined ? {} : { expectedVersion: owed.version }),
+          ...(owed.version === undefined ? {} : { expectedVersion: owed.version }),
           orgRootPublicKey: rootPublicKey,
           grants,
           revocations,
           at,
           demand: args.demand ?? {},
         }, verifierOptions);
+        // A submission record can detect malformed or changed producer bytes,
+        // but it grants no authority to reject or append a reason. Preserve
+        // invalid-proof refusals; never promote an otherwise valid producer
+        // envelope into verified rejection feedback.
+        verdict = submissionVerdict.kind === 'verified'
+          ? { kind: 'unverifiable', reason: 'reason-authority: submission.v1 does not authenticate the rejecting actor or a fresh reason head' }
+          : submissionVerdict;
       }
       const result = policyOutcome(order, opts.hardRule, policy, owed.path, verdict, warnings);
       if (result !== undefined) return result;
