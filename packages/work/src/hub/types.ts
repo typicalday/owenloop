@@ -865,6 +865,8 @@ export type LaunchObservationV1 =
   | { state: 'observed'; tuple: LocalModelTuple; pid: number; argv: readonly string[]; evidence: ArtifactRef };
 export interface LaunchReportV1 {
   version: 'launch-v1';
+  /** Required by live Service ingestion after reserve_launch. */
+  reservationId?: string;
   decisionId: string;
   binding: DecisionBindingV1;
   claimId: string;
@@ -873,6 +875,25 @@ export interface LaunchReportV1 {
   requested: LocalModelTuple | null;
   selected: LocalModelTuple | null;
   observation: LaunchObservationV1;
+}
+export interface LaunchReservationRequestV1 {
+  version: 'launch-reservation-v1';
+  claimId: string;
+  decisionId: string;
+  binding: DecisionBindingV1;
+  orderId: string;
+  attemptId: string;
+  rosterRevision: string;
+  /** Exact ordered local candidates submitted for assessment and launch. */
+  candidateIds: string[];
+  assessmentId: string | null;
+  requested: LocalModelTuple | null;
+  selected: LocalModelTuple | null;
+}
+export interface LaunchReservationResponse {
+  reservationId: string;
+  orderId: string;
+  expiresAt: number;
 }
 
 export interface RoutingScope { workflows?: string[]; crews?: string[]; capabilities?: string[] }

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 
 import { createHubClient } from '../src/hub/client.ts';
 import { HubError } from '../src/hub/types.ts';
+import type { LaunchReservationRequestV1 } from '../src/hub/types.ts';
 
 interface Captured {
   method: string;
@@ -348,6 +349,46 @@ test('routing session transport pins HTTPS origin, keeps capability in headers a
   assert.deepEqual(JSON.parse(String(requests[0]!.init.body)), { scope });
   assert.deepEqual(JSON.parse(String(requests[3]!.init.body)).submission, submission);
   assert.deepEqual(JSON.parse(String(requests[7]!.init.body)), binding);
+});
+
+test('reserve_launch carries the exact session-scoped pre-start request with no bearer-only fallback', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const request: LaunchReservationRequestV1 = {
+    version: 'launch-reservation-v1', claimId: 'claim', decisionId: 'decision',
+    binding: {
+      orgId: 'org', runId: 'run', frameId: 'frame',
+      def: { bundleDigest: 'sha256:bundle', workflowName: 'wf' }, subjectKey: 'subject',
+      evidenceDigest: 'sha256:evidence', candidateDigest: 'sha256:candidates', policyDigest: 'sha256:policy',
+      revisions: { definition: '1', candidates: '1', policy: '1', authority: '1', rolePolicy: '1',
+		roster: '1', routes: '1', membership: '1', evidenceGeneration: '1' },
+      issuedAt: 1_000, expiresAt: 2_000,
+      authority: { principalId: 'agent', sessionId: 'rs_session' },
+    },
+    orderId: 'run', attemptId: 'attempt', rosterRevision: 'roster-v1',
+    candidateIds: ['tuple-first', 'tuple-second'], assessmentId: 'assessment',
+    requested: { id: 'tuple-first', harness: 'codex', model: 'model-a', effort: 'high' },
+    selected: { id: 'tuple-second', harness: 'codex', model: 'model-b', effort: 'high' },
+  };
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => ({
+      sessionId: 'rs_session', shiftId: 'shf_service', credential: 'private-capability', expiresAt: 2_000,
+    }), now: () => 1_000 },
+    fetchImpl: (async (url, init) => {
+      calls.push({ url: String(url), init: init! });
+      return Response.json({ reservationId: 'lr-reservation', orderId: 'run', expiresAt: 1_500 });
+    }) as typeof fetch,
+  });
+  assert.deepEqual(await c.reserveLaunch({ workflow: 'wf', request }),
+    { reservationId: 'lr-reservation', orderId: 'run', expiresAt: 1_500 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url, 'https://hub.example/api/reserve_launch');
+  assert.equal(calls[0]!.init.redirect, 'error');
+  assert.equal(new Headers(calls[0]!.init.headers).get('X-Owenloop-Routing-Session'), 'private-capability');
+  assert.equal(new Headers(calls[0]!.init.headers).get('Authorization'), 'Bearer enrolled');
+  assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), { workflow: 'wf', request });
+  const bare = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    fetchImpl: (async () => { assert.fail('bearer-only reserve_launch reached transport'); }) as typeof fetch });
+  await assert.rejects(bare.reserveLaunch({ workflow: 'wf', request }), /routing origin refused/);
 });
 
 test('assessLocalModel uses the scoped service verb with exactly the reviewed body', async () => {

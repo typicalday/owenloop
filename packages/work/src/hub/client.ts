@@ -68,6 +68,8 @@ import type {
   InvocationBindingReadResponse,
   LaunchReportV1,
   LaunchReportResponse,
+  LaunchReservationRequestV1,
+  LaunchReservationResponse,
   LocalModelRequest,
   LocalModelResponse,
 } from './types.ts';
@@ -177,6 +179,7 @@ export interface RoutingHubClient extends HubClient {
   readRoutingClaim(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<RoutingClaimReadResponse>;
   readInvocationBinding(req: InvocationBindingReadRequest, signal?: AbortSignal): Promise<InvocationBindingReadResponse>;
   reportLaunch(req: { workflow: string; report: LaunchReportV1 }, signal?: AbortSignal): Promise<LaunchReportResponse>;
+  reserveLaunch(req: { workflow: string; request: LaunchReservationRequestV1 }, signal?: AbortSignal): Promise<LaunchReservationResponse>;
 }
 
 export function createHubClient(opts: HubClientOptions): RoutingHubClient {
@@ -327,6 +330,7 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     readRoutingClaim: (req, signal) => scopedPost('read_routing_claim', req, signal),
     readInvocationBinding: (req, signal) => scopedPost('read_invocation_binding', req, signal),
     reportLaunch: (req, signal) => scopedPost('report_launch', req, signal),
+    reserveLaunch: (req, signal) => scopedPost('reserve_launch', req, signal),
     assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
     // Hosted-holder preflight only. Routing orders return routing-unsupported;
     // get_order plus read_routing_claim supply Jev authority instead.
