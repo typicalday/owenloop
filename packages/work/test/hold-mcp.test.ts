@@ -248,6 +248,43 @@ test('opt-in held v2 shows only gated optional presence and refuses changed witn
   assert.equal(calls.filter(call => call.verb === 'submit').length, 0);
 });
 
+test('held v2 rechecks the pinned witness after an awaited signer before submit', async () => {
+  const response = producerOrderResponse();
+  response.order!.judge = 'result';
+  response.order!.inputs = ['result'];
+  response.order!.consumes = { result: { value: 'seen' } };
+  response.order!.consumedFingerprint = { result: 2 };
+  const { hub, calls } = mockHub({ getOrder: response });
+  let entered!: () => void;
+  let resume!: () => void;
+  const signing = new Promise<void>(resolve => { resume = resolve; });
+  const signerEntered = new Promise<void>(resolve => { entered = resolve; });
+  let observations = 0;
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: { ...signingKeys(), withSigningKey: async (_ref, callback) => {
+      entered();
+      await signing;
+      return callback('/fake/private-key');
+    } },
+    sshProcess: fakeSshProcess(),
+    trustedInputV2: { observe: async order => ({
+      ok: true, order, step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+      packetDigest: 'packet-a', witnessDigest: ++observations === 1 ? 'witness-a' : 'witness-b',
+      observedAt: 0, expiresAt: 5000, inputs: [],
+    }) },
+  }));
+  const pending = tool(mount.tools, 'submit').handler({ path: 'result', value: { ok: true } }, ctx);
+  await signerEntered;
+  assert.equal(calls.some(call => call.verb === 'submit'), false);
+  resume();
+  const refused = await pending;
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /claim input observation changed/);
+  assert.equal(observations, 2);
+  assert.equal(calls.some(call => call.verb === 'submit'), false);
+});
+
 // ---- get_order --------------------------------------------------------------
 
 test('get_order (no first contact yet) live-fetches for the bound run and returns a lean view', async () => {

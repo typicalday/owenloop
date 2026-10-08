@@ -436,6 +436,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
         }
+	// Signing may await local key access. Re-read the original claim and
+	// its v2 input witness after that await, immediately before the write.
+	if (deps.trustedInputV2 !== undefined) {
+	  const fresh = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refusedFresh = await gate(fresh);
+	  if (refusedFresh !== undefined) return refusedFresh;
+	}
         const beforeSubmit = terminalGuard();
         if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({

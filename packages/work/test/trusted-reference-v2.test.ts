@@ -194,6 +194,8 @@ test('v2 admission refuses forged private modifier and roster fields absent from
     { ok: false, reason: 'private-order-unwitnessed-field' });
   assert.deepEqual(await admission.observe({ ...privateOrder, capabilities: ['build'], crews: ['other'] }),
     { ok: false, reason: 'private-order-unwitnessed-field' });
+  assert.deepEqual(await admission.observe({ ...privateOrder, consumesProof: '{}' }),
+    { ok: false, reason: 'private-order-v2-mismatch' });
   assert.deepEqual(await admission.observe({ ...privateOrder, workdir: '/forged' }),
     { ok: false, reason: 'private-order-v2-mismatch' });
 });

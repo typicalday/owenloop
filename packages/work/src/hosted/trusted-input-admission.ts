@@ -49,6 +49,8 @@ export function createTrustedInputV2Admission(args: {
       inputs: order.inputs, outputs: order.outputs, consumes: order.consumes,
       consumedFingerprint: order.consumedFingerprint ?? null, workdir: order.workdir ?? null,
       cause: order.cause ?? null,
+      consumesProof: Object.hasOwn(order, 'consumesProof') ? order.consumesProof : null,
+      consumesProofRelay: Object.hasOwn(order, 'consumesProofRelay') ? order.consumesProofRelay : null,
       owes: order.owes.map(owed => ({ path: owed.path, version: owed.version ?? null })),
     });
     if (!equal(dynamic(privateOrder), dynamic(direct))
