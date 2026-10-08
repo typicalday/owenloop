@@ -2622,10 +2622,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       pendingCandidates.delete(exit.run);
       if (owned?.pid === exit.pid && owned.handoff.path === exit.routingHandoff) {
 	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
-	// Only a clean role completion attests that its own child operation ended.
-	// A crash/signal can leave a detached shell or provider group alive.
-	if (owned.spawnedAt !== undefined && (!owned.gateMayHaveOpened
-	  || (exit.exitStatus === 0 && exit.signal === null)))
+	// Once the gate may have opened, role exit does not prove that its detached
+	// shell or provider descendants stopped. Retain their bytes until a separate
+	// process-group termination proof exists, even after exit status zero.
+	if (owned.spawnedAt !== undefined && !owned.gateMayHaveOpened)
 	  owned.stage?.cleanupAfterExit({ workflow: exit.workflow, run: exit.run,
 	    pid: exit.pid, spawnedAt: owned.spawnedAt });
 	routingHandoffs.delete(exit.run);

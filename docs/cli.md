@@ -302,9 +302,9 @@ order's workdir and current operator trust before using that snapshot; the
 current routed role startup fence remains in force. Snapshot validation, Unix
 directory permissions, and the broker protocol do not isolate processes under
 the same user ID; hostile child code needs a separate OS isolation design.
-Activated snapshots survive an uncertain worker exit because a detached shell
-or provider may still read them. A safe descendant-group reaper is not yet
-implemented, so an uncertain snapshot may require operator cleanup.
+Activated snapshots survive every role exit, including status `0`, because a
+detached shell or provider may still read them. A safe descendant-group reaper
+is not yet implemented, so these snapshots may require operator cleanup.
 
 Routed holder file uploads require a server administrator to run
 `owenloop-routing-helper-build` from a trusted package installation on macOS

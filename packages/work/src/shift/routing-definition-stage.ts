@@ -179,7 +179,8 @@ export function createRoutedDefinitionMaintenance(args: {
 	    // No gate marker means authored work could never start. A confirmed dead
 	    // parked worker can be reaped after a Shift crash or canceled dispatch.
 	    // Once the gate may have opened, role-PID death says nothing about its
-	    // detached shell/provider descendants: retain until exact clean exit.
+	    // detached shell/provider descendants: retain until their termination
+	    // is independently proven. A role exit, even status zero, is insufficient.
 	    if (gateMayOpen(path) || isAlive(owner.pid) !== false) continue;
 	  } else if (now() - stat.mtimeMs < STAGE_RETENTION_MS) continue;
 	  makeOwnedDirectoriesWritable(path);

@@ -4736,7 +4736,7 @@ test('routed staging that finishes after session stop cannot reserve or spawn', 
   loop.stop();
 });
 
-test('routed terminal and Shift stop revoke access but retain stage bytes until exact clean child exit', async () => {
+test('routed terminal and Shift stop revoke access but retain post-gate stage after clean role exit', async () => {
   const f = await routedLoopFixture();
   let stagePath = '';
   let activated = false;
@@ -4759,37 +4759,76 @@ test('routed terminal and Shift stop revoke access but retain stage bytes until 
   loop.noteRunEnded('run_routed');
   assert.equal(cleanups, 0);
   assert.equal(existsSync(stagePath), true);
-  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'exec', pid: 9001,
     routingHandoff: '/wrong/old-handoff', exitStatus: 0, signal: null });
   assert.equal(existsSync(stagePath), true);
-  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'exec', pid: 9001,
     routingHandoff: spec.routingHandoff, exitStatus: 0, signal: null });
-  assert.equal(cleanups, 1);
-  assert.equal(existsSync(stagePath), false);
+  assert.equal(cleanups, 0);
+  assert.equal(existsSync(stagePath), true);
+  await f.session.stop();
+  rmSync(stagePath, { recursive: true, force: true });
 });
 
-test('abnormal routed role exit retains stage for uncertain detached descendants', async () => {
-  const f = await routedLoopFixture();
+test('agent and command role exits retain stage without descendant-stop proof', async () => {
+  for (const kind of ['agent-run', 'exec'] as const) for (const exitStatus of [0, 1]) {
+    const f = await routedLoopFixture();
+    let stagePath = '';
+    let activated = false;
+    const loop = createShiftLoop({ ...f.options, stageRoutedDefinition: async order => {
+      stagePath = mkdtempSync(join(stateDir, '.routing-def-'));
+      return { path: stagePath, digest: order.defDigest!, verifyOrder: async () => {},
+      canSubmit: () => false, canReplay: () => false,
+      activate: () => { activated = true; }, markGateMayOpen: () => {},
+      cleanup: () => { if (!activated) rmSync(stagePath, { recursive: true, force: true }); },
+      cleanupAfterExit: () => { throw new Error('must retain unproved descendant exit'); } };
+    } });
+    assert.equal(await loop.iterate(), 1);
+    const spec = f.spawns[0]!;
+    spec.onTerminal?.();
+    loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind, pid: 9001,
+      routingHandoff: spec.routingHandoff, exitStatus, signal: null });
+    assert.equal(existsSync(stagePath), true);
+    loop.stop();
+    await f.session.stop();
+    rmSync(stagePath, { recursive: true, force: true });
+  }
+});
+
+test('clean command role exit retains stage while a background shell child is alive', async () => {
+  if (process.platform === 'win32') return;
+  const f = await routedLoopFixture('command');
   let stagePath = '';
-  let activated = false;
   const loop = createShiftLoop({ ...f.options, stageRoutedDefinition: async order => {
     stagePath = mkdtempSync(join(stateDir, '.routing-def-'));
     return { path: stagePath, digest: order.defDigest!, verifyOrder: async () => {},
       canSubmit: () => false, canReplay: () => false,
-      activate: () => { activated = true; },
-      markGateMayOpen: () => {},
-      cleanup: () => { if (!activated) rmSync(stagePath, { recursive: true, force: true }); },
-      cleanupAfterExit: () => { throw new Error('must retain abnormal exit'); } };
+      activate: () => {}, markGateMayOpen: () => {}, cleanup: () => {},
+      cleanupAfterExit: () => { throw new Error('live background child lost its stage'); } };
   } });
-  assert.equal(await loop.iterate(), 1);
-  const spec = f.spawns[0]!;
-  spec.onTerminal?.();
-  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
-    routingHandoff: spec.routingHandoff, exitStatus: 1, signal: null });
-  assert.equal(existsSync(stagePath), true);
-  loop.stop();
-  await f.session.stop();
-  rmSync(stagePath, { recursive: true, force: true });
+  let backgroundPid = 0;
+  try {
+    assert.equal(await loop.iterate(), 1);
+    const spec = f.spawns[0]!;
+    const shell = spawn('/bin/sh', ['-c', 'sleep 30 >/dev/null 2>&1 & echo $!'],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    let output = '';
+    shell.stdout!.setEncoding('utf8');
+    shell.stdout!.on('data', chunk => { output += String(chunk); });
+    await once(shell, 'close');
+    backgroundPid = Number(output.trim());
+    assert.ok(Number.isSafeInteger(backgroundPid) && backgroundPid > 0);
+    process.kill(backgroundPid, 0);
+    loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'exec', pid: 9001,
+      routingHandoff: spec.routingHandoff, exitStatus: 0, signal: null });
+    assert.equal(existsSync(stagePath), true);
+    process.kill(backgroundPid, 0);
+  } finally {
+    if (backgroundPid > 0) try { process.kill(backgroundPid, 'SIGKILL'); } catch { /* exited */ }
+    loop.stop();
+    await f.session.stop();
+    if (stagePath) rmSync(stagePath, { recursive: true, force: true });
+  }
 });
 
 test('post-marker dispatch failure keeps parked child stage until its exit', async () => {

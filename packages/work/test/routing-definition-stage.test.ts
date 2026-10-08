@@ -197,7 +197,7 @@ test('bounded stage maintenance removes an old crash orphan but preserves a fres
   fresh.cleanup();
 });
 
-test('activated stage survives terminal cleanup, 24-hour age and maintenance restart until exact clean exit', async () => {
+test('activated stage survives terminal cleanup, 24-hour age and maintenance restart until explicit owner cleanup', async () => {
   const f = await fixture();
   const stage = await stageRoutedDefinition(f.args);
   const owner = { workflow: 'wf', run: 'run', pid: 92345, spawnedAt: 1_000 };
