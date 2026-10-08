@@ -70,6 +70,9 @@ test('private routed broker binds one dispatch and proxies only scoped requests'
     assert.equal(statSync(join(broker.socketPath, '..')).mode & 0o777, 0o700);
     const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub });
     const send = (method: string, body: unknown, cap = grant.cap) => request(grant.socketPath, { cap, method, body });
+    assert.equal((await send('get_order', {})).ok, false, 'pending grant cannot reach Hub before start gate');
+    assert.equal(calls.length, 0);
+    grant.activate();
     assert.equal((await send('get_order', {})).ok, true);
     assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), { workflow: 'wf', run: 'run' });
     assert.equal(new Headers(calls[0]!.init.headers).get('Authorization'), 'Bearer enrolled');
@@ -116,6 +119,7 @@ test('broker redacts upstream failures and rejects an expired incarnation before
   const broker = await createRoutingBroker({ now: () => now });
   try {
     const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub });
+    grant.activate();
     const response = await request(grant.socketPath, { cap: grant.cap, method: 'read_routing_claim', body: {} });
     assert.equal(response.ok, false);
     assert.equal(response.status, 429);
@@ -150,15 +154,51 @@ test('broker refuses overlong reservations and a response that finishes after gr
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
     const first = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub });
+    first.activate();
     assert.equal((await request(first.socketPath, { cap: first.cap, method: 'reserve_launch',
       body: { request: launch } })).ok, false, 'Service expiry may not widen the local claim bound');
     first.terminal();
     delayed = true;
     const second = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub });
+    second.activate();
     const result = request(second.socketPath, { cap: second.cap, method: 'reserve_launch', body: { request: launch } });
     await fetchStarted;
     second.terminal();
     reply(Response.json({ reservationId: 'lr_late', orderId: 'run', expiresAt: 40_000 }));
     assert.equal((await result).ok, false, 'revoked grant cannot deliver or cache an in-flight result');
+  } finally { await broker.close(); }
+});
+
+test('broker survives bounded client resets during pending Hub replies', async () => {
+  let defer = true;
+  let started: (() => void) | undefined;
+  const releases: Array<(response: Response) => void> = [];
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async () => {
+      if (!defer) return Response.json({ text: 'ok' });
+      return new Promise<Response>(resolve => { releases.push(resolve); started?.(); });
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub });
+    grant.activate();
+    for (let index = 0; index < 16; index++) {
+      const fetched = new Promise<void>(resolve => { started = resolve; });
+      const socket = createConnection(grant.socketPath);
+      socket.on('error', () => {});
+      socket.once('connect', () => socket.write(JSON.stringify({
+		cap: grant.cap, method: 'get_order', body: {},
+      }) + '\n'));
+      await fetched;
+      const closed = new Promise<void>(resolve => socket.once('close', () => resolve()));
+      socket.destroy(new Error('client reset'));
+      await closed;
+      releases.shift()!(Response.json({ text: 'late' }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    defer = false;
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: {} })).ok, true);
   } finally { await broker.close(); }
 });

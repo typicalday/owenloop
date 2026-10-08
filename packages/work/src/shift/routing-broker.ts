@@ -20,6 +20,7 @@ type Method = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reser
   | 'heartbeat' | 'submit';
 interface Grant {
   active: boolean;
+  ready: boolean;
   reservation: ChildReservation;
   routing: ReferenceRouting;
   identity: Identity;
@@ -30,7 +31,9 @@ interface Grant {
 }
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
-    currentIdentity: () => Identity | undefined; hub: RoutingHubClient }): { socketPath: string; cap: string; terminal(): void };
+    currentIdentity: () => Identity | undefined; hub: RoutingHubClient }): {
+      socketPath: string; cap: string; activate(): void; terminal(): void;
+    };
   close(): Promise<void>;
   socketPath: string;
 }
@@ -98,16 +101,16 @@ function validateGrant(grant: Grant, now: number): boolean {
 async function checked<T>(grant: Grant, call: Promise<T>, now: () => number): Promise<T> {
   try {
     const value = await call;
-    if (!validateGrant(grant, now())) throw new Error('routing broker grant expired');
+    if (!grant.ready || !validateGrant(grant, now())) throw new Error('routing broker grant expired');
     return value;
   } catch (error) {
-    if (!validateGrant(grant, now())) throw new Error('routing broker grant expired');
+    if (!grant.ready || !validateGrant(grant, now())) throw new Error('routing broker grant expired');
     throw error;
   }
 }
 
 async function invoke(grant: Grant, method: Method, body: unknown, now: () => number): Promise<unknown> {
-  if (!validateGrant(grant, now()))
+  if (!grant.ready || !validateGrant(grant, now()))
     throw new Error('routing broker grant expired');
   const { workflow, run, childKind } = grant.reservation;
   switch (method) {
@@ -191,6 +194,9 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
   const server: Server = createServer((socket: Socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
+    // A client may disconnect after writing a frame or while a Hub call is
+    // pending. ECONNRESET/EPIPE belong to that request, never the Shift.
+    socket.on('error', () => { socket.destroy(); });
     socket.setTimeout(10_000, () => socket.destroy());
     let bytes = 0;
     let line = '';
@@ -244,16 +250,20 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
     socketPath,
     issue({ reservation, routing, identity, currentIdentity, hub }) {
       if (closed) throw new Error('routing broker closed');
-      const grant: Grant = { active: true, reservation: structuredClone(reservation), routing: structuredClone(routing),
+      const grant: Grant = { active: true, ready: false, reservation: structuredClone(reservation), routing: structuredClone(routing),
 	identity: { ...identity }, currentIdentity, hub };
       if (!validateGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       grants.set(cap, grant);
       let terminal = false;
-      return { socketPath, cap, terminal() {
+      return { socketPath, cap, activate() {
+	  if (closed || !validateGrant(grant, now())) throw new Error('routing broker grant unavailable');
+	  grant.ready = true;
+	}, terminal() {
 	if (terminal) return;
 	terminal = true;
 	grant.active = false;
+	grant.ready = false;
 	grants.delete(cap);
       } };
     },

@@ -4908,13 +4908,14 @@ test('routed dispatch hands off only a broker cap and revokes it on terminal aft
   }
 });
 
-test('routed spawn rollback revokes its broker grant before any child request', async () => {
+test('routed start-gate rollback revokes its activated broker grant before any child request', async () => {
   const f = await routedLoopFixture('command');
   const broker = await createRoutingBroker({ now: () => 1_000 });
   let cap = '';
   const loop = createShiftLoop({ ...f.options, routingBroker: broker, spawner: spec => {
     cap = JSON.parse(readFileSync(spec.routingHandoff!, 'utf8')).broker.cap as string;
-    throw new Error('spawn refused');
+    unlinkSync(spec.startGate!); // Fail synchronous gate opening after broker activation.
+    return { pid: 9001 };
   } });
   try {
     assert.equal(await loop.iterate(), 0);
