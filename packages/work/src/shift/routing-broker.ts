@@ -217,6 +217,10 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
     const path = body.path as string;
     const holder = body.holder as ContactHolder;
     const value = normalizeSubmitValue(body.value);
+    // The versioned REST contract admits only object values. A correctable
+    // input refusal is not an uncertain write and must not poison retry state.
+    if (value === null || typeof value !== 'object' || Array.isArray(value))
+      throw new Error('routing submission value refused');
     const intent = valueDigestHex({ path, value, done: body.done ?? null, holder });
     if (grant.pendingSubmit && grant.pendingSubmit.intent !== intent)
       throw new Error('routing submission outcome unresolved');

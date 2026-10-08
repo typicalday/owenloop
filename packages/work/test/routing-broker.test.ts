@@ -852,3 +852,31 @@ test('routed get_order requires current parent trust before delivering any order
     assert.equal(contacts, 1);
   } finally { await broker.close(); }
 });
+
+test('malformed routed value never signs or writes and a corrected object remains usable', async () => {
+  let signatures = 0, writes = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url) => {
+      if (String(url).endsWith('/get_order')) return Response.json(parentOrder());
+      writes++;
+      return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+      submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => true,
+	sign: async () => { signatures++; return 'parent-proof'; } } });
+    grant.activate(child);
+    const send = (value: unknown) => request(grant.socketPath, { cap: grant.cap, method: 'submit',
+      body: { path: 'out', value, holder } });
+    await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: { holder } });
+    for (const value of ['not-json', [], 1, null]) assert.equal((await send(value)).ok, false);
+    assert.equal(signatures, 0);
+    assert.equal(writes, 0);
+    assert.equal((await send({ corrected: true })).ok, true);
+    assert.equal(signatures, 1);
+    assert.equal(writes, 1);
+  } finally { await broker.close(); }
+});
