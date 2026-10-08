@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
-import type { DecisionBindingV1, FileArtifactPointer, ReferenceRouting } from '../src/hub/types.ts';
+import type { DecisionBindingV1, FileArtifactPointer, GetOrderResponse, ReferenceRouting } from '../src/hub/types.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
 import type { ChildReservation } from '../src/shift/state.ts';
 
@@ -48,33 +48,63 @@ function bytesResponse(bytes: Uint8Array, pointer: FileArtifactPointer): Respons
 }
 
 async function fixture(kind: 'exec' | 'agent-run', pointer: FileArtifactPointer,
-  fileReply: (signal?: AbortSignal) => Response | Promise<Response>) {
+  fileReply: (signal?: AbortSignal) => Response | Promise<Response>,
+  parentVerify?: (response: GetOrderResponse) => Promise<void>) {
   let live: typeof identity | undefined = { ...identity };
   const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const verifiedOrder: GetOrderResponse = { text: 'ok', workflow: 'wf', run: 'run',
+    lease: { claimed: true }, order: { workflow: 'wf', run: 'run', step: 'work', key: '', defDigest: 'digest',
+      inputs: ['seed'], outputs: ['out'], owes: [{ path: 'out' }],
+      consumes: { seed: { nested: { file: pointer } } } } };
   const hub = createHubClient({ origin, getToken: async () => 'enrolled',
     routingSession: { allowedOrigin: origin, get: () => live && ({ ...live, credential }), now: () => 2_000 },
     fetchImpl: (async (url, init) => {
       requests.push({ url: String(url), init });
-      if (String(url).endsWith('/api/get_order')) return Response.json({ text: 'ok', workflow: 'wf', run: 'run',
-        lease: { claimed: true }, order: { workflow: 'wf', run: 'run', step: 'work', key: '', defDigest: 'digest',
-          inputs: ['seed'], outputs: ['out'], owes: [{ path: 'out' }],
-          consumes: { seed: { nested: { file: pointer } } } } });
+      if (String(url).endsWith('/api/get_order')) return Response.json(verifiedOrder);
       return fileReply(init?.signal ?? undefined);
     }) as typeof fetch,
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   const reservation: ChildReservation = { recordType: 'reservation', workflow: 'wf', run: 'run',
     childKind: kind, reservedAt: 1_000, token: 'a'.repeat(32) };
-  const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub });
+  // This transport fixture admits only its exact parent-verified packet. It
+  // grants no signing or submission capability; source/trust verification has
+  // separate stage tests rather than an unsigned production fallback.
+  const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub,
+    submissionAuthority: {
+      async verifyOrder(response) {
+	assert.deepEqual(response, verifiedOrder);
+	await parentVerify?.(response);
+      },
+      async sign() { throw new Error('download fixture cannot sign'); },
+      canSubmit: () => false,
+    } });
   grant.activate({ workflow: 'wf', run: 'run', kind, pid: 9001, spawnedAt: 1_000,
     gateToken: reservation.token });
   const cap = kind === 'agent-run' ? grant.holder! : grant;
   const client = createRoutingChildClient({ broker: cap, reservation });
-  await client.getOrder({ workflow: 'wf', run: 'run', holder: kind === 'exec'
-    ? { kind: 'exec', id: `${hostname()}:9001`, shiftId: identity.shiftId }
-    : { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+  try {
+    await client.getOrder({ workflow: 'wf', run: 'run', holder: kind === 'exec'
+      ? { kind: 'exec', id: `${hostname()}:9001`, shiftId: identity.shiftId }
+      : { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+  } catch (error) {
+    await broker.close();
+    throw error;
+  }
   return { broker, grant, client, requests, revoke: () => { live = undefined; } };
 }
+
+test('a refused parent packet closes fixture custody before any download', { timeout: 2_000 }, async () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const pointer: FileArtifactPointer = { __file: 'orgs/org/artifacts/wf/files/hash', hash: sha(bytes),
+    size: bytes.length, contentType: 'application/octet-stream' };
+  let reads = 0;
+  await assert.rejects(fixture('exec', pointer, () => {
+    reads++;
+    return bytesResponse(bytes, pointer);
+  }, async () => { throw new Error('parent refused fixture packet'); }), /routing broker unavailable/);
+  assert.equal(reads, 0);
+});
 
 test('role and holder download exact consumed pointer through session-scoped GET without JSON byte frames', async () => {
   const bytes = new Uint8Array(33 * 1024 * 1024 + 1).fill(7);
