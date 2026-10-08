@@ -4930,7 +4930,8 @@ for (const failure of ['sync', 'early-terminal', 'async'] as const) {
     assert.equal(await loop.iterate(), failure === 'async' ? 1 : 0);
     if (failure === 'async') {
       spawned!.onTerminal?.();
-      loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001 });
+      loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+      routingHandoff: spawned!.routingHandoff });
       const event = { workflow: 'wf', run: 'run_routed', kind: 'agent-run' as const, executable: 'worker', exitStatus: 1, signal: null, message: 'failed' };
       loop.noteWorkerFailure(event); loop.noteWorkerFailure(event);
     }
