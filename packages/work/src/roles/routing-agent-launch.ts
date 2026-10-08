@@ -21,6 +21,9 @@ type Args = {
   child: Pick<RoutingChildClient, 'readRoutingClaim' | 'assessLocalModel' | 'reserveLaunch'
     | 'reportLaunch' | 'getLaunchOrder'>;
   holder: ContactHolder; workflow: string; run: string; now?: () => number;
+  /** Optional local effects such as git worktree provisioning. Only after the
+   * authenticated report ACK; the final live order read follows the effect. */
+  beforeFinalCheck?: (signal?: AbortSignal) => Promise<void> | void;
 };
 
 /**
@@ -100,6 +103,10 @@ export function createRoutedAgentSelection(args: Args):
       if (!live(later) || accepted.orderId !== args.run || accepted.provenance !== 'authenticated-worker-report'
       || accepted.digest !== valueDigestHex(report) || !Number.isSafeInteger(accepted.recordedAt)
       || now() >= reservation.expiresAt) throw refused();
+      if (args.beforeFinalCheck) {
+	await args.beforeFinalCheck(later ?? signal);
+	if (!live(later) || now() >= reservation.expiresAt) throw refused();
+      }
       const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,
       holder: args.holder });
       if (!live(later) || now() >= reservation.expiresAt || !final.lease.claimed || !final.order

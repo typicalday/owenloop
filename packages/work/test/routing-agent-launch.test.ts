@@ -87,6 +87,28 @@ test('agent selection defers reserve and report until local adapter preflight ha
   await assert.rejects(select(order), /routed agent launch refused/);
 });
 
+test('local workdir materialization runs after report ACK and before final launch order', async () => {
+  const f = fixture();
+  const plan = await createRoutedAgentSelection({ child: f.child, holder,
+    workflow: 'wf', run: 'run', now: () => 2_000,
+    beforeFinalCheck: () => { f.calls.push('materialize'); },
+  })(order);
+  assert.deepEqual(f.calls, ['claim']);
+  await plan.authorize();
+  assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'materialize', 'order']);
+});
+
+test('failed local materialization refuses before final order or provider permission', async () => {
+  const f = fixture();
+  const plan = await createRoutedAgentSelection({ child: f.child, holder,
+    workflow: 'wf', run: 'run', now: () => 2_000,
+    beforeFinalCheck: () => { f.calls.push('materialize'); throw new Error('hook refused'); },
+  })(order);
+  await assert.rejects(plan.authorize(), /hook refused/);
+  assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'materialize']);
+  await assert.rejects(plan.authorize(), /routed agent launch refused/);
+});
+
 test('agent selection aborts during local preflight without reserving or reporting', async () => {
   const f = fixture();
   const controller = new AbortController();
