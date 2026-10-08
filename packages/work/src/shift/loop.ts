@@ -1057,8 +1057,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
   /** Daemon mode only: `once` runs one cycle and returns, so has nothing to watch. */
   function startTimers(): void {
+    let maintenanceRunning = false;
     if (opts.routingSession) cancelRoutingMaintenance = schedule(() => {
-      void opts.routingSession!.maintain().catch(() => opts.err('routing session maintenance failed'));
+      if (stopped || maintenanceRunning || monotonicNow() < backoffUntil) return;
+      maintenanceRunning = true;
+      void opts.routingSession!.maintain().catch(error => {
+	noteServerBackoff(error);
+	opts.err('routing session maintenance failed');
+      }).finally(() => { maintenanceRunning = false; });
     }, 30_000);
     cancelWatchdog = schedule(checkStall, Math.max(MIN_WATCHDOG_CHECK_MS, opts.pollIntervalMs));
     if (heartbeatIntervalMs > 0) cancelHeartbeat = schedule(heartbeat, heartbeatIntervalMs);

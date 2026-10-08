@@ -975,6 +975,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const workflows = opts.scope.workflows && [...opts.scope.workflows];
   let scope = normalize(structuredClone(opts.scope));
   let active = await openRoutingIncarnation({ ...opts, scope });
+  const retired = new Set<Awaited<ReturnType<typeof openRoutingIncarnation>>>();
   let stopped = false;
   let changing: Promise<void> = Promise.resolve();
   // Callers keep this client, while each request resolves the current authority.
@@ -1006,18 +1007,31 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	const previous = active;
 	active = next;
 	scope = desired;
-	// stop() defers close while any owned worker is live. Its existing
-	// terminal callbacks close that exact old session, not the new one.
+	// A retired incarnation retains renewal authority while an owned worker
+	// remains live. Its terminal callbacks close that exact old session.
 	await previous.stop();
+	if (previous.identity()) retired.add(previous);
       });
       changing = change;
       await change;
     },
-    async maintain() { await changing; await active.maintain(); },
+    async maintain() {
+      await changing;
+      // An older worker's session normally expires first. Renew in deadline
+      // order so a slow or rate-limited newer session cannot starve it.
+      const incarnations = [active, ...retired].sort((a, b) =>
+	(a.identity()?.expiresAt ?? Number.POSITIVE_INFINITY) - (b.identity()?.expiresAt ?? Number.POSITIVE_INFINITY));
+      for (const incarnation of incarnations) {
+	if (!incarnation.identity()) { retired.delete(incarnation); continue; }
+	await incarnation.maintain();
+	if (!incarnation.identity()) retired.delete(incarnation);
+      }
+    },
     async stop() {
       stopped = true;
       try { await changing; } catch { /* Failed scope changes retain active. */ }
       await active.stop();
+      for (const incarnation of retired) await incarnation.stop();
     },
   };
 }
@@ -1130,8 +1144,15 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
 	if (terminal) return;
 	terminal = true;
 	try {
-	  if (!sameInode(privateDirectory(directory), directoryInode)) throw new Error('routing handoff ownership changed');
-	  removeExactHandoff(path, inode!);
+	  if (!sameInode(privateDirectory(root), rootInode)) throw new Error('routing handoff ownership changed');
+	  try {
+	    if (!sameInode(privateDirectory(directory), directoryInode)) throw new Error('routing handoff ownership changed');
+	    removeExactHandoff(path, inode!);
+	  } catch (error) {
+	    // Another startup may remove an empty incarnation after this child
+	    // consumed its file. No path remains to clean up in that case.
+	    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+	  }
 	} finally {
 	  owned.delete(reservation.token);
 	  void finish();
@@ -1143,7 +1164,9 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
     async maintain() {
       if (closing) return closing;
       maintenance.sweep();
-      if (stopped || !authority || now() < authority.expiresAt - 60_000) return;
+      // stop() forbids new handoffs but a live detached worker still owns this
+      // session. Rotation and global stop both keep it renewable until terminal.
+      if (!authority || (stopped && owned.size === 0) || now() < authority.expiresAt - 60_000) return;
       renewing ??= (async () => {
 	const renewed = await hub.renewRoutingSession(AbortSignal.timeout(10_000));
 	if (!authority || renewed.sessionId !== authority.sessionId || renewed.shiftId !== authority.shiftId
@@ -1152,7 +1175,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
       })();
       try { await renewing; } finally { renewing = undefined; }
     },
-    async stop() { stopped = true; maintenance.close(); await finish(); },
+    async stop() { stopped = true; await finish(); },
   };
 }
 

@@ -43,7 +43,7 @@ import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
 import { exitCodeFor } from '../src/roles/agent-run.ts';
 import { createHubClient, type HubClient } from '../src/hub/client.ts';
-import { reachesSocketConsumer, openShiftRoutingSession, selectShiftRoutingTuples, routingSessionEnabled } from '../src/shift/runtime.ts';
+import { reachesSocketConsumer, openShiftRoutingSession, selectShiftRoutingTuples, routingSessionEnabled, type ShiftRoutingSession } from '../src/shift/runtime.ts';
 import { HubError, type InboxInstance, type WorkOrder } from '../src/hub/types.ts';
 
 // ---- fixtures ---------------------------------------------------------------
@@ -4321,6 +4321,57 @@ test('#300: a hub-instructed Retry-After pause is not a stall', async () => {
   assert.equal(await running, 0);
 });
 
+test('routing maintenance timer honors scope and renewal Retry-After before another call', async () => {
+  const { hub } = mockHub({});
+  const { spawner } = fakeSpawner();
+  const { schedule, timers } = fakeSchedule();
+  let monotonic = 0;
+  let releaseSleep: (() => void) | undefined;
+  let scopeCalls = 0;
+  let maintenanceCalls = 0;
+  const session = {
+    hub,
+    identity: () => undefined,
+    createHandoff: () => { throw new Error('unexpected dispatch'); },
+    ensureScope: async () => {
+      scopeCalls++;
+      if (scopeCalls === 1) throw new HubError(429, 'rate limited', 'rate_limited', 90_000);
+    },
+    maintain: async () => {
+      maintenanceCalls++;
+      if (maintenanceCalls === 1) throw new HubError(429, 'rate limited', 'rate_limited', 60_000);
+    },
+    stop: async () => {},
+  } as unknown as ShiftRoutingSession;
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    routingSession: session, monotonicNow: () => monotonic, schedule,
+    heartbeatIntervalMs: 0,
+    sleep: () => new Promise<void>(resolve => { releaseSleep = resolve; }),
+  }));
+  const running = loop.run();
+  try {
+    await settle(() => releaseSleep !== undefined, 'loop parked after scope 429');
+    const timer = timers.find(entry => entry.everyMs === 30_000)!;
+    timer.fn();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(maintenanceCalls, 0, 'scope backoff suppresses timer renewal');
+    monotonic = 90_000;
+    timer.fn();
+    await settle(() => maintenanceCalls === 1, 'timer renewal attempt');
+    monotonic = 91_000;
+    timer.fn();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(maintenanceCalls, 1, 'renewal backoff suppresses next timer');
+    monotonic = 150_000;
+    timer.fn();
+    await settle(() => maintenanceCalls === 2, 'timer resumes after Retry-After');
+  } finally {
+    loop.stop();
+    releaseSleep?.();
+  }
+  assert.equal(await running, 0);
+});
+
 test('#300: a long cycle of many settled calls is not a stall; one call that never settles is', async () => {
   // A cycle serialises wake, the inbox, one targeted whats_next per workflow,
   // and more. Against a slow-but-alive hub those can sum past the threshold
@@ -4839,21 +4890,29 @@ test('missing authored role policy at the offer endpoint still permits authentic
 
 test('session scope rotates after roster recovery, capability addition and crew changes without closing live handoffs', async () => {
   let nextId = 0;
+  let now = 1000;
   let refuseOpen = false;
   const scopes = new Map<string, import('../src/hub/types.ts').RoutingScope>();
+  const shiftIds = new Map<string, string>();
   const closed: string[] = [];
+  const renewed: string[] = [];
   const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
-    scope: { workflows: ['wf'], capabilities: [] }, now: () => 1000, getToken: async () => 'enrolled-base',
+    scope: { workflows: ['wf'], capabilities: [] }, now: () => now, getToken: async () => 'enrolled-base',
     fetchImpl: (async (url, init) => {
       const body = JSON.parse(String(init?.body));
       if (String(url).endsWith('/routing_session_open')) {
 	if (refuseOpen) return Response.json({ error: 'forbidden' }, { status: 403 });
 	const sessionId = `rs_12345678-1234-1234-1234-${String(++nextId).padStart(12, '0')}`;
 	scopes.set(sessionId, body.scope);
-	return Response.json({ sessionId, shiftId: `shf_${nextId}`, credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: 900_000 });
+	shiftIds.set(sessionId, `shf_${nextId}`);
+	return Response.json({ sessionId, shiftId: `shf_${nextId}`, credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
       }
       const id = new Headers(init?.headers).get('X-Owenloop-Routing-Session')!.split('.')[1]!;
       if (String(url).endsWith('/routing_session_close')) { closed.push(id); return Response.json({ closed: true }); }
+      if (String(url).endsWith('/routing_session_renew')) {
+	renewed.push(id);
+	return Response.json({ sessionId: id, shiftId: shiftIds.get(id), expiresAt: now + 900_000 });
+      }
       if (String(url).endsWith('/whats_next')) {
 	const scope = scopes.get(id)!;
 	assert.ok(body.serve_capabilities.every((cap: string) => scope.capabilities!.includes(cap)));
@@ -4889,7 +4948,15 @@ test('session scope rotates after roster recovery, capability addition and crew 
   assert.equal(nextId, 5);
   await session.ensureScope({ capabilities: ['build'], crews: [] });
   assert.equal(nextId, 5, 'unchanged selection does not reopen or renew offers');
+  unlinkSync(handoff.path); // The detached worker consumed its fixed-deadline file.
+  now = 841_000;
+  await session.maintain();
+  assert.ok(renewed.includes(oldId), 'retired live session renews near its original 15m expiry');
   await session.stop();
+  assert.equal(closed.includes(oldId), false);
+  now = 1_682_000;
+  await session.maintain();
+  assert.equal(renewed.filter(id => id === oldId).length, 2, 'global stop still permits renewal while worker is live');
   assert.equal(closed.includes(oldId), false);
   handoff.terminal();
   await new Promise(resolve => setImmediate(resolve));
