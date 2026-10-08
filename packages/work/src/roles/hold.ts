@@ -415,7 +415,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	});
 	const resolved = await modelResolver.resolveStep(order);
 	if (!resolved.ok) return { ok: false, reason: 'model order refusal: local definition unavailable' };
-	if (!validModelOrderFields(resolved.step, order)) {
+	if (!validModelOrderFields(resolved.step, order, resolved.inputNames)) {
 	  return { ok: false, reason: 'model order refusal: fields differ from local definition' };
 	}
 	return { ok: true };

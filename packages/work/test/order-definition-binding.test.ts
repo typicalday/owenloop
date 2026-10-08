@@ -56,11 +56,45 @@ test('local model order binds an authored static workdir and rejects a forged si
   assert.equal(validModelOrderFields(inherited, { ...packet('inherited', ['out']), workdir: '/allowed/project-b' }), false);
 
   const dynamic = step({ name: 'dynamic', consumes: ['seed'], produces: ['out'], workdirFrom: 'seed.cwd' });
-  assert.equal(validModelOrderFields(dynamic, {
+  const dynamicOrder = {
     ...packet('dynamic', ['out'], ['seed']),
     consumes: { seed: { cwd: '/allowed/project-b' } },
     workdir: '/allowed/project-b',
-  }), true, 'dynamic value binding is a separate gate');
+  };
+  assert.equal(validModelOrderFields(dynamic, dynamicOrder, []), true);
+  assert.equal(validModelOrderFields(dynamic, { ...dynamicOrder, workdir: '/allowed/project-a' }, []), false);
+  assert.equal(validModelOrderFields(dynamic, { ...dynamicOrder, workdir: undefined }, []), false);
+  assert.equal(validModelOrderFields(dynamic, {
+    ...dynamicOrder,
+    consumes: { seed: { cwd: '' } },
+    workdir: '',
+  }, []), false);
+  assert.equal(validModelOrderFields(dynamic, {
+    ...dynamicOrder,
+    consumes: { seed: { cwd: { path: '/allowed/project-b' } } },
+  }, []), false);
+});
+
+test('dynamic cwd resolves dotted declared input before a shorter consumed stem', () => {
+  const definition = buildDef({
+    name: 'binding', inputs: [{ name: 'a', seedOwed: true }, { name: 'a.b', seedOwed: true }],
+    steps: [{ name: 'route', consumes: ['a'], produces: ['out'], workdirFrom: 'a.b.cwd' }],
+  });
+  const local = definition.steps[0]!;
+  const store = openStore(':memory:');
+  try {
+    const engine = new Engine(store, () => definition);
+    const workflow = engine.createInstance(definition.name, { provide: {
+      a: { b: { cwd: '/allowed/consume-path' } },
+      'a.b': { cwd: '/allowed/input-path' },
+    } });
+    const offered = engine.tick(workflow).orders.find((order) => order.step === 'route')!;
+    assert.equal(offered.workdir, '/allowed/input-path');
+    assert.equal(validModelOrderFields(local, offered, definition.inputs.map((input) => input.name)), true);
+    assert.equal(validModelOrderFields(local, offered), false, 'dynamic binding requires verified input names');
+  } finally {
+    store.close();
+  }
 });
 
 test('local binding accepts a collection seal and bound map member, then refuses key/index/path drift', () => {

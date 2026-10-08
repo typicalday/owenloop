@@ -1,5 +1,5 @@
 /** Bind model-visible order paths to the locally resolved workflow step. */
-import { bindProduce, elementPath, matchConsume, sealPath } from '../../../src/paths.ts';
+import { bindProduce, elementPath, matchConsume, parseWorkdirFrom, sealPath } from '../../../src/paths.ts';
 import type { ProducePattern, StepDef } from '../../../src/types.ts';
 import type { OrderPacket } from './hub/types.ts';
 
@@ -45,17 +45,33 @@ export function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
   }));
 }
 
-/** A static cwd is an instruction from the local definition, not the relay.
- * Dynamic `workdirFrom` paths need their own value/proof binding and are not
- * covered by this comparison. A step declaring neither must receive neither. */
-export function validFixedWorkdir(step: StepDef, order: OrderPacket): boolean {
-  return step.workdirFrom !== undefined || order.workdir === step.workdir;
+/** Bind an order cwd to the local definition. A consumed `workdirFrom` value
+ * is independently verified by the consume gate before use. A declared input
+ * that the step does not consume is absent from this packet and still needs a
+ * separate authenticated input-value binding. */
+export function validFixedWorkdir(step: StepDef, order: OrderPacket, inputNames?: readonly string[]): boolean {
+  if (step.workdirFrom === undefined) return order.workdir === step.workdir;
+  // The full definition input list is required: a dotted input can be a
+  // longer match than a consumed stem (for example `a.b` versus `a`).
+  if (inputNames === undefined) return false;
+  const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes, inputNames);
+  if (parsed === null) return false;
+  if (parsed.source === 'input') return true; // Input value is not in order.consumes.
+  if (parsed.mode !== 'plain' || parsed.source !== 'consume'
+    || order.consumes === null || typeof order.consumes !== 'object') return false;
+  let value: unknown = order.consumes[parsed.stem];
+  for (const segment of parsed.path.split('.')) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)
+      || !Object.prototype.hasOwnProperty.call(value, segment)) return false;
+    value = (value as Record<string, unknown>)[segment];
+  }
+  return typeof value === 'string' && value.trim().length > 0 && order.workdir === value;
 }
 
 /** The old packet fallback has outputs but no owes; every present path still
  * has to be declared by the local step. Current get_order projects both sets. */
-export function validModelOrderFields(step: StepDef, order: OrderPacket): boolean {
-  if (order.step !== step.name || !validConsumedPaths(step, order) || !validFixedWorkdir(step, order)
+export function validModelOrderFields(step: StepDef, order: OrderPacket, inputNames?: readonly string[]): boolean {
+  if (order.step !== step.name || !validConsumedPaths(step, order) || !validFixedWorkdir(step, order, inputNames)
     || !Array.isArray(order.outputs) || !Array.isArray(order.owes)) return false;
   const outputs = order.outputs;
   if (order.owes.some((owed) => owed === null || typeof owed !== 'object'

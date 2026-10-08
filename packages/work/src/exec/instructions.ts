@@ -64,6 +64,8 @@ export interface ResolvedCommand {
 export interface ResolvedStep {
   ok: true;
   step: StepDef;
+  /** Names from the same locally verified definition as `step`. */
+  inputNames?: readonly string[];
   /** Verified installed bundle root, when resolution has bundle provenance. */
   bundleDir?: string;
 }
@@ -224,11 +226,11 @@ export function createStoreInstructionResolver(
       if (step === undefined) {
 	return refusal('integrity', order, 'the resolved workflow step is unavailable after instruction lookup');
       }
-      if (!validFixedWorkdir(step, order)) {
-	return refusal('integrity', order, 'order workdir differs from the locally verified step');
-      }
       const definition = source.getVerifiedDefinition(digest, order.step);
       if (definition === undefined) return refusal('integrity', order, 'the verified workflow definition is unavailable after priming');
+      if (!validFixedWorkdir(step, order, definition.inputs.map((input) => input.name))) {
+	return refusal('integrity', order, 'order workdir differs from the locally verified step');
+      }
       const object = source.getVerifiedObject(digest);
       if (object === undefined) return refusal('integrity', order, 'the verified workflow object metadata is unavailable after priming');
       return { ok: true, definition, step, bundleDigest: object.bundleDigest, objectPath: object.objectPath };
@@ -495,7 +497,8 @@ export function createStoreInstructionResolver(
     }
     const originRefusal = await checkOrigin(order, resolved);
     if (originRefusal !== undefined) return originRefusal;
-    return { ok: true, step: resolved.step, ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
+    return { ok: true, step: resolved.step, inputNames: resolved.definition.inputs.map((input) => input.name),
+      ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
   };
 
   return {
@@ -514,6 +517,7 @@ export function createStoreInstructionResolver(
       return {
 	  ok: true,
 	  step: resolved.step,
+	  inputNames: resolved.definition.inputs.map((input) => input.name),
 	  callsProducers: calls.producers ?? {},
 	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
       };
