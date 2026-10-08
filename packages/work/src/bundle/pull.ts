@@ -122,12 +122,16 @@ async function bytesFrom(
 
 /** Build the existing store's one-shot `onMissing` hook for a scoped worker. */
 export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): MissingObjectHandler {
-  const installed = new Set<string>();
-  const visiting = new Set<string>();
-  const recover = async (requestedDigest: string): Promise<void> => {
+  return {
+    async onMissing(requestedDigest: string): Promise<'retry'> {
+      // Each recovery is independent. A long-lived ordinary handler must not
+      // retain old digests across runs or skip an object removed by GC.
+      const installed = new Set<string>();
+      const visiting = new Set<string>();
+      const recover = async (requestedDigest: string): Promise<void> => {
       const digest = defDigest(requestedDigest);
       if (installed.has(digest)) return;
-      if (visiting.has(digest) || installed.size + visiting.size >= 64)
+      if (visiting.has(digest) || (args.recoverLockedDependencies && installed.size + visiting.size >= 64))
 	throw new Error('workflow bundle recovery closure refused');
       visiting.add(digest);
       try {
@@ -193,9 +197,7 @@ export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): 
       });
       installed.add(digest);
       } finally { visiting.delete(digest); }
-  };
-  return {
-    async onMissing(requestedDigest: string): Promise<'retry'> {
+      };
       await recover(requestedDigest);
       return 'retry';
     },
