@@ -27,10 +27,10 @@ export function createRoutedSubmissionAuthority(args: {
     ...(args.canReplay ? { canReplay: args.canReplay } : {}),
     async sign(order, path, value) {
       const proof = await buildSubmitProof({
-        origin: args.origin, env: args.env, order, path, value, now: args.now,
-        warn: () => {}, required: true,
-        ...(args.principalKeys ? { principalKeys: args.principalKeys } : {}),
-        ...(args.sshProcess ? { sshProcess: args.sshProcess } : {}),
+	origin: args.origin, env: args.env, order, path, value, now: args.now,
+	warn: () => {}, required: true,
+	...(args.principalKeys ? { principalKeys: args.principalKeys } : {}),
+	...(args.sshProcess ? { sshProcess: args.sshProcess } : {}),
       });
       if (!proof) throw new Error('routed machine signer unavailable');
       return proof;
