@@ -176,6 +176,7 @@ export interface RoutingHubClient extends HubClient {
   /** Explicit session-scoped lifecycle. Legacy HubClient verbs remain fenced. */
   routingHeartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
   routingSubmit(req: SubmitRequest, signal?: AbortSignal): Promise<SubmitResponse>;
+  routingSubmitConditional(req: ConditionalSubmitRequest, signal?: AbortSignal): Promise<ConditionalSubmitResponse>;
   routingRelease(req: { workflow: string; run: string; reason?: string }, signal?: AbortSignal): Promise<ReleaseResponse>;
   routingAsk(req: AskRequest, signal?: AbortSignal): Promise<AskResponse>;
   routingReject(req: RejectRequest, signal?: AbortSignal): Promise<RejectResponse>;
@@ -426,6 +427,7 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     reserveLaunch: (req, signal) => scopedPost('reserve_launch', req, signal),
     routingHeartbeat: (req, signal) => scopedPost('heartbeat', req, signal),
     routingSubmit: (req, signal) => scopedPost('submit', req, signal),
+    routingSubmitConditional: (req, signal) => scopedPost('submit/conditional-v1', req, signal),
     routingRelease: (req, signal) => scopedPost('release', req, signal),
     routingAsk: (req, signal) => scopedPost('routing_ask/v1', req, signal),
     routingReject: (req, signal) => scopedPost('routing_reject/v1', req, signal),

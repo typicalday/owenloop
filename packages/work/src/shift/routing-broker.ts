@@ -14,6 +14,10 @@ import type { RoutingHubClient } from '../hub/client.ts';
 import { HubError, type ContactHolder, type FileArtifactPointer, type GetOrderResponse, type LaunchReportV1,
   type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse } from '../hub/types.ts';
 import type { ChildRecord, ChildReservation } from './state.ts';
+import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
+import { outputVersionForSubmission } from '../submit-proof.ts';
+import { normalizeSubmitValue } from '../submit-value.ts';
+import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 
 // Service permits artifact values up to 25 MB. Leave bounded JSON overhead
 // while allowing a normal submit receipt through this private transport.
@@ -46,10 +50,14 @@ interface Grant {
   hub: RoutingHubClient;
   reservationRequest?: LaunchReservationRequestV1;
   launchReservationId?: string;
+  submissionAuthority?: RoutedSubmissionAuthority;
+  submitBusy?: boolean;
+  pendingSubmit?: { intent: string; binding: string; request: import('../hub/types.ts').ConditionalSubmitRequest };
 }
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
-    currentIdentity: () => Identity | undefined; hub: RoutingHubClient }): {
+    currentIdentity: () => Identity | undefined; hub: RoutingHubClient;
+    submissionAuthority?: RoutedSubmissionAuthority }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
       activate(record: ChildRecord): void; terminal(): void;
     };
@@ -179,6 +187,82 @@ async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, lau
   }
 }
 
+/** Only metadata the exact submit proof and target condition bind. The parent
+ * also verifies the entire packet against its signed source on every read. */
+function submissionBinding(response: GetOrderResponse, path: string, grant: Grant): string {
+  const order = response.order;
+  if (!validOrderResponse(grant, response) || !response.lease.claimed || !order
+    || !order.routing || !isDeepStrictEqual(order.routing.claim, grant.routing.claim)
+    || !isDeepStrictEqual(order.routing.decision.binding, grant.routing.claim.binding)
+    || order.routing.decision.decisionId !== grant.routing.claim.decisionId
+    || !order.consumedFingerprint || typeof order.consumedFingerprint !== 'object'
+    || Array.isArray(order.consumedFingerprint)
+    || Object.values(order.consumedFingerprint).some(v => !Number.isSafeInteger(v) || v < 0)
+    || !(order.owes.length ? order.owes.some(owe => owe.path === path) : order.outputs.includes(path)))
+    throw new Error('routing submission order refused');
+  const version = outputVersionForSubmission(order, path);
+  if (!Number.isSafeInteger(version) || version! < 1) throw new Error('routing submission target refused');
+  return valueDigestHex({ workflow: order.workflow, run: order.run, defDigest: order.defDigest,
+    step: order.step, key: order.key, index: order.index ?? null, workdir: order.workdir ?? null,
+    inputs: order.inputs, consumes: order.consumes, consumedFingerprint: order.consumedFingerprint,
+    judge: order.judge ?? null, path, version });
+}
+
+async function submitFromParent(grant: Grant, body: Record<string, unknown>, now: () => number,
+  signal: AbortSignal): Promise<unknown> {
+  const authority = grant.submissionAuthority;
+  if (!authority || grant.submitBusy) throw new Error('routing submission authority unavailable');
+  grant.submitBusy = true;
+  try {
+    const path = body.path as string;
+    const holder = body.holder as ContactHolder;
+    const value = normalizeSubmitValue(body.value);
+    const intent = valueDigestHex({ path, value, done: body.done ?? null, holder });
+    if (grant.pendingSubmit && grant.pendingSubmit.intent !== intent)
+      throw new Error('routing submission outcome unresolved');
+    const fresh = await checked(grant, grant.hub.getOrder({
+      workflow: grant.reservation.workflow, run: grant.reservation.run, holder,
+    }, signal), now);
+    const binding = submissionBinding(fresh, path, grant);
+    await checked(grant, authority.verifyOrder(fresh), now);
+    if (submissionBinding(fresh, path, grant) !== binding)
+      throw new Error('routing submission order changed');
+    if (grant.pendingSubmit && grant.pendingSubmit.binding !== binding)
+      throw new Error('routing submission outcome unresolved');
+    if (grant.pendingSubmit && authority.canReplay?.(fresh.order!, path) !== true)
+      throw new Error('routing submission outcome unresolved');
+    if (!grant.pendingSubmit) {
+      const proof = await checked(grant, authority.sign(fresh.order!, path, value), now);
+      if (typeof proof !== 'string' || !proof) throw new Error('routing submission proof refused');
+      // Signing and source verification await external work. Refresh again;
+      // the Service enforces the exact version at its final transaction too.
+      const current = await checked(grant, grant.hub.getOrder({
+	workflow: grant.reservation.workflow, run: grant.reservation.run, holder,
+      }, signal), now);
+      if (submissionBinding(current, path, grant) !== binding)
+	throw new Error('routing submission order changed');
+      await checked(grant, authority.verifyOrder(current), now);
+      if (submissionBinding(current, path, grant) !== binding)
+	throw new Error('routing submission order changed');
+      grant.pendingSubmit = { intent, binding, request: {
+	workflow: grant.reservation.workflow, run: grant.reservation.run, path,
+	value, holder, proof, expectedVersion: outputVersionForSubmission(fresh.order!, path)!,
+	...(body.done === undefined ? {} : { done: body.done as boolean }),
+      } };
+    }
+    const response = await checked(grant,
+      grant.hub.routingSubmitConditional(grant.pendingSubmit.request, signal), now);
+    if (!response || response.conditionApplied !== 'expected-version-v1'
+      || typeof response.outcome !== 'string' || !response.outcome
+      || (response.closed !== undefined && typeof response.closed !== 'boolean'))
+      throw new Error('routing broker response refused');
+    // A missing/malformed/failed acknowledgement preserves the one exact
+    // request, including its signature. It cannot become a new signed write.
+    grant.pendingSubmit = undefined;
+    return response;
+  } finally { grant.submitBusy = false; }
+}
+
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
   if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit'
@@ -267,22 +351,12 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       }
     case 'submit': {
       if (!exactKeys(body, ['path', 'value', 'holder'])
-	&& !exactKeys(body, ['path', 'value', 'holder', 'done'])
-	&& !exactKeys(body, ['path', 'value', 'holder', 'proof'])
-	&& !exactKeys(body, ['path', 'value', 'holder', 'done', 'proof'])) throw new Error('routing broker request refused');
+	&& !exactKeys(body, ['path', 'value', 'holder', 'done'])) throw new Error('routing broker request refused');
       if (typeof body.path !== 'string' || !body.path || !grant.allowedPaths?.has(body.path)
 	|| !validHolder(grant, scope, body.holder)
-	|| (body.done !== undefined && typeof body.done !== 'boolean')
-	|| (body.proof !== undefined && (typeof body.proof !== 'string' || !body.proof)))
+	|| (body.done !== undefined && typeof body.done !== 'boolean'))
 	throw new Error('routing broker request refused');
-      const response = await checked(grant, grant.hub.routingSubmit({ workflow, run, path: body.path,
-	value: body.value, holder: body.holder,
-	...(body.done === undefined ? {} : { done: body.done }),
-	...(body.proof === undefined ? {} : { proof: body.proof }) }, signal), now);
-      if (!response || typeof response.outcome !== 'string' || !response.outcome
-	|| (response.closed !== undefined && typeof response.closed !== 'boolean'))
-	throw new Error('routing broker response refused');
-      return response;
+      return submitFromParent(grant, body, now, signal);
     }
     case 'release':
       if (!exactKeys(body, []) && !exactKeys(body, ['reason'])) throw new Error('routing broker request refused');
@@ -576,11 +650,11 @@ export async function createRoutingBroker(args: { now?: () => number;
   const inode: Stats = lstatSync(socketPath);
   return {
     socketPath,
-    issue({ reservation, routing, identity, currentIdentity, hub }) {
+    issue({ reservation, routing, identity, currentIdentity, hub, submissionAuthority }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
-	identity: { ...identity }, currentIdentity, hub };
+	identity: { ...identity }, currentIdentity, hub, submissionAuthority };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;

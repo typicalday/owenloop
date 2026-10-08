@@ -240,18 +240,18 @@ test('child transport keeps lifecycle bound to one live session after launch win
   const hub = createHubClient({ origin, getToken: async () => 'enrolled',
     routingSession: { allowedOrigin: origin, get: () => ({ ...current, credential }), now: () => now },
     fetchImpl: (async (url, init) => {
-      const verb = String(url).split('/').at(-1)!;
+      const verb = String(url).split('/api/')[1]!;
       calls.push({ verb, body: JSON.parse(String(init?.body)) as Record<string, unknown>, headers: new Headers(init?.headers) });
-      if (verb === 'get_order') return Response.json(orderResponse);
+      if (verb === 'get_order') return Response.json({ ...orderResponse, order: { ...orderResponse.order, routing, defDigest: 'a'.repeat(64), step: 'producer', key: '', inputs: [], consumes: {}, consumedFingerprint: {}, owes: [{ path: 'out', version: 1 }] } });
       if (verb === 'heartbeat') return Response.json({ text: 'ok', ok: true });
-      if (verb === 'submit') return Response.json({ text: 'ok', outcome: 'submitted', closed: true });
+      if (verb === 'submit/conditional-v1') return Response.json({ text: 'ok', outcome: 'submitted', closed: true, conditionApplied: 'expected-version-v1' });
       if (verb === 'release') return Response.json({ text: 'ok', released: true });
       throw new Error('unexpected routed request');
     }) as typeof fetch,
   });
   const broker = await createRoutingBroker({ now: () => now });
   try {
-    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => current, hub });
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => current, hub, submissionAuthority: { verifyOrder: async () => {}, sign: async () => 'parent-proof' } });
     grant.activate(child);
     const client = createRoutingChildClient(handoffFor(grant));
     assert.equal('getToken' in client, false);
@@ -277,7 +277,7 @@ test('child transport keeps lifecycle bound to one live session after launch win
       orderId: 'run', attemptId: 'run', rosterRevision: 'roster-v1', candidateIds: [],
       assessmentId: null, requested: null, selected: null,
     } }), /routing broker unavailable/);
-    assert.deepEqual(calls.map(call => call.verb), ['get_order', 'heartbeat', 'submit', 'release']);
+    assert.deepEqual(calls.map(call => call.verb), ['get_order', 'heartbeat', 'get_order', 'get_order', 'submit/conditional-v1', 'release']);
     for (const call of calls) {
       assert.equal(call.headers.get('Authorization'), 'Bearer enrolled');
       assert.equal(call.headers.get('X-Owenloop-Routing-Session'), credential);
@@ -287,7 +287,7 @@ test('child transport keeps lifecycle bound to one live session after launch win
     grant.terminal();
     await assert.rejects(client.heartbeat({ workflow: 'wf', run: 'run', holder }), /routing broker unavailable/);
     current = { ...identity, sessionId: 'rs_changed' };
-    assert.equal(calls.length, 4);
+    assert.equal(calls.length, 6);
   } finally { await broker.close(); }
 });
 
@@ -700,5 +700,105 @@ test('child transport refuses malformed and absent success values on a socket', 
     for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function parentOrder(version = 1) {
+  return { ...orderResponse, order: { ...orderResponse.order, routing,
+    defDigest: 'a'.repeat(64), step: 'producer', key: '', inputs: [], consumes: {},
+    consumedFingerprint: {}, owes: [{ path: 'out', version }] } };
+}
+
+test('routed submit rejects child proofs and signs normalized exact current metadata in parent', async () => {
+  const calls: Array<{ route: string; body: Record<string, unknown> }> = [];
+  const signed: unknown[] = [];
+  let verified = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      calls.push({ route, body: JSON.parse(String(init!.body)) as Record<string, unknown> });
+      if (route === 'get_order') return Response.json(parentOrder());
+      assert.equal(route, 'submit/conditional-v1');
+      return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+      submissionAuthority: { verifyOrder: async () => { verified++; },
+	sign: async (order, path, value) => { signed.push({ order, path, value }); return 'parent-only-proof'; } } });
+    grant.activate(child);
+    const send = (body: unknown) => request(grant.socketPath, { cap: grant.cap, method: 'submit', body });
+    await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: { holder } });
+    const before = calls.length;
+    assert.equal((await send({ path: 'out', value: { ok: true }, holder, proof: 'child-proof' })).ok, false);
+    assert.equal(calls.length, before, 'child proof refuses before fresh contact or signer');
+    assert.equal((await send({ path: 'out', value: '{"ok":true}', holder })).ok, true);
+    assert.equal(verified, 2);
+    assert.equal(signed.length, 1);
+    assert.deepEqual((signed[0] as { value: unknown }).value, { ok: true });
+    assert.deepEqual(calls.at(-1)!.body, { workflow: 'wf', run: 'run', path: 'out',
+      value: { ok: true }, holder, proof: 'parent-only-proof', expectedVersion: 1 });
+  } finally { await broker.close(); }
+});
+
+test('parent signing rechecks changed targets and revoked grants without sending a write', async () => {
+  for (const mode of ['target', 'revoke', 'trust', 'missing-version', 'missing-authority'] as const) {
+    let version = 1, writes = 0, verifies = 0;
+    let live = { ...identity };
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async (url) => {
+	if (String(url).endsWith('/get_order')) return Response.json(parentOrder(mode === 'missing-version' ? 0 : version));
+	writes++;
+	return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+      }) as typeof fetch,
+    });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub,
+	...(mode === 'missing-authority' ? {} : { submissionAuthority: {
+	  verifyOrder: async () => { verifies++; if (mode === 'trust' && verifies === 2) throw new Error('revoked signer'); },
+	  sign: async () => { if (mode === 'target') version++; if (mode === 'revoke') live = { ...live, sessionId: 'rotated' }; return 'proof'; },
+	} }) });
+      grant.activate(child);
+      await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: { holder } });
+      assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'submit',
+	body: { path: 'out', value: { ok: true }, holder } })).ok, false, mode);
+      assert.equal(writes, 0, mode);
+    } finally { await broker.close(); }
+  }
+});
+
+test('uncertain singleton retry preserves exact parent signature and refuses changed payload', async () => {
+  for (const canReplay of [true, false]) {
+    const writes: string[] = [];
+    let signatures = 0;
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async (url, init) => {
+	if (String(url).endsWith('/get_order')) return Response.json(parentOrder());
+	writes.push(String(init!.body));
+	if (writes.length === 1) throw new Error('response lost');
+	return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+      }) as typeof fetch,
+    });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+	submissionAuthority: { verifyOrder: async () => {}, canReplay: () => canReplay,
+	  sign: async () => 'parent-proof-' + ++signatures } });
+      grant.activate(child);
+      const send = (value: unknown) => request(grant.socketPath, { cap: grant.cap, method: 'submit',
+	body: { path: 'out', value, holder } });
+      await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: { holder } });
+      assert.equal((await send({ ok: true })).ok, false);
+      assert.equal((await send({ ok: false })).ok, false, 'uncertain write cannot become a different write');
+      assert.equal((await send({ ok: true })).ok, canReplay);
+      assert.equal(signatures, 1);
+      assert.equal(writes.length, canReplay ? 2 : 1);
+      if (canReplay) assert.equal(writes[0], writes[1], 'signature, target and value bytes identical');
+    } finally { await broker.close(); }
   }
 });
