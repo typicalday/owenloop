@@ -1,7 +1,6 @@
 /** Narrow routed-child RPC client. It has no bearer, session key, URL or
  * generic Hub verb API; Shift binds every request at the private broker. */
 import { createConnection } from 'node:net';
-import type { RoutingHandoffV1 } from '../shift/runtime.ts';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
   type LaunchReportV1, type LaunchReportResponse, type LaunchReservationRequestV1,
@@ -27,7 +26,10 @@ export interface RoutingChildClient {
 
 function refused(): Error { return new Error('routing broker unavailable'); }
 
-export function createRoutingChildClient(handoff: RoutingHandoffV1): RoutingChildClient {
+export function createRoutingChildClient(handoff: {
+  broker?: { socketPath: string; cap: string };
+  reservation: { workflow: string; run: string };
+}): RoutingChildClient {
   const broker = handoff.broker;
   if (!broker || typeof broker.socketPath !== 'string' || !broker.socketPath
     || typeof broker.cap !== 'string' || !/^[a-f0-9]{64}$/.test(broker.cap))

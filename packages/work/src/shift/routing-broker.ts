@@ -22,6 +22,7 @@ const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
   | 'heartbeat' | 'submit' | 'release';
+type CapScope = 'role' | 'holder';
 interface Grant {
   active: boolean;
   ready: boolean;
@@ -38,7 +39,8 @@ interface Grant {
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
     currentIdentity: () => Identity | undefined; hub: RoutingHubClient }): {
-      socketPath: string; cap: string; activate(record: ChildRecord): void; terminal(): void;
+      socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
+      activate(record: ChildRecord): void; terminal(): void;
     };
   close(): Promise<void>;
   socketPath: string;
@@ -108,10 +110,10 @@ function validateLaunchGrant(grant: Grant, now: number): boolean {
     && now < grant.routing.claim.binding.expiresAt;
 }
 
-function validHolder(grant: Grant, value: unknown): value is ContactHolder {
+function validHolder(grant: Grant, scope: CapScope, value: unknown): value is ContactHolder {
   if (!exactKeys(value, ['kind', 'id', 'shiftId'])) return false;
   if (value.shiftId !== grant.identity.shiftId) return false;
-  if (value.kind === 'exec') return value.id === grant.execHolderId;
+  if (scope === 'role') return value.kind === 'exec' && value.id === grant.execHolderId;
   return grant.reservation.childKind === 'agent-run' && value.kind === 'session'
     && value.id === grant.identity.sessionId;
 }
@@ -143,15 +145,17 @@ async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, lau
   }
 }
 
-async function invoke(grant: Grant, method: Method, body: unknown, now: () => number,
+async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
+  if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit')
+    throw new Error('routing broker request refused');
   const launch = method === 'assess_local_model' || method === 'reserve_launch' || method === 'report_launch';
   if (!grant.ready || !(launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now())))
     throw new Error('routing broker grant expired');
   const { workflow, run, childKind } = grant.reservation;
   switch (method) {
     case 'get_order': {
-      if (!exactKeys(body, ['holder']) || !validHolder(grant, body.holder)) throw new Error('routing broker request refused');
+      if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
       const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now);
       if (!validOrderResponse(grant, response)) throw new Error('routing broker response refused');
       const order = response.order;
@@ -216,7 +220,7 @@ async function invoke(grant: Grant, method: Method, body: unknown, now: () => nu
       return checked(grant, grant.hub.reportLaunch({ workflow, report }, signal), now, true);
     }
     case 'heartbeat':
-      if (!exactKeys(body, ['holder']) || !validHolder(grant, body.holder)) throw new Error('routing broker request refused');
+      if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
       {
 	const response = await checked(grant, grant.hub.routingHeartbeat({ workflow, run, holder: body.holder }, signal), now);
 	if (!response || (response as { ok?: unknown }).ok !== true) throw new Error('routing broker response refused');
@@ -228,7 +232,7 @@ async function invoke(grant: Grant, method: Method, body: unknown, now: () => nu
 	&& !exactKeys(body, ['path', 'value', 'holder', 'proof'])
 	&& !exactKeys(body, ['path', 'value', 'holder', 'done', 'proof'])) throw new Error('routing broker request refused');
       if (typeof body.path !== 'string' || !body.path || !grant.allowedPaths?.has(body.path)
-	|| !validHolder(grant, body.holder)
+	|| !validHolder(grant, scope, body.holder)
 	|| (body.done !== undefined && typeof body.done !== 'boolean')
 	|| (body.proof !== undefined && (typeof body.proof !== 'string' || !body.proof)))
 	throw new Error('routing broker request refused');
@@ -261,7 +265,7 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
   const directory = mkdtempSync(join(tmpdir(), 'ol-rb-'));
   chmodSync(directory, 0o700);
   const socketPath = join(directory, 'broker.sock');
-  const grants = new Map<string, Grant>();
+  const grants = new Map<string, { grant: Grant; scope: CapScope }>();
   const now = args.now ?? Date.now;
   let closed = false;
   const sockets = new Set<Socket>();
@@ -293,12 +297,12 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	  const request: unknown = JSON.parse(raw);
 	  if (!exactKeys(request, ['cap', 'method', 'body']) || typeof request.cap !== 'string'
 	    || !CAP.test(request.cap) || typeof request.method !== 'string') throw new Error();
-	  const grant = grants.get(request.cap);
-	  if (!grant || closed) throw new Error();
+	  const entry = grants.get(request.cap);
+	  if (!entry || closed) throw new Error();
 	  const methods: readonly string[] = ['get_order', 'read_routing_claim', 'assess_local_model',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release'];
 	  if (!methods.includes(request.method)) throw new Error();
-	  const value = await invoke(grant, request.method as Method, request.body, now, controller.signal);
+	  const value = await invoke(entry.grant, entry.scope, request.method as Method, request.body, now, controller.signal);
 	  if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
 	} catch (error) {
 	  // No raw Hub body, credential, grant or request data on the wire.
@@ -332,9 +336,11 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	identity: { ...identity }, currentIdentity, hub };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
-      grants.set(cap, grant);
+      const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;
+      grants.set(cap, { grant, scope: 'role' });
+      if (holderCap) grants.set(holderCap, { grant, scope: 'holder' });
       let terminal = false;
-      return { socketPath, cap, activate(record) {
+      return { socketPath, cap, ...(holderCap ? { holder: { socketPath, cap: holderCap } } : {}), activate(record) {
 	  if (closed || grant.ready || !validateLaunchGrant(grant, now()) || record.workflow !== reservation.workflow
 	    || record.run !== reservation.run || record.gateToken !== reservation.token
 	    || (record.kind ?? 'exec') !== reservation.childKind
@@ -348,12 +354,13 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	grant.active = false;
 	grant.ready = false;
 	grants.delete(cap);
+	if (holderCap) grants.delete(holderCap);
       } };
     },
     async close() {
       if (closed) return;
       closed = true;
-      for (const grant of grants.values()) grant.active = false;
+      for (const entry of grants.values()) entry.grant.active = false;
       grants.clear();
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));

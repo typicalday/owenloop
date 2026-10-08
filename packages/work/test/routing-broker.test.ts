@@ -7,6 +7,7 @@ import { test } from 'node:test';
 
 import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
+import { createRoutingHolderClient } from '../src/hub/routing-holder-client.ts';
 import type { DecisionBindingV1, ReferenceRouting } from '../src/hub/types.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
@@ -293,23 +294,43 @@ test('agent-run session holder is pinned to the original routing session', async
   const seen: unknown[] = [];
   const hub = createHubClient({ origin, getToken: async () => 'enrolled',
     routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
-    fetchImpl: (async (_url, init) => {
+    fetchImpl: (async (url, init) => {
       seen.push(JSON.parse(String(init?.body)));
-      return Response.json(orderResponse);
+      return Response.json(String(url).endsWith('/heartbeat') ? { text: 'ok', ok: true } : orderResponse);
     }) as typeof fetch,
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
     const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder, 'agent-run receives a separate holder-only cap');
+    assert.notEqual(grant.holder.cap, grant.cap);
+    assert.equal((await request(grant.holder.socketPath, { cap: grant.holder.cap, method: 'get_order',
+      body: { holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } } })).ok, false,
+    'holder cap cannot act before the parent start gate');
     grant.activate(agentRecord);
     const client = createRoutingChildClient(handoffFor(grant, agentReservation));
     const sessionHolder = { kind: 'session' as const, id: sessionId, shiftId: identity.shiftId };
     await assert.rejects(client.getOrder({ workflow: 'wf', run: 'run',
       holder: { ...sessionHolder, id: 'arbitrary-mcp-session' } }), /routing broker unavailable/);
     assert.equal(seen.length, 0);
-    await client.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder });
+    await client.getOrder({ workflow: 'wf', run: 'run', holder: { ...holder, id: `${hostname()}:9001` } });
     assert.equal(seen.length, 1);
-    assert.deepEqual((seen[0] as { holder: unknown }).holder, sessionHolder);
+    assert.deepEqual((seen[0] as { holder: unknown }).holder, holder);
+    const holderClient = createRoutingChildClient(handoffFor(grant.holder, agentReservation));
+    assert.equal((await holderClient.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder })).lease.claimed, true);
+    assert.deepEqual((seen[1] as { holder: unknown }).holder, sessionHolder);
+    const mountHub = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder });
+    assert.equal((await mountHub.heartbeat({ workflow: 'wf', run: 'run', holder: sessionHolder })).text, 'ok');
+    await assert.rejects(mountHub.reject({ workflow: 'wf', run: 'run', path: 'out', text: 'no' }),
+      /routed holder verb unavailable/);
+    await assert.rejects(mountHub.release({ workflow: 'wf', run: 'run' }), /routed holder verb unavailable/);
+    await assert.rejects(holderClient.getOrder({ workflow: 'wf', run: 'run', holder }), /broker unavailable/);
+    await assert.rejects(client.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
+    await assert.rejects(holderClient.release({ workflow: 'wf', run: 'run' }), /broker unavailable/);
+    await assert.rejects(holderClient.readRoutingClaim({ workflow: 'wf', run: 'run' }), /broker unavailable/);
+    assert.equal(seen.length, 3, 'holder cap cannot invoke role methods or spoof the exec holder');
+    grant.terminal();
+    await assert.rejects(holderClient.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
   } finally { await broker.close(); }
 });
 

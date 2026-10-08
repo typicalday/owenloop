@@ -4570,6 +4570,23 @@ test('routing handoffs are exclusive, private, reservation-bound, sibling-indepe
   assert.equal(JSON.stringify(f.calls.map(c => c.body)).includes(f.credential), false);
 });
 
+test('agent-run private handoff carries a distinct holder-only broker cap', async () => {
+  const f = routingSessionFixture({ expiresAt: 90_000 });
+  const session = await f.open();
+  const broker = { socketPath: '/tmp/ol-rb-ABC123/broker.sock', cap: 'a'.repeat(64),
+    holder: { socketPath: '/tmp/ol-rb-ABC123/broker.sock', cap: 'b'.repeat(64) } };
+  const reservation = f.reserve('holder');
+  const handoff = session.createHandoff(reservation, broker);
+  try {
+    const payload = JSON.parse(readFileSync(handoff.path, 'utf8'));
+    assert.deepEqual(payload.broker, { socketPath: broker.socketPath, cap: broker.cap });
+    assert.deepEqual(payload.holderBroker, broker.holder);
+    assert.equal(consumeRoutingHandoff({ env: { OWENLOOP_ROUTING_HANDOFF: handoff.path },
+      origin: 'https://hub.example', target: { workflow: 'wf', run: 'holder' },
+      kind: 'agent-run', now: () => 1_000 })?.holderBroker?.cap, broker.holder.cap);
+  } finally { handoff.terminal(); await session.stop(); }
+});
+
 test('detached stop preserves live handoffs; true completion closes once even on transport failure', async () => {
   const f = routingSessionFixture({ failClose: true });
   const session = await f.open();

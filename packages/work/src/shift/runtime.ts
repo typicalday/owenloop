@@ -883,6 +883,8 @@ export interface RoutingHandoffV1 {
   version: 'routing-handoff-v1'; incarnation: string; nonce: string;
   origin: string; orgId: string; sessionId: string; shiftId: string;
   broker?: { socketPath: string; cap: string };
+  /** Narrower cap for the agent's separate born-bound holder process. */
+  holderBroker?: { socketPath: string; cap: string };
   reservation: ChildReservation; createdAt: number; expiresAt: number; sessionExpiresAt: number;
 }
 export interface RoutingHandoff {
@@ -896,7 +898,8 @@ export interface ShiftRoutingSession {
   /** Captures the exact incarnation, including after later scope rotation. */
   brokerTarget(): { hub: RoutingHubClient; identity: NonNullable<ReturnType<ShiftRoutingSession['identity']>>;
     currentIdentity: ShiftRoutingSession['identity'] } | undefined;
-  createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string }): RoutingHandoff;
+  createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string;
+    holder?: { socketPath: string; cap: string } }): RoutingHandoff;
   maintain(): Promise<void>;
   /** Monotonic service deadline shared with Shift's other Hub requests. */
   nextRequestAllowedAt(): number;
@@ -1228,7 +1231,9 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
       const createdAt = now();
       const payload: RoutingHandoffV1 = { version: 'routing-handoff-v1', incarnation, nonce,
 	origin: opts.origin, orgId: opts.orgId, sessionId: authority.sessionId, shiftId: authority.shiftId,
-	...(broker ? { broker } : {}), reservation: { ...reservation }, createdAt,
+	...(broker ? { broker: { socketPath: broker.socketPath, cap: broker.cap },
+	  ...(broker.holder ? { holderBroker: broker.holder } : {}) } : {}),
+	reservation: { ...reservation }, createdAt,
 	expiresAt: Math.min(createdAt + 120_000, authority.expiresAt), sessionExpiresAt: authority.expiresAt };
       if (payload.expiresAt <= createdAt) throw new Error('routing handoff deadline expired');
       let fd: number | undefined;

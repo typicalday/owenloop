@@ -1520,7 +1520,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    ...target });
 	}
 	const privateHandoff = opts.routingSession.createHandoff(reservation,
-	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap });
+	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap,
+	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) });
 	handoff = { path: privateHandoff.path, terminal: () => {
 	  brokerGrant?.terminal();
 	  privateHandoff.terminal();

@@ -75,6 +75,11 @@ export function consumeRoutingHandoff(args: {
 	|| basename(p.broker.socketPath) !== 'broker.sock'
 	|| !/^ol-rb-[A-Za-z0-9]{6}$/.test(basename(dirname(p.broker.socketPath)))
 	|| typeof p.broker.cap !== 'string' || !/^[a-f0-9]{64}$/.test(p.broker.cap)))
+      || (p.holderBroker !== undefined && (args.kind !== 'agent-run' || !p.broker
+	|| !p.holderBroker || typeof p.holderBroker !== 'object'
+	|| p.holderBroker.socketPath !== p.broker.socketPath
+	|| typeof p.holderBroker.cap !== 'string' || !/^[a-f0-9]{64}$/.test(p.holderBroker.cap)
+	|| p.holderBroker.cap === p.broker.cap))
       || !Number.isSafeInteger(p.createdAt) || !Number.isSafeInteger(p.expiresAt)
       || !Number.isSafeInteger(p.sessionExpiresAt) || p.createdAt > now || p.expiresAt <= now
       || p.expiresAt > p.createdAt + 120_000 || p.expiresAt > p.sessionExpiresAt

@@ -50,6 +50,7 @@
 import { hostname } from 'node:os';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
+import { createRoutingHolderClient } from '../hub/routing-holder-client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createHoldLoop, type HoldOutcome } from '../hold/loop.ts';
@@ -64,6 +65,7 @@ import { validModelOrderFields } from '../order-definition-binding.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, watchStdinEof, type SignalHost, type StdinHost } from './signals.ts';
+import { consumeRoutingHolderHandoff } from './routing-holder-handoff.ts';
 
 const DEFAULT_INTERVAL_MS = 60_000;
 // Deliberate duplicate of main.ts's VERSION (also '0.0.0'): the roles must not
@@ -85,6 +87,7 @@ interface ParsedArgs {
   mcpTools?: HoldMcpToolName[];
   /** Never hand the claim back — another process is the holder of record. */
   neverRelease?: boolean;
+  routingHolder?: string;
   error?: string;
 }
 
@@ -141,7 +144,8 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--shift':
       case '--heartbeat-interval':
       case '--jump-tolerance':
-      case '--mcp-tools': {
+      case '--mcp-tools':
+      case '--routing-holder': {
         const r = takeValue(a, i);
         if ('error' in r) return { ignoreStdin: false, mcp: false, error: r.error };
         i = r.next;
@@ -151,6 +155,7 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--as') parsed.as = r.value;
         else if (name === '--shift') parsed.shift = r.value;
+	else if (name === '--routing-holder') parsed.routingHolder = r.value;
 	else if (name === '--mcp-tools') {
 	  const selected = parseMcpTools(r.value);
 	  if ('error' in selected) return { ignoreStdin: false, mcp: false, error: selected.error };
@@ -345,15 +350,28 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const env = deps.env ?? process.env;
-  let settings;
-  try {
-    settings = loadSettings(env);
-  } catch (e) {
-    err(`owenloop work hold: ${errMsg(e)}`);
+  const routed = parsed.routingHolder !== undefined;
+  // The marker alone never authorizes an account-store fallback. The nested
+  // holder needs a one-use private handoff and is always a never-release MCP.
+  if (!routed && (env['OWENLOOP_ROUTING_SESSION'] === '1'
+    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || env['OWENLOOP_ROUTING_HOLDER'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HOLDER'] !== undefined)) {
+    err('owenloop work hold: routed holder transport unavailable');
     return 1;
   }
-
-  const origin = parsed.origin ?? settings.hubOrigin;
+  if (routed && (!parsed.mcp || !parsed.neverRelease || parsed.verifiedHosted
+    || parsed.origin === undefined || parsed.routingHolder === '')) {
+    err('owenloop work hold: routed holder requires --mcp --never-release and an explicit origin');
+    return 1;
+  }
+  let settings: ReturnType<typeof loadSettings> | undefined;
+  if (!routed) {
+    try { settings = loadSettings(env); }
+    catch (e) { err(`owenloop work hold: ${errMsg(e)}`); return 1; }
+  }
+  const origin = parsed.origin ?? settings?.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work hold: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
@@ -373,18 +391,38 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     err('owenloop work hold: --as requires a non-empty account name');
     return 2;
   }
-  const account = parsed.as ?? 'default';
-  const bearer = await resolveBearer({ origin, account, env });
-  if (!bearer.ok) {
-    err(`owenloop work hold: ${bearer.message}`);
-    return bearer.code;
+  let token: string | undefined;
+  let holder: ContactHolder;
+  let hub: HubClient;
+  if (routed) {
+    // Strip ambient bearer routes before local definition/consumed verification.
+    // The holder never invokes resolveBearer or accepts an injected broad Hub.
+    for (const source of [env, process.env]) {
+      delete source.OWENLOOP_TOKEN;
+      delete source.OWENLOOP_CREDENTIAL_COMMAND;
+      delete source.OWENLOOP_ROUTING_HANDOFF;
+      delete source.OWENLOOP_ROUTING_HOLDER;
+    }
+    try {
+      const binding = consumeRoutingHolderHandoff({ path: parsed.routingHolder!, origin,
+	workflow: target.workflow, run: target.run });
+      if ((parsed.session !== undefined && parsed.session !== binding.sessionId)
+	|| (parsed.shift !== undefined && parsed.shift !== binding.shiftId)) throw new Error();
+      holder = { kind: 'session', id: binding.sessionId, shiftId: binding.shiftId };
+      hub = createRoutingHolderClient(binding);
+    } catch {
+      err('owenloop work hold: routed holder handoff refused');
+      return 1;
+    }
+  } else {
+    const account = parsed.as ?? 'default';
+    const bearer = await resolveBearer({ origin, account, env });
+    if (!bearer.ok) { err(`owenloop work hold: ${bearer.message}`); return bearer.code; }
+    token = bearer.token;
+    const shiftId = resolveShiftId(parsed.shift, env);
+    holder = resolveHolder(parsed.session, env, { shiftId });
+    hub = deps.hub ?? createHubClient({ origin, getToken: async () => token! });
   }
-  const token = bearer.token;
-
-  const shiftId = resolveShiftId(parsed.shift, env);
-  const holder = resolveHolder(parsed.session, env, { shiftId });
-
-  const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
 
   // --never-release: this hold is NOT the holder of record. `owenloop work
   // agent-run` already claimed the order with its own `exec` lease loop and
@@ -454,7 +492,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       let adapter;
       try {
 	adapter = deps.hostedAdapter ?? createDefaultHostedOrderAdapter({
-	  hub: { origin, getToken: async () => token },
+	  hub: { origin, getToken: async () => token! },
 	  expected: { workflowId: target.workflow, runId: target.run },
 	  cwd: process.cwd(), env, now: () => Date.now(),
 	});

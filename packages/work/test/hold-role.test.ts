@@ -1,4 +1,6 @@
 import { createServer, type Server } from 'node:http';
+import { createServer as createSocketServer } from 'node:net';
+import { PassThrough } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,6 +14,8 @@ import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost, StdinHost } from '../src/roles/signals.ts';
 import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
+import { createRoutingHolderHandoff } from '../src/roles/routing-holder-handoff.ts';
+import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 
 /**
  * Seed a hermetic owenloop v2 credential file at `<home>/.owenloop/
@@ -262,6 +266,72 @@ test('run() exits 2 with the refuse message when no Scoped Identity key is store
     err.join('\n'),
     /no Scoped Identity key for https:\/\/hub\.example \(account "default"\) — run: owenloop login --hub https:\/\/hub\.example --as agent/,
   );
+});
+
+test('routed holder markers refuse before settings, credentials, or Hub contact', async () => {
+  for (const marker of ['OWENLOOP_ROUTING_SESSION', 'OWENLOOP_ROUTING_HANDOFF', 'OWENLOOP_ROUTING_HOLDER']) {
+    const err: string[] = [];
+    let contacted = false;
+    const code = await run(['--order', 'wf1/run1', '--origin', 'https://hub.example', '--mcp'], {
+      env: { [marker]: marker === 'OWENLOOP_ROUTING_SESSION' ? '1' : 'present',
+	OWENLOOP_CONFIG_DIR: '/missing-routed-holder-config' },
+      hub: new Proxy({} as HubClient, { get: () => { contacted = true; throw new Error('unexpected Hub contact'); } }),
+      err: line => err.push(line),
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(err, ['owenloop work hold: routed holder transport unavailable']);
+    assert.equal(contacted, false);
+  }
+});
+
+test('routed MCP hold first contact uses only its holder cap and original session holder', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ol-rb-'));
+  const socketPath = join(directory, 'broker.sock');
+  const cap = 'e'.repeat(64);
+  const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
+  const seen: unknown[] = [];
+  const stdin = new PassThrough();
+  const server = createSocketServer(socket => {
+    let raw = '';
+    socket.on('data', chunk => {
+      raw += chunk.toString('utf8');
+      if (!raw.includes('\n')) return;
+      const frame = JSON.parse(raw.slice(0, raw.indexOf('\n'))) as Record<string, unknown>;
+      seen.push(frame);
+      socket.end(JSON.stringify({ ok: true, value: {
+	text: '', workflow: 'wf1', run: 'run1', order: null,
+	lease: { claimed: false, outcome: 'ok' },
+      } }) + '\n');
+      stdin.end();
+    });
+  });
+  await new Promise<void>(resolve => server.listen(socketPath, resolve));
+  const now = Date.now();
+  const source: RoutingHandoffV1 = {
+    version: 'routing-handoff-v1', incarnation: 'inc_' + 'a'.repeat(32), nonce: 'b'.repeat(32),
+    origin: 'https://hub.example', orgId: 'org', sessionId, shiftId: 'shf_original',
+    broker: { socketPath, cap: 'd'.repeat(64) }, holderBroker: { socketPath, cap },
+    reservation: { recordType: 'reservation', workflow: 'wf1', run: 'run1', childKind: 'agent-run',
+      reservedAt: now, token: 'c'.repeat(32) },
+    createdAt: now, expiresAt: now + 120_000, sessionExpiresAt: now + 300_000,
+  };
+  const handoff = createRoutingHolderHandoff(source, now);
+  try {
+    const code = await run(['--order', 'wf1/run1', '--origin', source.origin, '--mcp', '--never-release',
+      '--routing-holder', handoff.path], {
+      env: { OWENLOOP_CONFIG_DIR: '/missing-routed-config', OWENLOOP_TOKEN: 'broad-token' },
+      hub: new Proxy({} as HubClient, { get: () => { throw new Error('broad Hub used'); } }),
+      stdin, signalHost: fakeSignalHost().host, err: () => {},
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(seen, [{ cap, method: 'get_order', body: {
+      holder: { kind: 'session', id: sessionId, shiftId: 'shf_original' },
+    } }]);
+  } finally {
+    handoff.cleanup();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('run() --as selects the agent slot named in the refuse hint (account "ci")', async () => {
