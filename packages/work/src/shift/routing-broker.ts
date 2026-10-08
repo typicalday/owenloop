@@ -227,6 +227,8 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
     await checked(grant, authority.verifyOrder(fresh), now);
     if (submissionBinding(fresh, path, grant) !== binding)
       throw new Error('routing submission order changed');
+    if (authority.canSubmit?.(fresh.order!, path) !== true)
+      throw new Error('routing submission kind unavailable');
     if (grant.pendingSubmit && grant.pendingSubmit.binding !== binding)
       throw new Error('routing submission outcome unresolved');
     if (grant.pendingSubmit && authority.canReplay?.(fresh.order!, path) !== true)
@@ -275,8 +277,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
   switch (method) {
     case 'get_order': {
       if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
+      if (!grant.submissionAuthority) throw new Error('routing order authority unavailable');
       const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now);
       if (!validOrderResponse(grant, response)) throw new Error('routing broker response refused');
+      if (response.lease.claimed && response.order)
+	await checked(grant, grant.submissionAuthority.verifyOrder(response), now);
       const order = response.order;
       grant.allowedPaths = order && response.lease.claimed
 	? new Set((order.owes.length ? order.owes.map(owe => owe.path) : order.outputs))

@@ -8,6 +8,9 @@ export interface RoutedSubmissionAuthority {
    * parent trust, including actual workdir and consumed-value provenance. */
   verifyOrder(response: GetOrderResponse): Promise<void>;
   sign(order: OrderPacket, path: string, value: unknown): Promise<string>;
+  /** The signed source must identify an output the current protocol can sign.
+   * Dynamic collection members need their own issued path/version protocol. */
+  canSubmit(order: OrderPacket, path: string): boolean;
   /** Verified singleton/judge semantics only. A seal target does not dedupe
    * dynamic member emissions, so their uncertain outcomes must quarantine. */
   canReplay?(order: OrderPacket, path: string): boolean;
@@ -21,10 +24,12 @@ export function createRoutedSubmissionAuthority(args: {
   principalKeys?: SubmissionKeyManager;
   sshProcess?: SshProcessAdapter;
   canReplay?: RoutedSubmissionAuthority['canReplay'];
+  canSubmit: RoutedSubmissionAuthority['canSubmit'];
 }): RoutedSubmissionAuthority {
   return {
     verifyOrder: args.verifyOrder,
     ...(args.canReplay ? { canReplay: args.canReplay } : {}),
+    canSubmit: args.canSubmit,
     async sign(order, path, value) {
       const proof = await buildSubmitProof({
 	origin: args.origin, env: args.env, order, path, value, now: args.now,
