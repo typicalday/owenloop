@@ -74,7 +74,7 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
     { stdio: 'ignore' });
     const observed: string[] = [];
-    let status = 200, cache = 'no-store';
+    let status = 200, cache = 'no-store', rateLimits = 0;
     let witness = pair();
     const server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
       observed.push(req.url!);
@@ -86,7 +86,8 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString()), expected);
       assert.ok(['/api/routing_reference_order/v2', '/api/read_routing_claim/v2'].includes(req.url!));
       res.writeHead(status, { 'content-type': 'application/json', 'cache-control': cache,
-	...(status === 302 ? { location: 'https://elsewhere.example/steal' } : {}) });
+	...(status === 302 ? { location: 'https://elsewhere.example/steal' } : {}),
+	...(status === 429 ? { 'retry-after': '2' } : {}) });
       res.end(JSON.stringify(req.url === '/api/routing_reference_order/v2' ? witness.reference : witness.claim));
     });
     await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
@@ -95,7 +96,9 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       assert.ok(address && typeof address !== 'string');
       const reader = createTrustedRoutedReferenceV2Reader({ origin: `https://localhost:${address.port}`,
 	expected, getToken: async () => 'worker-secret', getSession: async () => session,
-	trustedCa: readFileSync(cert) });
+	trustedCa: readFileSync(cert), onRateLimit: error => {
+	  rateLimits++; assert.equal(error.status, 429); assert.equal(error.retryAfterMs, 2_000);
+	} });
       assert.deepEqual(await reader.read(), witness);
       assert.deepEqual(observed, ['/api/routing_reference_order/v2', '/api/read_routing_claim/v2']);
       status = 302;
@@ -103,6 +106,9 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       assert.equal(observed.length, 3, 'redirect target receives no credentials');
       status = 404;
       await assert.rejects(reader.read());
+      status = 429;
+      await assert.rejects(reader.read());
+      assert.equal(rateLimits, 1);
       status = 200;
       cache = 'max-age=60';
       await assert.rejects(reader.read());

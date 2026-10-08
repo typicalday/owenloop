@@ -4,6 +4,7 @@ import type { IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
+import { HubError } from '../hub/types.ts';
 import type { RoutingChildClient } from '../hub/routing-child-client.ts';
 import type { OrderPacket, ReferenceRouting } from '../hub/types.ts';
 import { parseTrustedReferenceV2, type TrustedInputWitness } from './trusted-reference-v2.ts';
@@ -190,11 +191,13 @@ export function createTrustedRoutedReferenceV2Reader(options: {
   origin: string; getToken: () => Promise<string>; getSession: () => Promise<string>;
   expected: { workflow: string; run: string }; trustedCa?: string | Buffer;
   now?: () => number;
+  beforeRequest?: () => void;
+  onRateLimit?: (error: HubError) => void;
 }): RoutedReferenceV2Reader {
   const origin = new URL(options.origin);
   if (origin.protocol !== 'https:' || origin.origin !== options.origin || !id(options.expected.workflow)
     || !id(options.expected.run)) throw new Error('routed v2 requires exact HTTPS origin and bound order');
-  const now = options.now ?? Date.now;
+  const now = options.now ?? (() => performance.now());
   const request = async (path: string, started: number): Promise<unknown> => {
     const remaining = () => MAX_MS - (now() - started);
     let credentialTimer: ReturnType<typeof setTimeout> | undefined;
@@ -206,8 +209,17 @@ export function createTrustedRoutedReferenceV2Reader(options: {
     if (!token || /[\r\n]/.test(token) || !/^rs1\.rs_[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}$/.test(session))
       throw new Error('routed v2 credential unavailable');
     if (remaining() <= 0) throw new Error('routed v2 deadline exceeded');
+    options.beforeRequest?.();
     const response = await postHttps(new URL(path, origin), token, session,
       JSON.stringify(options.expected), remaining(), options.trustedCa);
+    if (response.status === 429) {
+      const raw = response.headers['retry-after'];
+      const seconds = typeof raw === 'string' ? Number(raw.trim()) : Number.NaN;
+      const retryAfterMs = Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1_000) : undefined;
+      const error = new HubError(429, 'routed v2 request refused', undefined, retryAfterMs);
+      options.onRateLimit?.(error);
+      throw error;
+    }
     if (remaining() <= 0 || response.status !== 200
       || !String(response.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')
       || !String(response.headers['cache-control'] ?? '').toLowerCase().split(',').map(part => part.trim()).includes('no-store'))
@@ -231,7 +243,7 @@ export function createTrustedRoutedReferenceV2Reader(options: {
  * It has no origin, bearer, session credential, or generic Hub method. */
 export function createBrokerRoutedReferenceV2Reader(client: Pick<RoutingChildClient,
   'readRoutedReferenceV2' | 'readRoutingClaimV2'>, expected: { workflow: string; run: string },
-now = Date.now): Pick<RoutedReferenceV2Reader, 'read'> {
+now = () => performance.now()): Pick<RoutedReferenceV2Reader, 'read'> {
   return { async read() {
     const started = now();
     const reference = parseRoutedReferenceV2(await client.readRoutedReferenceV2(expected), expected);
