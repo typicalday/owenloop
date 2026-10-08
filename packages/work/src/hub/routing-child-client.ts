@@ -5,6 +5,7 @@ import { createConnection } from 'node:net';
 import { PassThrough, Readable } from 'node:stream';
 import type { RoutedClaimV2, RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RecordedClaimV2, RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
+import type { RoutedQuiesceResult } from '../shift/routing-broker.ts';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
   type LaunchReportV1, type LaunchReportResponse, type LaunchReservationRequestV1,
@@ -26,7 +27,7 @@ const MAX_DOWNLOAD_HEADER = 4096;
 type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
-  | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject'
+  | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'quiesce'
   | 'request_approval' | 'read_invocation_binding';
 type CollectionVerb = Verb | 'collection_target' | 'emit_member' | 'seal_collection';
 
@@ -44,6 +45,8 @@ export interface RoutingChildClient {
   reserveLaunch(req: { workflow: string; request: LaunchReservationRequestV1 }): Promise<LaunchReservationResponse>;
   reportLaunch(req: { workflow: string; report: LaunchReportV1 }): Promise<LaunchReportResponse>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
+  /** Freeze role and holder effects. ACK is local broker state, not a fleet seal. */
+  quiesce(): Promise<RoutedQuiesceResult>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   collectionTarget(req: { workflow: string; run: string; path: string;
     holder: NonNullable<SubmitRequest['holder']> }): Promise<{ collection: boolean }>;
@@ -333,6 +336,15 @@ export function createRoutingChildClient(handoff: {
       return exchange('report_launch', { report: req.report });
     },
     heartbeat(req) { bound(req); return exchange('heartbeat', { holder: req.holder }); },
+    async quiesce() {
+      const value = await exchange<unknown>('quiesce', {});
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+				|| Object.keys(value).sort().join(',') !== 'effects,quiescing'
+				|| (value as Record<string, unknown>).quiescing !== true
+				|| !['settled', 'uncertain'].includes(String((value as Record<string, unknown>).effects)))
+				throw refused();
+      return value as RoutedQuiesceResult;
+    },
     submit(req) {
       bound(req);
       return exchange('submit', { path: req.path, value: req.value, holder: req.holder,
