@@ -11,7 +11,8 @@ const refused = (): Error => new Error('routed command launch refused');
 
 export function createRoutedCommandPrestart(args: {
   child: RoutingChildClient; holder: ContactHolder;
-  workflow: string; run: string; now?: () => number;
+  /** Canonical root is the broker request target; frameId is parent-bound. */
+  workflow: string; frameId: string; run: string; now?: () => number;
   /** Shift-owned private stage parent; consumed files never enter the author workdir. */
   privateBase?: string;
   /** Scoped prestart witness; never substitute an ordinary bearer reader. */
@@ -21,7 +22,7 @@ export function createRoutedCommandPrestart(args: {
   let used = false;
   const now = args.now ?? Date.now;
   return async (order, signal) => {
-    if (used || signal?.aborted || order.workflow !== args.workflow || order.run !== args.run
+    if (used || signal?.aborted || order.workflow !== args.frameId || order.run !== args.run
       || order.worker !== 'command' || !order.routing) throw refused();
     // A timed-out/ambiguous reservation must never authorize a second start.
     used = true;
@@ -29,6 +30,7 @@ export function createRoutedCommandPrestart(args: {
     const claim = routing.claim;
     const deadline = Math.min(routing.preference.expiresAt, claim.binding.expiresAt);
     if (now() >= deadline || claim.orderId !== args.run
+      || claim.binding.runId !== args.workflow || claim.binding.frameId !== args.frameId
       || claim.sessionId !== claim.binding.authority.sessionId
       || claim.principalId !== claim.binding.authority.principalId
       || args.holder.shiftId !== claim.shiftId) throw refused();

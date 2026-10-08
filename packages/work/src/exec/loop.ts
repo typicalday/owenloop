@@ -55,6 +55,7 @@ import { PAYLOAD_FILE_ENV, PAYLOAD_MAX_BYTES, readPayloadFile, resolvePayload } 
 import { buildReceipt, type CommandReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { routedWorkerEnv } from '../roles/routing-role-env.ts';
+import { createRoutedExecLoop, type RoutedExecutionController } from './routed-loop.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
@@ -113,7 +114,8 @@ export type ExecOutcome =
   | 'judge-rejected' // a judge delivered a non-zero verdict through reject (exit 0)
   | 'judge-no-verdict' // a judge ended with machinery/signal failure (exit 1)
   | 'reject-failed' // a reject was refused or threw; nothing was submitted (exit 1)
-  | 'stopped'; // stop() arrived before the hold was established (exit 1)
+  | 'stopped' // stop() arrived before the hold was established (exit 1)
+  | 'routed-quarantined'; // fenced routed lifecycle lacks exact closure; no release or cleanup
 
 export interface ExecLoopOptions {
   hub: HubClient;
@@ -134,6 +136,8 @@ export interface ExecLoopOptions {
   routedPrestart?: (order: OrderPacket, signal: AbortSignal) => Promise<void | {
     consumedFilePathsJson?: string; cleanup?: () => Promise<void>;
   }>;
+  /** Fenced, parent-owned command lifecycle. Never combine with routedPrestart. */
+  routedExecution?: RoutedExecutionController;
   /** Public-only stage paths for the command process; removes inherited account-store handles. */
   routedPublicEnv?: { HOME: string; OWENLOOP_CONFIG_DIR: string };
   /** cwd for the command when the order packet carries no `workdir`. */
@@ -272,7 +276,7 @@ function withCommandOutput(text: string, outputTail: string): string {
  * an input that was declared but never produced is ABSENT from the object, not
  * present as `null`, and a script tests for it with `'key' in consumes`.
  */
-function deliverConsumes(
+export function deliverConsumes(
   childEnv: Record<string, string | undefined>,
   consumes: Record<string, unknown> | undefined,
 ): string | undefined {
@@ -320,7 +324,7 @@ function deliverConsumes(
  * inline-or-file collision rule as consumes applies: a nested command must
  * never inherit stale feedback from its parent order.
  */
-function deliverFeedback(
+export function deliverFeedback(
   childEnv: Record<string, string | undefined>,
   feedback: Array<{ path: string; reasons: unknown[] }> | undefined,
 ): string | undefined {
@@ -383,7 +387,7 @@ function deliverFeedback(
  * one outcome worse than having no channel, because the child would then write
  * its result into its parent order's file.
  */
-function deliverPayloadFile(
+export function deliverPayloadFile(
   childEnv: Record<string, string | undefined>,
   warn: (message: string) => void,
 ): { dir?: string; file?: string } {
@@ -405,7 +409,7 @@ function deliverPayloadFile(
 }
 
 /** Best-effort removal of an overflow directory; a cleanup failure never fails a step. */
-function removeConsumesDir(dir: string | undefined): void {
+export function removeConsumesDir(dir: string | undefined): void {
   if (dir === undefined) return;
   try {
     rmSync(dir, { recursive: true, force: true });
@@ -417,6 +421,10 @@ function removeConsumesDir(dir: string | undefined): void {
 }
 
 export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
+  if (opts.routedExecution) {
+    if (opts.routedPrestart) throw new Error('routed execution cannot use the ordinary prestart seam');
+    return createRoutedExecLoop(opts, opts.routedExecution);
+  }
   const { hub, runner, workflow } = opts;
   const runId = opts.run;
 

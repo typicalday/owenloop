@@ -19,7 +19,7 @@ const routing: ReferenceRouting = { claim: { state: 'claimed', claimId: 'claim',
   decision: { decisionId: 'decision', binding, status: 'applied', applied: null, effect: null },
   preference: { offer: null, tuples: [], role: 'implementation', rolePolicy: null,
     rosterRevision: 'roster-v1', expiresAt: 70_000 } };
-const order: OrderPacket = { workflow: 'wf', run: 'run', step: 'build', key: '', defDigest: 'a'.repeat(64),
+const order: OrderPacket = { workflow: 'frame', run: 'run', step: 'build', key: '', defDigest: 'a'.repeat(64),
   worker: 'command', inputs: [], outputs: ['out'], consumes: {}, routing,
   owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] };
 const holder = { kind: 'exec' as const, id: 'host:1', shiftId: 'shf_service' };
@@ -44,7 +44,7 @@ test('command launch awaits empty-tuple reserve, exact unknown report, and final
     getLaunchOrder: async () => { calls.push('order'); return { workflow: 'wf', run: 'run', text: '',
       lease: { claimed: true }, order }; },
   } as unknown as RoutingChildClient;
-  const prestart = createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run', now: () => 2_000,
+  const prestart = createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run', now: () => 2_000,
     prepareFiles: async () => { calls.push('files'); return { envValue: '[]',
       cleanup: async () => { calls.push('cleanup'); } }; } });
   const prepared = await prestart(order);
@@ -65,7 +65,7 @@ test('command launch refuses a malformed report before any final-order read', as
       recordedAt: 2_000, provenance: 'authenticated-worker-report' }; },
     getLaunchOrder: async () => { calls.push('order'); throw new Error('must not read'); },
   } as unknown as RoutingChildClient;
-  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run',
+  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run',
     now: () => 2_000, prepareFiles: async () => { calls.push('files'); return { envValue: '[]',
       cleanup: async () => { calls.push('cleanup'); } }; } })(order), /routed command launch refused/);
   assert.deepEqual(calls, ['claim', 'files', 'reserve', 'report', 'cleanup']);
@@ -77,7 +77,7 @@ test('command launch refuses absent file preflight before reserve', async () => 
     routing, freshness: 'fresh-at-read', atomicLaunch: false }; },
     reserveLaunch: async () => { calls.push('reserve'); throw new Error('must not reserve'); },
   } as unknown as RoutingChildClient;
-  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run',
+  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run',
     now: () => 2_000 })(order), /routed command launch refused/);
   assert.deepEqual(calls, ['claim']);
 });
@@ -91,7 +91,7 @@ test('command launch aborts a pending consumed-file download before reserve', as
     routing, freshness: 'fresh-at-read', atomicLaunch: false }; },
     reserveLaunch: async () => { calls.push('reserve'); throw new Error('must not reserve'); },
   } as unknown as RoutingChildClient;
-  const prestart = createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run',
+  const prestart = createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run',
     now: () => 2_000, prepareFiles: async (_order, signal) => {
       calls.push('files'); entered();
       await new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), { once: true }));
@@ -118,11 +118,24 @@ test('command launch reobserves the same prestart input witness after file prepa
       witnessDigest: 'witness', bindingDigest: 'binding' }
       : { ok: false, reason: 'witness-value-mismatch' }) as RoutedInputAdmission;
   } };
-  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run',
+  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run',
     now: () => 2_000, inputAdmission: admission,
     prepareFiles: async () => { calls.push('files'); return { envValue: '[]',
       cleanup: async () => { calls.push('cleanup'); } }; } })(order),
   /routed command launch refused/);
   assert.deepEqual(calls, ['claim', 'files', 'cleanup']);
   assert.equal(reads, 2);
+});
+
+test('command launch binds parent root and exact child frame before any broker read or shell start', async () => {
+  const calls: string[] = [];
+  const child = { readRoutingClaim: async () => { calls.push('claim'); throw new Error('must not read'); } } as unknown as RoutingChildClient;
+  const wrongFrame = { ...order, workflow: 'sibling-frame' };
+  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame',
+    run: 'run', now: () => 2_000, prepareFiles: async () => { throw new Error('must not prepare'); } })(wrongFrame),
+  /routed command launch refused/);
+  const wrongRoot = createRoutedCommandPrestart({ child, holder, workflow: 'other-root', frameId: 'frame',
+    run: 'run', now: () => 2_000, prepareFiles: async () => { throw new Error('must not prepare'); } });
+  await assert.rejects(wrongRoot(order), /routed command launch refused/);
+  assert.deepEqual(calls, []);
 });
