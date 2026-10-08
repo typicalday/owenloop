@@ -32,9 +32,11 @@
  * exec loop can submit a receipt for it (plan decision 2) rather than crashing.
  */
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 
 import { PAYLOAD_MARKER, PAYLOAD_MAX_BYTES } from './payload.ts';
+import { ROUTED_GROUP_SUPERVISOR } from './routed-group-supervisor.ts';
 
 const RETAIN_CAP_BYTES = 1024 * 1024; // 1 MiB retained per stream (for the tail)
 const TAIL_BYTES = 4096; // last 4 KiB of combined output kept in the receipt
@@ -73,6 +75,26 @@ export interface RunningCommand {
   done: Promise<CommandResult>;
   /** Idempotently take down the command's process group (TERM → grace → KILL). */
   kill(): Promise<void>;
+}
+
+/** Bounded evidence about only the original POSIX group, never escaped children. */
+export interface GroupSettlement {
+  scope: 'original-posix-group';
+  state: 'empty' | 'uncertain';
+  evidence: {
+    pgid: number | null;
+    observedAt: number;
+    reason: string;
+  };
+}
+
+export interface RoutedRunningCommand extends RunningCommand {
+  /** Wait for the retained supervisor to tear down its original group. */
+  settleEffects(opts: { reason: 'natural-exit' | 'stop'; deadlineAt: number }): Promise<GroupSettlement>;
+}
+
+export interface RoutedCommandRunner {
+  start(command: string, opts: { cwd: string; env?: Record<string, string | undefined> }): RoutedRunningCommand;
 }
 
 /** The runner seam. Injected into the exec loop; faked in the loop's tests. */
@@ -142,6 +164,8 @@ export interface DefaultRunnerOptions {
   now?: () => number;
   /** Timer seam for the kill grace (default real `setTimeout`). */
   sleep?: (ms: number) => Promise<void>;
+  /** Read-only group probe seam, used only by routed settlement. */
+  groupProbe?: (pgid: number) => void;
 }
 
 /**
@@ -150,9 +174,19 @@ export interface DefaultRunnerOptions {
  * the kill-grace path is testable without wall-clock waits.
  */
 export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRunner {
+  return createRunner(opts, false);
+}
+
+/** Routed-only runner; its supervisor anchors the group after the shell exits. */
+export function createRoutedGroupRunner(opts: DefaultRunnerOptions = {}): RoutedCommandRunner {
+  return createRunner(opts, true) as RoutedCommandRunner;
+}
+
+function createRunner(opts: DefaultRunnerOptions, supervised: boolean): CommandRunner {
   const graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? ((ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)));
+  const groupProbe = opts.groupProbe ?? ((pgid: number): void => { process.kill(-pgid, 0); });
 
   return {
     start(command: string, startOpts: { cwd: string; env?: Record<string, string | undefined> }): RunningCommand {
@@ -263,21 +297,50 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
         });
       };
 
+      let pendingShellResult: {
+        code: number | null;
+        signal: string | null;
+        error?: string;
+        stdoutBytes: number;
+        stderrBytes: number;
+      } | undefined;
+      const maybeFinishShell = (): void => {
+        if (!pendingShellResult || stdoutBytes < pendingShellResult.stdoutBytes ||
+            stderrBytes < pendingShellResult.stderrBytes) return;
+        finish(pendingShellResult.code, pendingShellResult.signal, pendingShellResult.error);
+      };
+
       let child;
       try {
-        child = spawn(plan.command, plan.args, plan.options);
+        child = supervised
+          ? spawn(process.execPath, ['--eval', ROUTED_GROUP_SUPERVISOR], {
+              cwd: startOpts.cwd,
+              detached: true,
+              stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+              env: startOpts.env,
+            })
+          : spawn(plan.command, plan.args, plan.options);
       } catch (e) {
         finish(null, null, e instanceof Error ? e.message : String(e));
-        return { done, kill: async (): Promise<void> => {} };
+        const empty = async (): Promise<GroupSettlement> => ({
+          scope: 'original-posix-group', state: 'empty',
+          evidence: { pgid: null, observedAt: performance.now(), reason: 'never-started' },
+        });
+        return supervised
+          ? ({ done, kill: async (): Promise<void> => {}, settleEffects: empty } as RoutedRunningCommand)
+          : { done, kill: async (): Promise<void> => {} };
       }
 
       child.stdout?.on('data', (chunk: Buffer) => {
+        if (settled) return;
         hash.update(chunk);
         stdoutBytes += chunk.length;
         stdoutTail = appendTail(stdoutTail, chunk, RETAIN_CAP_BYTES);
         scanPayload(chunk);
+        maybeFinishShell();
       });
       child.stdout?.on('end', () => {
+        if (settled) return;
         finishPayloadLine();
         stdoutEnded = true;
         if (!degraded) for (const c of pendingStderr) hash.update(c);
@@ -285,6 +348,7 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
         pendingStderrBytes = 0;
       });
       child.stderr?.on('data', (chunk: Buffer) => {
+        if (settled) return;
         stderrHash.update(chunk); // always — this is the degraded fallback
         if (!degraded) {
           if (stdoutEnded) {
@@ -302,9 +366,126 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
         }
         stderrBytes += chunk.length;
         stderrTail = appendTail(stderrTail, chunk, RETAIN_CAP_BYTES);
+        maybeFinishShell();
       });
 
       child.on('error', (e: Error) => finish(null, null, e.message));
+      if (supervised) {
+        if (child.pid === undefined) {
+          const neverStarted = async (): Promise<GroupSettlement> => ({
+            scope: 'original-posix-group', state: 'empty',
+            evidence: { pgid: null, observedAt: performance.now(), reason: 'never-started' },
+          });
+          return { done, kill: async (): Promise<void> => {}, settleEffects: neverStarted } as RoutedRunningCommand;
+        }
+        const token = randomBytes(24).toString('hex');
+        let ready = false;
+        let teardownStarted = false;
+        let unsafe = false;
+        let exited = false;
+        let exitSignal: NodeJS.Signals | null = null;
+        let resolveExit!: () => void;
+        const exit = new Promise<void>((resolve) => { resolveExit = resolve; });
+        let teardownSent = false;
+        let teardownRequested = false;
+        let teardownReason: 'natural-exit' | 'stop' = 'stop';
+        const sendTeardown = (): void => {
+          if (!teardownRequested || teardownSent || !ready || !child.connected || unsafe) return;
+          teardownSent = true;
+          try { child.send({ type: 'settle', token, reason: teardownReason }); }
+          catch { unsafe = true; }
+        };
+        child.on('message', (raw: unknown) => {
+          if (raw === null || typeof raw !== 'object') return;
+          const msg = raw as Record<string, unknown>;
+          if (msg.token !== token) return;
+          if (msg.type === 'ready') {
+            if (msg.pgid !== child.pid || typeof msg.shellPid !== 'number') {
+              unsafe = true;
+              finish(null, null, 'supervisor group identity mismatch');
+            } else {
+              ready = true;
+              sendTeardown();
+            }
+          } else if (msg.type === 'shell-result') {
+            if (!Number.isSafeInteger(msg.stdoutBytes) || !Number.isSafeInteger(msg.stderrBytes) ||
+                (msg.stdoutBytes as number) < 0 || (msg.stderrBytes as number) < 0) {
+              unsafe = true;
+              finish(null, null, 'invalid supervisor output accounting');
+            } else {
+              pendingShellResult = {
+                code: typeof msg.code === 'number' ? msg.code : null,
+                signal: typeof msg.signal === 'string' ? msg.signal : null,
+                ...(typeof msg.error === 'string' ? { error: msg.error } : {}),
+                stdoutBytes: msg.stdoutBytes as number,
+                stderrBytes: msg.stderrBytes as number,
+              };
+              maybeFinishShell();
+            }
+          } else if (msg.type === 'teardown-started') teardownStarted = true;
+          else if (msg.type === 'unsafe-group' || msg.type === 'signal-error') unsafe = true;
+        });
+        child.on('exit', (_code, signal) => {
+          exited = true;
+          exitSignal = signal;
+          resolveExit();
+          if (!settled) finish(null, signal, 'supervisor exited before shell result');
+        });
+        child.on('disconnect', () => {
+          if (!exited && !teardownSent) unsafe = true;
+        });
+        try { child.send({ type: 'start', token, command, cwd: startOpts.cwd, env: startOpts.env, graceMs }); }
+        catch (e) {
+          unsafe = true;
+          finish(null, null, e instanceof Error ? e.message : String(e));
+        }
+
+        const settleEffects = async ({ reason, deadlineAt }: {
+          reason: 'natural-exit' | 'stop'; deadlineAt: number;
+        }): Promise<GroupSettlement> => {
+          const observation = (state: 'empty' | 'uncertain', why: string): GroupSettlement => ({
+            scope: 'original-posix-group', state,
+            evidence: { pgid: child.pid ?? null, observedAt: performance.now(), reason: why },
+          });
+          if (!teardownRequested) {
+            teardownRequested = true;
+            teardownReason = reason;
+            sendTeardown();
+          }
+          if (!Number.isFinite(deadlineAt) || deadlineAt <= performance.now()) return observation('uncertain', 'deadline');
+          while (!teardownSent && !exited && !unsafe && performance.now() < deadlineAt) {
+            await sleep(Math.min(25, Math.max(1, deadlineAt - performance.now())));
+          }
+          if (!teardownSent) return observation('uncertain', 'supervisor-not-ready');
+          while (!exited && performance.now() < deadlineAt) {
+            await Promise.race([exit, sleep(Math.min(25, Math.max(1, deadlineAt - performance.now())))]);
+          }
+          if (!exited) return observation('uncertain', 'supervisor-timeout');
+          if (unsafe || !teardownStarted || exitSignal !== 'SIGKILL' || child.pid === undefined) {
+            return observation('uncertain', 'supervisor-exit-unproven');
+          }
+          // Read-only absence probe. A present/recycled PGID, EPERM, or zombie
+          // can never justify a new signal or a quiescent result.
+          let lastProbe: 'present' | 'EPERM' = 'present';
+          while (performance.now() < deadlineAt) {
+            try {
+              groupProbe(child.pid);
+              lastProbe = 'present';
+            }
+            catch (e) {
+              if ((e as NodeJS.ErrnoException).code === 'ESRCH') return observation('empty', 'group-absent-at-observation');
+              if ((e as NodeJS.ErrnoException).code === 'EPERM') lastProbe = 'EPERM';
+              else return observation('uncertain', `group-probe-failed:${(e as NodeJS.ErrnoException).code ?? 'unknown'}`);
+            }
+            await sleep(Math.min(25, Math.max(1, deadlineAt - performance.now())));
+          }
+          return observation('uncertain', lastProbe === 'EPERM' ? 'group-probe-EPERM-at-deadline' : 'group-present-at-deadline');
+        };
+        const kill = async (): Promise<void> => {
+          await settleEffects({ reason: 'stop', deadlineAt: performance.now() + graceMs + 5_000 });
+        };
+        return { done, kill, settleEffects } as RoutedRunningCommand;
+      }
       child.on('close', (code: number | null, signal: NodeJS.Signals | null) => finish(code, signal));
 
       const kill = async (): Promise<void> => {
