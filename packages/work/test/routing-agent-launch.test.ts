@@ -46,7 +46,7 @@ function fixture(packet = order) {
       return { orderId: 'run', digest: valueDigestHex(sent), recordedAt: 2_000,
 	provenance: 'authenticated-worker-report' as const };
     },
-    getOrder: async () => { calls.push('order'); return { workflow: 'wf', run: 'run', text: '',
+    getLaunchOrder: async () => { calls.push('order'); return { workflow: 'wf', run: 'run', text: '',
       lease: { claimed: true }, order: packet }; },
   } as unknown as RoutingChildClient;
   return { child, calls, report: () => report };

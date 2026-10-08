@@ -40,7 +40,7 @@ test('command launch awaits empty-tuple reserve, exact unknown report, and final
       return { orderId: 'run', digest: valueDigestHex(report), recordedAt: 2_000,
 	provenance: 'authenticated-worker-report' as const };
     },
-    getOrder: async () => { calls.push('order'); return { workflow: 'wf', run: 'run', text: '',
+    getLaunchOrder: async () => { calls.push('order'); return { workflow: 'wf', run: 'run', text: '',
       lease: { claimed: true }, order }; },
   } as unknown as RoutingChildClient;
   const prestart = createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run', now: () => 2_000,
@@ -62,7 +62,7 @@ test('command launch refuses a malformed report before any final-order read', as
     reserveLaunch: async () => { calls.push('reserve'); return { reservationId: 'lr-one', orderId: 'run', expiresAt: 50_000 }; },
     reportLaunch: async () => { calls.push('report'); return { orderId: 'run', digest: 'wrong',
       recordedAt: 2_000, provenance: 'authenticated-worker-report' }; },
-    getOrder: async () => { calls.push('order'); throw new Error('must not read'); },
+    getLaunchOrder: async () => { calls.push('order'); throw new Error('must not read'); },
   } as unknown as RoutingChildClient;
   await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', run: 'run',
     now: () => 2_000, prepareFiles: async () => { calls.push('files'); return { envValue: '[]',

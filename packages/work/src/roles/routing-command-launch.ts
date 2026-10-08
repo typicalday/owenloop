@@ -60,7 +60,7 @@ export function createRoutedCommandPrestart(args: {
       throw refused();
       // Every asynchronous boundary can move claim/session/roster authority.
       // The broker itself revalidates parent signed source on this final GET.
-      const final = await args.child.getOrder({ workflow: args.workflow, run: args.run,
+      const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,
       holder: args.holder });
       if (signal?.aborted || !final.lease.claimed || !final.order
       || !isDeepStrictEqual(final.order, order) || now() >= reservation.expiresAt)

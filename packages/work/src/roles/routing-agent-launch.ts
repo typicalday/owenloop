@@ -21,7 +21,7 @@ export interface RoutedAgentLaunch {
  */
 export function createRoutedAgentPrestart(args: {
   child: Pick<RoutingChildClient, 'readRoutingClaim' | 'assessLocalModel' | 'reserveLaunch'
-    | 'reportLaunch' | 'getOrder'>;
+    | 'reportLaunch' | 'getLaunchOrder'>;
   holder: ContactHolder; workflow: string; run: string; now?: () => number;
 }): (order: OrderPacket, signal?: AbortSignal) => Promise<RoutedAgentLaunch> {
   const now = args.now ?? Date.now;
@@ -85,7 +85,7 @@ export function createRoutedAgentPrestart(args: {
     if (!live() || accepted.orderId !== args.run || accepted.provenance !== 'authenticated-worker-report'
       || accepted.digest !== valueDigestHex(report) || !Number.isSafeInteger(accepted.recordedAt)
       || now() >= reservation.expiresAt) throw refused();
-    const final = await args.child.getOrder({ workflow: args.workflow, run: args.run,
+    const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,
       holder: args.holder });
     if (!live() || now() >= reservation.expiresAt || !final.lease.claimed || !final.order
       || !isDeepStrictEqual(final.order, order)) throw refused();
