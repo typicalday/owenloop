@@ -53,11 +53,16 @@ interface Grant {
   submissionAuthority?: RoutedSubmissionAuthority;
   submitBusy?: boolean;
   pendingSubmit?: { intent: string; binding: string; request: import('../hub/types.ts').ConditionalSubmitRequest };
+  launchAuthority?: RoutedLaunchAuthority;
+}
+export interface RoutedLaunchAuthority {
+  /** Parent-owned current machine roster and adapter availability. */
+  verifySelection(order: import('../hub/types.ts').OrderPacket, request: LaunchReservationRequestV1): Promise<void>;
 }
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
     currentIdentity: () => Identity | undefined; hub: RoutingHubClient;
-    submissionAuthority?: RoutedSubmissionAuthority }): {
+    submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
       activate(record: ChildRecord): void; terminal(): void;
     };
@@ -269,6 +274,19 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
   } finally { grant.submitBusy = false; }
 }
 
+async function verifyParentLaunch(grant: Grant, request: LaunchReservationRequestV1,
+  now: () => number, signal: AbortSignal): Promise<void> {
+  if (!grant.submissionAuthority || !grant.launchAuthority || !grant.execHolderId)
+    throw new Error('routing launch authority unavailable');
+  const fresh = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+    run: grant.reservation.run, holder: { kind: 'exec', id: grant.execHolderId,
+      shiftId: grant.identity.shiftId } }, signal), now, true);
+  if (!validOrderResponse(grant, fresh) || !fresh.lease.claimed || !fresh.order)
+    throw new Error('routing launch order unavailable');
+  await checked(grant, grant.submissionAuthority.verifyOrder(fresh), now, true);
+  await checked(grant, grant.launchAuthority.verifySelection(fresh.order, structuredClone(request)), now, true);
+}
+
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
   if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit'
@@ -326,6 +344,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	throw new Error('routing broker request refused');
       if (grant.reservationRequest && !isDeepStrictEqual(grant.reservationRequest, request))
 	throw new Error('routing broker reservation changed');
+      await verifyParentLaunch(grant, request, now, signal);
       const response = await checked(grant, grant.hub.reserveLaunch({ workflow, request }, signal), now, true);
       const current = grant.currentIdentity();
       if (!response || response.orderId !== run || typeof response.reservationId !== 'string'
@@ -349,7 +368,15 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| !sameTuple(report.selected, grant.reservationRequest.selected)
 	|| !exactObservation(report.observation, grant.reservationRequest.selected))
 	throw new Error('routing broker request refused');
-      return checked(grant, grant.hub.reportLaunch({ workflow, report }, signal), now, true);
+      await verifyParentLaunch(grant, grant.reservationRequest, now, signal);
+      {
+	const response = await checked(grant, grant.hub.reportLaunch({ workflow, report }, signal), now, true);
+	if (!response || response.orderId !== run || response.digest !== valueDigestHex(report)
+	  || response.provenance !== 'authenticated-worker-report'
+	  || !Number.isSafeInteger(response.recordedAt) || response.recordedAt < 0)
+	  throw new Error('routing launch report acknowledgement refused');
+	return response;
+      }
     }
     case 'heartbeat':
       if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
@@ -659,11 +686,11 @@ export async function createRoutingBroker(args: { now?: () => number;
   const inode: Stats = lstatSync(socketPath);
   return {
     socketPath,
-    issue({ reservation, routing, identity, currentIdentity, hub, submissionAuthority }) {
+    issue({ reservation, routing, identity, currentIdentity, hub, submissionAuthority, launchAuthority }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
-	identity: { ...identity }, currentIdentity, hub, submissionAuthority };
+	identity: { ...identity }, currentIdentity, hub, submissionAuthority, launchAuthority };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;

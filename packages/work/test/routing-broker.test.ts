@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
@@ -52,6 +53,7 @@ const routing = {
     rosterRevision: 'roster-v1', expiresAt: 70_000 },
 } as ReferenceRouting;
 
+const transportLaunchAuthority = { verifySelection: async () => {} };
 const transportAuthority = { verifyOrder: async () => {}, canSubmit: () => true, sign: async () => 'parent-proof' };
 
 function request(socketPath: string, value: unknown): Promise<Record<string, unknown>> {
@@ -80,6 +82,7 @@ test('private routed broker binds one dispatch and proxies only scoped requests'
       const verb = String(url).split('/').at(-1)!;
       calls.push({ verb, init: init! });
       if (verb === 'reserve_launch') return Response.json({ reservationId: 'lr_one', orderId: 'run', expiresAt: 40_000 });
+      if (verb === 'report_launch') return Response.json({ orderId: 'run', digest: valueDigestHex(JSON.parse(String(init!.body)).report), recordedAt: 2_000, provenance: 'authenticated-worker-report' });
       return Response.json(verb === 'get_order' ? orderResponse : { text: 'ok' });
     }) as typeof fetch,
   });
@@ -87,7 +90,7 @@ test('private routed broker binds one dispatch and proxies only scoped requests'
   try {
     assert.equal(statSync(broker.socketPath).mode & 0o777, 0o600);
     assert.equal(statSync(join(broker.socketPath, '..')).mode & 0o777, 0o700);
-    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     const send = (method: string, body: unknown, cap = grant.cap) => request(grant.socketPath, { cap, method, body });
     assert.equal((await send('get_order', { holder })).ok, false, 'pending grant cannot reach Hub before start gate');
     assert.equal(calls.length, 0);
@@ -112,10 +115,10 @@ test('private routed broker binds one dispatch and proxies only scoped requests'
     assert.equal((await send('reserve_launch', { request: { ...launch, orderId: 'other' } })).ok, false);
     assert.equal((await send('reserve_launch', { request: launch })).ok, true);
     assert.equal((await send('report_launch', { report })).ok, true);
-    assert.deepEqual(calls.map(call => call.verb), ['get_order', 'reserve_launch', 'report_launch']);
+    assert.deepEqual(calls.map(call => call.verb), ['get_order', 'get_order', 'reserve_launch', 'get_order', 'report_launch']);
     grant.terminal();
     assert.equal((await send('get_order', { holder })).ok, false);
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 5);
     live = { ...live, sessionId: 'rs_changed' };
     assert.throws(() => broker.issue({ reservation, routing, identity, currentIdentity: () => live, hub }),
       /grant refused/);
@@ -138,7 +141,7 @@ test('broker redacts upstream failures and rejects an expired incarnation before
   });
   const broker = await createRoutingBroker({ now: () => now });
   try {
-    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     grant.activate(child);
     const response = await request(grant.socketPath, { cap: grant.cap, method: 'read_routing_claim', body: {} });
     assert.equal(response.ok, false);
@@ -173,13 +176,13 @@ test('broker refuses overlong reservations and a response that finishes after gr
     assessmentId: null, requested: null, selected: null };
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const first = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const first = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     first.activate(child);
     assert.equal((await request(first.socketPath, { cap: first.cap, method: 'reserve_launch',
       body: { request: launch } })).ok, false, 'Service expiry may not widen the local claim bound');
     first.terminal();
     delayed = true;
-    const second = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const second = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     second.activate(child);
     const result = request(second.socketPath, { cap: second.cap, method: 'reserve_launch', body: { request: launch } });
     await fetchStarted;
@@ -204,7 +207,7 @@ test('broker survives bounded client resets during pending Hub replies', async (
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     grant.activate(child);
     for (let index = 0; index < 16; index++) {
       const fetched = new Promise<void>(resolve => { started = resolve; });
@@ -306,7 +309,7 @@ test('agent-run session holder is pinned to the original routing session', async
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder, 'agent-run receives a separate holder-only cap');
     assert.notEqual(grant.holder.cap, grant.cap);
     assert.equal((await request(grant.holder.socketPath, { cap: grant.holder.cap, method: 'get_order',
@@ -376,7 +379,7 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder);
     grant.activate(agentRecord);
     const role = createRoutingChildClient(handoffFor(grant, agentReservation));
@@ -439,7 +442,7 @@ test('revoking a holder grant aborts an in-flight streamed upload', async () => 
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder);
     grant.activate(agentRecord);
     const client = createRoutingChildClient(handoffFor(grant.holder, agentReservation));
@@ -483,7 +486,7 @@ test('holder upload waits for a delayed helper exit after broker acknowledges ex
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder);
     grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
     const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder }, {
@@ -523,7 +526,7 @@ test('routed holder refuses a file when an ancestor changes after open', async (
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
     const reserved = { ...reservation, childKind: 'agent-run' as const, token: 'e'.repeat(32) };
-    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder);
     grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
     const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder }, {
@@ -579,7 +582,7 @@ test('broker rejects malformed upload pointers and a role-cap upload', async () 
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder);
     grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
     const holderClient = createRoutingChildClient(handoffFor(grant.holder, reserved));
@@ -617,7 +620,7 @@ test('broker upload absolute deadline aborts the parent request and child stream
   const broker = await createRoutingBroker({ now: () => 2_000,
     uploadTimeouts: { idleMs: 80, absoluteMs: 100 } });
   try {
-    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     assert.ok(grant.holder);
     grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
     const client = createRoutingChildClient(handoffFor(grant.holder, reserved));
@@ -649,7 +652,7 @@ test('malformed lifecycle replies and rotated sessions refuse through the child 
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => current, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => current, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     grant.activate(child);
     const client = createRoutingChildClient(handoffFor(grant));
     await assert.rejects(client.heartbeat({ workflow: 'wf', run: 'run', holder }), /broker unavailable/);
@@ -671,7 +674,7 @@ test('in-flight lifecycle result is discarded when the dispatch grant is revoked
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
   try {
-    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority });
+    const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority, launchAuthority: transportLaunchAuthority });
     grant.activate(child);
     const client = createRoutingChildClient(handoffFor(grant));
     const pending = client.heartbeat({ workflow: 'wf', run: 'run', holder });
@@ -879,4 +882,71 @@ test('malformed routed value never signs or writes and a corrected object remain
     assert.equal(signatures, 1);
     assert.equal(writes, 1);
   } finally { await broker.close(); }
+});
+
+test('parent live selection gate refuses missing authority, local roster drift and expiry before launch writes', async () => {
+  const launch = { version: 'launch-reservation-v1', claimId: 'run', decisionId: 'decision',
+    binding, orderId: 'run', attemptId: 'run', rosterRevision: 'roster-v1', candidateIds: [],
+    assessmentId: null, requested: null, selected: null };
+  for (const mode of ['missing', 'drift', 'expiry']) {
+    let now = 2_000, writes = 0;
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => now },
+      fetchImpl: (async (url) => {
+	if (String(url).endsWith('/get_order')) return Response.json(parentOrder());
+	writes++;
+	return Response.json({ reservationId: 'lr', orderId: 'run', expiresAt: 40_000 });
+      }) as typeof fetch,
+    });
+    const broker = await createRoutingBroker({ now: () => now });
+    try {
+      const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+	submissionAuthority: transportAuthority,
+	...(mode === 'missing' ? {} : { launchAuthority: { verifySelection: async () => {
+	  if (mode === 'drift') throw new Error('current machine roster changed');
+	  now = 75_000;
+	} } }) });
+      grant.activate(child);
+      assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'reserve_launch',
+	body: { request: launch } })).ok, false, mode);
+      assert.equal(writes, 0, mode);
+    } finally { await broker.close(); }
+  }
+});
+
+test('prestart report rechecks parent selection and exact acknowledgement after reservation', async () => {
+  const launch = { version: 'launch-reservation-v1', claimId: 'run', decisionId: 'decision',
+    binding, orderId: 'run', attemptId: 'run', rosterRevision: 'roster-v1', candidateIds: [],
+    assessmentId: null, requested: null, selected: null };
+  const report = { version: 'launch-v1', reservationId: 'lr', decisionId: 'decision',
+    binding, claimId: 'run', orderId: 'run', attemptId: 'run', requested: null,
+    selected: null, observation: { state: 'unknown' } };
+  for (const mode of ['drift', 'bad-ack']) {
+    let drift = false, reports = 0, selections = 0;
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async (url) => {
+	if (String(url).endsWith('/get_order')) return Response.json(parentOrder());
+	if (String(url).endsWith('/reserve_launch')) return Response.json({ reservationId: 'lr', orderId: 'run', expiresAt: 40_000 });
+	reports++;
+	return Response.json({ orderId: 'run', digest: 'wrong-digest', recordedAt: 2_000, provenance: 'authenticated-worker-report' });
+      }) as typeof fetch,
+    });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+	submissionAuthority: transportAuthority, launchAuthority: { verifySelection: async (_order, request) => {
+	  selections++;
+	  assert.deepEqual(request, launch);
+	  if (drift) throw new Error('adapter unavailable');
+	} } });
+      grant.activate(child);
+      const send = (method: string, body: unknown) => request(grant.socketPath, { cap: grant.cap, method, body });
+      assert.equal((await send('reserve_launch', { request: launch })).ok, true);
+      drift = mode === 'drift';
+      assert.equal((await send('report_launch', { report })).ok, false);
+      assert.equal(selections, 2);
+      assert.equal(reports, mode === 'drift' ? 0 : 1);
+    } finally { await broker.close(); }
+  }
 });
