@@ -1099,6 +1099,17 @@ test('C16 default policy retains the complete current holder surface', () => {
   assert.deepEqual(OWN_TOOLS, [...HOLD_MCP_TOOL_NAMES]);
 });
 
+test('routed collection seal is mounted only for the private routed holder', () => {
+  const routed = startArgs(undefined, { owenloopMcp: { command: '/fixture/node',
+    args: ['cli', 'work', 'hold', '--mcp', '--routing-holder=/private/holder'] } });
+  const routedServers = (buildThreadStartParams(routed)['config'] as {
+    mcp_servers: Record<string, unknown> }).mcp_servers;
+  assertOwnPolicy(routedServers['owenloop'], [...OWN_TOOLS, 'seal_collection']);
+  const ordinary = startArgs(undefined, { owenloopMcp: { command: '/fixture/node',
+    args: ['cli', 'work', 'hold', '--mcp', '--mcp-tools=seal_collection'] } });
+  assert.throws(() => buildThreadStartParams(ordinary), /mcp-tools/);
+});
+
 test('C17 all supported subsets match the holder parser in both argv forms and on resume', () => {
   for (let mask = 1; mask < (1 << OWN_TOOLS.length); mask++) {
     const selected = OWN_TOOLS.filter((_, i) => mask & (1 << i)).reverse();

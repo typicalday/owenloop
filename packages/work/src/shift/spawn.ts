@@ -55,7 +55,7 @@ export interface SpawnSpec {
   /** Authenticated service shift identity associated with this handoff. */
   routingShiftId?: string;
   /** Parent-only exact reservation cleanup, never passed to child code. */
-  onTerminal?: () => void;
+  onTerminal?: (reason?: 'exit' | 'start-failure' | 'cancel') => void;
   /** Stable shift name in force when this worker was dispatched. */
   shiftName?: string;
   /** Stable owner key for session reconciliation. */
@@ -373,10 +373,10 @@ export function createDefaultSpawner(
     // discard them before an operator can read them — reading them is the whole
     // point of `<run>.log`.
     let terminalReported = false;
-    const terminal = () => {
+    const terminal = (reason: 'exit' | 'start-failure' | 'cancel') => {
       if (terminalReported) return;
       terminalReported = true;
-      spec.onTerminal?.();
+      spec.onTerminal?.(reason);
     };
     let failureReported = false;
     let exitReported = false;
@@ -401,12 +401,12 @@ export function createDefaultSpawner(
 	...(spec.routingHandoff ? { routingHandoff: spec.routingHandoff } : {}), exitStatus, signal });
     };
     child.once('error', () => {
-      terminal();
+      terminal('start-failure');
       report(null, null, 'worker process failed to start');
       reportExit(null, null);
     });
     child.once('exit', (code, signal) => {
-      terminal();
+      terminal('exit');
       reportExit(code, signal);
       if (code === 0) return;
       report(code, signal, 'worker exited without completing successfully');
@@ -429,7 +429,7 @@ export function createDefaultSpawner(
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
     const kill = (): void => {
-      terminal();
+      terminal('cancel');
       try {
 	child.kill('SIGTERM');
       } catch {

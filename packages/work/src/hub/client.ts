@@ -74,6 +74,14 @@ import type {
   LaunchReservationResponse,
   LocalModelRequest,
   LocalModelResponse,
+  RoutedMemberIssueRequest,
+  RoutedMemberIssueResponse,
+  RoutedMemberEmitRequest,
+  RoutedMemberCancelRequest,
+  RoutedCollectionSealRequest,
+  RoutedCollectionReceiptRequest,
+  RoutedCollectionReceiptResponse,
+  RoutedCollectionWriteResponse,
 } from './types.ts';
 
 export interface HubClientOptions {
@@ -181,6 +189,12 @@ export interface RoutingHubClient extends HubClient {
   routingAsk(req: AskRequest, signal?: AbortSignal): Promise<AskResponse>;
   routingReject(req: RejectRequest, signal?: AbortSignal): Promise<RejectResponse>;
   routingRequestApproval(req: RequestApprovalRequest, signal?: AbortSignal): Promise<RequestApprovalResponse>;
+  routingCollectionIssue(req: RoutedMemberIssueRequest, signal?: AbortSignal): Promise<RoutedMemberIssueResponse>;
+  routingCollectionCancel(req: RoutedMemberCancelRequest, signal?: AbortSignal): Promise<RoutedCollectionWriteResponse>;
+  routingCollectionEmit(req: RoutedMemberEmitRequest, signal?: AbortSignal): Promise<RoutedCollectionWriteResponse>;
+  routingCollectionSeal(req: RoutedCollectionSealRequest, signal?: AbortSignal): Promise<RoutedCollectionWriteResponse>;
+  routingCollectionReceipt(req: RoutedCollectionReceiptRequest, signal?: AbortSignal): Promise<RoutedCollectionReceiptResponse>;
+  routingCollectionRevoke(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<{ revoked: true }>;
   routingPutFileArtifact(req: { workflow: string; run: string; body: Readable; size: number;
     contentType: string; filename?: string }, signal?: AbortSignal): Promise<PutFileArtifactResponse>;
   routingGetFileArtifact(req: { workflow: string; run: string; key: string;
@@ -432,6 +446,12 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     routingAsk: (req, signal) => scopedPost('routing_ask/v1', req, signal),
     routingReject: (req, signal) => scopedPost('routing_reject/v1', req, signal),
     routingRequestApproval: (req, signal) => scopedPost('routing_request_approval/v1', req, signal),
+    routingCollectionIssue: (req, signal) => scopedPost('routing_collection_member_issue/v1', req, signal),
+    routingCollectionCancel: (req, signal) => scopedPost('routing_collection_member_cancel/v1', req, signal),
+    routingCollectionEmit: (req, signal) => scopedPost('routing_collection_member_emit/v1', req, signal),
+    routingCollectionSeal: (req, signal) => scopedPost('routing_collection_seal/v1', req, signal),
+    routingCollectionReceipt: (req, signal) => scopedPost('routing_collection_receipt/v1', req, signal),
+    routingCollectionRevoke: (req, signal) => scopedPost('routing_collection_receipt_revoke/v1', req, signal),
     routingPutFileArtifact: (req, signal) => scopedFileArtifact(req, signal),
     routingGetFileArtifact: (req, signal) => scopedFileArtifactRead(req, signal),
     assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),

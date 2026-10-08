@@ -11,7 +11,8 @@ import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRe
   type AskRequest, type AskResponse, type RejectRequest, type RejectResponse,
   type RequestApprovalRequest, type RequestApprovalResponse,
   type InvocationBindingReadRequest, type InvocationBindingReadResponse,
-  type PutFileArtifactRequest, type PutFileArtifactResponse, type FileArtifactPointer } from './types.ts';
+  type PutFileArtifactRequest, type PutFileArtifactResponse, type FileArtifactPointer,
+  type RoutedCollectionWriteResponse, type RoutedMemberIssueResponse } from './types.ts';
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -23,6 +24,7 @@ const MAX_DOWNLOAD_HEADER = 4096;
 type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject'
   | 'request_approval' | 'read_invocation_binding';
+type CollectionVerb = Verb | 'collection_target' | 'emit_member' | 'seal_collection';
 
 export interface RoutingChildClient {
   getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
@@ -35,6 +37,14 @@ export interface RoutingChildClient {
   reportLaunch(req: { workflow: string; report: LaunchReportV1 }): Promise<LaunchReportResponse>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
+  collectionTarget(req: { workflow: string; run: string; path: string;
+    holder: NonNullable<SubmitRequest['holder']> }): Promise<{ collection: boolean }>;
+  emitCollectionMember(req: { workflow: string; run: string; sealPath: string;
+    emissionId: string; value: unknown; done: boolean; holder: NonNullable<SubmitRequest['holder']> }):
+    Promise<{ member: RoutedCollectionWriteResponse; seal?: RoutedCollectionWriteResponse;
+      issued: RoutedMemberIssueResponse }>;
+  sealCollection(req: { workflow: string; run: string; sealPath: string; sealId: string;
+    holder: NonNullable<SubmitRequest['holder']> }): Promise<RoutedCollectionWriteResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   ask(req: AskRequest): Promise<AskResponse>;
   reject(req: RejectRequest): Promise<RejectResponse>;
@@ -64,7 +74,7 @@ export function createRoutingChildClient(handoff: {
   const bound = (value: { workflow: string; run: string }) => {
     if (value.workflow !== workflow || value.run !== run) throw new Error('routing order binding refused');
   };
-  const exchange = <T>(method: Verb, body: unknown): Promise<T> => {
+  const exchange = <T>(method: CollectionVerb, body: unknown): Promise<T> => {
     const frame = JSON.stringify({ cap: broker.cap, method, body }) + '\n';
     if (Buffer.byteLength(frame) > MAX_REQUEST_BYTES) return Promise.reject(new Error('routing broker request too large'));
     return new Promise<T>((resolve, reject) => {
@@ -314,6 +324,20 @@ export function createRoutingChildClient(handoff: {
       return exchange('submit', { path: req.path, value: req.value, holder: req.holder,
 	...(req.done === undefined ? {} : { done: req.done }),
 	...(req.proof === undefined ? {} : { proof: req.proof }) });
+    },
+    collectionTarget(req) {
+      bound(req);
+      return exchange('collection_target', { path: req.path, holder: req.holder });
+    },
+    emitCollectionMember(req) {
+      bound(req);
+      return exchange('emit_member', { sealPath: req.sealPath, emissionId: req.emissionId,
+	value: req.value, done: req.done, holder: req.holder });
+    },
+    sealCollection(req) {
+      bound(req);
+      return exchange('seal_collection', { sealPath: req.sealPath, sealId: req.sealId,
+	holder: req.holder });
     },
     release(req) {
       if (!('workflow' in req) || !('run' in req)) throw new Error('routing order binding refused');

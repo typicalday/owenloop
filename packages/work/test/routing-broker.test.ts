@@ -715,6 +715,250 @@ function parentOrder(version = 1) {
     consumedFingerprint: {}, owes: [{ path: 'out', version }] } };
 }
 
+function parentCollectionOrder(version = 1) {
+  const base = parentOrder(version);
+  return { ...base, order: { ...base.order, outputs: ['items.sealed'],
+    owes: [{ path: 'items.sealed', version }] } };
+}
+
+test('parent collection issue, explicit member proof and separate seal survive terminal before ACK', async () => {
+  const calls: Array<{ route: string; body: Record<string, unknown>; headers: Headers }> = [];
+  const signed: Array<{ path: string; version?: number; value: unknown }> = [];
+  let grant: ReturnType<Awaited<ReturnType<typeof createRoutingBroker>>['issue']> | undefined;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      const body = JSON.parse(String(init!.body)) as Record<string, unknown>;
+      calls.push({ route, body, headers: new Headers(init!.headers) });
+      if (route === 'get_order') return Response.json(parentCollectionOrder());
+      if (route === 'routing_collection_member_issue/v1') return Response.json({
+	emissionId: body.emissionId, sealPath: 'items.sealed', sealTargetVersion: 1,
+	memberPath: 'items[0]', memberVersion: 1, valueDigest: body.valueDigest,
+	conditionApplied: 'routed-collection-member-v1',
+      });
+      if (route === 'routing_collection_member_emit/v1') return Response.json({
+	outcome: 'emitted', closed: false, emitted: ['items[0]'],
+	conditionApplied: 'routed-collection-member-v1',
+      });
+      if (route === 'routing_collection_seal/v1') {
+	grant?.terminal('normal-close');
+	return Response.json({ outcome: 'green', closed: true, sealed: 'items.sealed',
+	  conditionApplied: 'routed-collection-seal-v1' });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+      submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => false,
+	canCollect: (_order, path) => path === 'items.sealed',
+	sign: async (_order, path, value, version) => {
+	  signed.push({ path, value, ...(version === undefined ? {} : { version }) });
+	  return `parent-proof-${path}`;
+	} },
+    });
+    grant.activate(child);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'get_order',
+      body: { holder } })).ok, true);
+    const body = { sealPath: 'items.sealed', emissionId: 'a'.repeat(32),
+      value: { id: 1 }, done: true, holder };
+    const first = await request(grant.socketPath, { cap: grant.cap, method: 'emit_member', body });
+    assert.equal(first.ok, true);
+    assert.deepEqual(signed, [{ path: 'items[0]', value: { id: 1 }, version: 1 },
+      { path: 'items.sealed', value: {}, version: 1 }]);
+    assert.equal(calls.filter(call => call.route === 'routing_collection_member_emit/v1').length, 1);
+    assert.equal(calls.filter(call => call.route === 'routing_collection_seal/v1').length, 1);
+    // Shift may observe the role exit after the normal run-close event. It
+    // must keep this receipt-only tombstone instead of revoking it.
+    grant.terminal('normal-close');
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'heartbeat',
+      body: { holder } })).ok, false);
+    const same = await request(grant.socketPath, { cap: grant.cap, method: 'emit_member', body });
+    assert.deepEqual(same, first);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'emit_member',
+      body: { ...body, value: { id: 2 } } })).ok, false);
+    for (const call of calls) {
+      assert.equal(call.headers.get('authorization'), 'Bearer parent-bearer');
+      assert.equal(call.headers.get('x-owenloop-routing-session'), credential);
+    }
+  } finally { await broker.close(); }
+});
+
+test('child exit after lost seal ACK reconciles exact receipt without a run-close callback', async () => {
+  const routes: string[] = [];
+  let grant: ReturnType<Awaited<ReturnType<typeof createRoutingBroker>>['issue']> | undefined;
+  let sealRequest: Record<string, unknown> | undefined;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      routes.push(route);
+      const body = JSON.parse(String(init!.body)) as Record<string, unknown>;
+      if (route === 'get_order') return Response.json(parentCollectionOrder());
+      if (route === 'routing_collection_seal/v1') {
+	sealRequest = body;
+	grant?.terminal('child-exit');
+	throw new Error('ACK lost after Service commit');
+      }
+      if (route === 'routing_collection_receipt/v1') {
+	assert.equal(body.kind, 'seal');
+	assert.equal(body.id, sealRequest?.sealId);
+	assert.equal(body.requestDigest, valueDigestHex(sealRequest));
+	return Response.json({ state: 'sealed', result: { outcome: 'green', closed: true,
+	  sealed: 'items.sealed', conditionApplied: 'routed-collection-seal-v1' } });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+      submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => false,
+	canCollect: () => true, sign: async () => 'parent-seal-proof' } });
+    grant.activate(child);
+    await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: { holder } });
+    const body = { sealPath: 'items.sealed', sealId: 'b'.repeat(32), holder };
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'seal_collection', body })).ok, false);
+    const recovered = await request(grant.socketPath, { cap: grant.cap, method: 'seal_collection', body });
+    assert.equal(recovered.ok, true);
+    assert.equal((recovered.value as { outcome: string }).outcome, 'green');
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'seal_collection',
+      body: { ...body, sealId: 'c'.repeat(32) } })).ok, false);
+    assert.equal(routes.filter(route => route === 'routing_collection_seal/v1').length, 1);
+    assert.equal(routes.filter(route => route === 'routing_collection_receipt/v1').length, 1);
+  } finally { await broker.close(); }
+});
+
+test('explicit collection revocation clears cap and failed Service revoke quarantines broker close', async () => {
+  let revokes = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      if (route === 'get_order') return Response.json(parentCollectionOrder());
+      if (route === 'routing_collection_member_issue/v1') {
+	const body = JSON.parse(String(init!.body)) as Record<string, unknown>;
+	return Response.json({ emissionId: body.emissionId, sealPath: 'items.sealed',
+	  sealTargetVersion: 1, memberPath: 'items[0]', memberVersion: 1,
+	  valueDigest: body.valueDigest, conditionApplied: 'routed-collection-member-v1' });
+      }
+      if (route === 'routing_collection_receipt_revoke/v1') {
+	revokes++;
+	return new Response('unavailable', { status: 503 });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+    submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => false,
+      canCollect: () => true, sign: async () => 'proof' } });
+  grant.activate(child);
+  await request(grant.socketPath, { cap: grant.cap, method: 'get_order', body: { holder } });
+  // A pre-emit issue is enough to create exact collection custody.
+  await request(grant.socketPath, { cap: grant.cap, method: 'emit_member', body: {
+    sealPath: 'items.sealed', emissionId: 'd'.repeat(32), value: { id: 1 }, done: false, holder,
+  } });
+  grant.terminal('revoked');
+  assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'get_order',
+    body: { holder } })).ok, false);
+  await assert.rejects(broker.close(), /quarantined/);
+  await assert.rejects(broker.close(), /quarantined/, 'a second close cannot report false success');
+  assert.equal(revokes, 1);
+});
+
+test('session rotation revokes locally during an in-flight member write and quarantines its outcome', async () => {
+  let emitStarted!: () => void;
+  const started = new Promise<void>(resolve => { emitStarted = resolve; });
+  let finishEmit!: (response: Response) => void;
+  const heldEmit = new Promise<Response>(resolve => { finishEmit = resolve; });
+  let revokes = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      if (route === 'get_order') return Response.json(parentCollectionOrder());
+      if (route === 'routing_collection_member_issue/v1') {
+	const body = JSON.parse(String(init!.body)) as Record<string, unknown>;
+	return Response.json({ emissionId: body.emissionId, sealPath: 'items.sealed',
+	  sealTargetVersion: 1, memberPath: 'items[0]', memberVersion: 1,
+	  valueDigest: body.valueDigest, conditionApplied: 'routed-collection-member-v1' });
+      }
+      if (route === 'routing_collection_member_emit/v1') { emitStarted(); return heldEmit; }
+      if (route === 'routing_collection_receipt_revoke/v1') {
+	revokes++;
+	return Response.json({ revoked: true });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+    submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => false,
+      canCollect: () => true, sign: async () => 'parent-member-proof' } });
+  grant.activate(child);
+  try {
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'get_order',
+      body: { holder } })).ok, true);
+    const pending = request(grant.socketPath, { cap: grant.cap, method: 'emit_member',
+      body: { sealPath: 'items.sealed', emissionId: 'd'.repeat(32), value: { id: 1 },
+	done: false, holder } });
+    await started;
+    const revoked = broker.revokeSession(sessionId);
+    const revokedAssertion = assert.rejects(revoked, /quarantined/);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'heartbeat',
+      body: { holder } })).ok, false);
+    finishEmit(Response.json({ outcome: 'emitted', closed: false,
+      conditionApplied: 'routed-collection-member-v1' }));
+    await revokedAssertion;
+    assert.equal((await pending).ok, false);
+    assert.equal(revokes, 1);
+    await assert.rejects(broker.close(), /quarantined/);
+  } finally { await broker.close().catch(() => {}); }
+});
+
+test('Shift stop revokes a pending seal before ACK and cannot report a clean broker drain', async () => {
+  let sealStarted!: () => void;
+  const started = new Promise<void>(resolve => { sealStarted = resolve; });
+  let finishSeal!: (response: Response) => void;
+  const heldSeal = new Promise<Response>(resolve => { finishSeal = resolve; });
+  let revokes = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async url => {
+      const route = String(url).split('/api/')[1]!;
+      if (route === 'get_order') return Response.json(parentCollectionOrder());
+      if (route === 'routing_collection_seal/v1') { sealStarted(); return heldSeal; }
+      if (route === 'routing_collection_receipt_revoke/v1') {
+	revokes++;
+	return Response.json({ revoked: true });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+    submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => false,
+      canCollect: () => true, sign: async () => 'parent-seal-proof' } });
+  grant.activate(child);
+  try {
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'get_order',
+      body: { holder } })).ok, true);
+    const pending = request(grant.socketPath, { cap: grant.cap, method: 'seal_collection',
+      body: { sealPath: 'items.sealed', sealId: 'e'.repeat(32), holder } });
+    await started;
+    const closing = broker.close({ revokeNormalReceipts: true });
+    const refused = assert.rejects(closing, /quarantined/);
+    finishSeal(Response.json({ outcome: 'green', closed: true,
+      conditionApplied: 'routed-collection-seal-v1' }));
+    await refused;
+    assert.equal((await pending).ok, false);
+    assert.equal(revokes, 1);
+  } finally { await broker.close().catch(() => {}); }
+});
+
 test('routed submit rejects child proofs and signs normalized exact current metadata in parent', async () => {
   const calls: Array<{ route: string; body: Record<string, unknown> }> = [];
   const signed: unknown[] = [];

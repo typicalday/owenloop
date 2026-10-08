@@ -55,7 +55,8 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createHoldLoop, type HoldOutcome } from '../hold/loop.ts';
 import type { StopOptions } from '../lease/loop.ts';
-import { createHoldMcp, HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME, type HoldMcpToolName } from '../hold/mcp.ts';
+import { createHoldMcp, HOLD_MCP_TOOL_NAMES, ROUTED_COLLECTION_TOOL_NAME,
+  ROUTED_FILE_TOOL_NAME, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createDefaultHostedOrderAdapter, type HostedOrderResult } from '../hosted/order-adapter.ts';
 import { createVerifiedHostedHoldMcp } from '../hosted/verified-hold-mcp.ts';
 import { buildSubmitProof } from '../submit-proof.ts';
@@ -96,11 +97,11 @@ function parseMcpTools(value: string): HoldMcpToolName[] | { error: string } {
   if (names.length === 0 || names.some((name) => name === '')) {
     return { error: '--mcp-tools must be a comma-separated list with no empty names' };
   }
-  const allowed = new Set<string>([...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME]);
+  const allowed = new Set<string>([...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME, ROUTED_COLLECTION_TOOL_NAME]);
   const unknown = names.filter((name) => !allowed.has(name));
   if (unknown.length > 0) {
     return {
-      error: `--mcp-tools contains unknown tool(s): ${unknown.join(', ')}; expected ${[...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME].join(',')}`,
+      error: `--mcp-tools contains unknown tool(s): ${unknown.join(', ')}; expected ${[...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME, ROUTED_COLLECTION_TOOL_NAME].join(',')}`,
     };
   }
   if (new Set(names).size !== names.length) {
@@ -351,8 +352,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   const env = deps.env ?? process.env;
   const routed = parsed.routingHolder !== undefined;
-  if (!routed && parsed.mcpTools?.includes(ROUTED_FILE_TOOL_NAME)) {
-    err('owenloop work hold: get_file_artifact requires a routed holder');
+  if (!routed && parsed.mcpTools?.some(name => name === ROUTED_FILE_TOOL_NAME
+    || name === ROUTED_COLLECTION_TOOL_NAME)) {
+    err('owenloop work hold: routed tools require a routed holder');
     return 1;
   }
   // The marker alone never authorizes an account-store fallback. The nested
@@ -483,6 +485,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       ...(routedUploadFile ? { uploadFile: routedUploadFile } : {}),
       ...(routedFileClient ? { downloadFile: routedFileClient.downloadFile,
 	discardDownloadedFile: routedFileClient.discardDownloadedFile } : {}),
+      ...(routedFileClient ? { routedCollection: routedFileClient } : {}),
       ...(routed ? { routedSubmit: true as const } : {}),
       ...(parsed.verifiedHosted ? { tools: ['get_order' as const] }
 	: parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),

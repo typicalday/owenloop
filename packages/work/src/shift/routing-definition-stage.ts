@@ -30,8 +30,10 @@ export interface RoutedDefinitionStage {
   digest: string;
   /** Parent-only, fresh full-order and current operator trust gate. */
   verifyOrder(response: GetOrderResponse): Promise<void>;
-  /** Member emissions lack a Service proof path; admit only exact scalar targets. */
+  /** Fixed-path submit remains restricted to singleton and judge outputs. */
   canSubmit(order: OrderPacket, path: string): boolean;
+  /** The issued-member protocol requires an owed collection seal in signed source. */
+  canCollect?(order: OrderPacket, sealPath: string): boolean;
   /** Only a verified singleton or judge output has replay-safe submit semantics. */
   canReplay(order: OrderPacket, path: string): boolean;
   /** Durable exact child owner, written before the start gate opens. */
@@ -486,8 +488,15 @@ export async function stageRoutedDefinition(args: {
       if (!verified) return false;
       return verified.judges === path || outputFor(verified, order, path)?.kind === 'singleton';
     };
+    const canCollect = (order: OrderPacket, sealPath: string): boolean => {
+      if (order.defDigest !== args.order.defDigest || order.step !== args.order.step
+	|| order.workflow !== args.order.workflow || order.run !== args.order.run
+	|| !order.owes.some(owed => owed.path === sealPath)) return false;
+      const verified = source.getVerifiedStep(order.defDigest, order.step);
+      return !!verified && outputFor(verified, order, sealPath)?.kind === 'collection';
+    };
     return { path: stagePath, digest: args.order.defDigest!, verifyOrder,
-      canSubmit: canReplay, canReplay, activate, markGateMayOpen, cleanup, cleanupAfterExit };
+      canSubmit: canReplay, canReplay, canCollect, activate, markGateMayOpen, cleanup, cleanupAfterExit };
   } catch (error) {
     cleanup();
     if (error instanceof HubError) throw error;

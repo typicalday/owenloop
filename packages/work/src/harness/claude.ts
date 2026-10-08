@@ -609,6 +609,7 @@ const READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS = [...READ_ONLY_TOOLS]
 // over anyone else's work and there is no reason to withhold it under isolation.
 const BORN_BOUND_OWENLOOP_TOOL_NAMES = ['get_order', 'submit', 'ask'] as const;
 const ROUTED_FILE_TOOL = 'get_file_artifact';
+const ROUTED_COLLECTION_TOOL = 'seal_collection';
 const BORN_BOUND_OWENLOOP_TOOLS = BORN_BOUND_OWENLOOP_TOOL_NAMES.map(
   (name) => `mcp__owenloop__${name}`,
 );
@@ -617,6 +618,7 @@ const EXACT_WORKDIR_BUILTINS = new Set(['Read', 'Glob', 'Grep']);
 const OWENLOOP_CONTROL_TOOLS = new Set([
   ...BORN_BOUND_OWENLOOP_TOOLS,
   `mcp__owenloop__${ROUTED_FILE_TOOL}`,
+  `mcp__owenloop__${ROUTED_COLLECTION_TOOL}`,
   'mcp__plugin_owenloop_owenloop__get_order',
   'mcp__plugin_owenloop_owenloop__submit',
 ]);
@@ -847,8 +849,10 @@ function owenloopMount(mount: { command: string; args: string[] }): McpServerCon
  * derived from the same names used by `allowedTools`, so the declared exception
  * and the MCP server's actual `tools/list` cannot drift within this adapter. */
 function restrictedOwenloopMount(mount: { command: string; args: string[] }, verifiedFileCacheRoot?: string): McpServerConfig {
-  const selected = verifiedFileCacheRoot === undefined ? [...BORN_BOUND_OWENLOOP_TOOL_NAMES]
-    : [...BORN_BOUND_OWENLOOP_TOOL_NAMES, ROUTED_FILE_TOOL];
+  const routed = mount.args.some((arg) => arg === '--routing-holder' || arg.startsWith('--routing-holder='));
+  const selected = [...BORN_BOUND_OWENLOOP_TOOL_NAMES,
+    ...(verifiedFileCacheRoot === undefined ? [] : [ROUTED_FILE_TOOL]),
+    ...(routed ? [ROUTED_COLLECTION_TOOL] : [])];
   return owenloopMount({
     command: mount.command,
     args: [...mount.args, `--mcp-tools=${selected.join(',')}`],
@@ -1034,7 +1038,10 @@ export function buildClaudeOptions(
     options.tools = effectiveTools.filter((tool) => !OWENLOOP_CONTROL_TOOLS.has(tool));
     options.allowedTools = [
       ...new Set([...effectiveTools, ...BORN_BOUND_OWENLOOP_TOOLS,
-		...(inputs.verifiedFileCacheRoot === undefined ? [] : [`mcp__owenloop__${ROUTED_FILE_TOOL}`])]),
+	...(inputs.verifiedFileCacheRoot === undefined ? [] : [`mcp__owenloop__${ROUTED_FILE_TOOL}`]),
+	...(inputs.owenloopMcp.args.some((arg) => arg === '--routing-holder' || arg.startsWith('--routing-holder='))
+	  ? [`mcp__owenloop__${ROUTED_COLLECTION_TOOL}`] : []),
+      ]),
     ];
   }
   if (isolated) {

@@ -12,7 +12,10 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingHubClient } from '../hub/client.ts';
 import { HubError, type ContactHolder, type FileArtifactPointer, type GetOrderResponse, type LaunchReportV1,
-  type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse } from '../hub/types.ts';
+  type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse,
+  type RoutedCollectionHolder, type RoutedMemberIssueRequest, type RoutedMemberIssueResponse,
+  type RoutedMemberEmitRequest, type RoutedCollectionSealRequest,
+  type RoutedCollectionWriteResponse } from '../hub/types.ts';
 import type { ChildRecord, ChildReservation } from './state.ts';
 import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
 import { outputVersionForSubmission } from '../submit-proof.ts';
@@ -33,7 +36,7 @@ const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
-  | 'read_invocation_binding';
+  | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection';
 type CapScope = 'role' | 'holder';
 interface Grant {
   active: boolean;
@@ -56,6 +59,15 @@ interface Grant {
   submitBusy?: boolean;
   pendingSubmit?: { intent: string; binding: string; request: import('../hub/types.ts').ConditionalSubmitRequest };
   launchAuthority?: RoutedLaunchAuthority;
+  collectionBusy?: boolean;
+  collectionMember?: { intent: string; issue: RoutedMemberIssueRequest;
+    issued?: RoutedMemberIssueResponse; emit?: RoutedMemberEmitRequest;
+    result?: RoutedCollectionWriteResponse; done: boolean; sealId?: string };
+  collectionSeal?: { intent: string; request?: RoutedCollectionSealRequest;
+    result?: RoutedCollectionWriteResponse };
+  terminalReason?: 'normal-close' | 'receipt-pending' | 'revoked';
+  receiptUntil?: number;
+  revokeResult?: Promise<void>;
 }
 export interface RoutedLaunchAuthority {
   /** Parent-owned current machine roster and adapter availability. */
@@ -66,9 +78,12 @@ export interface RoutingBroker {
     currentIdentity: () => Identity | undefined; hub: RoutingHubClient;
     submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
-      activate(record: ChildRecord): void; terminal(): void;
+      activate(record: ChildRecord): void;
+      terminal(reason?: 'normal-close' | 'child-exit' | 'revoked'): Promise<void> | void;
     };
-  close(): Promise<void>;
+  close(options?: { revokeNormalReceipts?: boolean }): Promise<void>;
+  /** Extinguish one incarnation locally before awaiting its Service revocation. */
+  revokeSession(sessionId: string): Promise<void>;
   socketPath: string;
 }
 
@@ -290,17 +305,208 @@ async function verifyParentLaunch(grant: Grant, request: LaunchReservationReques
   await checked(grant, grant.launchAuthority.verifySelection(fresh.order, structuredClone(request)), now, true);
 }
 
+function collectionResponse(value: unknown, kind: 'member' | 'seal'): value is RoutedCollectionWriteResponse {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.outcome === 'string' && row.outcome.length > 0
+    && typeof row.closed === 'boolean'
+    && row.conditionApplied === (kind === 'member'
+      ? 'routed-collection-member-v1' : 'routed-collection-seal-v1');
+}
+
+function collectionOriginalSession(grant: Grant, now: () => number): boolean {
+  const current = grant.currentIdentity();
+  return !!current && current.sessionId === grant.identity.sessionId
+    && current.shiftId === grant.identity.shiftId && current.orgId === grant.identity.orgId
+    && current.principalId === grant.identity.principalId && now() < current.expiresAt;
+}
+
+function collectionReceiptOnly(grant: Grant, now: () => number): boolean {
+  return (grant.terminalReason === 'normal-close' || grant.terminalReason === 'receipt-pending')
+    && grant.receiptUntil !== undefined
+    && now() < grant.receiptUntil && collectionOriginalSession(grant, now);
+}
+
+async function collectionOrder(grant: Grant, sealPath: string, holder: RoutedCollectionHolder,
+  now: () => number, signal: AbortSignal): Promise<{ response: GetOrderResponse; binding: string; version: number }> {
+  const authority = grant.submissionAuthority;
+  if (!authority || !grant.ready || !validateSessionGrant(grant, now()))
+    throw new Error('routing collection authority unavailable');
+  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+    run: grant.reservation.run, holder }, signal), now);
+  if (!response.lease.claimed || !response.order) throw new Error('routing collection claim unavailable');
+  const binding = submissionBinding(response, sealPath, grant);
+  await checked(grant, authority.verifyOrder(response), now);
+  if (authority.canCollect?.(response.order, sealPath) !== true
+    || submissionBinding(response, sealPath, grant) !== binding)
+    throw new Error('routing collection target unavailable');
+  const version = outputVersionForSubmission(response.order, sealPath);
+  if (!Number.isSafeInteger(version) || version! < 1) throw new Error('routing collection target unavailable');
+  return { response, binding, version: version! };
+}
+
+async function collectionFresh(grant: Grant, sealPath: string, holder: RoutedCollectionHolder,
+  binding: string, now: () => number, signal: AbortSignal): Promise<void> {
+  const fresh = await collectionOrder(grant, sealPath, holder, now, signal);
+  if (fresh.binding !== binding) throw new Error('routing collection order changed');
+}
+
+function collectionReceiptQuery(grant: Grant, kind: 'member' | 'seal') {
+  const { workflow, run } = grant.reservation;
+  if (kind === 'member') {
+    const pending = grant.collectionMember;
+    if (!pending?.issued || !pending.emit) throw new Error('routing collection receipt unavailable');
+    return { workflow, run, kind, id: pending.issue.emissionId,
+      sealPath: pending.issue.sealPath, sealTargetVersion: pending.issued.sealTargetVersion,
+      requestDigest: valueDigestHex(pending.issue), proofDigest: valueDigestHex(pending.emit.proof),
+      holder: pending.issue.holder } as const;
+  }
+  const request = grant.collectionSeal?.request;
+  if (!request) throw new Error('routing collection receipt unavailable');
+  return { workflow, run, kind, id: request.sealId, sealPath: request.sealPath,
+    sealTargetVersion: request.sealTargetVersion, requestDigest: valueDigestHex(request),
+    holder: request.holder } as const;
+}
+
+async function collectionReconcile(grant: Grant, kind: 'member' | 'seal', now: () => number,
+  signal: AbortSignal): Promise<RoutedCollectionWriteResponse> {
+  if (!collectionReceiptOnly(grant, now)) throw new Error('routing collection receipt unavailable');
+  const receipt = await grant.hub.routingCollectionReceipt(collectionReceiptQuery(grant, kind), signal);
+  if (!collectionReceiptOnly(grant, now) || !receipt || receipt.state === 'pending'
+    || !collectionResponse(receipt.result, kind)) throw new Error('routing collection outcome unresolved');
+  return receipt.result;
+}
+
+async function collectionSeal(grant: Grant, sealPath: string, sealId: string,
+  holder: RoutedCollectionHolder, now: () => number, signal: AbortSignal): Promise<RoutedCollectionWriteResponse> {
+  const intent = valueDigestHex({ sealPath, sealId, holder });
+  if (grant.collectionSeal && grant.collectionSeal.intent !== intent)
+    throw new Error('routing collection seal outcome unresolved');
+  grant.collectionSeal ??= { intent };
+  if (grant.collectionSeal.result) return grant.collectionSeal.result;
+  if (collectionReceiptOnly(grant, now)) {
+    const result = await collectionReconcile(grant, 'seal', now, signal);
+    grant.collectionSeal.result = result;
+    return result;
+  }
+  if (!grant.collectionSeal.request) {
+    const { response, binding, version } = await collectionOrder(grant, sealPath, holder, now, signal);
+    const proof = await checked(grant, grant.submissionAuthority!.sign(response.order!, sealPath, {}, version), now);
+    if (typeof proof !== 'string' || !proof) throw new Error('routing collection proof unavailable');
+    await collectionFresh(grant, sealPath, holder, binding, now, signal);
+    grant.collectionSeal.request = { workflow: grant.reservation.workflow, run: grant.reservation.run,
+      sealPath, sealTargetVersion: version, sealId, proof, holder };
+  }
+  const result = await grant.hub.routingCollectionSeal(grant.collectionSeal.request, signal);
+  if (!collectionResponse(result, 'seal') || (!validateSessionGrant(grant, now())
+    && !collectionReceiptOnly(grant, now))) throw new Error('routing collection seal outcome unresolved');
+  grant.collectionSeal.result = result;
+  return result;
+}
+
+async function collectionEmit(grant: Grant, body: Record<string, unknown>, now: () => number,
+  signal: AbortSignal): Promise<unknown> {
+  const sealPath = body.sealPath as string;
+  const emissionId = body.emissionId as string;
+  const holder = body.holder as RoutedCollectionHolder;
+  const value = normalizeSubmitValue(body.value);
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('routing collection value refused');
+  const done = body.done as boolean;
+  const intent = valueDigestHex({ sealPath, emissionId, value, done, holder });
+  if (grant.collectionMember && grant.collectionMember.intent !== intent) {
+    if (!grant.collectionMember.result
+      || (grant.collectionMember.done && grant.collectionMember.result.outcome === 'emitted')
+      || grant.collectionSeal && !grant.collectionSeal.result)
+      throw new Error('routing collection outcome unresolved');
+    grant.collectionMember = undefined;
+  }
+  grant.collectionMember ??= { intent, done, issue: {
+    workflow: grant.reservation.workflow, run: grant.reservation.run, sealPath,
+    emissionId, valueDigest: valueDigestHex(value), holder } };
+  const pending = grant.collectionMember;
+  if (!pending.result) {
+    if (collectionReceiptOnly(grant, now)) {
+      pending.result = await collectionReconcile(grant, 'member', now, signal);
+    } else {
+      const { response, binding, version } = await collectionOrder(grant, sealPath, holder, now, signal);
+      pending.issued ??= await checked(grant, grant.hub.routingCollectionIssue(pending.issue, signal), now);
+      const issued = pending.issued;
+      if (!issued || issued.emissionId !== emissionId || issued.sealPath !== sealPath
+	|| issued.sealTargetVersion !== version || issued.memberVersion !== 1
+	|| issued.valueDigest !== pending.issue.valueDigest
+	|| issued.conditionApplied !== 'routed-collection-member-v1'
+	|| typeof issued.memberPath !== 'string' || !issued.memberPath)
+	throw new Error('routing collection issued target refused');
+      if (!pending.emit) {
+	await collectionFresh(grant, sealPath, holder, binding, now, signal);
+	const proof = await checked(grant, grant.submissionAuthority!.sign(response.order!,
+	  issued.memberPath, value, issued.memberVersion), now);
+	if (typeof proof !== 'string' || !proof) throw new Error('routing collection proof unavailable');
+	await collectionFresh(grant, sealPath, holder, binding, now, signal);
+	pending.emit = { workflow: grant.reservation.workflow, run: grant.reservation.run,
+	  emissionId, memberPath: issued.memberPath, memberVersion: 1,
+	  value: value as Record<string, unknown>, proof, holder };
+      }
+      const emitRequest = pending.emit;
+      if (!emitRequest) throw new Error('routing collection request unavailable');
+      const result = await grant.hub.routingCollectionEmit(emitRequest, signal);
+      if (!collectionResponse(result, 'member') || (!validateSessionGrant(grant, now())
+	&& !collectionReceiptOnly(grant, now))) throw new Error('routing collection outcome unresolved');
+      pending.result = result;
+    }
+  }
+  const member = pending.result;
+  if (!member || !pending.issued) throw new Error('routing collection outcome unresolved');
+  if (!done || member.outcome !== 'emitted') return { member, issued: pending.issued };
+  pending.sealId ??= createHash('sha256').update(`routed-seal:${emissionId}`).digest('hex').slice(0, 32);
+  const seal = await collectionSeal(grant, sealPath, pending.sealId, holder, now, signal);
+  return { member, seal, issued: pending.issued };
+}
+
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
   if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit'
-    && method !== 'ask' && method !== 'reject')
+    && method !== 'ask' && method !== 'reject' && method !== 'emit_member'
+    && method !== 'seal_collection' && method !== 'collection_target')
     throw new Error('routing broker request refused');
+  if (method === 'emit_member' || method === 'seal_collection') {
+    if (!exactKeys(body, method === 'emit_member'
+      ? ['sealPath', 'emissionId', 'value', 'done', 'holder']
+      : ['sealPath', 'sealId', 'holder'])
+      || typeof body.sealPath !== 'string' || !body.sealPath
+      || !grant.allowedPaths?.has(body.sealPath)
+      || !validHolder(grant, scope, body.holder)
+      || (method === 'emit_member' && (!/^[a-f0-9]{32,64}$/.test(body.emissionId as string)
+	|| typeof body.done !== 'boolean'))
+      || (method === 'seal_collection' && !/^[a-f0-9]{32,64}$/.test(body.sealId as string))
+      || grant.collectionBusy
+      || !(validateSessionGrant(grant, now()) || collectionReceiptOnly(grant, now)))
+      throw new Error('routing broker request refused');
+    grant.collectionBusy = true;
+    try {
+      return method === 'emit_member' ? await collectionEmit(grant, body, now, signal)
+	: await collectionSeal(grant, body.sealPath, body.sealId as string,
+	  body.holder as RoutedCollectionHolder, now, signal);
+    } finally { grant.collectionBusy = false; }
+  }
   const launch = method === 'get_launch_order' || method === 'assess_local_model'
     || method === 'reserve_launch' || method === 'report_launch';
   if (!grant.ready || !(launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now())))
     throw new Error('routing broker grant expired');
   const { workflow, run, childKind } = grant.reservation;
   switch (method) {
+    case 'collection_target': {
+      if (!exactKeys(body, ['path', 'holder']) || typeof body.path !== 'string'
+	|| !grant.allowedPaths?.has(body.path) || !validHolder(grant, scope, body.holder))
+	throw new Error('routing broker request refused');
+      const response = await checked(grant, grant.hub.getOrder({ workflow, run,
+	holder: body.holder }, signal), now);
+      if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order
+	|| !grant.submissionAuthority) throw new Error('routing collection order unavailable');
+      await checked(grant, grant.submissionAuthority.verifyOrder(response), now);
+      return { collection: grant.submissionAuthority.canCollect?.(response.order, body.path) === true };
+    }
     case 'get_launch_order':
     case 'get_order': {
       if (!exactKeys(body, ['holder']) || !validHolder(grant, scope, body.holder)) throw new Error('routing broker request refused');
@@ -504,6 +710,10 @@ export async function createRoutingBroker(args: { now?: () => number;
   chmodSync(directory, 0o700);
   const socketPath = join(directory, 'broker.sock');
   const grants = new Map<string, { grant: Grant; scope: CapScope }>();
+  const terminators = new Map<Grant, (reason?: 'normal-close' | 'child-exit' | 'revoked') => Promise<void> | void>();
+  const revocations = new Set<Promise<void>>();
+  let revocationFailed = false;
+  let outcomeUncertain = false;
   const now = args.now ?? Date.now;
   const uploadIdleMs = args.uploadTimeouts?.idleMs ?? UPLOAD_IDLE_MS;
   const uploadAbsoluteMs = args.uploadTimeouts?.absoluteMs ?? UPLOAD_ABSOLUTE_MS;
@@ -511,6 +721,7 @@ export async function createRoutingBroker(args: { now?: () => number;
     || !Number.isSafeInteger(uploadAbsoluteMs) || uploadAbsoluteMs <= uploadIdleMs
     || uploadAbsoluteMs > UPLOAD_ABSOLUTE_MS) throw new Error('routing broker upload timeout refused');
   let closed = false;
+  let closePromise: Promise<void> | undefined;
   const sockets = new Set<Socket>();
   const server: Server = createServer((socket: Socket) => {
     if (sockets.size >= MAX_SOCKETS) { socket.destroy(); return; }
@@ -681,7 +892,7 @@ export async function createRoutingBroker(args: { now?: () => number;
 	  if (tail.length > 0) throw new Error();
   const methods: readonly string[] = ['get_order', 'get_launch_order', 'read_routing_claim', 'assess_local_model',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
-	    'request_approval', 'read_invocation_binding'];
+	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection'];
 	  if (!methods.includes(request.method)) throw new Error();
 	  const value = await invoke(entry.grant, entry.scope, request.method as Method, request.body, now, controller.signal);
 	  if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
@@ -716,7 +927,92 @@ export async function createRoutingBroker(args: { now?: () => number;
       const holderCap = reservation.childKind === 'agent-run' ? randomBytes(32).toString('hex') : undefined;
       grants.set(cap, { grant, scope: 'role' });
       if (holderCap) grants.set(holderCap, { grant, scope: 'holder' });
-      let terminal = false;
+      let terminal: 'normal-close' | 'receipt-pending' | 'revoked' | undefined;
+      let tombstoneTimer: NodeJS.Timeout | undefined;
+      let settleTombstone: ((error?: Error) => void) | undefined;
+      let tombstoneWait: Promise<void> | undefined;
+      const terminate = (requested: 'normal-close' | 'child-exit' | 'revoked' = 'revoked'): Promise<void> | void => {
+	const frozen = !!(grant.collectionMember?.emit || grant.collectionSeal?.request);
+	const reason = requested === 'child-exit'
+	  ? frozen ? 'receipt-pending' : 'revoked' : requested;
+	if (terminal === 'revoked') return grant.revokeResult;
+	if ((terminal === 'normal-close' || terminal === 'receipt-pending')
+	  && (reason === 'normal-close' || reason === 'receipt-pending'))
+	  return tombstoneWait;
+	terminal = reason;
+	grant.terminalReason = reason;
+	grant.active = false;
+	grant.ready = false;
+	for (const controller of grant.uploadControllers) controller.abort();
+	if ((reason === 'normal-close' || reason === 'receipt-pending') && frozen) {
+	  grant.receiptUntil = Math.min(identity.expiresAt, now() + 60_000);
+	  const remaining = Math.max(0, grant.receiptUntil - now());
+	  tombstoneWait = new Promise<void>((resolve, reject) => {
+	    settleTombstone = error => error ? reject(error) : resolve();
+	  });
+	  void tombstoneWait.catch(() => {});
+	  tombstoneTimer = setTimeout(() => {
+	    if (grant.terminalReason === 'normal-close' || grant.terminalReason === 'receipt-pending') {
+	      const unresolved = !!((grant.collectionMember?.emit && !grant.collectionMember.result)
+		|| (grant.collectionSeal?.request && !grant.collectionSeal.result));
+	      if (unresolved) outcomeUncertain = true;
+	      grant.receiptUntil = undefined;
+	      grants.delete(cap);
+	      if (holderCap) grants.delete(holderCap);
+	      terminators.delete(grant);
+	      settleTombstone?.(unresolved ? new Error('routing collection outcome quarantined') : undefined);
+	    }
+	  }, remaining);
+	  tombstoneTimer.unref();
+	  // A Service commit may close the native run before its ACK reaches this
+	  // socket. Reconcile only the frozen request, never retry the mutation.
+	  void (async () => {
+	    let delay = 100;
+	    while (!closed && collectionReceiptOnly(grant, now)) {
+	      const kind = grant.collectionMember?.emit && !grant.collectionMember.result
+		? 'member' : grant.collectionSeal?.request && !grant.collectionSeal.result
+		  ? 'seal' : undefined;
+	      if (!kind) return;
+	      try {
+		const result = await collectionReconcile(grant, kind, now, AbortSignal.timeout(10_000));
+		if (kind === 'member' && grant.collectionMember) grant.collectionMember.result = result;
+		if (kind === 'seal' && grant.collectionSeal) grant.collectionSeal.result = result;
+		delay = 100;
+	      } catch (error) {
+		if (error instanceof HubError && error.status === 429 && error.retryAfterMs)
+		  delay = Math.max(delay, error.retryAfterMs);
+		else delay = Math.min(delay * 2, 5_000);
+	      }
+	      await new Promise<void>(resolve => { const timer = setTimeout(resolve, delay); timer.unref(); });
+	    }
+	  })();
+	  return tombstoneWait;
+	}
+	if (tombstoneTimer) clearTimeout(tombstoneTimer);
+	grant.receiptUntil = undefined;
+	if ((grant.collectionMember?.emit && !grant.collectionMember.result)
+	  || (grant.collectionSeal?.request && !grant.collectionSeal.result))
+	  outcomeUncertain = true;
+	if (grant.collectionMember || grant.collectionSeal) {
+	  const revoke = hub.routingCollectionRevoke({ workflow: reservation.workflow,
+	    run: reservation.run }, AbortSignal.timeout(10_000)).then(result => {
+	    if (!result || result.revoked !== true) throw new Error('routing collection revocation refused');
+	  });
+	  grant.revokeResult = revoke;
+	  revocations.add(revoke);
+	  void revoke.then(() => { revocations.delete(revoke); }, () => {
+	    revocationFailed = true;
+	    revocations.delete(revoke);
+	  });
+	  void revoke.then(() => settleTombstone?.(), () =>
+	    settleTombstone?.(new Error('routing collection revocation unresolved')));
+	}
+	grants.delete(cap);
+	if (holderCap) grants.delete(holderCap);
+	terminators.delete(grant);
+	return grant.revokeResult;
+      };
+      terminators.set(grant, terminate);
       return { socketPath, cap, ...(holderCap ? { holder: { socketPath, cap: holderCap } } : {}), activate(record) {
 	  if (closed || grant.ready || !validateLaunchGrant(grant, now()) || record.workflow !== reservation.workflow
 	    || record.run !== reservation.run || record.gateToken !== reservation.token
@@ -725,19 +1021,39 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    || !Number.isSafeInteger(record.spawnedAt)) throw new Error('routing broker grant unavailable');
 	  grant.execHolderId = `${hostname()}:${record.pid}`;
 	  grant.ready = true;
-	}, terminal() {
-	if (terminal) return;
-	terminal = true;
-	grant.active = false;
-	grant.ready = false;
-	for (const controller of grant.uploadControllers) controller.abort();
-	grants.delete(cap);
-	if (holderCap) grants.delete(holderCap);
-      } };
+      }, terminal: terminate };
     },
-    async close() {
-      if (closed) return;
+    async revokeSession(sessionId) {
+      const affected = [...terminators.entries()].filter(([grant]) => grant.identity.sessionId === sessionId);
+      const pending = affected.map(([, terminate]) => terminate('revoked')).filter(
+	(value): value is Promise<void> => value !== undefined);
+      const results = await Promise.allSettled([...pending, ...revocations]);
+      if (outcomeUncertain || revocationFailed || results.some(result => result.status === 'rejected'))
+	throw new Error('routing collection outcome quarantined');
+    },
+    close(options = {}) {
+      if (closePromise) return closePromise;
       closed = true;
+      closePromise = (async () => {
+      // All local mutation and receipt caps disappear before the first await.
+      const normal = options.revokeNormalReceipts ? [] : [...terminators.keys()]
+	.filter(grant => grant.terminalReason === 'normal-close' || grant.terminalReason === 'receipt-pending');
+      const pending = [...terminators.entries()]
+	.filter(([grant]) => !normal.includes(grant))
+	.map(([, terminate]) => terminate('revoked'));
+      const receiptChecks = normal.map(async grant => {
+	if (grant.collectionMember?.emit && !grant.collectionMember.result)
+	  grant.collectionMember.result = await collectionReconcile(grant, 'member', now,
+	    AbortSignal.timeout(10_000));
+	if (grant.collectionSeal?.request && !grant.collectionSeal.result)
+	  grant.collectionSeal.result = await collectionReconcile(grant, 'seal', now,
+	    AbortSignal.timeout(10_000));
+      });
+      const drained = await Promise.allSettled([
+	...pending.filter((value): value is Promise<void> => value !== undefined),
+	...revocations,
+	...receiptChecks,
+      ]);
       for (const entry of grants.values()) {
 	entry.grant.active = false;
 	for (const controller of entry.grant.uploadControllers) controller.abort();
@@ -750,6 +1066,11 @@ export async function createRoutingBroker(args: { now?: () => number;
 	if (current.dev === inode.dev && current.ino === inode.ino) unlinkSync(socketPath);
       } catch { /* Replaced or already removed. */ }
       try { rmdirSync(directory); } catch { /* Preserve substituted/nonempty directory. */ }
+      if (outcomeUncertain || revocationFailed
+	|| drained.some(result => result.status === 'rejected'))
+	throw new Error('routing collection outcome quarantined');
+      })();
+      return closePromise;
     },
   };
 }

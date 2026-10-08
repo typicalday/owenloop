@@ -625,3 +625,38 @@ test('routed GET failures never reveal transport or response text', async () => 
       error instanceof Error && !error.message.includes('cap-secret') && error.message.startsWith('routing request'));
   }
 });
+
+test('collection transport is versioned and bound to the original routing session', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => ({
+      sessionId: 'rs', shiftId: 'shf', credential: 'session-secret', expiresAt: 2_000,
+    }), now: () => 1_000 },
+    fetchImpl: (async (url, init) => {
+      calls.push({ url: String(url), init: init! });
+      return Response.json({ outcome: 'emitted', closed: false });
+    }) as typeof fetch,
+  });
+  const holder = { kind: 'exec' as const, id: 'host:42', shiftId: 'shf' };
+  await c.routingCollectionIssue({ workflow: 'wf', run: 'run', sealPath: 'items.sealed',
+    emissionId: 'a'.repeat(32), valueDigest: 'b'.repeat(64), holder });
+  await c.routingCollectionEmit({ workflow: 'wf', run: 'run', emissionId: 'a'.repeat(32),
+    memberPath: 'items[0]', memberVersion: 1, value: { answer: 1 }, proof: 'proof', holder });
+  await c.routingCollectionSeal({ workflow: 'wf', run: 'run', sealPath: 'items.sealed',
+    sealTargetVersion: 1, sealId: 'c'.repeat(32), proof: 'seal-proof', holder });
+  await c.routingCollectionReceipt({ workflow: 'wf', run: 'run', kind: 'seal', id: 'c'.repeat(32),
+    sealPath: 'items.sealed', sealTargetVersion: 1, requestDigest: 'd'.repeat(64), holder });
+  await c.routingCollectionRevoke({ workflow: 'wf', run: 'run' });
+  assert.deepEqual(calls.map(call => call.url.slice('https://hub.example/api/'.length)), [
+    'routing_collection_member_issue/v1', 'routing_collection_member_emit/v1',
+    'routing_collection_seal/v1', 'routing_collection_receipt/v1',
+    'routing_collection_receipt_revoke/v1',
+  ]);
+  for (const call of calls) {
+    const headers = new Headers(call.init.headers);
+    assert.equal(headers.get('authorization'), 'Bearer enrolled');
+    assert.equal(headers.get('x-owenloop-routing-session'), 'session-secret');
+    assert.equal(call.init.redirect, 'error');
+    assert.equal(String(call.init.body).includes('session-secret'), false);
+  }
+});

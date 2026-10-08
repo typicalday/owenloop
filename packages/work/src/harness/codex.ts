@@ -368,6 +368,7 @@ function mountEnv(): Record<string, string> {
 // Tests compare this contract to HOLD_MCP_TOOL_NAMES and the holder argv parser.
 const OWN_MCP_TOOLS = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
 const ROUTED_FILE_TOOL = 'get_file_artifact';
+const ROUTED_COLLECTION_TOOL = 'seal_collection';
 const HOLD_VALUE_FLAGS = new Set([
   '--order', '--workflow', '--session', '--origin', '--as', '--shift',
   '--heartbeat-interval', '--jump-tolerance',
@@ -377,8 +378,9 @@ const HOLD_VALUE_FLAGS = new Set([
 function ownMcpTools(args: readonly string[], verifiedFileCacheRoot?: string): string[] {
   const routed = args.some((arg) => arg === '--routing-holder' || arg.startsWith('--routing-holder='));
   if (verifiedFileCacheRoot !== undefined && !routed) throw new Error('routed file cache requires a routed holder');
-  let selected: string[] = verifiedFileCacheRoot === undefined ? [...OWN_MCP_TOOLS]
-    : [...OWN_MCP_TOOLS, ROUTED_FILE_TOOL];
+  let selected: string[] = [...OWN_MCP_TOOLS,
+    ...(verifiedFileCacheRoot === undefined ? [] : [ROUTED_FILE_TOOL]),
+    ...(routed ? [ROUTED_COLLECTION_TOOL] : [])];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     // Match hold.parseArgs consumption: a separate value belongs to its flag,
@@ -398,7 +400,8 @@ function ownMcpTools(args: readonly string[], verifiedFileCacheRoot?: string): s
       throw new Error('--mcp-tools must be a comma-separated list with no empty names');
     }
     if (names.some((name) => !(OWN_MCP_TOOLS as readonly string[]).includes(name)
-      && !(name === ROUTED_FILE_TOOL && routed && verifiedFileCacheRoot !== undefined))) {
+      && !(name === ROUTED_FILE_TOOL && routed && verifiedFileCacheRoot !== undefined)
+      && !(name === ROUTED_COLLECTION_TOOL && routed))) {
       throw new Error(`--mcp-tools must name only supported own tools: ${OWN_MCP_TOOLS.join(',')}`);
     }
     if (new Set(names).size !== names.length) {

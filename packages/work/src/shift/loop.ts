@@ -108,6 +108,8 @@ export interface ShiftLoopOptions {
   /** Explicit opt-in; absence preserves legacy serving. */
   routingSession?: ShiftRoutingSession;
   routingBroker?: RoutingBroker;
+  /** Synchronously revoke routed caps before Shift awaits session close. */
+  onStopRouting?: () => Promise<void>;
   /** Required for routed dispatch; prepares exact signed bytes without a role credential. */
   stageRoutedDefinition?: (order: WorkOrder) => Promise<RoutedDefinitionStage>;
   /** Parent-owned signer and full-order verifier bound to the staged source. */
@@ -1223,7 +1225,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     for (const rec of result.reaped) {
       const owned = routingHandoffs.get(rec.run);
       if (owned && owned.pid === rec.pid && owned.spawnedAt === rec.spawnedAt) {
-	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+	try { owned.handoff.terminal(owned.normalClosed ? 'normal-close' : 'child-exit'); }
+	catch { opts.err('routing handoff cleanup failed'); }
 	if (!owned.gateMayHaveOpened)
 	  owned.stage?.cleanupAfterExit({ workflow: rec.workflow, run: rec.run,
 	    pid: rec.pid, spawnedAt: rec.spawnedAt });
@@ -1316,7 +1319,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   const routingAttempts = new Map<string, number>();
   const routingRefusals = new Map<string, number>();
   const routingHandoffs = new Map<string, { handoff: RoutingHandoff; stage?: RoutedDefinitionStage;
-    pid?: number; spawnedAt?: number; gateMayHaveOpened?: boolean }>();
+    pid?: number; spawnedAt?: number; gateMayHaveOpened?: boolean; normalClosed?: boolean }>();
   const knownRole = (role: string) => ['research', 'implementation', 'review', 'judge'].includes(role);
   const localModelProtocol = 'local-model-assessment-v1' as const;
 
@@ -1580,16 +1583,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	const privateHandoff = opts.routingSession.createHandoff(reservation,
 	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap,
 	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) }, definitionStage);
-	handoff = { path: privateHandoff.path, terminal: () => {
-	  brokerGrant?.terminal();
-	  privateHandoff.terminal();
+	handoff = { path: privateHandoff.path, terminal: (reason) => {
+	  const drained = brokerGrant?.terminal(reason);
+	  if (drained) {
+	    void drained.then(() => privateHandoff.terminal(), () => {
+	      opts.err('routing collection outcome quarantined; original session custody retained');
+	    });
+	  } else privateHandoff.terminal();
 	} };
 	routingHandoffs.set(c.order.run, { handoff, ...(definitionStage ? { stage: definitionStage } : {}) });
       }
-      const terminal = () => {
+      const terminal = (reason?: 'exit' | 'start-failure' | 'cancel') => {
 	terminalBeforeStart = true;
-	brokerGrant?.terminal();
-	try { handoff?.terminal(); }
+	const disposition = reason === 'exit' ? 'child-exit' : 'revoked';
+	brokerGrant?.terminal(disposition);
+	try { handoff?.terminal(disposition); }
 	catch { opts.err('routing handoff cleanup failed'); }
       };
       const spawned = opts.spawner({
@@ -2558,7 +2566,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     stopped = true;
     opts.closeDefinitionStages?.();
     stopTimers();
-    void opts.routingSession?.stop();
+    if (opts.onStopRouting) void opts.onStopRouting();
+    else void opts.routingSession?.stop();
   }
 
   return {
@@ -2597,7 +2606,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     noteRunEnded: (run: string) => {
       const owned = routingHandoffs.get(run);
       if (owned) {
-	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+	owned.normalClosed = true;
+	try { owned.handoff.terminal('normal-close'); } catch { opts.err('routing handoff cleanup failed'); }
 	// A closed Hub run revokes Hub access but does not prove the child exited.
       }
       pendingCandidates.delete(run);
@@ -2621,7 +2631,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (owned && owned.handoff.path !== exit.routingHandoff) return;
       pendingCandidates.delete(exit.run);
       if (owned?.pid === exit.pid && owned.handoff.path === exit.routingHandoff) {
-	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+	try { owned.handoff.terminal(owned.normalClosed ? 'normal-close' : 'child-exit'); }
+	catch { opts.err('routing handoff cleanup failed'); }
 	// Once the gate may have opened, role exit does not prove that its detached
 	// shell or provider descendants stopped. Retain their bytes until a separate
 	// process-group termination proof exists, even after exit status zero.

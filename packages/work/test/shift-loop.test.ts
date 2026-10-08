@@ -1698,6 +1698,7 @@ test('createDefaultSpawner reports a clean agent-run exit without a worker failu
   const keepAlive = setTimeout(() => {}, 5_000);
   const failures: unknown[] = [];
   const exits: WorkerExit[] = [];
+  const terminalOrder: string[] = [];
   const exit = new Promise<WorkerExit>((resolve) => {
     const spawner = createDefaultSpawner(
       ORIGIN,
@@ -1708,11 +1709,13 @@ test('createDefaultSpawner reports a clean agent-run exit without a worker failu
       undefined,
       undefined,
       (reported) => {
+	terminalOrder.push('exit-report');
 	exits.push(reported);
 	resolve(reported);
       },
     );
-    spawner({ workflow: 'wf1', run: 'run_completed', step: 'builder', kind: 'agent-run' });
+    spawner({ workflow: 'wf1', run: 'run_completed', step: 'builder', kind: 'agent-run',
+      onTerminal: reason => terminalOrder.push(`terminal:${reason}`) });
   });
 
   try {
@@ -1727,6 +1730,8 @@ test('createDefaultSpawner reports a clean agent-run exit without a worker failu
     assert.deepEqual(failures, []);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(exits.length, 1, 'a clean exit is reported exactly once');
+    assert.deepEqual(terminalOrder, ['terminal:exit', 'exit-report'],
+      'natural exit enters receipt-only custody before the exact exit reporter');
   } finally {
     clearTimeout(keepAlive);
   }

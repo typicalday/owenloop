@@ -45,9 +45,12 @@
 import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 
+import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, FileArtifactPointer, GetOrderResponse, OrderPacket, PutFileArtifactResponse } from '../hub/types.ts';
+import type { ContactHolder, FileArtifactPointer, GetOrderResponse, OrderPacket, PutFileArtifactResponse,
+  RoutedCollectionWriteResponse, RoutedMemberIssueResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -59,7 +62,9 @@ import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
 export const ROUTED_FILE_TOOL_NAME = 'get_file_artifact' as const;
-export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number] | typeof ROUTED_FILE_TOOL_NAME;
+export const ROUTED_COLLECTION_TOOL_NAME = 'seal_collection' as const;
+export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number] | typeof ROUTED_FILE_TOOL_NAME
+  | typeof ROUTED_COLLECTION_TOOL_NAME;
 
 function consumedFile(order: OrderPacket, path: string, key: string): FileArtifactPointer | undefined {
   if (!order.inputs.includes(path) || !Object.hasOwn(order.consumes, path)) return undefined;
@@ -101,6 +106,17 @@ export interface HoldMcpDeps {
   discardDownloadedFile?: (file: string) => Promise<void>;
   /** Routed child submissions are broker-authorized and carry no local machine proof. */
   routedSubmit?: true;
+  /** Parent Shift signs and authorizes exact issued collection targets. */
+  routedCollection?: {
+    collectionTarget(req: { workflow: string; run: string; path: string; holder: ContactHolder }):
+      Promise<{ collection: boolean }>;
+    emitCollectionMember(req: { workflow: string; run: string; sealPath: string;
+      emissionId: string; value: unknown; done: boolean; holder: ContactHolder }):
+      Promise<{ member: RoutedCollectionWriteResponse; seal?: RoutedCollectionWriteResponse;
+	issued: RoutedMemberIssueResponse }>;
+    sealCollection(req: { workflow: string; run: string; sealPath: string;
+      sealId: string; holder: ContactHolder }): Promise<RoutedCollectionWriteResponse>;
+  };
   /** Positive registration list. Absent exposes every tool in `HOLD_MCP_TOOL_NAMES`. */
   tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
@@ -223,6 +239,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  let pendingCollection: { path: string; value: unknown; done: boolean; emissionId: string } | undefined;
+  let pendingSeal: { path: string; sealId: string } | undefined;
   let canonicalWorkflow: string | undefined;
   let firstContactIdentityRefusal: ToolResult | undefined;
   let stopping = false;
@@ -384,7 +402,6 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
     handler: async (args) => {
       const gone = terminalGuard();
-      if (gone !== undefined) return gone;
       const path = args['path'];
       if (typeof path !== 'string' || path === '') {
         return textResult({ error: 'submit requires a non-empty string "path"' }, true);
@@ -409,6 +426,22 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	  ? args['value']
 	  : await readSubmitValueFile(deps.workdir, valueFile);
 	const value = normalizeSubmitValue(rawValue);
+	const samePending = pendingCollection && pendingCollection.path === path
+	  && pendingCollection.done === done && isDeepStrictEqual(pendingCollection.value, value);
+	if (pendingCollection && !samePending)
+	  return textResult({ error: 'collection emission outcome unresolved' }, true);
+	if (samePending) {
+	  if (!deps.routedCollection || !deps.holder)
+	    return textResult({ error: 'routed collection unavailable' }, true);
+	  const res = await deps.routedCollection.emitCollectionMember({ workflow, run,
+	    sealPath: path, emissionId: pendingCollection!.emissionId, value, done: done as boolean,
+	    holder: deps.holder });
+	  if (res.seal?.closed || res.member.closed) loop.stop('submitted', { release: false });
+	  if (res.member.outcome !== 'emitted' || !done || res.seal) pendingCollection = undefined;
+	  return textResult({ member: res.member, ...(res.seal ? { seal: res.seal } : {}),
+	    memberPath: res.issued.memberPath });
+	}
+	if (gone !== undefined) return gone;
         // Submit is also a dynamic-data boundary. Fetch and gate the bound
         // packet even when no origin was supplied for submit-proof signing;
         // otherwise a direct submit call could bypass MCP consume-side
@@ -429,6 +462,22 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	  return textResult({ error: 'submit path refusal: path is not owed by the bound order' }, true);
 	}
         captured = orderResponse;
+	if (deps.routedSubmit) {
+	  if (!deps.routedCollection || !deps.holder)
+	    return textResult({ error: 'routed collection unavailable' }, true);
+	  const target = await deps.routedCollection.collectionTarget({ workflow, run, path, holder: deps.holder });
+	  if (target.collection) {
+	    if (typeof done !== 'boolean')
+	      return textResult({ error: 'collection submit requires boolean done' }, true);
+	    pendingCollection = { path, value, done, emissionId: randomBytes(16).toString('hex') };
+	    const res = await deps.routedCollection.emitCollectionMember({ workflow, run,
+	      sealPath: path, emissionId: pendingCollection.emissionId, value, done, holder: deps.holder });
+	    if (res.seal?.closed || res.member.closed) loop.stop('submitted', { release: false });
+	    if (res.member.outcome !== 'emitted' || !done || res.seal) pendingCollection = undefined;
+	    return textResult({ member: res.member, ...(res.seal ? { seal: res.seal } : {}),
+	      memberPath: res.issued.memberPath });
+	  }
+	}
 
         let proof: string | undefined;
 	if (!deps.routedSubmit && deps.origin !== undefined && orderResponse.order !== null) {
@@ -677,6 +726,46 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
   };
 
+  const sealCollectionTool: ToolRegistration = {
+    name: ROUTED_COLLECTION_TOOL_NAME,
+    description: 'Seal an owed collection without emitting another member. This also supports a zero-member collection.',
+    inputSchema: { type: 'object', required: ['path'], properties: {
+      path: { type: 'string', description: 'The owed collection seal path.' },
+    }, additionalProperties: false },
+    handler: async args => {
+      const path = args['path'];
+      if (typeof path !== 'string' || !path)
+	return textResult({ error: 'collection seal path required' }, true);
+      if (!deps.routedCollection || !deps.holder)
+	return textResult({ error: 'routed collection unavailable' }, true);
+      if (pendingCollection || (pendingSeal && pendingSeal.path !== path))
+	return textResult({ error: 'collection outcome unresolved' }, true);
+      if (!pendingSeal) {
+	const gone = terminalGuard();
+	if (gone !== undefined) return gone;
+	const orderResponse = captured ?? firstContact ?? await hub.getOrder({ workflow, run, ...holderReq });
+	const refused = await gate(orderResponse);
+	if (refused !== undefined) return refused;
+	if (!orderResponse.order || !(orderResponse.order.owes.length
+	  ? orderResponse.order.owes.some(owed => owed.path === path)
+	  : orderResponse.order.outputs.includes(path)))
+	  return textResult({ error: 'collection seal path is not owed' }, true);
+	const target = await deps.routedCollection.collectionTarget({ workflow, run, path, holder: deps.holder });
+	if (!target.collection) return textResult({ error: 'path is not a signed collection target' }, true);
+	pendingSeal = { path, sealId: randomBytes(16).toString('hex') };
+      }
+      try {
+	const response = await deps.routedCollection.sealCollection({ workflow, run,
+	  sealPath: path, sealId: pendingSeal.sealId, holder: deps.holder });
+	pendingSeal = undefined;
+	if (response.closed) loop.stop('submitted', { release: false });
+	return textResult(response);
+      } catch (error) {
+	return textResult({ error: errMsg(error) }, true);
+      }
+    },
+  };
+
   const registrations: Record<HoldMcpToolName, ToolRegistration> = {
     get_order: getOrderTool,
     submit: submitTool,
@@ -684,9 +773,11 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     ask: askTool,
     put_file_artifact: putFileArtifactTool,
     get_file_artifact: getFileArtifactTool,
+    seal_collection: sealCollectionTool,
   };
-  const selected = deps.tools ?? (deps.downloadFile
-    ? [...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME] : HOLD_MCP_TOOL_NAMES);
+  const selected = deps.tools ?? (deps.routedCollection
+    ? [...HOLD_MCP_TOOL_NAMES, ...(deps.downloadFile ? [ROUTED_FILE_TOOL_NAME] : []), ROUTED_COLLECTION_TOOL_NAME]
+    : deps.downloadFile ? [...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME] : HOLD_MCP_TOOL_NAMES);
   return {
     tools: selected.map((name) => registrations[name]), loop,
     readGatedOrder: () => terminal === undefined && !stopping ? captured : undefined,

@@ -483,6 +483,45 @@ export interface ConditionalSubmitResponse extends SubmitResponse {
   conditionApplied: 'expected-version-v1';
 }
 
+/** Versioned, session-scoped collection protocol. The child never supplies a
+ * member path or proof to Shift; these wire requests are parent-owned. */
+export interface RoutedCollectionHolder extends ContactHolder { shiftId: string }
+export interface RoutedMemberIssueRequest {
+  workflow: string; run: string; sealPath: string; emissionId: string;
+  valueDigest: string; holder: RoutedCollectionHolder;
+}
+export interface RoutedMemberIssueResponse {
+  emissionId: string; sealPath: string; sealTargetVersion: number;
+  memberPath: string; memberVersion: 1; valueDigest: string;
+  conditionApplied: 'routed-collection-member-v1';
+}
+export interface RoutedMemberEmitRequest {
+  workflow: string; run: string; emissionId: string; memberPath: string;
+  memberVersion: 1; value: Record<string, unknown>; proof: string;
+  holder: RoutedCollectionHolder;
+}
+export interface RoutedMemberCancelRequest {
+  workflow: string; run: string; emissionId: string; requestDigest: string;
+  holder: RoutedCollectionHolder;
+}
+export interface RoutedCollectionSealRequest {
+  workflow: string; run: string; sealPath: string; sealTargetVersion: number;
+  sealId: string; proof: string; holder: RoutedCollectionHolder;
+}
+export interface RoutedCollectionReceiptRequest {
+  workflow: string; run: string; kind: 'member' | 'seal'; id: string;
+  sealPath: string; sealTargetVersion: number; requestDigest: string;
+  holder: RoutedCollectionHolder; proofDigest?: string;
+}
+export interface RoutedCollectionWriteResponse {
+  outcome: string; closed: boolean; emitted?: string[]; sealed?: string;
+  issues?: unknown; conditionApplied: 'routed-collection-member-v1' | 'routed-collection-seal-v1';
+}
+export interface RoutedCollectionReceiptResponse {
+  state: 'pending' | 'emitted' | 'rejected' | 'sealed';
+  result?: RoutedCollectionWriteResponse;
+}
+
 // ---- file artifacts ---------------------------------------------------------
 
 /**

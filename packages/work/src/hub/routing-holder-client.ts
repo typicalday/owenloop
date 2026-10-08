@@ -2,11 +2,20 @@
  * holder-only broker cap; unimplemented verbs refuse without a network fallback. */
 import type { HubClient } from './client.ts';
 import { createRoutingChildClient } from './routing-child-client.ts';
-import type { FileArtifactPointer, PutFileArtifactResponse } from './types.ts';
+import type { ContactHolder, FileArtifactPointer, PutFileArtifactResponse,
+  RoutedCollectionWriteResponse, RoutedMemberIssueResponse } from './types.ts';
 import { openRoutedFileSource, type RoutedFileSourceSeams } from './routed-file-source.ts';
 import { openRoutedFileCache } from './routed-file-cache.ts';
 
 export interface RoutingHolderClient extends HubClient {
+  collectionTarget(req: { workflow: string; run: string; path: string; holder: ContactHolder }):
+    Promise<{ collection: boolean }>;
+  emitCollectionMember(req: { workflow: string; run: string; sealPath: string;
+    emissionId: string; value: unknown; done: boolean; holder: ContactHolder }):
+    Promise<{ member: RoutedCollectionWriteResponse; seal?: RoutedCollectionWriteResponse;
+      issued: RoutedMemberIssueResponse }>;
+  sealCollection(req: { workflow: string; run: string; sealPath: string;
+    sealId: string; holder: ContactHolder }): Promise<RoutedCollectionWriteResponse>;
   /** Reads a file under the holder's pinned workdir as bounded chunks. */
   uploadFile(req: { workflow: string; workdir: string; file: string; contentType: string;
     filename?: string }): Promise<PutFileArtifactResponse>;
@@ -29,6 +38,9 @@ export function createRoutingHolderClient(binding: {
     getOrder: child.getOrder,
     heartbeat: child.heartbeat,
     submit: child.submit,
+    collectionTarget: child.collectionTarget,
+    emitCollectionMember: child.emitCollectionMember,
+    sealCollection: child.sealCollection,
     ask: child.ask,
     reject: child.reject,
     putFileArtifact: child.putFileArtifact,

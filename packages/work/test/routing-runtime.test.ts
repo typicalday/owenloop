@@ -9,7 +9,7 @@ import { run as runExec } from '../src/roles/exec.ts';
 import { consumeRoutingHandoff } from '../src/roles/routing-handoff.ts';
 import { reserveChild } from '../src/shift/state.ts';
 import { buildSpawnPlan } from '../src/shift/spawn.ts';
-import { createRoutingBackoff, openShiftRoutingSession, selectLocalRoutingTuples } from '../src/shift/runtime.ts';
+import { createRoutingBackoff, createRoutingStop, openShiftRoutingSession, selectLocalRoutingTuples } from '../src/shift/runtime.ts';
 import { createHubClient } from '../src/hub/client.ts';
 import { HubError } from '../src/hub/types.ts';
 import { writeHubRosterCache } from '../src/settings/hub-roster-cache.ts';
@@ -18,6 +18,89 @@ import type { RoutingOfferCandidate } from '../src/hub/types.ts';
 const origin = 'https://hub.example.test';
 const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
 const credential = `rs1.${sessionId}.${'x'.repeat(43)}`;
+
+test('failed broker drain still parks the original session until its live handoff exits', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-stop-'));
+  const calls: string[] = [];
+  let reportClose!: () => void;
+  const closed = new Promise<void>(resolve => { reportClose = resolve; });
+  const now = 1_000;
+  try {
+    const session = await openShiftRoutingSession({ stateDir: root, origin, orgId: 'org',
+      principalId: 'actor', scope: { workflows: ['wf'] }, now: () => now,
+      getToken: async () => 'enrolled',
+      fetchImpl: (async url => {
+	const route = String(url).split('/').at(-1)!;
+	calls.push(route);
+	if (route === 'routing_session_open') return Response.json({ sessionId,
+	  shiftId: 'shf_service', credential, expiresAt: 900_000 });
+	if (route === 'routing_session_close') { reportClose(); return Response.json({ closed: true }); }
+	throw new Error(`unexpected ${route}`);
+      }) as typeof fetch,
+    });
+    const reservation = reserveChild(root, { workflow: 'wf', run: 'run',
+      childKind: 'exec', reservedAt: now }).reservation;
+    const handoff = session.createHandoff(reservation);
+    const stop = createRoutingStop(() => {
+      calls.push('broker-local-revoke');
+      return Promise.reject(new Error('remote receipt revoke uncertain'));
+    }, () => session.stop());
+    const stopped = assert.rejects(stop(), /remote receipt revoke uncertain/);
+    assert.equal(calls.at(-1), 'broker-local-revoke', 'local revocation begins synchronously');
+    await stopped;
+    assert.equal(calls.includes('routing_session_close'), false,
+      'live handoff keeps the original session for bounded post-stop custody');
+    handoff.terminal();
+    await Promise.race([closed, new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('original session did not close')), 1_000))]);
+    assert.deepEqual(calls, ['routing_session_open', 'broker-local-revoke', 'routing_session_close']);
+    await assert.rejects(stop(), /remote receipt revoke uncertain/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('scope rotation blocks new identity until old-session revoke settles and quarantines failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-rotation-'));
+  const secondId = 'rs_87654321-4321-4321-4321-cba987654321';
+  const secondCredential = `rs1.${secondId}.${'y'.repeat(43)}`;
+  let opens = 0;
+  let beginRevoke!: () => void;
+  const revoking = new Promise<void>(resolve => { beginRevoke = resolve; });
+  let finishRevoke!: () => void;
+  const held = new Promise<void>(resolve => { finishRevoke = resolve; });
+  const seen: string[] = [];
+  try {
+    const session = await openShiftRoutingSession({ stateDir: root, origin, orgId: 'org',
+      principalId: 'actor', scope: { workflows: ['wf'] }, now: () => 1_000,
+      getToken: async () => 'enrolled',
+      onRetiring: async original => {
+	seen.push(original);
+	beginRevoke();
+	await held;
+	throw new Error('remote revoke unavailable');
+      },
+      fetchImpl: (async url => {
+	const route = String(url).split('/').at(-1)!;
+	if (route === 'routing_session_open') {
+	  opens++;
+	  return Response.json({ sessionId: opens === 1 ? sessionId : secondId,
+	    shiftId: 'shf_service', credential: opens === 1 ? credential : secondCredential,
+	    expiresAt: 900_000 });
+	}
+	if (route === 'routing_session_close') return Response.json({ closed: true });
+	throw new Error(`unexpected ${route}`);
+      }) as typeof fetch,
+    });
+    const rotating = session.ensureScope({ crews: ['next'], capabilities: [] });
+    await revoking;
+    assert.equal(session.identity(), undefined, 'new session cannot issue grants during remote revoke');
+    assert.equal(session.brokerTarget(), undefined);
+    finishRevoke();
+    await assert.rejects(rotating, /remote revoke unavailable/);
+    assert.deepEqual(seen, [sessionId]);
+    assert.equal(session.identity(), undefined, 'unknown revocation quarantines later grants');
+    await session.stop();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('routed bootstrap roster 429 blocks whoami and session open until Retry-After', async () => {
   let monotonic = 0;

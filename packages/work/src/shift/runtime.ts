@@ -387,6 +387,21 @@ export function assertRoutedShiftPlatform(platform: NodeJS.Platform = process.pl
   if (platform === 'win32') throw new Error('routed Shift is not supported on Windows: private broker named-pipe ACLs are not implemented');
 }
 
+/** Revoke broker caps immediately, then stop the original session even when
+ * remote receipt revocation is uncertain. The stop result remains rejected so
+ * callers cannot report a clean Shift drain in that case. */
+export function createRoutingStop(drainBroker: () => Promise<void>, stopSession: () => Promise<void>): () => Promise<void> {
+  let pending: Promise<void> | undefined;
+  return () => {
+    if (pending) return pending;
+    let drained: Promise<void>;
+    try { drained = drainBroker(); }
+    catch (error) { drained = Promise.reject(error); }
+    pending = drained.finally(stopSession);
+    return pending;
+  };
+}
+
 /**
  * Shared runtime setup for the internal shift and public shift daemon.
  * `parsed` is already grammar-validated by the caller; this function owns all
@@ -563,6 +578,22 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       beforeRequest: routingBackoff.beforeRequest, onRateLimit: routingBackoff.onRateLimit } } : {}) });
   let routingSession: ShiftRoutingSession | undefined;
   let routingBroker: RoutingBroker | undefined;
+  let routingBrokerDrain: Promise<void> | undefined;
+  let routingStop: Promise<void> | undefined;
+  const drainRoutingBroker = (): Promise<void> => {
+    routingBrokerDrain ??= routingBroker?.close({ revokeNormalReceipts: true }) ?? Promise.resolve();
+    void routingBrokerDrain.catch(() => {
+      process.exitCode = 1;
+      process.stderr.write('owenloop shift: routed collection outcome quarantined during broker drain\n');
+    });
+    return routingBrokerDrain;
+  };
+  const stopRouting = createRoutingStop(drainRoutingBroker, () => routingSession?.stop() ?? Promise.resolve());
+  const trackedStopRouting = (): Promise<void> => {
+    routingStop ??= stopRouting();
+    void routingStop.catch(() => {});
+    return routingStop;
+  };
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
   );
@@ -671,7 +702,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	monotonicNow, routingBackoff,
 	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
 	onMaintenanceError: () => process.stderr.write(`${roleLabel}: parked routing session maintenance failed\n`),
-	onDrained: () => { void routingBroker?.close(); },
+	onDrained: () => { void drainRoutingBroker(); },
+	onRetiring: sessionId => routingBroker?.revokeSession(sessionId) ?? Promise.resolve(),
 	scope: {
 	  ...(parsed.workflow ? { workflows: [parsed.workflow] } : {}),
 	  ...(parsed.serveCrews?.length ? { crews: parsed.serveCrews } : {}),
@@ -768,7 +800,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       }),
       createRoutingSubmissionAuthority: stage => createRoutedSubmissionAuthority({
 	origin, env, now, verifyOrder: stage.verifyOrder,
-	canSubmit: stage.canSubmit, canReplay: stage.canReplay,
+	canSubmit: stage.canSubmit, canReplay: stage.canReplay, canCollect: stage.canCollect,
       }),
       createRoutingLaunchAuthority: (order, offer) => createRoutedLaunchAuthority({
 	offered: order, ...(offer ? { offer } : {}),
@@ -776,7 +808,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	currentRosterSnapshot: candidate =>
 	  selectLocalRoutingTuplesWithSnapshot(candidate, routingRosterOptions())?.snapshot,
       }) } : {}),
-    ...(routingBroker ? { routingBroker } : {}),
+	...(routingBroker ? { routingBroker, onStopRouting: trackedStopRouting } : {}),
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now,
@@ -897,7 +929,11 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     } else {
       emitStartupRosterSyncFailure();
     }
-    try { return await daemon.run(); } finally { loop.stop(); await routingSession?.stop(); }
+    try { return await daemon.run(); } finally {
+      loop.stop();
+      if (routingStop) await routingStop;
+      else await routingSession?.stop();
+    }
   }
 
   installSignalHandlers(loop, process, (line) => process.stderr.write(`${line}\n`));
@@ -908,7 +944,11 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   } else {
     emitStartupRosterSyncFailure();
   }
-  try { return await loop.run(); } finally { loop.stop(); await routingSession?.stop(); }
+  try { return await loop.run(); } finally {
+    loop.stop();
+    if (routingStop) await routingStop;
+    else await routingSession?.stop();
+  }
 }
 
 export async function run(args: string[]): Promise<number> {
@@ -946,7 +986,7 @@ export interface RoutingHandoffV1 {
 export interface RoutingHandoff {
   path: string;
   /** Exact reservation/incarnation owner callback; safe after child consumption. */
-  terminal(): void;
+  terminal(reason?: 'normal-close' | 'child-exit' | 'revoked'): void;
 }
 export interface ShiftRoutingSession {
   hub: RoutingHubClient;
@@ -1073,6 +1113,8 @@ interface ShiftRoutingSessionOptions {
   onMaintenanceError?: () => void;
   onClosed?: () => void;
   onDrained?: () => void;
+  /** Stop one original incarnation's mutation caps before scope rotation. */
+  onRetiring?: (sessionId: string) => Promise<void>;
 }
 
 export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions): Promise<ShiftRoutingSession> {
@@ -1102,17 +1144,20 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
     set: (_target, property, value) => Reflect.set(active.hub, property, value),
   });
   let parkedInFlight = false;
+  let quarantined = false;
+  let rotating = false;
   const session: ShiftRoutingSession = {
     hub,
-    identity: () => active.identity(),
+    identity: () => quarantined || rotating ? undefined : active.identity(),
     brokerTarget: () => {
+	if (quarantined || rotating) return undefined;
       const incarnation = active;
       const identity = incarnation.identity();
       return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: (reservation, broker, definitionStage) => {
-      if (stopped) throw new Error('routing session stopped');
+      if (stopped || quarantined || rotating) throw new Error('routing session stopped');
       return active.createHandoff(reservation, broker, definitionStage);
     },
     async ensureScope(selection) {
@@ -1122,7 +1167,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	capabilities: [...selection.capabilities],
       });
       const change = changing.catch(() => {}).then(async () => {
-	if (stopped) throw new Error('routing session stopped');
+	if (stopped || quarantined) throw new Error('routing session stopped');
 	backoff.beforeRequest();
 	if (JSON.stringify(scope) === JSON.stringify(desired)
 	  && (active.identity()?.expiresAt ?? 0) > (opts.now ?? Date.now)()) return;
@@ -1132,6 +1177,15 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	const previous = active;
 	active = next;
 	scope = desired;
+	if (previous.identity()) retired.add(previous);
+	// The original session remains active while its exact remote revocation
+	// settles. Failure leaves the old incarnation in retained custody.
+	if (previous.identity()) {
+	  rotating = true;
+	  try { await opts.onRetiring?.(previous.identity()!.sessionId); }
+	  catch (error) { quarantined = true; throw error; }
+	  finally { rotating = false; }
+	}
 	// A retired incarnation retains renewal authority while an owned worker
 	// remains live. Its terminal callbacks close that exact old session.
 	const closeRateLimit = await previous.stop();

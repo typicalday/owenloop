@@ -58,6 +58,74 @@ afterEach(() => {
   resetSshKeygenProbe();
 });
 
+test('routed collection submit replays one exact emission and seal uses its own tool', async () => {
+  const order = producerOrderResponse();
+  order.order!.outputs = ['items.sealed'];
+  order.order!.owes = [{ path: 'items.sealed', version: 1,
+    judgmentRejects: 0, schemaRejects: 0, reasons: [] }];
+  const { hub, calls: ordinary } = mockHub({ getOrder: order });
+  const emissions: Array<{ emissionId: string; value: unknown; done: boolean }> = [];
+  const seals: string[] = [];
+  let lose = true;
+  const routedCollection = {
+    collectionTarget: async () => ({ collection: true }),
+    emitCollectionMember: async (req: { emissionId: string; value: unknown; done: boolean }) => {
+      emissions.push(req);
+      if (lose) { lose = false; throw new Error('ACK unavailable'); }
+      return { issued: { emissionId: req.emissionId, sealPath: 'items.sealed',
+	sealTargetVersion: 1, memberPath: 'items[0]', memberVersion: 1 as const,
+	valueDigest: 'a'.repeat(64), conditionApplied: 'routed-collection-member-v1' as const },
+      member: { outcome: 'emitted', closed: false,
+	conditionApplied: 'routed-collection-member-v1' as const } };
+    },
+    sealCollection: async (req: { sealId: string }) => {
+      seals.push(req.sealId);
+      return { outcome: 'green', closed: true,
+	conditionApplied: 'routed-collection-seal-v1' as const };
+    },
+  };
+  const holder = { kind: 'session' as const, id: 'rs', shiftId: 'shf' };
+  const mount = createHoldMcp(deps(hub, { holder, routedSubmit: true, routedCollection }));
+  const submit = tool(mount.tools, 'submit');
+  const first = await submit.handler({ path: 'items.sealed', value: { id: 1 }, done: false }, ctx);
+  assert.equal(first.isError, true);
+  assert.equal((await submit.handler({ path: 'items.sealed', value: { id: 2 }, done: false }, ctx)).isError, true);
+  const replay = await submit.handler({ path: 'items.sealed', value: { id: 1 }, done: false }, ctx);
+  assert.equal(replay.isError, undefined);
+  assert.equal(parse(replay).memberPath, 'items[0]');
+  assert.equal(emissions.length, 2);
+  assert.equal(emissions[0]!.emissionId, emissions[1]!.emissionId);
+  assert.equal(ordinary.some(call => call.verb === 'submit'), false);
+  const sealed = await tool(mount.tools, 'seal_collection').handler({ path: 'items.sealed' }, ctx);
+  assert.equal(sealed.isError, undefined);
+  assert.equal(parse(sealed).closed, true);
+  assert.equal(seals.length, 1);
+});
+
+test('routed collection seals with zero members and never calls ordinary submit', async () => {
+  const order = producerOrderResponse();
+  order.order!.outputs = ['items.sealed'];
+  order.order!.owes = [{ path: 'items.sealed', version: 1,
+    judgmentRejects: 0, schemaRejects: 0, reasons: [] }];
+  const { hub, calls } = mockHub({ getOrder: order });
+  const seals: string[] = [];
+  const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 'rs', shiftId: 'shf' },
+    routedSubmit: true,
+    routedCollection: {
+      collectionTarget: async () => ({ collection: true }),
+      emitCollectionMember: async () => { throw new Error('unexpected emit'); },
+      sealCollection: async req => {
+	seals.push(req.sealId);
+	return { outcome: 'green', closed: true, conditionApplied: 'routed-collection-seal-v1' as const };
+      },
+    } }));
+  const result = await tool(mount.tools, 'seal_collection').handler({ path: 'items.sealed' }, ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(parse(result).closed, true);
+  assert.equal(seals.length, 1);
+  assert.equal(calls.some(call => call.verb === 'submit'), false);
+});
+
 function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
   const calls: Call[] = [];
   let getOrderIdx = 0;
