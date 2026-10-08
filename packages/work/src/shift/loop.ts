@@ -1557,7 +1557,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  ...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
 	  ...(childKind === 'agent-run' ? { step: c.order.step } : {}),
 	});
-	brokerGrant?.activate();
+	brokerGrant?.activate(rec);
 	startReservedChild(opts.stateDir, rec);
 	const owned = routingHandoffs.get(c.order.run);
 	if (owned) { owned.pid = rec.pid; owned.spawnedAt = rec.spawnedAt; }

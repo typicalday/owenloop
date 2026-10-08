@@ -102,7 +102,7 @@ export interface HubClient {
    * a fake that ignores it simply cannot be cut short.
    */
   whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
-  getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
+  getOrder(req: GetOrderRequest, signal?: AbortSignal): Promise<GetOrderResponse>;
   /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
   getReferenceOrder?(req: GetOrderRequest): Promise<unknown>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
@@ -171,6 +171,10 @@ export interface HubClient {
 
 export interface RoutingHubClient extends HubClient {
   assessLocalModel(req: LocalModelRequest, signal?: AbortSignal): Promise<LocalModelResponse>;
+  /** Explicit session-scoped lifecycle. Legacy HubClient verbs remain fenced. */
+  routingHeartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
+  routingSubmit(req: SubmitRequest, signal?: AbortSignal): Promise<SubmitResponse>;
+  routingRelease(req: { workflow: string; run: string; reason?: string }, signal?: AbortSignal): Promise<ReleaseResponse>;
   openRoutingSession(req: { scope?: RoutingScope }, signal?: AbortSignal): Promise<RoutingSessionOpenResponse>;
   renewRoutingSession(signal?: AbortSignal): Promise<RoutingSessionRenewResponse>;
   closeRoutingSession(signal?: AbortSignal): Promise<{ closed: true }>;
@@ -319,9 +323,9 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     whatsNext: (req, signal) => opts.routingSession !== undefined || req.routing !== undefined
       ? scopedPost<WhatsNextResponse>('whats_next', req, signal)
       : post<WhatsNextResponse>('whats_next', req, signal),
-    getOrder: (req) => opts.routingSession !== undefined
-      ? scopedPost<GetOrderResponse>('get_order', req)
-      : post<GetOrderResponse>('get_order', req),
+    getOrder: (req, signal) => opts.routingSession !== undefined
+      ? scopedPost<GetOrderResponse>('get_order', req, signal)
+      : post<GetOrderResponse>('get_order', req, signal),
     openRoutingSession: (req, signal) => scopedPost('routing_session_open', req, signal, true),
     renewRoutingSession: (signal) => scopedPost('routing_session_renew', {}, signal),
     closeRoutingSession: (signal) => scopedPost('routing_session_close', {}, signal),
@@ -331,6 +335,9 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     readInvocationBinding: (req, signal) => scopedPost('read_invocation_binding', req, signal),
     reportLaunch: (req, signal) => scopedPost('report_launch', req, signal),
     reserveLaunch: (req, signal) => scopedPost('reserve_launch', req, signal),
+    routingHeartbeat: (req, signal) => scopedPost('heartbeat', req, signal),
+    routingSubmit: (req, signal) => scopedPost('submit', req, signal),
+    routingRelease: (req, signal) => scopedPost('release', req, signal),
     assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
     // Hosted-holder preflight only. Routing orders return routing-unsupported;
     // get_order plus read_routing_claim supply Jev authority instead.

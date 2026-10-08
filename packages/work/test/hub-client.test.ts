@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { createHubClient } from '../src/hub/client.ts';
 import { HubError } from '../src/hub/types.ts';
 import type { LaunchReservationRequestV1 } from '../src/hub/types.ts';
+import { createRoutingBackoff } from '../src/shift/runtime.ts';
 
 interface Captured {
   method: string;
@@ -389,6 +390,50 @@ test('reserve_launch carries the exact session-scoped pre-start request with no 
   const bare = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
     fetchImpl: (async () => { assert.fail('bearer-only reserve_launch reached transport'); }) as typeof fetch });
   await assert.rejects(bare.reserveLaunch({ workflow: 'wf', request }), /routing origin refused/);
+});
+
+test('explicit routed lifecycle uses session headers and shared sanitized Retry-After without legacy fallback', async () => {
+  let monotonic = 0;
+  const backoff = createRoutingBackoff(() => monotonic);
+  const calls: Array<{ verb: string; init: RequestInit }> = [];
+  const holder = { kind: 'exec' as const, id: 'host:123', shiftId: 'shf_service' };
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example',
+      get: () => ({ sessionId: 'rs_session', shiftId: 'shf_service', credential: 'private-session', expiresAt: 100_000 }),
+      now: () => 1_000, beforeRequest: backoff.beforeRequest, onRateLimit: backoff.onRateLimit },
+    fetchImpl: (async (url, init) => {
+      const verb = String(url).split('/').at(-1)!;
+      calls.push({ verb, init: init! });
+      if (verb === 'heartbeat') return new Response('secret upstream body and bearer',
+	{ status: 429, headers: { 'Retry-After': '30' } });
+      if (verb === 'submit') return Response.json({ text: 'ok', outcome: 'submitted', closed: true });
+      if (verb === 'release') return Response.json({ text: 'ok', released: true });
+      throw new Error('unexpected verb');
+    }) as typeof fetch,
+  });
+  await assert.rejects(c.routingHeartbeat({ workflow: 'wf', run: 'run', holder }), error =>
+    error instanceof HubError && error.status === 429 && error.retryAfterMs === 30_000
+      && !error.message.includes('secret'));
+  await assert.rejects(c.routingSubmit({ workflow: 'wf', run: 'run', path: 'out', value: {}, holder }),
+    error => error instanceof HubError && error.status === 429);
+  assert.deepEqual(calls.map(call => call.verb), ['heartbeat']);
+  monotonic = 30_000;
+  assert.equal((await c.routingSubmit({ workflow: 'wf', run: 'run', path: 'out', value: {}, holder })).closed, true);
+  assert.equal((await c.routingRelease({ workflow: 'wf', run: 'run', reason: 'stop' })).released, true);
+  assert.deepEqual(calls.map(call => call.verb), ['heartbeat', 'submit', 'release']);
+  for (const call of calls) {
+    const headers = new Headers(call.init.headers);
+    assert.equal(headers.get('Authorization'), 'Bearer enrolled');
+    assert.equal(headers.get('X-Owenloop-Routing-Session'), 'private-session');
+    assert.equal(call.init.redirect, 'error');
+  }
+  await assert.rejects(c.heartbeat({ workflow: 'wf', run: 'run', holder }), /legacy POST refused/);
+  const bare = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    fetchImpl: (async () => { assert.fail('bare routed lifecycle reached fetch'); }) as typeof fetch });
+  await assert.rejects(bare.routingHeartbeat({ workflow: 'wf', run: 'run', holder }), /routing origin refused/);
+  await assert.rejects(bare.routingSubmit({ workflow: 'wf', run: 'run', path: 'out', value: {}, holder }),
+    /routing origin refused/);
+  await assert.rejects(bare.routingRelease({ workflow: 'wf', run: 'run' }), /routing origin refused/);
 });
 
 test('assessLocalModel uses the scoped service verb with exactly the reviewed body', async () => {

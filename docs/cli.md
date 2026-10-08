@@ -290,6 +290,16 @@ explicitly limited to the direct `owenloop work shift` loop: the public
 named-pipe transport has not been implemented. A Windows daemon start fails
 with that diagnostic instead of treating a Unix-domain socket path as usable.
 
+**Routed worker development boundary (operators).** `OWENLOOP_ROUTING_SESSION=1`
+is an opt-in server and worker infrastructure setting. Ordinary workflow users
+need no Jev installation, credentials, or model selection. The current source
+still refuses routed child startup; this is not a deployed launch capability.
+Its private Shift broker restricts a child to one bound dispatch and an
+allowlisted set of Hub requests while Shift retains the account credential.
+That protocol boundary does not isolate processes running under the same OS
+user ID; hostile child code needs a separate OS isolation design before such
+an isolation claim can be made.
+
 The `shift start` positional argument is a **crew** name. The routing API calls
 that field a **crew**: `serve_crews` contains the selected crew names. Passing
 `--all` maps to an empty `serve_crews` list, which means all crews available to
