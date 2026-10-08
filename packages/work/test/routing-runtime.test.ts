@@ -118,7 +118,7 @@ test('role startup consumes a private session handoff, then stops before any leg
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('handoff refuses wrong target, wrong session credential, and expired authority without fallback', async () => {
+test('handoff refuses wrong target, malformed session identity, and expired authority without fallback', async () => {
   const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-refuse-'));
   let now = 1_000;
   try {
@@ -139,12 +139,20 @@ test('handoff refuses wrong target, wrong session credential, and expired author
 
     const wrongSession = handoff('session');
     const payload = JSON.parse(readFileSync(wrongSession.path, 'utf8'));
-    payload.sessionId = 'rs_abcdef12-1234-1234-1234-123456789abc';
+    payload.sessionId = 'invalid';
     writeFileSync(wrongSession.path, JSON.stringify(payload));
     assert.throws(() => consumeRoutingHandoff({ env: { OWENLOOP_ROUTING_HANDOFF: wrongSession.path }, origin,
       target: { workflow: 'wf', run: 'session' }, kind: 'agent-run', now: () => now }), /refused/);
     assert.equal(existsSync(wrongSession.path), false);
     wrongSession.terminal();
+
+    const legacyCredential = handoff('legacy');
+    const legacyPayload = JSON.parse(readFileSync(legacyCredential.path, 'utf8'));
+    legacyPayload.credential = credential;
+    writeFileSync(legacyCredential.path, JSON.stringify(legacyPayload));
+    assert.throws(() => consumeRoutingHandoff({ env: { OWENLOOP_ROUTING_HANDOFF: legacyCredential.path }, origin,
+      target: { workflow: 'wf', run: 'legacy' }, kind: 'agent-run', now: () => now }), /refused/);
+    legacyCredential.terminal();
 
     const stale = handoff('stale');
     now = 121_001;

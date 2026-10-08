@@ -59,6 +59,7 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingOfferCandidate, ShiftOffer, LocalTupleEligibility } from '../hub/types.ts';
 import type { ShiftRoutingSession, RoutingHandoff } from './runtime.ts';
+import type { RoutingBroker } from './routing-broker.ts';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -104,6 +105,7 @@ import {
 export interface ShiftLoopOptions {
   /** Explicit opt-in; absence preserves legacy serving. */
   routingSession?: ShiftRoutingSession;
+  routingBroker?: RoutingBroker;
   /** Intersect service-authorized tuples with this account's current local roster. */
   selectRoutingTuples?: (candidate: RoutingOfferCandidate) => readonly LocalTupleEligibility[];
   hub: HubClient;
@@ -1502,6 +1504,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
     let reservation: ChildReservation | undefined;
     let handoff: RoutingHandoff | undefined;
+    let brokerGrant: ReturnType<RoutingBroker['issue']> | undefined;
     let terminalBeforeStart = false;
     let cancel: (() => void) | undefined;
     try {
@@ -1510,11 +1513,23 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       reservation = reserved.reservation;
       if (opts.routingSession) {
 	routingAttempts.set(c.order.run, c.order.routing!.preference.expiresAt);
-	handoff = opts.routingSession.createHandoff(reservation);
+	if (opts.routingBroker) {
+	  const target = opts.routingSession.brokerTarget();
+	  if (!target) throw new Error('routing broker incarnation unavailable');
+	  brokerGrant = opts.routingBroker.issue({ reservation, routing: c.order.routing!,
+	    ...target });
+	}
+	const privateHandoff = opts.routingSession.createHandoff(reservation,
+	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap });
+	handoff = { path: privateHandoff.path, terminal: () => {
+	  brokerGrant?.terminal();
+	  privateHandoff.terminal();
+	} };
 	routingHandoffs.set(c.order.run, { handoff });
       }
       const terminal = () => {
 	terminalBeforeStart = true;
+	brokerGrant?.terminal();
 	try { handoff?.terminal(); }
 	catch { opts.err('routing handoff cleanup failed'); }
 	if (routingHandoffs.get(c.order.run)?.handoff === handoff) routingHandoffs.delete(c.order.run);
@@ -1569,6 +1584,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       return 'dispatched';
     } catch (e) {
       cancel?.();
+      brokerGrant?.terminal();
       try { handoff?.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
       if (routingHandoffs.get(c.order.run)?.handoff === handoff) routingHandoffs.delete(c.order.run);
       if (reservation !== undefined) {

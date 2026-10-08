@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createConnection } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, unlinkSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,9 +42,11 @@ import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
+import { consumeRoutingHandoff } from '../src/roles/routing-handoff.ts';
 import { exitCodeFor } from '../src/roles/agent-run.ts';
 import { createHubClient, type HubClient } from '../src/hub/client.ts';
 import { reachesSocketConsumer, openShiftRoutingSession, selectShiftRoutingTuples, routingSessionEnabled, type ShiftRoutingSession } from '../src/shift/runtime.ts';
+import { createRoutingBroker } from '../src/shift/routing-broker.ts';
 import { HubError, type InboxInstance, type WorkOrder } from '../src/hub/types.ts';
 
 // ---- fixtures ---------------------------------------------------------------
@@ -4543,7 +4546,7 @@ test('routing handoffs are exclusive, private, reservation-bound, sibling-indepe
   assert.equal(statSync(a.path).mode & 0o777, 0o600);
   assert.equal(statSync(join(a.path, '..')).mode & 0o777, 0o700);
   const payload = JSON.parse(readFileSync(a.path, 'utf8'));
-  assert.equal(payload.credential, f.credential);
+  assert.equal(payload.credential, undefined);
   assert.equal(payload.orgId, 'org');
   assert.equal(payload.origin, 'https://hub.example');
   assert.deepEqual(payload.reservation, ar);
@@ -4860,6 +4863,75 @@ test('command claims consume a real shift offer with an open agent lane', async 
   assert.equal(f.spawns[0]!.kind, undefined);
   f.spawns[0]!.onTerminal?.();
   loop.stop(); await f.session.stop();
+});
+
+test('routed dispatch hands off only a broker cap and revokes it on terminal after Shift stop', async () => {
+  const f = await routedLoopFixture('command');
+  const broker = await createRoutingBroker({ now: () => 1_000 });
+  const loop = createShiftLoop({ ...f.options, routingBroker: broker });
+  const ask = (socketPath: string, cap: string): Promise<{ ok: boolean }> => new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let raw = '';
+    socket.once('connect', () => socket.write(JSON.stringify({ cap, method: 'read_routing_claim', body: {} }) + '\n'));
+    socket.on('data', chunk => {
+      raw += chunk.toString('utf8');
+      if (!raw.includes('\n')) return;
+      socket.destroy();
+      resolve(JSON.parse(raw.slice(0, raw.indexOf('\n'))) as { ok: boolean });
+    });
+    socket.once('error', reject);
+  });
+  try {
+    assert.equal(await loop.iterate(), 1);
+    const spec = f.spawns[0]!;
+    const handoff = JSON.parse(readFileSync(spec.routingHandoff!, 'utf8'));
+    assert.equal(handoff.credential, undefined);
+    assert.equal(typeof handoff.broker.cap, 'string');
+    assert.equal(handoff.broker.socketPath, broker.socketPath);
+    assert.deepEqual(consumeRoutingHandoff({ env: { OWENLOOP_ROUTING_HANDOFF: spec.routingHandoff },
+      origin: ORIGIN, target: { workflow: 'wf', run: 'run_routed' }, kind: 'exec', now: () => 1_000 })?.broker,
+    handoff.broker);
+    const reads = () => f.f.calls.filter(call => call.verb === 'read_routing_claim').length;
+    const before = reads();
+    assert.equal((await ask(broker.socketPath, handoff.broker.cap)).ok, false);
+    assert.equal(reads(), before + 1, 'grant reached only the captured session client');
+    loop.stop();
+    await f.session.stop();
+    assert.equal((await ask(broker.socketPath, handoff.broker.cap)).ok, false);
+    assert.equal(reads(), before + 2, 'live detached child retains its broker grant after Shift stop');
+    spec.onTerminal?.();
+    assert.equal((await ask(broker.socketPath, handoff.broker.cap)).ok, false);
+    assert.equal(reads(), before + 2, 'terminal revoked the grant before transport');
+  } finally {
+    f.spawns[0]?.onTerminal?.();
+    loop.stop(); await f.session.stop(); await broker.close();
+  }
+});
+
+test('routed spawn rollback revokes its broker grant before any child request', async () => {
+  const f = await routedLoopFixture('command');
+  const broker = await createRoutingBroker({ now: () => 1_000 });
+  let cap = '';
+  const loop = createShiftLoop({ ...f.options, routingBroker: broker, spawner: spec => {
+    cap = JSON.parse(readFileSync(spec.routingHandoff!, 'utf8')).broker.cap as string;
+    throw new Error('spawn refused');
+  } });
+  try {
+    assert.equal(await loop.iterate(), 0);
+    assert.ok(cap);
+    const socket = createConnection(broker.socketPath);
+    let raw = '';
+    const result = new Promise<{ ok: boolean }>((resolve, reject) => {
+      socket.once('connect', () => socket.write(JSON.stringify({ cap, method: 'get_order', body: {} }) + '\n'));
+      socket.on('data', chunk => {
+		raw += chunk.toString('utf8');
+		if (raw.includes('\n')) { socket.destroy(); resolve(JSON.parse(raw.slice(0, raw.indexOf('\n'))) as { ok: boolean }); }
+      });
+      socket.once('error', reject);
+    });
+    assert.equal((await result).ok, false);
+    assert.equal(f.f.calls.filter(call => call.verb === 'get_order').length, 0);
+  } finally { loop.stop(); await f.session.stop(); await broker.close(); }
 });
 
 test('missing authored role policy at the offer endpoint still permits authenticated command routing', async () => {

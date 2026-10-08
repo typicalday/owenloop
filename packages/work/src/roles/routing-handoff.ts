@@ -66,10 +66,15 @@ export function consumeRoutingHandoff(args: {
     if (!p || p.version !== 'routing-handoff-v1' || p.incarnation !== basename(directory)
       || p.nonce + '.json' !== basename(path) || !exactHttpsOrigin(args.origin) || p.origin !== args.origin
       || typeof p.orgId !== 'string' || !p.orgId.trim()
+      || Object.hasOwn(p, 'credential')
       || typeof p.sessionId !== 'string' || !/^rs_[a-f0-9-]{36}$/.test(p.sessionId)
       || typeof p.shiftId !== 'string' || !p.shiftId.startsWith('shf_')
-      || typeof p.credential !== 'string' || !/^rs1\.rs_[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}$/.test(p.credential)
-      || !p.credential.startsWith('rs1.' + p.sessionId + '.')
+      || (p.broker !== undefined && (!p.broker || typeof p.broker !== 'object'
+	|| typeof p.broker.socketPath !== 'string' || !isAbsolute(p.broker.socketPath)
+	|| normalize(p.broker.socketPath) !== p.broker.socketPath
+	|| basename(p.broker.socketPath) !== 'broker.sock'
+	|| !/^ol-rb-[A-Za-z0-9]{6}$/.test(basename(dirname(p.broker.socketPath)))
+	|| typeof p.broker.cap !== 'string' || !/^[a-f0-9]{64}$/.test(p.broker.cap)))
       || !Number.isSafeInteger(p.createdAt) || !Number.isSafeInteger(p.expiresAt)
       || !Number.isSafeInteger(p.sessionExpiresAt) || p.createdAt > now || p.expiresAt <= now
       || p.expiresAt > p.createdAt + 120_000 || p.expiresAt > p.sessionExpiresAt

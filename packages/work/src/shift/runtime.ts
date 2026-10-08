@@ -45,6 +45,7 @@ import {
 } from '../agent/workdir.ts';
 import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
+import { createRoutingBroker, type RoutingBroker } from './routing-broker.ts';
 import {
   createBundleIngestor,
   createStoreInstructionSource,
@@ -376,6 +377,11 @@ export function assertShiftDaemonPlatform(platform: NodeJS.Platform = process.pl
   }
 }
 
+/** Routed child broker needs a reviewed local transport on each platform. */
+export function assertRoutedShiftPlatform(platform: NodeJS.Platform = process.platform): void {
+  if (platform === 'win32') throw new Error('routed Shift is not supported on Windows: private broker named-pipe ACLs are not implemented');
+}
+
 /**
  * Shared runtime setup for the internal shift and public shift daemon.
  * `parsed` is already grammar-validated by the caller; this function owns all
@@ -402,6 +408,10 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   } catch (err) {
     process.stderr.write(`${roleLabel}: ${errMsg(err)}\n`);
     return 1;
+  }
+  if (routingEnabled) {
+    try { assertRoutedShiftPlatform(); }
+    catch (error) { process.stderr.write(`${roleLabel}: ${errMsg(error)}\n`); return 1; }
   }
 
   const origin = parsed.origin ?? settings.hubOrigin;
@@ -539,6 +549,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     ...(routingBackoff ? { routingSession: { allowedOrigin: origin, get: () => undefined,
       beforeRequest: routingBackoff.beforeRequest, onRateLimit: routingBackoff.onRateLimit } } : {}) });
   let routingSession: ShiftRoutingSession | undefined;
+  let routingBroker: RoutingBroker | undefined;
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
   );
@@ -645,15 +656,18 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       routingSession = await openShiftRoutingSession({ origin, stateDir, monotonicNow, routingBackoff,
 	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
 	onMaintenanceError: () => process.stderr.write(`${roleLabel}: parked routing session maintenance failed\n`),
+	onDrained: () => { void routingBroker?.close(); },
 	scope: {
 	  ...(parsed.workflow ? { workflows: [parsed.workflow] } : {}),
 	  ...(parsed.serveCrews?.length ? { crews: parsed.serveCrews } : {}),
 	  capabilities: computeServeCapabilities({ env, crews: parsed.serveCrews ?? [], hub: { origin, account } }),
 	},
       });
+      routingBroker = await createRoutingBroker();
       hub = routingSession.hub;
       shiftId = routingSession.identity()!.shiftId;
     } catch {
+      await routingSession?.stop();
       process.stderr.write(`${roleLabel}: routing session initialization failed\n`);
       return 1;
     }
@@ -712,6 +726,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const loop = createShiftLoop({
     hub,
     ...(routingSession ? { routingSession, selectRoutingTuples } : {}),
+    ...(routingBroker ? { routingBroker } : {}),
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now,
@@ -861,12 +876,13 @@ export async function run(args: string[]): Promise<number> {
   return runShiftRuntime(parsed);
 }
 
-/** Private handoff wire for the later trusted role consumer. The base bearer
- * remains in its existing account store. expiresAt is a consumption deadline,
+/** Private handoff wire for the later trusted role consumer. Both Hub
+ * credentials remain in Shift. expiresAt is a consumption deadline,
  * not a renewable lease; each sibling receives a different file and nonce. */
 export interface RoutingHandoffV1 {
   version: 'routing-handoff-v1'; incarnation: string; nonce: string;
-  origin: string; orgId: string; sessionId: string; shiftId: string; credential: string;
+  origin: string; orgId: string; sessionId: string; shiftId: string;
+  broker?: { socketPath: string; cap: string };
   reservation: ChildReservation; createdAt: number; expiresAt: number; sessionExpiresAt: number;
 }
 export interface RoutingHandoff {
@@ -877,7 +893,10 @@ export interface RoutingHandoff {
 export interface ShiftRoutingSession {
   hub: RoutingHubClient;
   identity(): { orgId: string; principalId: string; sessionId: string; shiftId: string; expiresAt: number } | undefined;
-  createHandoff(reservation: ChildReservation): RoutingHandoff;
+  /** Captures the exact incarnation, including after later scope rotation. */
+  brokerTarget(): { hub: RoutingHubClient; identity: NonNullable<ReturnType<ShiftRoutingSession['identity']>>;
+    currentIdentity: ShiftRoutingSession['identity'] } | undefined;
+  createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string }): RoutingHandoff;
   maintain(): Promise<void>;
   /** Monotonic service deadline shared with Shift's other Hub requests. */
   nextRequestAllowedAt(): number;
@@ -993,6 +1012,7 @@ interface ShiftRoutingSessionOptions {
   postStopSchedule?: (fn: () => void, everyMs: number) => () => void;
   onMaintenanceError?: () => void;
   onClosed?: () => void;
+  onDrained?: () => void;
 }
 
 export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions): Promise<ShiftRoutingSession> {
@@ -1011,7 +1031,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const live = () => Boolean(active.identity()) || [...retired].some(incarnation => Boolean(incarnation.identity()));
   const onClosed = () => {
     for (const incarnation of retired) if (!incarnation.identity()) retired.delete(incarnation);
-    if (stopped && !live()) { cancelParked?.(); cancelParked = undefined; }
+    if (stopped && !live()) { cancelParked?.(); cancelParked = undefined; opts.onDrained?.(); }
   };
   const incarnationOptions = { ...opts, onClosed, beforeRequest: backoff.beforeRequest, onRateLimit: backoff.onRateLimit };
   active = await openRoutingIncarnation({ ...incarnationOptions, scope });
@@ -1025,10 +1045,15 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const session: ShiftRoutingSession = {
     hub,
     identity: () => active.identity(),
+    brokerTarget: () => {
+      const incarnation = active;
+      const identity = incarnation.identity();
+      return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity } : undefined;
+    },
     nextRequestAllowedAt: backoff.nextAllowedAt,
-    createHandoff: reservation => {
+    createHandoff: (reservation, broker) => {
       if (stopped) throw new Error('routing session stopped');
-      return active.createHandoff(reservation);
+      return active.createHandoff(reservation, broker);
     },
     async ensureScope(selection) {
       const desired = normalize({
@@ -1106,7 +1131,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
   beforeRequest?: () => void; onRateLimit?: (error: HubError) => void;
 }): Promise<
-  Omit<ShiftRoutingSession, 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & { stop(): Promise<HubError | undefined> }
+  Omit<ShiftRoutingSession, 'brokerTarget' | 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & { stop(): Promise<HubError | undefined> }
 > {
   const origin = new URL(opts.origin);
   if (origin.protocol !== 'https:' || origin.origin !== opts.origin || origin.username || origin.password) throw new Error('routing origin refused');
@@ -1192,7 +1217,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
     hub,
     identity: () => renewalDenied ? undefined : authority && ({ orgId: opts.orgId, principalId: opts.principalId,
       sessionId: authority.sessionId, shiftId: authority.shiftId, expiresAt: authority.expiresAt }),
-    createHandoff(reservation) {
+    createHandoff(reservation, broker) {
       if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
 	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token
 	  && r.workflow === reservation.workflow && r.run === reservation.run && r.reservedAt === reservation.reservedAt)) throw new Error('routing reservation unavailable');
@@ -1203,7 +1228,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
       const createdAt = now();
       const payload: RoutingHandoffV1 = { version: 'routing-handoff-v1', incarnation, nonce,
 	origin: opts.origin, orgId: opts.orgId, sessionId: authority.sessionId, shiftId: authority.shiftId,
-	credential: authority.credential, reservation: { ...reservation }, createdAt,
+	...(broker ? { broker } : {}), reservation: { ...reservation }, createdAt,
 	expiresAt: Math.min(createdAt + 120_000, authority.expiresAt), sessionExpiresAt: authority.expiresAt };
       if (payload.expiresAt <= createdAt) throw new Error('routing handoff deadline expired');
       let fd: number | undefined;
