@@ -2,10 +2,9 @@
  * complete byte count and digest have been verified. No path in the mutable
  * workdir is opened or written by this module. */
 import { randomBytes } from 'node:crypto';
-import { constants, chmodSync, mkdtempSync, mkdirSync } from 'node:fs';
+import { constants, chmodSync, lstatSync, mkdtempSync, mkdirSync } from 'node:fs';
 import { chmod, open, rename, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, isAbsolute, join, normalize } from 'node:path';
 import { Readable } from 'node:stream';
 import type { FileArtifactPointer } from './types.ts';
 
@@ -28,16 +27,58 @@ export interface RoutedFileRequest {
   pointer: FileArtifactPointer;
 }
 
+/** Allocate before adapter start. Only `publishedRoot` may enter an adapter's
+ * read policy; staging stays outside that subtree. The parent owns cleanup if
+ * the nested holder exits without doing it. */
+export function allocateRoutedFileCache(base: string): {
+  custodyRoot: string; publishedRoot: string; cleanup(): Promise<void>;
+} {
+  if (!isAbsolute(base) || normalize(base) !== base) throw new Error('file-artifact-cache-unavailable: invalid base');
+  const parent = lstatSync(base);
+  if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o777) !== 0o700
+    || (process.getuid && parent.uid !== process.getuid()))
+    throw new Error('file-artifact-cache-unavailable: base is not private');
+  const custodyRoot = mkdtempSync(join(base, 'ol-rfc-'));
+  chmodSync(custodyRoot, 0o700);
+  mkdirSync(join(custodyRoot, 'staging'), { mode: 0o700 });
+  const publishedRoot = join(custodyRoot, 'verified');
+  mkdirSync(publishedRoot, { mode: 0o700 });
+  return { custodyRoot, publishedRoot,
+    cleanup: () => rm(custodyRoot, { recursive: true, force: true }) };
+}
+
+export function validateRoutedFileCacheRoot(root: string): void {
+  if (!isAbsolute(root) || normalize(root) !== root
+    || !/^ol-rfc-[A-Za-z0-9]{6}$/.test(basename(root)))
+    throw new Error('file-artifact-cache-unavailable: invalid root');
+  for (const path of [root, join(root, 'staging'), join(root, 'verified')]) {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700
+      || (process.getuid && stat.uid !== process.getuid()))
+      throw new Error('file-artifact-cache-unavailable: root changed');
+  }
+}
+
+export function validateRoutedPublishedRoot(root: string): void {
+  if (!isAbsolute(root) || normalize(root) !== root || basename(root) !== 'verified')
+    throw new Error('file-artifact-cache-unavailable: invalid published root');
+  validateRoutedFileCacheRoot(join(root, '..'));
+}
+
 export function createRoutedFileCache(
   download: (req: RoutedFileRequest, signal: AbortSignal) => Promise<RoutedFileDownload>,
-  base = tmpdir(),
+  base: string,
 ) {
-  const root = mkdtempSync(join(base, 'ol-rfc-'));
-  chmodSync(root, 0o700);
+  return openRoutedFileCache(download, allocateRoutedFileCache(base).custodyRoot);
+}
+
+export function openRoutedFileCache(
+  download: (req: RoutedFileRequest, signal: AbortSignal) => Promise<RoutedFileDownload>,
+  root: string,
+) {
+  validateRoutedFileCacheRoot(root);
   const staging = join(root, 'staging');
   const verified = join(root, 'verified');
-  mkdirSync(staging, { mode: 0o700 });
-  mkdirSync(verified, { mode: 0o700 });
   let closed = false;
   let reservedBytes = 0;
   let reservedFiles = 0;

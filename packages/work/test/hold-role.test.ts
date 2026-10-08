@@ -15,6 +15,7 @@ import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost, StdinHost } from '../src/roles/signals.ts';
 import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
 import { createRoutingHolderHandoff } from '../src/roles/routing-holder-handoff.ts';
+import { allocateRoutedFileCache } from '../src/hub/routed-file-cache.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 
 /**
@@ -315,7 +316,8 @@ test('routed MCP hold first contact uses only its holder cap and original sessio
       reservedAt: now, token: 'c'.repeat(32) },
     createdAt: now, expiresAt: now + 120_000, sessionExpiresAt: now + 300_000,
   };
-  const handoff = createRoutingHolderHandoff(source, now);
+  const cache = allocateRoutedFileCache(directory);
+  const handoff = createRoutingHolderHandoff(source, cache.custodyRoot, now);
   try {
     const code = await run(['--order', 'wf1/run1', '--origin', source.origin, '--mcp', '--never-release',
       '--routing-holder', handoff.path], {
@@ -329,6 +331,7 @@ test('routed MCP hold first contact uses only its holder cap and original sessio
     } }]);
   } finally {
     handoff.cleanup();
+    await cache.cleanup();
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
   }

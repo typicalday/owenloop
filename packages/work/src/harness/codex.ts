@@ -80,6 +80,8 @@ import { register } from './registry.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
 import { ADMITTED_OWENLOOP_KEYS, filterOwenloopEnv } from './child-env.ts';
 import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdio.ts';
+import { isInside } from './gatekeeper.ts';
+import { validateRoutedPublishedRoot } from '../hub/routed-file-cache.ts';
 
 /** The adapter id. Matches the `"codex"` key in `harness-versions.json`, so the
  *  worker can use one string for both the version pin and the adapter lookup. */
@@ -365,14 +367,18 @@ function mountEnv(): Record<string, string> {
 // holder tool must not silently acquire exposure or approval in this adapter.
 // Tests compare this contract to HOLD_MCP_TOOL_NAMES and the holder argv parser.
 const OWN_MCP_TOOLS = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
+const ROUTED_FILE_TOOL = 'get_file_artifact';
 const HOLD_VALUE_FLAGS = new Set([
   '--order', '--workflow', '--session', '--origin', '--as', '--shift',
   '--heartbeat-interval', '--jump-tolerance',
 ]);
 
 /** Read only the holder's tool selector; preserve the entire launch argv. */
-function ownMcpTools(args: readonly string[]): string[] {
-  let selected: string[] = [...OWN_MCP_TOOLS];
+function ownMcpTools(args: readonly string[], verifiedFileCacheRoot?: string): string[] {
+  const routed = args.some((arg) => arg === '--routing-holder' || arg.startsWith('--routing-holder='));
+  if (verifiedFileCacheRoot !== undefined && !routed) throw new Error('routed file cache requires a routed holder');
+  let selected: string[] = verifiedFileCacheRoot === undefined ? [...OWN_MCP_TOOLS]
+    : [...OWN_MCP_TOOLS, ROUTED_FILE_TOOL];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     // Match hold.parseArgs consumption: a separate value belongs to its flag,
@@ -391,7 +397,8 @@ function ownMcpTools(args: readonly string[]): string[] {
     if (names.some((name) => name === '')) {
       throw new Error('--mcp-tools must be a comma-separated list with no empty names');
     }
-    if (names.some((name) => !(OWN_MCP_TOOLS as readonly string[]).includes(name))) {
+    if (names.some((name) => !(OWN_MCP_TOOLS as readonly string[]).includes(name)
+      && !(name === ROUTED_FILE_TOOL && routed && verifiedFileCacheRoot !== undefined))) {
       throw new Error(`--mcp-tools must name only supported own tools: ${OWN_MCP_TOOLS.join(',')}`);
     }
     if (new Set(names).size !== names.length) {
@@ -405,8 +412,8 @@ function ownMcpTools(args: readonly string[]): string[] {
 }
 
 /** Own mount identity from the worker, with per-thread named MCP policy. */
-function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec {
-  const enabledTools = ownMcpTools(mcp.args);
+function owenloopMount(mcp: { command: string; args: string[] }, verifiedFileCacheRoot?: string): McpServerSpec {
+  const enabledTools = ownMcpTools(mcp.args, verifiedFileCacheRoot);
   return {
     command: mcp.command,
     args: [...mcp.args],
@@ -471,10 +478,23 @@ export function buildThreadStartParams(
     // The owenloop mount wins on a key clash, mirroring how the legacy
     // frontmatter builder overwrites an author's own `owenloop` entry. Without
     // it the agent has no `submit` tool and the order can never complete.
-    [OWENLOOP_MCP_NAME]: owenloopMount(args.owenloopMcp),
+    [OWENLOOP_MCP_NAME]: owenloopMount(args.owenloopMcp, args.verifiedFileCacheRoot),
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
+  if (args.verifiedFileCacheRoot !== undefined) {
+    const fileRoot = args.verifiedFileCacheRoot;
+    validateRoutedPublishedRoot(fileRoot);
+    if (sandbox === 'danger-full-access' || isInside(args.cwd, fileRoot)
+      || isInside(fileRoot, args.cwd))
+      throw new Error('routed file cache requires a separate read-only sandbox root');
+    const workspace = isPlainMap(config['sandbox_workspace_write']) ? config['sandbox_workspace_write'] : {};
+    const writable = workspace['writable_roots'];
+    if (writable !== undefined && (!Array.isArray(writable)
+      || writable.some((root) => typeof root !== 'string'
+		|| isInside(root, fileRoot) || isInside(fileRoot, root))))
+      throw new Error('routed file cache overlaps configured writable roots');
+  }
   if (args.permissions.network === 'unrestricted' && sandbox === 'workspace-write') {
     const authored = isPlainMap(config['sandbox_workspace_write'])
       ? config['sandbox_workspace_write']

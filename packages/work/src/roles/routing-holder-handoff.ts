@@ -5,11 +5,13 @@ import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, ope
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize } from 'node:path';
 import type { RoutingHandoffV1 } from '../shift/runtime.ts';
+import { validateRoutedFileCacheRoot } from '../hub/routed-file-cache.ts';
 
-export interface RoutingHolderHandoffV1 {
-  version: 'routing-holder-v1'; origin: string; workflow: string; run: string;
+export interface RoutingHolderHandoffV2 {
+  version: 'routing-holder-v2'; origin: string; workflow: string; run: string;
   sessionId: string; shiftId: string; expiresAt: number;
   broker: { socketPath: string; cap: string };
+  cacheRoot: string;
 }
 
 function validOrigin(value: string): boolean {
@@ -17,7 +19,7 @@ function validOrigin(value: string): boolean {
   catch { return false; }
 }
 
-export function createRoutingHolderHandoff(handoff: RoutingHandoffV1, now = Date.now()): {
+export function createRoutingHolderHandoff(handoff: RoutingHandoffV1, cacheRoot: string, now = Date.now()): {
   path: string; cleanup(): void;
 } {
   if (handoff.reservation.childKind !== 'agent-run' || !handoff.broker || !handoff.holderBroker
@@ -25,14 +27,16 @@ export function createRoutingHolderHandoff(handoff: RoutingHandoffV1, now = Date
     || handoff.holderBroker.cap === handoff.broker.cap
     || !validOrigin(handoff.origin) || !Number.isSafeInteger(now)
     || now >= handoff.sessionExpiresAt) throw new Error('routing holder handoff refused');
+  validateRoutedFileCacheRoot(cacheRoot);
   const directory = mkdtempSync(join(tmpdir(), 'ol-rh-'));
   chmodSync(directory, 0o700);
   const path = join(directory, `${randomBytes(16).toString('hex')}.json`);
-  const payload: RoutingHolderHandoffV1 = {
-    version: 'routing-holder-v1', origin: handoff.origin,
+  const payload: RoutingHolderHandoffV2 = {
+    version: 'routing-holder-v2', origin: handoff.origin,
     workflow: handoff.reservation.workflow, run: handoff.reservation.run,
     sessionId: handoff.sessionId, shiftId: handoff.shiftId,
     expiresAt: Math.min(now + 120_000, handoff.sessionExpiresAt), broker: handoff.holderBroker,
+    cacheRoot,
   };
   try { writeFileSync(path, JSON.stringify(payload), { flag: 'wx', mode: 0o600 }); }
   catch (error) { try { rmdirSync(directory); } catch { /* Preserve substituted entries. */ } throw error; }
@@ -47,11 +51,11 @@ export function createRoutingHolderHandoff(handoff: RoutingHandoffV1, now = Date
 }
 
 export function consumeRoutingHolderHandoff(args: { path: string; origin: string;
-  workflow: string; run: string; now?: () => number }): RoutingHolderHandoffV1 {
+  workflow: string; run: string; now?: () => number }): RoutingHolderHandoffV2 {
   const { path } = args;
   let fd: number | undefined;
   let owned: { dev: number; ino: number; directoryDev: number; directoryIno: number } | undefined;
-  let payload: RoutingHolderHandoffV1 | undefined;
+  let payload: RoutingHolderHandoffV2 | undefined;
   try {
     const directory = dirname(path);
     if (!isAbsolute(path) || normalize(path) !== path || !/^ol-rh-[A-Za-z0-9]{6}$/.test(basename(directory))
@@ -73,9 +77,9 @@ export function consumeRoutingHolderHandoff(args: { path: string; origin: string
     const after = fstatSync(fd);
     if (length !== file.size || length > 4096 || after.size !== file.size
       || after.mtimeMs !== file.mtimeMs || after.ctimeMs !== file.ctimeMs) throw new Error();
-    const value = JSON.parse(bytes.subarray(0, length).toString('utf8')) as RoutingHolderHandoffV1;
+    const value = JSON.parse(bytes.subarray(0, length).toString('utf8')) as RoutingHolderHandoffV2;
     const now = (args.now ?? Date.now)();
-    if (!value || value.version !== 'routing-holder-v1' || !validOrigin(args.origin)
+    if (!value || value.version !== 'routing-holder-v2' || !validOrigin(args.origin)
       || value.origin !== args.origin || value.workflow !== args.workflow || value.run !== args.run
       || !/^rs_[a-f0-9-]{36}$/.test(value.sessionId) || !value.shiftId.startsWith('shf_')
       || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= now
@@ -84,6 +88,7 @@ export function consumeRoutingHolderHandoff(args: { path: string; origin: string
       || !/^ol-rb-[A-Za-z0-9]{6}$/.test(basename(dirname(value.broker.socketPath)))
       || !/^[a-f0-9]{64}$/.test(value.broker.cap)
       || Object.hasOwn(value, 'credential') || Object.hasOwn(value, 'token')) throw new Error();
+    validateRoutedFileCacheRoot(value.cacheRoot);
     payload = value;
   } catch { /* A malformed or substituted file cannot authorize a bearer fallback. */ }
   finally {

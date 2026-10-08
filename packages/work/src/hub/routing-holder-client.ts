@@ -4,7 +4,7 @@ import type { HubClient } from './client.ts';
 import { createRoutingChildClient } from './routing-child-client.ts';
 import type { FileArtifactPointer, PutFileArtifactResponse } from './types.ts';
 import { openRoutedFileSource, type RoutedFileSourceSeams } from './routed-file-source.ts';
-import { createRoutedFileCache } from './routed-file-cache.ts';
+import { openRoutedFileCache } from './routed-file-cache.ts';
 
 export interface RoutingHolderClient extends HubClient {
   /** Reads a file under the holder's pinned workdir as bounded chunks. */
@@ -18,9 +18,13 @@ export interface RoutingHolderClient extends HubClient {
 
 export function createRoutingHolderClient(binding: {
   workflow: string; run: string; broker: { socketPath: string; cap: string };
+  cacheRoot?: string;
 }, seams: RoutedFileSourceSeams = {}): RoutingHolderClient {
   const child = createRoutingChildClient({ reservation: binding, broker: binding.broker });
-  const cache = createRoutedFileCache((req, signal) => child.getFileArtifactStream(req, signal));
+  // Old test fixtures may omit a cache root, but that capability can never
+  // download. A production routed holder receives one through its v2 handoff.
+  const cache = binding.cacheRoot === undefined ? undefined
+    : openRoutedFileCache((req, signal) => child.getFileArtifactStream(req, signal), binding.cacheRoot);
   const supported = {
     getOrder: child.getOrder,
     heartbeat: child.heartbeat,
@@ -28,9 +32,13 @@ export function createRoutingHolderClient(binding: {
     ask: child.ask,
     reject: child.reject,
     putFileArtifact: child.putFileArtifact,
-    downloadFile: cache.materialize,
-    discardDownloadedFile: cache.discard,
-    closeDownloadedFiles: cache.close,
+    downloadFile: (req: { workflow: string; run: string; path: string; pointer: FileArtifactPointer },
+      signal?: AbortSignal) => {
+      if (!cache) throw new Error('file-artifact-cache-unavailable');
+      return cache.materialize(req, signal);
+    },
+    discardDownloadedFile: (file: string) => cache?.discard(file) ?? Promise.resolve(),
+    closeDownloadedFiles: () => cache?.close() ?? Promise.resolve(),
     async uploadFile(req: { workflow: string; workdir: string; file: string;
       contentType: string; filename?: string }) {
       const source = await openRoutedFileSource(req, seams);

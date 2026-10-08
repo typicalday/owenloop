@@ -24,8 +24,8 @@
  * `register(claudeAdapter)` below and puts the adapter in the runtime registry.
  */
 import { randomUUID } from 'node:crypto';
-import { accessSync, constants, existsSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { accessSync, constants, existsSync, lstatSync } from 'node:fs';
+import { basename, delimiter, dirname, isAbsolute, join, normalize } from 'node:path';
 
 import type {
   CanUseTool,
@@ -45,11 +45,13 @@ import {
   classifyExactWorkdirPath,
   classifyToolCall,
   EXACT_WORKDIR_DENIAL_MESSAGE,
+  isInside,
   PATH_BEARING_TOOL_NAMES,
   READ_ONLY_TOOLS,
   type GatePolicy,
   type GateVerdict,
 } from './gatekeeper.ts';
+import { validateRoutedPublishedRoot } from '../hub/routed-file-cache.ts';
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
@@ -497,8 +499,14 @@ function buildCanUseTool(
   onEvent: (e: AgentEvent) => void,
   approvals?: ApprovalRequester,
   exactWorkdir = false,
+  verifiedFileCacheRoot?: string,
 ): CanUseTool {
   return async (toolName, input, options) => {
+    if (verifiedFileCacheRoot !== undefined && toolName === 'Read'
+      && isPlainMap(input) && typeof input['file_path'] === 'string'
+      && isPublishedFileRead(verifiedFileCacheRoot, input['file_path'])) {
+      return { behavior: 'allow' };
+    }
     let verdict: GateVerdict;
     try {
       verdict = classifyToolCall(
@@ -600,6 +608,7 @@ const READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS = [...READ_ONLY_TOOLS]
 // about the agent's OWN owed artifact, so unlike `reject` it grants no authority
 // over anyone else's work and there is no reason to withhold it under isolation.
 const BORN_BOUND_OWENLOOP_TOOL_NAMES = ['get_order', 'submit', 'ask'] as const;
+const ROUTED_FILE_TOOL = 'get_file_artifact';
 const BORN_BOUND_OWENLOOP_TOOLS = BORN_BOUND_OWENLOOP_TOOL_NAMES.map(
   (name) => `mcp__owenloop__${name}`,
 );
@@ -607,6 +616,7 @@ const RESTRICTED_OWENLOOP_DENIED_TOOLS = ['mcp__owenloop__reject'] as const;
 const EXACT_WORKDIR_BUILTINS = new Set(['Read', 'Glob', 'Grep']);
 const OWENLOOP_CONTROL_TOOLS = new Set([
   ...BORN_BOUND_OWENLOOP_TOOLS,
+  `mcp__owenloop__${ROUTED_FILE_TOOL}`,
   'mcp__plugin_owenloop_owenloop__get_order',
   'mcp__plugin_owenloop_owenloop__submit',
 ]);
@@ -661,7 +671,8 @@ function strictWorkdirToolIssue(permissions: StepPermissions): PermissionIssue |
     };
   }
   const unsafe = effective.filter(
-    (tool) => !EXACT_WORKDIR_BUILTINS.has(tool) && !BORN_BOUND_OWENLOOP_TOOLS.includes(tool as typeof BORN_BOUND_OWENLOOP_TOOLS[number]),
+    (tool) => !EXACT_WORKDIR_BUILTINS.has(tool) && !BORN_BOUND_OWENLOOP_TOOLS.includes(tool as typeof BORN_BOUND_OWENLOOP_TOOLS[number])
+      && tool !== `mcp__owenloop__${ROUTED_FILE_TOOL}`,
   );
   if (unsafe.length === 0) return undefined;
   return {
@@ -765,12 +776,24 @@ function claudePreflight(permissions: StepPermissions): PermissionIssue[] {
  */
 const RESUME_FAILURE_RE = /no conversation found|session not found|--resume/i;
 
+/** Cache publication creates only immediate, immutable, read-only files. */
+function isPublishedFileRead(root: string, file: string): boolean {
+  try {
+    if (!isAbsolute(file) || normalize(file) !== file || dirname(file) !== root
+      || !/^[a-f0-9]{32}$/.test(basename(file))) return false;
+    validateRoutedPublishedRoot(root);
+    const stat = lstatSync(file);
+    return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1
+      && (stat.mode & 0o222) === 0;
+  } catch { return false; }
+}
+
 function isPlainMap(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 /** Programmatic PreToolUse guard for every path-bearing exposed built-in. */
-export function buildExactWorkdirPreToolUse(cwd: string): HookCallback {
+export function buildExactWorkdirPreToolUse(cwd: string, verifiedFileCacheRoot?: string): HookCallback {
   return async (input) => {
     const deny = {
       continue: true,
@@ -783,6 +806,16 @@ export function buildExactWorkdirPreToolUse(cwd: string): HookCallback {
     try {
       if (input.hook_event_name !== 'PreToolUse' || !PATH_BEARING_TOOL_NAMES.has(input.tool_name)) return deny;
       if (!isPlainMap(input.tool_input)) return deny;
+      if (verifiedFileCacheRoot !== undefined && input.tool_name === 'Read'
+		&& typeof input.tool_input['file_path'] === 'string'
+		&& isInside(verifiedFileCacheRoot, input.tool_input['file_path'])) {
+		if (isPublishedFileRead(verifiedFileCacheRoot, input.tool_input['file_path'])) {
+		  return { continue: true, hookSpecificOutput: {
+		    hookEventName: 'PreToolUse' as const, permissionDecision: 'allow' as const,
+		  } };
+		}
+		return deny;
+      }
       const verdict = classifyExactWorkdirPath({
 	toolName: input.tool_name,
 	input: input.tool_input,
@@ -813,10 +846,12 @@ function owenloopMount(mount: { command: string; args: string[] }): McpServerCon
 /** Restricted sessions register a positive born-bound subset. The selector is
  * derived from the same names used by `allowedTools`, so the declared exception
  * and the MCP server's actual `tools/list` cannot drift within this adapter. */
-function restrictedOwenloopMount(mount: { command: string; args: string[] }): McpServerConfig {
+function restrictedOwenloopMount(mount: { command: string; args: string[] }, verifiedFileCacheRoot?: string): McpServerConfig {
+  const selected = verifiedFileCacheRoot === undefined ? [...BORN_BOUND_OWENLOOP_TOOL_NAMES]
+    : [...BORN_BOUND_OWENLOOP_TOOL_NAMES, ROUTED_FILE_TOOL];
   return owenloopMount({
     command: mount.command,
-    args: [...mount.args, `--mcp-tools=${BORN_BOUND_OWENLOOP_TOOL_NAMES.join(',')}`],
+    args: [...mount.args, `--mcp-tools=${selected.join(',')}`],
   });
 }
 
@@ -838,6 +873,7 @@ function mergeMcpServers(
 export interface ClaudeOptionInputs {
   cwd: string;
   owenloopMcp: { command: string; args: string[] };
+  verifiedFileCacheRoot?: string;
   /** Per-start override; wins over `permissions.model`. */
   model?: string;
   /** Per-start override; wins over `permissions.effort`. */
@@ -878,6 +914,13 @@ export function buildClaudeOptions(
 ): Options {
   const { permissions } = inputs;
 	const exactWorkdir = inputs.exactWorkdir === true;
+	if (inputs.verifiedFileCacheRoot !== undefined) {
+		validateRoutedPublishedRoot(inputs.verifiedFileCacheRoot);
+		if (!exactWorkdir || !inputs.owenloopMcp.args.includes('--routing-holder')
+		  || isInside(inputs.cwd, inputs.verifiedFileCacheRoot)
+		  || isInside(inputs.verifiedFileCacheRoot, inputs.cwd))
+			throw new HarnessTurnError('configuration', true, 'routed file cache requires an isolated read-only root');
+	}
 	const effectiveTools = effectiveClaudeTools(permissions);
 	if (exactWorkdir) {
 		const issue = strictWorkdirToolIssue(permissions);
@@ -894,7 +937,7 @@ export function buildClaudeOptions(
     env: extra.env,
     abortController: extra.abortController,
     mcpServers: isolated
-      ? { owenloop: restrictedOwenloopMount(inputs.owenloopMcp) }
+      ? { owenloop: restrictedOwenloopMount(inputs.owenloopMcp, inputs.verifiedFileCacheRoot) }
       : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
@@ -913,12 +956,13 @@ export function buildClaudeOptions(
 	  diagnosticEvent,
       inputs.approvals,
 	  exactWorkdir,
+      inputs.verifiedFileCacheRoot,
     ),
   };
 
 	if (exactWorkdir) {
 		options.hooks = {
-			PreToolUse: [{ matcher: [...PATH_BEARING_TOOL_NAMES].join('|'), hooks: [buildExactWorkdirPreToolUse(inputs.cwd)] }],
+			PreToolUse: [{ matcher: [...PATH_BEARING_TOOL_NAMES].join('|'), hooks: [buildExactWorkdirPreToolUse(inputs.cwd, inputs.verifiedFileCacheRoot)] }],
 		};
 	}
 
@@ -989,7 +1033,8 @@ export function buildClaudeOptions(
   if (effectiveTools !== undefined) {
     options.tools = effectiveTools.filter((tool) => !OWENLOOP_CONTROL_TOOLS.has(tool));
     options.allowedTools = [
-      ...new Set([...effectiveTools, ...BORN_BOUND_OWENLOOP_TOOLS]),
+      ...new Set([...effectiveTools, ...BORN_BOUND_OWENLOOP_TOOLS,
+		...(inputs.verifiedFileCacheRoot === undefined ? [] : [`mcp__owenloop__${ROUTED_FILE_TOOL}`])]),
     ];
   }
   if (isolated) {

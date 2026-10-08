@@ -313,6 +313,9 @@ export interface StartArgs {
    * argv, never the prompt.
    */
   owenloopMcp: { command: string; args: string[] };
+  /** Worker-created read-only published subtree for verified routed inputs.
+   * Staging and unrelated cache siblings are never exposed to the adapter. */
+  verifiedFileCacheRoot?: string;
   /** Normalized from the step def by `normalizeStepPermissions`. */
   permissions: StepPermissions;
   /**
@@ -352,6 +355,7 @@ export interface StartArgs {
  * miss.
  */
 export type DeliverArgs = Pick<StartArgs, 'cwd' | 'owenloopMcp' | 'permissions'> &
+  Pick<StartArgs, 'verifiedFileCacheRoot'> &
   Pick<StartArgs, 'model' | 'effort' | 'approvals' | 'recoveryPolicy'>;
 
 /** The neutral part of an adapter's opt-in silence recovery configuration. */
