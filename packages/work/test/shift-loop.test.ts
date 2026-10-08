@@ -5258,3 +5258,52 @@ test('session rotation preserves HTTP 429 Retry-After and suppresses every perio
     assert.equal(errors.some(message => message.includes('private response')), false);
   } finally { loop.stop(); await session.stop(); }
 });
+
+test('rate-limited close during session rotation suppresses Shift polling until Retry-After', async () => {
+  let clock = 0;
+  let opens = 0;
+  let closes = 0;
+  let offers = 0;
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => clock,
+    monotonicNow: () => clock, getToken: async () => 'enrolled-base',
+    fetchImpl: (async url => {
+      if (String(url).endsWith('/routing_session_open')) {
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++opens).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${opens}`,
+	  credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: clock + 900_000 });
+      }
+      if (String(url).endsWith('/routing_session_close')) {
+	if (++closes === 1) return Response.json({ error: 'rate_limited' },
+	  { status: 429, headers: { 'Retry-After': '120' } });
+	return Response.json({ closed: true });
+      }
+      if (String(url).endsWith('/routing_offer_context')) { offers++; return Response.json({ contexts: [] }); }
+      assert.fail(`unexpected session request ${String(url)}`);
+    }) as typeof fetch,
+  });
+  const { hub, calls } = mockHub({});
+  let capabilities = ['build'];
+  const loop = createShiftLoop(baseOpts(hub, () => { assert.fail('no work offered'); }, {
+    workflow: 'wf', routingSession: session, now: () => clock, monotonicNow: () => clock,
+    computeServeCapabilities: () => capabilities,
+  }));
+  try {
+    await loop.iterate();
+    capabilities = ['build', 'test'];
+    loop.setShift({ serveCrews: [] });
+    clock = 5_000;
+    await loop.iterate();
+    assert.equal(opens, 2, 'new authority remains active after the old close is rate limited');
+    assert.equal(closes, 1);
+    const quiet = { calls: calls.length, offers, opens, closes };
+    for (clock of [10_000, 65_000, 124_999]) {
+      await loop.iterate();
+      assert.deepEqual({ calls: calls.length, offers, opens, closes }, quiet);
+    }
+    clock = 125_000;
+    await loop.iterate();
+    assert.equal(offers, quiet.offers + 1, 'polling resumes at the close response deadline');
+    assert.ok(calls.length > quiet.calls);
+  } finally { loop.stop(); await session.stop(); }
+});

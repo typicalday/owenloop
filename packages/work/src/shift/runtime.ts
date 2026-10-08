@@ -972,7 +972,7 @@ interface ShiftRoutingSessionOptions {
   /** Keeps a stopped Shift alive while detached workers still own sessions. */
   postStopSchedule?: (fn: () => void, everyMs: number) => () => void;
   onMaintenanceError?: () => void;
-  onClosed?: () => void;
+  onClosed?: (closeRateLimit?: HubError) => void;
 }
 
 export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions): Promise<ShiftRoutingSession> {
@@ -994,7 +994,8 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   };
   let cancelParked: (() => void) | undefined;
   const live = () => Boolean(active.identity()) || [...retired].some(incarnation => Boolean(incarnation.identity()));
-  const onClosed = () => {
+  const onClosed = (closeRateLimit?: HubError) => {
+    if (closeRateLimit) noteRenewalBackoff(closeRateLimit);
     for (const incarnation of retired) if (!incarnation.identity()) retired.delete(incarnation);
     if (stopped && !live()) { cancelParked?.(); cancelParked = undefined; }
   };
@@ -1033,8 +1034,9 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	scope = desired;
 	// A retired incarnation retains renewal authority while an owned worker
 	// remains live. Its terminal callbacks close that exact old session.
-	await previous.stop();
+	const closeRateLimit = await previous.stop();
 	if (previous.identity()) retired.add(previous);
+	if (closeRateLimit) throw closeRateLimit;
       }).catch(error => { noteRenewalBackoff(error); throw error; });
       changing = change;
       await change;
@@ -1087,7 +1089,9 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   return session;
 }
 
-async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise<Omit<ShiftRoutingSession, 'ensureScope'>> {
+async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise<
+  Omit<ShiftRoutingSession, 'ensureScope' | 'stop'> & { stop(): Promise<HubError | undefined> }
+> {
   const origin = new URL(opts.origin);
   if (origin.protocol !== 'https:' || origin.origin !== opts.origin || origin.username || origin.password) throw new Error('routing origin refused');
   const now = opts.now ?? Date.now;
@@ -1145,20 +1149,25 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
   let stopped = false;
   let renewalDenied = false;
   let renewing: Promise<void> | undefined;
-  let closing: Promise<void> | undefined;
-  const finish = (): Promise<void> => {
-    if (!stopped || owned.size > 0) return Promise.resolve();
+  let closing: Promise<HubError | undefined> | undefined;
+  const finish = (): Promise<HubError | undefined> => {
+    if (!stopped || owned.size > 0) return Promise.resolve(undefined);
     closing ??= (async () => {
+      let closeRateLimit: HubError | undefined;
       try {
 	await renewing;
 	if (authority) await hub.closeRoutingSession(AbortSignal.timeout(10_000));
-      } catch { /* Remote expiry bounds authority even if close cannot be delivered. */ }
+      } catch (error) {
+	// Remote expiry bounds authority. A 429 also gates the next Shift poll.
+	if (error instanceof HubError && error.status === 429) closeRateLimit = error;
+      }
       finally {
 	authority = undefined;
 	maintenance.close();
 	try { if (sameInode(privateDirectory(directory), directoryInode)) rmdirSync(directory); } catch { /* Preserve substituted or nonempty entries. */ }
-	opts.onClosed?.();
+	opts.onClosed?.(closeRateLimit);
       }
+      return closeRateLimit;
     })();
     return closing;
   };
@@ -1215,7 +1224,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
       return handoff;
     },
     async maintain() {
-      if (closing) return closing;
+      if (closing) { await closing; return; }
       maintenance.sweep();
       // stop() forbids new handoffs but a live detached worker still owns this
       // session. Rotation and global stop both keep it renewable until terminal.
@@ -1233,7 +1242,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions): Promise
       })();
       try { await renewing; } finally { renewing = undefined; }
     },
-    async stop() { stopped = true; await finish(); },
+    async stop() { stopped = true; return finish(); },
   };
 }
 
