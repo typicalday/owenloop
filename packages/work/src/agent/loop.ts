@@ -58,6 +58,7 @@
  */
 import { isAbsolute, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { hasConsumedFilePointers } from '../hub/routed-command-files.ts';
 
 import { isExistingDirectory, isWorkdirAllowed } from './workdir.ts';
 
@@ -233,6 +234,9 @@ export interface AgentRunLoopOptions {
   /** One-use private holder subcap for nested MCP. Required for routed starts;
    * never substitute the operator account selector or a bearer fallback. */
   routingHolderPath?: string;
+  /** Published read-only cache view, used only when a routed input actually
+   * contains a verified file pointer. Never attach it to every routed agent. */
+  routedFileCacheRoot?: string;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
@@ -1007,6 +1011,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 	effort: routedSelection.selected.effort }
       : resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
     if (!routedSelection) await reportResolution(routing);
+    let routedFileCacheRoot: string | undefined;
+    if (routedSelection) {
+      try {
+	if (hasConsumedFilePointers(packet)) {
+	  if (!opts.routedFileCacheRoot || !isAbsolute(opts.routedFileCacheRoot)) throw new Error();
+	  routedFileCacheRoot = opts.routedFileCacheRoot;
+	}
+      } catch { return releaseWith('routed-file-cache-unavailable', 'routed-launch-refused'); }
+    }
     if (routing.kind === 'refused') {
       if (routing.reason === 'harness-policy') {
         opts.err(
@@ -1268,6 +1281,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       owenloopMcp,
       permissions,
       approvals,
+      ...(routedFileCacheRoot ? { verifiedFileCacheRoot: routedFileCacheRoot } : {}),
       ...(resolvedModel ?? {}),
       ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     };
@@ -1285,6 +1299,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       owenloopMcp,
       permissions,
       approvals,
+      ...(routedFileCacheRoot ? { verifiedFileCacheRoot: routedFileCacheRoot } : {}),
       ...(resolvedModel ?? {}),
       ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     });

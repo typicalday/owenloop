@@ -69,6 +69,7 @@ interface OrderOpts {
   outcome?: string;
   /** Consumed input artifact values, keyed by path. */
   consumes?: Record<string, unknown>;
+  inputs?: string[];
   /** Owed outputs, with their standing reject counts. */
   owes?: Array<{
     path: string;
@@ -103,7 +104,7 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       workflow: 'wf1',
       step: o.step ?? 'builder',
       key: 'k',
-      inputs: [],
+      inputs: o.inputs ?? [],
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
@@ -292,6 +293,7 @@ interface BuildOpts {
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   routedSelect?: AgentRunLoopOptions['routedSelect'];
   routingHolderPath?: string;
+  routedFileCacheRoot?: string;
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
 	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
@@ -325,6 +327,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     ...(b.routedSelect === undefined ? {} : {
       routingHolderPath: b.routingHolderPath ?? '/private/routed-holder.json',
     }),
+    ...(b.routedFileCacheRoot ? { routedFileCacheRoot: b.routedFileCacheRoot } : {}),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
@@ -379,7 +382,7 @@ test('routed single-output first start awaits authorization after adapter policy
   const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'out' }],
     consumes: { input: 'verified-value' } }),
     agentOrder({ claimed: false, outcome: 'green' })] });
-  const h = buildOpts({ hub, adapter,
+  const h = buildOpts({ hub, adapter, routedFileCacheRoot: '/private/cache/verified',
     consumedVerifier: async (order, options) => {
       gates.push(`consumed:${String(options.hardRule)}`);
       return { ok: true, order, warnings: [] };
@@ -402,8 +405,44 @@ test('routed single-output first start awaits authorization after adapter policy
   assert.ok(starts[0].args.owenloopMcp.args.includes('/private/routed-holder.json'));
   assert.equal(starts[0].args.owenloopMcp.args.includes('--as'), false);
   assert.equal(starts[0].args.owenloopMcp.args.includes('acct-1'), false);
+  assert.equal(starts[0].args.verifiedFileCacheRoot, undefined);
   assert.equal(adapter.calls.filter(call => call.kind === 'deliver').length, 0);
   assert.equal(verbs(calls).includes('report_resolution'), false);
+});
+
+test('routed consumed file attaches only its published cache view to provider', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const pointer = { __file: 'orgs/o/artifacts/wf/files/routed/run/key',
+    hash: 'a'.repeat(64), size: 4, contentType: 'text/plain' };
+  const packet = agentOrder({ inputs: ['input'], consumes: { input: pointer },
+    owes: [{ path: 'out' }] });
+  const { hub } = mockHub({ getOrder: [packet,
+    agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter, routedFileCacheRoot: '/private/cache/verified',
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'm', effort: 'high' },
+      authorize: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'm', effort: 'high' },
+	expiresAt: 5_000 }) }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  const start = adapter.calls.find(call => call.kind === 'start');
+  if (start?.kind !== 'start') assert.fail('missing routed provider start');
+  assert.equal(start.args.verifiedFileCacheRoot, '/private/cache/verified');
+});
+
+test('routed consumed file without published cache refuses before authorization and provider', async () => {
+  const adapter = createFakeAdapter();
+  const packet = agentOrder({ inputs: ['input'], consumes: { input: {
+    __file: 'orgs/o/artifacts/wf/files/routed/run/key', hash: 'a'.repeat(64),
+    size: 4, contentType: 'text/plain' } }, owes: [{ path: 'out' }] });
+  const { hub } = mockHub({ getOrder: [packet] });
+  let authorized = false;
+  const h = buildOpts({ hub, adapter,
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'm', effort: 'high' },
+      authorize: async () => { authorized = true; throw new Error('unexpected authorize'); } }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(authorized, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start').length, 0);
 });
 
 test('routed authorization refusal starts no provider process', async () => {
