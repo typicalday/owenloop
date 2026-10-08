@@ -77,6 +77,8 @@ export interface ResolvedHostedStep extends ResolvedStep {
   callsProducers: Readonly<Record<string, VerifiedCallsProducer>>;
   /** From the same verified local publication as step and calls closure. */
   declaredInputs: readonly InputDef[];
+  /** Allowed run/escalation modifiers from this same verified publication. */
+  allowedModifiers?: readonly string[];
 }
 
 export interface InstructionResolver {
@@ -523,6 +525,7 @@ export function createStoreInstructionResolver(
 	  step: resolved.step,
 	  inputNames: resolved.definition.inputs.map((input) => input.name),
 	  declaredInputs: resolved.definition.inputs,
+	  allowedModifiers: resolved.definition.modifiers ?? [],
 	  callsProducers: calls.producers ?? {},
 	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
       };

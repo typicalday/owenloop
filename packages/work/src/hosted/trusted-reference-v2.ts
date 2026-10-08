@@ -14,7 +14,8 @@ const MAX_DEPTH = 64;
 const MAX_NODES = 50_000;
 const MAX_MS = 5_000;
 const ORDER_FIELDS = new Set(['workflow', 'run', 'step', 'key', 'index', 'defDigest', 'inputs', 'outputs',
-  'consumes', 'consumedFingerprint', 'consumesProof', 'consumesProofRelay', 'owes', 'workdir', 'cause']);
+  'consumes', 'consumedFingerprint', 'consumesProof', 'consumesProofRelay', 'owes', 'workdir', 'cause',
+  'capabilities', 'crews', 'reroutedFrom', 'modifier', 'escalated', 'model', 'worker', 'judge', 'spec', 'x']);
 const ENVELOPE_FIELDS = new Set(['protocol', 'state', 'workflow', 'run', 'order', 'inputs', 'workdirInput', 'lease']);
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const DIGEST = /^[a-f0-9]{64}$/i;
@@ -97,6 +98,25 @@ export function parseTrustedReferenceV2(raw: unknown, expected: { workflow: stri
     || (order.consumesProofRelay !== undefined && !rec(order.consumesProofRelay))
     || order.owes.some(owed => !rec(owed) || !exact(owed, new Set(['path', 'version']))
       || !pathName(owed.path) || !positive(owed.version))) throw new Error('trusted reference v2 order malformed');
+  for (const field of ['capabilities', 'crews', 'reroutedFrom']) {
+    if (!Object.hasOwn(order, field)) continue;
+    const value = order[field];
+    if (!Array.isArray(value) || value.length > MAX_PATHS
+      || value.some(entry => typeof entry !== 'string' || entry.length === 0)) {
+      throw new Error('trusted reference v2 offer malformed');
+    }
+  }
+  for (const field of ['modifier', 'model', 'worker', 'judge']) {
+    if (Object.hasOwn(order, field) && (typeof order[field] !== 'string' || order[field].length === 0)) {
+      throw new Error('trusted reference v2 offer malformed');
+    }
+  }
+  if (Object.hasOwn(order, 'escalated') && order.escalated !== true) {
+    throw new Error('trusted reference v2 offer malformed');
+  }
+  for (const field of ['spec', 'x']) {
+    if (Object.hasOwn(order, field) && !rec(order[field])) throw new Error('trusted reference v2 offer malformed');
+  }
   if (!Array.isArray(wire.inputs) || wire.inputs.length !== order.inputs.length) {
     throw new Error('trusted reference v2 witness set mismatch');
   }

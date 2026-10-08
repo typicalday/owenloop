@@ -34,6 +34,8 @@ test('strict v2 parser preserves absent witness and refuses malformed authority'
   bad(wire => { (wire.lease as { claimed: boolean }).claimed = false; });
   bad(wire => { wire.order.defDigest = 'wrong'; });
   bad(wire => { wire.order.inputs.push('unknown'); });
+  bad(wire => { (wire.order as unknown as Record<string, unknown>).crews = 'builders'; });
+  bad(wire => { (wire.order as unknown as Record<string, unknown>).escalated = false; });
   assert.throws(() => parseTrustedReferenceV2({ ...available(), protocol: 'trusted-reference-read-v1' }, expected));
   assert.throws(() => parseTrustedReferenceV2({ ...available(), extra: true }, expected));
   assert.deepEqual(parseTrustedReferenceV2({ protocol: 'trusted-reference-read-v2', state: 'unavailable', ...expected }, expected),
@@ -187,17 +189,46 @@ test('v2 admission refuses forged private modifier and roster fields absent from
       resolveHostedStep: async () => ({ ok: true, step, inputNames: ['optional'],
 	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
     consumedVerifier: async order => ({ ok: true, order, warnings: [] }) });
-  const privateOrder = { ...direct.order,
+  const privateOrder: typeof direct.order = { ...direct.order,
     owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
   assert.equal((await admission.observe(privateOrder)).ok, true);
   assert.deepEqual(await admission.observe({ ...privateOrder, modifier: 'deep' }),
-    { ok: false, reason: 'private-order-unwitnessed-field' });
-  assert.deepEqual(await admission.observe({ ...privateOrder, capabilities: ['build'], crews: ['other'] }),
-    { ok: false, reason: 'private-order-unwitnessed-field' });
-  assert.deepEqual(await admission.observe({ ...privateOrder, consumesProof: '{}' }),
     { ok: false, reason: 'private-order-v2-mismatch' });
+  assert.deepEqual(await admission.observe({ ...privateOrder, capabilities: ['build'], crews: ['other'] }),
+    { ok: false, reason: 'private-order-v2-mismatch' });
+  assert.equal((await admission.observe({ ...privateOrder, consumesProof: '{"optional":"human-advisory"}' })).ok, true);
+  assert.deepEqual(await admission.observe({ ...privateOrder, consumesProof: '{"producer":"forged"}' }),
+    { ok: false, reason: 'private-order-producer-proof-mismatch' });
   assert.deepEqual(await admission.observe({ ...privateOrder, workdir: '/forged' }),
     { ok: false, reason: 'private-order-v2-mismatch' });
+});
+
+test('authoritative v2 offer admits a locally allowed modifier and exact Service roster', async () => {
+  const direct = available();
+  direct.order.capabilities = ['build:deep'];
+  direct.order.crews = ['builders'];
+  direct.order.modifier = 'deep';
+  const local = { name: 'planner', consumes: [parseConsume('optional')], produces: [parseProduce('plan')],
+    capabilities: ['build'], escalation: { after: 2, modifier: 'deep' } } as StepDef;
+  const admission = createTrustedInputV2Admission({ reader: { read: async () => direct }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local, inputNames: ['optional'],
+	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {},
+	allowedModifiers: ['deep'] }) },
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }) });
+  const privateOrder: typeof direct.order = { ...direct.order,
+    owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  assert.equal((await admission.observe(privateOrder)).ok, true);
+  assert.deepEqual(await admission.observe({ ...privateOrder, crews: ['other'] }),
+    { ok: false, reason: 'private-order-v2-mismatch' });
+  direct.order.escalated = true;
+  privateOrder.escalated = true;
+  assert.equal((await admission.observe(privateOrder)).ok, true);
+  direct.order.modifier = 'unknown';
+  privateOrder.modifier = 'unknown';
+  assert.deepEqual(await admission.observe(privateOrder),
+    { ok: false, reason: 'local-offer-structure-mismatch' });
 });
 
 test('a real capability claim remains unsupported until Service v2 witnesses the offer', async () => {
@@ -221,6 +252,6 @@ test('a real capability claim remains unsupported until Service v2 witnesses the
       consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
     });
     assert.deepEqual(await admission.observe(privateOrder),
-      { ok: false, reason: 'private-order-unwitnessed-field' });
+      { ok: false, reason: 'private-order-v2-mismatch' });
   } finally { store.close(); }
 });

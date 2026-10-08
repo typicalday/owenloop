@@ -9,10 +9,31 @@ import { bindTrustedReferenceV2 } from './trusted-input-binding.ts';
 import type { TrustedInputWitness, TrustedReferenceV2Reader } from './trusted-reference-v2.ts';
 
 const MAX_OBSERVATION_MS = 5_000;
+const CLAIM_FACING_FIELDS = ['capabilities', 'crews', 'reroutedFrom', 'modifier', 'escalated',
+  'model', 'worker', 'judge', 'spec', 'x'] as const;
 const equal = (left: unknown, right: unknown): boolean => {
   try { return valueDigestHex(left) === valueDigestHex(right); }
   catch { return false; }
 };
+const record = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/** Ordinary get_order can carry advisory human provideProof. Only producer
+ * proof entries are authority; Service v2 deliberately omits the advisory. */
+function producerProofView(order: OrderPacket, declared: ReadonlySet<string>): unknown {
+  let proofs: unknown = {};
+  if (order.consumesProof !== undefined) {
+    try { proofs = JSON.parse(order.consumesProof) as unknown; }
+    catch { return undefined; }
+  }
+  if (!record(proofs)) return undefined;
+  const relay = order.consumesProofRelay ?? {};
+  if (!record(relay)) return undefined;
+  return {
+    proofs: Object.fromEntries(Object.entries(proofs).filter(([path]) => !declared.has(path))),
+    relay: Object.fromEntries(Object.entries(relay).filter(([path]) => !declared.has(path))),
+  };
+}
 
 export type TrustedInputAdmission = {
   ok: true;
@@ -49,8 +70,8 @@ export function createTrustedInputV2Admission(args: {
       inputs: order.inputs, outputs: order.outputs, consumes: order.consumes,
       consumedFingerprint: order.consumedFingerprint ?? null, workdir: order.workdir ?? null,
       cause: order.cause ?? null,
-      consumesProof: Object.hasOwn(order, 'consumesProof') ? order.consumesProof : null,
-      consumesProofRelay: Object.hasOwn(order, 'consumesProofRelay') ? order.consumesProofRelay : null,
+      offer: Object.fromEntries(CLAIM_FACING_FIELDS.filter(field => Object.hasOwn(order, field))
+	.map(field => [field, (order as unknown as Record<string, unknown>)[field]])),
       owes: order.owes.map(owed => ({ path: owed.path, version: owed.version ?? null })),
     });
     if (!equal(dynamic(privateOrder), dynamic(direct))
@@ -58,10 +79,9 @@ export function createTrustedInputV2Admission(args: {
         || owed.schemaRejects !== 0 || owed.proof !== undefined || owed.previousValue !== undefined)) {
       return refused('private-order-v2-mismatch');
     }
-    // These provider-facing fields are absent from the Service v2 projection.
-    // A replaceable ordinary HubClient response cannot supply them by itself.
-    if (['modifier', 'capabilities', 'crews', 'escalated', 'model', 'judge', 'routing',
-      'reroutedFrom', 'spec', 'x'].some(field => Object.hasOwn(privateOrder, field))) {
+    // Still refuse private fields outside the exact v2 projection. Routing is
+    // separately fenced by Service v2 until its own signed protocol is ready.
+    if (['routing'].some(field => Object.hasOwn(privateOrder, field))) {
       return refused('private-order-unwitnessed-field');
     }
     if (!args.instructions.resolveHostedStep) return refused('local-definition-verifier-unavailable');
@@ -69,6 +89,23 @@ export function createTrustedInputV2Admission(args: {
     try { step = await args.instructions.resolveHostedStep(direct); }
     catch { return refused('local-definition-verifier-unavailable'); }
     if (!step.ok) return refused(`local-definition-${step.kind}`);
+    const local = step.step;
+    if (!equal(privateOrder.model ?? null, local.model ?? null)
+      || !equal(privateOrder.judge ?? null, local.judges ?? null)
+      || !equal(privateOrder.spec ?? null, local.spec ?? null)
+      || !equal(privateOrder.x ?? null, local.x ?? null)
+      || (privateOrder.modifier !== undefined && !step.allowedModifiers?.includes(privateOrder.modifier))
+      || (privateOrder.escalated === true && local.escalation?.modifier !== privateOrder.modifier)
+      || ((local.capabilities?.length ?? 0) > 0 && (!privateOrder.capabilities?.length || !privateOrder.crews?.length))
+      || ((local.capabilities?.length ?? 0) === 0 && (privateOrder.capabilities?.length ?? 0) > 0)) {
+      return refused('local-offer-structure-mismatch');
+    }
+    const declared = new Set(step.declaredInputs.map(input => input.name));
+    const privateProof = producerProofView(privateOrder, declared);
+    const directProof = producerProofView(direct, declared);
+    if (privateProof === undefined || directProof === undefined || !equal(privateProof, directProof)) {
+      return refused('private-order-producer-proof-mismatch');
+    }
     if ((step.step.executor === 'command' ? privateOrder.worker !== 'command'
       : privateOrder.worker !== undefined && privateOrder.worker !== 'agent')) {
       return refused('private-order-worker-mismatch');
