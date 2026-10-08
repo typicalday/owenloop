@@ -67,6 +67,18 @@ test('current nested pointer is fully staged before a command receives its path 
   });
 });
 
+test('a routed command with no present file pointer keeps an empty side map', async () => {
+  await withBase(async base => {
+    const submitted = order({ 'seed.value': { text: 'ordinary JSON' } });
+    const { child, seen } = client(submitted);
+    const result = await materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base });
+    assert.equal(result.envValue, '[]');
+    assert.deepEqual(seen, []);
+    assert.deepEqual(readdirSync(base), []);
+    await result.cleanup();
+  });
+});
+
 test('stale or released current order refuses before download and leaves no cache', async () => {
   await withBase(async base => {
     const submitted = order();
