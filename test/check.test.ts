@@ -4,8 +4,8 @@
  * Part 1: Differential conformance — the SAME firing sequences are driven through
  *   both the real Engine on openStore(':memory:') AND through applyOutcome/settleInMemory,
  *   then asserted for per-artifact field equality on { acceptance, version,
- *   judgmentRejects, schemaRejects, fingerprint }. This proves the checker's
- *   verdicts are trustworthy.
+ *   judgmentRejects, schemaRejects, fingerprint }. These are selected
+ *   transition checks, not a proof of general checker soundness.
  *
  * Part 2: modelCheck unit tests — stall states, true deadlocks, stuck, completable, dead steps.
  *

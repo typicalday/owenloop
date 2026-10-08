@@ -1133,7 +1133,7 @@ export interface CheckStep {
     | 'group-reject';
   /** Number of members in a collection-emit transition. */
   count?: number;
-  /** Concrete owned output targeted by a mixed producer's same-run action. */
+  /** Concrete target of a mixed producer action or consumer judgment rejection. */
   path?: string;
   /** Accepted bind value selected by this commit or applied by final judge approval. */
   selectedModifier?: string;

@@ -68,7 +68,7 @@ import {
 import type { DefLoadFailure } from './defs.ts';
 import { implementsIssues } from './implements.ts';
 import { createDefInstructionSource } from './order-resolver.ts';
-import type { CheckReport, WorkflowDef } from './types.ts';
+import type { CheckReport, CheckStep, WorkflowDef } from './types.ts';
 import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
 import { packageVersion } from './package-version.ts';
 import {
@@ -2378,6 +2378,8 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       print(io, report);
     } else {
       // text format
+      const formatCheckStep = (step: CheckStep): string =>
+	`${step.step}/${step.outcome}${step.outcome === 'judgment-reject' && step.path ? `(${step.path})` : ''}`;
       const definiteDefect = hasDefiniteCheckDefect(report);
       const status = definiteDefect ? 'DEFECTS FOUND'
 	: report.bounded || report.coverageIncomplete.length > 0 || !report.completable
@@ -2410,7 +2412,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out('');
 		io.out(`Stall states (expected — retryable brakes / future idle waits) (${report.stallStates.length}):`);
         for (const s of report.stallStates) {
-          io.out(`  path: ${s.path.map((p) => `${p.step}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
+	  io.out(`  path: ${s.path.map(formatCheckStep).join(' -> ') || '(initial state)'}`);
         }
       }
       if (report.deadlocks.length > 0) {
@@ -2419,7 +2421,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 	  ? `Finite-model no-move states (runtime coverage incomplete) (${report.deadlocks.length}):`
 	  : `True deadlocks (no path to completion at unlimited attempts) (${report.deadlocks.length}):`);
         for (const d of report.deadlocks) {
-          io.out(`  path: ${d.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+	  io.out(`  path: ${d.path.map(formatCheckStep).join(' -> ') || '(initial state)'}`);
         }
       }
       if (strictInputs) {
@@ -2445,7 +2447,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out('');
         io.out(`Stuck states (brake tripped; other branches still moving — informational) (${report.stuck.length}):`);
         for (const s of report.stuck) {
-          io.out(`  path: ${s.path.map((p) => `${p.step}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
+	  io.out(`  path: ${s.path.map(formatCheckStep).join(' -> ') || '(initial state)'}`);
         }
       }
       if (report.invariantViolations.length > 0) {
@@ -2453,7 +2455,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out(`Invariant violations (${report.invariantViolations.length}):`);
         for (const v of report.invariantViolations) {
           io.out(`  invariant: ${v.invariant}`);
-          io.out(`  path: ${v.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+	  io.out(`  path: ${v.path.map(formatCheckStep).join(' -> ') || '(initial state)'}`);
         }
       }
       if (report.structurallyDeadSteps.length > 0) {
