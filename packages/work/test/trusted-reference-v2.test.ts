@@ -128,6 +128,16 @@ test('local v2 gate admits optional absence/present human input while keeping pr
   changed.inputs[0]!.value = { choice: 'forged' };
   assert.deepEqual(await gate(parseTrustedReferenceV2(changed, expected) as TrustedReferenceV2),
     { ok: false, reason: 'witness-value-mismatch' });
+  const extraAbsent = structuredClone(raw);
+  extraAbsent.order.inputs.push('unconsumed-optional');
+  extraAbsent.order.consumedFingerprint!['unconsumed-optional'] = 1;
+  extraAbsent.inputs.push({ path: 'unconsumed-optional', version: 1, present: false });
+  const extraGate = await bindTrustedReferenceV2({ response: parseTrustedReferenceV2(extraAbsent, expected) as TrustedReferenceV2,
+    expected: { ...expected, defDigest: 'a'.repeat(64), step: 'planner', key: '' }, step,
+    declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false },
+      { name: 'unconsumed-optional', producer: 'human', seedOwed: false }], callsProducers: {},
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }) });
+  assert.deepEqual(extraGate, { ok: false, reason: 'order-structure-mismatch' });
 });
 
 test('local v2 gate retains map/cause structure and unconsumed dotted cwd source', async () => {

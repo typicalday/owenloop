@@ -38,7 +38,7 @@ function validConsumedShape(step: StepDef, order: OrderPacket, allowAbsent: bool
     if (!(step.on ?? ['inputsGreen']).includes('inputsGreen')) return false;
   } else if ((order.cause !== 'allGreen' && order.cause !== 'idle')
     || !step.on?.includes(order.cause) || expected.size !== 0) return false;
-  return delivered.every((path) => step.consumes.some((pattern) => {
+  return [...expected].every((path) => step.consumes.some((pattern) => {
     if (pattern.mode === 'reduce' && path === sealPath(pattern.stem)) return true;
     const matched = matchConsume(pattern, path);
     return matched !== null && (pattern.mode !== 'map' || matched.index === order.index);
