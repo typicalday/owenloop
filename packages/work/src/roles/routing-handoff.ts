@@ -69,6 +69,10 @@ export function consumeRoutingHandoff(args: {
       || Object.hasOwn(p, 'credential')
       || typeof p.sessionId !== 'string' || !/^rs_[a-f0-9-]{36}$/.test(p.sessionId)
       || typeof p.shiftId !== 'string' || !p.shiftId.startsWith('shf_')
+      || (p.workRoot !== undefined && (typeof p.workRoot !== 'string'
+	|| !isAbsolute(p.workRoot) || normalize(p.workRoot) !== p.workRoot))
+      || (p.workRepo !== undefined && (typeof p.workRepo !== 'string'
+	|| !isAbsolute(p.workRepo) || normalize(p.workRepo) !== p.workRepo))
       || (p.broker !== undefined && (!p.broker || typeof p.broker !== 'object'
 	|| typeof p.broker.socketPath !== 'string' || !isAbsolute(p.broker.socketPath)
 	|| normalize(p.broker.socketPath) !== p.broker.socketPath

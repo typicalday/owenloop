@@ -77,7 +77,8 @@ test('role startup consumes an incomplete private handoff before any legacy effe
   const now = Date.now();
   const calls: string[] = [];
   try {
-    const session = await openShiftRoutingSession({ stateDir: root, origin, orgId: 'org', principalId: 'actor',
+    const session = await openShiftRoutingSession({ stateDir: root, workRoot: join(root, 'work'),
+      origin, orgId: 'org', principalId: 'actor',
       scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
       fetchImpl: (async (url, init) => {
 	const verb = String(url).split('/').at(-1)!;
@@ -92,6 +93,7 @@ test('role startup consumes an incomplete private handoff before any legacy effe
       workflow: 'wf', run, childKind: kind, reservedAt: now,
     }).reservation;
     const agent = session.createHandoff(reserve('agent', 'agent-run'));
+    assert.equal(JSON.parse(readFileSync(agent.path, 'utf8')).workRoot, join(root, 'work'));
     mkdirSync(join(root, '.owenloop'), { recursive: true });
     writeFileSync(join(root, '.owenloop', 'settings.json'), '{malformed-json');
     const env: Record<string, string | undefined> = { HOME: root, OWENLOOP_ROUTING_HANDOFF: agent.path,
@@ -192,6 +194,15 @@ test('handoff refuses wrong target, malformed session identity, and expired auth
       target: { workflow: 'wf', run: 'session' }, kind: 'agent-run', now: () => now }), /refused/);
     assert.equal(existsSync(wrongSession.path), false);
     wrongSession.terminal();
+
+    const wrongRoot = handoff('root');
+    const rootPayload = JSON.parse(readFileSync(wrongRoot.path, 'utf8'));
+    rootPayload.workRoot = 'relative/work';
+    writeFileSync(wrongRoot.path, JSON.stringify(rootPayload));
+    assert.throws(() => consumeRoutingHandoff({ env: { OWENLOOP_ROUTING_HANDOFF: wrongRoot.path }, origin,
+      target: { workflow: 'wf', run: 'root' }, kind: 'agent-run', now: () => now }), /refused/);
+    assert.equal(existsSync(wrongRoot.path), false);
+    wrongRoot.terminal();
 
     const legacyCredential = handoff('legacy');
     const legacyPayload = JSON.parse(readFileSync(legacyCredential.path, 'utf8'));

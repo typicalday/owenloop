@@ -666,7 +666,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       if (!['token', 'oauth'].includes(principal.authMethod) || principal.tokenStatus !== 'active') {
 	throw new Error('routing requires an enrolled bearer');
       }
-      routingSession = await openShiftRoutingSession({ origin, stateDir, monotonicNow, routingBackoff,
+      routingSession = await openShiftRoutingSession({ origin, stateDir, workRoot: resolve(workRoot),
+	...(workRepo ? { workRepo: resolve(workRepo) } : {}),
+	monotonicNow, routingBackoff,
 	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
 	onMaintenanceError: () => process.stderr.write(`${roleLabel}: parked routing session maintenance failed\n`),
 	onDrained: () => { void routingBroker?.close(); },
@@ -935,6 +937,10 @@ export interface RoutingHandoffV1 {
   holderBroker?: { socketPath: string; cap: string };
   /** Private signed snapshot. No bearer, signer or operator HOME path. */
   definitionStage?: { path: string; digest: string };
+  /** Shift-resolved default agent work root; never derived from public stage. */
+  workRoot?: string;
+  /** Shift-resolved git worktree source, when configured. */
+  workRepo?: string;
   reservation: ChildReservation; createdAt: number; expiresAt: number; sessionExpiresAt: number;
 }
 export interface RoutingHandoff {
@@ -1058,6 +1064,7 @@ export function createRoutingBackoff(monotonicNow: () => number = () => performa
  * MCP argument, persisted dispatch event, global env variable or log payload. */
 interface ShiftRoutingSessionOptions {
   stateDir: string; origin: string; orgId: string; principalId: string; scope: RoutingScope;
+  workRoot?: string; workRepo?: string;
   getToken: () => Promise<string>; fetchImpl?: typeof fetch; now?: () => number; nonce?: () => string;
   monotonicNow?: () => number;
   routingBackoff?: ReturnType<typeof createRoutingBackoff>;
@@ -1274,6 +1281,10 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
       if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)
 	|| !readChildReservations(opts.stateDir).some(r => r.token === reservation.token
 	  && r.workflow === reservation.workflow && r.run === reservation.run && r.reservedAt === reservation.reservedAt)) throw new Error('routing reservation unavailable');
+      if (opts.workRoot !== undefined && resolve(opts.workRoot) !== opts.workRoot)
+	throw new Error('routing work root unavailable');
+      if (opts.workRepo !== undefined && resolve(opts.workRepo) !== opts.workRepo)
+	throw new Error('routing work repo unavailable');
       ensureIncarnation();
       const nonce = (opts.nonce ?? (() => randomBytes(16).toString('hex')))();
       if (!/^[a-f0-9]{32}$/.test(nonce) || !sameInode(privateDirectory(directory), directoryInode)) throw new Error('routing handoff ownership refused');
@@ -1281,6 +1292,8 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
       const createdAt = now();
       const payload: RoutingHandoffV1 = { version: 'routing-handoff-v1', incarnation, nonce,
 	origin: opts.origin, orgId: opts.orgId, sessionId: authority.sessionId, shiftId: authority.shiftId,
+	...(opts.workRoot ? { workRoot: opts.workRoot } : {}),
+	...(opts.workRepo ? { workRepo: opts.workRepo } : {}),
 	...(broker ? { broker: { socketPath: broker.socketPath, cap: broker.cap },
 	  ...(broker.holder ? { holderBroker: broker.holder } : {}) } : {}),
 	...(definitionStage ? { definitionStage: { path: definitionStage.path, digest: definitionStage.digest } } : {}),
