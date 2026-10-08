@@ -90,7 +90,7 @@ test('Claude routed Read can open only a complete immutable file; other paths an
 
 test('cache custody refuses a shared or substituted base before exposing an adapter path', async () => {
   const shared = mkdtempSync(join(tmpdir(), 'ol-rfc-shared-'));
-  chmodSync(shared, 0o777);
+  chmodSync(shared, 0o1777);
   try { assert.throws(() => allocateRoutedFileCache(shared), /base is not private/); }
   finally { rmSync(shared, { recursive: true, force: true }); }
 });
