@@ -31,7 +31,8 @@
     "automation"
   ],
   "bin": {
-    "owenloop": "bin/owenloop.mjs"
+    "owenloop": "bin/owenloop.mjs",
+    "owenloop-routing-helper-build": "bin/owenloop-routing-helper-build.mjs"
   },
   "exports": {
     ".": {
@@ -42,6 +43,7 @@
   "files": [
     "dist",
     "bin",
+    "native/routing-file-open.c",
     "examples/workflows",
     "plugins/claude-code",
     "plugins/codex",
@@ -62,7 +64,9 @@
     "clean": "rm -rf dist",
     "materialize:plugins": "node scripts/materialize-plugins.mjs",
     "build": "npm run clean && tsc -p tsconfig.build.json",
-    "pretest": "npm run build",
+    "build:routing-helper": "node bin/owenloop-routing-helper-build.mjs",
+    "pretest": "npm run build && node bin/owenloop-routing-helper-build.mjs --if-supported",
+    "pretest:quiet": "node bin/owenloop-routing-helper-build.mjs --if-supported",
     "check": "npm run typecheck && npm run lint && npm run build && npm run test:quiet",
     "prepack": "npm run build",
     "prepublishOnly": "npm run check"

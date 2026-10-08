@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,7 @@ import { test } from 'node:test';
 import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
 import { createRoutingHolderClient } from '../src/hub/routing-holder-client.ts';
+import { openRoutedFileSource } from '../src/hub/routed-file-source.ts';
 import type { DecisionBindingV1, ReferenceRouting } from '../src/hub/types.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
@@ -376,7 +378,9 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
     assert.ok(grant.holder);
     grant.activate(agentRecord);
     const role = createRoutingChildClient(handoffFor(grant, agentReservation));
-    const holderClient = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder });
+    const holderClient = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder }, {
+      openRoot: workdir => open(workdir, 'r'),
+    });
     const sessionHolder = { kind: 'session' as const, id: sessionId, shiftId: identity.shiftId };
     await holderClient.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder });
     assert.equal((await holderClient.ask({ workflow: 'wf', run: 'run', path: 'out', question: 'Need a value?' })).closed, true);
@@ -453,6 +457,51 @@ test('revoking a holder grant aborts an in-flight streamed upload', async () => 
   } finally { await broker.close(); }
 });
 
+test('holder upload waits for a delayed helper exit after broker acknowledges exact bytes', async () => {
+  const fileRoot = mkdtempSync(join(tmpdir(), 'owenloop-routing-helper-root-'));
+  const helperRoot = mkdtempSync(join(tmpdir(), 'owenloop-routing-helper-bin-'));
+  const executable = join(helperRoot, 'delayed-helper');
+  writeFileSync(executable,
+    '#!/bin/sh\nprintf "OK 6\\n" >&4\nprintf inside\n/bin/sleep 0.25\nexit 0\n', { mode: 0o755 });
+  const reserved = { ...reservation, childKind: 'agent-run' as const, token: 'e'.repeat(32) };
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      if (String(url).endsWith('/get_order')) return Response.json(orderResponse);
+      if (String(url).includes('routing_file_artifacts')) {
+	let size = 0;
+	for await (const part of init?.body as AsyncIterable<Uint8Array>) size += part.byteLength;
+	assert.equal(size, 6);
+	return Response.json({ text: 'stored',
+	  __file: 'orgs/org/artifacts/wf/files/routed/run/12345678-1234-4123-8123-123456789abc',
+	  hash: 'a'.repeat(64), size, contentType: 'text/plain' });
+      }
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder);
+    grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
+    const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder }, {
+      helperPath: executable, openRoot: workdir => open(workdir, 'r'),
+    });
+    await client.getOrder({ workflow: 'wf', run: 'run',
+      holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+    const started = Date.now();
+    const pointer = await client.uploadFile({ workflow: 'wf', workdir: fileRoot,
+      file: 'artifact', contentType: 'text/plain' });
+    assert.equal(pointer.size, 6);
+    assert.ok(Date.now() - started >= 160, 'the accepted broker reply waits for helper EOF');
+    grant.terminal();
+  } finally {
+    await broker.close();
+    rmSync(fileRoot, { recursive: true, force: true });
+    rmSync(helperRoot, { recursive: true, force: true });
+  }
+});
+
 test('routed holder refuses a file when an ancestor changes after open', async () => {
   const base = mkdtempSync(join(tmpdir(), 'owenloop-routing-swap-'));
   const root = join(base, 'root'), safe = join(root, 'safe'), outside = join(base, 'outside');
@@ -476,7 +525,8 @@ test('routed holder refuses a file when an ancestor changes after open', async (
     assert.ok(grant.holder);
     grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
     const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder }, {
-      afterFileOpen() {
+      openRoot: workdir => open(workdir, 'r'),
+      afterRootOpen() {
 	renameSync(safe, join(root, 'moved'));
 	symlinkSync(outside, safe, 'dir');
       },
@@ -490,20 +540,23 @@ test('routed holder refuses a file when an ancestor changes after open', async (
   } finally { await broker.close(); rmSync(base, { recursive: true, force: true }); }
 });
 
-test('routed holder refuses a same-path replacement after opening the file inode', async () => {
+test('routed helper opens the final file under the held root after a same-path replacement', async () => {
   const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-inode-'));
   const file = join(root, 'artifact.bin');
   writeFileSync(file, 'original');
   try {
-    const client = createRoutingHolderClient({ workflow: 'wf', run: 'run',
-      broker: { socketPath: join(root, 'missing.sock'), cap: 'a'.repeat(64) } }, {
-      afterFileOpen() {
+    const source = await openRoutedFileSource({ workdir: root, file: 'artifact.bin' }, {
+      openRoot: workdir => open(workdir, 'r'),
+      afterRootOpen() {
 	renameSync(file, join(root, 'old.bin'));
 	writeFileSync(file, 'replacement');
       },
     });
-    await assert.rejects(client.uploadFile({ workflow: 'wf', workdir: root,
-      file: 'artifact.bin', contentType: 'application/octet-stream' }), /file-artifact-outside-workdir/);
+    const parts: Buffer[] = [];
+    for await (const part of source.chunks) parts.push(Buffer.from(part));
+    await source.complete();
+    source.close();
+    assert.equal(Buffer.concat(parts).toString(), 'replacement');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

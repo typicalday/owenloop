@@ -566,10 +566,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'file-artifact-invalid: filename must be a non-empty string when present' }, true);
       }
       try {
-        // Same two-phase containment as a submit value file, under this tool's
-        // own error family: the working directory is the only root a step's
-        // outputs may come from, and a symlink out of it is an exfiltration
-        // path, not a convenience.
+        // Ordinary uploads use the contained-path check. Routed uploads open
+        // relative to the holder's pinned workdir FD through the native helper,
+        // so an ancestor symlink swap cannot redirect the file read.
 	const resolved = deps.uploadFile ? file : await resolveContainedPath(deps.workdir, file, 'file-artifact');
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);

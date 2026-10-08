@@ -300,6 +300,16 @@ That protocol boundary does not isolate processes running under the same OS
 user ID; hostile child code needs a separate OS isolation design before such
 an isolation claim can be made.
 
+Routed holder file uploads require a server administrator to run
+`owenloop-routing-helper-build` from a trusted package installation on macOS
+or Linux with a C compiler. This builds the packaged, read-only native opener
+for that server's architecture. The package and helper executable must remain
+outside the workflow's writable directory and under operator-controlled file
+permissions. A missing helper refuses the routed upload; ordinary installs
+never compile it. The opener starts from a held working-directory descriptor,
+so its authority follows that directory object if a pathname is renamed. It
+does not assert where the object appears in the current filesystem namespace.
+
 The `shift start` positional argument is a **crew** name. The routing API calls
 that field a **crew**: `serve_crews` contains the selected crew names. Passing
 `--all` maps to an empty `serve_crews` list, which means all crews available to

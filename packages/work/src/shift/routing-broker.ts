@@ -3,7 +3,7 @@
  * credentials; a child receives only a random, one-dispatch socket capability.
  * No caller may choose a URL, header, verb, workflow, run or session.
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, lstatSync, mkdtempSync, rmdirSync, unlinkSync, type Stats } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { PassThrough } from 'node:stream';
@@ -11,7 +11,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingHubClient } from '../hub/client.ts';
-import { HubError, type ContactHolder, type GetOrderResponse, type LaunchReportV1,
+import { HubError, type ContactHolder, type FileArtifactPointer, type GetOrderResponse, type LaunchReportV1,
   type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse } from '../hub/types.ts';
 import type { ChildRecord, ChildReservation } from './state.ts';
 
@@ -37,6 +37,7 @@ interface Grant {
   execHolderId?: string;
   allowedPaths?: Set<string>;
   consumedPaths?: Set<string>;
+  consumedFiles?: Map<string, FileArtifactPointer>;
   uploadControllers: Set<AbortController>;
   reservation: ChildReservation;
   routing: ReferenceRouting;
@@ -143,6 +144,29 @@ function validOrderResponse(grant: Grant, value: unknown): value is GetOrderResp
     && Array.isArray(order.outputs) && order.outputs.every(path => typeof path === 'string');
 }
 
+function consumedFiles(response: GetOrderResponse): Map<string, FileArtifactPointer> {
+  const found = new Map<string, FileArtifactPointer>();
+  const order = response.order;
+  if (!response.lease.claimed || !order || !Array.isArray(order.inputs)
+    || !order.consumes || typeof order.consumes !== 'object') return found;
+  const walk = (path: string, value: unknown, depth: number): void => {
+    if (depth > 32 || !value || typeof value !== 'object') return;
+    const row = value as Record<string, unknown>;
+    if (typeof row.__file === 'string' && typeof row.hash === 'string'
+      && /^[a-f0-9]{64}$/.test(row.hash) && typeof row.size === 'number'
+      && Number.isSafeInteger(row.size) && row.size > 0 && row.size <= MAX_FILE
+      && typeof row.contentType === 'string' && row.contentType.length > 0) {
+      found.set(`${path}\0${row.__file}`, row as unknown as FileArtifactPointer);
+      return;
+    }
+    if (Array.isArray(value)) for (const item of value) walk(path, item, depth + 1);
+    else for (const item of Object.values(row)) walk(path, item, depth + 1);
+  };
+  for (const path of order.inputs) if (Object.hasOwn(order.consumes, path))
+    walk(path, order.consumes[path], 0);
+  return found;
+}
+
 async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, launch = false): Promise<T> {
   const valid = () => grant.ready && (launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now()));
   try {
@@ -176,6 +200,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       grant.consumedPaths = order && response.lease.claimed && order.consumes
 	&& typeof order.consumes === 'object' && !Array.isArray(order.consumes)
 	? new Set(Object.keys(order.consumes)) : undefined;
+      grant.consumedFiles = consumedFiles(response);
       return response;
     }
     case 'read_routing_claim':
@@ -410,6 +435,73 @@ export async function createRoutingBroker(args: { now?: () => number;
 	    || !CAP.test(request.cap) || typeof request.method !== 'string') throw new Error();
 	  const entry = grants.get(request.cap);
 	  if (!entry || closed) throw new Error();
+	  if (request.method === 'download_file') {
+	    if (tail.length > 0 || !entry.grant.ready || !validateSessionGrant(entry.grant, now())
+	      || !exactKeys(request.body, ['path', 'pointer'])
+	      || typeof request.body.path !== 'string' || !request.body.path
+	      || !request.body.pointer || typeof request.body.pointer !== 'object'
+	      || typeof (request.body.pointer as { __file?: unknown }).__file !== 'string') throw new Error();
+	    const grant = entry.grant;
+	    const pointer = request.body.pointer as FileArtifactPointer;
+	    const pinned = grant.consumedFiles?.get(`${request.body.path}\0${pointer.__file}`);
+	    if (!pinned || !isDeepStrictEqual(pinned, pointer)) throw new Error();
+	    let started = false;
+	    let source: import('node:stream').Readable | undefined;
+	    grant.uploadControllers.add(controller);
+	    const timer = setTimeout(() => controller.abort(), UPLOAD_ABSOLUTE_MS);
+	    timer.unref();
+	    socket.setTimeout(UPLOAD_IDLE_MS, () => controller.abort());
+	    controller.signal.addEventListener('abort', () => { source?.destroy(); socket.destroy(); }, { once: true });
+	    const drain = () => new Promise<void>((resolve, reject) => {
+	      const ready = () => { socket.off('close', gone); resolve(); };
+	      const gone = () => { socket.off('drain', ready); reject(new Error('routing broker closed')); };
+	      socket.once('drain', ready);
+	      socket.once('close', gone);
+	    });
+	    try {
+	      let result: Awaited<ReturnType<typeof grant.hub.routingGetFileArtifact>>;
+	      try {
+	        result = await grant.hub.routingGetFileArtifact({
+	          workflow: grant.reservation.workflow, run: grant.reservation.run,
+	          key: pointer.__file, pointer,
+	        }, controller.signal);
+	      } catch (error) {
+	        if (!grant.ready || !validateSessionGrant(grant, now())) throw new Error('routing broker grant expired');
+	        throw error;
+	      }
+	      source = result.body;
+	      source?.on('error', () => {});
+	      if (!grant.ready || !validateSessionGrant(grant, now()) || controller.signal.aborted)
+	        throw new Error('routing broker grant expired');
+	      if (!source || typeof source.destroy !== 'function' || result.size !== pointer.size
+	        || result.contentType !== pointer.contentType) throw new Error('routing broker response refused');
+	      const header = JSON.stringify({ ok: true, size: result.size, contentType: result.contentType }) + '\n';
+	      started = true;
+	      if (!socket.write(header)) await drain();
+	      let sent = 0;
+	      const hash = createHash('sha256');
+	      for await (const chunk of source) {
+	        if (!validateSessionGrant(grant, now()) || controller.signal.aborted) throw new Error('routing broker grant expired');
+	        if (!(chunk instanceof Uint8Array) || sent + chunk.byteLength > pointer.size)
+	          throw new Error('routing broker file length refused');
+	        sent += chunk.byteLength;
+	        hash.update(chunk);
+	        if (!socket.write(chunk)) await drain();
+	      }
+	      if (sent !== pointer.size || hash.digest('hex') !== pointer.hash
+	        || !validateSessionGrant(grant, now()) || controller.signal.aborted)
+	        throw new Error('routing broker file digest refused');
+	      socket.end();
+	    } catch (error) {
+	      if (started) socket.destroy();
+	      else refuse(error);
+	    } finally {
+	      clearTimeout(timer);
+	      grant.uploadControllers.delete(controller);
+	      source?.destroy();
+	    }
+	    return;
+	  }
 	  if (request.method === 'upload_file') {
 	    if (newline > MAX_UPLOAD_HEADER || entry.scope !== 'holder'
 	      || entry.grant.reservation.childKind !== 'agent-run'

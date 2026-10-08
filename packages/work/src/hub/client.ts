@@ -22,7 +22,7 @@
  * No retries/backoff and no token refresh in C1 — the roles own their retry
  * policy later, and oauth-kind token refresh stays inside owenloop.
  */
-import type { Readable } from 'node:stream';
+import { Readable } from 'node:stream';
 import { HubError } from './types.ts';
 import type {
   AnswerApprovalRequest,
@@ -44,6 +44,7 @@ import type {
   PresencePingResponse,
   PutFileArtifactRequest,
   PutFileArtifactResponse,
+  FileArtifactPointer,
   ReleaseRequest,
   ReleaseResponse,
   RejectRequest,
@@ -181,6 +182,8 @@ export interface RoutingHubClient extends HubClient {
   routingRequestApproval(req: RequestApprovalRequest, signal?: AbortSignal): Promise<RequestApprovalResponse>;
   routingPutFileArtifact(req: { workflow: string; run: string; body: Readable; size: number;
     contentType: string; filename?: string }, signal?: AbortSignal): Promise<PutFileArtifactResponse>;
+  routingGetFileArtifact(req: { workflow: string; run: string; key: string;
+    pointer: FileArtifactPointer }, signal?: AbortSignal): Promise<{ body: Readable; size: number; contentType: string }>;
   openRoutingSession(req: { scope?: RoutingScope }, signal?: AbortSignal): Promise<RoutingSessionOpenResponse>;
   renewRoutingSession(signal?: AbortSignal): Promise<RoutingSessionRenewResponse>;
   closeRoutingSession(signal?: AbortSignal): Promise<{ closed: true }>;
@@ -317,6 +320,48 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     }
   }
 
+  async function scopedFileArtifactRead(req: { workflow: string; run: string; key: string;
+    pointer: FileArtifactPointer }, signal?: AbortSignal): Promise<{ body: Readable; size: number; contentType: string }> {
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password
+      || !req.workflow || !req.run || !req.key || req.pointer.__file !== req.key
+      || !Number.isSafeInteger(req.pointer.size) || req.pointer.size <= 0 || req.pointer.size > 500_000_000
+      || !/^[a-f0-9]{64}$/.test(req.pointer.hash)) throw new Error('routing file artifact refused');
+    const session = routing.get();
+    if (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
+      throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      headers['X-Owenloop-Routing-Session'] = session.credential;
+      routing.beforeRequest?.();
+      const url = `${base}/api/routing_file_artifacts/v1?workflow=${encodeURIComponent(req.workflow)}`
+        + `&run=${encodeURIComponent(req.run)}&key=${encodeURIComponent(req.key)}`;
+      const res = await fetchImpl(url, { method: 'GET', headers, redirect: 'error',
+        ...(signal === undefined ? {} : { signal }) });
+      if (!res.ok) {
+        const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+        if (error.status === 429) routing.onRateLimit?.(error);
+        throw error;
+      }
+      const size = Number(res.headers.get('Content-Length'));
+      const contentType = res.headers.get('Content-Type');
+      const hash = res.headers.get('X-File-Hash');
+      if (!res.body || !Number.isSafeInteger(size) || size !== req.pointer.size
+        || contentType !== req.pointer.contentType || hash !== req.pointer.hash) {
+        void res.body?.cancel().catch(() => {});
+        throw new Error('routing file artifact response refused');
+      }
+      return { body: Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), size, contentType };
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
   async function get<T>(verb: string, query?: string, signal?: AbortSignal): Promise<T> {
     if (opts.routingSession) {
       let origin: URL;
@@ -386,6 +431,7 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     routingReject: (req, signal) => scopedPost('routing_reject/v1', req, signal),
     routingRequestApproval: (req, signal) => scopedPost('routing_request_approval/v1', req, signal),
     routingPutFileArtifact: (req, signal) => scopedFileArtifact(req, signal),
+    routingGetFileArtifact: (req, signal) => scopedFileArtifactRead(req, signal),
     assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
     // Hosted-holder preflight only. Routing orders return routing-unsupported;
     // get_order plus read_routing_claim supply Jev authority instead.

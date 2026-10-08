@@ -1,7 +1,8 @@
 /** Narrow routed-child RPC client. It has no bearer, session key, URL or
  * generic Hub verb API; Shift binds every request at the private broker. */
+import { createHash } from 'node:crypto';
 import { createConnection } from 'node:net';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
   type LaunchReportV1, type LaunchReportResponse, type LaunchReservationRequestV1,
@@ -10,7 +11,7 @@ import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRe
   type AskRequest, type AskResponse, type RejectRequest, type RejectResponse,
   type RequestApprovalRequest, type RequestApprovalResponse,
   type InvocationBindingReadRequest, type InvocationBindingReadResponse,
-  type PutFileArtifactRequest, type PutFileArtifactResponse } from './types.ts';
+  type PutFileArtifactRequest, type PutFileArtifactResponse, type FileArtifactPointer } from './types.ts';
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -18,6 +19,7 @@ const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_FILE = 500_000_000;
 const UPLOAD_IDLE_MS = 4 * 60_000;
 const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
+const MAX_DOWNLOAD_HEADER = 4096;
 type Verb = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject'
   | 'request_approval' | 'read_invocation_binding';
@@ -39,6 +41,10 @@ export interface RoutingChildClient {
   /** Byte stream stays in the child process; no file path crosses the broker. */
   putFileArtifactStream(req: { workflow: string; size: number; chunks: AsyncIterable<Uint8Array>;
     contentType: string; filename?: string }): Promise<PutFileArtifactResponse>;
+  /** Chunks are provisional until `verified` resolves after exact EOF/hash. */
+  getFileArtifactStream(req: { workflow: string; run: string; path: string;
+    pointer: FileArtifactPointer }): Promise<{ size: number; contentType: string;
+      chunks: AsyncIterable<Uint8Array>; verified: Promise<void> }>;
 }
 
 function refused(): Error { return new Error('routing broker unavailable'); }
@@ -117,16 +123,21 @@ export function createRoutingChildClient(handoff: {
       const socket = createConnection(broker.socketPath);
       let settled = false;
       let sent = 0;
+      let pumpComplete = false;
+      let accepted: PutFileArtifactResponse | undefined;
       let length = 0;
       const chunks: Buffer[] = [];
       const finish = (error?: Error, value?: PutFileArtifactResponse) => {
 	if (settled) return;
 	settled = true;
 	clearTimeout(totalTimer);
-	if (req.chunks instanceof Readable) req.chunks.destroy();
+	if (error && req.chunks instanceof Readable) req.chunks.destroy();
 	socket.destroy();
 	if (error) reject(error);
 	else resolve(value!);
+      };
+      const finishAccepted = () => {
+	if (pumpComplete && accepted) finish(undefined, accepted);
       };
       const drain = () => new Promise<void>((resume, fail) => {
 	const done = () => { socket.off('close', closed); resume(); };
@@ -146,6 +157,8 @@ export function createRoutingChildClient(handoff: {
 	    sent += part.byteLength;
 	  }
 	  if (sent !== req.size) throw refused();
+	  pumpComplete = true;
+	  finishAccepted();
 	} catch { finish(refused()); }
       };
       const totalTimer = setTimeout(() => finish(refused()), UPLOAD_ABSOLUTE_MS);
@@ -168,7 +181,8 @@ export function createRoutingChildClient(handoff: {
 	if (!response || typeof response !== 'object' || !('ok' in response)) { finish(refused()); return; }
 	const packet = response as Record<string, unknown>;
 	if (packet.ok === true && packet.value && typeof packet.value === 'object') {
-	  finish(undefined, packet.value as PutFileArtifactResponse); return;
+	  accepted = packet.value as PutFileArtifactResponse;
+	  finishAccepted(); return;
 	}
 	if (packet.ok === false && typeof packet.status === 'number'
 	  && Number.isSafeInteger(packet.status) && packet.status >= 400 && packet.status <= 599
@@ -179,9 +193,94 @@ export function createRoutingChildClient(handoff: {
 	}
 	finish(refused());
       });
-      socket.once('error', () => finish(refused()));
-      socket.once('end', () => finish(refused()));
-      socket.once('close', () => finish(refused()));
+      socket.once('error', () => { if (!accepted) finish(refused()); });
+      socket.once('end', () => { if (!accepted) finish(refused()); });
+      socket.once('close', () => { if (!accepted) finish(refused()); });
+    });
+  };
+  const download = (req: { workflow: string; run: string; path: string; pointer: FileArtifactPointer }) => {
+    bound(req);
+    const pointer = req.pointer;
+    if (!req.path || !pointer || typeof pointer.__file !== 'string' || !pointer.__file
+      || !/^[a-f0-9]{64}$/.test(pointer.hash) || !Number.isSafeInteger(pointer.size)
+      || pointer.size <= 0 || pointer.size > MAX_FILE || !pointer.contentType)
+      return Promise.reject(refused());
+    const frame = JSON.stringify({ cap: broker.cap, method: 'download_file', body: {
+      path: req.path, pointer,
+    } }) + '\n';
+    if (Buffer.byteLength(frame) > MAX_DOWNLOAD_HEADER) return Promise.reject(refused());
+    return new Promise<{ size: number; contentType: string; chunks: AsyncIterable<Uint8Array>;
+      verified: Promise<void> }>((resolve, reject) => {
+      const socket = createConnection(broker.socketPath);
+      const output = new PassThrough({ highWaterMark: 64 * 1024 });
+      output.on('error', () => {});
+      let verifyResolve!: () => void;
+      let verifyReject!: (error: Error) => void;
+      const verified = new Promise<void>((done, fail) => { verifyResolve = done; verifyReject = fail; });
+      void verified.catch(() => {});
+      const hash = createHash('sha256');
+      let header = Buffer.alloc(0);
+      let started = false;
+      let completed = false;
+      let received = 0;
+      const timer = setTimeout(() => fail(refused()), UPLOAD_ABSOLUTE_MS);
+      timer.unref();
+      const fail = (error: Error) => {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timer);
+        socket.destroy();
+        output.destroy(error);
+        verifyReject(error);
+        if (!started) reject(error);
+      };
+      output.once('close', () => { if (!completed) fail(refused()); });
+      const take = (bytes: Buffer) => {
+        if (completed || received + bytes.length > pointer.size) { fail(refused()); return; }
+        received += bytes.length;
+        hash.update(bytes);
+        if (!output.write(bytes)) {
+          socket.pause();
+          output.once('drain', () => { if (!socket.destroyed) socket.resume(); });
+        }
+      };
+      socket.setTimeout(UPLOAD_IDLE_MS, () => fail(refused()));
+      socket.once('connect', () => socket.write(frame));
+      socket.on('data', (bytes: Buffer) => {
+        if (started) { take(bytes); return; }
+        header = Buffer.concat([header, bytes]);
+        if (header.length > MAX_DOWNLOAD_HEADER + 64 * 1024) { fail(refused()); return; }
+        const newline = header.indexOf(0x0a);
+        if (newline < 0) return;
+        if (newline > MAX_DOWNLOAD_HEADER) { fail(refused()); return; }
+        let packet: unknown;
+        try { packet = JSON.parse(header.subarray(0, newline).toString('utf8')); }
+        catch { fail(refused()); return; }
+        if (!packet || typeof packet !== 'object') { fail(refused()); return; }
+        const row = packet as Record<string, unknown>;
+        if (row.ok === false && typeof row.status === 'number' && row.status >= 400 && row.status <= 599) {
+          fail(new HubError(row.status, 'routing request refused')); return;
+        }
+        if (row.ok !== true || row.size !== pointer.size || row.contentType !== pointer.contentType) {
+          fail(refused()); return;
+        }
+        started = true;
+        resolve({ size: pointer.size, contentType: pointer.contentType, chunks: output, verified });
+        const tail = header.subarray(newline + 1);
+        header = Buffer.alloc(0);
+        if (tail.length) take(tail);
+      });
+      socket.once('end', () => {
+        if (!started || received !== pointer.size || hash.digest('hex') !== pointer.hash) {
+          fail(refused()); return;
+        }
+        completed = true;
+        clearTimeout(timer);
+        output.end();
+        verifyResolve();
+      });
+      socket.once('error', () => fail(refused()));
+      socket.once('close', () => { if (!completed) fail(refused()); });
     });
   };
   return {
@@ -231,5 +330,6 @@ export function createRoutingChildClient(handoff: {
 	...(req.filename === undefined ? {} : { filename: req.filename }) });
     },
     putFileArtifactStream: upload,
+    getFileArtifactStream: download,
   };
 }
