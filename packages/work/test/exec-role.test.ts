@@ -565,7 +565,7 @@ test('opt-in command v2 admits omitted optional seed only after fresh prestart r
   order.owes[0]!.version = 1;
   const wire: TrustedReferenceV2 = { protocol: 'trusted-reference-read-v2', state: 'available',
     workflow: 'wf1', run: 'run1', order: { workflow: 'wf1', run: 'run1', step: 'builder', key: '',
-      defDigest: 'a'.repeat(64), inputs: ['optional'], outputs: ['out'], consumes: {},
+      defDigest: 'a'.repeat(64), worker: 'command', inputs: ['optional'], outputs: ['out'], consumes: {},
       consumedFingerprint: { optional: 1 }, owes: [{ path: 'out', version: 1,
 	reasons: [], judgmentRejects: 0, schemaRejects: 0 }] },
     inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } };
@@ -586,7 +586,7 @@ test('opt-in command v2 admits omitted optional seed only after fresh prestart r
     cwd: home, out: () => {}, err: () => {}, signalHost: fakeSignalHost().host });
   assert.equal(code, 0);
   assert.equal(starts, 1);
-  assert.equal(reads, 3, 'initial, prestart, and consequence reads are required');
+  assert.equal(reads, 4, 'initial, prestart, postrun and immediate pre-submit reads are required');
 
   reads = 0;
   starts = 0;
@@ -612,4 +612,16 @@ test('opt-in command v2 admits omitted optional seed only after fresh prestart r
   assert.equal(starts, 1);
   assert.equal(reads, 3);
   assert.equal(consequenceHub.submits.length, 0);
+
+  reads = 0;
+  starts = 0;
+  const finalSubmitHub = roleHub({ getOrder: packet });
+  const noLateSubmit = await run([...WIRE_ARGS, '--trusted-input-v2'], { hub: finalSubmitHub.hub, instructions,
+    trustedInputV2Reader: { read: async () => ++reads < 4 ? wire : changed },
+    runner: { start: () => { starts++; return { done: Promise.resolve(fixedResult(0)), kill: async () => {} }; } },
+    cwd: home, out: () => {}, err: () => {}, signalHost: fakeSignalHost().host });
+  assert.equal(noLateSubmit, 1);
+  assert.equal(starts, 1);
+  assert.equal(reads, 4);
+  assert.equal(finalSubmitHub.submits.length, 0, 'input movement after the postrun read must still block submission');
 });
