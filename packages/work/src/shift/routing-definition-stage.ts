@@ -368,7 +368,7 @@ export async function stageRoutedDefinition(args: {
 	|| (args.order.key !== undefined && order.key !== args.order.key)
 	|| (args.order.index !== undefined && order.index !== args.order.index)
 	|| !isDeepStrictEqual(order.routing, args.order.routing)
-	|| order.worker !== (args.order.worker ?? 'agent'))
+	|| (order.worker ?? 'agent') !== (args.order.worker ?? 'agent'))
 	throw new Error('routed order changed');
       const currentStage = lstatSync(stagePath);
       if (!currentStage.isDirectory() || currentStage.isSymbolicLink()

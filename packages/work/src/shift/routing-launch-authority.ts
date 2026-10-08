@@ -27,7 +27,7 @@ export function createRoutedLaunchAuthority(args: {
 	throw refused();
       return;
     }
-    if (order.worker !== 'agent') throw refused();
+    if ((order.worker ?? 'agent') !== 'agent') throw refused();
     const offer = args.offer;
     const served = routing.preference.offer;
     if (!offer || !served || !isDeepStrictEqual(served, offer.offer)

@@ -64,6 +64,16 @@ test('agent launch reserves the first Service-ordered tuple and awaits unknown r
   assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'order']);
 });
 
+test('agent launch accepts the documented omitted worker field as agent', async () => {
+  const packet = structuredClone(order);
+  delete packet.worker;
+  const f = fixture(packet);
+  const admitted = await createRoutedAgentPrestart({ child: f.child, holder,
+    workflow: 'wf', run: 'run', now: () => 2_000 })(packet);
+  assert.deepEqual(admitted.selected, first);
+  assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'order']);
+});
+
 test('agent selection defers reserve and report until local adapter preflight has passed', async () => {
   const f = fixture();
   const select = createRoutedAgentSelection({ child: f.child, holder,

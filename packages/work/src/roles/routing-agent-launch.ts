@@ -36,7 +36,8 @@ export function createRoutedAgentSelection(args: Args):
   let used = false;
   return async (order, signal) => {
     if (used || signal?.aborted || order.workflow !== args.workflow || order.run !== args.run
-      || order.worker !== 'agent' || !order.routing || args.holder.kind !== 'session') throw refused();
+      || (order.worker !== undefined && order.worker !== 'agent')
+      || !order.routing || args.holder.kind !== 'session') throw refused();
     used = true;
     // Pin the full order before any asynchronous assessment or local checks.
     const pinned = structuredClone(order);

@@ -57,6 +57,7 @@
  * back would waste a whole re-offer cycle to learn something already known.
  */
 import { resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 import { isExistingDirectory, isWorkdirAllowed } from './workdir.ts';
 
@@ -64,7 +65,7 @@ import { createApprovalRequester } from './approvals.ts';
 
 import { createLeaseLoop, type LeaseLoop, type LeaseLoopOptions, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
+import type { ContactHolder, GetOrderResponse, LocalModelTuple, OrderPacket, ResolutionPayload } from '../hub/types.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import type {
@@ -116,6 +117,7 @@ export type AgentRunOutcome =
   | 'unstamped-order' // a capability-bearing order had no usable hub crew stamp (exit 1)
   | 'unresolvable-crew' // a stamped crew's local roster could not be read (exit 1)
   | 'unresolvable-capability' // no settings row for the order's capabilities (exit 1)
+  | 'routed-launch-refused' // exact routed pre-provider authorization was unavailable (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'session-store-failed' // durable active-row gate failed before provider work (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
@@ -221,6 +223,13 @@ export interface AgentRunLoopOptions {
    * root. A real binary/credential probe needs new adapter-contract surface.
    */
   harnessAvailable: (harnessId: string) => boolean;
+  /** Optional Shift-authorized selection. Reserve/report remain deferred until
+   * local adapter policy passes, and the routed role stays fenced until all
+   * provider/holder lifecycle paths have launch proof. */
+  routedSelect?: (order: OrderPacket, signal: AbortSignal) => Promise<{
+    selected: LocalModelTuple;
+    authorize(signal: AbortSignal): Promise<{ selected: LocalModelTuple; expiresAt: number }>;
+  }>;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
@@ -556,6 +565,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   let reportRecoveryPersistenceFailure: ((error: unknown) => void) | undefined;
   /** Provider-selected model, when a harness reports it after its synchronous start gate. */
   let runtimeModel: string | undefined;
+  const routedAbort = new AbortController();
   /** Recent unique harness diagnostics for the capability-silent no-submit log only. */
   const harnessFailures: string[] = [];
 
@@ -859,6 +869,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     void leasePromise.then((outcome) => {
       leaseSettled = true;
       settledLeaseOutcome = outcome;
+      routedAbort.abort();
     });
 
     // First contact race: the order arrives (hold established), or the lease
@@ -890,7 +901,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return releaseWith('unverified-consumed', 'unverified-consumed');
       }
       try {
-        const checked = await opts.consumedVerifier(packet, { hardRule: false });
+	const checked = await opts.consumedVerifier(packet, { hardRule: opts.routedSelect !== undefined });
         if (!checked.ok) {
           opts.err(`owenloop work agent-run: ${checked.reason} — releasing ${order}`);
           return releaseWith('unverified-consumed', 'unverified-consumed');
@@ -979,8 +990,20 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     const step: NormalizedStepSpec = material;
 
     // ---- ROUTING: select a roster candidate before resolving an adapter ----
-    const routing = resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
-    await reportResolution(routing);
+    let routedSelection: Awaited<ReturnType<NonNullable<AgentRunLoopOptions['routedSelect']>>> | undefined;
+    if (opts.routedSelect) {
+      try { routedSelection = await opts.routedSelect(packet, routedAbort.signal); }
+      catch {
+	opts.err('owenloop work agent-run: routed selection refused');
+	return releaseWith('routed-selection-refused', 'routed-launch-refused');
+      }
+    }
+    const routing: OrderRouting = routedSelection
+      ? { kind: 'resolved', capability: packet.capabilities?.[0] ?? 'routed', match: 'exact',
+	harness: routedSelection.selected.harness, model: routedSelection.selected.model,
+	effort: routedSelection.selected.effort }
+      : resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
+    if (!routedSelection) await reportResolution(routing);
     if (routing.kind === 'refused') {
       if (routing.reason === 'harness-policy') {
         opts.err(
@@ -1011,6 +1034,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     const chosenHarnessId = routing.kind === 'resolved' ? routing.harness : undefined;
+    if (routedSelection && step.harness && step.harness !== chosenHarnessId)
+      return releaseWith('routed-harness-policy', 'routed-launch-refused');
     const resolution = opts.resolveAdapter(chosenHarnessId, step.harness);
     adapterId = resolution.id;
     if (resolution.adapter === undefined) {
@@ -1018,6 +1043,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       opts.err(`owenloop work agent-run: no adapter registered for harness '${resolution.id}' (registered: ${known}) — releasing`);
       return releaseWith('no-harness', 'no-harness');
     }
+    if (routedSelection && resolution.id !== routedSelection.selected.harness)
+      return releaseWith('routed-adapter-mismatch', 'routed-launch-refused');
     adapter = resolution.adapter;
     /** The same object as `adapter`, but narrowed — the module-scope `adapter`
      *  stays `HarnessAdapter | undefined` for `teardown`/`stop`. */
@@ -1062,9 +1089,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       .map((owed) => owed.path)
       .filter((path) => path !== '');
     const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);
-    const recoveryEnabled =
+    const recoveryEnabled = !routedSelection &&
       recoveryPaths.length === 1 &&
       (recoveryPolicy !== undefined || recoveryConfigurationIsTerminal);
+    // Existing recovery can resume or start a different provider process.
+    // Routed firings use the initial start only until those paths have their
+    // own launch proof; a configured recovery policy must not block that start.
 
     // A present-but-invalid adapter setting must stop before *any* provider
     // delivery, including multi-output orders that cannot use bounded recovery.
@@ -1168,6 +1198,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       prev.cwd === recordCwd &&
       dirExists(prev.cwd) &&
       delta.message !== '';
+    // A native token may open a new vendor process on deliver. Until that
+    // process receives its own admission proof, no routed resume can run.
+    if (routedSelection && resumable)
+      return releaseWith('routed-resume-unavailable', 'routed-launch-refused');
 
     // The watermark this firing's records carry. It STARTS at the prior value —
     // never at the delta's — and advances only once the reasons have actually
@@ -1651,11 +1685,26 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       `owenloop work agent-run: hosting ${order} (step '${packet.step}', harness '${resolution.id}', attempt ${attempt}, ${path})`,
     );
 
-    type TurnResult = { t: 'turn'; failure?: unknown; persistenceFailure?: unknown };
+    type TurnResult = { t: 'turn'; failure?: unknown; persistenceFailure?: unknown;
+      routedRefused?: boolean };
+
+    let routedStartUsed = false;
+    async function beforeColdStart(): Promise<boolean> {
+      if (!routedSelection) return true;
+      if (routedStartUsed || signalled || leaseSettled || routedAbort.signal.aborted) return false;
+      routedStartUsed = true;
+      try {
+	const admitted = await routedSelection.authorize(routedAbort.signal);
+	return !signalled && !leaseSettled && !routedAbort.signal.aborted
+	  && opts.now() < admitted.expiresAt
+	  && isDeepStrictEqual(admitted.selected, routedSelection.selected);
+      } catch { return false; }
+    }
 
     /** Cold-start this firing. Shared by the ordinary path and the fallback. */
     async function coldStart(): Promise<TurnResult> {
       activePersistenceFailure = undefined;
+      if (!await beforeColdStart()) return { t: 'turn', routedRefused: true };
       try {
         const ref = await active.start(coldArgs(), onEvent);
         sessionRef = ref;
@@ -1753,6 +1802,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       return releaseWith('session-store-failed', 'session-store-failed');
     }
 
+    if (raced.routedRefused) {
+      opts.err('owenloop work agent-run: routed launch authorization refused before provider start');
+      return releaseWith('routed-launch-refused', 'routed-launch-refused');
+    }
+
     // TURN END — NOT task end. Log the failure shape for humans, then confirm.
     if (raced.failure !== undefined) {
       rememberHarnessFailure(errMsg(raced.failure));
@@ -1830,6 +1884,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   function stop(reason?: string): void {
     if (signalled) return;
     signalled = true;
+    routedAbort.abort();
     void teardown();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

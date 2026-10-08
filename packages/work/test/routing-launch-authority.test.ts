@@ -52,6 +52,9 @@ test('parent launch authority refuses changed or reordered machine roster before
     offer: { candidate, offer, rosterSnapshot: snapshot },
     currentTuples: () => current, currentRosterSnapshot: () => snapshot });
   await authority.verifySelection(order, request);
+  const implicitAgent = structuredClone(order);
+  delete implicitAgent.worker;
+  await authority.verifySelection(implicitAgent, request);
   snapshot = 'ordered-b-a';
   await assert.rejects(authority.verifySelection(order, request), /selection refused/);
   snapshot = 'ordered-a-b';

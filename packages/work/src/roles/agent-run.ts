@@ -230,6 +230,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'unstamped-order':
     case 'unresolvable-crew':
     case 'unresolvable-capability':
+    case 'routed-launch-refused':
     case 'unverified-consumed':
     case 'session-store-failed':
     case 'no-submit':

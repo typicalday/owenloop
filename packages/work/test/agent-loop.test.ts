@@ -290,6 +290,7 @@ interface BuildOpts {
   shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
+  routedSelect?: AgentRunLoopOptions['routedSelect'];
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
 	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
@@ -319,6 +320,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     harnessAvailable: (id) => id === 'fake',
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
     resolveCrewRosters: b.resolveCrewRosters ?? (() => ({ ok: true, rosters: [] })),
+    ...(b.routedSelect === undefined ? {} : { routedSelect: b.routedSelect }),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
@@ -363,6 +365,96 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
     adapter.calls.filter((c) => c.kind === 'stop').length,
     1,
   );
+});
+
+test('routed single-output first start awaits authorization after adapter policy without invoking recovery', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const gates: string[] = [];
+  adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+  adapter.preflight = () => { gates.push('policy'); return []; };
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'out' }],
+    consumes: { input: 'verified-value' } }),
+    agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter,
+    consumedVerifier: async (order, options) => {
+      gates.push(`consumed:${String(options.hardRule)}`);
+      return { ok: true, order, warnings: [] };
+    }, routedSelect: async () => {
+    gates.push('select');
+    return { selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => { gates.push('authorize'); return {
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }; } };
+  } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.deepEqual(gates, ['consumed:true', 'select', 'policy', 'authorize']);
+  const starts = adapter.calls.filter(call => call.kind === 'start');
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0]?.kind === 'start' &&
+    { model: starts[0].args.model, effort: starts[0].args.effort },
+    { model: 'service-model', effort: 'high' });
+  assert.equal(adapter.calls.filter(call => call.kind === 'deliver').length, 0);
+  assert.equal(verbs(calls).includes('report_resolution'), false);
+});
+
+test('routed authorization refusal starts no provider process', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({ hub, adapter, routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => { throw new Error('private broker failed'); },
+  }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+  assert.ok(h.errs.some(line => line.includes('routed launch authorization refused')));
+  assert.ok(h.errs.every(line => !line.includes('private broker failed')));
+});
+
+test('routed authorization tuple mismatch starts no provider process', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({ hub, adapter, routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => ({ selected: { id: 'other', harness: 'fake', model: 'other-model', effort: 'high' },
+      expiresAt: 5_000 }),
+  }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('routed step harness mismatch refuses before reservation and provider work', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let authorized = false;
+  const h = buildOpts({ hub, adapter, spec: { ...baseSpec(), harness: 'other' },
+    routedSelect: async () => ({
+      selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => { authorized = true; throw new Error('must not authorize'); },
+    }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(authorized, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('routed stop during pending launch authorization starts no provider process', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let entered!: () => void, resume!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { resume = resolve; });
+  const h = buildOpts({ hub, adapter, routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => { entered(); await held; return {
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }; },
+  }) });
+  const loop = createAgentRunLoop(h.opts);
+  const running = loop.run();
+  await waiting;
+  loop.stop('test-stop');
+  resume();
+  await running;
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
 });
 
 test('idle recovery is bounded to primary, one wake, one cold start, then one producer ask', async () => {
