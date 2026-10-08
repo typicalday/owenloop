@@ -492,6 +492,18 @@ export interface Order {
   cause?: FiringTrigger;
 }
 
+/** Native claim-only metadata. It is stored in run.order_json, never projected
+ * into the frozen order.v1 packet or its signed field manifest. */
+export interface ClaimWorkdirInputV1 {
+  stem: string;
+  version: number;
+  present: true;
+}
+
+export interface ClaimOrder extends Order {
+  claimWorkdirInputV1?: ClaimWorkdirInputV1;
+}
+
 export interface RunData {
   workflow: string;
   step: string;
@@ -527,14 +539,14 @@ export interface RunData {
   fingerprint?: Fingerprint;
   /** The firing trigger that woke this run (§21). Absent = 'inputsGreen'. */
   cause?: FiringTrigger;
-  /** The flattened order packet issued at claim time (§8 / Gap 1) — the exact
-   *  Order buildOrder emitted, written in the SAME transaction that created
+  /** The flattened order packet issued at claim time (§8 / Gap 1), with any
+   *  private claim metadata, written in the SAME transaction that created
    *  this run. `updateRun` never touches it, so no close/outcome write can
    *  clobber it; `Store.restampOrderTarget` is the single narrow exception,
    *  rewriting one `owes[].version` when a reject re-arms a still-open claim.
    *  The replay/eval/paper-trail record (buildOrder is deterministic modulo run
    *  id). Absent on runs created before schema v7. */
-  order?: Order;
+  order?: ClaimOrder;
 }
 
 export interface WorkflowData {

@@ -68,6 +68,7 @@ import {
 import type { DefLoadFailure } from './defs.ts';
 import { implementsIssues } from './implements.ts';
 import { createDefInstructionSource } from './order-resolver.ts';
+import { publicOrderV1 } from './order-projection.ts';
 import type { CheckReport, CheckStep, WorkflowDef } from './types.ts';
 import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
 import { packageVersion } from './package-version.ts';
@@ -2775,7 +2776,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         if (!r) throw new CliError(`run not found: ${run}`);
         if (r.workflow !== wf) throw new CliError(`run ${run} belongs to workflow ${r.workflow}, not ${wf}`);
         if (r.order === undefined) throw new CliError(`run ${run} has no persisted order (created before order persistence, schema v7)`);
-        print(io, r.order);
+	print(io, publicOrderV1(r.order));
         return 0;
       }
       case 'list': {

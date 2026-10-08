@@ -32,7 +32,7 @@ import type {
   ExecutorLane,
   Fingerprint,
   InterfaceCallBinding,
-  Order,
+  ClaimOrder,
   ReasonEntry,
   RunData,
   TaskData,
@@ -714,7 +714,7 @@ function mapRun(r: RunRowRaw): RunRow {
   });
   if (fp !== undefined) out.fingerprint = fp;
   if (r.cause !== null) out.cause = r.cause as RunData['cause'];
-  const order = fromJson<Order | undefined>(r.order_json, undefined, {
+  const order = fromJson<ClaimOrder | undefined>(r.order_json, undefined, {
     table: 'run',
     id: r.id,
     column: 'order_json',
@@ -1763,7 +1763,7 @@ export class Store {
     if (owed === undefined || owed.version === version) return;
     // Rebuilt immutably (map, not in-place mutation) so no caller is left
     // holding a half-mutated Order read before this write.
-    const next: Order = {
+    const next: ClaimOrder = {
       ...cur.order,
       owes: cur.order.owes.map((o) => (o.path === path ? { ...o, version } : o)),
     };
