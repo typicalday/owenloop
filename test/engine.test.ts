@@ -3040,6 +3040,26 @@ test('U1-capacity-one: B alone persists; resolved scoped filter/stamp and crew i
   assert.equal(store.getTask(workflow, 'B', '')!.run, result.order.run);
 });
 
+test('claimReady returns frozen v1 order while persisting the private workdir input witness', async () => {
+  const { engine, store, workflow } = await boundedFixture(`  - name: C
+    consumes: []
+    produces: [c]
+    workdirFrom: seed.path
+    capabilities: [work]
+`);
+  engine.provideInput(workflow, 'seed', { value: 1, path: '/claim-ready-cwd' });
+  const firing = choices(engine, workflow).find(f => f.step === 'C')!;
+  assert.ok(firing);
+  const result = engine.claimReady(claimPlan(firing), readyOpts);
+  assert.equal(result.kind, 'claimed', JSON.stringify(result));
+  if (result.kind !== 'claimed') return;
+  assert.equal(result.order.workdir, '/claim-ready-cwd');
+  assert.equal(Object.hasOwn(result.order, 'claimWorkdirInputV1'), false);
+  assert.equal(validateValue(orderSchema, result.order).valid, true);
+  assert.deepEqual(store.getRun(result.order.run)?.order?.claimWorkdirInputV1,
+    { stem: 'seed', version: 2, present: true });
+});
+
 test('U1-stale-fallback: no stale claim mutation, then a separate fresh scan can claim A', async () => {
   const { engine, store, workflow } = await boundedFixture();
   const b = choices(engine, workflow).find(f => f.step === 'B')!;

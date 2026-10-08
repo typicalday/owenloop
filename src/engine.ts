@@ -72,6 +72,7 @@ import type {
 } from './types.ts';
 import { isCallStep } from './types.ts';
 import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
+import { publicOrderV1 } from './order-projection.ts';
 import type { OrderInstructionSource, ResolvedInstructions } from './order-resolver.ts';
 
 export type { Order } from './types.ts';
@@ -2916,11 +2917,9 @@ export class Engine {
       claimedAt: now,
       attempts: existing?.attempts ?? 0,
     });
-    if (order.claimWorkdirInputV1 === undefined) return order;
-    // The persisted native claim retains this witness. The existing tick and
-    // claimReady Order is the frozen v1 projection and must not expose it.
-    const { claimWorkdirInputV1: _private, ...publicOrder } = order;
-    return publicOrder;
+    // The persisted native claim retains this witness. Tick and claimReady
+    // return the same frozen v1 projection as the persisted-order CLI read.
+    return publicOrderV1(order);
   }
 
   /**
