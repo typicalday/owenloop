@@ -943,6 +943,9 @@ export interface WorkflowDef {
    * bundle format carries no per-workflow digest to check instead.
    */
   bundleDigest?: string;
+  /** @internal Verified manifest dialect for CAS calls resolution. Loader-only,
+   * non-enumerable: never changes hashes or persisted definition snapshots. */
+  bundleDialect?: 'plain' | 'hub-qualified';
   /**
    * @internal Store roots whose indexes/objects made `bundleDigest`
    * discoverable. Snapshot writers acquire every root's writer lock and

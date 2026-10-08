@@ -19,11 +19,11 @@ import { writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 const temp = (prefix: string) => mkdtempSync(join(tmpdir(), prefix));
 const workflow = 'name: recovered\ninputs: []\nsteps:\n  - name: command\n    consumes: []\n    produces: [out]\n    terminal: true\n    command: echo recovered\n';
 
-async function fixture(workflowSource = workflow) {
+async function fixture(workflowSource = workflow, bundleSource?: string) {
   const home = temp('routing-stage-home-');
   const stateDir = temp('routing-stage-state-');
   const workRoot = temp('routing-stage-work-');
-  const packed = packBundle(writeBundleSource({ name: 'recovered', workflow: workflowSource }));
+  const packed = packBundle(bundleSource ?? writeBundleSource({ name: 'recovered', workflow: workflowSource }));
   const keyPath = join(home, 'publisher');
   execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', keyPath], { stdio: 'ignore' });
   const publicKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
@@ -54,6 +54,41 @@ async function fixture(workflowSource = workflow) {
     stillAuthorized: () => true, fetchImpl };
   return { args, config, home, stateDir, seen, packed, keyPath, publicKey };
 }
+
+function mixedNamespaceSource(): string {
+  const root = temp('routing-mixed-namespace-');
+  writeFileSync(join(root, 'bundle.yaml'), [
+    'formatVersion: 2', 'package:', '  name: routing', '  version: 1.0.0',
+    'workflows:', '  "routing/parent": "parent.yaml"', '  "other/child": "child.yaml"',
+    'default: "routing/parent"', 'platforms: []', 'integrity:',
+    '  algorithm: sha256', '  files: {}', 'capabilities: {}', 'lock: {}', '',
+  ].join('\n'));
+  writeFileSync(join(root, 'parent.yaml'), 'name: routing/parent\ninputs: []\nsteps:\n' +
+    '  - name: command\n    consumes: []\n    produces: [out]\n' +
+    '    terminal: true\n    command: echo parent\n');
+  writeFileSync(join(root, 'child.yaml'), 'name: other/child\ninputs: []\nsteps:\n' +
+    '  - name: child\n    consumes: []\n    produces: [other]\n' +
+    '    terminal: true\n    command: echo child\n');
+  return root;
+}
+
+test('mixed authored namespace origin rule applies at staging and fresh verifyOrder', async () => {
+  const f = await fixture(workflow, mixedNamespaceSource());
+  writeFileSync(join(f.config, 'settings.json'), JSON.stringify({ originRules: { routing: 'any', other: 'git' } }));
+  await assert.rejects(stageRoutedDefinition(f.args), /routed definition staging refused/);
+  assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
+
+  writeFileSync(join(f.config, 'settings.json'), JSON.stringify({ originRules: { routing: 'any', other: 'any' } }));
+  const stage = await stageRoutedDefinition(f.args);
+  const response: GetOrderResponse = { text: '', workflow: 'wf', run: 'run', lease: { claimed: true },
+    order: { workflow: 'wf', run: 'run', step: 'command', key: '', defDigest: f.packed.digest,
+      worker: 'command', inputs: [], outputs: ['out'], consumes: {},
+      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] } };
+  await stage.verifyOrder(response);
+  writeFileSync(join(f.config, 'settings.json'), JSON.stringify({ originRules: { routing: 'any', other: 'git' } }));
+  await assert.rejects(stage.verifyOrder(response), /routed definition origin changed/);
+  stage.cleanup();
+});
 
 test('routed staging keeps signed exact bytes and public trust private without mutating ordinary store', async () => {
   const f = await fixture();

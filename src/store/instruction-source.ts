@@ -18,7 +18,8 @@ import type {
   OrderInstructionRef,
   OrderInstructionSource,
 } from '../order-resolver.ts';
-import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile, resolveCallsTarget } from '../defs.ts';
+import { digestScopedCallsTargetKey, finalizeDefs, resolveCallsTarget } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
 import type { StepDef, WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import {
@@ -190,9 +191,10 @@ async function loadVerifiedObject(
     const objectPath = await verifiedCandidateObject(root, bundleDigest, level, verifier);
     try {
       const manifest = parseManifestBytes(readFileSync(join(objectPath, 'bundle.yaml')));
+      const dialect = bundleDialectForManifest(manifest);
       const defs = new Map<string, WorkflowDef>();
       for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
-	const def = loadDefFile(join(objectPath, workflowPath));
+	const def = loadBundleDefFile(join(objectPath, workflowPath), dialect);
 	if (def.name !== workflowName) {
 	  throw new StoreIntegrityError(
 	    'object-corrupt',

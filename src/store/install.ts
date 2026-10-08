@@ -30,10 +30,10 @@ import {
   digestScopedCallsTargetKey,
   finalizeDefs,
   lintDef,
-  loadDefFile,
   loadDefsRaw,
   validateDef,
 } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
 import { isVersionedReference, parseManifestBytes, parseVersionedCallTarget } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
@@ -459,21 +459,22 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // Validate the staged tree with the engine's strict pass — the exact
     // bytes that will be committed, with no re-write after validation.
     const reasons: string[] = [];
-    let staged: Map<string, ReturnType<typeof loadDefFile>>;
+    let staged: Map<string, ReturnType<typeof loadBundleDefFile>>;
     let externalVersionedCalls: ReadonlySet<string> = new Set();
     let stagedBundleLock: Readonly<Record<string, string>> = {};
     const manifestPath = join(stagingDir, 'bundle.yaml');
     if (existsSync(manifestPath)) {
       // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
       // path and key the staged definitions by the manifest's workflow name.
-      staged = new Map<string, ReturnType<typeof loadDefFile>>();
+      staged = new Map<string, ReturnType<typeof loadBundleDefFile>>();
       try {
         const manifest = parseManifestBytes(readFileSync(manifestPath));
 		stagedBundleLock = manifest.lock;
+		const dialect = bundleDialectForManifest(manifest);
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
           try {
-            const stagedDef = loadDefFile(workflowFile);
+			const stagedDef = loadBundleDefFile(workflowFile, dialect);
             if (stagedDef.name !== workflowName) {
               reasons.push(
                 `${workflowFile}: definition name '${stagedDef.name}' must equal workflow map key '${workflowName}'`,

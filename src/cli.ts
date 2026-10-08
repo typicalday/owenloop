@@ -51,7 +51,6 @@ import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import {
   buildDef,
   DefError,
-  digestScopedCallsTargetKey,
   finalizeDefs,
   lintDef,
   loadDefFile,
@@ -61,6 +60,8 @@ import {
   expandDefsRaw,
   reportCallsCycles,
   resolveCallsTarget,
+  resolveExactBundleTarget,
+  verifiedBundleDialect,
   scanDefsRaw,
   validateCallsEdges,
   validateDef,
@@ -868,8 +869,9 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
   // flat-map lookup it has always been.
   const engine = new Engine(store, (name, from, bundleDigest) => {
     const d = bundleDigest !== undefined
-      ? defs.get(digestScopedCallsTargetKey(bundleDigest, name)) ?? defs.get(name)
-      : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      ? resolveExactBundleTarget(defs, bundleDigest, name)
+      : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from,
+		from.bundleDigest === undefined ? undefined : verifiedBundleDialect(defs, from.bundleDigest));
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
   }, {

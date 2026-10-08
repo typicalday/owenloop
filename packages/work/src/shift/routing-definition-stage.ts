@@ -10,6 +10,7 @@ import { chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdi
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { readRegularFileNoFollow } from '../../../../src/install.ts';
+import { parseManifestBytes } from '../../../../src/bundle/manifest.ts';
 import { allowedSignersPath } from '../../../../src/crypto/trust-roots.ts';
 import { grantsDir, orgRootPublicKeyPath, revocationsDir } from '../../../../src/crypto/org-root.ts';
 import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
@@ -51,6 +52,26 @@ const STAGE_RETENTION_MS = 24 * 60 * 60_000;
 const stageName = /^\.routing-def-[A-Za-z0-9]{6}$/;
 const OWNER_FILE = 'owner.json';
 const GATE_MARKER = 'gate-may-open';
+
+/** Both the indexed package namespace and every signed authored Hub
+ * namespace govern an object. A package coordinate alone cannot weaken the
+ * policy for a second `other/child` definition in the same bundle. */
+function originNamespacesForObject(
+  object: { bundleDigest: string; objectPath: string },
+  index: ReturnType<typeof readWorkflowStoreIndex>,
+): string[] {
+  const coordinates = Object.entries(index.entries)
+    .filter(([, entry]) => entry.digest === object.bundleDigest)
+    .map(([coordinate]) => coordinate);
+  if (coordinates.length === 0) throw new Error('routed definition index refused');
+  const bytes = readRegularFileNoFollow(join(object.objectPath, 'bundle.yaml'), 'routed bundle manifest');
+  if (bytes === undefined) throw new Error('routed definition manifest refused');
+  const manifest = parseManifestBytes(bytes);
+  return [...new Set([
+    ...coordinates.map(coordinate => parseWorkflowCoordinate(coordinate).namespace),
+    ...Object.keys(manifest.workflows).filter(name => name.includes('/')).map(name => name.split('/')[0]!),
+  ])];
+}
 
 function processLiveness(pid: number): boolean | undefined {
   try { process.kill(pid, 0); return true; }
@@ -321,12 +342,8 @@ export async function stageRoutedDefinition(args: {
       if (verdict.kind !== 'verified') throw new Error('routed definition publication refused');
       const originVerdict = await verifyOrigin(object);
       if (originVerdict.kind === 'invalid') throw new Error('routed definition origin refused');
-      const coordinates = Object.entries(stagedIndex.entries)
-	.filter(([, entry]) => entry.digest === object.bundleDigest)
-	.map(([coordinate]) => coordinate);
-      if (coordinates.length === 0) throw new Error('routed definition index refused');
-      for (const coordinate of coordinates) {
-	const rule = matchOriginRule(originRules, parseWorkflowCoordinate(coordinate).namespace);
+      for (const namespace of originNamespacesForObject(object, stagedIndex)) {
+	const rule = matchOriginRule(originRules, namespace);
 	if (rule && !evaluateOriginRule(rule.value, originVerdict).ok)
 	  throw new Error('routed definition origin refused');
       }
@@ -344,11 +361,8 @@ export async function stageRoutedDefinition(args: {
       if ((await freshDefinition(object)).kind !== 'verified') throw new Error('routed definition publication changed');
       const verdict = await freshOrigin(object);
       if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
-      const coordinates = Object.entries(stagedIndex.entries)
-	.filter(([, entry]) => entry.digest === object.bundleDigest)
-	.map(([coordinate]) => coordinate);
-      for (const coordinate of coordinates) {
-	const rule = matchOriginRule(freshRules, parseWorkflowCoordinate(coordinate).namespace);
+      for (const namespace of originNamespacesForObject(object, stagedIndex)) {
+	const rule = matchOriginRule(freshRules, namespace);
 	if (rule && !evaluateOriginRule(rule.value, verdict).ok)
 	  throw new Error('routed definition origin changed');
       }
@@ -404,12 +418,8 @@ export async function stageRoutedDefinition(args: {
 	  throw new Error('routed definition trust changed');
 	const verdict = await freshOrigin(object);
 	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
-	const coordinates = Object.entries(freshIndex.entries)
-	  .filter(([, entry]) => entry.digest === object.bundleDigest)
-	  .map(([coordinate]) => coordinate);
-	if (coordinates.length === 0) throw new Error('routed definition index changed');
-	for (const coordinate of coordinates) {
-	  const rule = matchOriginRule(freshRules, parseWorkflowCoordinate(coordinate).namespace);
+	for (const namespace of originNamespacesForObject(object, freshIndex)) {
+	  const rule = matchOriginRule(freshRules, namespace);
 	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
 	    throw new Error('routed definition origin changed');
 	}
@@ -460,12 +470,8 @@ export async function stageRoutedDefinition(args: {
 	  throw new Error('routed definition trust changed');
 	const verdict = await finalOrigin(object);
 	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
-	const coordinates = Object.entries(finalIndex.entries)
-	  .filter(([, entry]) => entry.digest === object.bundleDigest)
-	  .map(([coordinate]) => coordinate);
-	if (coordinates.length === 0) throw new Error('routed definition index changed');
-	for (const coordinate of coordinates) {
-	  const rule = matchOriginRule(finalRules, parseWorkflowCoordinate(coordinate).namespace);
+	for (const namespace of originNamespacesForObject(object, finalIndex)) {
+	  const rule = matchOriginRule(finalRules, namespace);
 	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
 	    throw new Error('routed definition origin changed');
 	}

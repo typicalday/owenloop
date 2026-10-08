@@ -1159,7 +1159,7 @@ export function expandIncludes(
   // cannot carry them. Preserve the original descriptor explicitly so an
   // include-expanded CAS definition still coordinates its snapshot writes with
   // bundle GC.
-  for (const key of ['bundleStoreRoots', 'bundleResolutionContext'] as const) {
+  for (const key of ['bundleStoreRoots', 'bundleResolutionContext', 'bundleDialect'] as const) {
     const descriptor = Object.getOwnPropertyDescriptor(def, key);
     if (descriptor !== undefined) Object.defineProperty(expanded, key, descriptor);
   }
@@ -2582,8 +2582,35 @@ function resolveCallsTargetKey(
   defs: Map<string, WorkflowDef>,
   target: string,
   from: WorkflowDef,
+  loadedDialect?: 'plain' | 'hub-qualified',
 ): string | undefined {
   if (target.includes('/')) {
+    // The dialect is stamped from the verified manifest, never inferred from
+    // whichever subset of aliases a resolver happens to carry. A persisted
+    // parent snapshot loses the non-enumerable marker, so its live resolver
+    // must supply the same digest's verified dialect. Unknown CAS context
+    // refuses instead of drifting through an ambient global alias.
+    const dialect = loadedDialect ?? from.bundleDialect
+      ?? (from.bundleDigest === undefined ? undefined : verifiedBundleDialect(defs, from.bundleDigest));
+    // An exact versioned target carries its own digest lock and remains safe
+    // to resolve from an older persisted parent snapshot even when the
+    // resolver has not recovered the manifest dialect. Only unversioned
+    // package/name spelling is ambiguous with a Hub-authored sibling.
+    if (from.bundleDigest !== undefined && dialect === undefined
+      && !target.includes('@') && !target.includes('#')) return undefined;
+    const hubDialect = from.bundleDigest !== undefined && dialect === 'hub-qualified';
+    // A Hub-qualified `calls: namespace/child` is an authored definition
+    // name, not a portable package/workflow alias. Resolve it only from the
+    // parent's exact immutable bundle. This first lookup also lets a plain
+    // parent in a mixed bundle call its qualified sibling without a global
+    // alias. Existing plain-package alias behavior remains the fallback for
+    // plain parents; qualified parents cannot drift to another bundle.
+    if (from.bundleDigest !== undefined && !target.includes('@') && !target.includes('#')) {
+      for (const [key, candidate] of defs) {
+		if (candidate.bundleDigest === from.bundleDigest && candidate.name === target) return key;
+      }
+      if (hubDialect) return undefined;
+    }
     let lockKey = target;
     if (target.includes('#')) {
       try {
@@ -2600,6 +2627,7 @@ function resolveCallsTargetKey(
     if (target.includes('#')) {
       return from.bundleDigest === undefined && defs.has(target) ? target : undefined;
     }
+    if (hubDialect && target.includes('@')) return undefined;
     return defs.has(target) ? target : undefined;
   }
   if (from.bundleDigest !== undefined) {
@@ -2608,6 +2636,46 @@ function resolveCallsTargetKey(
     }
   }
   return defs.has(target) ? target : undefined;
+}
+
+/** Recover the loader's signed-manifest dialect, including when `from` is a
+ * persisted snapshot whose non-enumerable provenance was intentionally not
+ * serialized. A partial resolver with no trusted live member remains unknown. */
+export function verifiedBundleDialect(
+  defs: Map<string, WorkflowDef>, digest: string,
+): 'plain' | 'hub-qualified' | undefined {
+  let dialect: 'plain' | 'hub-qualified' | undefined;
+  for (const def of defs.values()) {
+    if (def.bundleDigest !== digest || def.bundleDialect === undefined) continue;
+    if (dialect !== undefined && dialect !== def.bundleDialect) return undefined;
+    dialect = def.bundleDialect;
+  }
+  return dialect;
+}
+
+/** An explicit qualified DefRef may never fall through to an ambient alias
+ * with the same text but a different bundle digest. Coordinate aliases keep
+ * their existing digest-scoped key; authored names scan verified members. */
+export function resolveExactBundleTarget(
+  defs: Map<string, WorkflowDef>, digest: string, name: string,
+): WorkflowDef | undefined {
+  const aliased = defs.get(digestScopedCallsTargetKey(digest, name));
+  if (aliased?.bundleDigest === digest) return aliased;
+  // Existing explicit package coordinates remain visible to the invocation
+  // verifier even when a supplied digest is wrong; it reports the established
+  // digest-mismatch assessment. Only authored namespace/name has the new
+  // no-global-fallback rule.
+  if (name.includes('@') || name.includes('#')) return defs.get(name);
+  if (name.includes('/')) {
+    const dialect = verifiedBundleDialect(defs, digest);
+    if (dialect === undefined) return undefined;
+    if (dialect === 'plain') return defs.get(name);
+    for (const def of defs.values()) {
+      if (def.bundleDigest === digest && def.name === name) return def;
+    }
+    return undefined;
+  }
+  return defs.get(name);
 }
 
 /**
@@ -2621,8 +2689,9 @@ export function resolveCallsTarget(
   defs: Map<string, WorkflowDef>,
   target: string,
   from: WorkflowDef,
+  loadedDialect?: 'plain' | 'hub-qualified',
 ): WorkflowDef | undefined {
-  const key = resolveCallsTargetKey(defs, target, from);
+  const key = resolveCallsTargetKey(defs, target, from, loadedDialect);
   return key === undefined ? undefined : defs.get(key);
 }
 
