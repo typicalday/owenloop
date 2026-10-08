@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -434,6 +435,35 @@ test('explicit routed lifecycle uses session headers and shared sanitized Retry-
   await assert.rejects(bare.routingSubmit({ workflow: 'wf', run: 'run', path: 'out', value: {}, holder }),
     /routing origin refused/);
   await assert.rejects(bare.routingRelease({ workflow: 'wf', run: 'run' }), /routing origin refused/);
+});
+
+test('scoped file upload 429 redacts upstream body and blocks later routed verbs', async () => {
+  let monotonic = 0;
+  const backoff = createRoutingBackoff(() => monotonic);
+  const requests: Array<{ url: string; headers: Headers }> = [];
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: 'https://hub.example',
+      get: () => ({ sessionId: 'rs', shiftId: 'shf', credential: 'private-session', expiresAt: 100_000 }),
+      now: () => 1_000, beforeRequest: backoff.beforeRequest, onRateLimit: backoff.onRateLimit },
+    fetchImpl: (async (url, init) => {
+      requests.push({ url: String(url), headers: new Headers(init?.headers) });
+      if (String(url).includes('routing_file_artifacts')) return new Response('private-session secret',
+	{ status: 429, headers: { 'Retry-After': '2' } });
+      return Response.json({ text: 'ok', ok: true });
+    }) as typeof fetch,
+  });
+  await assert.rejects(c.routingPutFileArtifact({ workflow: 'wf', run: 'run',
+    body: Readable.from([Buffer.from('file')]), size: 4, contentType: 'text/plain' }),
+  error => error instanceof HubError && error.status === 429 && error.retryAfterMs === 2_000
+    && !error.message.includes('private-session'));
+  await assert.rejects(c.routingAsk({ workflow: 'wf', run: 'run', path: 'out', question: 'help' }),
+    error => error instanceof HubError && error.status === 429);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.url, 'https://hub.example/api/routing_file_artifacts/v1?workflow=wf&run=run');
+  assert.equal(requests[0]?.headers.get('X-Owenloop-Routing-Session'), 'private-session');
+  monotonic = 2_000;
+  assert.equal((await c.routingAsk({ workflow: 'wf', run: 'run', path: 'out', question: 'help' })).ok, true);
+  assert.equal(requests[1]?.url, 'https://hub.example/api/routing_ask/v1');
 });
 
 test('assessLocalModel uses the scoped service verb with exactly the reviewed body', async () => {

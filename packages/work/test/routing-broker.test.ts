@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -321,8 +321,6 @@ test('agent-run session holder is pinned to the original routing session', async
     assert.deepEqual((seen[1] as { holder: unknown }).holder, sessionHolder);
     const mountHub = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder });
     assert.equal((await mountHub.heartbeat({ workflow: 'wf', run: 'run', holder: sessionHolder })).text, 'ok');
-    await assert.rejects(mountHub.reject({ workflow: 'wf', run: 'run', path: 'out', text: 'no' }),
-      /routed holder verb unavailable/);
     await assert.rejects(mountHub.release({ workflow: 'wf', run: 'run' }), /routed holder verb unavailable/);
     await assert.rejects(holderClient.getOrder({ workflow: 'wf', run: 'run', holder }), /broker unavailable/);
     await assert.rejects(client.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
@@ -331,6 +329,120 @@ test('agent-run session holder is pinned to the original routing session', async
     assert.equal(seen.length, 3, 'holder cap cannot invoke role methods or spoof the exec holder');
     grant.terminal();
     await assert.rejects(holderClient.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder }), /broker unavailable/);
+  } finally { await broker.close(); }
+});
+
+test('holder ask/reject/upload and role approval use only exact scoped routes', async () => {
+  const agentReservation: ChildReservation = { ...reservation, childKind: 'agent-run', token: 'b'.repeat(32) };
+  const agentRecord = { ...child, kind: 'agent-run' as const, gateToken: agentReservation.token };
+  const calls: Array<{ route: string; body: unknown; headers: Headers }> = [];
+  const bytes = new Uint8Array(32 * 1024 * 1024 + 1);
+  bytes.fill(0x63);
+  const fileRoot = mkdtempSync(join(tmpdir(), 'owenloop-routing-upload-'));
+  const file = join(fileRoot, 'artifact.bin');
+  writeFileSync(file, bytes);
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      const headers = new Headers(init?.headers);
+      if (route.startsWith('routing_file_artifacts/v1?')) {
+	let size = 0;
+	for await (const part of init?.body as AsyncIterable<Uint8Array>) size += part.byteLength;
+	calls.push({ route, body: { size }, headers });
+	return Response.json({ text: 'stored', __file: 'orgs/org/artifacts/wf/files/routed/run/unique/key',
+	  hash: 'a'.repeat(64), size, contentType: 'application/octet-stream' });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push({ route, body, headers });
+      if (route === 'get_order') return Response.json({ ...orderResponse,
+	order: { ...orderResponse.order, consumes: { source: 'value' } } });
+      if (route === 'routing_ask/v1' || route === 'routing_reject/v1')
+	return Response.json({ text: 'done', ok: true, closed: true });
+      if (route === 'routing_request_approval/v1')
+	return Response.json({ text: 'pending', ok: true, approval: { state: 'pending' } });
+      if (route === 'read_invocation_binding') return Response.json({
+	protocol: 'owenloop-binding-v1', orgId: 'org', freshness: 'fresh-at-read', atomicLaunch: false,
+	binding: { id: 'inv_1' }, bindingJson: '{}', bindingDigest: 'sha256:binding',
+      });
+      throw new Error('unexpected scoped route');
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder);
+    grant.activate(agentRecord);
+    const role = createRoutingChildClient(handoffFor(grant, agentReservation));
+    const holderClient = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder });
+    const sessionHolder = { kind: 'session' as const, id: sessionId, shiftId: identity.shiftId };
+    await holderClient.getOrder({ workflow: 'wf', run: 'run', holder: sessionHolder });
+    assert.equal((await holderClient.ask({ workflow: 'wf', run: 'run', path: 'out', question: 'Need a value?' })).closed, true);
+    assert.equal((await holderClient.reject({ workflow: 'wf', run: 'run', path: 'source', text: 'Invalid' })).ok, true);
+    assert.equal((await role.requestApproval({ workflow: 'wf', run: 'run', tool_use_id: 'tool-1',
+	tool_name: 'Bash', tool_input: { command: 'pwd' }, reason: 'needs approval' })).approval?.state, 'pending');
+    const invocation = { workflow: 'wf', orderId: 'run', parentWorkflow: 'parent',
+      parentDefRef: { bundleDigest: 'sha256:bundle', workflowName: 'parent' }, callPath: 'out' };
+    assert.equal((await role.readInvocationBinding(invocation)).binding.id, 'inv_1');
+    const pointer = await holderClient.putFileArtifact({ workflow: 'wf', bytes,
+	contentType: 'application/octet-stream' });
+    assert.equal(pointer.size, bytes.byteLength);
+    assert.equal(typeof pointer.__file, 'string');
+    const streamed = await holderClient.uploadFile({ workflow: 'wf', file,
+	contentType: 'application/octet-stream', filename: 'artifact.bin' });
+    assert.equal(streamed.size, bytes.byteLength);
+    await assert.rejects(holderClient.ask({ workflow: 'wf', run: 'run', path: 'other', question: 'No' }), /unavailable/);
+    await assert.rejects(holderClient.reject({ workflow: 'wf', run: 'run', path: 'other', text: 'No' }), /unavailable/);
+    const narrow = createRoutingChildClient(handoffFor(grant.holder, agentReservation));
+    await assert.rejects(narrow.requestApproval({ workflow: 'wf', run: 'run', tool_use_id: 'other',
+	tool_name: 'Bash', tool_input: {}, reason: 'no' }), /unavailable/);
+    await assert.rejects(narrow.readInvocationBinding(invocation), /unavailable/);
+    assert.deepEqual(calls.map(c => c.route), ['get_order', 'routing_ask/v1', 'routing_reject/v1',
+      'routing_request_approval/v1', 'read_invocation_binding',
+      'routing_file_artifacts/v1?workflow=wf&run=run',
+      'routing_file_artifacts/v1?workflow=wf&run=run']);
+    for (const call of calls) {
+      assert.equal(call.headers.get('Authorization'), 'Bearer enrolled');
+      assert.equal(call.headers.get('X-Owenloop-Routing-Session'), credential);
+    }
+    assert.equal(calls.at(-1)?.headers.get('content-length'), String(bytes.byteLength));
+    grant.terminal();
+  } finally { await broker.close(); rmSync(fileRoot, { recursive: true, force: true }); }
+});
+
+test('revoking a holder grant aborts an in-flight streamed upload', async () => {
+  const agentReservation: ChildReservation = { ...reservation, childKind: 'agent-run', token: 'd'.repeat(32) };
+  const agentRecord = { ...child, kind: 'agent-run' as const, gateToken: agentReservation.token };
+  let uploadStarted!: () => void;
+  const started = new Promise<void>(resolve => { uploadStarted = resolve; });
+  let aborted = false;
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      if (String(url).endsWith('/get_order')) return Response.json(orderResponse);
+      if (String(url).includes('routing_file_artifacts')) {
+	uploadStarted();
+	return new Promise<Response>((_resolve, reject) => {
+	  init?.signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+	});
+      }
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder);
+    grant.activate(agentRecord);
+    const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder });
+    await client.getOrder({ workflow: 'wf', run: 'run',
+      holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+    const pending = client.putFileArtifact({ workflow: 'wf', bytes: new Uint8Array(1024 * 1024),
+      contentType: 'application/octet-stream' });
+    await started;
+    grant.terminal();
+    await assert.rejects(pending, /routing broker unavailable|routing request refused/);
+    assert.equal(aborted, true);
   } finally { await broker.close(); }
 });
 

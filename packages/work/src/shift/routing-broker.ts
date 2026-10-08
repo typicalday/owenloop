@@ -6,28 +6,34 @@
 import { randomBytes } from 'node:crypto';
 import { chmodSync, lstatSync, mkdtempSync, rmdirSync, unlinkSync, type Stats } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
+import { PassThrough } from 'node:stream';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingHubClient } from '../hub/client.ts';
 import { HubError, type ContactHolder, type GetOrderResponse, type LaunchReportV1,
-  type LaunchReservationRequestV1, type ReferenceRouting } from '../hub/types.ts';
+  type LaunchReservationRequestV1, type ReferenceRouting, type PutFileArtifactResponse } from '../hub/types.ts';
 import type { ChildRecord, ChildReservation } from './state.ts';
 
 // Service permits artifact values up to 25 MB. Leave bounded JSON overhead
 // while allowing a normal submit receipt through this private transport.
 const MAX_LINE = 32 * 1024 * 1024;
+const MAX_FILE = 500_000_000;
+const MAX_UPLOAD_HEADER = 4096;
 const MAX_SOCKETS = 16;
 const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
-  | 'heartbeat' | 'submit' | 'release';
+  | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
+  | 'read_invocation_binding';
 type CapScope = 'role' | 'holder';
 interface Grant {
   active: boolean;
   ready: boolean;
   execHolderId?: string;
   allowedPaths?: Set<string>;
+  consumedPaths?: Set<string>;
+  uploadControllers: Set<AbortController>;
   reservation: ChildReservation;
   routing: ReferenceRouting;
   identity: Identity;
@@ -147,7 +153,8 @@ async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, lau
 
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
-  if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit')
+  if (scope === 'holder' && method !== 'get_order' && method !== 'heartbeat' && method !== 'submit'
+    && method !== 'ask' && method !== 'reject')
     throw new Error('routing broker request refused');
   const launch = method === 'assess_local_model' || method === 'reserve_launch' || method === 'report_launch';
   if (!grant.ready || !(launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now())))
@@ -162,6 +169,9 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       grant.allowedPaths = order && response.lease.claimed
 	? new Set((order.owes.length ? order.owes.map(owe => owe.path) : order.outputs))
 	: undefined;
+      grant.consumedPaths = order && response.lease.claimed && order.consumes
+	&& typeof order.consumes === 'object' && !Array.isArray(order.consumes)
+	? new Set(Object.keys(order.consumes)) : undefined;
       return response;
     }
     case 'read_routing_claim':
@@ -255,6 +265,74 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	if (!response || typeof response.released !== 'boolean') throw new Error('routing broker response refused');
 	return response;
       }
+    case 'ask': {
+      if (!exactKeys(body, ['path', 'question']) && !exactKeys(body, ['path', 'question', 'context']))
+	throw new Error('routing broker request refused');
+      if (typeof body.path !== 'string' || !grant.allowedPaths?.has(body.path)
+	|| typeof body.question !== 'string' || !body.question.trim()
+	|| (body.context !== undefined && typeof body.context !== 'string'))
+	throw new Error('routing broker request refused');
+      const response = await checked(grant, grant.hub.routingAsk({ workflow, run, path: body.path,
+	question: body.question, ...(body.context === undefined ? {} : { context: body.context }) }, signal), now);
+      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
+	throw new Error('routing broker response refused');
+      return response;
+    }
+    case 'reject': {
+      if (!exactKeys(body, ['path', 'text']) && !exactKeys(body, ['path', 'text', 'requested']))
+	throw new Error('routing broker request refused');
+      if (typeof body.path !== 'string' || !grant.consumedPaths?.has(body.path)
+	|| typeof body.text !== 'string' || !body.text.trim()
+	|| (body.requested !== undefined && (typeof body.requested !== 'string' || !body.requested.trim())))
+	throw new Error('routing broker request refused');
+      const response = await checked(grant, grant.hub.routingReject({ workflow, run, path: body.path,
+	text: body.text, ...(body.requested === undefined ? {} : { requested: body.requested }) }, signal), now);
+      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
+	throw new Error('routing broker response refused');
+      return response;
+    }
+    case 'request_approval': {
+      if (scope !== 'role' || childKind !== 'agent-run'
+	|| !exactKeys(body, ['tool_use_id', 'tool_name', 'tool_input', 'reason'])
+	&& !exactKeys(body, ['tool_use_id', 'tool_name', 'tool_input', 'reason', 'title']))
+	throw new Error('routing broker request refused');
+      if (typeof body.tool_use_id !== 'string' || !body.tool_use_id
+	|| typeof body.tool_name !== 'string' || !body.tool_name
+	|| typeof body.reason !== 'string' || !body.reason
+	|| (body.title !== undefined && typeof body.title !== 'string'))
+	throw new Error('routing broker request refused');
+      const response = await checked(grant, grant.hub.routingRequestApproval({ workflow, run,
+	tool_use_id: body.tool_use_id, tool_name: body.tool_name, tool_input: body.tool_input,
+	reason: body.reason, ...(body.title === undefined ? {} : { title: body.title }) }, signal), now);
+      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
+	throw new Error('routing broker response refused');
+      return response;
+    }
+    case 'read_invocation_binding': {
+      if (scope !== 'role' || !exactKeys(body, ['parentWorkflow', 'parentDefRef', 'callPath'])
+	&& !exactKeys(body, ['parentWorkflow', 'parentDefRef', 'callPath', 'parentArtifactVersion']))
+	throw new Error('routing broker request refused');
+      if (typeof body.parentWorkflow !== 'string' || !body.parentWorkflow
+	|| !exactKeys(body.parentDefRef, ['bundleDigest', 'workflowName'])
+	|| typeof body.parentDefRef.bundleDigest !== 'string' || !body.parentDefRef.bundleDigest
+	|| typeof body.parentDefRef.workflowName !== 'string' || !body.parentDefRef.workflowName
+	|| typeof body.callPath !== 'string' || !body.callPath
+	|| (body.parentArtifactVersion !== undefined && (!Number.isSafeInteger(body.parentArtifactVersion)
+	  || (body.parentArtifactVersion as number) < 1))) throw new Error('routing broker request refused');
+      const response = await checked(grant, grant.hub.readInvocationBinding({ workflow, orderId: run,
+	parentWorkflow: body.parentWorkflow, parentDefRef: {
+	  bundleDigest: body.parentDefRef.bundleDigest,
+	  workflowName: body.parentDefRef.workflowName,
+	},
+	callPath: body.callPath, ...(body.parentArtifactVersion === undefined
+	  ? {} : { parentArtifactVersion: body.parentArtifactVersion as number }) }, signal), now, true);
+      if (!response || response.protocol !== 'owenloop-binding-v1'
+	|| response.orgId !== grant.identity.orgId || response.freshness !== 'fresh-at-read'
+	|| response.atomicLaunch !== false || !response.binding || typeof response.binding.id !== 'string'
+	|| !response.binding.id || typeof response.bindingJson !== 'string'
+	|| typeof response.bindingDigest !== 'string') throw new Error('routing broker response refused');
+      return response;
+    }
   }
 }
 
@@ -282,16 +360,39 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
     let bytes = 0;
     const chunks: Buffer[] = [];
     let handled = false;
+    let upload: { remaining: number; stream: PassThrough } | undefined;
+    const feedUpload = (chunk: Buffer) => {
+      if (!upload || chunk.length > upload.remaining) { socket.destroy(); return; }
+      upload.remaining -= chunk.length;
+      if (chunk.length > 0 && !upload.stream.write(chunk)) {
+	socket.pause();
+	upload.stream.once('drain', () => { if (!socket.destroyed) socket.resume(); });
+      }
+      if (upload.remaining === 0) upload.stream.end();
+    };
+    const refuse = (error: unknown) => {
+      const status = error instanceof HubError ? error.status : undefined;
+      const retryAfterMs = error instanceof HubError ? error.retryAfterMs : undefined;
+      if (!socket.destroyed) socket.end(JSON.stringify({ ok: false, error: 'routing request refused',
+	...(status === undefined ? {} : { status }),
+	...(retryAfterMs === undefined ? {} : { retryAfterMs }) }) + '\n');
+    };
     socket.on('data', data => {
-      if (handled) return;
       const chunk = typeof data === 'string' ? Buffer.from(data) : data;
+      if (upload) { feedUpload(chunk); return; }
+      if (handled) return;
       bytes += chunk.length;
-      if (bytes > MAX_LINE) { handled = true; socket.destroy(); return; }
       chunks.push(chunk);
-      if (chunk.indexOf(0x0a) < 0) return;
+      if (chunk.indexOf(0x0a) < 0) {
+	if (bytes > MAX_LINE) { handled = true; socket.destroy(); }
+	return;
+      }
       handled = true;
       const frame = Buffer.concat(chunks, bytes);
-      const raw = frame.subarray(0, frame.indexOf(0x0a)).toString('utf8');
+      const newline = frame.indexOf(0x0a);
+      if (newline > MAX_LINE) { socket.destroy(); return; }
+      const raw = frame.subarray(0, newline).toString('utf8');
+      const tail = frame.subarray(newline + 1);
       void (async () => {
 	try {
 	  const request: unknown = JSON.parse(raw);
@@ -299,18 +400,59 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	    || !CAP.test(request.cap) || typeof request.method !== 'string') throw new Error();
 	  const entry = grants.get(request.cap);
 	  if (!entry || closed) throw new Error();
+	  if (request.method === 'upload_file') {
+	    if (newline > MAX_UPLOAD_HEADER || entry.scope !== 'holder'
+	      || entry.grant.reservation.childKind !== 'agent-run'
+	      || !entry.grant.ready || !validateSessionGrant(entry.grant, now())
+	      || !entry.grant.allowedPaths?.size
+	      || (!exactKeys(request.body, ['size', 'contentType'])
+		&& !exactKeys(request.body, ['size', 'contentType', 'filename']))) throw new Error();
+	    const body = request.body;
+	    if (!Number.isSafeInteger(body.size) || (body.size as number) <= 0
+	      || (body.size as number) > MAX_FILE || typeof body.contentType !== 'string'
+	      || !body.contentType.trim() || body.contentType.length > 256
+	      || (body.filename !== undefined && (typeof body.filename !== 'string'
+		|| !body.filename || body.filename.length > 1024))
+	      || tail.length > (body.size as number)) throw new Error();
+	    const grant = entry.grant;
+	    const stream = new PassThrough({ highWaterMark: 64 * 1024 });
+	    stream.on('error', () => {}); // Disconnect/revocation is a request failure, never a Shift crash.
+	    socket.setTimeout(20 * 60_000, () => socket.destroy());
+	    const totalTimer = setTimeout(() => socket.destroy(), 60 * 60_000);
+	    totalTimer.unref();
+	    socket.once('close', () => clearTimeout(totalTimer));
+	    controller.signal.addEventListener('abort', () => { stream.destroy(); socket.destroy(); }, { once: true });
+	    grant.uploadControllers.add(controller);
+	    upload = { remaining: body.size as number, stream };
+	    const keyPrefix = `orgs/${grant.identity.orgId}/artifacts/${grant.reservation.workflow}`
+	      + `/files/routed/${encodeURIComponent(grant.reservation.run)}/`;
+	    void checked(grant, grant.hub.routingPutFileArtifact({
+	      workflow: grant.reservation.workflow, run: grant.reservation.run,
+	      body: stream, size: body.size as number, contentType: body.contentType,
+	      ...(body.filename === undefined ? {} : { filename: body.filename }),
+	    }, controller.signal), now).then((value: PutFileArtifactResponse) => {
+	      if (!value || typeof value.__file !== 'string' || !value.__file.startsWith(keyPrefix)
+		|| value.__file.length <= keyPrefix.length
+		|| typeof value.hash !== 'string' || !/^[a-f0-9]{64}$/.test(value.hash)
+		|| value.size !== body.size || value.contentType !== body.contentType
+		|| typeof value.text !== 'string') throw new Error('routing broker response refused');
+	      if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
+	    }).catch(refuse).finally(() => {
+	      grant.uploadControllers.delete(controller);
+	      stream.destroy();
+	    });
+	    feedUpload(tail);
+	    return;
+	  }
+	  if (tail.length > 0) throw new Error();
 	  const methods: readonly string[] = ['get_order', 'read_routing_claim', 'assess_local_model',
-	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release'];
+	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
+	    'request_approval', 'read_invocation_binding'];
 	  if (!methods.includes(request.method)) throw new Error();
 	  const value = await invoke(entry.grant, entry.scope, request.method as Method, request.body, now, controller.signal);
 	  if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
 	} catch (error) {
-	  // No raw Hub body, credential, grant or request data on the wire.
-	  const status = error instanceof HubError ? error.status : undefined;
-	  const retryAfterMs = error instanceof HubError ? error.retryAfterMs : undefined;
-	  if (!socket.destroyed) socket.end(JSON.stringify({ ok: false, error: 'routing request refused',
-	    ...(status === undefined ? {} : { status }),
-	    ...(retryAfterMs === undefined ? {} : { retryAfterMs }) }) + '\n');
+	  refuse(error);
 	}
       })();
     });
@@ -332,7 +474,8 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
     socketPath,
     issue({ reservation, routing, identity, currentIdentity, hub }) {
       if (closed) throw new Error('routing broker closed');
-      const grant: Grant = { active: true, ready: false, reservation: structuredClone(reservation), routing: structuredClone(routing),
+      const grant: Grant = { active: true, ready: false, uploadControllers: new Set(),
+	reservation: structuredClone(reservation), routing: structuredClone(routing),
 	identity: { ...identity }, currentIdentity, hub };
       if (!validateLaunchGrant(grant, now())) throw new Error('routing broker grant refused');
       const cap = randomBytes(32).toString('hex');
@@ -353,6 +496,7 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	terminal = true;
 	grant.active = false;
 	grant.ready = false;
+	for (const controller of grant.uploadControllers) controller.abort();
 	grants.delete(cap);
 	if (holderCap) grants.delete(holderCap);
       } };
@@ -360,7 +504,10 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
     async close() {
       if (closed) return;
       closed = true;
-      for (const entry of grants.values()) entry.grant.active = false;
+      for (const entry of grants.values()) {
+	entry.grant.active = false;
+	for (const controller of entry.grant.uploadControllers) controller.abort();
+      }
       grants.clear();
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));

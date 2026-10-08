@@ -47,7 +47,7 @@ import { basename, extname } from 'node:path';
 
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
+import type { ContactHolder, GetOrderResponse, OrderPacket, PutFileArtifactResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -66,6 +66,9 @@ export interface HoldMcpDeps {
   run: string;
   /** Sole containment root for submit value files. */
   workdir: string;
+  /** Routed holder streams a contained local file without materializing all bytes. */
+  uploadFile?: (req: { workflow: string; file: string; contentType: string;
+    filename?: string }) => Promise<PutFileArtifactResponse>;
   /** Positive registration list. Absent exposes every tool in `HOLD_MCP_TOOL_NAMES`. */
   tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
@@ -568,16 +571,21 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         // outputs may come from, and a symlink out of it is an exfiltration
         // path, not a convenience.
         const resolved = await resolveContainedPath(deps.workdir, file, 'file-artifact');
-        const bytes = new Uint8Array(await readFile(resolved));
-        if (bytes.byteLength === 0) {
-          return textResult({ error: `file-artifact-empty: ${file} is zero bytes` }, true);
-        }
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
         const beforeUpload = terminalGuard();
         if (beforeUpload !== undefined) return beforeUpload;
-        const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
+	let res: PutFileArtifactResponse;
+	if (deps.uploadFile) {
+	  res = await deps.uploadFile({ workflow, file: resolved, contentType, filename });
+	} else {
+	  const bytes = new Uint8Array(await readFile(resolved));
+	  if (bytes.byteLength === 0) {
+	    return textResult({ error: `file-artifact-empty: ${file} is zero bytes` }, true);
+	  }
+	  res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
+	}
         // Hand back the envelope EXACTLY as it must be submitted. The hub's
         // `text` is dropped from the pointer so the model cannot paste a field
         // the artifact schema does not know about.
@@ -590,7 +598,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         };
         return textResult({
           pointer,
-          text: `Stored ${String(bytes.byteLength)} bytes as ${contentType}. Submit this pointer as your value, or embed it in one.`,
+	  text: `Stored ${String(res.size)} bytes as ${contentType}. Submit this pointer as your value, or embed it in one.`,
         });
       } catch (e) {
         return textResult({ error: errMsg(e) }, true);

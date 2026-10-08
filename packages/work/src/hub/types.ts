@@ -504,12 +504,13 @@ export interface PutFileArtifactRequest {
 
 /**
  * The envelope, which IS the artifact value. `__file` is the discriminator the
- * hub's pointer walk looks for; `hash` is the content address (so re-uploading
- * identical bytes is free); `size` and `contentType` describe bytes a def can
+ * hub's pointer walk looks for; `hash` identifies the uploaded bytes, while
+ * the key is unique to this routed upload attempt. `size` and `contentType` describe bytes a def can
  * constrain with ordinary JSON Schema even though it can never see them.
  */
 export interface FileArtifactPointer {
-  __file: true;
+  /** Opaque R2 object key returned by Service, never a boolean marker. */
+  __file: string;
   hash: string;
   size: number;
   contentType: string;

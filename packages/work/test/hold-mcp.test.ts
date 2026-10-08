@@ -103,7 +103,7 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
       if (cfg.putFileArtifact instanceof Error) throw cfg.putFileArtifact;
       return {
         text: 'stored',
-        __file: true,
+	__file: 'orgs/org/artifacts/wf/files/hash',
         hash: 'a'.repeat(64),
         size: req.bytes.byteLength,
         contentType: req.contentType,
@@ -1127,7 +1127,7 @@ test('put_file_artifact uploads a contained file and returns the submittable env
     assert.notEqual((res as { isError?: boolean }).isError, true);
     const body = parse(res);
     assert.deepEqual(body.pointer, {
-      __file: true,
+      __file: 'orgs/org/artifacts/wf/files/hash',
       hash: 'a'.repeat(64),
       size: 5,
       contentType: 'image/png',
@@ -1142,6 +1142,25 @@ test('put_file_artifact uploads a contained file and returns the submittable env
   } finally {
     cleanup();
   }
+});
+
+test('routed put_file_artifact uses the contained streaming seam without a legacy byte upload', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    const file = join(dir, 'render.png');
+    writeFileSync(file, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]));
+    const { hub, calls } = mockHub({});
+    const uploads: unknown[] = [];
+    const mount = createHoldMcp(deps(hub, { workdir: dir, uploadFile: async req => {
+      uploads.push(req);
+      return { text: 'stored', __file: 'orgs/org/artifacts/wf/files/routed/run/unique/key',
+	hash: 'a'.repeat(64), size: 5, contentType: 'image/png', filename: 'render.png' };
+    } }));
+    const result = await tool(mount.tools, 'put_file_artifact').handler({ file: 'render.png' }, ctx);
+    assert.notEqual((result as { isError?: boolean }).isError, true);
+    assert.deepEqual(uploads, [{ workflow: 'wf1', file, contentType: 'image/png', filename: 'render.png' }]);
+    assert.equal(calls.some(call => call.verb === 'put_file_artifact'), false);
+  } finally { cleanup(); }
 });
 
 test('put_file_artifact honours an explicit contentType and filename over the extension guess', async () => {

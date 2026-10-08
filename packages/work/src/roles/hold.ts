@@ -394,6 +394,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   let token: string | undefined;
   let holder: ContactHolder;
   let hub: HubClient;
+  let routedUploadFile: ReturnType<typeof createRoutingHolderClient>['uploadFile'] | undefined;
   if (routed) {
     // Strip ambient bearer routes before local definition/consumed verification.
     // The holder never invokes resolveBearer or accepts an injected broad Hub.
@@ -409,7 +410,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       if ((parsed.session !== undefined && parsed.session !== binding.sessionId)
 	|| (parsed.shift !== undefined && parsed.shift !== binding.shiftId)) throw new Error();
       holder = { kind: 'session', id: binding.sessionId, shiftId: binding.shiftId };
-      hub = createRoutingHolderClient(binding);
+      const routedHub = createRoutingHolderClient(binding);
+      hub = routedHub;
+      routedUploadFile = routedHub.uploadFile;
     } catch {
       err('owenloop work hold: routed holder handoff refused');
       return 1;
@@ -471,6 +474,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       workflow: target.workflow,
       run: target.run,
       workdir: process.cwd(),
+      ...(routedUploadFile ? { uploadFile: routedUploadFile } : {}),
       ...(parsed.verifiedHosted ? { tools: ['get_order' as const] }
 	: parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),
       origin,
