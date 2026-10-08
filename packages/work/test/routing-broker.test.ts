@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { test } from 'node:test';
 
 import { createHubClient } from '../src/hub/client.ts';
@@ -350,8 +351,9 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
 	let size = 0;
 	for await (const part of init?.body as AsyncIterable<Uint8Array>) size += part.byteLength;
 	calls.push({ route, body: { size }, headers });
-	return Response.json({ text: 'stored', __file: 'orgs/org/artifacts/wf/files/routed/run/unique/key',
-	  hash: 'a'.repeat(64), size, contentType: 'application/octet-stream' });
+      return Response.json({ text: 'stored', __file: 'orgs/org/artifacts/wf/files/routed/run/12345678-1234-4123-8123-123456789abc',
+	  hash: 'a'.repeat(64), size, contentType: 'application/octet-stream',
+	  ...(headers.get('x-file-name') === null ? {} : { filename: headers.get('x-file-name') }) });
       }
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       calls.push({ route, body, headers });
@@ -388,7 +390,7 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
 	contentType: 'application/octet-stream' });
     assert.equal(pointer.size, bytes.byteLength);
     assert.equal(typeof pointer.__file, 'string');
-    const streamed = await holderClient.uploadFile({ workflow: 'wf', file,
+    const streamed = await holderClient.uploadFile({ workflow: 'wf', workdir: fileRoot, file: 'artifact.bin',
 	contentType: 'application/octet-stream', filename: 'artifact.bin' });
     assert.equal(streamed.size, bytes.byteLength);
     await assert.rejects(holderClient.ask({ workflow: 'wf', run: 'run', path: 'other', question: 'No' }), /unavailable/);
@@ -434,15 +436,148 @@ test('revoking a holder grant aborts an in-flight streamed upload', async () => 
     const grant = broker.issue({ reservation: agentReservation, routing, identity, currentIdentity: () => identity, hub });
     assert.ok(grant.holder);
     grant.activate(agentRecord);
-    const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder });
+    const client = createRoutingChildClient(handoffFor(grant.holder, agentReservation));
     await client.getOrder({ workflow: 'wf', run: 'run',
       holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
-    const pending = client.putFileArtifact({ workflow: 'wf', bytes: new Uint8Array(1024 * 1024),
-      contentType: 'application/octet-stream' });
+    let sent = false;
+    const source = new Readable({ read() {
+      if (!sent) { sent = true; this.push(Buffer.alloc(64 * 1024)); }
+    } });
+    const pending = client.putFileArtifactStream({ workflow: 'wf', size: 1024 * 1024,
+      chunks: source, contentType: 'application/octet-stream' });
     await started;
     grant.terminal();
     await assert.rejects(pending, /routing broker unavailable|routing request refused/);
     assert.equal(aborted, true);
+    assert.equal(source.destroyed, true, 'client stops reading the local file source');
+  } finally { await broker.close(); }
+});
+
+test('routed holder refuses a file when an ancestor changes after open', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'owenloop-routing-swap-'));
+  const root = join(base, 'root'), safe = join(root, 'safe'), outside = join(base, 'outside');
+  mkdirSync(safe, { recursive: true });
+  mkdirSync(outside);
+  writeFileSync(join(safe, 'artifact.bin'), 'inside');
+  writeFileSync(join(outside, 'artifact.bin'), 'outside');
+  let uploadCalls = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async url => {
+      if (String(url).endsWith('/get_order')) return Response.json(orderResponse);
+      uploadCalls++;
+      return Response.json({ text: 'unexpected' });
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const reserved = { ...reservation, childKind: 'agent-run' as const, token: 'e'.repeat(32) };
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder);
+    grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
+    const client = createRoutingHolderClient({ workflow: 'wf', run: 'run', broker: grant.holder }, {
+      afterFileOpen() {
+	renameSync(safe, join(root, 'moved'));
+	symlinkSync(outside, safe, 'dir');
+      },
+    });
+    await client.getOrder({ workflow: 'wf', run: 'run',
+      holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+    await assert.rejects(client.uploadFile({ workflow: 'wf', workdir: root,
+      file: 'safe/artifact.bin', contentType: 'application/octet-stream' }), /file-artifact-outside-workdir/);
+    assert.equal(uploadCalls, 0);
+    grant.terminal();
+  } finally { await broker.close(); rmSync(base, { recursive: true, force: true }); }
+});
+
+test('routed holder refuses a same-path replacement after opening the file inode', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-inode-'));
+  const file = join(root, 'artifact.bin');
+  writeFileSync(file, 'original');
+  try {
+    const client = createRoutingHolderClient({ workflow: 'wf', run: 'run',
+      broker: { socketPath: join(root, 'missing.sock'), cap: 'a'.repeat(64) } }, {
+      afterFileOpen() {
+	renameSync(file, join(root, 'old.bin'));
+	writeFileSync(file, 'replacement');
+      },
+    });
+    await assert.rejects(client.uploadFile({ workflow: 'wf', workdir: root,
+      file: 'artifact.bin', contentType: 'application/octet-stream' }), /file-artifact-outside-workdir/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('broker rejects malformed upload pointers and a role-cap upload', async () => {
+  const reserved = { ...reservation, childKind: 'agent-run' as const, token: 'f'.repeat(32) };
+  const good = { text: 'stored', __file: 'orgs/org/artifacts/wf/files/routed/run/12345678-1234-4123-8123-123456789abc',
+    hash: 'a'.repeat(64), size: 1, contentType: 'text/plain' };
+  let response: Record<string, unknown> = good;
+  let uploadCalls = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      if (String(url).endsWith('/get_order')) return Response.json(orderResponse);
+      uploadCalls++;
+      for await (const _part of init?.body as AsyncIterable<Uint8Array>) { /* drain */ }
+      return Response.json(response);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder);
+    grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
+    const holderClient = createRoutingChildClient(handoffFor(grant.holder, reserved));
+    await holderClient.getOrder({ workflow: 'wf', run: 'run',
+      holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+    for (const bad of [
+      { ...good, __file: 'orgs/other/artifacts/wf/files/routed/run/12345678-1234-4123-8123-123456789abc' },
+      { ...good, __file: 'orgs/org/artifacts/wf/files/routed/run/not-a-uuid' },
+      { ...good, filename: 'wrong.txt' },
+    ]) {
+      response = bad;
+      await assert.rejects(holderClient.putFileArtifact({ workflow: 'wf', bytes: Uint8Array.of(1),
+	contentType: 'text/plain' }), /routing broker unavailable/);
+    }
+    const role = createRoutingChildClient(handoffFor(grant, reserved));
+    await assert.rejects(role.putFileArtifact({ workflow: 'wf', bytes: Uint8Array.of(1),
+      contentType: 'text/plain' }), /routing broker unavailable/);
+    assert.equal(uploadCalls, 3, 'role cap never reaches the scoped upload route');
+    grant.terminal();
+  } finally { await broker.close(); }
+});
+
+test('broker upload absolute deadline aborts the parent request and child stream', async () => {
+  const reserved = { ...reservation, childKind: 'agent-run' as const, token: '1'.repeat(32) };
+  let aborted = false;
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      if (String(url).endsWith('/get_order')) return Response.json(orderResponse);
+      return new Promise<Response>((_resolve, reject) => {
+	init?.signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+      });
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000,
+    uploadTimeouts: { idleMs: 80, absoluteMs: 100 } });
+  try {
+    const grant = broker.issue({ reservation: reserved, routing, identity, currentIdentity: () => identity, hub });
+    assert.ok(grant.holder);
+    grant.activate({ ...child, kind: 'agent-run', gateToken: reserved.token });
+    const client = createRoutingChildClient(handoffFor(grant.holder, reserved));
+    await client.getOrder({ workflow: 'wf', run: 'run',
+      holder: { kind: 'session', id: sessionId, shiftId: identity.shiftId } });
+    async function* slowBytes(): AsyncGenerator<Uint8Array> {
+      for (let i = 0; i < 8; i++) {
+	yield Uint8Array.of(i);
+	await new Promise(resolve => setTimeout(resolve, 30));
+      }
+    }
+    await assert.rejects(client.putFileArtifactStream({ workflow: 'wf', size: 8,
+      chunks: slowBytes(), contentType: 'application/octet-stream' }), /routing broker unavailable/);
+    assert.equal(aborted, true);
+    grant.terminal();
   } finally { await broker.close(); }
 });
 

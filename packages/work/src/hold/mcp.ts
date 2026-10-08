@@ -67,7 +67,7 @@ export interface HoldMcpDeps {
   /** Sole containment root for submit value files. */
   workdir: string;
   /** Routed holder streams a contained local file without materializing all bytes. */
-  uploadFile?: (req: { workflow: string; file: string; contentType: string;
+  uploadFile?: (req: { workflow: string; workdir: string; file: string; contentType: string;
     filename?: string }) => Promise<PutFileArtifactResponse>;
   /** Positive registration list. Absent exposes every tool in `HOLD_MCP_TOOL_NAMES`. */
   tools?: readonly HoldMcpToolName[];
@@ -570,7 +570,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         // own error family: the working directory is the only root a step's
         // outputs may come from, and a symlink out of it is an exfiltration
         // path, not a convenience.
-        const resolved = await resolveContainedPath(deps.workdir, file, 'file-artifact');
+	const resolved = deps.uploadFile ? file : await resolveContainedPath(deps.workdir, file, 'file-artifact');
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
@@ -578,7 +578,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (beforeUpload !== undefined) return beforeUpload;
 	let res: PutFileArtifactResponse;
 	if (deps.uploadFile) {
-	  res = await deps.uploadFile({ workflow, file: resolved, contentType, filename });
+	  res = await deps.uploadFile({ workflow, workdir: deps.workdir, file, contentType, filename });
 	} else {
 	  const bytes = new Uint8Array(await readFile(resolved));
 	  if (bytes.byteLength === 0) {

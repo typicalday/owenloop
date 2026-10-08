@@ -16,6 +16,8 @@ const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_FILE = 500_000_000;
+const UPLOAD_IDLE_MS = 4 * 60_000;
+const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 type Verb = 'get_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject'
   | 'request_approval' | 'read_invocation_binding';
@@ -120,6 +122,8 @@ export function createRoutingChildClient(handoff: {
       const finish = (error?: Error, value?: PutFileArtifactResponse) => {
 	if (settled) return;
 	settled = true;
+	clearTimeout(totalTimer);
+	if (req.chunks instanceof Readable) req.chunks.destroy();
 	socket.destroy();
 	if (error) reject(error);
 	else resolve(value!);
@@ -144,7 +148,9 @@ export function createRoutingChildClient(handoff: {
 	  if (sent !== req.size) throw refused();
 	} catch { finish(refused()); }
       };
-      socket.setTimeout(20 * 60_000, () => finish(refused()));
+      const totalTimer = setTimeout(() => finish(refused()), UPLOAD_ABSOLUTE_MS);
+      totalTimer.unref();
+      socket.setTimeout(UPLOAD_IDLE_MS, () => finish(refused()));
       socket.once('connect', () => { void (async () => {
 	try { if (!socket.write(frame)) await drain(); await pump(); }
 	catch { finish(refused()); }
@@ -175,6 +181,7 @@ export function createRoutingChildClient(handoff: {
       });
       socket.once('error', () => finish(refused()));
       socket.once('end', () => finish(refused()));
+      socket.once('close', () => finish(refused()));
     });
   };
   return {

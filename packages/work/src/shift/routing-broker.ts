@@ -20,6 +20,10 @@ import type { ChildRecord, ChildReservation } from './state.ts';
 const MAX_LINE = 32 * 1024 * 1024;
 const MAX_FILE = 500_000_000;
 const MAX_UPLOAD_HEADER = 4096;
+// Service reserves a routed upload for 15 minutes. End our request early so
+// abort and staged-object cleanup can settle before that reservation expires.
+const UPLOAD_IDLE_MS = 4 * 60_000;
+const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_SOCKETS = 16;
 const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
@@ -337,7 +341,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 }
 
 /** Start a separate private socket for both foreground and daemon Shift modes. */
-export async function createRoutingBroker(args: { now?: () => number } = {}): Promise<RoutingBroker> {
+export async function createRoutingBroker(args: { now?: () => number;
+  uploadTimeouts?: { idleMs: number; absoluteMs: number } } = {}): Promise<RoutingBroker> {
   // macOS limits Unix socket paths to about 104 bytes. A short private temp
   // directory works even when the operator's Shift state path is deeply nested.
   const directory = mkdtempSync(join(tmpdir(), 'ol-rb-'));
@@ -345,6 +350,11 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
   const socketPath = join(directory, 'broker.sock');
   const grants = new Map<string, { grant: Grant; scope: CapScope }>();
   const now = args.now ?? Date.now;
+  const uploadIdleMs = args.uploadTimeouts?.idleMs ?? UPLOAD_IDLE_MS;
+  const uploadAbsoluteMs = args.uploadTimeouts?.absoluteMs ?? UPLOAD_ABSOLUTE_MS;
+  if (!Number.isSafeInteger(uploadIdleMs) || uploadIdleMs <= 0
+    || !Number.isSafeInteger(uploadAbsoluteMs) || uploadAbsoluteMs <= uploadIdleMs
+    || uploadAbsoluteMs > UPLOAD_ABSOLUTE_MS) throw new Error('routing broker upload timeout refused');
   let closed = false;
   const sockets = new Set<Socket>();
   const server: Server = createServer((socket: Socket) => {
@@ -417,8 +427,8 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	    const grant = entry.grant;
 	    const stream = new PassThrough({ highWaterMark: 64 * 1024 });
 	    stream.on('error', () => {}); // Disconnect/revocation is a request failure, never a Shift crash.
-	    socket.setTimeout(20 * 60_000, () => socket.destroy());
-	    const totalTimer = setTimeout(() => socket.destroy(), 60 * 60_000);
+	    socket.setTimeout(uploadIdleMs, () => controller.abort());
+	    const totalTimer = setTimeout(() => controller.abort(), uploadAbsoluteMs);
 	    totalTimer.unref();
 	    socket.once('close', () => clearTimeout(totalTimer));
 	    controller.signal.addEventListener('abort', () => { stream.destroy(); socket.destroy(); }, { once: true });
@@ -432,9 +442,11 @@ export async function createRoutingBroker(args: { now?: () => number } = {}): Pr
 	      ...(body.filename === undefined ? {} : { filename: body.filename }),
 	    }, controller.signal), now).then((value: PutFileArtifactResponse) => {
 	      if (!value || typeof value.__file !== 'string' || !value.__file.startsWith(keyPrefix)
-		|| value.__file.length <= keyPrefix.length
+		|| !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+		  value.__file.slice(keyPrefix.length))
 		|| typeof value.hash !== 'string' || !/^[a-f0-9]{64}$/.test(value.hash)
 		|| value.size !== body.size || value.contentType !== body.contentType
+		|| value.filename !== body.filename
 		|| typeof value.text !== 'string') throw new Error('routing broker response refused');
 	      if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, value }) + '\n');
 	    }).catch(refuse).finally(() => {

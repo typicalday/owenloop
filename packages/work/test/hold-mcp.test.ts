@@ -1158,7 +1158,8 @@ test('routed put_file_artifact uses the contained streaming seam without a legac
     } }));
     const result = await tool(mount.tools, 'put_file_artifact').handler({ file: 'render.png' }, ctx);
     assert.notEqual((result as { isError?: boolean }).isError, true);
-    assert.deepEqual(uploads, [{ workflow: 'wf1', file, contentType: 'image/png', filename: 'render.png' }]);
+    assert.deepEqual(uploads, [{ workflow: 'wf1', workdir: dir, file: 'render.png',
+      contentType: 'image/png', filename: 'render.png' }]);
     assert.equal(calls.some(call => call.verb === 'put_file_artifact'), false);
   } finally { cleanup(); }
 });
