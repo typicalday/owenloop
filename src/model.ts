@@ -2833,9 +2833,16 @@ export function collectionLeaseSuccessors(
   // seal, a human intervention, or an input move.
   move('collection-close', new Map(state.arts), withoutLease);
 
+  const singletonPaths = singletonProduces(step)
+    .map((produce) => produce.stem)
+    // An open run may commit the same singleton again after it is green or
+    // submitted. That bumps its version and may invalidate downstream work.
+    .filter((path) => state.arts.has(path));
+
   // skip() checks producer authority, not the run's input CAS, and leaves a
-  // claimed task open. It can skip an owed, rejected, or already-green seal.
-  for (const path of sealPaths) {
+  // claimed task open. Both seals and singleton outputs can be skipped even
+  // when the claimed run's inputs have moved.
+  for (const path of [...sealPaths, ...singletonPaths]) {
     const firing: Firing = { step: lease.step, key: lease.key, inputs: lease.inputs, outputs: [path] };
     for (const arts of applyOutcome(def, state.arts, firing, 'skip',
       { maxCollectionSize, modifier: state.modifier ?? modifier })) {
@@ -2845,11 +2852,6 @@ export function collectionLeaseSuccessors(
 
   const stale = lease.inputs.some((path) =>
     !isGreen(state.arts.get(path)) || state.arts.get(path)?.version !== lease.fingerprint[path]);
-  const singletonPaths = singletonProduces(step)
-    .map((produce) => produce.stem)
-    // An open run may commit the same singleton again after it is green or
-    // submitted. That bumps its version and may invalidate downstream work.
-    .filter((path) => state.arts.has(path));
   if (stale) {
     // The worker may attempt green() on a singleton or emit()/seal() on the
     // collection. Each CAS-refused verb born-rejects its OWN target and releases
@@ -2888,6 +2890,7 @@ export function collectionLeaseSuccessors(
       step: lease.step, key: lease.key, inputs: lease.inputs, outputs: [path],
     };
     for (const outcome of eligibleOutcomes(def, state.arts, firing, { modifier: state.modifier ?? modifier })) {
+      if (outcome === 'skip') continue; // Already modeled for both fresh and stale leases.
       if (outcome === 'green' && !witnesses?.green) continue;
       if (outcome === 'schema-reject' && !witnesses?.refusal) continue;
       const selected = outcome === 'green' ? witnesses!.acceptedModifiers : [undefined];
