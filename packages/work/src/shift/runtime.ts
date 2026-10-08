@@ -640,7 +640,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       if (!['token', 'oauth'].includes(principal.authMethod) || principal.tokenStatus !== 'active') {
 	throw new Error('routing requires an enrolled bearer');
       }
-      routingSession = await openShiftRoutingSession({ origin, stateDir,
+      routingSession = await openShiftRoutingSession({ origin, stateDir, monotonicNow,
 	orgId: principal.orgId, principalId: principal.actor.id, getToken: async () => token,
 	onMaintenanceError: () => process.stderr.write(`${roleLabel}: parked routing session maintenance failed\n`),
 	scope: {
@@ -968,6 +968,7 @@ function handoffMaintenance(root: string, now: () => number, preserved: Set<stri
 interface ShiftRoutingSessionOptions {
   stateDir: string; origin: string; orgId: string; principalId: string; scope: RoutingScope;
   getToken: () => Promise<string>; fetchImpl?: typeof fetch; now?: () => number; nonce?: () => string;
+  monotonicNow?: () => number;
   /** Keeps a stopped Shift alive while detached workers still own sessions. */
   postStopSchedule?: (fn: () => void, everyMs: number) => () => void;
   onMaintenanceError?: () => void;
@@ -984,6 +985,13 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
   const retired = new Set<Incarnation>();
   let stopped = false;
   let changing: Promise<void> = Promise.resolve();
+  let renewalBackoffUntil = Number.NEGATIVE_INFINITY;
+  const monotonicNow = opts.monotonicNow ?? (() => performance.now());
+  const noteRenewalBackoff = (error: unknown) => {
+    if (error instanceof HubError && error.status === 429) {
+      renewalBackoffUntil = Math.max(renewalBackoffUntil, monotonicNow() + (error.retryAfterMs ?? 30_000));
+    }
+  };
   let cancelParked: (() => void) | undefined;
   const live = () => Boolean(active.identity()) || [...retired].some(incarnation => Boolean(incarnation.identity()));
   const onClosed = () => {
@@ -998,7 +1006,6 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
     get: (_target, property) => Reflect.get(active.hub, property),
     set: (_target, property, value) => Reflect.set(active.hub, property, value),
   });
-  let parkedBackoffUntil = Number.NEGATIVE_INFINITY;
   let parkedInFlight = false;
   const session: ShiftRoutingSession = {
     hub,
@@ -1015,6 +1022,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       });
       const change = changing.catch(() => {}).then(async () => {
 	if (stopped) throw new Error('routing session stopped');
+	if (monotonicNow() < renewalBackoffUntil) throw new Error('routing backoff active');
 	if (JSON.stringify(scope) === JSON.stringify(desired)
 	  && (active.identity()?.expiresAt ?? 0) > (opts.now ?? Date.now)()) return;
 	// Never alter the old session, nor discard it on a failed open.
@@ -1027,7 +1035,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	// remains live. Its terminal callbacks close that exact old session.
 	await previous.stop();
 	if (previous.identity()) retired.add(previous);
-      });
+      }).catch(error => { noteRenewalBackoff(error); throw error; });
       changing = change;
       await change;
     },
@@ -1035,6 +1043,7 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       // A failed scope expansion rejects its caller, but never poisons the
       // still-valid authority's independent renewal path.
       await changing.catch(() => {});
+      if (monotonicNow() < renewalBackoffUntil) return;
       // An older worker's session normally expires first. Renew in deadline
       // order so a slow or rate-limited newer session cannot starve it.
       const incarnations = [active, ...retired].sort((a, b) =>
@@ -1044,7 +1053,11 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	if (!incarnation.identity()) { retired.delete(incarnation); continue; }
 	try { await incarnation.maintain(); }
 	catch (error) {
-	  if (firstError === undefined || (error instanceof HubError && error.status === 429)) firstError = error;
+	  if (error instanceof HubError && error.status === 429) {
+	    noteRenewalBackoff(error);
+	    throw error; // Service forbids further requests until Retry-After.
+	  }
+	  if (firstError === undefined) firstError = error;
 	}
 	if (!incarnation.identity()) retired.delete(incarnation);
       }
@@ -1061,14 +1074,10 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	  return () => clearInterval(timer);
 	});
 	cancelParked = schedule(() => {
-	  const now = (opts.now ?? Date.now)();
 	  if (!live()) { onClosed(); return; }
-	  if (parkedInFlight || now < parkedBackoffUntil) return;
+	  if (parkedInFlight || monotonicNow() < renewalBackoffUntil) return;
 	  parkedInFlight = true;
-	  void session.maintain().catch(error => {
-	    if (error instanceof HubError && error.status === 429) {
-	      parkedBackoffUntil = Math.max(parkedBackoffUntil, (opts.now ?? Date.now)() + (error.retryAfterMs ?? 30_000));
-	    }
+	  void session.maintain().catch(() => {
 	    opts.onMaintenanceError?.();
 	  }).finally(() => { parkedInFlight = false; onClosed(); });
 	}, 30_000);

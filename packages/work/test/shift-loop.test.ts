@@ -4998,12 +4998,14 @@ test('failed scope expansion cannot poison renewal of the retained session', asy
 
 test('stopped Shift owns a renewal timer until its detached handoff terminates', async () => {
   let now = 1_000;
+  let monotonic = 0;
   let renews = 0;
   let closes = 0;
   const { schedule, timers } = fakeSchedule();
   const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
   const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
-    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, getToken: async () => 'enrolled',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now,
+    monotonicNow: () => monotonic, getToken: async () => 'enrolled',
     postStopSchedule: schedule,
     fetchImpl: (async url => {
       const verb = String(url).split('/').at(-1);
@@ -5011,6 +5013,7 @@ test('stopped Shift owns a renewal timer until its detached handoff terminates',
 	credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
       if (verb === 'routing_session_renew') {
 	renews++;
+	if (renews === 1) return Response.json({ error: 'rate limited' }, { status: 429, headers: { 'Retry-After': '60' } });
 	return Response.json({ sessionId, shiftId: 'shf_one', expiresAt: now + 900_000 });
       }
       if (verb === 'routing_session_close') { closes++; return Response.json({ closed: true }); }
@@ -5026,7 +5029,16 @@ test('stopped Shift owns a renewal timer until its detached handoff terminates',
   assert.equal(closes, 0);
   now = 841_000;
   timers[0]!.fn();
-  await settle(() => renews === 1, 'post-stop session renewal');
+  await settle(() => renews === 1, 'post-stop renewal rate limit');
+  await new Promise(resolve => setImmediate(resolve));
+  now += 3_600_000; // Wall-clock jump must not end monotonic Retry-After.
+  timers[0]!.fn();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(renews, 1);
+  now = 841_000;
+  monotonic = 60_000;
+  timers[0]!.fn();
+  await settle(() => renews === 2, 'post-stop renewal after Retry-After');
   assert.equal(closes, 0);
   handoff.terminal();
   await settle(() => closes === 1 && timers[0]!.cancelled, 'post-stop timer cleanup');
@@ -5069,6 +5081,61 @@ test('a revoked retired session does not starve renewal of another live incarnat
     assert.equal(renews.length, 2, 'healthy session renews despite retired revocation');
     assert.equal(renews[1], secondId);
     assert.equal(session.identity()?.sessionId, secondId);
+  } finally {
+    first.terminal(); second.terminal();
+    await session.stop();
+  }
+});
+
+test('429 renewal stops later incarnations until monotonic Retry-After ends', async () => {
+  let now = 1_000;
+  let monotonic = 0;
+  let nextId = 0;
+  let rateLimitOld = true;
+  const renews: string[] = [];
+  const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => now, monotonicNow: () => monotonic,
+    getToken: async () => 'enrolled',
+    fetchImpl: (async (url, init) => {
+      const verb = String(url).split('/').at(-1);
+      if (verb === 'routing_session_open') {
+	const sessionId = `rs_12345678-1234-1234-1234-${String(++nextId).padStart(12, '0')}`;
+	return Response.json({ sessionId, shiftId: `shf_${nextId}`,
+	  credential: `rs1.${sessionId}.${'x'.repeat(43)}`, expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_renew') {
+	const id = new Headers(init?.headers).get('X-Owenloop-Routing-Session')!.split('.')[1]!;
+	renews.push(id);
+	if (id.endsWith('000000000001') && rateLimitOld) {
+	  rateLimitOld = false;
+	  return Response.json({ error: 'rate limited' }, { status: 429, headers: { 'Retry-After': '30' } });
+	}
+	return Response.json({ sessionId: id, shiftId: id.endsWith('000000000001') ? 'shf_1' : 'shf_2', expiresAt: now + 900_000 });
+      }
+      if (verb === 'routing_session_close') return Response.json({ closed: true });
+      throw new Error('unexpected request');
+    }) as typeof fetch,
+  });
+  const first = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'first-429',
+    reservedAt: now, childKind: 'agent-run' }).reservation);
+  now = 2_000;
+  await session.ensureScope({ capabilities: ['build', 'test'], crews: [] });
+  const secondId = session.identity()!.sessionId;
+  const second = session.createHandoff(reserveChild(stateDir, { workflow: 'wf', run: 'second-429',
+    reservedAt: now, childKind: 'agent-run' }).reservation);
+  unlinkSync(first.path); unlinkSync(second.path);
+  now = 842_000;
+  try {
+    await assert.rejects(session.maintain(), error => error instanceof HubError && error.status === 429);
+    assert.equal(renews.length, 1, 'later session receives no request after 429');
+    now += 3_600_000;
+    await session.maintain();
+    assert.equal(renews.length, 1, 'wall-clock jump cannot bypass Retry-After');
+    now = 842_000;
+    monotonic = 30_000;
+    await session.maintain();
+    assert.equal(renews.length, 3);
+    assert.equal(renews[2], secondId);
   } finally {
     first.terminal(); second.terminal();
     await session.stop();
@@ -5143,7 +5210,8 @@ test('session rotation preserves HTTP 429 Retry-After and suppresses every perio
   let syncs = 0;
   const errors: string[] = [];
   const session = await openShiftRoutingSession({ stateDir, origin: ORIGIN, orgId: 'org', principalId: 'agent',
-    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => clock, getToken: async () => 'enrolled-base',
+    scope: { workflows: ['wf'], capabilities: ['build'] }, now: () => clock,
+    monotonicNow: () => clock, getToken: async () => 'enrolled-base',
     fetchImpl: (async (url, init) => {
       if (String(url).endsWith('/routing_session_open')) {
 	opens++;
