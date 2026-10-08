@@ -482,7 +482,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       err(`owenloop work agent-run: ${resolved.reason}`);
       return null;
     }
-    if (!validModelOrderFields(resolved.step, order)) {
+    if (!validModelOrderFields(resolved.step, order, resolved.inputNames)) {
       err('owenloop work agent-run: model order refusal: fields differ from local definition');
       return null;
     }
