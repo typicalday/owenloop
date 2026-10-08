@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
-import { createRoutedAgentPrestart } from '../src/roles/routing-agent-launch.ts';
+import { createRoutedAgentPrestart, createRoutedAgentSelection } from '../src/roles/routing-agent-launch.ts';
 import type { RoutingChildClient } from '../src/hub/routing-child-client.ts';
 import type { DecisionBindingV1, LaunchReportV1, LocalModelAssessment,
   LocalModelTuple, OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
@@ -62,6 +62,29 @@ test('agent launch reserves the first Service-ordered tuple and awaits unknown r
   assert.deepEqual(f.report()?.observation, { state: 'unknown' });
   await assert.rejects(prestart(order), /routed agent launch refused/);
   assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'order']);
+});
+
+test('agent selection defers reserve and report until local adapter preflight has passed', async () => {
+  const f = fixture();
+  const select = createRoutedAgentSelection({ child: f.child, holder,
+    workflow: 'wf', run: 'run', now: () => 2_000 });
+  const plan = await select(order);
+  assert.deepEqual(plan.selected, first);
+  assert.deepEqual(f.calls, ['claim']);
+  await plan.authorize();
+  assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'order']);
+  await assert.rejects(plan.authorize(), /routed agent launch refused/);
+  await assert.rejects(select(order), /routed agent launch refused/);
+});
+
+test('agent selection aborts during local preflight without reserving or reporting', async () => {
+  const f = fixture();
+  const controller = new AbortController();
+  const plan = await createRoutedAgentSelection({ child: f.child, holder,
+    workflow: 'wf', run: 'run', now: () => 2_000 })(order, controller.signal);
+  controller.abort();
+  await assert.rejects(plan.authorize(), /routed agent launch refused/);
+  assert.deepEqual(f.calls, ['claim']);
 });
 
 function assessment(status: 'advisory' | 'fallback', advised: LocalModelTuple | null): LocalModelAssessment {

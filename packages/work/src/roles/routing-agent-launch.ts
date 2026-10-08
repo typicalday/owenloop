@@ -11,6 +11,17 @@ export interface RoutedAgentLaunch {
   reservationId: string;
   expiresAt: number;
 }
+export interface RoutedAgentSelection {
+  selected: LocalModelTuple;
+  /** Called only after the adapter's local policy and consumed inputs pass. */
+  authorize(signal?: AbortSignal): Promise<RoutedAgentLaunch>;
+}
+
+type Args = {
+  child: Pick<RoutingChildClient, 'readRoutingClaim' | 'assessLocalModel' | 'reserveLaunch'
+    | 'reportLaunch' | 'getLaunchOrder'>;
+  holder: ContactHolder; workflow: string; run: string; now?: () => number;
+};
 
 /**
  * The broker independently verifies current parent trust and roster state at
@@ -19,21 +30,20 @@ export interface RoutedAgentLaunch {
  * may start or deliver provider work. A lost acknowledgement consumes the
  * one-use latch and cannot silently authorize another cold start.
  */
-export function createRoutedAgentPrestart(args: {
-  child: Pick<RoutingChildClient, 'readRoutingClaim' | 'assessLocalModel' | 'reserveLaunch'
-    | 'reportLaunch' | 'getLaunchOrder'>;
-  holder: ContactHolder; workflow: string; run: string; now?: () => number;
-}): (order: OrderPacket, signal?: AbortSignal) => Promise<RoutedAgentLaunch> {
+export function createRoutedAgentSelection(args: Args):
+  (order: OrderPacket, signal?: AbortSignal) => Promise<RoutedAgentSelection> {
   const now = args.now ?? Date.now;
   let used = false;
   return async (order, signal) => {
     if (used || signal?.aborted || order.workflow !== args.workflow || order.run !== args.run
       || order.worker !== 'agent' || !order.routing || args.holder.kind !== 'session') throw refused();
     used = true;
-    const routing = order.routing;
+    // Pin the full order before any asynchronous assessment or local checks.
+    const pinned = structuredClone(order);
+    const routing = pinned.routing!;
     const { claim, preference } = routing;
     const deadline = Math.min(preference.expiresAt, claim.binding.expiresAt);
-    const live = () => !signal?.aborted && now() < deadline;
+    const live = (later?: AbortSignal) => !signal?.aborted && !later?.aborted && now() < deadline;
     if (!live() || claim.orderId !== args.run || typeof claim.attemptId !== 'string'
       || !claim.attemptId
       || claim.sessionId !== claim.binding.authority.sessionId
@@ -69,26 +79,39 @@ export function createRoutedAgentPrestart(args: {
       assessmentId = assessment.assessmentId;
     }
     if (!live()) throw refused();
-    const request = { version: 'launch-reservation-v1' as const,
+    let authorized = false;
+    return { selected: structuredClone(selected), authorize: async (later?: AbortSignal) => {
+      if (authorized || !live(later)) throw refused();
+      authorized = true;
+      const request = { version: 'launch-reservation-v1' as const,
       claimId: claim.claimId, decisionId: claim.decisionId, binding: claim.binding,
       orderId: claim.orderId, attemptId: claim.attemptId,
       rosterRevision: preference.rosterRevision, candidateIds, assessmentId, requested, selected };
-    const reservation = await args.child.reserveLaunch({ workflow: args.workflow, request });
-    if (!live() || reservation.orderId !== args.run || !reservation.reservationId
+      const reservation = await args.child.reserveLaunch({ workflow: args.workflow, request });
+      if (!live(later) || reservation.orderId !== args.run || !reservation.reservationId
       || !Number.isSafeInteger(reservation.expiresAt) || reservation.expiresAt <= now()
       || reservation.expiresAt > deadline) throw refused();
-    const report = { version: 'launch-v1' as const, reservationId: reservation.reservationId,
+      const report = { version: 'launch-v1' as const, reservationId: reservation.reservationId,
       decisionId: claim.decisionId, binding: claim.binding, claimId: claim.claimId,
       orderId: claim.orderId, attemptId: claim.attemptId, requested, selected,
       observation: { state: 'unknown' as const } };
-    const accepted = await args.child.reportLaunch({ workflow: args.workflow, report });
-    if (!live() || accepted.orderId !== args.run || accepted.provenance !== 'authenticated-worker-report'
+      const accepted = await args.child.reportLaunch({ workflow: args.workflow, report });
+      if (!live(later) || accepted.orderId !== args.run || accepted.provenance !== 'authenticated-worker-report'
       || accepted.digest !== valueDigestHex(report) || !Number.isSafeInteger(accepted.recordedAt)
       || now() >= reservation.expiresAt) throw refused();
-    const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,
+      const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,
       holder: args.holder });
-    if (!live() || now() >= reservation.expiresAt || !final.lease.claimed || !final.order
-      || !isDeepStrictEqual(final.order, order)) throw refused();
-    return { selected, reservationId: reservation.reservationId, expiresAt: reservation.expiresAt };
+      if (!live(later) || now() >= reservation.expiresAt || !final.lease.claimed || !final.order
+	|| !isDeepStrictEqual(final.order, pinned)) throw refused();
+      return { selected: structuredClone(selected), reservationId: reservation.reservationId,
+	expiresAt: reservation.expiresAt };
+    } };
   };
+}
+
+/** Convenience for callers whose adapter policy is already preflighted. */
+export function createRoutedAgentPrestart(args: Args):
+  (order: OrderPacket, signal?: AbortSignal) => Promise<RoutedAgentLaunch> {
+  const select = createRoutedAgentSelection(args);
+  return async (order, signal) => (await select(order, signal)).authorize(signal);
 }
