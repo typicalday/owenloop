@@ -169,6 +169,12 @@ test('routed holder submit omits local machine proof with an origin while ordina
   } as unknown as HubClient;
   const mount = createHoldMcp({ hub, workflow: 'wf', run: 'run', workdir: process.cwd(),
     origin: 'https://hub.example', routedSubmit: true,
+    holder: { kind: 'session', id: 'routing-session', shiftId: 'shift' },
+    routedCollection: {
+      collectionTarget: async () => ({ collection: false }),
+      emitCollectionMember: async () => { throw new Error('unexpected collection emission'); },
+      sealCollection: async () => { throw new Error('unexpected collection seal'); },
+    },
     sleep: async () => {}, now: () => 0, err: () => {},
     modelOrderVerifier: async () => ({ ok: true }),
     consumedVerifier: async value => ({ ok: true, order: value, warnings: [] }),
@@ -177,5 +183,6 @@ test('routed holder submit omits local machine proof with an origin while ordina
     { path: 'output', value: { result: true }, done: true }, context());
   assert.equal(result.isError, undefined);
   assert.deepEqual(submissions, [{ workflow: 'wf', run: 'run', path: 'output',
-    value: { result: true }, done: true }]);
+    value: { result: true }, done: true,
+    holder: { kind: 'session', id: 'routing-session', shiftId: 'shift' } }]);
 });
