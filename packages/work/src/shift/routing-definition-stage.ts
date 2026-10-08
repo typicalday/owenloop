@@ -5,7 +5,8 @@
 import { randomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync,
-  openSync, opendirSync, readdirSync, realpathSync, rmSync, writeFileSync, type Dir } from 'node:fs';
+  openSync, opendirSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync,
+  fsyncSync, type Dir } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { readRegularFileNoFollow } from '../../../../src/install.ts';
@@ -33,11 +34,47 @@ export interface RoutedDefinitionStage {
   canSubmit(order: OrderPacket, path: string): boolean;
   /** Only a verified singleton or judge output has replay-safe submit semantics. */
   canReplay(order: OrderPacket, path: string): boolean;
+  /** Durable exact child owner, written before the start gate opens. */
+  activate(owner: RoutedStageOwner): void;
+  /** Persist uncertainty before the gate could expose authored work. */
+  markGateMayOpen(owner: RoutedStageOwner): void;
+  /** Before activation only; an active stage is retained until verified exit. */
   cleanup(): void;
+  cleanupAfterExit(owner: RoutedStageOwner): void;
 }
+
+export interface RoutedStageOwner { workflow: string; run: string; pid: number; spawnedAt: number }
 
 const STAGE_RETENTION_MS = 24 * 60 * 60_000;
 const stageName = /^\.routing-def-[A-Za-z0-9]{6}$/;
+const OWNER_FILE = 'owner.json';
+const GATE_MARKER = 'gate-may-open';
+
+function processLiveness(pid: number): boolean | undefined {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH' ? false : undefined; }
+}
+
+function gateMayOpen(stagePath: string): boolean {
+  try { return lstatSync(join(stagePath, GATE_MARKER), { throwIfNoEntry: false }) !== undefined; }
+  catch { return true; }
+}
+
+function ownerAt(stagePath: string): RoutedStageOwner | undefined | 'uncertain' {
+  try {
+    const bytes = readRegularFileNoFollow(join(stagePath, OWNER_FILE), 'routed stage owner');
+    if (bytes === undefined) return undefined;
+    if (bytes.length > 1024) return 'uncertain';
+    const row = JSON.parse(Buffer.from(bytes).toString('utf8')) as Record<string, unknown>;
+    if (!row || Object.keys(row).sort().join(',') !== 'pid,run,spawnedAt,workflow'
+      || typeof row.workflow !== 'string' || !row.workflow
+      || typeof row.run !== 'string' || !row.run
+      || typeof row.pid !== 'number' || !Number.isSafeInteger(row.pid) || row.pid <= 0
+      || typeof row.spawnedAt !== 'number' || !Number.isSafeInteger(row.spawnedAt)
+      || row.spawnedAt < 0) return 'uncertain';
+    return row as unknown as RoutedStageOwner;
+  } catch { return 'uncertain'; }
+}
 
 function copyPublicFile(source: string, target: string, required: boolean): void {
   const bytes = readRegularFileNoFollow(source, 'routed public trust');
@@ -117,9 +154,11 @@ function operatorStageRoot(stateDir: string, workRoot: string): string {
  * must tie its stage to durable child ownership before extending retention. */
 export function createRoutedDefinitionMaintenance(args: {
   stateDir: string; workRoot: string; now?: () => number;
+  isAlive?: (pid: number) => boolean | undefined;
 }): { sweep(): void; close(): void } {
   const root = operatorStageRoot(args.stateDir, args.workRoot);
   const now = args.now ?? Date.now;
+  const isAlive = args.isAlive ?? processLiveness;
   let entries: Dir | undefined;
   const close = () => { entries?.closeSync(); entries = undefined; };
   return {
@@ -133,8 +172,16 @@ export function createRoutedDefinitionMaintenance(args: {
 	try {
 	  const stat = lstatSync(path);
 	  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700
-	    || (process.getuid && stat.uid !== process.getuid())
-	    || now() - stat.mtimeMs < STAGE_RETENTION_MS) continue;
+	    || (process.getuid && stat.uid !== process.getuid())) continue;
+	  const owner = ownerAt(path);
+	  if (owner === 'uncertain') continue;
+	  if (owner) {
+	    // No gate marker means authored work could never start. A confirmed dead
+	    // parked worker can be reaped after a Shift crash or canceled dispatch.
+	    // Once the gate may have opened, role-PID death says nothing about its
+	    // detached shell/provider descendants: retain until exact clean exit.
+	    if (gateMayOpen(path) || isAlive(owner.pid) !== false) continue;
+	  } else if (now() - stat.mtimeMs < STAGE_RETENTION_MS) continue;
 	  makeOwnedDirectoriesWritable(path);
 	  const current = lstatSync(path);
 	  if (current.dev === stat.dev && current.ino === stat.ino)
@@ -169,7 +216,7 @@ export async function stageRoutedDefinition(args: {
   const stagePath = mkdtempSync(join(root, '.routing-def-'));
   chmodSync(stagePath, 0o700);
   const inode = lstatSync(stagePath);
-  const cleanup = () => {
+  const removeStage = () => {
     try {
       const current = lstatSync(stagePath);
       if (current.isDirectory() && !current.isSymbolicLink()
@@ -178,6 +225,47 @@ export async function stageRoutedDefinition(args: {
 	rmSync(stagePath, { recursive: true, force: true });
       }
     } catch { /* Already removed or substituted: never follow a replacement. */ }
+  };
+  const cleanup = () => {
+    if (ownerAt(stagePath) !== undefined) return;
+    removeStage();
+  };
+  const activate = (owner: RoutedStageOwner) => {
+    if (owner.workflow !== args.order.workflow || owner.run !== args.order.run
+      || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
+      || !Number.isSafeInteger(owner.spawnedAt) || owner.spawnedAt < 0
+      || ownerAt(stagePath) !== undefined) throw new Error('routed stage owner refused');
+    const current = lstatSync(stagePath);
+    if (!current.isDirectory() || current.isSymbolicLink()
+      || current.dev !== inode.dev || current.ino !== inode.ino)
+      throw new Error('routed stage ownership changed');
+    // The owner entry is durable before opening the child start gate. A crash
+    // during this write leaves an uncertain marker that maintenance preserves.
+    const fd = openSync(join(stagePath, OWNER_FILE), constants.O_WRONLY | constants.O_CREAT
+      | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      const bytes = Buffer.from(JSON.stringify(owner));
+      if (bytes.length > 1024 || writeSync(fd, bytes) !== bytes.length)
+	throw new Error('routed stage owner write failed');
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    const directoryFd = openSync(stagePath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  };
+  const markGateMayOpen = (owner: RoutedStageOwner) => {
+    if (!isDeepStrictEqual(ownerAt(stagePath), owner))
+      throw new Error('routed stage owner changed');
+    const fd = openSync(join(stagePath, GATE_MARKER), constants.O_WRONLY | constants.O_CREAT
+      | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try { writeSync(fd, Buffer.from('1')); fsyncSync(fd); }
+    finally { closeSync(fd); }
+    const directoryFd = openSync(stagePath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  };
+  const cleanupAfterExit = (owner: RoutedStageOwner) => {
+    const stored = ownerAt(stagePath);
+    if (stored === undefined || stored === 'uncertain' || !isDeepStrictEqual(stored, owner)) return;
+    removeStage();
   };
   try {
     const deadline = performance.now() + 120_000;
@@ -398,7 +486,7 @@ export async function stageRoutedDefinition(args: {
       return verified.judges === path || outputFor(verified, order, path)?.kind === 'singleton';
     };
     return { path: stagePath, digest: args.order.defDigest!, verifyOrder,
-      canSubmit: canReplay, canReplay, cleanup };
+      canSubmit: canReplay, canReplay, activate, markGateMayOpen, cleanup, cleanupAfterExit };
   } catch (error) {
     cleanup();
     if (error instanceof HubError) throw error;

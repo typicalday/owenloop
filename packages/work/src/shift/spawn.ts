@@ -161,6 +161,8 @@ export interface WorkerExit {
   run: string;
   kind: 'exec' | 'agent-run';
   pid: number;
+  /** Unique per-dispatch path, used only to match a routed stage owner. */
+  routingHandoff?: string;
   exitStatus: number | null;
   signal: NodeJS.Signals | null;
 }
@@ -395,7 +397,8 @@ export function createDefaultSpawner(
     const reportExit = (exitStatus: number | null, signal: NodeJS.Signals | null): void => {
       if (exitReported || onExit === undefined || child.pid === undefined) return;
       exitReported = true;
-      onExit({ workflow: spec.workflow, run: spec.run, kind, pid: child.pid, exitStatus, signal });
+      onExit({ workflow: spec.workflow, run: spec.run, kind, pid: child.pid,
+	...(spec.routingHandoff ? { routingHandoff: spec.routingHandoff } : {}), exitStatus, signal });
     };
     child.once('error', () => {
       terminal();

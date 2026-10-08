@@ -414,6 +414,9 @@ export interface ShiftLoop {
     run: string;
     kind: 'exec' | 'agent-run';
     pid: number;
+    routingHandoff?: string;
+    exitStatus?: number | null;
+    signal?: NodeJS.Signals | null;
   }): void;
   /**
    * A dispatched child exited non-zero. Charges one failure against that run's
@@ -1221,6 +1224,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       const owned = routingHandoffs.get(rec.run);
       if (owned && owned.pid === rec.pid && owned.spawnedAt === rec.spawnedAt) {
 	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+	if (!owned.gateMayHaveOpened)
+	  owned.stage?.cleanupAfterExit({ workflow: rec.workflow, run: rec.run,
+	    pid: rec.pid, spawnedAt: rec.spawnedAt });
+	// After the gate could open, a detached descendant remains uncertain.
 	routingHandoffs.delete(rec.run);
       }
       emit({
@@ -1308,7 +1315,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     rosterSnapshot: string; spentBy?: string }>();
   const routingAttempts = new Map<string, number>();
   const routingRefusals = new Map<string, number>();
-  const routingHandoffs = new Map<string, { handoff: RoutingHandoff; pid?: number; spawnedAt?: number }>();
+  const routingHandoffs = new Map<string, { handoff: RoutingHandoff; stage?: RoutedDefinitionStage;
+    pid?: number; spawnedAt?: number; gateMayHaveOpened?: boolean }>();
   const knownRole = (role: string) => ['research', 'implementation', 'review', 'judge'].includes(role);
   const localModelProtocol = 'local-model-assessment-v1' as const;
 
@@ -1574,17 +1582,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) }, definitionStage);
 	handoff = { path: privateHandoff.path, terminal: () => {
 	  brokerGrant?.terminal();
-	  try { privateHandoff.terminal(); }
-	  finally { definitionStage?.cleanup(); }
+	  privateHandoff.terminal();
 	} };
-	routingHandoffs.set(c.order.run, { handoff });
+	routingHandoffs.set(c.order.run, { handoff, ...(definitionStage ? { stage: definitionStage } : {}) });
       }
       const terminal = () => {
 	terminalBeforeStart = true;
 	brokerGrant?.terminal();
 	try { handoff?.terminal(); }
 	catch { opts.err('routing handoff cleanup failed'); }
-	if (routingHandoffs.get(c.order.run)?.handoff === handoff) routingHandoffs.delete(c.order.run);
       };
       const spawned = opts.spawner({
 	workflow: c.workflow,
@@ -1598,18 +1604,31 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       });
       cancel = spawned.cancel ?? spawned.terminate;
       if (terminalBeforeStart) throw new Error('routing worker terminated before start');
+      const spawnedAt = opts.now();
+      // Pin the child before the durable PID record and before opening its
+      // gate. A crash after record finalization cannot leave an unowned stage.
+      definitionStage?.activate({ workflow: c.workflow, run: c.order.run, pid: spawned.pid, spawnedAt });
+      const ownedBeforeGate = routingHandoffs.get(c.order.run);
+      if (ownedBeforeGate && ownedBeforeGate.handoff === handoff) {
+	ownedBeforeGate.pid = spawned.pid;
+	ownedBeforeGate.spawnedAt = spawnedAt;
+      }
       const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
       let rec: ChildRecord;
       try {
 	rec = finalizeChildReservation(opts.stateDir, reservation, {
 	  pid: spawned.pid,
-	  spawnedAt: opts.now(),
+	  spawnedAt,
 	  kind: childKind,
 	  ...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
 	  ...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
 	  ...(childKind === 'agent-run' ? { step: c.order.step } : {}),
 	});
 	brokerGrant?.activate(rec);
+	if (terminalBeforeStart) throw new Error('routing worker terminated before gate');
+	definitionStage?.markGateMayOpen({ workflow: c.workflow, run: c.order.run,
+	  pid: rec.pid, spawnedAt: rec.spawnedAt });
+	if (ownedBeforeGate && ownedBeforeGate.handoff === handoff) ownedBeforeGate.gateMayHaveOpened = true;
 	startReservedChild(opts.stateDir, rec);
 	const owned = routingHandoffs.get(c.order.run);
 	if (owned) { owned.pid = rec.pid; owned.spawnedAt = rec.spawnedAt; }
@@ -1640,7 +1659,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       brokerGrant?.terminal();
       try { handoff?.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
       definitionStage?.cleanup();
-      if (routingHandoffs.get(c.order.run)?.handoff === handoff) routingHandoffs.delete(c.order.run);
+      const owned = routingHandoffs.get(c.order.run);
+      if (owned && owned.handoff === handoff && owned.pid === undefined) routingHandoffs.delete(c.order.run);
       if (reservation !== undefined) {
 	try {
 	  const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
@@ -2578,7 +2598,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       const owned = routingHandoffs.get(run);
       if (owned) {
 	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
-	routingHandoffs.delete(run);
+	// A closed Hub run revokes Hub access but does not prove the child exited.
       }
       pendingCandidates.delete(run);
       // A run that ENDED is a run that progressed — the shift's MCP `submit`
@@ -2593,11 +2613,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	// The hub's closed-run report is authoritative but carries no record identity.
 	removeRecordUnderDispatchLock(run);
     },
-    noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number }) => {
-      pendingCandidates.delete(exit.run);
+    noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number;
+      routingHandoff?: string; exitStatus?: number | null; signal?: NodeJS.Signals | null }) => {
       const owned = routingHandoffs.get(exit.run);
-      if (owned?.pid === exit.pid) {
+      // A late old exit can reuse the same PID after a new dispatch. Its
+      // per-dispatch handoff path must match before touching stage or slot.
+      if (owned && owned.handoff.path !== exit.routingHandoff) return;
+      pendingCandidates.delete(exit.run);
+      if (owned?.pid === exit.pid && owned.handoff.path === exit.routingHandoff) {
 	try { owned.handoff.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+	// Only a clean role completion attests that its own child operation ended.
+	// A crash/signal can leave a detached shell or provider group alive.
+	if (owned.spawnedAt !== undefined && (!owned.gateMayHaveOpened
+	  || (exit.exitStatus === 0 && exit.signal === null)))
+	  owned.stage?.cleanupAfterExit({ workflow: exit.workflow, run: exit.run,
+	    pid: exit.pid, spawnedAt: owned.spawnedAt });
 	routingHandoffs.delete(exit.run);
       }
       let removed = false;

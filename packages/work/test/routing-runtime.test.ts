@@ -140,7 +140,9 @@ test('complete routed role preflight opens public stage, then retains the launch
 	workflow: 'wf', run, step: 'build', digest, bundleDigest: 'b'.repeat(64),
 	originRules: {}, nonce: 'c'.repeat(32) }), { mode: 0o600 });
       return { path, digest, verifyOrder: async () => {}, canSubmit: () => false,
-	canReplay: () => false, cleanup: () => rmSync(path, { recursive: true, force: true }) };
+	canReplay: () => false, activate: () => {}, markGateMayOpen: () => {},
+	cleanupAfterExit: () => rmSync(path, { recursive: true, force: true }),
+	cleanup: () => rmSync(path, { recursive: true, force: true }) };
     };
     const broker = { socketPath: join(tmpdir(), 'ol-rb-ABCDEF', 'broker.sock'), cap: 'd'.repeat(64) };
     for (const kind of ['agent-run', 'exec'] as const) {

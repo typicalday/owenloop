@@ -27,6 +27,7 @@ import {
   type WorkerExit,
 } from '../src/shift/spawn.ts';
 import {
+  cancelReservedChild,
   finalizeChildReservation,
   readChildRecords,
   readChildReservations,
@@ -4697,6 +4698,8 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
       const path = mkdtempSync(join(stateDir, '.routing-def-'));
       return { path, digest: order.defDigest!, verifyOrder: async () => {},
 	canSubmit: () => false, canReplay: () => false,
+	activate: () => {}, markGateMayOpen: () => {},
+	cleanupAfterExit: () => rmSync(path, { recursive: true, force: true }),
 	cleanup: () => rmSync(path, { recursive: true, force: true }) };
     },
     selectRoutingTuples: c => c.tuples, computeServeCapabilities: () => ['build'],
@@ -4718,6 +4721,8 @@ test('routed staging that finishes after session stop cannot reserve or spawn', 
     stagedPath = mkdtempSync(join(stateDir, '.routing-def-'));
     return { path: stagedPath, digest: order.defDigest!, verifyOrder: async () => {},
 	canSubmit: () => false, canReplay: () => false,
+	activate: () => {}, markGateMayOpen: () => {},
+	cleanupAfterExit: () => rmSync(stagedPath, { recursive: true, force: true }),
 	cleanup: () => rmSync(stagedPath, { recursive: true, force: true }) };
   } });
   const iteration = loop.iterate();
@@ -4728,6 +4733,95 @@ test('routed staging that finishes after session stop cannot reserve or spawn', 
   assert.equal(f.spawns.length, 0);
   assert.equal(readChildReservations(stateDir).length, 0);
   assert.equal(existsSync(stagedPath), false);
+  loop.stop();
+});
+
+test('routed terminal and Shift stop revoke access but retain stage bytes until exact clean child exit', async () => {
+  const f = await routedLoopFixture();
+  let stagePath = '';
+  let activated = false;
+  let cleanups = 0;
+  const loop = createShiftLoop({ ...f.options, stageRoutedDefinition: async order => {
+    stagePath = mkdtempSync(join(stateDir, '.routing-def-'));
+    return { path: stagePath, digest: order.defDigest!, verifyOrder: async () => {},
+      canSubmit: () => false, canReplay: () => false,
+      activate: () => { activated = true; },
+      markGateMayOpen: () => {},
+      cleanup: () => { if (!activated) rmSync(stagePath, { recursive: true, force: true }); },
+      cleanupAfterExit: () => { cleanups++; rmSync(stagePath, { recursive: true, force: true }); } };
+  } });
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(activated, true);
+  const spec = f.spawns[0]!;
+  loop.stop();
+  assert.equal(existsSync(stagePath), true);
+  spec.onTerminal?.(); // Spawner also calls this on kill before actual exit.
+  loop.noteRunEnded('run_routed');
+  assert.equal(cleanups, 0);
+  assert.equal(existsSync(stagePath), true);
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+    routingHandoff: '/wrong/old-handoff', exitStatus: 0, signal: null });
+  assert.equal(existsSync(stagePath), true);
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+    routingHandoff: spec.routingHandoff, exitStatus: 0, signal: null });
+  assert.equal(cleanups, 1);
+  assert.equal(existsSync(stagePath), false);
+});
+
+test('abnormal routed role exit retains stage for uncertain detached descendants', async () => {
+  const f = await routedLoopFixture();
+  let stagePath = '';
+  let activated = false;
+  const loop = createShiftLoop({ ...f.options, stageRoutedDefinition: async order => {
+    stagePath = mkdtempSync(join(stateDir, '.routing-def-'));
+    return { path: stagePath, digest: order.defDigest!, verifyOrder: async () => {},
+      canSubmit: () => false, canReplay: () => false,
+      activate: () => { activated = true; },
+      markGateMayOpen: () => {},
+      cleanup: () => { if (!activated) rmSync(stagePath, { recursive: true, force: true }); },
+      cleanupAfterExit: () => { throw new Error('must retain abnormal exit'); } };
+  } });
+  assert.equal(await loop.iterate(), 1);
+  const spec = f.spawns[0]!;
+  spec.onTerminal?.();
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+    routingHandoff: spec.routingHandoff, exitStatus: 1, signal: null });
+  assert.equal(existsSync(stagePath), true);
+  loop.stop();
+  await f.session.stop();
+  rmSync(stagePath, { recursive: true, force: true });
+});
+
+test('post-marker dispatch failure keeps parked child stage until its exit', async () => {
+  const f = await routedLoopFixture();
+  let stagePath = '';
+  let activated = false;
+  let cleaned = 0;
+  let spawned: SpawnSpec | undefined;
+  const loop = createShiftLoop({ ...f.options,
+    spawner: spec => {
+      spawned = spec;
+      const reservation = readChildReservations(stateDir)[0]!;
+      cancelReservedChild(stateDir, reservation); // finalize now fails after marker activation.
+      return { pid: 9001, cancel: () => spec.onTerminal?.() };
+    },
+    stageRoutedDefinition: async order => {
+      stagePath = mkdtempSync(join(stateDir, '.routing-def-'));
+      return { path: stagePath, digest: order.defDigest!, verifyOrder: async () => {},
+	canSubmit: () => false, canReplay: () => false,
+	activate: () => { activated = true; }, markGateMayOpen: () => { throw new Error('gate must stay closed'); },
+	cleanup: () => { if (!activated) rmSync(stagePath, { recursive: true, force: true }); },
+	cleanupAfterExit: () => { cleaned++; rmSync(stagePath, { recursive: true, force: true }); } };
+    },
+  });
+  assert.equal(await loop.iterate(), 0);
+  assert.equal(activated, true);
+  assert.equal(cleaned, 0);
+  assert.equal(existsSync(stagePath), true);
+  loop.noteChildExited({ workflow: 'wf', run: 'run_routed', kind: 'agent-run', pid: 9001,
+    routingHandoff: spawned!.routingHandoff, exitStatus: 1, signal: 'SIGTERM' });
+  assert.equal(cleaned, 1);
+  assert.equal(existsSync(stagePath), false);
   loop.stop();
 });
 

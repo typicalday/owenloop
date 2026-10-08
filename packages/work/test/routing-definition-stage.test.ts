@@ -197,6 +197,40 @@ test('bounded stage maintenance removes an old crash orphan but preserves a fres
   fresh.cleanup();
 });
 
+test('activated stage survives terminal cleanup, 24-hour age and maintenance restart until exact clean exit', async () => {
+  const f = await fixture();
+  const stage = await stageRoutedDefinition(f.args);
+  const owner = { workflow: 'wf', run: 'run', pid: 92345, spawnedAt: 1_000 };
+  stage.activate(owner);
+  stage.markGateMayOpen(owner);
+  assert.deepEqual(JSON.parse(readFileSync(join(stage.path, 'owner.json'), 'utf8')), owner);
+  stage.cleanup();
+  assert.equal(existsSync(stage.path), true);
+  const age = new Date(Date.now() - 25 * 60 * 60_000);
+  utimesSync(stage.path, age, age);
+  for (let restart = 0; restart < 2; restart++) {
+    const maintenance = createRoutedDefinitionMaintenance({ stateDir: f.stateDir,
+      workRoot: f.args.workRoot });
+    maintenance.sweep(); maintenance.close();
+    assert.equal(existsSync(stage.path), true);
+  }
+  stage.cleanupAfterExit({ ...owner, spawnedAt: 999 });
+  assert.equal(existsSync(stage.path), true);
+  stage.cleanupAfterExit(owner);
+  assert.equal(existsSync(stage.path), false);
+});
+
+test('restart reaps an activated child that died before its start gate opened', async () => {
+  const f = await fixture();
+  const stage = await stageRoutedDefinition(f.args);
+  const owner = { workflow: 'wf', run: 'run', pid: 92346, spawnedAt: 1_000 };
+  stage.activate(owner);
+  const maintenance = createRoutedDefinitionMaintenance({ stateDir: f.stateDir,
+    workRoot: f.args.workRoot, isAlive: () => false });
+  maintenance.sweep(); maintenance.close();
+  assert.equal(existsSync(stage.path), false);
+});
+
 test('routed staging fetches the signed locked child and refuses child-only unsigned evidence', async () => {
   const f = await fixture();
   const child = packBundle(writeBundleSource({ name: 'child', workflow: `name: child
