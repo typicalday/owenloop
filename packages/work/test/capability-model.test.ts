@@ -158,9 +158,9 @@ function authorizedInput(): AuthorizedSelectionInput {
     preference: {
       role: 'implementation', rolePolicy: POLICY, rosterRevision: 'content-abc', expiresAt: 250, tuples,
       offer: {
-        version: 'shift-offer-v1', offerId: 'offer', orgId: 'org', principalId: 'principal',
-        sessionId: 'session', shiftId: 'shift', willingness: { runIds: ['run'], crewIds: ['delivery'], capabilities: ['build:deep'] },
-        rosterRevision: 'content-abc', rolePolicyRevision: 'policy-1', issuedAt: 100, expiresAt: 280, tuples,
+	version: 'shift-offer-v1', offerId: 'offer', orgId: 'org', principalId: 'principal',
+	sessionId: 'session', shiftId: 'shift', willingness: { runIds: ['run'], crewIds: ['delivery'], capabilities: ['build:deep'] },
+	rosterRevision: 'content-abc', rolePolicyRevision: 'policy-1', issuedAt: 100, expiresAt: 280, tuples,
       },
     },
     current: {
@@ -293,9 +293,9 @@ test('offer, preference and current tuple eligibility are independent constraint
       input.preferred = ASTRA;
       const owner = set === 'offer' ? input.preference.offer! : input[set];
       owner.tuples = change === 'absent' ? []
-        : change === 'ambiguous-id' ? [eligible(ASTRA), eligible({ ...ASTRA, model: LUNA.model })]
-        : [{ tuple: change === 'components' ? { ...ASTRA, effort: 'low' } : ASTRA,
-          eligible: change !== 'ineligible', available: change !== 'unavailable' }];
+	: change === 'ambiguous-id' ? [eligible(ASTRA), eligible({ ...ASTRA, model: LUNA.model })]
+	: [{ tuple: change === 'components' ? { ...ASTRA, effort: 'low' } : ASTRA,
+	  eligible: change !== 'ineligible', available: change !== 'unavailable' }];
       expectRefusal(input, 'none-eligible');
     }
   }

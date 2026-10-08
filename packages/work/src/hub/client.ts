@@ -217,6 +217,9 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
   }
 
   async function post<T>(verb: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    // A routing claim has additional authority and launch fences. Legacy
+    // lifecycle verbs cannot settle it through bearer-only routes.
+    if (opts.routingSession) throw new Error('routing session legacy POST refused');
     const res = await fetchImpl(`${base}/api/${verb}`, {
       method: 'POST',
       headers: await authHeaders(),
@@ -241,8 +244,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
       const headers = await authHeaders();
       if (session) headers['X-Owenloop-Routing-Session'] = session.credential;
       const res = await fetchImpl(`${base}/api/${verb}`, {
-        method: 'POST', headers, body: JSON.stringify(body), redirect: 'error',
-        ...(signal === undefined ? {} : { signal }),
+	method: 'POST', headers, body: JSON.stringify(body), redirect: 'error',
+	...(signal === undefined ? {} : { signal }),
       });
       // Response bodies and fetch errors can echo credentials. Keep them out
       // of persisted worker diagnostics while retaining status/backoff metadata.
@@ -259,7 +262,7 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
       let origin: URL;
       try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
       if (origin.protocol !== 'https:' || base !== origin.origin || origin.origin !== opts.routingSession.allowedOrigin
-        || origin.username || origin.password) throw new Error('routing origin refused');
+	|| origin.username || origin.password) throw new Error('routing origin refused');
     }
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
     const res = await fetchImpl(url, {
@@ -272,6 +275,7 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
   }
 
   async function postBytes<T>(path: string, req: PutFileArtifactRequest): Promise<T> {
+    if (opts.routingSession) throw new Error('routing session legacy POST refused');
     const token = await opts.getToken();
     const headers: Record<string, string> = {
       authorization: `Bearer ${token}`,
@@ -304,6 +308,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     readInvocationBinding: (req, signal) => scopedPost('read_invocation_binding', req, signal),
     reportLaunch: (req, signal) => scopedPost('report_launch', req, signal),
     assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
+    // Hosted-holder preflight only. Routing orders return routing-unsupported;
+    // get_order plus read_routing_claim supply Jev authority instead.
     getReferenceOrder: (req) => opts.routingSession !== undefined
       ? scopedPost<unknown>('reference_order/v1', req)
       : post<unknown>('reference_order/v1', req),
@@ -318,6 +324,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     answerApproval: (req) => post<AnswerApprovalResponse>('answer_approval', req),
     listPendingApprovals: () => post<ListPendingApprovalsResponse>('list_pending_approvals', {}),
     reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
+    // Bearer-only identity bootstrap. Routed clients still pin HTTPS origin
+    // and disallow redirects, but send no routing-session capability here.
     whoami: (signal) => get<WhoamiResponse>('whoami', undefined, signal),
     getRosters: (signal) => get<GetRostersResponse>('rosters', undefined, signal),
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),

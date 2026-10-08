@@ -411,6 +411,33 @@ test('a configured routing session binds ordinary polling and reference reads', 
   assert.equal(legacy.every(r => r.init.redirect === undefined), true);
 });
 
+test('a routing client refuses legacy lifecycle writes before reading credentials or fetching', async () => {
+  let tokenReads = 0;
+  let sessionReads = 0;
+  let fetches = 0;
+  const c = createHubClient({ origin: 'https://hub.example',
+    getToken: async () => { tokenReads++; return 'enrolled-secret'; },
+    routingSession: { allowedOrigin: 'https://hub.example',
+      get: () => { sessionReads++; return { sessionId: 'rs', shiftId: 'shf', credential: 'session-secret', expiresAt: 2000 }; },
+      now: () => 1000 },
+    fetchImpl: (async () => { fetches++; return Response.json({ text: 'unexpected' }); }) as typeof fetch,
+  });
+  for (const write of [
+    () => c.heartbeat({} as never),
+    () => c.release({ workflow: 'wf', run: 'run' }),
+    () => c.submit({} as never),
+    () => c.submitConditional!({} as never),
+    () => c.reject({} as never),
+    () => c.reportResolution({} as never),
+    () => c.putFileArtifact({} as never),
+  ]) {
+    await assert.rejects(write, error => error instanceof Error
+      && /routing session legacy POST refused/u.test(error.message)
+      && !error.message.includes('secret'));
+  }
+  assert.deepEqual([tokenReads, sessionReads, fetches], [0, 0, 0]);
+});
+
 // Credential-free final-head service exchange. This is transport evidence only,
 // not a live Jev result or a complete ReferenceRouting anchor.
 // Source: model-routing-integration-preparation/worker-binding-preparation/
