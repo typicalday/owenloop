@@ -12,12 +12,13 @@ import { DSSE_SSH_NAMESPACE, dsseSignPublication } from '../../../src/crypto/dss
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { createSshSigner } from '../../../src/crypto/ssh.ts';
 import { canonicalJsonBytes } from '../../../src/install.ts';
-import type { WorkOrder } from '../src/hub/types.ts';
+import type { DecisionBindingV1, ReferenceRouting, WorkOrder } from '../src/hub/types.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import { stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
 import { prepareRoutedCommandRunner } from '../src/roles/routing-command-runner.ts';
 
-const rootWorkflow = 'root', frameWorkflow = 'routing/child', run = 'native-run';
+const rootWorkflow = 'root', frameWorkflow = 'wf_child_instance';
+const definitionName = 'routing/child', run = 'native-run';
 const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
 
 async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
@@ -29,13 +30,13 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
   for (const dir of [home, stateDir, workRoot, bundle]) mkdirSync(dir, { mode: 0o700 });
   writeFileSync(join(bundle, 'bundle.yaml'), [
     'formatVersion: 2', 'package:', '  name: routing', '  version: 1.0.0',
-    'workflows:', `  "${frameWorkflow}": child.yaml`, `default: "${frameWorkflow}"`,
+    'workflows:', `  "${definitionName}": child.yaml`, `default: "${definitionName}"`,
     'platforms: []', 'integrity:', '  algorithm: sha256', '  files: {}',
     'capabilities: {}', 'lock: {}', '',
   ].join('\n'));
   const command = options.command ?? 'printf x >> started.txt; printf live > live.txt; printf \'{"result":"ok"}\' > "$OWENLOOP_PAYLOAD_FILE"';
   writeFileSync(join(bundle, 'child.yaml'), [
-    `name: ${frameWorkflow}`, 'inputs: []', 'steps:', '  - name: build',
+    `name: ${definitionName}`, 'inputs: []', 'steps:', '  - name: build',
     '    executor: command', '    consumes: []', '    produces: [out]',
     '    terminal: true', `    command: ${command}`, '',
   ].join('\n'));
@@ -52,11 +53,29 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
     digest: packed.digest, name: packed.manifest.package.name,
     version: packed.manifest.package.version, publisherKeyId: publicKey.keyid, timestamp: Date.now(),
   })), signer)).envelope);
-  const native: WorkOrder = { workflow: rootWorkflow, run, step: 'build', worker: 'command',
-    defDigest: packed.digest, consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
-  const stage = await stageRoutedDefinition({ order: native, origin: 'https://hub.example.test',
-    token: 'fixture-secret', stateDir, workRoot, sourceEnv: { HOME: home },
-    beforeRequest: () => {}, onRateLimit: () => {}, stillAuthorized: () => true,
+  const now = Date.now();
+  const binding: DecisionBindingV1 = { orgId: 'org', runId: rootWorkflow, frameId: frameWorkflow,
+    def: { bundleDigest: `sha256:${packed.digest}` as const, workflowName: definitionName },
+    subjectKey: 'subject', evidenceDigest: 'sha256:evidence', candidateDigest: 'sha256:candidates',
+    policyDigest: 'sha256:policy', revisions: { definition: '1', candidates: '1', policy: '1',
+      authority: '1', rolePolicy: '1', roster: '1', routes: '1', membership: '1', evidenceGeneration: '1' },
+    issuedAt: now - 1_000, expiresAt: now + 90_000,
+    authority: { principalId: 'agent', sessionId } };
+  const claimBinding = { ...binding, frameId: options.claimFrame ?? frameWorkflow };
+  const routing: ReferenceRouting = { claim: { state: 'claimed', claimId: run, decisionId: 'decision', binding: claimBinding,
+    invocationId: null, orderId: run, attemptId: 'attempt', principalId: 'agent',
+    sessionId, shiftId: 'shf_service' },
+  decision: { decisionId: 'decision', binding: claimBinding, status: 'applied', applied: null, effect: null },
+  preference: { offer: null, tuples: [], role: 'implementation', rolePolicy: null,
+    rosterRevision: 'a'.repeat(64), expiresAt: now + 60_000 } };
+  const native: WorkOrder = { workflow: frameWorkflow, run, step: 'build', worker: 'command',
+    defDigest: packed.digest, consumes: {}, expected_outputs: [], feedback: [], advisory: {},
+    submit_hint: '', routing: { ...routing, claim: { ...routing.claim, binding },
+      decision: { ...routing.decision, binding } } };
+  const stage = await stageRoutedDefinition({ order: native, rootWorkflow,
+    origin: 'https://hub.example.test', token: 'fixture-secret', stateDir, workRoot,
+    sourceEnv: { HOME: home }, beforeRequest: () => {}, onRateLimit: () => {},
+    stillAuthorized: () => true,
     fetchImpl: (async input => {
       const path = new URL(String(input)).pathname;
       if (path === `/api/bundles/${packed.digest}`) return new Response(packed.bytes, { status: 200 });
@@ -65,22 +84,6 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
       if (path === `/api/origins/${packed.digest}`) return new Response(null, { status: 404 });
       throw new Error('unexpected fixture fetch');
     }) as typeof fetch });
-
-  const now = Date.now();
-  const binding = { orgId: 'org', runId: rootWorkflow, frameId: frameWorkflow,
-    def: { bundleDigest: packed.digest, workflowName: frameWorkflow },
-    subjectKey: 'subject', evidenceDigest: 'sha256:evidence', candidateDigest: 'sha256:candidates',
-    policyDigest: 'sha256:policy', revisions: { definition: '1', candidates: '1', policy: '1',
-      authority: '1', rolePolicy: '1', roster: '1', routes: '1', membership: '1', evidenceGeneration: '1' },
-    issuedAt: now - 1_000, expiresAt: now + 90_000,
-    authority: { principalId: 'agent', sessionId } };
-  const claimBinding = { ...binding, frameId: options.claimFrame ?? frameWorkflow };
-  const routing = { claim: { state: 'claimed', claimId: run, decisionId: 'decision', binding: claimBinding,
-    invocationId: null, orderId: run, attemptId: 'attempt', principalId: 'agent',
-    sessionId, shiftId: 'shf_service' },
-  decision: { decisionId: 'decision', binding: claimBinding, status: 'applied', applied: null, effect: null },
-  preference: { offer: null, tuples: [], role: 'implementation', rolePolicy: null,
-    rosterRevision: 'a'.repeat(64), expiresAt: now + 60_000 } };
   const order = { workflow: frameWorkflow, run, step: 'build', key: '',
     defDigest: packed.digest, worker: 'command', inputs: [], outputs: ['out'], consumes: {},
     consumedFingerprint: {}, owes: [{ path: 'out', version: 1, judgmentRejects: 0,
@@ -178,15 +181,17 @@ test('wrong current child frame and changed input binding refuse before shell st
   for (const options of [{ claimFrame: 'routing/sibling' }, { inputMismatch: true }]) {
     const f = await fixture(options);
     try {
-      const prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
+      const prepare = () => prepareRoutedCommandRunner({ handoff: f.handoff,
 	originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
 	out: () => {}, err: () => {} });
-      assert.equal(await prepared.run(), 'unresolved-instructions');
+      if (options.claimFrame) await assert.rejects(prepare(), /routed command role refused/);
+      else assert.equal(await (await prepare()).run(), 'unresolved-instructions');
       assert.equal(f.events.filter(method => method === 'reserve_launch').length, 0);
       assert.equal(f.events.filter(method => method === 'command_postrun').length, 0);
       assert.equal(existsSync(join(f.root, 'work', rootWorkflow, run, 'live.txt')), false);
       assert.equal(existsSync(join(f.root, 'work', rootWorkflow, run, 'started.txt')), false);
-      assert.equal(f.events.filter(method => method === 'command_finish').length, 1);
+      assert.equal(f.events.filter(method => method === 'command_finish').length,
+	options.claimFrame ? 0 : 1);
     } finally {
       await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
       f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });

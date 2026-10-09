@@ -4641,13 +4641,13 @@ test('startup and bounded maintenance reclaim fixed-deadline orphans without PID
   await next.stop();
 });
 
-async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
+async function routedLoopFixture(kind: 'agent' | 'command' = 'agent', frame = 'wf') {
   const f = routingSessionFixture();
   const session = await f.open();
   const id = session.identity()!;
   const tuple = { id: 'service-tuple', harness: 'codex', model: 'approved-model', effort: 'high' as const };
   const candidate = {
-    candidateId: 'candidate', frameId: 'wf', step: 'builder', key: '', evidenceGeneration: 'generation-1',
+    candidateId: 'candidate', frameId: frame, step: 'builder', key: '', evidenceGeneration: 'generation-1',
     context: { now: 1000, maxTtlMs: 300_000, ...id, rosterRevision: 'roster', rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew-id', capability: 'build' },
     role: 'implementation', rolePolicy: { revision: 'policy', unknownRole: 'refuse' as const, rules: [{ model: tuple.model, roles: ['implementation' as const] }] },
     tuples: [{ tuple, eligible: true, available: true }],
@@ -4667,7 +4667,7 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
     requests.push(req);
     if (replay) return { text: '', orders: [replay] };
     const binding: import('../src/hub/types.ts').DecisionBindingV1 = {
-      orgId: id.orgId, runId: 'wf', frameId: 'wf', def: { bundleDigest: `sha256:${'a'.repeat(64)}`, workflowName: 'demo' },
+      orgId: id.orgId, runId: 'wf', frameId: frame, def: { bundleDigest: `sha256:${'a'.repeat(64)}`, workflowName: 'demo' },
       subjectKey: 'subject', evidenceDigest: 'sha256:evidence', candidateDigest: 'sha256:candidates', policyDigest: 'sha256:policy',
       revisions: { definition: 'd', candidates: 'c', policy: 'p', authority: 'a', rolePolicy: 'policy', roster: 'scoped-generation', routes: 'r', membership: 'm', evidenceGeneration: 'generation-1' },
       issuedAt: 1000, expiresAt: 100_000, authority: { principalId: id.principalId, sessionId: id.sessionId },
@@ -4679,7 +4679,7 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
       decision: { decisionId: 'decision', binding, status: 'applied', applied: offer ? { kind: 'shift', target: { candidateId: 'selected', shiftId: id.shiftId, offerId: offer.offerId } } : { kind: 'ready_firing', target: { candidateId: 'candidate', firingId: 'firing', step: 'builder', key: '' } }, effect: offer ? { kind: 'shift', claimId: 'run_routed', orderId: 'run_routed', attemptId: 'run_routed' } : { kind: 'ready_firing', firingId: 'firing' } },
       preference: { offer, tuples: candidate.tuples, role: candidate.role, rolePolicy: candidate.rolePolicy, rosterRevision: 'roster', expiresAt: 100_000 },
     };
-    const order: WorkOrder = { ...modernWo('run_routed', 'builder', kind, 'a'.repeat(64)), workflow: 'wf', capabilities: ['build'], crews: ['crew'], routing };
+    const order: WorkOrder = { ...modernWo('run_routed', 'builder', kind, 'a'.repeat(64)), workflow: frame, capabilities: ['build'], crews: ['crew'], routing };
     editOrder(order);
     replay = order;
     return { text: '', orders: [order] };
@@ -4712,6 +4712,31 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent') {
   });
   return { f, session, candidate, offers, requests, hub, calls, spawns, options, edit: (fn: typeof editOrder) => { editOrder = fn; } };
 }
+
+test('nested command staging receives canonical root and the unchanged signed frame', async () => {
+  const f = await routedLoopFixture('command', 'wf_child_instance');
+  const seen: Array<{ root: string; frame: string }> = [];
+  const loop = createShiftLoop({ ...f.options,
+    stageRoutedDefinition: async (order, root) => {
+      seen.push({ root, frame: order.workflow });
+      const path = mkdtempSync(join(stateDir, '.routing-def-'));
+      return { path, digest: order.defDigest!, verifyOrder: async () => {},
+	canSubmit: () => false, canReplay: () => false,
+	activate: owner => { assert.equal(owner.workflow, root); },
+	markGateMayOpen: owner => { assert.equal(owner.workflow, root); },
+	cleanupAfterExit: () => rmSync(path, { recursive: true, force: true }),
+	cleanup: () => rmSync(path, { recursive: true, force: true }) };
+    },
+  });
+  try {
+    assert.equal(await loop.iterate(), 1);
+    assert.deepEqual(seen, [{ root: 'wf', frame: 'wf_child_instance' }]);
+    assert.equal(f.spawns.length, 1);
+  } finally {
+    f.spawns[0]?.onTerminal?.();
+    loop.stop(); await f.session.stop();
+  }
+});
 
 test('routed staging that finishes after session stop cannot reserve or spawn', async () => {
   const f = await routedLoopFixture();

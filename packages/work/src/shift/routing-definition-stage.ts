@@ -225,6 +225,8 @@ export function createRoutedDefinitionMaintenance(args: {
 
 /** Fetch and verify the exact order digest and its locked calls closure. */
 export async function stageRoutedDefinition(args: {
+  /** Canonical Shift/Service request target; WorkOrder.workflow is the signed frame. */
+  rootWorkflow: string;
   order: WorkOrder;
   origin: string;
   token: string;
@@ -236,8 +238,17 @@ export async function stageRoutedDefinition(args: {
   stillAuthorized: () => boolean;
   fetchImpl?: typeof fetch;
 }): Promise<RoutedDefinitionStage> {
+  const frameWorkflow = args.order.workflow;
+  const routing = args.order.routing;
+  const binding = routing?.claim.binding;
+  const definitionName = binding?.def?.workflowName;
   if (!exactOrigin(args.origin) || !/^[0-9a-f]{64}$/.test(args.order.defDigest ?? '')
-    || !args.order.workflow || !args.order.run || !args.order.step
+    || !args.rootWorkflow || !frameWorkflow || !args.order.run || !args.order.step
+    || (routing !== undefined && (!binding || binding.runId !== args.rootWorkflow
+      || binding.frameId !== frameWorkflow || !definitionName
+      || binding.def.bundleDigest !== `sha256:${args.order.defDigest}`
+      || routing.claim.orderId !== args.order.run || routing.claim.claimId !== args.order.run
+      || !isDeepStrictEqual(binding, routing.decision.binding)))
     || (args.order.worker !== undefined && args.order.worker !== 'agent' && args.order.worker !== 'command'))
     throw new Error('routed definition staging refused');
   let root: string;
@@ -261,7 +272,7 @@ export async function stageRoutedDefinition(args: {
     removeStage();
   };
   const activate = (owner: RoutedStageOwner) => {
-    if (owner.workflow !== args.order.workflow || owner.run !== args.order.run
+    if (owner.workflow !== args.rootWorkflow || owner.run !== args.order.run
       || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
       || !Number.isSafeInteger(owner.spawnedAt) || owner.spawnedAt < 0
       || ownerAt(stagePath) !== undefined) throw new Error('routed stage owner refused');
@@ -333,7 +344,9 @@ export async function stageRoutedDefinition(args: {
     const support = source.getVerifiedSupport?.(args.order.defDigest!, args.order.step);
     const definition = source.getVerifiedDefinition(args.order.defDigest!, args.order.step);
     const step = source.getVerifiedStep(args.order.defDigest!, args.order.step);
-    if (!resolved || !definition || !step || !support?.length) throw new Error('routed definition step unavailable');
+    if (!resolved || !definition || !step || !support?.length
+      || (routing !== undefined && definition.name !== definitionName))
+      throw new Error('routed definition step unavailable');
     // Apply all configured rules matching the installed namespace. WorkOrder
     // lacks workdir/inputs, so full step and consume binding is deferred.
     const stagedIndex = readWorkflowStoreIndex(storeIndexPath(root));
@@ -374,7 +387,8 @@ export async function stageRoutedDefinition(args: {
       }
     }
     if (performance.now() >= deadline || !args.stillAuthorized()) throw new Error('routed definition staging expired');
-    const descriptor = { version: 'routing-definition-stage-v1', workflow: args.order.workflow,
+    const descriptor = { version: 'routing-definition-stage-v2', rootWorkflow: args.rootWorkflow,
+      frameWorkflow, definitionName: definition.name,
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
       bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
@@ -386,8 +400,8 @@ export async function stageRoutedDefinition(args: {
       // callback. The pre-start preference deadline must not terminate trust
       // checks for a long-running child after a launch report was accepted.
       if (!order || !response.lease.claimed || response.lease.outcome !== undefined
-	|| response.workflow !== args.order.workflow || response.run !== args.order.run
-	|| order.workflow !== args.order.workflow || order.run !== args.order.run
+	|| response.workflow !== frameWorkflow || response.run !== args.order.run
+	|| order.workflow !== frameWorkflow || order.run !== args.order.run
 	|| order.step !== args.order.step || order.defDigest !== args.order.defDigest
 	|| (args.order.key !== undefined && order.key !== args.order.key)
 	|| (args.order.index !== undefined && order.index !== args.order.index)
@@ -440,7 +454,9 @@ export async function stageRoutedDefinition(args: {
 	  artifactPolicy: 'enforce' }), warn: () => {} });
       const verifiedStep = readOnlySource.getVerifiedStep(order.defDigest, order.step);
       const verifiedDefinition = readOnlySource.getVerifiedDefinition(order.defDigest, order.step);
-	if (!verifiedStep || !verifiedDefinition || (!routed && !validModelOrderFields(verifiedStep, order,
+	if (!verifiedStep || !verifiedDefinition
+	  || (routing !== undefined && verifiedDefinition.name !== definitionName)
+	  || (!routed && !validModelOrderFields(verifiedStep, order,
 	  verifiedDefinition.inputs.map(input => input.name))))
 	throw new Error('routed order fields changed');
       // A declared optional input can set workdir without appearing in
@@ -455,8 +471,7 @@ export async function stageRoutedDefinition(args: {
 	  privateOrder: order, instructions: resolver,
 	  consumedVerifier: createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
 	    artifactPolicy: 'enforce' }),
-	  expected: { workflow: args.order.routing?.claim.binding.runId ?? args.order.workflow,
-	    run: args.order.run },
+	  expected: { workflow: args.rootWorkflow, run: args.order.run },
 	  ...(routed.started ? { startedAt: routed.started.wall,
 	    startedMonotonic: routed.started.monotonic } : {}) });
 	if (!admission.ok || (order.worker === 'command'
@@ -530,7 +545,11 @@ export async function stageRoutedDefinition(args: {
       verifyOrder: response => verifyOrderInternal(response),
       commandFor: async order => {
 	if (order.worker !== 'command' || order.defDigest !== args.order.defDigest
-	  || order.step !== args.order.step || order.run !== args.order.run)
+	  || order.workflow !== frameWorkflow || order.step !== args.order.step
+	  || order.run !== args.order.run)
+	  throw new Error('routed command definition refused');
+	if (routing !== undefined
+	  && source.getVerifiedDefinition(order.defDigest, order.step)?.name !== definitionName)
 	  throw new Error('routed command definition refused');
 	const verified = source.getVerifiedStep(order.defDigest, order.step);
 	if (typeof verified?.command !== 'string' || !verified.command.trim())

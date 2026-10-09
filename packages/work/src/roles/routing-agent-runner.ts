@@ -113,6 +113,9 @@ export async function prepareRoutedAgentRunner(args: {
     harnessAvailable: id => adapterFor(id) !== undefined,
     consumedVerifier,
     routedInputV2: { observe: async order => {
+      if (order.workflow !== stage.frameWorkflow
+	|| order.routing?.claim.binding.def.workflowName !== stage.definitionName)
+	return { ok: false, reason: 'routed-stage-frame-changed' };
       const result = await observedInput.observe(order);
       admittedPacket = result.ok ? structuredClone(order) : undefined;
       return result;

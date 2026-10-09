@@ -49,7 +49,9 @@ export async function prepareRoutedCommandRunner(args: {
     const claim = fresh.routing.claim;
     frameId = claim.binding.frameId;
     if (fresh.freshness !== 'fresh-at-read' || fresh.atomicLaunch !== false
-      || !frameId || claim.orderId !== run || claim.binding.runId !== root
+      || !frameId || frameId !== stage.frameWorkflow
+      || claim.binding.def.workflowName !== stage.definitionName
+      || claim.orderId !== run || claim.binding.runId !== root
       || claim.sessionId !== handoff.sessionId || claim.shiftId !== handoff.shiftId)
       throw refused();
   } catch { throw refused(); }

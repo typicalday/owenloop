@@ -111,7 +111,7 @@ export interface ShiftLoopOptions {
   /** Synchronously revoke routed caps before Shift awaits session close. */
   onStopRouting?: () => Promise<void>;
   /** Required for routed dispatch; prepares exact signed bytes without a role credential. */
-  stageRoutedDefinition?: (order: WorkOrder) => Promise<RoutedDefinitionStage>;
+  stageRoutedDefinition?: (order: WorkOrder, rootWorkflow: string) => Promise<RoutedDefinitionStage>;
   /** Parent-owned signer and full-order verifier bound to the staged source. */
   createRoutingSubmissionAuthority?: (stage: RoutedDefinitionStage) => RoutedSubmissionAuthority;
   /** Fixed original-session reads plus signed input and current trust gate. */
@@ -1435,6 +1435,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     if (!binding || claim.state !== 'claimed' || claim.orderId !== c.order.run || claim.claimId !== c.order.run
       || claim.attemptId !== c.order.run || claim.sessionId !== identity.sessionId || claim.shiftId !== identity.shiftId
       || claim.principalId !== identity.principalId || binding.orgId !== identity.orgId || binding.runId !== c.workflow
+      || binding.frameId !== c.order.workflow
       || binding.authority?.sessionId !== identity.sessionId || binding.authority?.principalId !== identity.principalId
       || claim.decisionId !== decision.decisionId || !isDeepStrictEqual(binding, decision.binding)
       || !['applied', 'fallback'].includes(decision.status) || !Number.isFinite(preference.expiresAt)
@@ -1551,7 +1552,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     try {
       if (opts.routingSession) {
 	if (!opts.stageRoutedDefinition) throw new Error('routed definition staging unavailable');
-	definitionStage = await opts.stageRoutedDefinition(c.order);
+	definitionStage = await opts.stageRoutedDefinition(c.order, c.workflow);
 	if (definitionStage.digest !== c.order.defDigest) throw new Error('routed definition digest changed');
 	// Stage downloads can outlive a decision or session. Re-read the
 	// authoritative claim after every staging await, then re-check local

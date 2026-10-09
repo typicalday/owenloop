@@ -54,7 +54,7 @@ async function fixture(workflowSource = workflow, bundleSource?: string) {
     if (path === `/api/origins/${packed.digest}`) return new Response(null, { status: 404 });
     throw new Error('unexpected request');
   };
-  const args = { order, origin: 'https://hub.example', token: 'secret-marker', stateDir, workRoot,
+  const args = { order, rootWorkflow: 'wf', origin: 'https://hub.example', token: 'secret-marker', stateDir, workRoot,
     sourceEnv: { HOME: home }, beforeRequest: () => {}, onRateLimit: (_error: HubError) => {},
     stillAuthorized: () => true, fetchImpl };
   return { args, config, home, stateDir, seen, packed, keyPath, publicKey };
@@ -148,22 +148,37 @@ test('parent signed stage admits an exact Service input-derived cwd witness and 
   const f = await fixture('name: recovered\ninputs:\n  - name: target\nsteps:\n  - name: command\n' +
     '    executor: command\n    consumes: []\n    produces: [out]\n    terminal: true\n' +
     '    workdirFrom: target.path\n    command: echo recovered\n');
-  const routing = { claim: { claimId: 'run', decisionId: 'decision',
+  const signedBinding = { runId: 'wf', frameId: 'wf_child_instance',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'recovered' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', decisionId: 'decision',
     sessionId: 'rs_12345678-1234-1234-1234-123456789abc', shiftId: 'shf_service',
-    attemptId: 'attempt', binding: { runId: 'wf', frameId: 'wf' } },
-  decision: { decisionId: 'decision' },
+    attemptId: 'attempt', binding: signedBinding },
+  decision: { decisionId: 'decision', binding: signedBinding },
   preference: { rosterRevision: 'a'.repeat(64), expiresAt: Date.now() + 60_000 },
   } as unknown as ReferenceRouting;
-  const stage = await stageRoutedDefinition({ ...f.args,
-    order: { ...f.args.order, routing } });
+  const stagedOrder = { ...f.args.order, workflow: 'wf_child_instance', routing };
+  await assert.rejects(stageRoutedDefinition({ ...f.args, order: stagedOrder,
+    rootWorkflow: 'other_root' }), /routed definition staging refused/);
+  const wrongDefinition = structuredClone(routing);
+  wrongDefinition.claim.binding.def.workflowName = 'other/child';
+  wrongDefinition.decision.binding.def.workflowName = 'other/child';
+  await assert.rejects(stageRoutedDefinition({ ...f.args,
+    order: { ...stagedOrder, routing: wrongDefinition } }), /routed definition staging refused/);
+  const stage = await stageRoutedDefinition({ ...f.args, order: stagedOrder });
   try {
-    const packet: OrderPacket = { workflow: 'wf', run: 'run', step: 'command', key: '',
+    const packet: OrderPacket = { workflow: 'wf_child_instance', run: 'run', step: 'command', key: '',
       defDigest: f.packed.digest, worker: 'command', workdir: f.args.workRoot,
       inputs: [], outputs: ['out'], consumes: {}, consumedFingerprint: {},
       owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }], routing };
-    const response: GetOrderResponse = { text: '', workflow: 'wf', run: 'run',
+    const response: GetOrderResponse = { text: '', workflow: 'wf_child_instance', run: 'run',
       lease: { claimed: true }, order: packet };
-    const binding = { rootWorkflow: 'wf', frameWorkflow: 'wf', run: 'run',
+    assert.equal(await stage.commandFor!(packet), 'echo recovered');
+    await assert.rejects(stage.commandFor!({ ...packet, workflow: 'wf_sibling_instance' }),
+      /routed command definition refused/);
+    await assert.rejects(stage.verifyOrder({ ...response, workflow: 'wf' }), /routed order changed/);
+    await assert.rejects(stage.verifyOrder({ ...response,
+      order: { ...packet, workflow: 'wf_sibling_instance' } }), /routed order changed/);
+    const binding = { rootWorkflow: 'wf', frameWorkflow: 'wf_child_instance', run: 'run',
       claimId: 'run', decisionId: 'decision', sessionId: routing.claim.sessionId,
       shiftId: routing.claim.shiftId, orderDigest: 'b'.repeat(64),
       authorityRevision: 'c'.repeat(64), rosterRevision: routing.preference.rosterRevision,
@@ -181,6 +196,8 @@ test('parent signed stage admits an exact Service input-derived cwd witness and 
     await assert.rejects(stage.verifyOrder(response), /routed order fields changed|routed workdir witness unavailable/);
     const opened = openRoutingRoleStage({ definitionStage: { path: stage.path, digest: stage.digest },
       reservation: { workflow: 'wf', run: 'run' } } as RoutingHandoffV1);
+    assert.equal(opened.frameWorkflow, 'wf_child_instance');
+    assert.equal(opened.definitionName, 'recovered');
     const direct = await bindTrustedRoutedInputV2({ phase: 'prestart', pair, privateOrder: packet,
       instructions: opened.instructions, consumedVerifier: createConsumedVerifier({
 	env: opened.publicEnv, now: Date.now, artifactPolicy: 'enforce' }),
@@ -201,6 +218,9 @@ test('routed role opens only the staged public definition store', async () => {
   const handoff = { definitionStage: { path: stage.path, digest: stage.digest },
     reservation: { workflow: 'wf', run: 'run' } } as RoutingHandoffV1;
   const opened = openRoutingRoleStage(handoff);
+  assert.throws(() => openRoutingRoleStage({ ...handoff,
+    reservation: { ...handoff.reservation, workflow: 'other_root' } }),
+  /routing definition stage refused/);
   assert.equal(opened.publicEnv.OWENLOOP_CONFIG_DIR, join(stage.path, 'public'));
   assert.equal(opened.publicEnv.HOME, join(stage.path, 'home'));
   assert.equal(JSON.stringify(opened.publicEnv).includes('secret-marker'), false);

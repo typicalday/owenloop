@@ -41,6 +41,8 @@ function descriptor(path: string): unknown {
 export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
   instructions: InstructionResolver;
   publicEnv: Record<string, string | undefined>;
+  frameWorkflow: string;
+  definitionName: string;
 } {
   try {
     const stage = handoff.definitionStage;
@@ -51,8 +53,11 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
     privateDir(join(stage.path, 'public'));
     privateDir(join(stage.path, 'home'));
     const data = descriptor(join(stage.path, 'stage.json')) as Record<string, unknown>;
-    if (!data || data.version !== 'routing-definition-stage-v1'
-      || data.workflow !== handoff.reservation.workflow || data.run !== handoff.reservation.run
+    if (!data || data.version !== 'routing-definition-stage-v2'
+	|| data.rootWorkflow !== handoff.reservation.workflow
+	|| typeof data.frameWorkflow !== 'string' || !data.frameWorkflow
+	|| typeof data.definitionName !== 'string' || !data.definitionName
+	|| data.run !== handoff.reservation.run
       || data.digest !== stage.digest || typeof data.step !== 'string' || !data.step
       || typeof data.bundleDigest !== 'string' || !/^[0-9a-f]{64}$/.test(data.bundleDigest)
       || typeof data.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(data.nonce)
@@ -70,7 +75,8 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
       originVerifier: createExecutionOriginVerifier({ env: publicEnv }),
       consumedVerifier: createConsumedVerifier({ env: publicEnv, now: Date.now,
 	artifactPolicy: 'enforce' }), warn: () => {} });
-    return { publicEnv, instructions: {
+    return { publicEnv, frameWorkflow: data.frameWorkflow,
+      definitionName: data.definitionName, instructions: {
       ...strict,
       // Agent hosting needs the entire signed calls closure, not just one
       // prompt body. Command resolution already applies that hard boundary.

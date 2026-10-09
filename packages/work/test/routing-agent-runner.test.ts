@@ -15,7 +15,8 @@ function fixture() {
   chmodSync(stagePath, 0o700);
   const digest = 'a'.repeat(64);
   writeFileSync(join(stagePath, 'stage.json'), JSON.stringify({
-    version: 'routing-definition-stage-v1', workflow: 'wf', run: 'run', step: 'build',
+    version: 'routing-definition-stage-v2', rootWorkflow: 'wf', frameWorkflow: 'wf',
+    definitionName: 'wf', run: 'run', step: 'build',
     digest, bundleDigest: 'b'.repeat(64), nonce: 'c'.repeat(32), originRules: {},
   }), { mode: 0o600 });
   const now = Date.now();

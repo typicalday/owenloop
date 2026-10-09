@@ -786,8 +786,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     ...(routingSession ? { routingSession, selectRoutingTuples, routingRosterSnapshot,
       maintainDefinitionStages: definitionMaintenance!.sweep,
       closeDefinitionStages: definitionMaintenance!.close,
-      stageRoutedDefinition: (order: import('../hub/types.ts').WorkOrder) => stageRoutedDefinition({
-	order, origin, token, stateDir, workRoot, sourceEnv: env,
+      stageRoutedDefinition: (order: import('../hub/types.ts').WorkOrder, rootWorkflow: string) => stageRoutedDefinition({
+	order, rootWorkflow, origin, token, stateDir, workRoot, sourceEnv: env,
 	beforeRequest: routingBackoff!.beforeRequest,
 	onRateLimit: routingBackoff!.onRateLimit,
 	stillAuthorized: () => {
