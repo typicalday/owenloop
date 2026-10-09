@@ -120,6 +120,7 @@ export type AgentRunOutcome =
   | 'unresolvable-crew' // a stamped crew's local roster could not be read (exit 1)
   | 'unresolvable-capability' // no settings row for the order's capabilities (exit 1)
   | 'routed-launch-refused' // exact routed pre-provider authorization was unavailable (exit 1)
+  | 'routed-quarantined' // routed effects or provider group could not be settled (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'session-store-failed' // durable active-row gate failed before provider work (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
@@ -128,6 +129,13 @@ export type AgentRunOutcome =
   | 'ownership-error' // 403 — the run is not ours (exit 1)
   | 'hub-unreachable' // transient failures spanned the window (exit 1)
   | 'stopped'; // stop() arrived before the hold was established (exit 1)
+
+export interface RoutedAgentLifecycle {
+  start(args: StartArgs, onEvent: (event: AgentEvent) => void): Promise<HarnessSessionRef>;
+  requestStop(): void;
+  complete(reason: 'prestart' | 'turn-ended' | 'lease-ended' | 'stop'):
+    Promise<'submitted' | 'released' | 'uncertain'>;
+}
 
 /**
  * Locate the normalized step spec for an order. Injected because the lookup is
@@ -233,6 +241,9 @@ export interface AgentRunLoopOptions {
     selected: LocalModelTuple;
     authorize(signal: AbortSignal): Promise<{ selected: LocalModelTuple; expiresAt: number }>;
   }>;
+  /** Routed-only process and consequence owner. It retains the managed launch
+   * at spawn time and owns freeze/group/parent outcome before any release. */
+  routedLifecycle?: RoutedAgentLifecycle;
   /** One-use private holder subcap for nested MCP. Required for routed starts;
    * never substitute the operator account selector or a bearer fallback. */
   routingHolderPath?: string;
@@ -875,6 +886,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
   /** Release and finish. Used by every path that hands the order back. */
   async function releaseWith(reason: string, outcome: AgentRunOutcome): Promise<AgentRunOutcome> {
+    if (opts.routedLifecycle) {
+      let terminal: 'submitted' | 'released' | 'uncertain' = 'uncertain';
+      try { terminal = await opts.routedLifecycle.complete(signalled ? 'stop' : 'prestart'); }
+      catch { /* Parent/group custody was not proved. */ }
+      lease.stop(reason, { release: false });
+      if (leasePromise) await Promise.race([leasePromise,
+	new Promise<void>(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref(); })]);
+      return terminal === 'uncertain' ? 'routed-quarantined' : outcome;
+    }
     lease.stop(reason);
     await leasePromise;
     return outcome;
@@ -1785,7 +1805,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       if (!await beforeColdStart()) return { t: 'turn', routedRefused: true };
       try {
 	await freshTrustedInputV2();
-        const ref = await active.start(coldArgs(), onEvent);
+	const ref = await (opts.routedLifecycle
+	  ? opts.routedLifecycle.start(coldArgs(), onEvent) : active.start(coldArgs(), onEvent));
         sessionRef = ref;
         // The replay brief carried the reasons, and the turn it opened has now
         // ended — only here is the watermark honest. (The `active` row written
@@ -1796,7 +1817,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return { t: 'turn' };
       } catch (e: unknown) {
 	if (activePersistenceFailure !== undefined) {
-	  await teardown();
+	  if (opts.routedLifecycle) opts.routedLifecycle.requestStop();
+	  else await teardown();
 	  return { t: 'turn', persistenceFailure: activePersistenceFailure };
 	}
         return { t: 'turn', failure: e };
@@ -1859,6 +1881,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     const raced = await Promise.race([turnDone, leasePromise.then((o) => ({ t: 'lease' as const, o }))]);
 
     if (raced.t === 'lease') {
+      if (opts.routedLifecycle) {
+	let terminal: 'submitted' | 'released' | 'uncertain' = 'uncertain';
+	try { terminal = await opts.routedLifecycle.complete(signalled ? 'stop' : 'lease-ended'); }
+	catch { /* The provider or parent state is uncertain. */ }
+	lease.stop('routed-terminal', { release: false });
+	return terminal === 'submitted' ? 'submitted'
+	  : terminal === 'released' && signalled ? 'killed' : 'routed-quarantined';
+      }
       await teardown();
       if (raced.o === 'completed') {
         opts.out(`owenloop work agent-run: ${order} completed mid-turn (the hub reported an outcome)`);
@@ -1889,6 +1919,18 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     if (raced.failure instanceof TrustedInputV2Refusal) {
       opts.err(`owenloop work agent-run: trusted input v2 prestart refusal: ${raced.failure.message}`);
       return releaseWith('unverified-consumed', 'unverified-consumed');
+    }
+
+    if (opts.routedLifecycle) {
+      let terminal: 'submitted' | 'released' | 'uncertain' = 'uncertain';
+      try { terminal = await opts.routedLifecycle.complete(signalled ? 'stop' : 'turn-ended'); }
+      catch { /* A failed final observation retains all routed custody. */ }
+      lease.stop('routed-terminal', { release: false });
+      if (leasePromise) await Promise.race([leasePromise,
+	new Promise<void>(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref(); })]);
+      if (terminal === 'submitted') return 'submitted';
+      if (terminal === 'released') return signalled ? 'killed' : 'no-submit';
+      return 'routed-quarantined';
     }
 
     // TURN END — NOT task end. Log the failure shape for humans, then confirm.
@@ -1969,6 +2011,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     if (signalled) return;
     signalled = true;
     routedAbort.abort();
+    if (opts.routedLifecycle) { opts.routedLifecycle.requestStop(); return; }
     void teardown();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

@@ -143,7 +143,8 @@ test('role quiesce freezes holder and role writes, waits for a known ask ACK, an
       const parts = String(url).split('/');
       const verb = parts.at(-1) === 'v1' ? parts.at(-2)! : parts.at(-1)!;
       calls.push(verb);
-      if (verb === 'routing_ask') { beginAsk(); await askReply; return Response.json({ text: 'answer', ok: true }); }
+      if (verb === 'routing_ask') { beginAsk(); await askReply;
+	return Response.json({ text: 'answer', ok: true, closed: true }); }
       if (verb === 'get_order') return Response.json(orderResponse);
       if (verb === 'heartbeat') return Response.json({ text: 'ok', ok: true });
       throw new Error(`unexpected routed mutation ${verb}`);

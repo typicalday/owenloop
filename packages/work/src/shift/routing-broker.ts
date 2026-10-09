@@ -53,7 +53,7 @@ type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
   | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection' | 'quiesce'
-  | 'command_postrun' | 'command_finish';
+  | 'command_postrun' | 'command_finish' | 'agent_outcome' | 'agent_finish';
 type CapScope = 'role' | 'holder';
 export type RoutedQuiesceResult = { quiescing: true; effects: 'settled' | 'uncertain' };
 interface Grant {
@@ -72,6 +72,11 @@ interface Grant {
   quiescing: boolean;
   inFlightEffects: Set<Promise<void>>;
   uncertainEffects: Set<Method | 'upload_file'>;
+  /** One entry per dispatched child mutation with a lost/malformed ACK. The
+   * method set above remains a coarse quarantine signal for stream effects. */
+  effectLedger: Map<number, { method: Method; requestDigest?: string }>;
+  nextEffectId: number;
+  effectLedgerOverflow: boolean;
   syncUncertainty?: () => void;
   quiesceResult?: Promise<RoutedQuiesceResult>;
   observeQuiesce?: (result: Promise<RoutedQuiesceResult>) => void;
@@ -113,6 +118,11 @@ interface Grant {
     result?: CommandPostrunResponse };
   postrunBusy?: boolean;
   postrunRelease?: { reason: string; dispatched: boolean; response?: import('../hub/types.ts').ReleaseResponse };
+  /** Authenticated Service mutation results only. A model claim is never an ACK. */
+  agentAcks: Array<{ method: 'submit' | 'ask' | 'reject' | 'seal_collection'; closed: boolean }>;
+  agentAckOverflow: boolean;
+  agentOutcome?: 'closed' | 'held';
+  agentRelease?: { dispatched: boolean; response?: import('../hub/types.ts').ReleaseResponse };
   terminalReason?: 'normal-close' | 'receipt-pending' | 'revoked';
   receiptUntil?: number;
   revokeResult?: Promise<void>;
@@ -312,23 +322,40 @@ function startEffect<T>(grant: Grant, send: () => Promise<T>): Promise<T> {
  * or lost ACK after Service commit remains uncertain at the quiesce boundary. */
 function trackEffect<T>(grant: Grant, method: Method, send: () => Promise<T>): Promise<T> {
   const context = { dispatched: false };
+  const id = ++grant.nextEffectId;
+  const priorSubmitDigest = method === 'submit' ? grant.pendingSubmit?.requestDigest : undefined;
   const operation = effectContext.run(context, send);
   const settled = operation.then(() => {
     // These three operations have an exact conditional replay/receipt path.
     // A later acknowledged replay resolves only its original frozen intent.
     if (method === 'submit' || method === 'emit_member' || method === 'seal_collection') {
+      if (method === 'submit' && priorSubmitDigest)
+	for (const [effectId, entry] of grant.effectLedger)
+	  if (entry.method === 'submit' && entry.requestDigest === priorSubmitDigest)
+	    grant.effectLedger.delete(effectId);
       grant.uncertainEffects.delete(method);
       grant.syncUncertainty?.();
     }
   }, () => {
     if (context.dispatched) {
       grant.uncertainEffects.add(method);
+      if (grant.effectLedger.size >= 256) grant.effectLedgerOverflow = true;
+      else grant.effectLedger.set(id, { method,
+	...(method === 'submit' && grant.pendingSubmit
+	  ? { requestDigest: grant.pendingSubmit.requestDigest } : {}) });
       grant.syncUncertainty?.();
     }
   });
   grant.inFlightEffects.add(settled);
   void settled.finally(() => { grant.inFlightEffects.delete(settled); });
   return operation;
+}
+
+function recordAgentAck(grant: Grant, method: 'submit' | 'ask' | 'reject' | 'seal_collection',
+  closed: boolean): void {
+  if (grant.reservation.childKind !== 'agent-run') return;
+  if (grant.agentAcks.length >= 256) { grant.agentAckOverflow = true; return; }
+  grant.agentAcks.push({ method, closed });
 }
 
 /** Parent-owned irreversible local effect freeze. A successful reply proves
@@ -634,16 +661,26 @@ function validConditionalReceiptResponse(value: unknown): value is import('../hu
 async function readDispatchedConditionalAck(grant: Grant, now: () => number,
   signal: AbortSignal): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {
   const pending = grant.pendingSubmit;
-  if (!pending || !grant.postrun || !grant.quiescing)
+  const commandPostrun = grant.postrun;
+  const agentSolePending = grant.reservation.childKind === 'agent-run'
+    && grant.uncertainEffects.size === 1 && grant.uncertainEffects.has('submit')
+    && !grant.effectLedgerOverflow && grant.effectLedger.size === 1
+    && [...grant.effectLedger.values()][0]?.method === 'submit'
+    && [...grant.effectLedger.values()][0]?.requestDigest === pending?.requestDigest
+    && grant.inFlightEffects.size === 0;
+  if (!pending || !grant.quiescing || (!commandPostrun && !agentSolePending))
     throw new Error('routing submission outcome unresolved');
-  const postrun = grant.postrun;
   const query = conditionalReceiptRequest(grant);
   const started = performance.now();
   let backoff = 100;
   const stillOwned = () => {
     const elapsed = performance.now() - started;
     return grant.pendingSubmit === pending && !signal.aborted
-      && grant.postrun === postrun && liveChildValid(grant, now())
+      && grant.postrun === commandPostrun && liveChildValid(grant, now())
+      && (commandPostrun !== undefined || grant.uncertainEffects.size === 1
+	&& grant.uncertainEffects.has('submit') && grant.inFlightEffects.size === 0
+	&& !grant.effectLedgerOverflow && grant.effectLedger.size === 1
+	&& [...grant.effectLedger.values()][0]?.requestDigest === pending.requestDigest)
       && Number.isFinite(elapsed) && elapsed >= 0 && elapsed < CONDITIONAL_ACK_READ_MS;
   };
   while (stillOwned()) {
@@ -758,6 +795,7 @@ async function collectionSeal(grant: Grant, sealPath: string, sealId: string,
   if (!collectionResponse(result, 'seal') || (!validateSessionGrant(grant, now())
     && !collectionReceiptOnly(grant, now))) throw new Error('routing collection seal outcome unresolved');
   grant.collectionSeal.result = result;
+  recordAgentAck(grant, 'seal_collection', result.closed === true);
   grant.uncertainEffects.delete('seal_collection');
   grant.syncUncertainty?.();
   return result;
@@ -1050,6 +1088,109 @@ async function commandFinish(grant: Grant, body: unknown, now: () => number,
   }
 }
 
+/** A routed agent may inspect only parent-retained Service mutation results
+ * after the role and holder are frozen and its original group is observed
+ * empty. An exact conditional receipt may resolve its own lost ACK, but never
+ * an unrelated upload, collection, ask or reject effect. */
+async function agentOutcome(grant: Grant, body: unknown, now: () => number,
+  signal: AbortSignal): Promise<{ claim: 'closed' | 'held' | 'uncertain' }> {
+  const groupEmpty = exactKeys(body, ['group']) && exactKeys(body.group, ['scope', 'state'])
+    && body.group.scope === 'original-posix-group' && body.group.state === 'empty';
+  if (!groupEmpty || grant.reservation.childKind !== 'agent-run' || !grant.quiescing
+    || !grant.quiesceResult || !grant.acceptedLaunchReport || !grant.launchReservationId
+    || signal.aborted || !liveChildValid(grant, now())) throw new Error('routing agent outcome unavailable');
+  await grant.quiesceResult;
+  if (signal.aborted || !liveChildValid(grant, now())) return { claim: 'uncertain' };
+  if (grant.inFlightEffects.size > 0) return { claim: 'uncertain' };
+  if (grant.pendingSubmit && grant.uncertainEffects.size === 1
+    && grant.uncertainEffects.has('submit')) {
+    try {
+      const response = await readDispatchedConditionalAck(grant, now, signal);
+      if (!liveChildValid(grant, now())) return { claim: 'uncertain' };
+      const [effectId, effect] = [...grant.effectLedger.entries()][0] ?? [];
+      if (effectId === undefined || effect?.method !== 'submit'
+	|| effect.requestDigest !== grant.pendingSubmit?.requestDigest)
+	return { claim: 'uncertain' };
+      recordAgentAck(grant, 'submit', response.closed === true);
+      grant.pendingSubmit = undefined;
+      grant.effectLedger.delete(effectId);
+      grant.uncertainEffects.delete('submit'); grant.syncUncertainty?.();
+    } catch { return { claim: 'uncertain' }; }
+  }
+  if (grant.pendingSubmit || grant.uncertainEffects.size > 0
+    || grant.effectLedgerOverflow || grant.effectLedger.size > 0 || grant.agentAckOverflow)
+    return { claim: 'uncertain' };
+  if (grant.agentAcks.some(ack => ack.closed)) {
+    grant.agentOutcome = 'closed';
+    return { claim: 'closed' };
+  }
+  try {
+    const current = await verifyCurrentConsequence(grant, 'role', now, signal);
+    if (!current?.lease.claimed || !current.order || !liveChildValid(grant, now()))
+      return { claim: 'uncertain' };
+    grant.agentOutcome = 'held';
+    return { claim: 'held' };
+  } catch { return { claim: 'uncertain' }; }
+}
+
+/** Release is a separate, one-use parent operation. A closed ACK needs no
+ * follow-up get_order; a held result needs a fresh parent-internal witness. */
+async function agentFinish(grant: Grant, body: unknown, now: () => number,
+  signal: AbortSignal): Promise<{ state: 'released' | 'already-closed' | 'uncertain' }> {
+  const noStart = exactKeys(body, ['observation']) && body.observation === 'not-started';
+  const groupEmpty = exactKeys(body, ['group']) && exactKeys(body.group, ['scope', 'state'])
+    && body.group.scope === 'original-posix-group' && body.group.state === 'empty';
+  if ((!noStart && !groupEmpty) || grant.reservation.childKind !== 'agent-run'
+    || !grant.quiescing || !grant.quiesceResult || signal.aborted || !liveChildValid(grant, now())
+    || groupEmpty && !grant.acceptedLaunchReport)
+    throw new Error('routing agent finish unavailable');
+  await grant.quiesceResult;
+  if (signal.aborted || !liveChildValid(grant, now())) return { state: 'uncertain' };
+  if (grant.inFlightEffects.size || grant.uncertainEffects.size || grant.pendingSubmit)
+    return { state: 'uncertain' };
+  if (grant.agentRelease?.response) return { state: 'released' };
+  if (grant.agentRelease?.dispatched) return { state: 'uncertain' };
+  if (grant.agentOutcome === 'closed') return { state: 'already-closed' };
+  if (groupEmpty) {
+    if (grant.agentOutcome !== 'held') return { state: 'uncertain' };
+    try {
+      const current = await verifyCurrentConsequence(grant, 'role', now, signal);
+      if (!current?.lease.claimed || !current.order || !liveChildValid(grant, now()))
+	return { state: 'uncertain' };
+    }
+    catch { return { state: 'uncertain' }; }
+  } else {
+    // Before the start latch, no worker result exists. An original-session
+    // current claim read still obeys the startup preference fence.
+    if (grant.agentOutcome || grant.agentAcks.length || grant.agentAckOverflow)
+      return { state: 'uncertain' };
+    try {
+      const current = await checked(grant, grant.hub.readRoutingClaim({
+	workflow: grant.reservation.workflow, run: grant.reservation.run }, signal), now);
+      if (current.freshness !== 'fresh-at-read' || current.atomicLaunch !== false
+	|| current.routing.claim.state !== 'claimed'
+	|| !isDeepStrictEqual(current.routing, grant.routing)) return { state: 'uncertain' };
+    } catch { return { state: 'uncertain' }; }
+  }
+  grant.agentRelease = { dispatched: true };
+  const context = { dispatched: false, parentPostrun: true };
+  try {
+    if (signal.aborted || !liveChildValid(grant, now()))
+      throw new Error('routing agent release revoked');
+    const response = await effectContext.run(context, () => startEffect(grant, () =>
+      grant.hub.routingRelease({ workflow: grant.reservation.workflow,
+	run: grant.reservation.run, reason: 'routed-agent-finished' }, signal)));
+    if (!response || response.released !== true || signal.aborted
+      || !liveChildValid(grant, now()))
+      throw new Error('routing agent release outcome unresolved');
+    grant.agentRelease.response = response;
+    return { state: 'released' };
+  } catch {
+    grant.uncertainEffects.add('agent_finish'); grant.syncUncertainty?.();
+    return { state: 'uncertain' };
+  }
+}
+
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
   if (method === 'quiesce') {
@@ -1064,6 +1205,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
   if (method === 'command_finish') {
     if (scope !== 'role') throw new Error('routing broker request refused');
     return commandFinish(grant, body, now, signal);
+  }
+  if (method === 'agent_outcome' || method === 'agent_finish') {
+    if (scope !== 'role') throw new Error('routing broker request refused');
+    return method === 'agent_outcome' ? agentOutcome(grant, body, now, signal)
+      : agentFinish(grant, body, now, signal);
   }
   if (grant.quiescing && method !== 'heartbeat'
     && !((method === 'emit_member' || method === 'seal_collection')
@@ -1309,7 +1455,14 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| !validHolder(grant, scope, body.holder)
 	|| (body.done !== undefined && typeof body.done !== 'boolean'))
 	throw new Error('routing broker request refused');
-      return submitFromParent(grant, body, now, signal);
+      const response = await submitFromParent(grant, body, now, signal) as
+	import('../hub/types.ts').RoutedConditionalMutationResponse;
+      if (grant.reservation.childKind === 'agent-run') {
+	if (!validConditionalReceiptResponse(response))
+	  throw new Error('routing agent submit acknowledgement refused');
+	recordAgentAck(grant, 'submit', response.closed === true);
+      }
+      return response;
     }
     case 'release':
       if (!exactKeys(body, []) && !exactKeys(body, ['reason'])) throw new Error('routing broker request refused');
@@ -1337,8 +1490,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       const context = body.context as string | undefined;
       const response = await checked(grant, startEffect(grant, () => grant.hub.routingAsk({ workflow, run, path,
 	question, ...(context === undefined ? {} : { context }) }, signal)), now);
-      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
+      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string'
+	|| grant.reservation.childKind === 'agent-run' && typeof response.closed !== 'boolean')
 	throw new Error('routing broker response refused');
+      if (grant.reservation.childKind === 'agent-run' && response.ok)
+	recordAgentAck(grant, 'ask', response.closed === true);
       return response;
     }
     case 'reject': {
@@ -1356,8 +1512,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       const requested = body.requested as string | undefined;
       const response = await checked(grant, startEffect(grant, () => grant.hub.routingReject({ workflow, run, path,
 	text: value, ...(requested === undefined ? {} : { requested }) }, signal)), now);
-      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string')
+      if (!response || typeof response.ok !== 'boolean' || typeof response.text !== 'string'
+	|| grant.reservation.childKind === 'agent-run' && typeof response.closed !== 'boolean')
 	throw new Error('routing broker response refused');
+      if (grant.reservation.childKind === 'agent-run' && response.ok)
+	recordAgentAck(grant, 'reject', response.closed === true);
       return response;
     }
     case 'request_approval': {
@@ -1632,7 +1791,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       'read_live_routed_reference_v2', 'read_live_routing_claim_v2',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection',
-	    'quiesce', 'command_postrun', 'command_finish'];
+	    'quiesce', 'command_postrun', 'command_finish', 'agent_outcome', 'agent_finish'];
 	  if (!methods.includes(request.method)) throw new Error();
 	  const effect = ['reserve_launch', 'report_launch', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'emit_member', 'seal_collection'].includes(request.method);
@@ -1664,6 +1823,8 @@ export async function createRoutingBroker(args: { now?: () => number;
       submissionAuthority, launchAuthority, inputAuthority, commandFor }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, quiescing: false,
+	agentAcks: [], agentAckOverflow: false,
+	effectLedger: new Map(), nextEffectId: 0, effectLedgerOverflow: false,
 	inFlightEffects: new Set(), uncertainEffects: new Set(), uploadControllers: new Set(),
 	uploadEffectControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),

@@ -2189,6 +2189,36 @@ test('cold start requires a durable active row before provider work', async () =
   assert.ok(h.errs.some((line) => line.includes('durable active-session persistence failed before provider delivery')));
 });
 
+test('routed started-event persistence failure freezes retained launch before terminal observation', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder()] });
+  const events: string[] = [];
+  const h = buildOpts({ hub, adapter,
+    appendSession: record => { if (record.status === 'active') throw new Error('active fsync failed'); },
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    routedSelect: async () => ({
+      selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => ({
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }),
+    }),
+  });
+  h.opts.routedLifecycle = {
+    async start(_args, onEvent) {
+      events.push('launch');
+      onEvent({ kind: 'started', ref: { harness: 'fake', token: 'retained' } });
+      assert.fail('active persistence failure must stop provider delivery');
+    },
+    requestStop() { events.push('freeze'); },
+    async complete() { events.push('settle'); return 'uncertain'; },
+  };
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-quarantined');
+  assert.deepEqual(events, ['launch', 'freeze', 'settle']);
+  assert.equal(adapter.calls.filter(call => call.kind === 'stop').length, 0,
+    'ordinary adapter teardown must not precede broker freeze and retained group custody');
+  assert.equal(verbs(calls).filter(verb => verb === 'release').length, 0);
+});
+
 test('resume requires a durable active row before provider delivery', async () => {
   const previous: SessionRecord = {
     workflow: 'wf1',

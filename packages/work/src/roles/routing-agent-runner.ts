@@ -15,6 +15,7 @@ import { createTrustedRoutedInputV2Admission } from '../hosted/trusted-input-adm
 import { createBrokerRoutedReferenceV2Reader } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RoutingHandoffV1 } from '../shift/runtime.ts';
 import { createRoutedAgentSelection } from './routing-agent-launch.ts';
+import { createRoutedAgentLifecycle } from './routing-agent-lifecycle.ts';
 import { createRoutedAgentStepLoader } from './routing-agent-step.ts';
 import { assertRoutedAgentWorkdirDisjoint, planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
 import { createRoutingHolderHandoff } from './routing-holder-handoff.ts';
@@ -81,7 +82,13 @@ export async function prepareRoutedAgentRunner(args: {
     expected: { workflow, run }, monotonicNow: () => performance.now(),
   });
   const sessionsFile = sessionsPath(resolveCacheDir(publicEnv));
-  const select = createRoutedAgentSelection({ child: client.routed, holder, workflow, run,
+  const lifecycle = createRoutedAgentLifecycle({ child: client.routed,
+    generation: `${handoff.incarnation}:${handoff.nonce}:${run}` });
+  const sessionHolder: ContactHolder = { kind: 'session', id: handoff.sessionId,
+    shiftId: handoff.shiftId };
+  const select = createRoutedAgentSelection({ child: client.routed, sessionHolder,
+    roleHolder: holder, workflow, frameWorkflow: stage.frameWorkflow,
+    definitionName: stage.definitionName, run,
     beforeFinalCheck: (order) => {
       if (order.workdir === undefined) planned.materialize();
       else assertRoutedAgentWorkdirDisjoint(order.workdir, dirname(handoff.definitionStage!.path));
@@ -97,13 +104,13 @@ export async function prepareRoutedAgentRunner(args: {
       admittedRoutedInputV2: order => !!admittedPacket && isDeepStrictEqual(admittedPacket, order) }),
     resolveAdapter: (chosenHarness, stepHarness) => {
       const id = chosenHarness ?? stepHarness ?? '';
-      const adapter = adapterFor(id);
+      const adapter = id === 'codex' ? adapterFor(id) : undefined;
       return { id: id || '<none>', ...(adapter ? { adapter } : {}),
 	registered: registeredHarnessIds() };
     },
     resolveCrewRosters: crew => ({ ok: false, crew: crew[0] ?? 'routed',
       detail: 'routed server selection required' }),
-    harnessAvailable: id => adapterFor(id) !== undefined,
+    harnessAvailable: id => id === 'codex' && adapterFor(id) !== undefined,
     consumedVerifier,
     routedInputV2: { observe: async order => {
       if (order.workflow !== stage.frameWorkflow
@@ -114,6 +121,7 @@ export async function prepareRoutedAgentRunner(args: {
       return result;
     } },
     routedSelect: (order, signal) => select(order, signal),
+    routedLifecycle: lifecycle,
     createRoutingHolderPath: () => {
       if (holderHandoff) throw refused();
       holderHandoff = createRoutingHolderHandoff(handoff, cache.custodyRoot);
@@ -133,8 +141,22 @@ export async function prepareRoutedAgentRunner(args: {
   });
   return { loop, run: async () => {
     const restore = replaceProcessEnv(providerEnv);
-    try { return await loop.run(); }
-    finally { restore(); holderHandoff?.cleanup(); }
+    let outcome: AgentRunOutcome = 'routed-quarantined';
+    try { outcome = await loop.run(); return outcome; }
+    catch {
+      lifecycle.requestStop();
+      await lifecycle.complete('stop').catch(() => 'uncertain');
+      throw refused();
+    }
+    finally {
+      restore();
+      // Unknown mutation or group state keeps the holder/cache custody for
+      // exact parent recovery; a role exit is not a cleanup proof.
+      if (outcome !== 'routed-quarantined') {
+	holderHandoff?.cleanup();
+	await cache.cleanup();
+      }
+    }
   } };
   } catch {
     holderHandoff?.cleanup();

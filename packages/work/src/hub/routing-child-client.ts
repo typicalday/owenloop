@@ -29,7 +29,7 @@ type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_lo
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'quiesce'
-  | 'command_postrun' | 'command_finish'
+  | 'command_postrun' | 'command_finish' | 'agent_outcome' | 'agent_finish'
   | 'request_approval' | 'read_invocation_binding';
 type CollectionVerb = Verb | 'collection_target' | 'emit_member' | 'seal_collection';
 
@@ -54,6 +54,12 @@ export interface RoutingChildClient {
   /** Parent checks current native claim and uses only a targeted release. */
   commandFinish(req: { group: { scope: 'original-posix-group'; state: 'empty' } }
     | { observation: 'not-started' }):
+    Promise<{ state: 'released' | 'already-closed' | 'uncertain' }>;
+  /** Parent-owned terminal state; the role supplies only its local group observation. */
+  agentOutcome(req: { group: { scope: 'original-posix-group'; state: 'empty' } }, signal?: AbortSignal):
+    Promise<{ claim: 'closed' | 'held' | 'uncertain' }>;
+  agentFinish(req: { group: { scope: 'original-posix-group'; state: 'empty' } }
+    | { observation: 'not-started' }, signal?: AbortSignal):
     Promise<{ state: 'released' | 'already-closed' | 'uncertain' }>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   collectionTarget(req: { workflow: string; run: string; path: string;
@@ -93,7 +99,9 @@ export function createRoutingChildClient(handoff: {
   const bound = (value: { workflow: string; run: string }) => {
     if (value.workflow !== workflow || value.run !== run) throw new Error('routing order binding refused');
   };
-  const exchange = <T>(method: CollectionVerb, body: unknown, absoluteMs?: number): Promise<T> => {
+  const exchange = <T>(method: CollectionVerb, body: unknown, absoluteMs?: number,
+    signal?: AbortSignal): Promise<T> => {
+    if (signal?.aborted) return Promise.reject(refused());
     const frame = JSON.stringify({ cap: broker.cap, method, body }) + '\n';
     if (Buffer.byteLength(frame) > MAX_REQUEST_BYTES) return Promise.reject(new Error('routing broker request too large'));
     return new Promise<T>((resolve, reject) => {
@@ -105,11 +113,14 @@ export function createRoutingChildClient(handoff: {
 	if (settled) return;
 	settled = true;
 	if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+	signal?.removeEventListener('abort', abort);
 	socket.destroy();
 	if (error) reject(error);
 	else resolve(value as T);
       };
       const deadlineTimer = absoluteMs === undefined ? undefined : setTimeout(() => finish(refused()), absoluteMs);
+      const abort = () => finish(refused());
+      signal?.addEventListener('abort', abort, { once: true });
       socket.setTimeout(REQUEST_TIMEOUT_MS, () => finish(refused()));
       socket.once('connect', () => socket.write(frame));
       socket.on('data', (chunk: Buffer) => {
@@ -369,6 +380,22 @@ export function createRoutingChildClient(handoff: {
         || Object.keys(value).join(',') !== 'state'
         || !['released', 'already-closed', 'uncertain'].includes(
           String((value as Record<string, unknown>).state))) throw refused();
+      return value as { state: 'released' | 'already-closed' | 'uncertain' };
+    },
+    async agentOutcome(req, signal) {
+      const value = await exchange<unknown>('agent_outcome', req, undefined, signal);
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+	|| Object.keys(value).join(',') !== 'claim'
+	|| !['closed', 'held', 'uncertain'].includes(String((value as Record<string, unknown>).claim)))
+	throw refused();
+      return value as { claim: 'closed' | 'held' | 'uncertain' };
+    },
+    async agentFinish(req, signal) {
+      const value = await exchange<unknown>('agent_finish', req, undefined, signal);
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+	|| Object.keys(value).join(',') !== 'state'
+	|| !['released', 'already-closed', 'uncertain'].includes(
+	  String((value as Record<string, unknown>).state))) throw refused();
       return value as { state: 'released' | 'already-closed' | 'uncertain' };
     },
     submit(req) {

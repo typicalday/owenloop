@@ -20,7 +20,10 @@ export interface RoutedAgentSelection {
 type Args = {
   child: Pick<RoutingChildClient, 'readRoutingClaim' | 'assessLocalModel' | 'reserveLaunch'
     | 'reportLaunch' | 'getLaunchOrder'>;
-  holder: ContactHolder; workflow: string; run: string; now?: () => number;
+  /** The request targets the canonical root; the order belongs to frameWorkflow. */
+  workflow: string; frameWorkflow: string; definitionName: string; run: string;
+  /** Claim authority is the original session, while getLaunchOrder is a role read. */
+  sessionHolder: ContactHolder; roleHolder: ContactHolder; now?: () => number;
   /** Optional local effects such as git worktree provisioning. Only after the
    * authenticated report ACK; the final live order read follows the effect. */
   beforeFinalCheck?: (order: OrderPacket, signal?: AbortSignal) => Promise<void> | void;
@@ -38,9 +41,10 @@ export function createRoutedAgentSelection(args: Args):
   const now = args.now ?? Date.now;
   let used = false;
   return async (order, signal) => {
-    if (used || signal?.aborted || order.workflow !== args.workflow || order.run !== args.run
+    if (used || signal?.aborted || order.workflow !== args.frameWorkflow || order.run !== args.run
       || (order.worker !== undefined && order.worker !== 'agent')
-      || !order.routing || args.holder.kind !== 'session') throw refused();
+      || !order.routing || args.sessionHolder.kind !== 'session'
+      || args.roleHolder.kind !== 'exec') throw refused();
     used = true;
     // Pin the full order before any asynchronous assessment or local checks.
     const pinned = structuredClone(order);
@@ -48,11 +52,15 @@ export function createRoutedAgentSelection(args: Args):
     const { claim, preference } = routing;
     const deadline = Math.min(preference.expiresAt, claim.binding.expiresAt);
     const live = (later?: AbortSignal) => !signal?.aborted && !later?.aborted && now() < deadline;
-    if (!live() || claim.orderId !== args.run || typeof claim.attemptId !== 'string'
+    if (!live() || claim.orderId !== args.run || claim.binding.runId !== args.workflow
+      || claim.binding.frameId !== args.frameWorkflow
+      || claim.binding.def.workflowName !== args.definitionName
+      || typeof claim.attemptId !== 'string'
       || !claim.attemptId
       || claim.sessionId !== claim.binding.authority.sessionId
       || claim.principalId !== claim.binding.authority.principalId
-      || args.holder.id !== claim.sessionId || args.holder.shiftId !== claim.shiftId) throw refused();
+      || args.sessionHolder.id !== claim.sessionId || args.sessionHolder.shiftId !== claim.shiftId
+      || args.roleHolder.shiftId !== claim.shiftId || !args.roleHolder.id) throw refused();
     const fresh = await args.child.readRoutingClaim({ workflow: args.workflow, run: args.run });
     if (!live() || fresh.freshness !== 'fresh-at-read' || fresh.atomicLaunch !== false
       || !isDeepStrictEqual(fresh.routing, routing)) throw refused();
@@ -108,8 +116,9 @@ export function createRoutedAgentSelection(args: Args):
 	if (!live(later) || now() >= reservation.expiresAt) throw refused();
       }
       const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,
-      holder: args.holder });
+      holder: args.roleHolder });
       if (!live(later) || now() >= reservation.expiresAt || !final.lease.claimed || !final.order
+	|| final.workflow !== args.frameWorkflow || final.run !== args.run
 	|| !isDeepStrictEqual(final.order, pinned)) throw refused();
       return { selected: structuredClone(selected), reservationId: reservation.reservationId,
 	expiresAt: reservation.expiresAt };

@@ -8,7 +8,7 @@ import type { DecisionBindingV1, LaunchReportV1, LocalModelAssessment,
 
 const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
 const binding: DecisionBindingV1 = { orgId: 'org', runId: 'wf', frameId: 'frame',
-  def: { bundleDigest: 'sha256:bundle', workflowName: 'wf' }, subjectKey: 'subject',
+  def: { bundleDigest: 'sha256:bundle', workflowName: 'routing/child' }, subjectKey: 'subject',
   evidenceDigest: 'sha256:evidence', candidateDigest: 'sha256:candidates', policyDigest: 'sha256:policy',
   revisions: { definition: '1', candidates: '1', policy: '1', authority: '1', rolePolicy: '1',
     roster: '1', routes: '1', membership: '1', evidenceGeneration: '1' },
@@ -22,10 +22,13 @@ const routing: ReferenceRouting = { claim: { state: 'claimed', claimId: 'run', d
   preference: { offer: null, tuples: [{ tuple: first, eligible: true, available: true },
     { tuple: second, eligible: true, available: true }], role: 'implementation', rolePolicy: null,
     rosterRevision: 'roster-v1', expiresAt: 70_000 } };
-const order: OrderPacket = { workflow: 'wf', run: 'run', step: 'build', key: '',
+const order: OrderPacket = { workflow: 'frame', run: 'run', step: 'build', key: '',
   defDigest: 'a'.repeat(64), worker: 'agent', inputs: [], outputs: ['out'], consumes: {}, routing,
   owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] };
 const holder = { kind: 'session' as const, id: sessionId, shiftId: 'shf_service' };
+const roleHolder = { kind: 'exec' as const, id: 'host:100', shiftId: 'shf_service' };
+const identities = { sessionHolder: holder, roleHolder,
+  workflow: 'wf', frameWorkflow: 'frame', definitionName: 'routing/child', run: 'run' };
 
 function fixture(packet = order) {
   const calls: string[] = [];
@@ -46,7 +49,8 @@ function fixture(packet = order) {
       return { orderId: 'run', digest: valueDigestHex(sent), recordedAt: 2_000,
 	provenance: 'authenticated-worker-report' as const };
     },
-    getLaunchOrder: async () => { calls.push('order'); return { workflow: 'wf', run: 'run', text: '',
+    getLaunchOrder: async ({ holder: received }: { holder: unknown }) => { calls.push('order');
+      assert.deepEqual(received, roleHolder); return { workflow: 'frame', run: 'run', text: '',
       lease: { claimed: true }, order: packet }; },
   } as unknown as RoutingChildClient;
   return { child, calls, report: () => report };
@@ -54,8 +58,7 @@ function fixture(packet = order) {
 
 test('agent launch reserves the first Service-ordered tuple and awaits unknown receipt and final order', async () => {
   const f = fixture();
-  const prestart = createRoutedAgentPrestart({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 });
+  const prestart = createRoutedAgentPrestart({ child: f.child, ...identities, now: () => 2_000 });
   const selected = await prestart(order);
   assert.deepEqual(selected, { selected: first, reservationId: 'lr-one', expiresAt: 50_000 });
   assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'order']);
@@ -68,16 +71,30 @@ test('agent launch accepts the documented omitted worker field as agent', async 
   const packet = structuredClone(order);
   delete packet.worker;
   const f = fixture(packet);
-  const admitted = await createRoutedAgentPrestart({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 })(packet);
+  const admitted = await createRoutedAgentPrestart({ child: f.child, ...identities, now: () => 2_000 })(packet);
   assert.deepEqual(admitted.selected, first);
   assert.deepEqual(f.calls, ['claim', 'reserve', 'report', 'order']);
 });
 
+test('nested agent launch refuses wrong root, frame, signed name, run, session or role contact before reserve', async () => {
+  const variants = [
+    { workflow: 'other-root' }, { frameWorkflow: 'other-frame' },
+    { definitionName: 'routing/sibling' }, { run: 'other-run' },
+    { sessionHolder: { ...holder, id: 'other-session' } },
+    { roleHolder: { ...roleHolder, shiftId: 'other-shift' } },
+  ];
+  for (const variant of variants) {
+    const f = fixture();
+    await assert.rejects(createRoutedAgentPrestart({ child: f.child,
+      ...identities, ...variant, now: () => 2_000 })(order), /routed agent launch refused/);
+    assert.equal(f.calls.includes('reserve'), false);
+    assert.equal(f.calls.includes('report'), false);
+  }
+});
+
 test('agent selection defers reserve and report until local adapter preflight has passed', async () => {
   const f = fixture();
-  const select = createRoutedAgentSelection({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 });
+  const select = createRoutedAgentSelection({ child: f.child, ...identities, now: () => 2_000 });
   const plan = await select(order);
   assert.deepEqual(plan.selected, first);
   assert.deepEqual(f.calls, ['claim']);
@@ -89,8 +106,7 @@ test('agent selection defers reserve and report until local adapter preflight ha
 
 test('local workdir materialization runs after report ACK and before final launch order', async () => {
   const f = fixture();
-  const plan = await createRoutedAgentSelection({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000,
+  const plan = await createRoutedAgentSelection({ child: f.child, ...identities, now: () => 2_000,
     beforeFinalCheck: (pinned) => {
       assert.deepEqual(pinned, order);
       f.calls.push('materialize');
@@ -103,8 +119,7 @@ test('local workdir materialization runs after report ACK and before final launc
 
 test('failed local materialization refuses before final order or provider permission', async () => {
   const f = fixture();
-  const plan = await createRoutedAgentSelection({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000,
+  const plan = await createRoutedAgentSelection({ child: f.child, ...identities, now: () => 2_000,
     beforeFinalCheck: () => { f.calls.push('materialize'); throw new Error('hook refused'); },
   })(order);
   await assert.rejects(plan.authorize(), /hook refused/);
@@ -115,8 +130,7 @@ test('failed local materialization refuses before final order or provider permis
 test('agent selection aborts during local preflight without reserving or reporting', async () => {
   const f = fixture();
   const controller = new AbortController();
-  const plan = await createRoutedAgentSelection({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 })(order, controller.signal);
+  const plan = await createRoutedAgentSelection({ child: f.child, ...identities, now: () => 2_000 })(order, controller.signal);
   controller.abort();
   await assert.rejects(plan.authorize(), /routed agent launch refused/);
   assert.deepEqual(f.calls, ['claim']);
@@ -148,8 +162,7 @@ for (const status of ['advisory', 'fallback'] as const) {
       assert.deepEqual(request.selected, status === 'advisory' ? second : first);
       return { reservationId: 'lr-one', orderId: 'run', expiresAt: 50_000 };
     };
-    const selected = await createRoutedAgentPrestart({ child: f.child, holder,
-      workflow: 'wf', run: 'run', now: () => 2_000 })(packet);
+    const selected = await createRoutedAgentPrestart({ child: f.child, ...identities, now: () => 2_000 })(packet);
     assert.deepEqual(selected.selected, status === 'advisory' ? second : first);
     assert.deepEqual(f.calls, ['claim', 'assess', 'reserve', 'report', 'order']);
   });
@@ -162,8 +175,7 @@ test('agent assessment refuses an invented preference tuple before reservation',
   f.child.assessLocalModel = async () => { f.calls.push('assess'); return {
     status: 'advisory', reason: 'ok', assessment: assessment('advisory',
       { ...second, id: 'invented' }) }; };
-  await assert.rejects(createRoutedAgentPrestart({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 })(packet), /routed agent launch refused/);
+  await assert.rejects(createRoutedAgentPrestart({ child: f.child, ...identities, now: () => 2_000 })(packet), /routed agent launch refused/);
   assert.deepEqual(f.calls, ['claim', 'assess']);
 });
 
@@ -171,8 +183,7 @@ test('agent launch refuses a lost report acknowledgment and never authorizes fin
   const f = fixture();
   f.child.reportLaunch = async () => { f.calls.push('report'); return { orderId: 'run',
     digest: 'wrong', recordedAt: 2_000, provenance: 'authenticated-worker-report' }; };
-  await assert.rejects(createRoutedAgentPrestart({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 })(order), /routed agent launch refused/);
+  await assert.rejects(createRoutedAgentPrestart({ child: f.child, ...identities, now: () => 2_000 })(order), /routed agent launch refused/);
   assert.deepEqual(f.calls, ['claim', 'reserve', 'report']);
 });
 
@@ -183,7 +194,6 @@ test('agent launch refuses stop during assessment without reserve or report', as
   const controller = new AbortController();
   f.child.assessLocalModel = async () => { f.calls.push('assess'); controller.abort();
     return { status: 'advisory', reason: 'ok', assessment: assessment('advisory', second) }; };
-  await assert.rejects(createRoutedAgentPrestart({ child: f.child, holder,
-    workflow: 'wf', run: 'run', now: () => 2_000 })(packet, controller.signal), /routed agent launch refused/);
+  await assert.rejects(createRoutedAgentPrestart({ child: f.child, ...identities, now: () => 2_000 })(packet, controller.signal), /routed agent launch refused/);
   assert.deepEqual(f.calls, ['claim', 'assess']);
 });
