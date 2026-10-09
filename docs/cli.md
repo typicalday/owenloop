@@ -292,14 +292,15 @@ with that diagnostic instead of treating a Unix-domain socket path as usable.
 
 **Routed worker development boundary (operators).** `OWENLOOP_ROUTING_SESSION=1`
 is an opt-in server and worker infrastructure setting. Ordinary workflow users
-need no Jev installation, credentials, or model selection. The current source
-still refuses routed child startup; this is not a deployed launch capability.
+need no Jev installation, credentials, or model selection. Routed child startup
+is implemented behind the opt-in Shift session and a one-use handoff. It remains
+a development capability pending end-to-end qualification and deployment.
 Its private Shift broker restricts a child to one bound dispatch and an
 allowlisted set of Hub requests while Shift retains the account credential.
 Shift may prepare a provisional, signed definition snapshot in a private
-operator state subdirectory. A future routed role must check the fresh full
-order's workdir and current operator trust before using that snapshot; the
-current routed role startup fence remains in force. Snapshot validation, Unix
+operator state subdirectory. Routed roles recheck the fresh full order, workdir
+and current operator trust before command or provider use; a failed check
+refuses startup. Snapshot validation, Unix
 directory permissions, and the broker protocol do not isolate processes under
 the same user ID; hostile child code needs a separate OS isolation design.
 Activated snapshots survive every role exit, including status `0`, because a
