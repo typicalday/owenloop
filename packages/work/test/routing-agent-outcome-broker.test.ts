@@ -207,14 +207,18 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
       // Parent freeze flips before the first await, so revocation happens
       // while its in-flight effect drain is still pending.
       const frozen = grant.quiesce();
-      const outcome = assert.rejects(client.agentOutcome({ group: {
-	scope: 'original-posix-group', state: 'empty' } }), /routing broker unavailable/);
+      const outcome = client.agentOutcome({ group: {
+	scope: 'original-posix-group', state: 'empty' } }).then(
+	value => ({ kind: 'ok' as const, value }),
+	error => ({ kind: 'error' as const, error }));
       await sleep(25);
       currentIdentity = undefined;
       resolveApproval();
       await approval;
       assert.equal((await frozen).effects, 'uncertain');
-      await outcome;
+      const observed = await outcome;
+      assert.equal(observed.kind, 'ok', 'the paused read crossed the quiesce await');
+      if (observed.kind === 'ok') assert.equal(observed.value.claim, 'uncertain');
       assert.equal(releases, 0);
       return;
     }
