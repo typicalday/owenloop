@@ -1225,7 +1225,9 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	routedLiveV2Read: incarnation.readRecordedV2,
 	routedV2PairRead: incarnation.readRoutedPairV2,
 	routedLiveV2PairRead: incarnation.readRecordedPairV2,
-	readInvocationBinding: incarnation.readInvocationBinding } : undefined;
+	readInvocationBinding: incarnation.readInvocationBinding,
+	readConcreteCallStructure: incarnation.readConcreteCallStructure,
+	readConcreteCallBinding: incarnation.readConcreteCallBinding } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: (reservation, broker, definitionStage) => {
@@ -1323,6 +1325,8 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
     readRoutedPairV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2PairRead'];
     readRecordedPairV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedLiveV2PairRead'];
     readInvocationBinding: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readInvocationBinding'];
+    readConcreteCallStructure: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readConcreteCallStructure'];
+    readConcreteCallBinding: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readConcreteCallBinding'];
     stop(): Promise<HubError | undefined>;
   }
 > {
