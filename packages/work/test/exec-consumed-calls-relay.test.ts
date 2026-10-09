@@ -286,11 +286,28 @@ test('selected native concrete child binds the signed relay to that exact workfl
 	receiptDigest: valueDigestHex(receipt), proof }) },
     });
   };
-  const accepted = await makeResolver('wf-change-unit').resolveRoutedCommandDefinition!(packet);
+  // Signed definition preparation is separate from admitting consumed proof.
+  // Both selected occurrences have valid definition bytes; the effect-time
+  // command and hosted gates must compare the proof's native producer ID.
+  for (const nativeWorkflow of ['wf-change-unit', 'wf-other-native']) {
+    const definition = await makeResolver(nativeWorkflow).resolveRoutedCommandDefinition!(packet);
+    assert.equal(definition.ok, true, JSON.stringify(definition));
+  }
+  const accepted = await makeResolver('wf-change-unit').resolveCommand(packet);
   assert.equal(accepted.ok, true, JSON.stringify(accepted));
-  const otherNative = await makeResolver('wf-other-native').resolveRoutedCommandDefinition!(packet);
+  const otherNative = await makeResolver('wf-other-native').resolveCommand(packet);
   assert.equal(otherNative.ok, false, 'a same-definition proof from another native child must refuse');
   if (!otherNative.ok) assert.equal(otherNative.kind, 'unverified-consumed');
+  for (const nativeWorkflow of ['wf-change-unit', 'wf-other-native']) {
+    const hosted = await makeResolver(nativeWorkflow).resolveHostedStep!(packet);
+    assert.equal(hosted.ok, true, JSON.stringify(hosted));
+    if (!hosted.ok) continue;
+    assert.equal(hosted.callsProducers.u1?.childWorkflow, nativeWorkflow);
+    const consumed = await verifierFor(fixtureData, 'enforce')(packet, {
+      hardRule: true, callsProducers: hosted.callsProducers,
+    });
+    assert.equal(consumed.ok, nativeWorkflow === 'wf-change-unit', JSON.stringify(consumed));
+  }
 });
 
 const NO_RELAY_REASON = /\(calls\) .* artifact 'u1': artifact 'u1' is produced by calls: step 'unit1' \(dep\/change-unit@1\.0\.0\), so only a relayed child proof can prove it, but the order carries no consumesProofRelay entry for it/;
