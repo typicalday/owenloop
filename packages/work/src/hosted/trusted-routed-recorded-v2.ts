@@ -98,6 +98,9 @@ export function parseRoutedServiceRecordedPairV2(raw: unknown,
   if (!wire || wire.protocol !== 'routed-recorded-input-pair-v2' || wire.phase !== 'recorded-live'
     || !keys(wire, ['protocol', 'phase', 'reference', 'claim']))
     throw new Error('routed recorded pair envelope refused');
+  if (Buffer.byteLength(JSON.stringify(wire.reference)) > 2_000_000
+    || Buffer.byteLength(JSON.stringify(wire.claim)) > 2_000_000)
+    throw new Error('routed recorded pair member exceeds bounds');
   const reference = parseRecordedReferenceV2(wire.reference, expected);
   if (reference.state !== 'available') {
     const skipped = record(wire.claim);

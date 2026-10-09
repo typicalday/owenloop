@@ -1421,12 +1421,12 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 				getToken: opts.getToken, expected, beforeRequest: opts.beforeRequest,
 				onRateLimit: opts.onRateLimit,
 				getSession: async () => {
-					if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+					if (renewalDenied || !authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
 						|| now() >= authority.expiresAt) throw new Error('routed pair session changed');
 					return authority.credential;
 				} });
 			const pair = await reader.read();
-			if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+			if (renewalDenied || !authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
 				|| now() >= authority.expiresAt) throw new Error('routed pair session changed');
       return pair;
     },
@@ -1452,12 +1452,12 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 				getToken: opts.getToken, expected, beforeRequest: opts.beforeRequest,
 				onRateLimit: opts.onRateLimit,
 				getSession: async () => {
-					if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+					if (renewalDenied || !authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
 						|| now() >= authority.expiresAt) throw new Error('routed recorded pair session changed');
 					return authority.credential;
 				} });
 			const pair = await reader.read();
-			if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+			if (renewalDenied || !authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
 				|| now() >= authority.expiresAt) throw new Error('routed recorded pair session changed');
       return pair;
     },

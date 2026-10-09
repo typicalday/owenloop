@@ -80,6 +80,12 @@ test('combined recorded parser binds both occurrence members and refuses skipped
   assert.throws(() => parseRoutedServiceRecordedPairV2({ ...composite,
     reference: { protocol: 'trusted-routed-recorded-reference-read-v2', state: 'unavailable', ...expected },
     claim: { state: 'skipped' } }, expected), /reference unavailable/);
+  const near = structuredClone(composite);
+  const reference = near.reference as Extract<RecordedReferenceV2, { state: 'available' }>;
+  const baseBytes = Buffer.byteLength(JSON.stringify(reference));
+  (reference.order as OrderPacket).spec = { pad: 'x'.repeat(2_000_000 - baseBytes) };
+  assert.ok(Buffer.byteLength(JSON.stringify(reference)) > 2_000_000);
+  assert.throws(() => parseRoutedServiceRecordedPairV2(near, expected), /member exceeds bounds/);
 });
 
 test('broker observation refuses a mixed recorded binding or routing sidecar', async () => {
