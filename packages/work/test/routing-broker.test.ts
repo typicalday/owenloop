@@ -16,7 +16,7 @@ import { parseRoutedReferenceV2, type RoutedClaimV2,
   type RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
 import { openRoutedFileSource } from '../src/hub/routed-file-source.ts';
 import type { DecisionBindingV1, OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
-import { createRoutingBroker } from '../src/shift/routing-broker.ts';
+import { advanceRoutingDiagnosticCounter, createRoutingBroker } from '../src/shift/routing-broker.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import type { ChildReservation } from '../src/shift/state.ts';
 
@@ -457,6 +457,7 @@ test('child transport keeps lifecycle bound to one live session after launch win
     await assert.rejects(client.heartbeat({ workflow: 'wf', run: 'run',
       holder: { ...holder, id: 'different-child' } }), /routing broker unavailable/);
     assert.deepEqual(calls.map(call => call.verb), ['get_order']);
+    assert.equal(grant.diagnosticsSnapshot().roleSubmitsAccepted, 0, 'rejected target is not admitted');
     now = 75_000; // Original preference ended at 70_000; live lease continues.
     assert.equal((await client.heartbeat({ workflow: 'wf', run: 'run', holder })).text, 'ok');
     const receipt = { text: 'x'.repeat(128 * 1024) };
@@ -476,6 +477,8 @@ test('child transport keeps lifecycle bound to one live session after launch win
       assert.equal(call.body.workflow, 'wf');
       assert.equal(call.body.run, 'run');
     }
+    assert.equal(grant.diagnosticsSnapshot().roleSubmitsAccepted, 1);
+    assert.equal(grant.diagnosticsSnapshot().releaseDispatched, 1);
     await grant.terminal();
     await assert.rejects(client.heartbeat({ workflow: 'wf', run: 'run', holder }), /routing broker unavailable/);
     current = { ...identity, sessionId: 'rs_changed' };
@@ -1251,6 +1254,16 @@ test('uncertain singleton retry preserves exact parent signature and refuses cha
 	'pending original generation does not grant a second write');
       assert.equal(writes.length, canReplay ? 2 : 1);
       if (canReplay) assert.equal(writes[0], writes[1], 'signature, target and value bytes identical');
+      const observed = grant.diagnosticsSnapshot();
+      assert.equal(observed.roleSubmitsAccepted, 3,
+	'all three bound submits pass method guards; changed intent is refused later');
+      assert.equal(observed.pendingSubmitReceiptReads, 1,
+	'only the identical second admitted intent reads the pending receipt');
+      assert.equal(observed.initialConditionalMutationsDispatched, 1);
+      assert.equal(observed.retryIssuesDispatched, retryIssues);
+      assert.equal(observed.replayConditionalMutationsDispatched, canReplay ? 1 : 0);
+      assert.equal(observed.agentOutcomeReceiptReads, 0);
+      assert.equal(observed.terminalReceiptReads, 0);
     } finally {
       if (canReplay) await broker.close();
       else await assert.rejects(broker.close(), /quarantined/);
@@ -1301,6 +1314,14 @@ test('natural child exit after a lost terminal submit ACK keeps exact receipt-on
     assert.equal(routes.filter(route => route === 'routing_submit_conditional/v1').length, 1);
     assert.ok(routes.includes('routing_submit_conditional_receipt/v1'));
     assert.equal(routes.includes('routing_submit_conditional_receipt_revoke/v1'), false);
+    const observed = grant.diagnosticsSnapshot();
+    assert.equal(observed.roleSubmitsAccepted, 1, 'terminal cap cannot admit a second submit');
+    assert.equal(observed.terminalReceiptReads,
+      routes.filter(route => route === 'routing_submit_conditional_receipt/v1').length);
+    assert.ok(observed.terminalReceiptReads > 0);
+    assert.equal(observed.pendingSubmitReceiptReads, 0);
+    assert.equal(observed.agentOutcomeReceiptReads, 0);
+    assert.equal(observed.agentOutcomeRecoveredClosedSubmits, 0);
   } finally { await broker.close().catch(() => {}); }
 });
 
@@ -1936,4 +1957,107 @@ test('coherent final launch observation stays after selection and refuses drift 
       assert.equal(observes, drift === 'input' || drift === 'order' ? 1 : 0);
     } finally { await broker.close(); }
   }
+});
+
+
+test('internal diagnostic arithmetic saturates and marks malformed evidence', () => {
+  assert.deepEqual(advanceRoutingDiagnosticCounter(65_534),
+    { value: 65_535, overflow: false, incomplete: false });
+  assert.deepEqual(advanceRoutingDiagnosticCounter(65_535),
+    { value: 65_535, overflow: true, incomplete: false });
+  assert.deepEqual(advanceRoutingDiagnosticCounter(Number.NaN),
+    { value: 0, overflow: false, incomplete: true });
+});
+
+test('parent diagnostic snapshots are immutable, isolated and unavailable to children', async () => {
+  let contacts = 0;
+  const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async () => { contacts++; throw new Error('no Hub request expected'); }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    const first = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub });
+    const second = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub });
+    const initial = first.diagnosticsSnapshot();
+    assert.deepEqual(Object.keys(initial).sort(), [
+      'protocol', 'holderSubmitsAccepted', 'roleSubmitsAccepted', 'pendingSubmitReceiptReads',
+      'retryIssuesDispatched', 'initialConditionalMutationsDispatched', 'replayConditionalMutationsDispatched',
+      'quiesceAccepted', 'agentOutcomeAccepted', 'agentOutcomeRecoveryEntries', 'agentOutcomeReceiptReads',
+      'agentOutcomeCommittedClosedReceipts', 'agentOutcomeRecoveredClosedSubmits', 'agentOutcomeClosedReturns',
+      'agentOutcomeHeldReturns', 'agentOutcomeUncertainReturns', 'agentFinishAccepted', 'releaseDispatched',
+      'terminalReceiptReads', 'overflow', 'incomplete',
+    ].sort());
+    assert.equal(Object.isFrozen(initial), true);
+    assert.equal(Reflect.set(initial, 'roleSubmitsAccepted', 9), false);
+    assert.notEqual(initial, first.diagnosticsSnapshot());
+    assert.equal(initial.protocol, 'routing-broker-diagnostics-v1');
+    assert.ok(Object.entries(initial).every(([key, value]) => key === 'protocol'
+      || typeof value === 'boolean' || Number.isSafeInteger(value)));
+    assert.equal((await request(first.socketPath, { cap: first.cap, method: 'quiesce', body: {} })).ok, false);
+    first.activate(child);
+    assert.equal((await request(first.socketPath, { cap: first.cap,
+      method: 'diagnostics_snapshot', body: {} })).ok, false);
+    assert.equal((await request(first.socketPath, { cap: first.cap,
+      method: 'quiesce', body: { extra: true } })).ok, false);
+    assert.deepEqual(first.diagnosticsSnapshot(), initial, 'refused packets do not enter accepted methods');
+    assert.equal((await request(first.socketPath, { cap: first.cap, method: 'quiesce', body: {} })).ok, true);
+    assert.equal(first.diagnosticsSnapshot().quiesceAccepted, 1);
+    assert.equal(initial.quiesceAccepted, 0, 'old snapshot does not change');
+    assert.equal(second.diagnosticsSnapshot().quiesceAccepted, 0, 'another grant is isolated');
+    await second.quiesce();
+    assert.equal(second.diagnosticsSnapshot().quiesceAccepted, 0, 'parent freeze is not a child invocation');
+    first.terminal();
+    await broker.close();
+    assert.equal(first.diagnosticsSnapshot().quiesceAccepted, 1, 'parent observation survives cleanup');
+    assert.equal(contacts, 0);
+  } finally { await broker.close(); }
+});
+
+test('reading parent diagnostics does not change broker responses or Hub effects', async () => {
+  const outcomes: Array<{ replies: unknown[]; effects: Array<{ route: string; body: unknown }> }> = [];
+  for (const sample of [false, true]) {
+    const effects: Array<{ route: string; body: unknown }> = [];
+    const hub = createHubClient({ origin, getToken: async () => 'enrolled',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async (url, init) => {
+	const route = String(url).split('/api/')[1]!;
+	effects.push({ route, body: JSON.parse(String(init!.body)) });
+	if (route === 'get_order') return Response.json(parentOrder());
+	if (route === 'routing_submit_conditional/v1') return Response.json({ text: 'ok',
+	  outcome: 'submitted', closed: true, conditionApplied: 'routed-conditional-receipt-v1' });
+	if (route === 'release') return Response.json({ text: 'ok', released: true });
+	if (route === 'routing_submit_conditional_receipt_revoke/v1') return Response.json({ revoked: true });
+	throw new Error('unexpected request');
+      }) as typeof fetch });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+	submissionAuthority: transportAuthority });
+      grant.activate(child);
+      const send = async (method: string, body: unknown) => {
+	if (sample) grant.diagnosticsSnapshot();
+	const reply = await request(grant.socketPath, { cap: grant.cap, method, body });
+	if (sample) grant.diagnosticsSnapshot();
+	return reply;
+      };
+      const firstReply = await send('get_order', { holder });
+      const extraBody = await send('submit', { path: 'out', value: { ok: true }, holder, proof: 'child-proof' });
+      const wrongHolder = await send('submit', { path: 'out', value: { ok: true },
+	holder: { ...holder, id: 'other-child' } });
+      assert.equal(extraBody.ok, false);
+      assert.equal(wrongHolder.ok, false);
+      assert.equal(grant.diagnosticsSnapshot().roleSubmitsAccepted, 0);
+      const replies = [firstReply, extraBody, wrongHolder,
+	await send('submit', { path: 'out', value: { ok: true }, holder }),
+	await send('release', { reason: 'finished' })];
+      await broker.close();
+      const observed = grant.diagnosticsSnapshot();
+      assert.equal(observed.roleSubmitsAccepted, 1);
+      assert.equal(observed.initialConditionalMutationsDispatched, 1);
+      assert.equal(observed.releaseDispatched, 1);
+      assert.equal(observed.agentOutcomeAccepted, 0);
+      outcomes.push({ replies, effects });
+    } finally { await broker.close(); }
+  }
+  assert.deepEqual(outcomes[0], outcomes[1]);
 });

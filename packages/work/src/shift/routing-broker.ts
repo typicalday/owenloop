@@ -49,6 +49,41 @@ const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_SOCKETS = 16;
 const QUIESCE_DRAIN_MS = 10_000;
 const CAP = /^[a-f0-9]{64}$/;
+// Observation only: neither these counters nor their flags authorize a request.
+const DIAGNOSTIC_LIMIT = 65_535;
+/** @internal Pure arithmetic seam; cannot read or mutate a broker grant. */
+export function advanceRoutingDiagnosticCounter(value: number): {
+  value: number; overflow: boolean; incomplete: boolean;
+} {
+  if (!Number.isSafeInteger(value) || value < 0 || value > DIAGNOSTIC_LIMIT)
+    return { value: 0, overflow: false, incomplete: true };
+  return value === DIAGNOSTIC_LIMIT
+    ? { value, overflow: true, incomplete: false }
+    : { value: value + 1, overflow: false, incomplete: false };
+}
+function newDiagnostics() {
+  return {
+    protocol: 'routing-broker-diagnostics-v1' as const,
+    holderSubmitsAccepted: 0, roleSubmitsAccepted: 0,
+    pendingSubmitReceiptReads: 0, retryIssuesDispatched: 0,
+    initialConditionalMutationsDispatched: 0, replayConditionalMutationsDispatched: 0,
+    quiesceAccepted: 0, agentOutcomeAccepted: 0, agentOutcomeRecoveryEntries: 0,
+    agentOutcomeReceiptReads: 0, agentOutcomeCommittedClosedReceipts: 0,
+    agentOutcomeRecoveredClosedSubmits: 0, agentOutcomeClosedReturns: 0,
+    agentOutcomeHeldReturns: 0, agentOutcomeUncertainReturns: 0,
+    agentFinishAccepted: 0, releaseDispatched: 0, terminalReceiptReads: 0,
+    overflow: false, incomplete: false,
+  };
+}
+export type RoutingBrokerDiagnostics = Readonly<ReturnType<typeof newDiagnostics>>;
+type DiagnosticCounter = Exclude<keyof RoutingBrokerDiagnostics, 'protocol' | 'overflow' | 'incomplete'>;
+function countDiagnostic(grant: Grant, key: DiagnosticCounter): void {
+  const next = advanceRoutingDiagnosticCounter(grant.diagnostics[key]);
+  grant.diagnostics[key] = next.value;
+  grant.diagnostics.overflow ||= next.overflow;
+  grant.diagnostics.incomplete ||= next.incomplete;
+}
+
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
   | 'read_routed_reference_v2' | 'read_routing_claim_v2' | 'read_routed_pair_v2'
@@ -59,6 +94,7 @@ type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_
 type CapScope = 'role' | 'holder';
 export type RoutedQuiesceResult = { quiescing: true; effects: 'settled' | 'uncertain' };
 interface Grant {
+  diagnostics: ReturnType<typeof newDiagnostics>;
   active: boolean;
   ready: boolean;
   liveChild?: { custody: RetainedChildCustody; pid: number; spawnedAt: number;
@@ -154,6 +190,8 @@ export interface RoutingBroker {
     inputAuthority?: RoutedInputAuthority;
     commandFor?: Grant['commandFor'] }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
+      /** Parent-only observation; never an authority witness or child method. */
+      diagnosticsSnapshot(): RoutingBrokerDiagnostics;
       activate(record: ChildRecord): void;
       bindChild(record: ChildRecord, custody: RetainedChildCustody,
 	handoff: { incarnation: string; nonce: string }): void;
@@ -552,6 +590,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       const reference = { workflow: pending.request.workflow, run: pending.request.run,
 	intentId: pending.intentId, requestDigest: pending.requestDigest,
 	holder: pending.request.holder as import('../hub/types.ts').RoutedCollectionHolder };
+      countDiagnostic(grant, 'pendingSubmitReceiptReads');
       const observed = await checked(grant, grant.hub.routingConditionalReceipt(reference, signal), now);
       if (observed.state === 'committed') {
 	const response = observed.result;
@@ -565,6 +604,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
 	throw new Error('routing submission outcome unresolved');
       // Only Service can terminalize the old generation. Its issued token
       // permits the identical frozen bytes once under the original live claim.
+      countDiagnostic(grant, 'retryIssuesDispatched');
       const issued = await checked(grant, grant.hub.routingConditionalRetryIssue(reference, signal), now);
       if (!issued || issued.requestDigest !== pending.requestDigest
 	|| !Number.isSafeInteger(issued.generation) || issued.generation < 1
@@ -575,9 +615,12 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
 	|| authority.canReplay?.(fresh.order!, path) !== true)
 	throw new Error('routing submission retry order changed');
       pending.generationToken = issued.generationToken;
-      const replay = await checked(grant, startEffect(grant, () => grant.hub.routingConditionalMutation({
+      const replay = await checked(grant, startEffect(grant, () => {
+	countDiagnostic(grant, 'replayConditionalMutationsDispatched');
+	return grant.hub.routingConditionalMutation({
 	intentId: pending.intentId, rawBody: pending.rawBody,
-	generationToken: pending.generationToken }, signal)), now);
+	generationToken: pending.generationToken }, signal);
+      }), now);
       if (!validConditionalReceiptResponse(replay))
 	throw new Error('routing submission retry response refused');
 	if (!parentPostrun || replay.outcome === 'green' || replay.outcome === 'submitted'
@@ -610,8 +653,11 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
     let response: import('../hub/types.ts').RoutedConditionalMutationResponse;
     try {
       response = await checked(grant,
-	startEffect(grant, () => grant.hub.routingConditionalMutation({
-	  intentId: grant.pendingSubmit!.intentId, rawBody: grant.pendingSubmit!.rawBody }, signal)), now);
+	startEffect(grant, () => {
+	  countDiagnostic(grant, 'initialConditionalMutationsDispatched');
+	  return grant.hub.routingConditionalMutation({
+	    intentId: grant.pendingSubmit!.intentId, rawBody: grant.pendingSubmit!.rawBody }, signal);
+	}), now);
       if (!validConditionalReceiptResponse(response))
 	throw new Error('routing broker response refused');
     } catch (error) {
@@ -619,7 +665,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       // Worker. Recover only an exact committed result through Service's
       // original-session receipt read while this direct role child is live.
       if (!parentPostrun || !effectContext.getStore()?.dispatched) throw error;
-      response = await readDispatchedConditionalAck(grant, now, signal);
+      response = await readDispatchedConditionalAck(grant, now, signal, 'command-postrun');
     }
     // A missing/malformed/failed acknowledgement preserves the one exact
     // request, including its signature. It cannot become a new signed write.
@@ -696,7 +742,7 @@ function validConditionalReceiptResponse(value: unknown): value is import('../hu
  * Read only the one frozen request's receipt while its original role child and
  * session remain live. This path never issues a retry generation or write. */
 async function readDispatchedConditionalAck(grant: Grant, now: () => number,
-  signal: AbortSignal): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {
+  signal: AbortSignal, diagnosticOrigin: 'command-postrun' | 'agent-outcome'): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {
   const pending = grant.pendingSubmit;
   const commandPostrun = grant.postrun;
   const agentSolePending = grant.reservation.childKind === 'agent-run'
@@ -726,12 +772,18 @@ async function readDispatchedConditionalAck(grant: Grant, now: () => number,
     const readSignal = AbortSignal.any([signal,
       AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(10_000, remaining))))]);
     try {
+      if (diagnosticOrigin === 'agent-outcome' && agentSolePending && !commandPostrun)
+	countDiagnostic(grant, 'agentOutcomeReceiptReads');
       const observed = await checked(grant,
 	grant.hub.routingConditionalReceipt(query, readSignal), now);
       if (!stillOwned()) break;
       if (!observed || typeof observed !== 'object') break;
       if (observed.state === 'committed') {
 	if (!validConditionalReceiptResponse(observed.result)) break;
+	if (diagnosticOrigin === 'agent-outcome' && agentSolePending && !commandPostrun
+	  && observed.result.closed === true
+	  && ['green', 'submitted', 'approved'].includes(observed.result.outcome))
+	  countDiagnostic(grant, 'agentOutcomeCommittedClosedReceipts');
 	return observed.result;
       }
       if (observed.state !== 'pending') break;
@@ -751,7 +803,9 @@ async function readDispatchedConditionalAck(grant: Grant, now: () => number,
 async function conditionalReconcile(grant: Grant, now: () => number,
   signal: AbortSignal): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {
   if (!collectionReceiptOnly(grant, now)) throw new Error('routing submission receipt unavailable');
-  const result = await grant.hub.routingConditionalReceipt(conditionalReceiptRequest(grant), signal);
+  const request = conditionalReceiptRequest(grant);
+  countDiagnostic(grant, 'terminalReceiptReads');
+  const result = await grant.hub.routingConditionalReceipt(request, signal);
   if (!collectionReceiptOnly(grant, now) || result.state !== 'committed'
     || !validConditionalReceiptResponse(result.result))
     throw new Error('routing submission outcome unresolved');
@@ -1138,9 +1192,11 @@ async function commandFinish(grant: Grant, body: unknown, now: () => number,
   grant.postrunRelease = { reason, dispatched: true };
   const context = { dispatched: false, parentPostrun: true };
   try {
-    const response = await effectContext.run(context, () => startEffect(grant, () =>
-      grant.hub.routingRelease({ workflow: grant.reservation.workflow,
-        run: grant.reservation.run, reason }, signal)));
+    const response = await effectContext.run(context, () => startEffect(grant, () => {
+      countDiagnostic(grant, 'releaseDispatched');
+      return grant.hub.routingRelease({ workflow: grant.reservation.workflow,
+	run: grant.reservation.run, reason }, signal);
+    }));
     if (!response || response.released !== true)
       throw new Error('routing command release outcome unresolved');
     grant.postrunRelease.response = response;
@@ -1162,38 +1218,65 @@ async function agentOutcome(grant: Grant, body: unknown, now: () => number,
   if (!groupEmpty || grant.reservation.childKind !== 'agent-run' || !grant.quiescing
     || !grant.quiesceResult || !grant.acceptedLaunchReport || !grant.launchReservationId
     || signal.aborted || !liveChildValid(grant, now())) throw new Error('routing agent outcome unavailable');
+  countDiagnostic(grant, 'agentOutcomeAccepted');
   await grant.quiesceResult;
-  if (signal.aborted || !liveChildValid(grant, now())) return { claim: 'uncertain' };
-  if (grant.inFlightEffects.size > 0) return { claim: 'uncertain' };
+  if (signal.aborted || !liveChildValid(grant, now())) {
+    countDiagnostic(grant, 'agentOutcomeUncertainReturns');
+    return { claim: 'uncertain' };
+  }
+  if (grant.inFlightEffects.size > 0) {
+    countDiagnostic(grant, 'agentOutcomeUncertainReturns');
+    return { claim: 'uncertain' };
+  }
   if (grant.pendingSubmit && grant.uncertainEffects.size === 1
     && grant.uncertainEffects.has('submit')) {
     try {
-      const response = await readDispatchedConditionalAck(grant, now, signal);
-      if (!liveChildValid(grant, now())) return { claim: 'uncertain' };
+      countDiagnostic(grant, 'agentOutcomeRecoveryEntries');
+      const response = await readDispatchedConditionalAck(grant, now, signal, 'agent-outcome');
+      if (!liveChildValid(grant, now())) {
+	countDiagnostic(grant, 'agentOutcomeUncertainReturns');
+	return { claim: 'uncertain' };
+      }
       const [effectId, effect] = [...grant.effectLedger.entries()][0] ?? [];
       if (effectId === undefined || effect?.method !== 'submit'
-	|| effect.requestDigest !== grant.pendingSubmit?.requestDigest)
+	|| effect.requestDigest !== grant.pendingSubmit?.requestDigest) {
+	countDiagnostic(grant, 'agentOutcomeUncertainReturns');
 	return { claim: 'uncertain' };
+      }
+      if (response.closed === true && ['green', 'submitted', 'approved'].includes(response.outcome))
+	countDiagnostic(grant, 'agentOutcomeRecoveredClosedSubmits');
       recordAgentAck(grant, 'submit', response.closed === true);
       grant.pendingSubmit = undefined;
       grant.effectLedger.delete(effectId);
       grant.uncertainEffects.delete('submit'); grant.syncUncertainty?.();
-    } catch { return { claim: 'uncertain' }; }
+    } catch {
+      countDiagnostic(grant, 'agentOutcomeUncertainReturns');
+      return { claim: 'uncertain' };
+    }
   }
   if (grant.pendingSubmit || grant.uncertainEffects.size > 0
-    || grant.effectLedgerOverflow || grant.effectLedger.size > 0 || grant.agentAckOverflow)
+    || grant.effectLedgerOverflow || grant.effectLedger.size > 0 || grant.agentAckOverflow) {
+    countDiagnostic(grant, 'agentOutcomeUncertainReturns');
     return { claim: 'uncertain' };
+  }
   if (grant.agentAcks.some(ack => ack.closed)) {
     grant.agentOutcome = 'closed';
+    countDiagnostic(grant, 'agentOutcomeClosedReturns');
     return { claim: 'closed' };
   }
   try {
     const current = await verifyCurrentConsequence(grant, 'role', now, signal);
-    if (!current?.lease.claimed || !current.order || !liveChildValid(grant, now()))
+    if (!current?.lease.claimed || !current.order || !liveChildValid(grant, now())) {
+      countDiagnostic(grant, 'agentOutcomeUncertainReturns');
       return { claim: 'uncertain' };
+    }
     grant.agentOutcome = 'held';
+    countDiagnostic(grant, 'agentOutcomeHeldReturns');
     return { claim: 'held' };
-  } catch { return { claim: 'uncertain' }; }
+  } catch {
+    countDiagnostic(grant, 'agentOutcomeUncertainReturns');
+    return { claim: 'uncertain' };
+  }
 }
 
 /** Release is a separate, one-use parent operation. A closed ACK needs no
@@ -1207,6 +1290,7 @@ async function agentFinish(grant: Grant, body: unknown, now: () => number,
     || !grant.quiescing || !grant.quiesceResult || signal.aborted || !liveChildValid(grant, now())
     || groupEmpty && !grant.acceptedLaunchReport)
     throw new Error('routing agent finish unavailable');
+  countDiagnostic(grant, 'agentFinishAccepted');
   await grant.quiesceResult;
   if (signal.aborted || !liveChildValid(grant, now())) return { state: 'uncertain' };
   if (grant.inFlightEffects.size || grant.uncertainEffects.size || grant.pendingSubmit)
@@ -1240,9 +1324,11 @@ async function agentFinish(grant: Grant, body: unknown, now: () => number,
   try {
     if (signal.aborted || !liveChildValid(grant, now()))
       throw new Error('routing agent release revoked');
-    const response = await effectContext.run(context, () => startEffect(grant, () =>
-      grant.hub.routingRelease({ workflow: grant.reservation.workflow,
-	run: grant.reservation.run, reason: 'routed-agent-finished' }, signal)));
+    const response = await effectContext.run(context, () => startEffect(grant, () => {
+      countDiagnostic(grant, 'releaseDispatched');
+      return grant.hub.routingRelease({ workflow: grant.reservation.workflow,
+	run: grant.reservation.run, reason: 'routed-agent-finished' }, signal);
+    }));
     if (!response || response.released !== true || signal.aborted
       || !liveChildValid(grant, now()))
       throw new Error('routing agent release outcome unresolved');
@@ -1259,6 +1345,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
   if (method === 'quiesce') {
     if (scope !== 'role' || !exactKeys(body, []) || !grant.ready
       || !validateSessionGrant(grant, now())) throw new Error('routing broker request refused');
+    countDiagnostic(grant, 'quiesceAccepted');
     return quiesceGrant(grant);
   }
   if (method === 'command_postrun') {
@@ -1549,6 +1636,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| !validHolder(grant, scope, body.holder)
 	|| (body.done !== undefined && typeof body.done !== 'boolean'))
 	throw new Error('routing broker request refused');
+      countDiagnostic(grant, scope === 'holder' ? 'holderSubmitsAccepted' : 'roleSubmitsAccepted');
       const response = await submitFromParent(grant, body, now, signal) as
 	import('../hub/types.ts').RoutedConditionalMutationResponse;
       if (grant.reservation.childKind === 'agent-run') {
@@ -1564,8 +1652,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	throw new Error('routing broker request refused');
       {
 	const reason = body.reason as string | undefined;
-	const response = await checked(grant, startEffect(grant, () => grant.hub.routingRelease({ workflow, run,
-	  ...(reason === undefined ? {} : { reason }) }, signal)), now);
+	const response = await checked(grant, startEffect(grant, () => {
+	  countDiagnostic(grant, 'releaseDispatched');
+	  return grant.hub.routingRelease({ workflow, run,
+	    ...(reason === undefined ? {} : { reason }) }, signal);
+	}), now);
 	if (!response || typeof response.released !== 'boolean') throw new Error('routing broker response refused');
 	return response;
       }
@@ -1934,7 +2025,7 @@ export async function createRoutingBroker(args: { now?: () => number;
     issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, routedLiveV2Read,
       submissionAuthority, launchAuthority, inputAuthority, commandFor }) {
       if (closed) throw new Error('routing broker closed');
-      const grant: Grant = { active: true, ready: false, quiescing: false,
+      const grant: Grant = { diagnostics: newDiagnostics(), active: true, ready: false, quiescing: false,
 	agentAcks: [], agentAckOverflow: false,
 	effectLedger: new Map(), nextEffectId: 0, effectLedgerOverflow: false,
 	inFlightEffects: new Set(), uncertainEffects: new Set(), uploadControllers: new Set(),
@@ -2062,7 +2153,9 @@ export async function createRoutingBroker(args: { now?: () => number;
 	return grant.revokeResult;
       };
       terminators.set(grant, terminate);
-      return { socketPath, cap, ...(holderCap ? { holder: { socketPath, cap: holderCap } } : {}), activate(record) {
+      return { socketPath, cap, ...(holderCap ? { holder: { socketPath, cap: holderCap } } : {}),
+	diagnosticsSnapshot: () => Object.freeze({ ...grant.diagnostics }),
+	activate(record) {
 	  if (closed || grant.ready || !validateLaunchGrant(grant, now()) || record.workflow !== reservation.workflow
 	    || record.run !== reservation.run || record.gateToken !== reservation.token
 	    || (record.kind ?? 'exec') !== reservation.childKind

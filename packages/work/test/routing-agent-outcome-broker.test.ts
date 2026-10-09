@@ -53,7 +53,8 @@ async function waitFor(path: string): Promise<void> {
 
 for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
   'sole-lost-submit', 'mixed-lost-effects', 'release-revoked', 'not-started',
-  'quiesce-session-revoked'] as const) test(
+  'quiesce-session-revoked', 'sole-lost-holder-submit', 'receipt-pending',
+  'receipt-held', 'receipt-unavailable', 'receipt-revoked'] as const) test(
   `retained agent socket binds frozen outcome and targeted release (${scenario})`, async () => {
   const root = mkdtempSync(join(tmpdir(), 'routed-agent-outcome-'));
   const permit = join(root, 'permit'), entered = join(root, 'entered');
@@ -68,6 +69,9 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
     + `process.send({type:'routing-gate-entered',dispatchToken:h.reservation.token,routingHandoff:process.env.OWENLOOP_ROUTING_HANDOFF});\n`
     + `setInterval(()=>{},1000);\n`);
   let closed = false, releases = 0, asks = 0, submits = 0, receipts = 0, reportDigest = '';
+  const lostSubmit = scenario === 'sole-lost-submit' || scenario === 'mixed-lost-effects'
+    || scenario === 'sole-lost-holder-submit' || scenario.startsWith('receipt-');
+  const receiptUncertain = scenario === 'receipt-unavailable' || scenario === 'receipt-revoked';
   let currentIdentity: typeof identity | undefined = identity;
   let releaseStarted!: () => void, resolveRelease!: () => void;
   const startedRelease = new Promise<void>(resolve => { releaseStarted = resolve; });
@@ -95,12 +99,15 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
 	closed = true;
 	return Response.json({ text: 'asked', ok: true, closed: true }); }
       if (route === 'routing_submit_conditional/v1') {
-	submits++; closed = true; throw new Error('lost conditional ACK');
+	submits++; closed = scenario !== 'receipt-held'; throw new Error('lost conditional ACK');
       }
       if (route === 'routing_submit_conditional_receipt/v1') {
 	receipts++;
+	if (scenario === 'receipt-unavailable') return Response.json({ state: 'unavailable' });
+	if (scenario === 'receipt-pending' && receipts === 1) return Response.json({ state: 'pending' });
+	if (scenario === 'receipt-revoked') currentIdentity = undefined;
 	return Response.json({ state: 'committed', result: { text: 'accepted',
-	  outcome: 'submitted', closed: true,
+	  outcome: 'submitted', closed: scenario !== 'receipt-held',
 	  conditionApplied: 'routed-conditional-receipt-v1' } });
       }
       if (route === 'routing_submit_conditional_receipt_revoke/v1')
@@ -143,6 +150,9 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
     submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => true,
       sign: async () => 'proof' },
     launchAuthority: { verifySelection: async () => {} } });
+  const pristineDiagnostics = grant.diagnosticsSnapshot();
+  assert.equal(Object.isFrozen(pristineDiagnostics), true);
+  assert.equal(pristineDiagnostics.agentOutcomeAccepted, 0);
   handoff.broker.cap = grant.cap;
   writeFileSync(handoffPath, JSON.stringify(handoff));
   const client = createRoutingChildClient(handoff);
@@ -190,10 +200,13 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
       assert.equal((await client.agentFinish({ observation: 'not-started' })).state, 'released');
       assert.equal(releases, 1);
       assert.equal(asks + submits + receipts, 0);
+      assert.equal(grant.diagnosticsSnapshot().agentFinishAccepted, 1);
+      assert.equal(grant.diagnosticsSnapshot().releaseDispatched, 1);
       return;
     }
     await assert.rejects(client.agentOutcome({ group: {
       scope: 'original-posix-group', state: 'empty' } }), /routing broker unavailable/);
+    assert.equal(grant.diagnosticsSnapshot().agentOutcomeAccepted, 0, 'guard refusal is not an accepted outcome');
     const holder = { kind: 'exec' as const, id: `${hostname()}:${record.pid}`,
       shiftId: identity.shiftId };
     phase = 'current-order';
@@ -220,6 +233,7 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
       assert.equal(observed.kind, 'ok', 'the paused read crossed the quiesce await');
       if (observed.kind === 'ok') assert.equal(observed.value.claim, 'uncertain');
       assert.equal(releases, 0);
+      assert.equal(grant.diagnosticsSnapshot().agentOutcomeUncertainReturns, 1);
       return;
     }
     if (scenario === 'closed-ask') {
@@ -232,21 +246,46 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
       await assert.rejects(client.ask({ ...target, path: 'out', question: 'Need input?' }),
 	/routing broker unavailable/);
     }
-    if (scenario === 'sole-lost-submit' || scenario === 'mixed-lost-effects') {
+    if (lostSubmit) {
       phase = 'lost-submit';
-      await assert.rejects(client.submit({ ...target, path: 'out', value: { ok: true }, holder }),
+      const submitClient = scenario === 'sole-lost-holder-submit'
+	? createRoutingChildClient({ ...handoff, broker: grant.holder! }) : client;
+      const submitHolder = scenario === 'sole-lost-holder-submit'
+	? { kind: 'session' as const, id: sessionId, shiftId: identity.shiftId } : holder;
+      await assert.rejects(submitClient.submit({ ...target, path: 'out', value: { ok: true }, holder: submitHolder }),
 	/routing broker unavailable/);
       assert.equal(submits, 1);
     }
     phase = 'quiesce';
     assert.deepEqual(await client.quiesce(), { quiescing: true,
-      effects: scenario === 'sole-lost-submit' || scenario === 'mixed-lost-effects'
-	? 'uncertain' : 'settled' });
+      effects: lostSubmit ? 'uncertain' : 'settled' });
     phase = 'outcome';
     assert.equal((await client.agentOutcome({ group: {
       scope: 'original-posix-group', state: 'empty' } })).claim,
-      scenario === 'closed-ask' || scenario === 'sole-lost-submit' ? 'closed'
-	: scenario === 'mixed-lost-effects' ? 'uncertain' : 'held');
+      scenario === 'closed-ask' || lostSubmit && scenario !== 'mixed-lost-effects'
+	&& scenario !== 'receipt-held' && !receiptUncertain ? 'closed'
+	: scenario === 'mixed-lost-effects' || receiptUncertain ? 'uncertain' : 'held');
+    const recovered = grant.diagnosticsSnapshot();
+    assert.equal(recovered.quiesceAccepted, 1);
+    assert.equal(recovered.agentOutcomeAccepted, 1);
+    assert.equal(recovered.pendingSubmitReceiptReads, 0);
+    assert.equal(recovered.terminalReceiptReads, 0);
+    assert.equal(recovered.retryIssuesDispatched + recovered.replayConditionalMutationsDispatched, 0);
+    assert.equal(recovered.initialConditionalMutationsDispatched, lostSubmit ? 1 : 0);
+    assert.equal(recovered.holderSubmitsAccepted, scenario === 'sole-lost-holder-submit' ? 1 : 0);
+    assert.equal(recovered.roleSubmitsAccepted, lostSubmit && scenario !== 'sole-lost-holder-submit' ? 1 : 0);
+    assert.equal(recovered.agentOutcomeRecoveryEntries, lostSubmit && scenario !== 'mixed-lost-effects' ? 1 : 0);
+    assert.equal(recovered.agentOutcomeReceiptReads, receipts);
+    const exactClosedRecovery = lostSubmit && scenario !== 'mixed-lost-effects'
+      && scenario !== 'receipt-held' && !receiptUncertain;
+    assert.equal(recovered.agentOutcomeCommittedClosedReceipts, exactClosedRecovery ? 1 : 0);
+    assert.equal(recovered.agentOutcomeRecoveredClosedSubmits, exactClosedRecovery ? 1 : 0);
+    assert.equal(recovered.agentOutcomeClosedReturns, exactClosedRecovery || scenario === 'closed-ask' ? 1 : 0);
+    assert.equal(recovered.agentOutcomeUncertainReturns, receiptUncertain || scenario === 'mixed-lost-effects' ? 1 : 0);
+    assert.equal(recovered.agentOutcomeHeldReturns, recovered.agentOutcomeClosedReturns + recovered.agentOutcomeUncertainReturns ? 0 : 1);
+    assert.equal(recovered.overflow || recovered.incomplete, false);
+    assert.equal(pristineDiagnostics.agentOutcomeAccepted, 0, 'old immutable snapshot is not a live view');
+    if (receiptUncertain) { assert.equal(releases, 0); return; }
     if (scenario === 'claim-moved') closed = true;
     phase = 'finish';
     const finish = client.agentFinish({ group: {
@@ -257,11 +296,14 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
       resolveRelease();
     }
     assert.equal((await finish).state,
-      scenario === 'closed-ask' || scenario === 'sole-lost-submit' ? 'already-closed'
-	: scenario === 'held-release' ? 'released' : 'uncertain');
-    assert.equal(releases, scenario === 'held-release' || scenario === 'release-revoked' ? 1 : 0);
-    assert.equal(receipts, scenario === 'sole-lost-submit' ? 1 : 0,
+      scenario === 'closed-ask' || exactClosedRecovery ? 'already-closed'
+	: scenario === 'held-release' || scenario === 'receipt-held' ? 'released' : 'uncertain');
+    assert.equal(releases, scenario === 'held-release' || scenario === 'release-revoked' || scenario === 'receipt-held' ? 1 : 0);
+    assert.equal(receipts, exactClosedRecovery || scenario === 'receipt-held' ? scenario === 'receipt-pending' ? 2 : 1 : 0,
       'an unrelated lost holder effect prevents even exact conditional receipt reconciliation');
+    assert.equal(grant.diagnosticsSnapshot().agentFinishAccepted, 1);
+    assert.equal(grant.diagnosticsSnapshot().releaseDispatched, releases);
+    const beforeHolderRefusal = grant.diagnosticsSnapshot();
     const { createConnection } = await import('node:net');
     for (const method of ['agent_outcome', 'agent_finish']) {
       const holderAnswer = await new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -276,13 +318,14 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
       });
       assert.equal(holderAnswer.ok, false, `${method} is role-only`);
     }
+    assert.deepEqual(grant.diagnosticsSnapshot(), beforeHolderRefusal);
   } catch (error) {
     throw new Error(`agent socket phase ${phase}`, { cause: error });
   } finally {
     spawned.cancel?.();
     await Promise.race([exit, sleep(5_000)]);
     if (scenario === 'mixed-lost-effects' || scenario === 'release-revoked'
-      || scenario === 'quiesce-session-revoked')
+      || scenario === 'quiesce-session-revoked' || receiptUncertain)
       await assert.rejects(broker.close(), /routing effect outcome quarantined/);
     else await broker.close();
     rmSync(root, { recursive: true, force: true });

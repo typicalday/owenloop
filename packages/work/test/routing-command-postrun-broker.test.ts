@@ -252,6 +252,8 @@ for (const scenario of ['normal', 'child-ack-lost', 'submit-held', 'drift-after-
       assert.equal((await client.commandFinish({ observation: 'not-started' })).state, 'released');
       assert.equal(requests.filter(row => row.route === 'release').length, 1);
       assert.equal(requests.filter(row => row.route === 'routing_submit_conditional/v1').length, 0);
+      assert.equal(grant.diagnosticsSnapshot().releaseDispatched, 1);
+      assert.equal(grant.diagnosticsSnapshot().agentOutcomeReceiptReads, 0);
       return;
     }
     const result = { exitCode: scenario === 'ask-closed' || scenario === 'ask-lost-ack' ? 1 : 0,
@@ -333,6 +335,8 @@ for (const scenario of ['normal', 'child-ack-lost', 'submit-held', 'drift-after-
       assert.equal(submits, 1, 'an immutable command receipt cannot mint another intent');
       assert.equal(requests.filter(row => row.route === 'routing_submit_conditional_receipt/v1').length, 1);
       assert.equal((await client.commandFinish({ group: packet.group })).state, 'released');
+      assert.equal(grant.diagnosticsSnapshot().releaseDispatched, 1);
+      assert.equal(grant.diagnosticsSnapshot().agentOutcomeReceiptReads, 0);
       return;
     }
     if (scenario === 'born-rejected') {
@@ -353,6 +357,9 @@ for (const scenario of ['normal', 'child-ack-lost', 'submit-held', 'drift-after-
       /routing broker unavailable/);
     assert.equal((await client.commandFinish({ group: packet.group })).state,
       scenario === 'submit-held' ? 'released' : 'already-closed');
+    assert.equal(grant.diagnosticsSnapshot().releaseDispatched, scenario === 'submit-held' ? 1 : 0);
+    assert.equal(grant.diagnosticsSnapshot().agentOutcomeReceiptReads, 0,
+      'command receipt recovery is distinct from agentOutcome');
     assert.equal(signs, scenario === 'ask-closed' || scenario === 'reject-closed' ? 0
       : scenario === 'collection' || scenario === 'collection-lost-seal-ack'
         || scenario === 'multi-output' ? 2 : 1);
