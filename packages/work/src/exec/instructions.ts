@@ -11,8 +11,10 @@ import type { InvocationBindingSource, VerifiedInvocationReceipt } from '../../.
  */
 
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../../src/store/index.ts';
-import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource } from '../../../../src/store/index.ts';
+import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource,
+  VerifiedDefinitionSelection } from '../../../../src/store/index.ts';
 import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
 import { compareStoreText, parseWorkflowCoordinate } from '../../../../src/store/types.ts';
@@ -114,6 +116,9 @@ export interface OriginVerifierInput {
 export type OriginVerifier = (input: OriginVerifierInput) => Promise<OriginVerdict> | OriginVerdict;
 
 export interface StoreInstructionResolverOptions {
+  /** Parent-bound routed identity; absent keeps ordinary digest/step ambiguity. */
+  routedSelection?: { rootWorkflow: string; frameWorkflow: string;
+    definitionName: string; defDigest: string; run: string };
   projectRoot?: string;
   globalRoot: string;
   verifier: BundleIngestor;
@@ -171,6 +176,7 @@ interface ResolvedDefinition {
   step: StepDef;
   bundleDigest: string;
   objectPath: string;
+  callsChild?: VerifiedDefinitionSelection['callsChild'];
 }
 
 type ResolvedDefinitionOrRefusal = ResolvedDefinition | InstructionRefusal;
@@ -217,6 +223,28 @@ export function createStoreInstructionResolver(
       const primed = await source.prime(digest);
       if (primed === 'unknown-digest') {
         return refusal('unknown-digest', order, 'no verified local workflow bundle matches the order digest');
+      }
+      const routed = options.routedSelection;
+      if (routed !== undefined) {
+	const claim = order.routing?.claim;
+	const binding = claim?.binding;
+	if (digest !== routed.defDigest || order.run !== routed.run
+	  || order.workflow !== routed.frameWorkflow || !binding
+	  || binding.runId !== routed.rootWorkflow || binding.frameId !== routed.frameWorkflow
+	  || binding.def.workflowName !== routed.definitionName
+	  || binding.def.bundleDigest !== `sha256:${routed.defDigest}`
+	  || claim.orderId !== routed.run || claim.claimId !== routed.run
+	  || !isDeepStrictEqual(binding, order.routing?.decision.binding))
+	  return refusal('integrity', order, 'routed signed definition identity changed');
+	const selected = source.selectVerifiedDefinition(digest, routed.definitionName, order.step);
+	if (selected === undefined) return refusal('unknown-step', order,
+	  'signed routed definition or step is unavailable in the verified bundle');
+	if (!validFixedWorkdir(selected.step, order,
+	  selected.definition.inputs.map(input => input.name)))
+	  return refusal('integrity', order, 'order workdir differs from the locally verified step');
+	return { ok: true, definition: selected.definition, step: selected.step,
+	  bundleDigest: selected.bundleDigest, objectPath: selected.objectPath,
+	  callsChild: selected.callsChild };
       }
       const lookup = source.lookup({ defDigest: digest, step: order.step, key: order.key });
       if (lookup.status === 'unknown-digest') {
@@ -435,7 +463,9 @@ export function createStoreInstructionResolver(
       }
       if (callsStep?.calls === undefined) continue;
       const relayed = order.consumesProofRelay?.[path] !== undefined;
-      const child = source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
+      const child = resolved.callsChild !== undefined
+	? resolved.callsChild(callsStep.name)
+	: source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
       if (child === undefined) {
 	if (!relayed && !requireClosure) continue;
         return refusal(

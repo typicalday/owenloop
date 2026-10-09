@@ -125,6 +125,7 @@ export type {
   MissingObjectHandler,
   StoreInstructionSource,
   StoreInstructionSourceArgs,
+  VerifiedDefinitionSelection,
   VerifiedCallsChild,
 } from './instruction-source.ts';
 export type {

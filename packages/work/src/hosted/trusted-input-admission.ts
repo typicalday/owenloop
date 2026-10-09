@@ -195,6 +195,14 @@ export async function bindTrustedRoutedInputV2(args: {
   const { routing: _privateRouting, ...privateUnrouted } = privateOrder;
   const { routing: _directRouting, ...directUnrouted } = reference.order;
   const frame = reference.binding.frameWorkflow;
+  // The ordinary structural binder sees no routing field. Only its local
+  // signed-definition verifier receives the already-bound Service routing,
+  // which selects the exact member of a multi-definition bundle.
+  const routedInstructions: InstructionResolver = {
+    ...args.instructions,
+    ...(args.instructions.resolveHostedStep ? { resolveHostedStep: (order: OrderPacket) =>
+      args.instructions.resolveHostedStep!({ ...order, routing: reference.order.routing }) } : {}),
+  };
   const ordinary = createTrustedInputV2Admission({
     reader: { read: async () => ({
       protocol: 'trusted-reference-read-v2', state: 'available', workflow: frame,
@@ -202,7 +210,9 @@ export async function bindTrustedRoutedInputV2(args: {
       ...(reference.workdirInput === undefined ? {} : { workdirInput: reference.workdirInput }),
       lease: { claimed: true },
     }) },
-    instructions: args.instructions, consumedVerifier: args.consumedVerifier,
+    instructions: routedInstructions,
+    consumedVerifier: (order, opts) => args.consumedVerifier({ ...order,
+      routing: reference.order.routing }, opts),
     expected: { workflow: frame, run: args.expected.run }, now, elapsedNow: monotonicNow,
   });
   const local = await ordinary.observe(privateUnrouted);

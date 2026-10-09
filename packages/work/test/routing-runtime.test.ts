@@ -224,7 +224,7 @@ test('complete routed role preflight opens public stage, then retains the launch
       mkdirSync(join(path, 'home'), { mode: 0o700 });
       const digest = 'a'.repeat(64);
       writeFileSync(join(path, 'stage.json'), JSON.stringify({ version: 'routing-definition-stage-v2',
-	rootWorkflow: 'wf', frameWorkflow: 'wf', definitionName: 'wf',
+	rootWorkflow: 'wf', frameWorkflow: 'wf', definitionName: 'wf', routed: true,
 	run, step: 'build', digest, bundleDigest: 'b'.repeat(64),
 	originRules: {}, nonce: 'c'.repeat(32) }), { mode: 0o600 });
       return { path, digest, verifyOrder: async () => {}, canSubmit: () => false,

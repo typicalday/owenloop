@@ -20,6 +20,8 @@ import { DSSE_SSH_NAMESPACE, dsseSignPublication } from '../../../src/crypto/dss
 import { createSshSigner } from '../../../src/crypto/ssh.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { createBundleIngestor, createStoreInstructionSource,
+  globalStoreRoot } from '../../../src/store/index.ts';
 
 const temp = (prefix: string) => mkdtempSync(join(tmpdir(), prefix));
 const workflow = 'name: recovered\ninputs: []\nsteps:\n  - name: command\n    consumes: []\n    produces: [out]\n    terminal: true\n    command: echo recovered\n';
@@ -76,6 +78,73 @@ function mixedNamespaceSource(): string {
     '    terminal: true\n    command: echo child\n');
   return root;
 }
+
+function duplicateStepSource(): string {
+  const root = temp('routing-duplicate-step-');
+  writeFileSync(join(root, 'bundle.yaml'), [
+    'formatVersion: 2', 'package:', '  name: routing', '  version: 1.0.0',
+    'workflows:', '  "routing/parent": parent.yaml', '  "routing/child": child.yaml',
+    'default: "routing/parent"', 'platforms: []', 'integrity:',
+    '  algorithm: sha256', '  files: {}', 'capabilities: {}', 'lock: {}', '',
+  ].join('\n'));
+  writeFileSync(join(root, 'parent.yaml'), 'name: routing/parent\ninputs: []\nsteps:\n' +
+    '  - name: build\n    executor: command\n    consumes: []\n' +
+    '    produces: [parent-out]\n    terminal: true\n    command: echo parent\n' +
+    'outputs: [parent-out]\n');
+  writeFileSync(join(root, 'child.yaml'), 'name: routing/child\ninputs: []\nsteps:\n' +
+    '  - name: build\n    executor: command\n    consumes: []\n' +
+    '    produces: [child-out]\n    terminal: true\n    command: echo child\n' +
+    'outputs: [child-out]\n');
+  return root;
+}
+
+test('routed signed selector chooses exact child among same-step siblings', async () => {
+  const f = await fixture(workflow, duplicateStepSource());
+  const binding = { runId: 'wf_root', frameId: 'wf_child_instance',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'routing/child' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', binding },
+    decision: { binding } } as unknown as ReferenceRouting;
+  const original = { ...f.args.order, workflow: 'wf_child_instance', step: 'build', routing };
+  const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root', order: original });
+  try {
+    const packet: OrderPacket = { workflow: 'wf_child_instance', run: 'run', step: 'build',
+      key: '', defDigest: f.packed.digest, worker: 'command', inputs: [], outputs: ['child-out'],
+      consumes: {}, owes: [{ path: 'child-out', judgmentRejects: 0,
+	schemaRejects: 0, reasons: [] }], routing };
+    assert.equal(await stage.commandFor!(packet), 'echo child');
+    assert.equal(stage.canSubmit(packet, 'child-out'), true);
+    assert.equal(stage.canSubmit(packet, 'parent-out'), false);
+    const parentClaim = structuredClone(routing);
+    parentClaim.claim.binding.def.workflowName = 'routing/parent';
+    parentClaim.decision.binding.def.workflowName = 'routing/parent';
+    const wrongSibling = { ...packet, outputs: ['parent-out'],
+      owes: [{ path: 'parent-out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      routing: parentClaim };
+    assert.equal(stage.canSubmit(wrongSibling, 'parent-out'), false);
+    await assert.rejects(stage.commandFor!(wrongSibling), /routed command definition refused/);
+    await assert.rejects(stage.commandFor!({ ...packet, run: 'other_run' }),
+      /routed command definition refused/);
+    const response: GetOrderResponse = { text: '', workflow: 'wf_child_instance', run: 'run',
+      lease: { claimed: true }, order: packet };
+    await stage.verifyOrder(response);
+    await assert.rejects(stage.verifyOrder({ ...response, order: wrongSibling }),
+      /routed order changed/);
+    writeFileSync(join(f.config, 'allowed_signers'), '', { mode: 0o600 });
+    await assert.rejects(stage.verifyOrder(response), /routed definition trust changed/);
+    const handoff = { definitionStage: { path: stage.path, digest: stage.digest },
+      reservation: { workflow: 'wf_root', run: 'run' } } as RoutingHandoffV1;
+    const opened = openRoutingRoleStage(handoff);
+    assert.equal(opened.definitionName, 'routing/child');
+    const command = await opened.instructions.resolveCommand(packet);
+    assert.equal(command.ok, true);
+    if (command.ok) assert.equal(command.command, 'echo child');
+    const ordinary = createStoreInstructionSource({ globalRoot: globalStoreRoot(opened.publicEnv.HOME!),
+      verifier: createBundleIngestor() });
+    assert.equal(await ordinary.prime(f.packed.digest), 'resolved');
+    assert.equal(ordinary.lookup({ defDigest: f.packed.digest, step: 'build', key: '' }).status,
+      'ambiguous-step');
+  } finally { stage.cleanup(); }
+});
 
 test('mixed authored namespace origin rule applies at staging and fresh verifyOrder', async () => {
   const f = await fixture(workflow, mixedNamespaceSource());
@@ -214,7 +283,12 @@ test('parent signed stage admits an exact Service input-derived cwd witness and 
 
 test('routed role opens only the staged public definition store', async () => {
   const f = await fixture();
-  const stage = await stageRoutedDefinition(f.args);
+  const binding = { runId: 'wf', frameId: 'wf',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'recovered' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', binding },
+    decision: { binding } } as unknown as ReferenceRouting;
+  const stage = await stageRoutedDefinition({ ...f.args,
+    order: { ...f.args.order, routing } });
   const handoff = { definitionStage: { path: stage.path, digest: stage.digest },
     reservation: { workflow: 'wf', run: 'run' } } as RoutingHandoffV1;
   const opened = openRoutingRoleStage(handoff);
@@ -226,7 +300,7 @@ test('routed role opens only the staged public definition store', async () => {
   assert.equal(JSON.stringify(opened.publicEnv).includes('secret-marker'), false);
   const command = await opened.instructions.resolveCommand({ workflow: 'wf', run: 'run', step: 'command',
     key: '', defDigest: f.packed.digest, worker: 'command', inputs: [], outputs: ['out'], consumes: {},
-    owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] });
+    owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }], routing });
   assert.equal(command.ok, true);
   stage.cleanup();
   assert.throws(() => openRoutingRoleStage(handoff), /routing definition stage refused/);

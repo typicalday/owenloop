@@ -53,7 +53,7 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
     privateDir(join(stage.path, 'public'));
     privateDir(join(stage.path, 'home'));
     const data = descriptor(join(stage.path, 'stage.json')) as Record<string, unknown>;
-    if (!data || data.version !== 'routing-definition-stage-v2'
+    if (!data || data.version !== 'routing-definition-stage-v2' || data.routed !== true
 	|| data.rootWorkflow !== handoff.reservation.workflow
 	|| typeof data.frameWorkflow !== 'string' || !data.frameWorkflow
 	|| typeof data.definitionName !== 'string' || !data.definitionName
@@ -70,6 +70,9 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
     const source = createStoreInstructionSource({ globalRoot, verifier: createBundleIngestor() });
     const strict = createStoreInstructionResolver({ globalRoot, source,
       verifier: createBundleIngestor(), env: publicEnv,
+      routedSelection: { rootWorkflow: data.rootWorkflow as string,
+	frameWorkflow: data.frameWorkflow, definitionName: data.definitionName,
+	defDigest: data.digest as string, run: data.run as string },
       defPolicy: 'enforce', originPolicy: 'enforce', originRules,
       definitionVerifier: createExecutionDefinitionVerifier({ env: publicEnv }),
       originVerifier: createExecutionOriginVerifier({ env: publicEnv }),

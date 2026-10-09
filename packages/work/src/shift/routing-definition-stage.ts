@@ -340,10 +340,15 @@ export async function stageRoutedDefinition(args: {
     // fresh full order and verify consumed values before external start.
     if (await source.prime(args.order.defDigest!) !== 'resolved') throw new Error('routed definition unavailable');
     if (performance.now() >= deadline || !args.stillAuthorized()) throw new Error('routed definition staging expired');
-    const resolved = source.getVerifiedObject(args.order.defDigest!);
-    const support = source.getVerifiedSupport?.(args.order.defDigest!, args.order.step);
-    const definition = source.getVerifiedDefinition(args.order.defDigest!, args.order.step);
-    const step = source.getVerifiedStep(args.order.defDigest!, args.order.step);
+    const selected = routing === undefined ? undefined
+      : source.selectVerifiedDefinition(args.order.defDigest!, definitionName!, args.order.step);
+    const resolved = routing === undefined ? source.getVerifiedObject(args.order.defDigest!) : selected;
+    const support = routing === undefined
+      ? source.getVerifiedSupport?.(args.order.defDigest!, args.order.step) : selected?.support;
+    const definition = routing === undefined
+      ? source.getVerifiedDefinition(args.order.defDigest!, args.order.step) : selected?.definition;
+    const step = routing === undefined
+      ? source.getVerifiedStep(args.order.defDigest!, args.order.step) : selected?.step;
     if (!resolved || !definition || !step || !support?.length
       || (routing !== undefined && definition.name !== definitionName))
       throw new Error('routed definition step unavailable');
@@ -388,7 +393,7 @@ export async function stageRoutedDefinition(args: {
     }
     if (performance.now() >= deadline || !args.stillAuthorized()) throw new Error('routed definition staging expired');
     const descriptor = { version: 'routing-definition-stage-v2', rootWorkflow: args.rootWorkflow,
-      frameWorkflow, definitionName: definition.name,
+      frameWorkflow, definitionName: definition.name, routed: routing !== undefined,
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
       bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
@@ -433,7 +438,10 @@ export async function stageRoutedDefinition(args: {
 	verifier: createBundleIngestor() });
       if (await readOnlySource.prime(order.defDigest) !== 'resolved')
 	throw new Error('routed definition object changed');
-      const currentSupport = readOnlySource.getVerifiedSupport?.(order.defDigest, order.step);
+      const currentSelection = routing === undefined ? undefined
+	: readOnlySource.selectVerifiedDefinition(order.defDigest, definitionName!, order.step);
+      const currentSupport = routing === undefined
+	? readOnlySource.getVerifiedSupport?.(order.defDigest, order.step) : currentSelection?.support;
       if (!currentSupport?.length) throw new Error('routed definition closure unavailable');
       for (const object of currentSupport) {
 	if ((await freshDefinition(object)).kind !== 'verified')
@@ -448,12 +456,17 @@ export async function stageRoutedDefinition(args: {
       }
       const resolver = createStoreInstructionResolver({ globalRoot: root, source: readOnlySource,
 	verifier: createBundleIngestor(), env: args.sourceEnv, defPolicy: 'enforce',
+	...(routing === undefined ? {} : { routedSelection: {
+	  rootWorkflow: args.rootWorkflow, frameWorkflow,
+	  definitionName: definitionName!, defDigest: args.order.defDigest!, run: args.order.run } }),
 	originPolicy: 'enforce', originRules: freshRules,
 	definitionVerifier: freshDefinition, originVerifier: freshOrigin,
 	consumedVerifier: createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
 	  artifactPolicy: 'enforce' }), warn: () => {} });
-      const verifiedStep = readOnlySource.getVerifiedStep(order.defDigest, order.step);
-      const verifiedDefinition = readOnlySource.getVerifiedDefinition(order.defDigest, order.step);
+      const verifiedStep = routing === undefined
+	? readOnlySource.getVerifiedStep(order.defDigest, order.step) : currentSelection?.step;
+      const verifiedDefinition = routing === undefined
+	? readOnlySource.getVerifiedDefinition(order.defDigest, order.step) : currentSelection?.definition;
 	if (!verifiedStep || !verifiedDefinition
 	  || (routing !== undefined && verifiedDefinition.name !== definitionName)
 	  || (!routed && !validModelOrderFields(verifiedStep, order,
@@ -529,16 +542,20 @@ export async function stageRoutedDefinition(args: {
     const canReplay = (order: OrderPacket, path: string): boolean => {
       if (order.defDigest !== args.order.defDigest || order.step !== args.order.step
 	|| order.workflow !== args.order.workflow || order.run !== args.order.run
+	|| (routing !== undefined && !isDeepStrictEqual(order.routing, routing))
 	|| !order.owes.some(owed => owed.path === path)) return false;
-      const verified = source.getVerifiedStep(order.defDigest, order.step);
+      const verified = routing === undefined
+	? source.getVerifiedStep(order.defDigest, order.step) : selected?.step;
       if (!verified) return false;
       return verified.judges === path || outputFor(verified, order, path)?.kind === 'singleton';
     };
     const canCollect = (order: OrderPacket, sealPath: string): boolean => {
       if (order.defDigest !== args.order.defDigest || order.step !== args.order.step
 	|| order.workflow !== args.order.workflow || order.run !== args.order.run
+	|| (routing !== undefined && !isDeepStrictEqual(order.routing, routing))
 	|| !order.owes.some(owed => owed.path === sealPath)) return false;
-      const verified = source.getVerifiedStep(order.defDigest, order.step);
+      const verified = routing === undefined
+	? source.getVerifiedStep(order.defDigest, order.step) : selected?.step;
       return !!verified && outputFor(verified, order, sealPath)?.kind === 'collection';
     };
     return { path: stagePath, digest: args.order.defDigest!,
@@ -548,10 +565,10 @@ export async function stageRoutedDefinition(args: {
 	  || order.workflow !== frameWorkflow || order.step !== args.order.step
 	  || order.run !== args.order.run)
 	  throw new Error('routed command definition refused');
-	if (routing !== undefined
-	  && source.getVerifiedDefinition(order.defDigest, order.step)?.name !== definitionName)
+	if (routing !== undefined && (!selected || !isDeepStrictEqual(order.routing, args.order.routing)))
 	  throw new Error('routed command definition refused');
-	const verified = source.getVerifiedStep(order.defDigest, order.step);
+	const verified = routing === undefined
+	  ? source.getVerifiedStep(order.defDigest, order.step) : selected?.step;
 	if (typeof verified?.command !== 'string' || !verified.command.trim())
 	  throw new Error('routed command definition refused');
 	return verified.command;

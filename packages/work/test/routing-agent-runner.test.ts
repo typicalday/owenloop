@@ -16,7 +16,7 @@ function fixture() {
   const digest = 'a'.repeat(64);
   writeFileSync(join(stagePath, 'stage.json'), JSON.stringify({
     version: 'routing-definition-stage-v2', rootWorkflow: 'wf', frameWorkflow: 'wf',
-    definitionName: 'wf', run: 'run', step: 'build',
+    definitionName: 'wf', routed: true, run: 'run', step: 'build',
     digest, bundleDigest: 'b'.repeat(64), nonce: 'c'.repeat(32), originRules: {},
   }), { mode: 0o600 });
   const now = Date.now();
