@@ -51,7 +51,7 @@ const QUIESCE_DRAIN_MS = 10_000;
 const CAP = /^[a-f0-9]{64}$/;
 type Identity = { sessionId: string; shiftId: string; orgId: string; principalId: string; expiresAt: number };
 type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch' | 'report_launch'
-  | 'read_routed_reference_v2' | 'read_routing_claim_v2'
+  | 'read_routed_reference_v2' | 'read_routing_claim_v2' | 'read_routed_pair_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
   | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection' | 'quiesce'
@@ -1280,7 +1280,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
   }
   const launch = method === 'get_launch_order' || method === 'assess_local_model'
     || method === 'reserve_launch' || method === 'report_launch'
-    || method === 'read_routed_reference_v2' || method === 'read_routing_claim_v2';
+    || method === 'read_routed_reference_v2' || method === 'read_routing_claim_v2'
+    || method === 'read_routed_pair_v2';
   if (!grant.ready || !(launch ? validateLaunchGrant(grant, now()) : validateSessionGrant(grant, now())))
     throw new Error('routing broker grant expired');
   const { workflow, run, childKind } = grant.reservation;
@@ -1338,6 +1339,35 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
     case 'read_routing_claim':
       if (!exactKeys(body, [])) throw new Error('routing broker request refused');
       return checked(grant, grant.hub.readRoutingClaim({ workflow, run }, signal), now);
+    case 'read_routed_pair_v2': {
+      // This is one parent observation. The underlying Service reference and
+      // claim reads remain sequential and are independently checked by the
+      // input authority; no result is cached across child requests.
+      if (scope !== 'role' || !exactKeys(body, []) || !grant.inputAuthority
+	|| !grant.execHolderId) throw new Error('routing broker pair refused');
+      const holder: ContactHolder = { kind: 'exec', id: grant.execHolderId,
+	shiftId: grant.identity.shiftId };
+      const response = await checked(grant,
+	grant.hub.getOrder({ workflow, run, holder }, signal), now, true);
+      if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order)
+	throw new Error('routing broker pair refused');
+      const pair = await verifyParentOrder(grant, response, 'prestart', now);
+      if (!pair || !validateLaunchGrant(grant, now()) || !grant.active || !grant.ready)
+	throw new Error('routing broker pair refused');
+      const reference = parseRoutedReferenceV2(pair.reference, { workflow, run });
+      const claim = parseRoutedClaimV2(pair.claim, { workflow, run });
+      if (reference.state !== 'available' || claim.state !== 'available'
+	|| reference.binding.frameWorkflow !== grant.routing.claim.binding.frameId
+	|| reference.binding.run !== run
+	|| reference.binding.rootWorkflow !== workflow
+	|| reference.binding.sessionId !== grant.identity.sessionId
+	|| reference.binding.shiftId !== grant.identity.shiftId
+	|| reference.binding.routingDigest !== valueDigestHex(grant.routing)
+	|| !isDeepStrictEqual(reference.binding, claim.binding)
+	|| !isDeepStrictEqual(reference.order.routing, claim.routing))
+	throw new Error('routing broker pair refused');
+      return { protocol: 'routed-prestart-pair-v2', phase: 'prestart', reference, claim };
+    }
     case 'read_routed_reference_v2':
     case 'read_routing_claim_v2': {
       if (!exactKeys(body, []) || !grant.routedV2Read) throw new Error('routing broker request refused');
@@ -1832,7 +1862,7 @@ export async function createRoutingBroker(args: { now?: () => number;
 	  }
 	  if (tail.length > 0) throw new Error();
   const methods: readonly string[] = ['get_order', 'get_launch_order', 'read_routing_claim',
-      'read_routed_reference_v2', 'read_routing_claim_v2', 'assess_local_model',
+      'read_routed_reference_v2', 'read_routing_claim_v2', 'read_routed_pair_v2', 'assess_local_model',
       'read_live_routed_reference_v2', 'read_live_routing_claim_v2',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection',

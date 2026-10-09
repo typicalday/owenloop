@@ -3,7 +3,9 @@
 import { createHash } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { PassThrough, Readable } from 'node:stream';
-import type { RoutedClaimV2, RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import { parseRoutedClaimV2, parseRoutedReferenceV2,
+  type RoutedClaimV2, type RoutedPrestartPairV2, type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import { isDeepStrictEqual } from 'node:util';
 import type { RecordedClaimV2, RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import type { RoutedQuiesceResult } from '../shift/routing-broker.ts';
 import type { VerifiedInvocationReceipt } from '../../../../src/types.ts';
@@ -28,7 +30,7 @@ const UPLOAD_IDLE_MS = 4 * 60_000;
 const UPLOAD_ABSOLUTE_MS = 14 * 60_000;
 const MAX_DOWNLOAD_HEADER = 4096;
 type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_local_model' | 'reserve_launch'
-  | 'read_routed_reference_v2' | 'read_routing_claim_v2'
+  | 'read_routed_reference_v2' | 'read_routing_claim_v2' | 'read_routed_pair_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'quiesce'
   | 'command_postrun' | 'command_postrun_status' | 'command_finish' | 'agent_outcome' | 'agent_finish'
@@ -43,6 +45,7 @@ export interface RoutingChildClient {
   readRoutingClaim(req: { workflow: string; run: string }): Promise<RoutingClaimReadResponse>;
   readRoutedReferenceV2(req: { workflow: string; run: string }): Promise<RoutedReferenceV2>;
   readRoutingClaimV2(req: { workflow: string; run: string }): Promise<RoutedClaimV2>;
+  readRoutedPairV2(req: { workflow: string; run: string }): Promise<RoutedPrestartPairV2>;
   readLiveRoutedReferenceV2(req: { workflow: string; run: string }): Promise<RecordedReferenceV2>;
   readLiveRoutingClaimV2(req: { workflow: string; run: string }): Promise<RecordedClaimV2>;
   assessLocalModel(req: LocalModelRequest): Promise<LocalModelResponse>;
@@ -349,6 +352,22 @@ export function createRoutingChildClient(handoff: {
     readRoutingClaim(req) { bound(req); return exchange('read_routing_claim', {}); },
     readRoutedReferenceV2(req) { bound(req); return exchange('read_routed_reference_v2', {}, 5_000); },
     readRoutingClaimV2(req) { bound(req); return exchange('read_routing_claim_v2', {}, 5_000); },
+    async readRoutedPairV2(req) {
+      bound(req);
+      const raw = await exchange<unknown>('read_routed_pair_v2', {}, 5_000);
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw refused();
+      const row = raw as Record<string, unknown>;
+      if (Object.keys(row).sort().join(',') !== 'claim,phase,protocol,reference'
+	|| row.protocol !== 'routed-prestart-pair-v2' || row.phase !== 'prestart') throw refused();
+      try {
+	const reference = parseRoutedReferenceV2(row.reference, req);
+	const claim = parseRoutedClaimV2(row.claim, req);
+	if (reference.state !== 'available' || claim.state !== 'available'
+	  || !isDeepStrictEqual(reference.binding, claim.binding)
+	  || !isDeepStrictEqual(reference.order.routing, claim.routing)) throw refused();
+	return { protocol: 'routed-prestart-pair-v2', phase: 'prestart', reference, claim };
+      } catch { throw refused(); }
+    },
     readLiveRoutedReferenceV2(req) { bound(req); return exchange('read_live_routed_reference_v2', {}, 5_000); },
     readLiveRoutingClaimV2(req) { bound(req); return exchange('read_live_routing_claim_v2', {}, 5_000); },
     assessLocalModel(req) { bound(req); return exchange('assess_local_model', { candidateIds: req.candidateIds }); },

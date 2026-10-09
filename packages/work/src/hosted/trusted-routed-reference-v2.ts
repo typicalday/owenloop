@@ -2,6 +2,7 @@
  * routing session; a role receives only exact bound results through its broker. */
 import type { IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { isDeepStrictEqual } from 'node:util';
 
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import { HubError } from '../hub/types.ts';
@@ -52,6 +53,8 @@ export type RoutedClaimV2 = {
 } | {
   protocol: 'routing-claim-read-v2'; state: 'unavailable'; workflow: string; run: string;
 };
+export type RoutedPrestartPairV2 = { protocol: 'routed-prestart-pair-v2'; phase: 'prestart';
+  reference: RoutedReferenceV2; claim: RoutedClaimV2 };
 export interface RoutedReferenceV2Reader {
   readReference(): Promise<RoutedReferenceV2>;
   readClaim(): Promise<RoutedClaimV2>;
@@ -260,19 +263,24 @@ export function createTrustedRoutedReferenceV2Reader(options: RoutedV2TransportO
   } };
 }
 
-/** Child-side adapter to the parent broker's two fixed, claim-bound verbs.
+/** Child-side adapter to one parent observation of the two fixed Service reads.
  * It has no origin, bearer, session credential, or generic Hub method. */
 export function createBrokerRoutedReferenceV2Reader(client: Pick<RoutingChildClient,
-  'readRoutedReferenceV2' | 'readRoutingClaimV2'>, expected: { workflow: string; run: string },
+  'readRoutedPairV2'>, expected: { workflow: string; run: string },
 now = () => performance.now()): Pick<RoutedReferenceV2Reader, 'read'> {
   return { async read() {
     const started = now();
-    const reference = parseRoutedReferenceV2(await client.readRoutedReferenceV2(expected), expected);
+    const pair = await client.readRoutedPairV2(expected);
     if (now() - started >= MAX_MS) throw new Error('routed v2 broker observation expired');
-    if (reference.state !== 'available') return { reference,
-      claim: { protocol: 'routing-claim-read-v2', state: 'unavailable', ...expected } as RoutedClaimV2 };
-    const claim = parseRoutedClaimV2(await client.readRoutingClaimV2(expected), expected);
-    if (now() - started >= MAX_MS) throw new Error('routed v2 broker observation expired');
+    if (!pair || pair.protocol !== 'routed-prestart-pair-v2' || pair.phase !== 'prestart'
+      || Object.keys(pair).sort().join(',') !== 'claim,phase,protocol,reference')
+      throw new Error('routed v2 broker pair refused');
+    const reference = parseRoutedReferenceV2(pair.reference, expected);
+    const claim = parseRoutedClaimV2(pair.claim, expected);
+    if (reference.state !== 'available' || claim.state !== 'available'
+      || !isDeepStrictEqual(reference.binding, claim.binding)
+      || !isDeepStrictEqual(reference.order.routing, claim.routing))
+      throw new Error('routed v2 broker pair refused');
     return { reference, claim };
   } };
 }

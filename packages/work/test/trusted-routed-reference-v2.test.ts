@@ -237,19 +237,19 @@ test('child broker reader accepts only its fixed root/run and rechecks elapsed o
   let clock = 1_000;
   const calls: string[] = [];
   const client = {
-    readRoutedReferenceV2: async (req: typeof expected) => {
-      calls.push('reference'); assert.deepEqual(req, expected); return value.reference;
-    },
-    readRoutingClaimV2: async (req: typeof expected) => {
-      calls.push('claim'); assert.deepEqual(req, expected); return value.claim;
+    readRoutedPairV2: async (req: typeof expected) => {
+      calls.push('pair'); assert.deepEqual(req, expected);
+      return { protocol: 'routed-prestart-pair-v2' as const, phase: 'prestart' as const, ...value };
     },
   };
   const reader = createBrokerRoutedReferenceV2Reader(client, expected, () => clock);
   assert.deepEqual(await reader.read(), value);
-  assert.deepEqual(calls, ['reference', 'claim']);
-  client.readRoutingClaimV2 = async () => { clock += 5_000; return value.claim; };
+  assert.deepEqual(calls, ['pair']);
+  client.readRoutedPairV2 = async () => { clock += 5_000;
+    return { protocol: 'routed-prestart-pair-v2', phase: 'prestart', ...value } as const; };
   await assert.rejects(reader.read(), /observation expired/);
-  client.readRoutingClaimV2 = async () => ({ ...value.claim, workflow: 'wf_wrong' });
+  client.readRoutedPairV2 = async () => ({ protocol: 'routed-prestart-pair-v2', phase: 'prestart',
+    reference: value.reference, claim: { ...value.claim, workflow: 'wf_wrong' } } as const);
   clock = 1_000;
   await assert.rejects(reader.read(), /envelope mismatch/);
 });

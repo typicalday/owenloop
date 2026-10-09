@@ -1519,6 +1519,7 @@ test('final role launch read checks accepted report and current selection withou
 test('parent input gate binds the Service root to a nested frame and permits prestart heartbeat only with current witness', async () => {
   let now = 2_000;
   let witnessChanged = false;
+  let liveIdentity = identity;
   const routes: string[] = [];
   const framed = { ...routing, preference: { ...routing.preference,
     rosterRevision: 'a'.repeat(64) } };
@@ -1557,35 +1558,64 @@ test('parent input gate binds the Service root to a nested frame and permits pre
     }) as typeof fetch });
   const broker = await createRoutingBroker({ now: () => now });
   try {
-    const grant = broker.issue({ reservation, routing: framed, identity,
-      currentIdentity: () => identity, hub, submissionAuthority: transportAuthority,
+    const agentReservation = { ...reservation, childKind: 'agent-run' as const };
+    const grant = broker.issue({ reservation: agentReservation, routing: framed, identity,
+      currentIdentity: () => liveIdentity, hub, submissionAuthority: transportAuthority,
       inputAuthority: { observe: async (response, phase) => {
 	assert.equal(response.workflow, 'frame');
 	phases.push(phase);
 	if (delayed) { observing(); return delayed; }
 	return pair();
       } } });
-    grant.activate(child);
+    grant.activate({ ...child, kind: 'agent-run' });
     const send = (method: string, body: unknown) => request(grant.socketPath,
       { cap: grant.cap, method, body });
     assert.equal((await send('get_order', { holder })).ok, true);
     assert.equal((await send('heartbeat', { holder })).ok, true);
     assert.deepEqual(phases, ['prestart', 'prestart']);
     assert.deepEqual(routes, ['get_order', 'get_order', 'heartbeat']);
+    const role = createRoutingChildClient(handoffFor(grant, agentReservation));
+    const priorReads = routes.length, priorObservations = phases.length;
+    const paired = await role.readRoutedPairV2({ workflow: 'wf', run: 'run' });
+    assert.equal(paired.protocol, 'routed-prestart-pair-v2');
+    assert.equal(paired.phase, 'prestart');
+    assert.equal(paired.reference.state, 'available');
+    assert.equal(paired.claim.state, 'available');
+    assert.deepEqual(routes.slice(priorReads), ['get_order']);
+    assert.deepEqual(phases.slice(priorObservations), ['prestart']);
+    await role.readRoutedPairV2({ workflow: 'wf', run: 'run' });
+    assert.deepEqual(routes.slice(priorReads), ['get_order', 'get_order'],
+      'a later request must obtain a fresh current order');
+    assert.deepEqual(phases.slice(priorObservations), ['prestart', 'prestart']);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap,
+      method: 'read_routed_pair_v2', body: { phase: 'recorded-live' } })).ok, false);
+    assert.equal((await request(grant.holder!.socketPath, { cap: grant.holder!.cap,
+      method: 'read_routed_pair_v2', body: {} })).ok, false,
+      'a holder cannot read the role pair');
+    assert.equal(routes.length, priorReads + 2);
+    liveIdentity = { ...identity, sessionId: 'rs_revoked' };
+    await assert.rejects(role.readRoutedPairV2({ workflow: 'wf', run: 'run' }),
+      /routing broker unavailable/);
+    assert.equal(routes.length, priorReads + 2, 'revoked session refuses before current order read');
+    liveIdentity = identity;
     witnessChanged = true;
+    await assert.rejects(role.readRoutedPairV2({ workflow: 'wf', run: 'run' }),
+      /routing broker unavailable/);
     assert.equal((await send('heartbeat', { holder })).ok, false);
     assert.equal(routes.at(-1), 'get_order', 'changed witness cannot issue a heartbeat');
     now = 75_000;
+    await assert.rejects(role.readRoutedPairV2({ workflow: 'wf', run: 'run' }),
+      /routing broker unavailable/);
     assert.equal((await send('heartbeat', { holder })).ok, false,
       'startup preference does not become a fresh launch after expiry');
     now = 2_000;
     witnessChanged = false;
     delayed = new Promise(resolve => { finish = resolve; });
-    const pending = send('get_order', { holder });
+    const pending = role.readRoutedPairV2({ workflow: 'wf', run: 'run' });
     await observed;
     grant.terminal();
     finish(pair());
-    assert.equal((await pending).ok, false,
-      'a completed witness after grant revocation cannot return a packet');
+    await assert.rejects(pending, /routing broker unavailable/,
+      'a completed witness after grant revocation cannot return a pair');
   } finally { await broker.close(); }
 });

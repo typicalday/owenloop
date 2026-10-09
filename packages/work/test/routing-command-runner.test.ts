@@ -126,6 +126,8 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
 	case 'heartbeat': value = { text: '' }; break;
 	case 'read_routed_reference_v2': value = reference; break;
 	case 'read_routing_claim_v2': value = claim; break;
+	case 'read_routed_pair_v2': value = { protocol: 'routed-prestart-pair-v2',
+	  phase: 'prestart', reference, claim }; break;
 	case 'reserve_launch': value = { reservationId: 'lr-one', orderId: run, expiresAt: now + 50_000 }; break;
 	case 'report_launch': value = { orderId: run, digest: valueDigestHex(request.body.report),
 	  recordedAt: now, provenance: 'authenticated-worker-report' }; break;
