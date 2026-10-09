@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createServer, type Server } from 'node:net';
+import { createServer, type Server, type Socket } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -110,6 +110,12 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
   const errors: string[] = [];
   let signalStatusEntry: () => void = () => {};
   const statusEntered = new Promise<void>(resolve => { signalStatusEntry = resolve; });
+  let pendingStatusSocket: Socket | undefined;
+  let signalStatusClose: () => void = () => {};
+  const statusClosed = new Promise<void>(resolve => { signalStatusClose = resolve; });
+  const statusSocketErrors: string[] = [];
+  let statusStopArmed = false;
+  let lateStatusReplies = 0;
   let cachedPostrunDigest: string | undefined;
   const server: Server = createServer(socket => {
     let text = '';
@@ -119,7 +125,6 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
       if (newline < 0) return;
       const request = JSON.parse(text.slice(0, newline)) as { method: string; body: Record<string, unknown> };
       events.push(request.method);
-      if (request.method === 'command_postrun_status') signalStatusEntry();
       let value: unknown;
       switch (request.method) {
 	case 'read_routing_claim': value = { routing, freshness: 'fresh-at-read', atomicLaunch: false }; break;
@@ -153,8 +158,21 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
 	  break;
 	}
 	case 'command_postrun_status':
-	  value = options.statusPending ? { state: 'pending' }
-	    : request.body.bodyDigest === cachedPostrunDigest
+	  if (options.statusPending) {
+	    assert.equal(pendingStatusSocket, undefined);
+	    assert.equal(request.body.bodyDigest, cachedPostrunDigest);
+	    pendingStatusSocket = socket;
+	    socket.on('error', error => {
+	      const code = (error as NodeJS.ErrnoException).code;
+	      if (code !== 'ECONNRESET' || !statusStopArmed)
+		statusSocketErrors.push(code ?? 'unknown');
+	    });
+	    socket.once('close', signalStatusClose);
+	    signalStatusEntry();
+	    return;
+	  }
+	  signalStatusEntry();
+	  value = request.body.bodyDigest === cachedPostrunDigest
 	    ? { state: 'committed', result: { outcome: 'submitted', claim: options.postrunClaim ?? 'closed' } }
 	    : { state: 'unavailable' };
 	  break;
@@ -172,7 +190,21 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
     reservation: { recordType: 'reservation', workflow: rootWorkflow, run,
       childKind: 'exec', token: 'f'.repeat(32), reservedAt: now },
     createdAt: now, expiresAt: now + 120_000, sessionExpiresAt: now + 900_000 } as RoutingHandoffV1;
-  return { root, stage, server, handoff, events, errors, order, statusEntered };
+  const stopWithLateStatus = (stop: () => void) => {
+    assert.equal(options.statusPending, true);
+    assert.ok(pendingStatusSocket);
+    assert.ok(cachedPostrunDigest);
+    statusStopArmed = true;
+    stop();
+    // Queue an authentic cached success only after stop has aborted the client.
+    // The result must not turn the stopped role into a submitted outcome.
+    pendingStatusSocket.end(JSON.stringify({ ok: true, value: { state: 'committed',
+      result: { outcome: 'submitted', claim: options.postrunClaim ?? 'closed' } } }) + '\n');
+    lateStatusReplies++;
+  };
+  return { root, stage, server, handoff, events, errors, order, statusEntered,
+    statusClosed, statusSocketErrors, stopWithLateStatus,
+    lateStatusReplies: () => lateStatusReplies };
 }
 
 test('real routed command composition executes signed nested frame in writable cwd and sends one parent postrun', async () => {
@@ -269,7 +301,8 @@ test('stop during cached-status wait cannot accept a later command result', asyn
       }),
     ]);
     if (timer !== undefined) clearTimeout(timer);
-    prepared.loop.stop();
+    if (observed.kind === 'status') f.stopWithLateStatus(() => prepared.loop.stop());
+    else prepared.loop.stop();
     const outcome = await running;
     assert.equal(observed.kind, 'status',
       `status RPC did not arrive before ${JSON.stringify(observed)}; events=${f.events.join(',')}; errors=${f.errors.join('|')}`);
@@ -277,6 +310,16 @@ test('stop during cached-status wait cannot accept a later command result', asyn
     assert.ok(f.events.includes('command_postrun_status'));
     assert.equal(f.events.filter(method => method === 'command_postrun').length, 1);
     assert.equal(f.events.filter(method => method === 'command_finish').length, 0);
+    assert.equal(f.lateStatusReplies(), 1);
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([f.statusClosed, new Promise<never>((_, reject) => {
+	closeTimer = setTimeout(() => reject(new Error('pending status socket did not close')), 5_000);
+      })]);
+    } finally {
+      if (closeTimer !== undefined) clearTimeout(closeTimer);
+    }
+    assert.deepEqual(f.statusSocketErrors, []);
   } finally {
     await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
     f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });
