@@ -169,7 +169,7 @@ test('parent current stage refuses changed signed command bytes before a postrun
     chmodSync(object, 0o600);
     writeFileSync(object, workflow.replace('echo recovered', 'echo changed'));
     await assert.rejects(stage.verifyOrder(response),
-      /routed definition object changed|routed signed selection changed/);
+      /integrity mismatch for 'workflow.yaml'/);
     assert.equal(await stage.commandFor!(packet), 'echo recovered',
       'captured command alone cannot authorize a parent postrun');
   } finally { stage.cleanup(); }
@@ -271,11 +271,11 @@ outputs: [result]
   const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root',
     order: { ...f.args.order, workflow: 'wf_frame', step: 'command',
       consumes: { child: value }, consumedFingerprint: { child: 1 }, routing },
-    readCurrentPair: async () => pair,
-    readInvocationBinding: async () => {
+    readCurrentPair: async () => {
       if (pause) { entered(); await resume; }
-      return relay;
-    } });
+      return pair;
+    },
+    readInvocationBinding: async () => relay });
   try {
     const response: GetOrderResponse = { text: '', workflow: 'wf_frame', run: 'run',
       lease: { claimed: true }, order: packet };
@@ -286,13 +286,13 @@ outputs: [result]
       const enteredBeforeReturn = await Promise.race([
 	waiting.then(() => true), pending.then(() => false, () => false),
       ]);
-      assert.equal(enteredBeforeReturn, true, 'the current check awaits the direct relay');
+      assert.equal(enteredBeforeReturn, true, 'the current check awaits the post-relay pair read');
       const object = join(globalStoreRoot(join(stage.path, 'home')), 'objects', 'sha256',
 	f.packed.digest, 'parent.yaml');
       chmodSync(object, 0o600);
       writeFileSync(object, parent.replace('echo original', 'echo moved'));
     } finally { release(); }
-    await assert.rejects(pending, /routed signed selection changed|routed definition object changed|routed input witness refused/);
+    await assert.rejects(pending, /integrity mismatch for 'parent.yaml'/);
     assert.equal(await stage.commandFor!(packet), 'echo original',
       'captured command is data; refused parent verification cannot authorize signing');
   } finally { stage.cleanup(); }
