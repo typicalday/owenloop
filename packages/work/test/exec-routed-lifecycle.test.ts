@@ -118,9 +118,11 @@ test('prestart ambiguity yields zero starts and no broad consequence', async () 
 });
 
 test('signed prestart revalidation logs only its closed refusal kind before any start', async () => {
-  for (const [kind, expected] of [
-    ['unverified-consumed', 'unverified-consumed'],
-    ['unrecognized-private-kind', 'unclassified'],
+  for (const [kind, code, expected] of [
+    ['unverified-consumed', undefined, 'unverified-consumed'],
+    ['unrecognized-private-kind', undefined, 'unclassified'],
+    ['unverified-consumed', 'invocation-read-failed', 'unverified-consumed; invocation-read-failed'],
+    ['unverified-consumed', 'private-receipt-text', 'unverified-consumed; unclassified'],
   ] as const) {
     const events: string[] = [], errors: string[] = [];
     const { opts, starts } = fixture(events);
@@ -130,6 +132,7 @@ test('signed prestart revalidation logs only its closed refusal kind before any 
       async resolveRoutedCommandDefinition() { return { ok: true, command: 'printf hello',
 	inputWitnessRequired: true,
 	revalidate: async () => ({ ok: false, kind: kind as 'unverified-consumed',
+	  ...(code === undefined ? {} : { code: code as 'invocation-read-failed' }),
 	  reason: 'private proof, bearer, and input value must stay hidden' }) }; },
       async resolveStep() { throw new Error('unused'); },
     };
@@ -138,7 +141,7 @@ test('signed prestart revalidation logs only its closed refusal kind before any 
     assert.ok(!events.includes('prestart') && !events.includes('parent-postrun'));
     assert.ok(errors.some(line => line.includes(`signed command changed before prestart (${expected})`)));
     assert.ok(errors.every(line => !line.includes('private proof') && !line.includes('bearer')
-      && !line.includes('input value')));
+      && !line.includes('input value') && !line.includes('private-receipt-text')));
   }
 });
 

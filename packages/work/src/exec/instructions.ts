@@ -48,10 +48,18 @@ export type InstructionRefusalKind =
   | 'origin-policy'
   | 'unverified-consumed';
 
+/** Fixed diagnostic only; it never changes admission or contains a relay key. */
+export type InvocationRefusalCode =
+  | 'invocation-source-absent'
+  | 'invocation-version-missing'
+  | 'invocation-read-failed'
+  | 'invocation-receipt-moved';
+
 export interface InstructionRefusal {
   ok: false;
   reason: string;
   kind: InstructionRefusalKind;
+  code?: InvocationRefusalCode;
 }
 
 export interface ResolvedCommand {
@@ -161,11 +169,13 @@ function refusal(
   kind: InstructionRefusalKind,
   order: OrderPacket,
   detail: string,
+  code?: InvocationRefusalCode,
 ): InstructionRefusal {
   const digest = order.defDigest === undefined || order.defDigest === '' ? '<missing>' : order.defDigest;
   return {
     ok: false,
     kind,
+    ...(code === undefined ? {} : { code }),
     reason: `instruction refusal (${kind}) for ${order.workflow}/${order.run} step '${order.step}' defDigest '${digest}': ${detail}`,
   };
 }
@@ -449,18 +459,22 @@ export function createStoreInstructionResolver(
         (step) => (step.calls !== undefined || step.callsInterface !== undefined) && step.produces.some((produce) => produce.stem === path),
       );
       if (callsStep?.callsInterface?.selection === 'invocation') {
-        if (!options.invocationBindingSource) return refusal('unverified-consumed', order, 'dynamic relay requires a trusted InvocationBindingSource');
+	if (!options.invocationBindingSource) return refusal('unverified-consumed', order,
+	  'dynamic relay requires a trusted InvocationBindingSource', 'invocation-source-absent');
         const version = order.consumedFingerprint?.[path];
-        if (version === undefined) return refusal('unverified-consumed', order, 'dynamic relay requires the parent artifact version');
+	if (version === undefined) return refusal('unverified-consumed', order,
+	  'dynamic relay requires the parent artifact version', 'invocation-version-missing');
         const key = { parentWorkflow: order.workflow, parentDefRef: { bundleDigest: resolved.bundleDigest, workflowName: resolved.definition.name },
           callPath: path, parentArtifactVersion: version };
         let trusted: VerifiedInvocationReceipt | undefined;
         try { trusted = await options.invocationBindingSource.read(key); }
-        catch (error) { return refusal('unverified-consumed', order, `trusted invocation read failed: ${errorText(error)}`); }
+	catch (error) { return refusal('unverified-consumed', order,
+	  `trusted invocation read failed: ${errorText(error)}`, 'invocation-read-failed'); }
         if (!trusted || valueDigestHex(trusted.receipt) !== trusted.receiptDigest
           || valueDigestHex(trusted.receipt.parentDefRef) !== valueDigestHex(key.parentDefRef)
           || trusted.receipt.callPath !== path || trusted.receipt.parentArtifactVersion !== version) {
-          return refusal('unverified-consumed', order, 'trusted invocation receipt is missing or moved');
+	  return refusal('unverified-consumed', order,
+	    'trusted invocation receipt is missing or moved', 'invocation-receipt-moved');
         }
         receipts.push(trusted);
         producers[path] = { step: callsStep.name, target: trusted.receipt.childDefRef.workflowName,

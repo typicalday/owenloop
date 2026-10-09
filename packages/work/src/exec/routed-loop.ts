@@ -13,7 +13,7 @@ import { routedWorkerEnv } from '../roles/routing-role-env.ts';
 import type { CommandResult, GroupSettlement, RoutedCommandRunner, RoutedRunningCommand } from './runner.ts';
 import { readPayloadFile, resolvePayload, type ParsedPayload } from './payload.ts';
 import { buildReceipt, type CommandReceipt } from './receipt.ts';
-import type { InstructionRefusalKind } from './instructions.ts';
+import type { InstructionRefusalKind, InvocationRefusalCode } from './instructions.ts';
 import { deliverConsumes, deliverFeedback, deliverPayloadFile, removeConsumesDir,
   type ExecLoop, type ExecLoopOptions, type ExecOutcome } from './loop.ts';
 
@@ -68,11 +68,22 @@ const PRESTART_REFUSAL_KINDS: Record<InstructionRefusalKind, true> = {
   integrity: true, 'no-digest': true, 'missing-command': true,
   'unverified-def': true, 'origin-policy': true, 'unverified-consumed': true,
 };
+const PRESTART_REFUSAL_CODES: Record<InvocationRefusalCode, true> = {
+  'invocation-source-absent': true, 'invocation-version-missing': true,
+  'invocation-read-failed': true, 'invocation-receipt-moved': true,
+};
 function prestartRefusalKind(value: unknown): string {
   if (value === null || typeof value !== 'object') return 'unclassified';
   const kind = (value as { kind?: unknown }).kind;
   return typeof kind === 'string' && Object.hasOwn(PRESTART_REFUSAL_KINDS, kind)
     ? kind : 'unclassified';
+}
+function prestartRefusalLabel(value: unknown): string {
+  const kind = prestartRefusalKind(value);
+  if (value === null || typeof value !== 'object' || !Object.hasOwn(value, 'code')) return kind;
+  const code = (value as { code?: unknown }).code;
+  return `${kind}; ${typeof code === 'string' && Object.hasOwn(PRESTART_REFUSAL_CODES, code)
+    ? code : 'unclassified'}`;
 }
 
 export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecutionController): ExecLoop {
@@ -280,7 +291,7 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
       const prestartRefusal = resolved.revalidate && await awaitBounded('signed prestart revalidation',
 	resolved.revalidate, startupDeadlineAt);
       if (prestartRefusal)
-	throw new Error(`signed command changed before prestart (${prestartRefusalKind(prestartRefusal)})`);
+	throw new Error(`signed command changed before prestart (${prestartRefusalLabel(prestartRefusal)})`);
       if (!active()) throw new Error('stopped before prestart');
       const prepared = await awaitBounded('prestart', () => control.prestart(order, abort.signal),
 	startupDeadlineAt);

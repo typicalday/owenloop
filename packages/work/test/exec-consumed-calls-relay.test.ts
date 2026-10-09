@@ -489,7 +489,20 @@ test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted 
   await refused({ ...packet, consumedFingerprint: { ...packet.consumedFingerprint, one: 999 } });
   const absent = await resolver().resolveCommand(packet);
   assert.equal(absent.ok, false);
-  if (!absent.ok) assert.match(absent.reason, /InvocationBindingSource/);
+  if (!absent.ok) {
+    assert.match(absent.reason, /InvocationBindingSource/);
+    assert.equal(absent.code, 'invocation-source-absent');
+  }
+  const noVersion = await resolver(source).resolveCommand({ ...packet,
+    consumedFingerprint: { two: packet.consumedFingerprint!.two! } });
+  assert.equal(noVersion.ok, false);
+  if (!noVersion.ok) assert.equal(noVersion.code, 'invocation-version-missing');
+  const missingReceipt = await resolver({ read: () => undefined }).resolveCommand(packet);
+  assert.equal(missingReceipt.ok, false);
+  if (!missingReceipt.ok) assert.equal(missingReceipt.code, 'invocation-receipt-moved');
+  const failedRead = await resolver({ read: () => { throw new Error('private relay failure'); } }).resolveCommand(packet);
+  assert.equal(failedRead.ok, false);
+  if (!failedRead.ok) assert.equal(failedRead.code, 'invocation-read-failed');
   await refused(packet, { read: () => undefined });
   await refused(packet, { read: () => { throw new Error('unavailable'); } });
   f.engine.cancelRun(workflow);
