@@ -73,8 +73,9 @@ test('combined recorded parser binds both occurrence members and refuses skipped
   const composite = { protocol: 'routed-recorded-input-pair-v2', phase: 'recorded-live', ...valid };
   assert.deepEqual(parseRoutedServiceRecordedPairV2(composite, expected), valid);
   const mixed = structuredClone(composite);
-  (mixed.claim as Extract<RecordedClaimV2, { state: 'available' }>).
-    binding.recordedOccurrence.reportDigest = 'f'.repeat(64);
+  const mixedClaim = mixed.claim as Extract<RecordedClaimV2, { state: 'available' }>;
+  mixedClaim.binding = { ...mixedClaim.binding,
+    recordedOccurrence: { ...mixedClaim.binding.recordedOccurrence, reportDigest: 'f'.repeat(64) } };
   assert.throws(() => parseRoutedServiceRecordedPairV2(mixed, expected));
   assert.throws(() => parseRoutedServiceRecordedPairV2({ ...composite, phase: 'prestart' }, expected));
   assert.throws(() => parseRoutedServiceRecordedPairV2({ ...composite,

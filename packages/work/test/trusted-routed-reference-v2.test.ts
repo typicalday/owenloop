@@ -74,7 +74,8 @@ test('combined prestart parser accepts only two exact current members and explic
   const composite = { protocol: 'routed-prestart-input-pair-v2', phase: 'prestart', ...valid };
   assert.deepEqual(parseRoutedServicePrestartPairV2(composite, expected), valid);
   const mixed = structuredClone(composite);
-  (mixed.claim as Extract<RoutedClaimV2, { state: 'available' }>).binding.orderDigest = 'e'.repeat(64);
+  const mixedClaim = mixed.claim as Extract<RoutedClaimV2, { state: 'available' }>;
+  mixedClaim.binding = { ...mixedClaim.binding, orderDigest: 'e'.repeat(64) };
   assert.throws(() => parseRoutedServicePrestartPairV2(mixed, expected));
   assert.throws(() => parseRoutedServicePrestartPairV2({ ...composite, phase: 'recorded-live' }, expected));
   assert.throws(() => parseRoutedServicePrestartPairV2({ ...composite, extra: true }, expected));
