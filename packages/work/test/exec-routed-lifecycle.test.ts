@@ -145,6 +145,33 @@ test('signed prestart revalidation logs only its closed refusal kind before any 
   }
 });
 
+test('signed postrun revalidation logs only its closed refusal kind after freeze', async () => {
+  for (const [kind, code, expected] of [
+    ['unverified-consumed', 'invocation-read-failed', 'unverified-consumed; invocation-read-failed'],
+    ['private-kind', 'private-code', 'unclassified; unclassified'],
+  ] as const) {
+    const events: string[] = [], errors: string[] = [];
+    const { opts, starts } = fixture(events);
+    opts.err = line => errors.push(line);
+    opts.instructions = {
+      async resolveCommand() { throw new Error('ordinary command resolver used'); },
+      async resolveRoutedCommandDefinition() { return { ok: true, command: 'printf hello',
+	inputWitnessRequired: true,
+	revalidateAfterRun: async () => ({ ok: false, kind: kind as 'unverified-consumed',
+	  code: code as 'invocation-read-failed',
+	  reason: 'private proof, bearer, and input value must stay hidden' }) }; },
+      async resolveStep() { throw new Error('unused'); },
+    };
+    assert.equal(await createExecLoop(opts).run(), 'unresolved-instructions');
+    assert.equal(starts(), 1);
+    assert.ok(events.includes('freeze') && events.includes('group-empty'));
+    assert.ok(!events.includes('parent-postrun'));
+    assert.ok(errors.some(line => line.includes(`signed command changed after run (${expected})`)));
+    assert.ok(errors.every(line => !line.includes('private proof') && !line.includes('bearer')
+      && !line.includes('input value') && !line.includes('private-kind') && !line.includes('private-code')));
+  }
+});
+
 test('stalled original-session first contact is bounded without ordinary release', async () => {
   const events: string[] = [];
   const { opts, starts } = fixture(events, { prestartDeadlineMs: 15, leaseRpcDeadlineMs: 25 });

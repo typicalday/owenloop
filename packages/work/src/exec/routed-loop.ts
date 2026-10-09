@@ -326,9 +326,10 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
 	throw new Error('command output is incomplete');
       const parsed = resolvePayload({ payloadLine: result.payloadLine,
 	payloadOverCap: result.payloadOverCap, file: readPayloadFile(payload.file) });
-      if (resolved.revalidateAfterRun && await awaitBounded('signed postrun revalidation',
-	resolved.revalidateAfterRun, closureDeadlineAt!))
-	throw new Error('signed command changed after run');
+      const postrunRefusal = resolved.revalidateAfterRun && await awaitBounded(
+	'signed postrun revalidation', resolved.revalidateAfterRun, closureDeadlineAt!);
+      if (postrunRefusal)
+	throw new Error(`signed command changed after run (${prestartRefusalLabel(postrunRefusal)})`);
       if (!active()) return quarantine('stopped before parent postrun');
       const receipt = buildReceipt(result, { command: resolved.command,
 	orchestrator: opts.holder.id, workflow: opts.workflow, run: opts.run, step: order.step }, parsed);
