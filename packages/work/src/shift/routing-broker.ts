@@ -400,21 +400,13 @@ function quiesceGrant(grant: Grant): Promise<RoutedQuiesceResult> {
   return grant.quiesceResult;
 }
 
-async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
-  phase: RoutedInputPhase, now: () => number): Promise<RoutedInputPair | undefined> {
-  const authority = grant.submissionAuthority;
-  if (!authority || !response.lease.claimed || !response.order)
-    throw new Error('routing order authority unavailable');
-  // The legacy strict verifier continues to cover the v1 path. Optional and
-  // human input admission requires this additional parent-owned Service pair.
-  if (!grant.inputAuthority) {
-    await checked(grant, authority.verifyOrder(response), now);
-    return undefined;
-  }
-  if (phase === 'recorded-live' && (!grant.acceptedLaunchReport || !liveChildValid(grant, now())))
-    throw new Error('routing recorded occurrence unavailable');
-  const pair = await checked(grant, grant.inputAuthority.observe(response, phase),
-    now, phase === 'prestart');
+/** Apply the same exact grant binding to a pair already fully verified by the
+ * parent stage. This is synchronous and never caches a witness across reads. */
+function acceptVerifiedPair(grant: Grant, pair: RoutedInputPair,
+  phase: RoutedInputPhase, now: () => number): void {
+  if (phase === 'prestart' ? !validateLaunchGrant(grant, now())
+    : !grant.acceptedLaunchReport || !liveChildValid(grant, now()))
+    throw new Error('routing input grant changed');
   if (phase === 'prestart') {
     const expected = { workflow: grant.reservation.workflow, run: grant.reservation.run };
     const reference = parseRoutedReferenceV2(pair.reference, expected);
@@ -444,6 +436,24 @@ async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
       || !liveChildValid(grant, now()))
       throw new Error('routing recorded input changed');
   }
+}
+
+async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
+  phase: RoutedInputPhase, now: () => number): Promise<RoutedInputPair | undefined> {
+  const authority = grant.submissionAuthority;
+  if (!authority || !response.lease.claimed || !response.order)
+    throw new Error('routing order authority unavailable');
+  // The legacy strict verifier continues to cover the v1 path. Optional and
+  // human input admission requires this additional parent-owned Service pair.
+  if (!grant.inputAuthority) {
+    await checked(grant, authority.verifyOrder(response), now);
+    return undefined;
+  }
+  if (phase === 'recorded-live' && (!grant.acceptedLaunchReport || !liveChildValid(grant, now())))
+    throw new Error('routing recorded occurrence unavailable');
+  const pair = await checked(grant, grant.inputAuthority.observe(response, phase),
+    now, phase === 'prestart');
+  acceptVerifiedPair(grant, pair, phase, now);
   return pair;
 }
 
@@ -1612,7 +1622,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       return response;
     }
     case 'read_invocation_binding': {
-      if (scope !== 'role' || !grant.inputAuthority?.observeInvocation
+      if (scope !== 'role' || !grant.submissionAuthority
+	|| !grant.inputAuthority?.observeInvocation
 	|| !exactKeys(body, ['parentWorkflow', 'parentDefRef', 'callPath', 'parentArtifactVersion']))
 	throw new Error('routing broker request refused');
       if (typeof body.parentWorkflow !== 'string' || !body.parentWorkflow
@@ -1625,6 +1636,8 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (grant.acceptedLaunchReport && !liveChildValid(grant, now()))
 	throw new Error('routing recorded occurrence unavailable');
       const phase: RoutedInputPhase = grant.acceptedLaunchReport ? 'recorded-live' : 'prestart';
+      if (signal.aborted || phase === 'prestart' && !validateLaunchGrant(grant, now()))
+	throw new Error('routing invocation grant unavailable');
       const key: InvocationRelayKey = { parentWorkflow: body.parentWorkflow as string,
 	parentDefRef: { bundleDigest: body.parentDefRef.bundleDigest as string,
 	  workflowName: body.parentDefRef.workflowName as string },
@@ -1632,12 +1645,22 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	parentArtifactVersion: body.parentArtifactVersion as number };
       if (grant.inputAuthority.validateInvocationKey?.(key) !== true)
 	throw new Error('routing invocation key refused');
-      const response = await verifyCurrentConsequence(grant, scope, now, signal, phase);
-      if (!response || !liveChildValid(grant, now()) && phase === 'recorded-live')
+      if (!grant.execHolderId) throw new Error('routing order holder unavailable');
+      const holder: ContactHolder = { kind: 'exec', id: grant.execHolderId,
+	shiftId: grant.identity.shiftId };
+      const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder }, signal),
+	now, phase === 'prestart');
+      if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order
+	|| phase !== (grant.acceptedLaunchReport ? 'recorded-live' : 'prestart')
+	|| phase === 'recorded-live' && !liveChildValid(grant, now()))
 	throw new Error('routing invocation order unavailable');
       const observed = await checked(grant,
 	grant.inputAuthority.observeInvocation(response, phase, key), now, phase === 'prestart');
-      if (!observed.relay || phase === 'recorded-live' && !liveChildValid(grant, now()))
+      if (signal.aborted || !observed.relay
+	|| phase !== (grant.acceptedLaunchReport ? 'recorded-live' : 'prestart'))
+	throw new Error('routing invocation witness unavailable');
+      acceptVerifiedPair(grant, observed.pair, phase, now);
+      if (signal.aborted || phase === 'recorded-live' && !liveChildValid(grant, now()))
 	throw new Error('routing invocation witness unavailable');
       return observed.relay;
     }

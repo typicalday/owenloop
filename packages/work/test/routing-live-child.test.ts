@@ -56,6 +56,7 @@ async function waitFor(path: string): Promise<void> {
 test('only the retained exact child after gate entry can read a recorded occurrence', async () => {
   const root = mkdtempSync(join(tmpdir(), 'routed-live-child-'));
   let now = 2_000;
+  let liveIdentity = identity;
   let reportDigest = '';
   const verbs: string[] = [];
   const hub = createHubClient({ origin, getToken: async () => 'enrolled',
@@ -113,6 +114,10 @@ test('only the retained exact child after gate entry can read a recorded occurre
   const phases: string[] = [];
   const invocationPhases: string[] = [];
   let invocationReads = 0;
+  let pauseInvocation = false;
+  let invocationEntered!: () => void;
+  let resumeInvocation!: () => void;
+  const invocationStarted = new Promise<void>(resolve => { invocationEntered = resolve; });
   const invocationKey = { workflow: 'wf', orderId: 'run', parentWorkflow: 'frame',
     parentDefRef: { bundleDigest: 'sha256:bundle', workflowName: 'wf' },
     callPath: 'child', parentArtifactVersion: 1 };
@@ -126,7 +131,7 @@ test('only the retained exact child after gate entry can read a recorded occurre
     : { protocol: 'routing-claim-read-v2', state: 'available', ...expected,
 	routing, binding: referenceBinding };
   const grant = broker.issue({ reservation: reserved.reservation, routing, identity,
-    currentIdentity: () => identity, hub,
+    currentIdentity: () => liveIdentity, hub,
     routedV2Read: prestartRead,
     routedLiveV2Read: liveRead as NonNullable<Parameters<typeof broker.issue>[0]['routedLiveV2Read']>,
     inputAuthority: { validateInvocationKey: key => key.parentWorkflow === 'frame'
@@ -136,6 +141,10 @@ test('only the retained exact child after gate entry can read a recorded occurre
       observeInvocation: async (_response, phase) => {
 	invocationReads++;
 	invocationPhases.push(phase);
+	if (pauseInvocation) {
+	  invocationEntered();
+	  await new Promise<void>(resolve => { resumeInvocation = resolve; });
+	}
 	return { pair: phase === 'prestart'
 	  ? { reference: await prestartRead('reference') as RoutedReferenceV2,
 	    claim: await prestartRead('claim') as RoutedClaimV2 }
@@ -212,6 +221,22 @@ test('only the retained exact child after gate entry can read a recorded occurre
       await assert.rejects(client.readInvocationBinding(changed), /routing broker unavailable/);
     assert.equal(invocationReads, 0, 'wrong key cannot trigger direct parent relay reads');
     assert.equal(verbs.length, beforeInvalidKey, 'wrong key is refused before a scoped order read');
+    const beforePrestartOrder = verbs.filter(verb => verb === 'get_order').length;
+    const beforePrestartBinder = phases.length;
+    assert.deepEqual(await client.readInvocationBinding(invocationKey), invocationRelay);
+    assert.equal(verbs.filter(verb => verb === 'get_order').length, beforePrestartOrder + 1);
+    assert.equal(phases.length, beforePrestartBinder,
+      'one invocation request does not run a separate full input observation');
+    assert.deepEqual(invocationPhases, ['prestart']);
+    assert.deepEqual(await client.readInvocationBinding(invocationKey), invocationRelay);
+    assert.equal(verbs.filter(verb => verb === 'get_order').length, beforePrestartOrder + 2,
+      'a later invocation socket request obtains another current order');
+    assert.equal(phases.length, beforePrestartBinder);
+    now = 70_000;
+    await assert.rejects(client.readInvocationBinding(invocationKey), /routing broker unavailable/);
+    assert.equal(verbs.filter(verb => verb === 'get_order').length, beforePrestartOrder + 2,
+      'an expired startup preference refuses before the parent order read');
+    now = 2_000;
     assert.equal((await client.heartbeat({ ...expected, holder: { kind: 'exec',
 	id: `${hostname()}:${record.pid}`, shiftId: 'shf_service' } })).text, 'ok');
     assert.equal(phases.at(-1), 'prestart');
@@ -226,7 +251,7 @@ test('only the retained exact child after gate entry can read a recorded occurre
       observation: { state: 'unknown' } } });
     await assert.rejects(client.readInvocationBinding(invocationKey), /routing broker unavailable/,
       'accepted report without entered child cannot downgrade to prestart read');
-    assert.equal(invocationReads, 0);
+    assert.equal(invocationReads, 2);
     assert.equal((await send(grant.cap, 'read_live_routed_reference_v2', {})).ok, false,
       'an accepted report before direct-child gate entry grants no live read');
     writeFileSync(permit, 'go');
@@ -235,8 +260,12 @@ test('only the retained exact child after gate entry can read a recorded occurre
     assert.equal(retainedChildLive(spawned.custody, spawned.pid), true,
       'successful IPC disconnect is not role exit');
     assert.deepEqual(terminalReasons, []);
+    const beforeRecordedOrder = verbs.filter(verb => verb === 'get_order').length;
+    const beforeRecordedBinder = phases.length;
     assert.deepEqual(await client.readInvocationBinding(invocationKey), invocationRelay);
-    assert.deepEqual(invocationPhases, ['recorded-live']);
+    assert.equal(verbs.filter(verb => verb === 'get_order').length, beforeRecordedOrder + 1);
+    assert.equal(phases.length, beforeRecordedBinder);
+    assert.deepEqual(invocationPhases, ['prestart', 'prestart', 'recorded-live']);
     await assert.rejects(createRoutingChildClient({ ...handoff,
       broker: grant.holder! }).readInvocationBinding(invocationKey), /routing broker unavailable/);
     now = 70_000;
@@ -248,12 +277,23 @@ test('only the retained exact child after gate entry can read a recorded occurre
       'elapsed startup preference does not end an entered child claim');
     assert.equal((await client.readLiveRoutingClaimV2(expected)).state, 'available');
     badMode = 'frame';
+    await assert.rejects(client.readInvocationBinding(invocationKey), /routing broker unavailable/,
+      'a verified relay cannot excuse a moved recorded frame');
     await assert.rejects(client.readLiveRoutingClaimV2(expected), /routing broker unavailable/);
     badMode = 'reservation';
     await assert.rejects(client.readLiveRoutedReferenceV2(expected), /routing broker unavailable/);
     badMode = 'report';
     await assert.rejects(client.readLiveRoutingClaimV2(expected), /routing broker unavailable/);
     badMode = undefined;
+    pauseInvocation = true;
+    const pendingInvocation = client.readInvocationBinding(invocationKey);
+    await invocationStarted;
+    liveIdentity = { ...identity, sessionId: 'rs_rotated' };
+    resumeInvocation();
+    await assert.rejects(pendingInvocation, /routing broker unavailable/,
+      'a revoked original session cannot return an awaited relay');
+    liveIdentity = identity;
+    pauseInvocation = false;
     const previousCalls = verbs.length;
     delayed = true;
     const pending = client.readLiveRoutedReferenceV2(expected);
