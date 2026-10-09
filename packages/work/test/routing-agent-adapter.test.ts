@@ -5,13 +5,17 @@ import { createRoutedAgentAdapterGate } from '../src/roles/routing-agent-adapter
 
 const launch = { generation: 'one-use', onLaunch: () => {} };
 const args = {} as Parameters<NonNullable<HarnessAdapter['startRouted']>>[0];
+const base = (id: string, start: HarnessAdapter['start']): HarnessAdapter => ({
+  id, resumeTier: 'native-token', preflight: () => [], start,
+  deliver: async () => {}, stop: async () => {},
+});
 
 test('an adapter without retained routed custody is ineligible and never uses ordinary start', async () => {
   let ordinaryStarts = 0;
-  const ordinary = { id: 'ordinary', start: async () => {
+  const ordinary = base('ordinary', async () => {
     ordinaryStarts++;
     return { harness: 'ordinary', token: 'unexpected' };
-  } } as HarnessAdapter;
+  });
   const gate = createRoutedAgentAdapterGate(id => id === ordinary.id ? ordinary : undefined,
     () => [ordinary.id]);
   assert.equal(gate.harnessAvailable(ordinary.id), false);
@@ -22,15 +26,19 @@ test('an adapter without retained routed custody is ineligible and never uses or
 
 test('routed start uses the exact captured adapter and callable after registry replacement', async () => {
   const starts: string[] = [];
-  const first = { id: 'managed', startRouted: async (_args: unknown, _event: unknown,
+  const first: HarnessAdapter = { ...base('managed', async () => {
+    throw new Error('ordinary start must not run');
+  }), startRouted: async (_args: unknown, _event: unknown,
     request: { generation: string }) => {
     starts.push(`first:${request.generation}`);
     return { harness: 'managed', token: 'first' };
-  } } as HarnessAdapter;
-  const replacement = { id: 'managed', startRouted: async () => {
+  } };
+  const replacement: HarnessAdapter = { ...base('managed', async () => {
+    throw new Error('ordinary start must not run');
+  }), startRouted: async () => {
     starts.push('replacement');
     return { harness: 'managed', token: 'replacement' };
-  } } as HarnessAdapter;
+  } };
   const registry = new Map([[first.id, first]]);
   const gate = createRoutedAgentAdapterGate(id => registry.get(id), () => [...registry.keys()]);
   assert.equal(gate.harnessAvailable(first.id), true);

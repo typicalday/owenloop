@@ -27,7 +27,7 @@ export function createRoutedAgentAdapterGate(
       const adapter = lookup(id), start = adapter?.startRouted;
       const eligible = adapter?.id === id && typeof start === 'function'
 	&& (!selected || selected.id === id && selected.adapter === adapter && selected.start === start);
-      if (eligible && adapter && start && !selected) selected = { id, adapter, start };
+      if (eligible && adapter && !selected) selected = { id, adapter, start };
       return { id: id || '<none>', ...(eligible && adapter ? { adapter } : {}),
 	registered: registered() };
     },
