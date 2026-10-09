@@ -782,7 +782,8 @@ async function readDispatchedConditionalAck(grant: Grant, now: () => number,
 	if (!validConditionalReceiptResponse(observed.result)) break;
 	if (diagnosticOrigin === 'agent-outcome' && agentSolePending && !commandPostrun
 	  && observed.result.closed === true
-	  && ['green', 'submitted', 'approved'].includes(observed.result.outcome))
+	  && (observed.result.outcome === 'green' || observed.result.outcome === 'submitted'
+	    || observed.result.outcome === 'approved'))
 	  countDiagnostic(grant, 'agentOutcomeCommittedClosedReceipts');
 	return observed.result;
       }
@@ -1243,7 +1244,8 @@ async function agentOutcome(grant: Grant, body: unknown, now: () => number,
 	countDiagnostic(grant, 'agentOutcomeUncertainReturns');
 	return { claim: 'uncertain' };
       }
-      if (response.closed === true && ['green', 'submitted', 'approved'].includes(response.outcome))
+      if (response.closed === true && (response.outcome === 'green'
+	|| response.outcome === 'submitted' || response.outcome === 'approved'))
 	countDiagnostic(grant, 'agentOutcomeRecoveredClosedSubmits');
       recordAgentAck(grant, 'submit', response.closed === true);
       grant.pendingSubmit = undefined;
