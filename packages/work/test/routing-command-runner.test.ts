@@ -366,23 +366,36 @@ test('still-held parent postrun makes one scoped finish after one physical comma
 
 test('operator stop settles the real command group before one scoped finish and no postrun', async () => {
   const f = await fixture({ command: 'printf x >> started.txt; exec sleep 30' });
+  let prepared: Awaited<ReturnType<typeof prepareRoutedCommandRunner>> | undefined;
+  let running: Promise<string> | undefined;
   try {
-    const prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
+    prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
       originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
       out: () => {}, err: line => f.errors.push(line) });
-    const running = prepared.run();
+    running = prepared.run();
+    let terminal: string | undefined;
+    void running.then(value => { terminal = `resolved:${value}`; },
+      error => { terminal = `rejected:${String(error)}`; });
     const marker = join(f.root, 'work', rootWorkflow, run, 'started.txt');
-    for (let i = 0; i < 500 && !existsSync(marker); i++)
+    let markerContent = '';
+    for (let i = 0; i < 500; i++) {
+      if (existsSync(marker)) markerContent = readFileSync(marker, 'utf8');
+      if (markerContent !== '' || terminal !== undefined) break;
       await new Promise<void>(resolve => setTimeout(resolve, 10));
-    assert.equal(readFileSync(marker, 'utf8'), 'x', f.errors.join('\n'));
+    }
+    assert.equal(markerContent, 'x',
+      `marker=${JSON.stringify(markerContent)}; terminal=${terminal ?? 'pending'}; events=${f.events.join(',')}; errors=${f.errors.join('|')}`);
     prepared.loop.stop();
     assert.equal(await running, 'killed', f.errors.join('\n'));
+    assert.equal(readFileSync(marker, 'utf8'), 'x', 'physical start marker changed after stop');
     assert.equal(f.events.filter(method => method === 'reserve_launch').length, 1);
     assert.equal(f.events.filter(method => method === 'report_launch').length, 1);
     assert.equal(f.events.filter(method => method === 'quiesce').length, 1);
     assert.equal(f.events.filter(method => method === 'command_postrun').length, 0);
     assert.equal(f.events.filter(method => method === 'command_finish').length, 1);
   } finally {
+    prepared?.loop.stop();
+    if (running !== undefined) await running.catch(() => {});
     await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
     f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });
   }
