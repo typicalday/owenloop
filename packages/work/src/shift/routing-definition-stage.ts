@@ -21,6 +21,7 @@ import { bindTrustedRoutedInputV2, type RoutedInputPair, type RoutedInputPhase }
 import { validModelOrderFields, outputFor } from '../order-definition-binding.ts';
 import { createStoreInstructionResolver } from '../exec/instructions.ts';
 import { createParentRoutedInvocationSource } from './routing-invocation-source.ts';
+import { RoutedInputWitnessRefusal } from './routing-input-refusal.ts';
 import { parseRoutedReferenceV2, parseRoutedClaimV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import type { DefRef, InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
@@ -606,9 +607,10 @@ export async function stageRoutedDefinition(args: {
 	  expected: { workflow: args.rootWorkflow, run: args.order.run },
 	  ...(routed.started ? { startedAt: routed.started.wall,
 	    startedMonotonic: routed.started.monotonic } : {}) });
-	if (!admission.ok || (order.worker === 'command'
-	  && (typeof verifiedStep.command !== 'string' || !verifiedStep.command.trim())))
-	  throw new Error('routed input witness refused');
+	if (!admission.ok) throw new RoutedInputWitnessRefusal(admission.reason);
+	if (order.worker === 'command'
+	  && (typeof verifiedStep.command !== 'string' || !verifiedStep.command.trim()))
+	  throw new RoutedInputWitnessRefusal('command-definition-missing');
       } else if (order.worker === 'command') {
 	const checked = await resolver.resolveCommand(order);
 	if (!checked.ok) throw new Error('routed command definition refused');

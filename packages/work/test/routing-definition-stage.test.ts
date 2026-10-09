@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
+import { RoutedInputWitnessRefusal } from '../src/shift/routing-input-refusal.ts';
 import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
 import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
@@ -423,9 +424,22 @@ test('parent signed stage admits an exact Service input-derived cwd witness and 
     const changed = structuredClone(pair);
     if (changed.reference.state !== 'available') assert.fail('missing witness');
     changed.reference.workdirInput!.value = { path: f.stateDir };
-    await assert.rejects(stage.verifyRoutedInput!(response, changed, 'prestart'),
-      /routed input witness refused/);
+    await assert.rejects(stage.verifyRoutedInput!(response, changed, 'prestart'), error => {
+      assert.ok(error instanceof RoutedInputWitnessRefusal);
+      assert.equal(error.message, 'routed input witness refused');
+      assert.equal(error.code, 'workdir-value-mismatch');
+      assert.ok(!JSON.stringify(error).includes(f.stateDir));
+      return true;
+    });
   } finally { stage.cleanup(); }
+});
+
+test('routed witness diagnostic maps arbitrary verifier text to a closed code', () => {
+  const refusal = new RoutedInputWitnessRefusal('token=/private/input/value');
+  assert.equal(refusal.message, 'routed input witness refused');
+  assert.equal(refusal.code, 'unclassified');
+  assert.ok(!String(refusal.stack).includes('/private/input/value'));
+  assert.ok(!JSON.stringify(refusal).includes('/private/input/value'));
 });
 
 test('routed role opens only the staged public definition store', async () => {
