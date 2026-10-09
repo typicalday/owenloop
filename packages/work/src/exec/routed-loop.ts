@@ -18,7 +18,7 @@ import { deliverConsumes, deliverFeedback, deliverPayloadFile, removeConsumesDir
 
 export interface RoutedPostrunResult {
   /** Only a parent-owned, scoped receipt authority may report these outcomes. */
-  outcome: 'submitted' | 'rejected' | 'judge-rejected' | 'command-failed';
+  outcome: 'submitted' | 'submit-rejected' | 'rejected' | 'judge-rejected' | 'command-failed';
   claim: 'closed' | 'held' | 'uncertain';
 }
 

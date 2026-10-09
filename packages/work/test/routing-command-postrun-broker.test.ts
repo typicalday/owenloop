@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,7 +50,8 @@ async function waitFor(path: string): Promise<void> {
   throw new Error('routed child did not enter');
 }
 
-for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submit-ack', 'no-start',
+for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submit-ack', 'schema-rejected',
+  'born-rejected', 'no-start',
   'ask-closed', 'ask-lost-ack', 'reject-held', 'reject-closed',
   'reject-lost-ack', 'collection', 'collection-lost-seal-ack', 'multi-output'] as const) test(
   `post-quiesce role data reaches only parent signed conditional submit once (${scenario})`, async () => {
@@ -84,13 +86,18 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
     : scenario === 'multi-output' ? multiOrder : order;
   const witnesses = rejection ? [{ path: 'source', version: 1, present: inputPresent,
     ...(inputPresent ? { value: { bad: true } } : {}) }] : [];
-  const requests: Array<{ route: string; body: unknown; session: string | null }> = [];
+  const requests: Array<{ route: string; body: unknown; rawBody: string;
+    session: string | null; intent: string | null }> = [];
   const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
     routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
     fetchImpl: (async (url, init) => {
       const route = String(url).split('/api/')[1]!;
-      const body = init?.body ? JSON.parse(String(init.body)) as unknown : undefined;
-      requests.push({ route, body, session: new Headers(init?.headers).get('X-Owenloop-Routing-Session') });
+      const rawBody = init?.body ? String(init.body) : '';
+      const body = rawBody ? JSON.parse(rawBody) as unknown : undefined;
+      const headers = new Headers(init?.headers);
+      requests.push({ route, body, rawBody,
+	session: headers.get('X-Owenloop-Routing-Session'),
+	intent: headers.get('X-Owenloop-Routing-Intent') });
       if (route === 'get_order') return Response.json({ text: 'ok', workflow: 'frame', run: 'run',
         lease: { claimed: !closed }, order: closed ? null : activeOrder });
       if (route === 'reserve_launch') return Response.json({ reservationId: 'lr_one',
@@ -125,12 +132,28 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
           throw new Error('lost seal ACK');
         return Response.json({
         outcome: 'sealed', closed: true, conditionApplied: 'routed-collection-seal-v1' }); }
-      if (route === 'submit/conditional-v1') {
-        submits++;
-        if (scenario === 'lost-submit-ack' && submits === 1) throw new Error('lost ACK');
-        closed = scenario !== 'multi-output' && scenario !== 'submit-held' || submits === 2;
-        return Response.json({ outcome: 'submitted', closed,
-          conditionApplied: 'expected-version-v1' }); }
+      if (route === 'routing_submit_conditional_receipt/v1') {
+	assert.ok(scenario === 'lost-submit-ack' || scenario === 'schema-rejected'
+	  || scenario === 'born-rejected');
+	return Response.json({ state: 'committed', result: scenario === 'lost-submit-ack'
+	  ? { text: 'accepted', outcome: 'submitted', closed: true,
+	    conditionApplied: 'routed-conditional-receipt-v1' }
+	  : scenario === 'born-rejected'
+	    ? { text: 'native CAS lost', outcome: 'born-rejected', closed: true,
+	      conditionApplied: 'routed-conditional-receipt-v1' }
+	  : { text: 'schema refused', outcome: 'schema-rejected', issues: [],
+	    conditionApplied: 'routed-conditional-receipt-v1' } });
+      }
+      if (route === 'routing_submit_conditional_receipt_revoke/v1')
+	return Response.json({ revoked: true });
+      if (route === 'routing_submit_conditional/v1') {
+	submits++;
+	closed = scenario !== 'multi-output' && scenario !== 'submit-held' || submits === 2;
+	if (scenario === 'lost-submit-ack' && submits === 1) throw new Error('lost ACK');
+	if (scenario === 'schema-rejected') { closed = false; throw new Error('lost schema ACK'); }
+	if (scenario === 'born-rejected') throw new Error('lost CAS ACK');
+	return Response.json({ text: 'accepted', outcome: 'submitted', closed,
+	  conditionApplied: 'routed-conditional-receipt-v1' }); }
       if (route === 'routing_session_close') return Response.json({ closed: true });
       throw new Error(`unexpected ${route}`);
     }) as typeof fetch });
@@ -210,7 +233,7 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       assert.equal((await client.commandFinish({ observation: 'not-started' })).state, 'released');
       assert.equal((await client.commandFinish({ observation: 'not-started' })).state, 'released');
       assert.equal(requests.filter(row => row.route === 'release').length, 1);
-      assert.equal(requests.filter(row => row.route === 'submit/conditional-v1').length, 0);
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional/v1').length, 0);
       return;
     }
     const result = { exitCode: scenario === 'ask-closed' || scenario === 'ask-lost-ack' ? 1 : 0,
@@ -229,12 +252,13 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
     if (scenario === 'drift-after-sign') {
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
       assert.equal(signs, 1);
-      assert.equal(requests.filter(row => row.route === 'submit/conditional-v1').length, 0,
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional/v1').length, 0,
         'a changed recorded witness after signing cannot publish a receipt');
       assert.equal((await client.commandFinish({ group: packet.group })).state, 'uncertain');
       return;
     }
-    if (scenario === 'lost-submit-ack' || scenario === 'collection-lost-seal-ack')
+    if (scenario === 'lost-submit-ack' || scenario === 'born-rejected'
+      || scenario === 'collection-lost-seal-ack')
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
     if (scenario === 'ask-lost-ack' || scenario === 'reject-lost-ack') {
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
@@ -242,8 +266,29 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       const route = scenario === 'ask-lost-ack' ? 'routing_ask/v1' : 'routing_reject/v1';
       assert.equal(requests.filter(row => row.route === route).length, 1,
         'a lost ACK cannot issue a fresh ask or reject');
-      assert.equal(requests.filter(row => row.route === 'submit/conditional-v1').length, 0);
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional/v1').length, 0);
       assert.equal((await client.commandFinish({ group: packet.group })).state, 'uncertain');
+      return;
+    }
+    if (scenario === 'schema-rejected') {
+      await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
+      assert.deepEqual(await client.commandPostrun(packet),
+	{ outcome: 'submit-rejected', claim: 'held' });
+      assert.deepEqual(await client.commandPostrun(packet),
+	{ outcome: 'submit-rejected', claim: 'held' });
+      assert.equal(signs, 1);
+      assert.equal(submits, 1, 'an immutable command receipt cannot mint another intent');
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional_receipt/v1').length, 1);
+      assert.equal((await client.commandFinish({ group: packet.group })).state, 'released');
+      return;
+    }
+    if (scenario === 'born-rejected') {
+      assert.deepEqual(await client.commandPostrun(packet),
+	{ outcome: 'submit-rejected', claim: 'closed' });
+      assert.equal((await client.commandFinish({ group: packet.group })).state, 'already-closed');
+      assert.equal(signs, 1);
+      assert.equal(submits, 1);
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional_receipt/v1').length, 1);
       return;
     }
     const expectedOutcome = scenario === 'ask-closed' ? 'command-failed'
@@ -258,17 +303,26 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
     assert.equal(signs, scenario === 'ask-closed' || scenario === 'reject-closed' ? 0
       : scenario === 'collection' || scenario === 'collection-lost-seal-ack'
         || scenario === 'multi-output' ? 2 : 1);
-    assert.equal(requests.filter(row => row.route === 'submit/conditional-v1').length,
-      scenario === 'lost-submit-ack' || scenario === 'multi-output' ? 2 : scenario === 'ask-closed'
+    assert.equal(requests.filter(row => row.route === 'routing_submit_conditional/v1').length,
+      scenario === 'multi-output' ? 2 : scenario === 'ask-closed'
         || scenario === 'reject-closed' || scenario === 'collection'
         || scenario === 'collection-lost-seal-ack' ? 0 : 1);
+    if (scenario === 'lost-submit-ack') {
+      const write = requests.find(row => row.route === 'routing_submit_conditional/v1')!;
+      const read = requests.find(row => row.route === 'routing_submit_conditional_receipt/v1')!;
+      assert.equal((read.body as { intentId: string }).intentId, write.intent);
+      assert.equal((read.body as { requestDigest: string }).requestDigest,
+	createHash('sha256').update(write.rawBody).digest('hex'));
+      assert.equal(requests.slice(requests.indexOf(write) + 1).some(row => row.route === 'get_order'), false,
+	'closed-run reconciliation performs no new order read');
+    }
     if (scenario === 'collection' || scenario === 'collection-lost-seal-ack') {
       assert.deepEqual(requests.filter(row => row.route.startsWith('routing_collection_'))
         .map(row => row.route), ['routing_collection_member_issue/v1',
 	'routing_collection_member_emit/v1', 'routing_collection_seal/v1',
 	...(scenario === 'collection-lost-seal-ack' ? ['routing_collection_seal/v1'] : [])]);
     }
-    const write = requests.find(row => row.route === 'submit/conditional-v1');
+    const write = requests.find(row => row.route === 'routing_submit_conditional/v1');
     if (write) {
       assert.equal(write.session, credential);
       assert.equal((write.body as { proof: string }).proof, 'parent-proof');

@@ -357,7 +357,7 @@ export function createRoutingChildClient(handoff: {
       const value = await exchange<unknown>('command_postrun', req);
       if (!value || typeof value !== 'object' || Array.isArray(value)
         || Object.keys(value).sort().join(',') !== 'claim,outcome'
-        || !['submitted', 'rejected', 'judge-rejected', 'command-failed'].includes(
+	|| !['submitted', 'submit-rejected', 'rejected', 'judge-rejected', 'command-failed'].includes(
           String((value as Record<string, unknown>).outcome))
         || !['closed', 'held', 'uncertain'].includes(String((value as Record<string, unknown>).claim)))
         throw refused();

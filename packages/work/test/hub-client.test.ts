@@ -151,6 +151,43 @@ test('conditional submit does not fall back to legacy submit when the route is a
   assert.deepEqual(captured.map((request) => request.url), ['https://hub.example/api/submit/conditional-v1']);
 });
 
+test('routed conditional transport preserves frozen body and exact original-session receipt routes', async () => {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const c = createHubClient({ origin: 'https://hub.example', getToken: async () => 'server-bearer',
+    routingSession: { allowedOrigin: 'https://hub.example', get: () => ({
+      sessionId: 'rs', shiftId: 'shf', credential: 'private-session', expiresAt: 2000,
+    }), now: () => 1000 },
+    fetchImpl: (async (url, init) => {
+      requests.push({ url: String(url), init: init! });
+      return Response.json(requests.length === 1
+	? { text: 'accepted', outcome: 'green', closed: true,
+	  conditionApplied: 'routed-conditional-receipt-v1' }
+	: { state: 'committed', result: { text: 'accepted', outcome: 'green', closed: true,
+	  conditionApplied: 'routed-conditional-receipt-v1' } });
+    }) as typeof fetch,
+  });
+  const rawBody = String.raw`{"workflow":"wf","run":"run","value":{"n":1},"proof":"p"}`;
+  const intentId = 'a'.repeat(32);
+  const mutation = await c.routingConditionalMutation({ intentId, rawBody });
+  assert.equal(mutation.conditionApplied, 'routed-conditional-receipt-v1');
+  const holder = { kind: 'exec' as const, id: 'host:123', shiftId: 'shf' };
+  const receipt = await c.routingConditionalReceipt({ workflow: 'wf', run: 'run', intentId,
+    requestDigest: 'b'.repeat(64), holder });
+  assert.equal(receipt.state, 'committed');
+  assert.deepEqual(requests.map(row => row.url), [
+    'https://hub.example/api/routing_submit_conditional/v1',
+    'https://hub.example/api/routing_submit_conditional_receipt/v1',
+  ]);
+  assert.equal(requests[0]!.init.body, rawBody, 'mutation sends byte-identical frozen JSON text');
+  assert.equal(new Headers(requests[0]!.init.headers).get('x-owenloop-routing-intent'), intentId);
+  for (const row of requests) {
+    assert.equal(row.init.redirect, 'error');
+    assert.equal(new Headers(row.init.headers).get('authorization'), 'Bearer server-bearer');
+    assert.equal(new Headers(row.init.headers).get('x-owenloop-routing-session'), 'private-session');
+    assert.equal(String(row.init.body).includes('private-session'), false);
+  }
+});
+
 test('reject POSTs /api/reject without a client-supplied by field', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'rejected', ok: true, closed: false } }));

@@ -31,6 +31,11 @@ import type {
   AskResponse,
   ConditionalSubmitRequest,
   ConditionalSubmitResponse,
+  RoutedConditionalMutationRequest,
+  RoutedConditionalMutationResponse,
+  RoutedConditionalReceiptRequest,
+  RoutedConditionalReceiptResponse,
+  RoutedConditionalRetryIssueResponse,
   GetRostersResponse,
   ListHarnessModelsResponse,
   ListPendingApprovalsResponse,
@@ -185,6 +190,10 @@ export interface RoutingHubClient extends HubClient {
   routingHeartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
   routingSubmit(req: SubmitRequest, signal?: AbortSignal): Promise<SubmitResponse>;
   routingSubmitConditional(req: ConditionalSubmitRequest, signal?: AbortSignal): Promise<ConditionalSubmitResponse>;
+  routingConditionalMutation(req: RoutedConditionalMutationRequest, signal?: AbortSignal): Promise<RoutedConditionalMutationResponse>;
+  routingConditionalReceipt(req: RoutedConditionalReceiptRequest, signal?: AbortSignal): Promise<RoutedConditionalReceiptResponse>;
+  routingConditionalRetryIssue(req: RoutedConditionalReceiptRequest, signal?: AbortSignal): Promise<RoutedConditionalRetryIssueResponse>;
+  routingConditionalRevoke(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<{ revoked: true }>;
   routingRelease(req: { workflow: string; run: string; reason?: string }, signal?: AbortSignal): Promise<ReleaseResponse>;
   routingAsk(req: AskRequest, signal?: AbortSignal): Promise<AskResponse>;
   routingReject(req: RejectRequest, signal?: AbortSignal): Promise<RejectResponse>;
@@ -291,6 +300,44 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
 	throw error;
       }
       return await res.json() as T;
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
+  async function scopedConditionalMutation(req: RoutedConditionalMutationRequest,
+    signal?: AbortSignal): Promise<RoutedConditionalMutationResponse> {
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password
+      || !/^[a-f0-9]{32,64}$/.test(req.intentId)
+      || (req.generationToken !== undefined && !/^[a-f0-9]{64}$/.test(req.generationToken))
+      || typeof req.rawBody !== 'string' || Buffer.byteLength(req.rawBody, 'utf8') === 0
+      || Buffer.byteLength(req.rawBody, 'utf8') > 32 * 1024 * 1024)
+      throw new Error('routing conditional request refused');
+    const session = routing.get();
+    if (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
+      throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      headers['X-Owenloop-Routing-Session'] = session.credential;
+      headers['X-Owenloop-Routing-Intent'] = req.intentId;
+      if (req.generationToken) headers['X-Owenloop-Routing-Generation'] = req.generationToken;
+      routing.beforeRequest?.();
+      const res = await fetchImpl(`${base}/api/routing_submit_conditional/v1`, {
+	method: 'POST', headers, body: req.rawBody, redirect: 'error',
+	...(signal === undefined ? {} : { signal }),
+      });
+      if (!res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) routing.onRateLimit?.(error);
+	throw error;
+      }
+      return await res.json() as RoutedConditionalMutationResponse;
     } catch (error) {
       if (error instanceof HubError) throw error;
       throw new Error('routing request failed');
@@ -442,6 +489,10 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     routingHeartbeat: (req, signal) => scopedPost('heartbeat', req, signal),
     routingSubmit: (req, signal) => scopedPost('submit', req, signal),
     routingSubmitConditional: (req, signal) => scopedPost('submit/conditional-v1', req, signal),
+    routingConditionalMutation: (req, signal) => scopedConditionalMutation(req, signal),
+    routingConditionalReceipt: (req, signal) => scopedPost('routing_submit_conditional_receipt/v1', req, signal),
+    routingConditionalRetryIssue: (req, signal) => scopedPost('routing_submit_conditional_retry_issue/v1', req, signal),
+    routingConditionalRevoke: (req, signal) => scopedPost('routing_submit_conditional_receipt_revoke/v1', req, signal),
     routingRelease: (req, signal) => scopedPost('release', req, signal),
     routingAsk: (req, signal) => scopedPost('routing_ask/v1', req, signal),
     routingReject: (req, signal) => scopedPost('routing_reject/v1', req, signal),

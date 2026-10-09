@@ -91,7 +91,10 @@ interface Grant {
   acceptedLaunchReport?: string;
   submissionAuthority?: RoutedSubmissionAuthority;
   submitBusy?: boolean;
-  pendingSubmit?: { intent: string; binding: string; request: import('../hub/types.ts').ConditionalSubmitRequest };
+  pendingSubmit?: { intent: string; binding: string;
+    request: import('../hub/types.ts').ConditionalSubmitRequest;
+    intentId: string; requestDigest: string; rawBody: string; generationToken?: string };
+  conditionalTouched?: boolean;
   launchAuthority?: RoutedLaunchAuthority;
   collectionBusy?: boolean;
   collectionMember?: { intent: string; issue: RoutedMemberIssueRequest;
@@ -465,6 +468,47 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
     const intent = valueDigestHex({ path, value, done: body.done ?? null, holder });
     if (grant.pendingSubmit && grant.pendingSubmit.intent !== intent)
       throw new Error('routing submission outcome unresolved');
+    if (grant.pendingSubmit) {
+      const pending = grant.pendingSubmit;
+      const reference = { workflow: pending.request.workflow, run: pending.request.run,
+	intentId: pending.intentId, requestDigest: pending.requestDigest,
+	holder: pending.request.holder as import('../hub/types.ts').RoutedCollectionHolder };
+      const observed = await checked(grant, grant.hub.routingConditionalReceipt(reference, signal), now);
+      if (observed.state === 'committed') {
+	const response = observed.result;
+	if (!validConditionalReceiptResponse(response))
+	  throw new Error('routing submission receipt refused');
+	if (!parentPostrun || response.outcome === 'green' || response.outcome === 'submitted'
+	  || response.outcome === 'approved') grant.pendingSubmit = undefined;
+	return response;
+      }
+      if (observed.state !== 'unavailable' || !pending.binding)
+	throw new Error('routing submission outcome unresolved');
+      // Only Service can terminalize the old generation. Its issued token
+      // permits the identical frozen bytes once under the original live claim.
+      const issued = await checked(grant, grant.hub.routingConditionalRetryIssue(reference, signal), now);
+      if (!issued || issued.requestDigest !== pending.requestDigest
+	|| !Number.isSafeInteger(issued.generation) || issued.generation < 1
+	|| !/^[a-f0-9]{64}$/.test(issued.generationToken))
+	throw new Error('routing submission retry authority refused');
+      const fresh = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+	run: grant.reservation.run, holder }, signal), now);
+      if (submissionBinding(fresh, path, grant) !== pending.binding
+	|| authority.canReplay?.(fresh.order!, path) !== true)
+	throw new Error('routing submission retry order changed');
+      await verifyParentOrder(grant, fresh, 'recorded-live', now);
+      if (submissionBinding(fresh, path, grant) !== pending.binding)
+	throw new Error('routing submission retry order changed');
+      pending.generationToken = issued.generationToken;
+      const replay = await checked(grant, startEffect(grant, () => grant.hub.routingConditionalMutation({
+	intentId: pending.intentId, rawBody: pending.rawBody,
+	generationToken: pending.generationToken }, signal)), now);
+      if (!validConditionalReceiptResponse(replay))
+	throw new Error('routing submission retry response refused');
+	if (!parentPostrun || replay.outcome === 'green' || replay.outcome === 'submitted'
+	  || replay.outcome === 'approved') grant.pendingSubmit = undefined;
+	return replay;
+    }
     const fresh = await checked(grant, grant.hub.getOrder({
       workflow: grant.reservation.workflow, run: grant.reservation.run, holder,
     }, signal), now);
@@ -474,11 +518,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       throw new Error('routing submission order changed');
     if (authority.canSubmit?.(fresh.order!, path) !== true)
       throw new Error('routing submission kind unavailable');
-    if (grant.pendingSubmit && grant.pendingSubmit.binding !== binding)
-      throw new Error('routing submission outcome unresolved');
-    if (grant.pendingSubmit && authority.canReplay?.(fresh.order!, path) !== true)
-      throw new Error('routing submission outcome unresolved');
-    if (!grant.pendingSubmit) {
+    {
       const proof = await checked(grant, authority.sign(fresh.order!, path, value), now);
       if (typeof proof !== 'string' || !proof) throw new Error('routing submission proof refused');
       // Signing and source verification await external work. Refresh again;
@@ -491,21 +531,26 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       await verifyParentOrder(grant, current, 'recorded-live', now);
       if (submissionBinding(current, path, grant) !== binding)
 	throw new Error('routing submission order changed');
-      grant.pendingSubmit = { intent, binding, request: {
-	workflow: grant.reservation.workflow, run: grant.reservation.run, path,
+      const request = { workflow: grant.reservation.workflow, run: grant.reservation.run, path,
 	value, holder, proof, expectedVersion: outputVersionForSubmission(fresh.order!, path)!,
-	...(body.done === undefined ? {} : { done: body.done as boolean }),
-      } };
+	done: body.done === undefined ? true : body.done as boolean };
+      const rawBody = JSON.stringify(request);
+      if (Buffer.byteLength(rawBody, 'utf8') > MAX_LINE)
+	throw new Error('routing submission frame refused');
+      grant.pendingSubmit = { intent, binding, request,
+	intentId: randomBytes(16).toString('hex'), rawBody,
+	requestDigest: createHash('sha256').update(rawBody, 'utf8').digest('hex') };
+      grant.conditionalTouched = true;
     }
     const response = await checked(grant,
-      startEffect(grant, () => grant.hub.routingSubmitConditional(grant.pendingSubmit!.request, signal)), now);
-    if (!response || response.conditionApplied !== 'expected-version-v1'
-      || typeof response.outcome !== 'string' || !response.outcome
-      || (response.closed !== undefined && typeof response.closed !== 'boolean'))
+      startEffect(grant, () => grant.hub.routingConditionalMutation({
+	intentId: grant.pendingSubmit!.intentId, rawBody: grant.pendingSubmit!.rawBody }, signal)), now);
+    if (!validConditionalReceiptResponse(response))
       throw new Error('routing broker response refused');
     // A missing/malformed/failed acknowledgement preserves the one exact
     // request, including its signature. It cannot become a new signed write.
-    grant.pendingSubmit = undefined;
+    if (!parentPostrun || response.outcome === 'green' || response.outcome === 'submitted'
+      || response.outcome === 'approved') grant.pendingSubmit = undefined;
     return response;
   } finally { grant.submitBusy = false; }
 }
@@ -552,6 +597,34 @@ function collectionReceiptOnly(grant: Grant, now: () => number): boolean {
   return (grant.terminalReason === 'normal-close' || grant.terminalReason === 'receipt-pending')
     && grant.receiptUntil !== undefined
     && now() < grant.receiptUntil && collectionOriginalSession(grant, now);
+}
+
+function conditionalReceiptRequest(grant: Grant) {
+  const pending = grant.pendingSubmit;
+  if (!pending) throw new Error('routing submission receipt unavailable');
+  return { workflow: pending.request.workflow, run: pending.request.run,
+    intentId: pending.intentId, requestDigest: pending.requestDigest,
+    holder: pending.request.holder as import('../hub/types.ts').RoutedCollectionHolder };
+}
+function validConditionalReceiptResponse(value: unknown): value is import('../hub/types.ts').RoutedConditionalMutationResponse {
+  if (!value || typeof value !== 'object'
+    || (value as { conditionApplied?: unknown }).conditionApplied !== 'routed-conditional-receipt-v1')
+    return false;
+  const response = value as { outcome?: unknown; closed?: unknown };
+  if (response.outcome === 'green' || response.outcome === 'submitted' || response.outcome === 'approved')
+    return typeof response.closed === 'boolean';
+  if (response.outcome === 'born-rejected') return response.closed === true;
+  return (response.outcome === 'schema-rejected' || response.outcome === 'group-rejected')
+    && response.closed === undefined;
+}
+async function conditionalReconcile(grant: Grant, now: () => number,
+  signal: AbortSignal): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {
+  if (!collectionReceiptOnly(grant, now)) throw new Error('routing submission receipt unavailable');
+  const result = await grant.hub.routingConditionalReceipt(conditionalReceiptRequest(grant), signal);
+  if (!collectionReceiptOnly(grant, now) || result.state !== 'committed'
+    || !validConditionalReceiptResponse(result.result))
+    throw new Error('routing submission outcome unresolved');
+  return result.result;
 }
 
 async function collectionOrder(grant: Grant, sealPath: string, holder: RoutedCollectionHolder,
@@ -829,7 +902,11 @@ async function commandPostrun(grant: Grant, body: unknown, now: () => number,
       // the original session; a fresh get_order now correctly refuses.
       const exactSealReplay = kind === 'collection' && !!grant.collectionSeal?.request
         && !grant.collectionSeal.result;
-      if (!exactSealReplay) {
+      // A terminal conditional submit may have committed before its ACK was
+      // lost. Its frozen receipt is readable without get_order; the closed
+      // native claim deliberately refuses a fresh order read.
+      const exactSubmitReplay = kind === 'singleton' && !!grant.pendingSubmit;
+      if (!exactSealReplay && !exactSubmitReplay) {
         const fresh = await verifyCurrentConsequence(grant, 'role', now, signal);
         if (!fresh?.order?.owes.some(owe => owe.path === path))
           throw new Error('routing command output target changed');
@@ -843,11 +920,18 @@ async function commandPostrun(grant: Grant, body: unknown, now: () => number,
           throw new Error('routing command collection outcome unresolved');
         pending.terminalClosed = answer.seal.closed;
       } else {
-        const answer = await perform('submit', () => submitFromParent(grant,
-          { path, value: pending.snapshot.receipt(), holder }, now, signal, true)) as
-          import('../hub/types.ts').ConditionalSubmitResponse;
-        if (answer.outcome !== 'green' && answer.outcome !== 'submitted')
-          throw new Error('routing command submit refused');
+	const answer = await perform('submit', () => submitFromParent(grant,
+	  { path, value: pending.snapshot.receipt(), holder }, now, signal, true)) as
+	  import('../hub/types.ts').RoutedConditionalMutationResponse;
+	if (answer.outcome !== 'green' && answer.outcome !== 'submitted') {
+	  // Native CAS loss is an authenticated failed-run close. Schema and
+		  // other accepted refusals require a fresh held-claim witness before the
+		  // role can finish. No later owed path receives this immutable receipt.
+	  const claim = answer.closed === true ? 'closed' : await postrunClaim(grant, now, signal);
+	  grant.pendingSubmit = undefined;
+	  grant.uncertainEffects.delete('submit'); grant.syncUncertainty?.();
+	  return pending.result = { outcome: 'submit-rejected', claim };
+	}
         if (typeof answer.closed !== 'boolean')
           throw new Error('routing command submit closure unavailable');
         pending.terminalClosed = answer.closed;
@@ -1552,7 +1636,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       const terminate = (requested: 'normal-close' | 'child-exit' | 'revoked' = 'revoked'): Promise<void> | void => {
 	void quiesceGrant(grant);
 	if (grant.liveChild) grant.liveChild.terminal = true;
-	const frozen = !!(grant.collectionMember?.emit || grant.collectionSeal?.request);
+	const frozen = !!(grant.collectionMember?.emit || grant.collectionSeal?.request || grant.pendingSubmit);
 	const reason = requested === 'child-exit'
 	  ? frozen ? 'receipt-pending' : 'revoked' : requested;
 	if (terminal === 'revoked') return grant.revokeResult;
@@ -1574,13 +1658,14 @@ export async function createRoutingBroker(args: { now?: () => number;
 	  tombstoneTimer = setTimeout(() => {
 	    if (grant.terminalReason === 'normal-close' || grant.terminalReason === 'receipt-pending') {
 	      const unresolved = !!((grant.collectionMember?.emit && !grant.collectionMember.result)
-		|| (grant.collectionSeal?.request && !grant.collectionSeal.result));
+		|| (grant.collectionSeal?.request && !grant.collectionSeal.result)
+		|| grant.pendingSubmit);
 	      if (unresolved) outcomeUncertain = true;
 	      grant.receiptUntil = undefined;
 	      grants.delete(cap);
 	      if (holderCap) grants.delete(holderCap);
 	      terminators.delete(grant);
-	      settleTombstone?.(unresolved ? new Error('routing collection outcome quarantined') : undefined);
+	      settleTombstone?.(unresolved ? new Error('routing receipt outcome quarantined') : undefined);
 	    }
 	  }, remaining);
 	  tombstoneTimer.unref();
@@ -1592,12 +1677,18 @@ export async function createRoutingBroker(args: { now?: () => number;
 	      const kind = grant.collectionMember?.emit && !grant.collectionMember.result
 		? 'member' : grant.collectionSeal?.request && !grant.collectionSeal.result
 		  ? 'seal' : undefined;
-	      if (!kind) return;
+	      if (!kind && !grant.pendingSubmit) return;
 	      try {
-		const result = await collectionReconcile(grant, kind, now, AbortSignal.timeout(10_000));
-		if (kind === 'member' && grant.collectionMember) grant.collectionMember.result = result;
-		if (kind === 'seal' && grant.collectionSeal) grant.collectionSeal.result = result;
-		grant.uncertainEffects.delete(kind === 'member' ? 'emit_member' : 'seal_collection');
+		if (kind) {
+		  const result = await collectionReconcile(grant, kind, now, AbortSignal.timeout(10_000));
+		  if (kind === 'member' && grant.collectionMember) grant.collectionMember.result = result;
+		  if (kind === 'seal' && grant.collectionSeal) grant.collectionSeal.result = result;
+		  grant.uncertainEffects.delete(kind === 'member' ? 'emit_member' : 'seal_collection');
+		} else {
+		  await conditionalReconcile(grant, now, AbortSignal.timeout(10_000));
+		  grant.pendingSubmit = undefined;
+		  grant.uncertainEffects.delete('submit');
+		}
 		grant.syncUncertainty?.();
 		delay = 100;
 	      } catch (error) {
@@ -1613,12 +1704,18 @@ export async function createRoutingBroker(args: { now?: () => number;
 	if (tombstoneTimer) clearTimeout(tombstoneTimer);
 	grant.receiptUntil = undefined;
 	if ((grant.collectionMember?.emit && !grant.collectionMember.result)
-	  || (grant.collectionSeal?.request && !grant.collectionSeal.result))
+	  || (grant.collectionSeal?.request && !grant.collectionSeal.result)
+	  || grant.pendingSubmit)
 	  outcomeUncertain = true;
-	if (grant.collectionMember || grant.collectionSeal) {
-	  const revoke = hub.routingCollectionRevoke({ workflow: reservation.workflow,
-	    run: reservation.run }, AbortSignal.timeout(10_000)).then(result => {
-	    if (!result || result.revoked !== true) throw new Error('routing collection revocation refused');
+	if (grant.collectionMember || grant.collectionSeal || grant.conditionalTouched) {
+	  const revoke = Promise.all([
+	    ...(grant.collectionMember || grant.collectionSeal ? [hub.routingCollectionRevoke({
+	      workflow: reservation.workflow, run: reservation.run }, AbortSignal.timeout(10_000))] : []),
+	    ...(grant.conditionalTouched ? [hub.routingConditionalRevoke({
+	      workflow: reservation.workflow, run: reservation.run }, AbortSignal.timeout(10_000))] : []),
+	  ]).then(results => {
+	    if (results.some(result => !result || result.revoked !== true))
+	      throw new Error('routing receipt revocation refused');
 	  });
 	  grant.revokeResult = revoke;
 	  revocations.add(revoke);
@@ -1707,6 +1804,12 @@ export async function createRoutingBroker(args: { now?: () => number;
 	if (grant.collectionSeal?.request && !grant.collectionSeal.result)
 	  grant.collectionSeal.result = await collectionReconcile(grant, 'seal', now,
 	    AbortSignal.timeout(10_000));
+	if (grant.pendingSubmit) {
+	  await conditionalReconcile(grant, now, AbortSignal.timeout(10_000));
+	  grant.pendingSubmit = undefined;
+	  grant.uncertainEffects.delete('submit');
+	  grant.syncUncertainty?.();
+	}
       });
       const drained = await Promise.allSettled([
 	...pending.filter((value): value is Promise<void> => value !== undefined),

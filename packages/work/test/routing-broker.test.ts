@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
@@ -433,7 +434,8 @@ test('child transport keeps lifecycle bound to one live session after launch win
       calls.push({ verb, body: JSON.parse(String(init?.body)) as Record<string, unknown>, headers: new Headers(init?.headers) });
       if (verb === 'get_order') return Response.json({ ...orderResponse, order: { ...orderResponse.order, routing, defDigest: 'a'.repeat(64), step: 'producer', key: '', inputs: [], consumes: {}, consumedFingerprint: {}, owes: [{ path: 'out', version: 1 }] } });
       if (verb === 'heartbeat') return Response.json({ text: 'ok', ok: true });
-      if (verb === 'submit/conditional-v1') return Response.json({ text: 'ok', outcome: 'submitted', closed: true, conditionApplied: 'expected-version-v1' });
+      if (verb === 'routing_submit_conditional/v1') return Response.json({ text: 'ok', outcome: 'submitted', closed: true, conditionApplied: 'routed-conditional-receipt-v1' });
+      if (verb === 'routing_submit_conditional_receipt_revoke/v1') return Response.json({ revoked: true });
       if (verb === 'release') return Response.json({ text: 'ok', released: true });
       throw new Error('unexpected routed request');
     }) as typeof fetch,
@@ -466,17 +468,17 @@ test('child transport keeps lifecycle bound to one live session after launch win
       orderId: 'run', attemptId: 'run', rosterRevision: 'roster-v1', candidateIds: [],
       assessmentId: null, requested: null, selected: null,
     } }), /routing broker unavailable/);
-    assert.deepEqual(calls.map(call => call.verb), ['get_order', 'heartbeat', 'get_order', 'get_order', 'submit/conditional-v1', 'release']);
+    assert.deepEqual(calls.map(call => call.verb), ['get_order', 'heartbeat', 'get_order', 'get_order', 'routing_submit_conditional/v1', 'release']);
     for (const call of calls) {
       assert.equal(call.headers.get('Authorization'), 'Bearer enrolled');
       assert.equal(call.headers.get('X-Owenloop-Routing-Session'), credential);
       assert.equal(call.body.workflow, 'wf');
       assert.equal(call.body.run, 'run');
     }
-    grant.terminal();
+    await grant.terminal();
     await assert.rejects(client.heartbeat({ workflow: 'wf', run: 'run', holder }), /routing broker unavailable/);
     current = { ...identity, sessionId: 'rs_changed' };
-    assert.equal(calls.length, 6);
+    assert.equal(calls.length, 7);
   } finally { await broker.close(); }
 });
 
@@ -1155,8 +1157,9 @@ test('routed submit rejects child proofs and signs normalized exact current meta
       const route = String(url).split('/api/')[1]!;
       calls.push({ route, body: JSON.parse(String(init!.body)) as Record<string, unknown> });
       if (route === 'get_order') return Response.json(parentOrder());
-      assert.equal(route, 'submit/conditional-v1');
-      return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+      if (route === 'routing_submit_conditional_receipt_revoke/v1') return Response.json({ revoked: true });
+      assert.equal(route, 'routing_submit_conditional/v1');
+      return Response.json({ text: 'ok', outcome: 'submitted', closed: false, conditionApplied: 'routed-conditional-receipt-v1' });
     }) as typeof fetch,
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
@@ -1175,7 +1178,7 @@ test('routed submit rejects child proofs and signs normalized exact current meta
     assert.equal(signed.length, 1);
     assert.deepEqual((signed[0] as { value: unknown }).value, { ok: true });
     assert.deepEqual(calls.at(-1)!.body, { workflow: 'wf', run: 'run', path: 'out',
-      value: { ok: true }, holder, proof: 'parent-only-proof', expectedVersion: 1 });
+      value: { ok: true }, holder, proof: 'parent-only-proof', expectedVersion: 1, done: true });
   } finally { await broker.close(); }
 });
 
@@ -1208,16 +1211,29 @@ test('parent signing rechecks changed targets and revoked grants without sending
 });
 
 test('uncertain singleton retry preserves exact parent signature and refuses changed payload', async () => {
-  for (const canReplay of [true, false]) {
+  for (const mode of ['retry', 'no-replay', 'pending'] as const) {
+    const canReplay = mode === 'retry';
     const writes: string[] = [];
+    let retryIssues = 0;
     let signatures = 0;
     const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
       routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
       fetchImpl: (async (url, init) => {
-	if (String(url).endsWith('/get_order')) return Response.json(parentOrder());
+	const route = String(url).split('/api/')[1]!;
+	if (route === 'get_order') return Response.json(parentOrder());
+	if (route === 'routing_submit_conditional_receipt/v1')
+	  return Response.json({ state: mode === 'pending' ? 'pending' : 'unavailable' });
+	if (route === 'routing_submit_conditional_receipt_revoke/v1') return Response.json({ revoked: true });
+	if (route === 'routing_submit_conditional_retry_issue/v1') { retryIssues++; return Response.json({
+	  generation: 1, generationToken: 'e'.repeat(64), expiresAt: 80_000,
+	  requestDigest: (JSON.parse(String(init!.body)) as { requestDigest: string }).requestDigest,
+	}); }
+	assert.equal(route, 'routing_submit_conditional/v1');
 	writes.push(String(init!.body));
 	if (writes.length === 1) throw new Error('response lost');
-	return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+	assert.equal(new Headers(init!.headers).get('X-Owenloop-Routing-Generation'), 'e'.repeat(64));
+	return Response.json({ text: 'ok', outcome: 'submitted', closed: false,
+	  conditionApplied: 'routed-conditional-receipt-v1' });
       }) as typeof fetch,
     });
     const broker = await createRoutingBroker({ now: () => 2_000 });
@@ -1233,6 +1249,8 @@ test('uncertain singleton retry preserves exact parent signature and refuses cha
       assert.equal((await send({ ok: false })).ok, false, 'uncertain write cannot become a different write');
       assert.equal((await send({ ok: true })).ok, canReplay);
       assert.equal(signatures, 1);
+      assert.equal(retryIssues, mode === 'pending' ? 0 : 1,
+	'pending original generation does not grant a second write');
       assert.equal(writes.length, canReplay ? 2 : 1);
       if (canReplay) assert.equal(writes[0], writes[1], 'signature, target and value bytes identical');
     } finally {
@@ -1240,6 +1258,52 @@ test('uncertain singleton retry preserves exact parent signature and refuses cha
       else await assert.rejects(broker.close(), /quarantined/);
     }
   }
+});
+
+test('natural child exit after a lost terminal submit ACK keeps exact receipt-only custody', async () => {
+  const routes: string[] = [];
+  let grant: ReturnType<Awaited<ReturnType<typeof createRoutingBroker>>['issue']> | undefined;
+  let intentId = '';
+  let digest = '';
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+    fetchImpl: (async (url, init) => {
+      const route = String(url).split('/api/')[1]!;
+      routes.push(route);
+      if (route === 'get_order') return Response.json(parentOrder());
+      if (route === 'routing_submit_conditional/v1') {
+	intentId = new Headers(init!.headers).get('X-Owenloop-Routing-Intent')!;
+	digest = createHash('sha256').update(String(init!.body)).digest('hex');
+	grant?.terminal('child-exit');
+	throw new Error('terminal ACK lost');
+      }
+      if (route === 'routing_submit_conditional_receipt/v1') {
+	const query = JSON.parse(String(init!.body)) as { intentId: string; requestDigest: string };
+	assert.equal(query.intentId, intentId);
+	assert.equal(query.requestDigest, digest);
+	return Response.json({ state: 'committed', result: { text: 'accepted', outcome: 'submitted',
+	  closed: true, conditionApplied: 'routed-conditional-receipt-v1' } });
+      }
+      throw new Error(`unexpected routed request ${route}`);
+    }) as typeof fetch,
+  });
+  const broker = await createRoutingBroker({ now: () => 2_000 });
+  try {
+    grant = broker.issue({ reservation, routing, identity, currentIdentity: () => identity, hub,
+      submissionAuthority: { verifyOrder: async () => {}, canSubmit: () => true,
+	sign: async () => 'parent-proof' } });
+    grant.activate(child);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'get_order',
+      body: { holder } })).ok, true);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'submit',
+      body: { path: 'out', value: { completed: true }, holder } })).ok, false);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap, method: 'submit',
+      body: { path: 'out', value: { completed: true }, holder } })).ok, false);
+    await broker.close();
+    assert.equal(routes.filter(route => route === 'routing_submit_conditional/v1').length, 1);
+    assert.ok(routes.includes('routing_submit_conditional_receipt/v1'));
+    assert.equal(routes.includes('routing_submit_conditional_receipt_revoke/v1'), false);
+  } finally { await broker.close().catch(() => {}); }
 });
 
 test('a valid issued seal target still cannot sign or send a dynamic collection member', async () => {
@@ -1296,8 +1360,11 @@ test('malformed routed value never signs or writes and a corrected object remain
     routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
     fetchImpl: (async (url) => {
       if (String(url).endsWith('/get_order')) return Response.json(parentOrder());
+      if (String(url).endsWith('/routing_submit_conditional_receipt_revoke/v1'))
+	return Response.json({ revoked: true });
       writes++;
-      return Response.json({ text: 'ok', outcome: 'submitted', conditionApplied: 'expected-version-v1' });
+      return Response.json({ text: 'ok', outcome: 'submitted', closed: false,
+	conditionApplied: 'routed-conditional-receipt-v1' });
     }) as typeof fetch,
   });
   const broker = await createRoutingBroker({ now: () => 2_000 });
