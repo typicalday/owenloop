@@ -30,7 +30,8 @@ import { HubError, type GetOrderResponse, type OrderPacket, type WorkOrder } fro
 import {
   createBundleIngestor, createExecutionDefinitionVerifier, createExecutionOriginVerifier,
   createPreCommitVerifier, createStoreInstructionSource, globalStoreRoot,
-  parseWorkflowCoordinate, readWorkflowStoreIndex, resolveOriginRules, storeIndexPath,
+  defDigest, parseWorkflowCoordinate, readWorkflowStoreIndex, resolveOriginRules, storeIndexPath,
+  verifyWorkflowObjectSync,
 } from '../../../../src/store/index.ts';
 
 export interface RoutedDefinitionStage {
@@ -88,6 +89,24 @@ function originNamespacesForObject(
     ...coordinates.map(coordinate => parseWorkflowCoordinate(coordinate).namespace),
     ...Object.keys(manifest.workflows).filter(name => name.includes('/')).map(name => name.split('/')[0]!),
   ])];
+}
+
+/** Final current-object fence after asynchronous publication/origin checks.
+ * Every signed support object is verified synchronously against its manifest
+ * and canonical digest, with no awaited work between objects and the final
+ * policy/custody reads. This validates current bytes without coordinating a
+ * repair or accepting a replacement object during the final fence. */
+export function verifyRoutedSupportObjectsSync(
+  support: readonly { bundleDigest: string; objectPath: string }[],
+): void {
+  const checked = new Set<string>();
+  for (const object of support) {
+    const identity = `${object.bundleDigest}\0${object.objectPath}`;
+    if (checked.has(identity)) continue;
+    checked.add(identity);
+    verifyWorkflowObjectSync(object.objectPath, defDigest(object.bundleDigest),
+      { coordinateRepair: false });
+  }
 }
 
 function processLiveness(pid: number): boolean | undefined {
@@ -665,6 +684,7 @@ export async function stageRoutedDefinition(args: {
 	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
 	finalVerdicts.push({ object, verdict });
       }
+      if (routing !== undefined) verifyRoutedSupportObjectsSync(currentSupport);
       const finalRules = resolveOriginRules(args.sourceEnv);
       const finalIndex = readWorkflowStoreIndex(storeIndexPath(root));
       for (const { object, verdict } of finalVerdicts) {

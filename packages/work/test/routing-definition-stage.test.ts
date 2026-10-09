@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
+import { createRoutedDefinitionMaintenance, stageRoutedDefinition,
+  verifyRoutedSupportObjectsSync } from '../src/shift/routing-definition-stage.ts';
 import { RoutedInputWitnessRefusal } from '../src/shift/routing-input-refusal.ts';
 import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
@@ -296,6 +297,45 @@ outputs: [result]
     await assert.rejects(pending, /integrity mismatch for 'parent.yaml'/);
     assert.equal(await stage.commandFor!(packet), 'echo original',
       'captured command is data; refused parent verification cannot authorize signing');
+  } finally { stage.cleanup(); }
+});
+
+test('terminal synchronous support fence catches parent and child bytes moved during a final await', async () => {
+  const f = await fixture(workflow, duplicateStepSource());
+  const binding = { runId: 'wf_root', frameId: 'wf_frame',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'routing/child' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', binding },
+    decision: { binding } } as unknown as ReferenceRouting;
+  const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root',
+    order: { ...f.args.order, workflow: 'wf_frame', step: 'build', routing } });
+  try {
+    const objectPath = join(globalStoreRoot(join(stage.path, 'home')), 'objects', 'sha256',
+      f.packed.digest);
+    const support = [{ bundleDigest: f.packed.digest, objectPath }];
+    verifyRoutedSupportObjectsSync(support);
+    for (const name of ['parent.yaml', 'child.yaml']) {
+      const file = join(objectPath, name);
+      const original = readFileSync(file);
+      const mode = statSync(file).mode & 0o777;
+      let entered!: () => void;
+      let resume!: () => void;
+      const waiting = new Promise<void>(resolve => { entered = resolve; });
+      const pausedVerifier = new Promise<void>(resolve => { resume = resolve; });
+      const pending = (async () => {
+	entered();
+	await pausedVerifier;
+	verifyRoutedSupportObjectsSync(support);
+      })();
+      await waiting;
+      try {
+	chmodSync(file, 0o600);
+	writeFileSync(file, Buffer.concat([original, Buffer.from('# moved during trust await\n')]));
+      } finally { resume(); }
+      await assert.rejects(pending, new RegExp(`integrity mismatch for '${name}'`));
+      writeFileSync(file, original);
+      chmodSync(file, mode);
+      verifyRoutedSupportObjectsSync(support);
+    }
   } finally { stage.cleanup(); }
 });
 
