@@ -639,24 +639,6 @@ export async function stageRoutedDefinition(args: {
 	  if (!consumed.ok) throw new Error('routed consumed proof refused');
 	}
       }
-      // Consume verification can await external signature checks. Read the
-      // current operator trust again at the final parent boundary, after all
-      // such awaits, so a mid-check revocation cannot authorize a broker reply.
-      const finalRules = resolveOriginRules(args.sourceEnv);
-      const finalIndex = readWorkflowStoreIndex(storeIndexPath(root));
-      const finalDefinition = createExecutionDefinitionVerifier({ env: args.sourceEnv });
-      const finalOrigin = createExecutionOriginVerifier({ env: args.sourceEnv });
-      for (const object of currentSupport) {
-	if ((await finalDefinition(object)).kind !== 'verified')
-	  throw new Error('routed definition trust changed');
-	const verdict = await finalOrigin(object);
-	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
-	for (const namespace of originNamespacesForObject(object, finalIndex)) {
-	  const rule = matchOriginRule(finalRules, namespace);
-	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
-	    throw new Error('routed definition origin changed');
-	}
-      }
       if (routing !== undefined) {
 	// The binder and trust checks above can await a direct invocation relay.
 	// Reopen the exact signed member after those awaits; a moved index or
@@ -667,6 +649,30 @@ export async function stageRoutedDefinition(args: {
 	  throw new Error('routed signed selection changed');
 	requireOriginalSelection(finalSource.selectVerifiedDefinition(order.defDigest,
 	  definitionName!, order.step));
+      }
+      // The binder and final source reopen can await. Check publication,
+      // origin and every applicable operator rule after that reopen. Keep the
+      // last index/rule read after the awaited verifiers so a rule change
+      // during verification cannot reuse an earlier policy snapshot.
+      const finalDefinition = createExecutionDefinitionVerifier({ env: args.sourceEnv });
+      const finalOrigin = createExecutionOriginVerifier({ env: args.sourceEnv });
+      const finalVerdicts: Array<{ object: (typeof currentSupport)[number];
+	verdict: Awaited<ReturnType<typeof finalOrigin>> }> = [];
+      for (const object of currentSupport) {
+	if ((await finalDefinition(object)).kind !== 'verified')
+	  throw new Error('routed definition trust changed');
+	const verdict = await finalOrigin(object);
+	if (verdict.kind === 'invalid') throw new Error('routed definition origin changed');
+	finalVerdicts.push({ object, verdict });
+      }
+      const finalRules = resolveOriginRules(args.sourceEnv);
+      const finalIndex = readWorkflowStoreIndex(storeIndexPath(root));
+      for (const { object, verdict } of finalVerdicts) {
+	for (const namespace of originNamespacesForObject(object, finalIndex)) {
+	  const rule = matchOriginRule(finalRules, namespace);
+	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
+	    throw new Error('routed definition origin changed');
+	}
       }
       const finalStage = lstatSync(stagePath);
       const finalWorkdir = order.workdir !== undefined || order.worker === 'command'

@@ -6,9 +6,10 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
-import type { ExecLoop, ExecLoopOptions, ExecOutcome } from '../exec/loop.ts';
+import { createExecLoop, type ExecLoop, type ExecOutcome } from '../exec/loop.ts';
+import type { InstructionResolver } from '../exec/instructions.ts';
 import { createRoutedGroupRunner } from '../exec/runner.ts';
-import { createShiftVerifiedRoutedExecLoop, type RoutedExecutionController } from '../exec/routed-loop.ts';
+import type { RoutedExecutionController } from '../exec/routed-loop.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { RoutingBrokerTransportLoss } from '../hub/routing-child-client.ts';
 import { createTrustedRoutedInputV2Admission } from '../hosted/trusted-input-admission.ts';
@@ -137,16 +138,31 @@ export async function prepareRoutedCommandRunner(args: {
     pending.timer = setTimeout(() => { pendingSleeps.delete(pending); resolve(); }, ms);
     pendingSleeps.add(pending);
   });
-  const loopOptions: ExecLoopOptions = { hub: client, runner: controller.runner,
-    workflow: root, run, holder, instructions: stage.instructions,
+  // The child retains a fresh local signed command/publication/origin check
+  // after freeze. Its dynamic invocation read is impossible once the broker
+  // quiesces; the parent command_postrun performs that hard producer/current
+  // input check directly under the original recorded occurrence instead.
+  const parentBackedInstructions: InstructionResolver = {
+    ...stage.instructions,
+    async resolveRoutedCommandDefinition(order) {
+      const signed = await stage.instructions.resolveRoutedCommandDefinition?.(order);
+      if (!signed) return { ok: false, kind: 'integrity',
+	reason: 'routed signed definition resolver unavailable' };
+      if (!signed.ok) return signed;
+      if (!signed.revalidateLocalAfterRun) return { ok: false, kind: 'integrity',
+	reason: 'routed local postrun verifier unavailable' };
+      return { ...signed, revalidateAfterRun: signed.revalidateLocalAfterRun };
+    },
+  };
+  const rawLoop = createExecLoop({ hub: client, runner: controller.runner,
+    workflow: root, run, holder, instructions: parentBackedInstructions,
     routedExecution: controller, routedPublicEnv: publicEnv,
     cwd: planned.cwd, allowedWorkdirRoots: planned.allowedWorkdirRoots,
     env: args.originalEnv, out: args.out, err: args.err,
     sleep, now: Date.now,
     ...(args.heartbeatIntervalMs ? { heartbeatIntervalMs: args.heartbeatIntervalMs } : {}),
     ...(args.jumpToleranceMs ? { jumpToleranceMs: args.jumpToleranceMs } : {}),
-  };
-  const rawLoop = createShiftVerifiedRoutedExecLoop(loopOptions, controller);
+  });
   const runRole = async (): Promise<ExecOutcome> => {
     try { return await rawLoop.run(); }
     finally {

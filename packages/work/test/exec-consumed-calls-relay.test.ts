@@ -473,6 +473,41 @@ test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted 
   assert.equal(typeof passed.revalidate, 'function');
   assert.equal(await passed.revalidate!(), undefined);
   assert.deepEqual(reads.slice(2), reads.slice(0, 2), 'final revalidation rereads both trusted receipts');
+  if (!crossStore && factory === 'store') {
+    const definitionName = 'parent';
+    const binding = { runId: 'wf-root', frameId: workflow,
+      def: { bundleDigest: `sha256:${parentDigest}`, workflowName: definitionName } };
+    const routedPacket: OrderPacket = { ...packet, routing: {
+      claim: { claimId: finish.run, orderId: finish.run, binding },
+      decision: { binding },
+    } as OrderPacket['routing'] };
+    let directReads = 0;
+    let allowDirect = true;
+    const routed = createStoreInstructionResolver({ projectRoot, globalRoot,
+      verifier: createBundleIngestor(),
+      definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
+      consumedVerifier: verifierFor(fixtureData, 'enforce'), env: fixtureData.env,
+      routedSelection: { rootWorkflow: 'wf-root', frameWorkflow: workflow,
+	definitionName, defDigest: parentDigest, run: finish.run },
+      invocationBindingSource: { read: key => {
+	directReads++;
+	if (!allowDirect) throw new Error('postfreeze invocation read is forbidden');
+	return source.read(key);
+      } },
+    });
+    const signed = await routed.resolveRoutedCommandDefinition!(routedPacket);
+    assert.equal(signed.ok, true, JSON.stringify(signed));
+    if (signed.ok) {
+      assert.equal(directReads, 2, 'prestart resolves both actual invocation receipts');
+      allowDirect = false;
+      assert.equal(await signed.revalidateLocalAfterRun?.(), undefined);
+      assert.equal(directReads, 2, 'local postrun checks source but makes no frozen role relay read');
+      const full = await signed.revalidateAfterRun?.();
+      assert.equal(full?.ok, false, 'generic full postrun still requires invocation receipts');
+      if (full) assert.equal(full.code, 'invocation-read-failed');
+      assert.equal(directReads, 3);
+    }
+  }
   const refused = async (p: OrderPacket, src: InvocationBindingSource | undefined = source) => {
     const r = await resolver(src).resolveCommand(p);
     assert.equal(r.ok, false, JSON.stringify(r));

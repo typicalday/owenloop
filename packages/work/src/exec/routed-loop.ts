@@ -86,8 +86,7 @@ function prestartRefusalLabel(value: unknown): string {
     ? code : 'unclassified'}`;
 }
 
-function createRoutedExecLoopInternal(opts: ExecLoopOptions, control: RoutedExecutionController,
-  parentOwnsPostrunRevalidation: boolean): ExecLoop {
+export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecutionController): ExecLoop {
   if (opts.routedPrestart) throw new Error('routed execution cannot use the ordinary prestart seam');
   const groupSettleMs = control.groupSettleMs ?? 10_000;
   const lifecycleDeadlineMs = control.lifecycleDeadlineMs ?? 120_000;
@@ -328,7 +327,7 @@ function createRoutedExecLoopInternal(opts: ExecLoopOptions, control: RoutedExec
 	throw new Error('command output is incomplete');
       const parsed = resolvePayload({ payloadLine: result.payloadLine,
 	payloadOverCap: result.payloadOverCap, file: readPayloadFile(payload.file) });
-      const postrunRefusal = !parentOwnsPostrunRevalidation && resolved.revalidateAfterRun && await awaitBounded(
+      const postrunRefusal = resolved.revalidateAfterRun && await awaitBounded(
 	'signed postrun revalidation', resolved.revalidateAfterRun, closureDeadlineAt!);
       if (postrunRefusal)
 	throw new Error(`signed command changed after run (${prestartRefusalLabel(postrunRefusal)})`);
@@ -376,17 +375,4 @@ function createRoutedExecLoopInternal(opts: ExecLoopOptions, control: RoutedExec
     // A controller loss is quarantined; ordinary final-breath release is never used.
   }
   return { run, stop };
-}
-
-/** Generic routed execution retains its full role-side postrun verifier. */
-export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecutionController): ExecLoop {
-  return createRoutedExecLoopInternal(opts, control, false);
-}
-
-/** Only the Shift-created routed command role uses the parent broker's fresh
- * signed stage and hard producer gate after freeze. The generic injected
- * controller path above cannot claim this authority. */
-export function createShiftVerifiedRoutedExecLoop(opts: ExecLoopOptions,
-  control: RoutedExecutionController): ExecLoop {
-  return createRoutedExecLoopInternal(opts, control, true);
 }

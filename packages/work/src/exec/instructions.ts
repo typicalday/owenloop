@@ -77,6 +77,10 @@ export interface ResolvedCommand {
  * input witness and accepted one-use launch before external start. */
 export interface ResolvedRoutedCommandDefinition extends ResolvedCommand {
   inputWitnessRequired: true;
+  /** Local signed source, command, origin and locked calls closure after run.
+   * Dynamic invocation producer/current-input proof remains parent-owned after
+   * broker quiesce; generic callers keep revalidateAfterRun's full read. */
+  revalidateLocalAfterRun?: () => Promise<InstructionRefusal | undefined>;
 }
 
 export interface ResolvedStep {
@@ -451,6 +455,7 @@ export function createStoreInstructionResolver(
     order: OrderPacket,
     resolved: ResolvedDefinition,
     requireClosure = false,
+    skipDynamicInvocationRead = false,
   ): Promise<{ ok: true; producers: Record<string, VerifiedCallsProducer>; receipts: VerifiedInvocationReceipt[] } | InstructionRefusal> => {
     const receipts: VerifiedInvocationReceipt[] = [];
     const producers: Record<string, VerifiedCallsProducer> = {};
@@ -459,6 +464,7 @@ export function createStoreInstructionResolver(
         (step) => (step.calls !== undefined || step.callsInterface !== undefined) && step.produces.some((produce) => produce.stem === path),
       );
       if (callsStep?.callsInterface?.selection === 'invocation') {
+	if (skipDynamicInvocationRead) continue;
 	if (!options.invocationBindingSource) return refusal('unverified-consumed', order,
 	  'dynamic relay requires a trusted InvocationBindingSource', 'invocation-source-absent');
         const version = order.consumedFingerprint?.[path];
@@ -575,7 +581,7 @@ export function createStoreInstructionResolver(
 	|| !resolved.step.command.trim())
 	return refusal('missing-command', order, 'the selected signed command step is unavailable');
       const command = resolved.step.command;
-      const revalidateSigned = async (): Promise<InstructionRefusal | undefined> => {
+      const revalidateSigned = async (localOnly = false): Promise<InstructionRefusal | undefined> => {
 	const fresh = await resolveVerifiedStep(order);
 	if (!fresh.ok) return fresh;
 	if (fresh.step.executor !== 'command' || fresh.step.command !== command
@@ -585,11 +591,12 @@ export function createStoreInstructionResolver(
 	if (currentVerdict.kind !== 'verified') return refuseUnverified(order, currentVerdict);
 	const currentOrigin = await checkOrigin(order, fresh);
 	if (currentOrigin !== undefined) return currentOrigin;
-	const currentCalls = await verifiedCallsProducers(order, fresh, true);
+	const currentCalls = await verifiedCallsProducers(order, fresh, true, localOnly);
 	return currentCalls.ok ? undefined : currentCalls;
       };
       return { ok: true, command, inputWitnessRequired: true,
-	revalidate: revalidateSigned, revalidateAfterRun: revalidateSigned,
+	revalidate: () => revalidateSigned(), revalidateAfterRun: () => revalidateSigned(),
+	revalidateLocalAfterRun: () => revalidateSigned(true),
 	...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
     },
     async resolveHostedStep(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal> {

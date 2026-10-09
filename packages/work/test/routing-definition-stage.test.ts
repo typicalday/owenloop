@@ -19,7 +19,7 @@ import { canonicalJsonBytes } from '../../../src/install.ts';
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import type { RoutedClaimV2, RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
 import type { OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
-import { DSSE_SSH_NAMESPACE, dsseSignPublication } from '../../../src/crypto/dsse.ts';
+import { DSSE_SSH_NAMESPACE, dsseSignPublication, dsseSignSubmission } from '../../../src/crypto/dsse.ts';
 import { createSshSigner } from '../../../src/crypto/ssh.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { writeBundleSource } from '../../../test/helpers/store-fixture.ts';
@@ -171,6 +171,128 @@ test('parent current stage refuses changed signed command bytes before a postrun
       /routed definition object changed|routed signed selection changed/);
     assert.equal(await stage.commandFor!(packet), 'echo recovered',
       'captured command alone cannot authorize a parent postrun');
+  } finally { stage.cleanup(); }
+});
+
+test('parent final signed selection refuses a source move during awaited dynamic relay', async () => {
+  const parent = `name: routing/parent
+inputs: [{name: data, seedOwed: true}]
+steps:
+  - name: delegate
+    callsInterface:
+      name: report
+      version: '1'
+      selection: invocation
+      signature:
+${'        inputs: [{name: data, schema: true}]'}
+${'        outputs: [{name: result, schema: true}]'}
+      policy: {name: deterministic, version: '1', config: {}}
+    inputs: {data: data}
+    produces: [child]
+  - name: command
+    executor: command
+    consumes: [child]
+    produces: [out]
+    terminal: true
+    command: echo original
+outputs: [out]
+`;
+  const child = `name: routing/child
+x:
+  implements: [{name: report, version: '1'}]
+inputs: [{name: data, schema: true}]
+steps:
+  - name: work
+    consumes: [data]
+    produces: [{name: result, schema: true}]
+    terminal: true
+outputs: [result]
+`;
+  const bundle = temp('routing-dynamic-selection-');
+  writeFileSync(join(bundle, 'bundle.yaml'), [
+    'formatVersion: 2', 'package:', '  name: routing', '  version: 1.0.0',
+    'workflows:', '  "routing/parent": parent.yaml', '  "routing/child": child.yaml',
+    'default: "routing/parent"', 'platforms: []', 'integrity:',
+    '  algorithm: sha256', '  files: {}', 'capabilities: {}', 'lock: {}', '',
+  ].join('\n'));
+  writeFileSync(join(bundle, 'parent.yaml'), parent);
+  writeFileSync(join(bundle, 'child.yaml'), child);
+  const f = await fixture(parent, bundle);
+  writeFileSync(join(f.config, 'org-root.pub'), readFileSync(`${f.keyPath}.pub`), { mode: 0o600 });
+  const value = { result: 'signed-child' };
+  const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: f.keyPath });
+  const signedProof = await dsseSignSubmission(Buffer.from(JSON.stringify({
+    run: 'child-run', workflow: 'wf_nested', defDigest: f.packed.digest,
+    step: 'work', key: '', produced: [{ artifact: 'result', version: 1,
+      valueDigest: valueDigestHex(value) }], consumedFingerprint: {},
+    producerKeyId: f.publicKey.keyid, timestamp: 10,
+  })), signer);
+  signer.dispose();
+  const binding = { runId: 'wf_root', frameId: 'wf_frame',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'routing/parent' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', decisionId: 'decision',
+    sessionId: 'rs_12345678-1234-1234-1234-123456789abc', shiftId: 'shf_service',
+    attemptId: 'attempt', binding }, decision: { decisionId: 'decision', binding },
+    preference: { rosterRevision: 'a'.repeat(64), expiresAt: Date.now() + 60_000 },
+  } as unknown as ReferenceRouting;
+  const packet: OrderPacket = { workflow: 'wf_frame', run: 'run', step: 'command', key: '',
+    defDigest: f.packed.digest, worker: 'command', inputs: ['child'], outputs: ['out'],
+    consumes: { child: value }, consumedFingerprint: { child: 1 },
+    consumesProof: JSON.stringify({ child: signedProof.envelope }),
+    consumesProofRelay: { child: { childDefDigest: f.packed.digest, childVersion: 1,
+      childOutcome: 'result' } },
+    owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0,
+      reasons: [] }], routing };
+  const referenceBinding = { rootWorkflow: 'wf_root', frameWorkflow: 'wf_frame', run: 'run',
+    claimId: 'run', decisionId: 'decision', sessionId: routing.claim.sessionId,
+    shiftId: routing.claim.shiftId, orderDigest: 'b'.repeat(64),
+    authorityRevision: 'c'.repeat(64), rosterRevision: routing.preference.rosterRevision,
+    routingDigest: valueDigestHex(routing), preferenceExpiresAt: routing.preference.expiresAt };
+  const pair: { reference: RoutedReferenceV2; claim: RoutedClaimV2 } = {
+    reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
+      workflow: 'wf_root', run: 'run', order: { ...packet, owes: [{ path: 'out', version: 1 }] },
+      inputs: [{ path: 'child', version: 1, present: true, value }],
+      lease: { claimed: true }, binding: referenceBinding },
+    claim: { protocol: 'routing-claim-read-v2', state: 'available',
+      workflow: 'wf_root', run: 'run', routing, binding: referenceBinding },
+  };
+  const relayReceipt = { invocationId: 'inv',
+    parentDefRef: { bundleDigest: f.packed.digest, workflowName: 'routing/parent' },
+    callPath: 'child', evidenceDigest: 'd'.repeat(64), parentArtifactVersion: 1,
+    childWorkflow: 'wf_nested', childDefRef: { bundleDigest: f.packed.digest,
+      workflowName: 'routing/child' }, childOutcome: 'result', childOutcomeVersion: 1 };
+  const relay = { receipt: relayReceipt, receiptDigest: valueDigestHex(relayReceipt) };
+  let pause = false;
+  let entered!: () => void;
+  let release!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const resume = new Promise<void>(resolve => { release = resolve; });
+  const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root',
+    order: { ...f.args.order, workflow: 'wf_frame', step: 'command',
+      consumes: { child: value }, consumedFingerprint: { child: 1 }, routing },
+    readCurrentPair: async () => pair,
+    readInvocationBinding: async () => {
+      if (pause) { entered(); await resume; }
+      return relay;
+    } });
+  try {
+    const response: GetOrderResponse = { text: '', workflow: 'wf_frame', run: 'run',
+      lease: { claimed: true }, order: packet };
+    await stage.verifyRoutedInput!(response, pair, 'prestart');
+    pause = true;
+    const pending = stage.verifyRoutedInput!(response, pair, 'prestart');
+    try {
+      const enteredBeforeReturn = await Promise.race([
+	waiting.then(() => true), pending.then(() => false, () => false),
+      ]);
+      assert.equal(enteredBeforeReturn, true, 'the current check awaits the direct relay');
+      const object = join(globalStoreRoot(join(stage.path, 'home')), 'objects', 'sha256',
+	f.packed.digest, 'parent.yaml');
+      writeFileSync(object, parent.replace('echo original', 'echo moved'));
+    } finally { release(); }
+    await assert.rejects(pending, /routed signed selection changed|routed definition object changed|routed input witness refused/);
+    assert.equal(await stage.commandFor!(packet), 'echo original',
+      'captured command is data; refused parent verification cannot authorize signing');
   } finally { stage.cleanup(); }
 });
 
