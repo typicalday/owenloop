@@ -13,6 +13,7 @@ import type { OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
 import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
 import {
   createBrokerRecordedRoutedV2Reader, createRecordedRoutedV2Reader,
+  createRecordedRoutedInputPairV2Reader, parseRoutedServiceRecordedPairV2,
   parseRecordedClaimV2, parseRecordedReferenceV2,
   type RecordedClaimV2, type RecordedReferenceV2,
 } from '../src/hosted/trusted-routed-recorded-v2.ts';
@@ -65,6 +66,20 @@ test('recorded parser binds exact occurrence and keeps elapsed startup preferenc
   assert.deepEqual(parseRecordedReferenceV2({ protocol: 'trusted-routed-recorded-reference-read-v2',
     state: 'unsupported-feedback', ...expected }, expected), {
     protocol: 'trusted-routed-recorded-reference-read-v2', state: 'unsupported-feedback', ...expected });
+});
+
+test('combined recorded parser binds both occurrence members and refuses skipped or mixed claims', () => {
+  const valid = pair();
+  const composite = { protocol: 'routed-recorded-input-pair-v2', phase: 'recorded-live', ...valid };
+  assert.deepEqual(parseRoutedServiceRecordedPairV2(composite, expected), valid);
+  const mixed = structuredClone(composite);
+  (mixed.claim as Extract<RecordedClaimV2, { state: 'available' }>).
+    binding.recordedOccurrence.reportDigest = 'f'.repeat(64);
+  assert.throws(() => parseRoutedServiceRecordedPairV2(mixed, expected));
+  assert.throws(() => parseRoutedServiceRecordedPairV2({ ...composite, phase: 'prestart' }, expected));
+  assert.throws(() => parseRoutedServiceRecordedPairV2({ ...composite,
+    reference: { protocol: 'trusted-routed-recorded-reference-read-v2', state: 'unavailable', ...expected },
+    claim: { state: 'skipped' } }, expected), /reference unavailable/);
 });
 
 test('broker observation refuses a mixed recorded binding or routing sidecar', async () => {
@@ -154,8 +169,9 @@ test('recorded transport sends only fixed routes with original bearer and routin
       assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString()), expected);
       calls.push(req.url!);
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(JSON.stringify(req.url === '/api/routing_reference_order/live/v2'
-	? witness.reference : witness.claim));
+      res.end(JSON.stringify(req.url === '/api/read_routing_input_pair/live/v2'
+	? { protocol: 'routed-recorded-input-pair-v2', phase: 'recorded-live', ...witness }
+	: req.url === '/api/routing_reference_order/live/v2' ? witness.reference : witness.claim));
     });
     await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
     try {
@@ -167,6 +183,12 @@ test('recorded transport sends only fixed routes with original bearer and routin
       assert.deepEqual(await reader.readReference(), witness.reference);
       assert.deepEqual(await reader.readClaim(), witness.claim);
       assert.deepEqual(calls, ['/api/routing_reference_order/live/v2', '/api/read_routing_claim/live/v2']);
+      const combined = createRecordedRoutedInputPairV2Reader({ origin: `https://localhost:${address.port}`,
+	expected, getToken: async () => 'enrolled', getSession: async () => session,
+	trustedCa: readFileSync(cert) });
+      assert.deepEqual(await combined.read(), witness);
+      assert.deepEqual(calls, ['/api/routing_reference_order/live/v2', '/api/read_routing_claim/live/v2',
+	'/api/read_routing_input_pair/live/v2']);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }

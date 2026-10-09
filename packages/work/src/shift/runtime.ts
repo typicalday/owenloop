@@ -15,9 +15,11 @@ import { performance } from 'node:perf_hooks';
 import { createHubClient, type RoutingHubClient } from '../hub/client.ts';
 import { HubError, type RoutingScope, type RoutingSessionOpenResponse, type RoutingOfferCandidate, type LocalTupleEligibility, type LocalModelTuple } from '../hub/types.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
-import { createTrustedRoutedReferenceV2Reader, type RoutedClaimV2,
+import { createTrustedRoutedReferenceV2Reader, createTrustedRoutedInputPairV2Reader,
+  type RoutedServicePrestartPairV2, type RoutedClaimV2,
   type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
-import { createRecordedRoutedV2Reader, type RecordedClaimV2,
+import { createRecordedRoutedV2Reader, createRecordedRoutedInputPairV2Reader,
+  type RoutedServiceRecordedPairV2, type RecordedClaimV2,
   type RecordedBindingV2, type RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { createDirectRoutedInvocationReader } from '../hosted/trusted-routed-invocation.ts';
 import type { InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
@@ -801,10 +803,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	    if (target.workflow !== expected.workflow || target.run !== expected.run)
 	      throw new Error('routed definition target changed');
 	    return phase === 'prestart'
-	      ? { reference: await captured.routedV2Read('reference', target) as RoutedReferenceV2,
-		claim: await captured.routedV2Read('claim', target) as RoutedClaimV2 }
-	      : { reference: await captured.routedLiveV2Read('reference', target) as RecordedReferenceV2,
-		claim: await captured.routedLiveV2Read('claim', target) as RecordedClaimV2 };
+	      ? captured.routedV2PairRead(target)
+	      : captured.routedLiveV2PairRead(target);
 	  },
 	  stillAuthorized: () => {
 	    const identity = routingSession.identity();
@@ -830,10 +830,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	  const started = { wall: now(), monotonic: performance.now() };
 	  const expected = { workflow: rootWorkflow, run: response.run };
 	  const pair = phase === 'prestart'
-	    ? { reference: await target.routedV2Read('reference', expected) as RoutedReferenceV2,
-	      claim: await target.routedV2Read('claim', expected) as RoutedClaimV2 }
-	    : { reference: await target.routedLiveV2Read('reference', expected) as RecordedReferenceV2,
-	      claim: await target.routedLiveV2Read('claim', expected) as RecordedClaimV2 };
+	    ? await target.routedV2PairRead(expected)
+	    : await target.routedLiveV2PairRead(expected);
 	  await stage.verifyRoutedInput(response, pair, phase, started);
 	  return pair;
 	},
@@ -841,10 +839,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	  if (!stage.readInvocationBinding) throw new Error('routed invocation authority unavailable');
 	  const expected = { workflow: rootWorkflow, run: response.run };
 	  const pair = phase === 'prestart'
-	    ? { reference: await target.routedV2Read('reference', expected) as RoutedReferenceV2,
-		claim: await target.routedV2Read('claim', expected) as RoutedClaimV2 }
-	    : { reference: await target.routedLiveV2Read('reference', expected) as RecordedReferenceV2,
-		claim: await target.routedLiveV2Read('claim', expected) as RecordedClaimV2 };
+	    ? await target.routedV2PairRead(expected)
+	    : await target.routedLiveV2PairRead(expected);
 	  const relay = await stage.readInvocationBinding(response, pair, phase, key);
 	  return { pair, relay };
 	},
@@ -1048,6 +1044,8 @@ export interface ShiftRoutingSession {
       Promise<RoutedReferenceV2 | RoutedClaimV2>;
     routedLiveV2Read: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
       Promise<RecordedReferenceV2 | RecordedClaimV2>;
+    routedV2PairRead: (expected: { workflow: string; run: string }) => Promise<RoutedServicePrestartPairV2>;
+    routedLiveV2PairRead: (expected: { workflow: string; run: string }) => Promise<RoutedServiceRecordedPairV2>;
     readInvocationBinding: (key: InvocationRelayKey, phase: 'prestart' | 'recorded-live',
       expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
       Promise<VerifiedInvocationReceipt | undefined> } | undefined;
@@ -1213,6 +1211,8 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity,
 	routedV2Read: incarnation.readRoutedV2,
 	routedLiveV2Read: incarnation.readRecordedV2,
+	routedV2PairRead: incarnation.readRoutedPairV2,
+	routedLiveV2PairRead: incarnation.readRecordedPairV2,
 	readInvocationBinding: incarnation.readInvocationBinding } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
@@ -1308,6 +1308,8 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
   Omit<ShiftRoutingSession, 'brokerTarget' | 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & {
     readRoutedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2Read'];
     readRecordedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedLiveV2Read'];
+    readRoutedPairV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2PairRead'];
+    readRecordedPairV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedLiveV2PairRead'];
     readInvocationBinding: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readInvocationBinding'];
     stop(): Promise<HubError | undefined>;
   }
@@ -1411,6 +1413,23 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	} });
       return kind === 'reference' ? reader.readReference() : reader.readClaim();
     },
+    async readRoutedPairV2(expected) {
+      if (renewalDenied || !authority || now() >= authority.expiresAt)
+				throw new Error('routed pair session unavailable');
+			const sessionId = authority.sessionId, shiftId = authority.shiftId;
+			const reader = createTrustedRoutedInputPairV2Reader({ origin: opts.origin,
+				getToken: opts.getToken, expected, beforeRequest: opts.beforeRequest,
+				onRateLimit: opts.onRateLimit,
+				getSession: async () => {
+					if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+						|| now() >= authority.expiresAt) throw new Error('routed pair session changed');
+					return authority.credential;
+				} });
+			const pair = await reader.read();
+			if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+				|| now() >= authority.expiresAt) throw new Error('routed pair session changed');
+      return pair;
+    },
     async readRecordedV2(kind, expected) {
       if (renewalDenied || !authority || now() >= authority.expiresAt)
 	throw new Error('routed recorded session unavailable');
@@ -1424,6 +1443,23 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	  return authority.credential;
 	} });
       return kind === 'reference' ? reader.readReference() : reader.readClaim();
+    },
+    async readRecordedPairV2(expected) {
+      if (renewalDenied || !authority || now() >= authority.expiresAt)
+				throw new Error('routed recorded pair session unavailable');
+			const sessionId = authority.sessionId, shiftId = authority.shiftId;
+			const reader = createRecordedRoutedInputPairV2Reader({ origin: opts.origin,
+				getToken: opts.getToken, expected, beforeRequest: opts.beforeRequest,
+				onRateLimit: opts.onRateLimit,
+				getSession: async () => {
+					if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+						|| now() >= authority.expiresAt) throw new Error('routed recorded pair session changed');
+					return authority.credential;
+				} });
+			const pair = await reader.read();
+			if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+				|| now() >= authority.expiresAt) throw new Error('routed recorded pair session changed');
+      return pair;
     },
     async readInvocationBinding(key, phase, expected, binding) {
       if (renewalDenied || !authority || now() >= authority.expiresAt)

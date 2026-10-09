@@ -13,6 +13,7 @@ import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingBackoff } from '../src/shift/runtime.ts';
 import { createTrustedRoutedInputV2Admission } from '../src/hosted/trusted-input-admission.ts';
 import { createBrokerRoutedReferenceV2Reader, createTrustedRoutedReferenceV2Reader,
+  createTrustedRoutedInputPairV2Reader, parseRoutedServicePrestartPairV2,
   parseRoutedClaimV2, parseRoutedReferenceV2,
   type RoutedClaimV2, type RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
 import type { OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
@@ -68,6 +69,23 @@ test('routed v2 parser requires exact root, frame, routing and closed refusal pr
     protocol: 'trusted-routed-reference-read-v2', state: 'unsupported-feedback', ...expected });
 });
 
+test('combined prestart parser accepts only two exact current members and explicit skipped refusal', () => {
+  const valid = pair();
+  const composite = { protocol: 'routed-prestart-input-pair-v2', phase: 'prestart', ...valid };
+  assert.deepEqual(parseRoutedServicePrestartPairV2(composite, expected), valid);
+  const mixed = structuredClone(composite);
+  (mixed.claim as Extract<RoutedClaimV2, { state: 'available' }>).binding.orderDigest = 'e'.repeat(64);
+  assert.throws(() => parseRoutedServicePrestartPairV2(mixed, expected));
+  assert.throws(() => parseRoutedServicePrestartPairV2({ ...composite, phase: 'recorded-live' }, expected));
+  assert.throws(() => parseRoutedServicePrestartPairV2({ ...composite, extra: true }, expected));
+  const unavailable = { ...composite,
+    reference: { protocol: 'trusted-routed-reference-read-v2', state: 'unavailable', ...expected },
+    claim: { state: 'skipped' } };
+  assert.throws(() => parseRoutedServicePrestartPairV2(unavailable, expected), /reference unavailable/);
+  assert.throws(() => parseRoutedServicePrestartPairV2({ ...unavailable, claim: valid.claim }, expected),
+    /skip refused/);
+});
+
 test('parent-owned HTTPS reads both scoped routes with original bearer/session and refuses downgrade', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'routed-v2-https-'));
   try {
@@ -87,11 +105,14 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
       assert.equal(req.headers.authorization, 'Bearer worker-secret');
       assert.equal(req.headers['x-owenloop-routing-session'], session);
       assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString()), expected);
-      assert.ok(['/api/routing_reference_order/v2', '/api/read_routing_claim/v2'].includes(req.url!));
+      assert.ok(['/api/routing_reference_order/v2', '/api/read_routing_claim/v2',
+	'/api/read_routing_input_pair/v2'].includes(req.url!));
       res.writeHead(status, { 'content-type': 'application/json', 'cache-control': cache,
 	...(status === 302 ? { location: 'https://elsewhere.example/steal' } : {}),
 	...(status === 429 ? { 'retry-after': '2' } : {}) });
-      res.end(JSON.stringify(req.url === '/api/routing_reference_order/v2' ? witness.reference : witness.claim));
+      res.end(JSON.stringify(req.url === '/api/read_routing_input_pair/v2'
+	? { protocol: 'routed-prestart-input-pair-v2', phase: 'prestart', ...witness }
+	: req.url === '/api/routing_reference_order/v2' ? witness.reference : witness.claim));
     });
     await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
     try {
@@ -104,9 +125,16 @@ test('parent-owned HTTPS reads both scoped routes with original bearer/session a
 	  assert.equal(error.status, 429); assert.equal(error.retryAfterMs, 2_000); } });
       assert.deepEqual(await reader.read(), witness);
       assert.deepEqual(observed, ['/api/routing_reference_order/v2', '/api/read_routing_claim/v2']);
+      const combined = createTrustedRoutedInputPairV2Reader({ origin: `https://localhost:${address.port}`,
+	expected, getToken: async () => 'worker-secret', getSession: async () => session,
+	trustedCa: readFileSync(cert), beforeRequest: backoff.beforeRequest,
+	onRateLimit: backoff.onRateLimit });
+      assert.deepEqual(await combined.read(), witness);
+      assert.deepEqual(observed, ['/api/routing_reference_order/v2', '/api/read_routing_claim/v2',
+	'/api/read_routing_input_pair/v2'], 'combined read makes exactly one original-session request');
       status = 302;
       await assert.rejects(reader.read());
-      assert.equal(observed.length, 3, 'redirect target receives no credentials');
+      assert.equal(observed.length, 4, 'redirect target receives no credentials');
       status = 404;
       await assert.rejects(reader.read());
       status = 429;

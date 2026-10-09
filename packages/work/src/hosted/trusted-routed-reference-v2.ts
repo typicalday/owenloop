@@ -11,9 +11,11 @@ import type { OrderPacket, ReferenceRouting } from '../hub/types.ts';
 import { parseTrustedReferenceV2, type TrustedInputWitness } from './trusted-reference-v2.ts';
 
 const MAX_WIRE_BYTES = 2_000_000;
+const MAX_PAIR_WIRE_BYTES = 4_100_000;
 const MAX_MS = 5_000;
 const ROUTES = new Set(['/api/routing_reference_order/v2', '/api/read_routing_claim/v2',
   '/api/routing_reference_order/live/v2', '/api/read_routing_claim/live/v2',
+  '/api/read_routing_input_pair/v2', '/api/read_routing_input_pair/live/v2',
   '/api/read_invocation_binding', '/api/read_invocation_binding/live/v2']);
 const DIGEST = /^[a-f0-9]{64}$/i;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
@@ -55,13 +57,15 @@ export type RoutedClaimV2 = {
 };
 export type RoutedPrestartPairV2 = { protocol: 'routed-prestart-pair-v2'; phase: 'prestart';
   reference: RoutedReferenceV2; claim: RoutedClaimV2 };
+export type RoutedServicePrestartPairV2 = { reference: Extract<RoutedReferenceV2, { state: 'available' }>;
+  claim: Extract<RoutedClaimV2, { state: 'available' }> };
 export interface RoutedReferenceV2Reader {
   readReference(): Promise<RoutedReferenceV2>;
   readClaim(): Promise<RoutedClaimV2>;
   read(): Promise<{ reference: RoutedReferenceV2; claim: RoutedClaimV2 }>;
 }
 
-function bounded(value: unknown): boolean {
+function bounded(value: unknown, maxBytes = MAX_WIRE_BYTES): boolean {
   const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
   let nodes = 0;
   while (pending.length) {
@@ -71,8 +75,30 @@ function bounded(value: unknown): boolean {
       for (const child of Object.values(next.value)) pending.push({ value: child, depth: next.depth + 1 });
     }
   }
-  try { return Buffer.byteLength(JSON.stringify(value)) <= MAX_WIRE_BYTES; }
+  try { return Buffer.byteLength(JSON.stringify(value)) <= maxBytes; }
   catch { return false; }
+}
+
+/** A skipped claim asserts only that no second native read was attempted. */
+export function parseRoutedServicePrestartPairV2(raw: unknown,
+  expected: { workflow: string; run: string }): RoutedServicePrestartPairV2 {
+  if (!bounded(raw, MAX_PAIR_WIRE_BYTES)) throw new Error('routed input pair exceeds bounds');
+  const wire = rec(raw);
+  if (!wire || wire.protocol !== 'routed-prestart-input-pair-v2' || wire.phase !== 'prestart'
+    || Object.keys(wire).length !== 4 || !exact(wire, ['protocol', 'phase', 'reference', 'claim']))
+    throw new Error('routed input pair envelope refused');
+  const reference = parseRoutedReferenceV2(wire.reference, expected);
+  if (reference.state !== 'available') {
+    const skipped = rec(wire.claim);
+    if (!skipped || Object.keys(skipped).length !== 1 || skipped.state !== 'skipped')
+      throw new Error('routed input pair skip refused');
+    throw new Error('routed input reference unavailable');
+  }
+  const claim = parseRoutedClaimV2(wire.claim, expected);
+  if (claim.state !== 'available' || !isDeepStrictEqual(reference.binding, claim.binding)
+    || !isDeepStrictEqual(reference.order.routing, claim.routing))
+    throw new Error('routed input pair changed');
+  return { reference, claim };
 }
 
 function parseBinding(raw: unknown, expected: { workflow: string; run: string }, routing: unknown): RoutedReferenceBindingV2 {
@@ -161,6 +187,7 @@ export function parseRoutedClaimV2(raw: unknown, expected: { workflow: string; r
 
 function postHttps(url: URL, token: string, session: string, body: string, remainingMs: number,
   ca?: string | Buffer, onHeaders?: (status: number, headers: IncomingHttpHeaders) => void,
+  maxBytes = MAX_WIRE_BYTES,
 ): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -181,7 +208,7 @@ function postHttps(url: URL, token: string, session: string, body: string, remai
       let size = 0;
       response.on('data', (chunk: Buffer) => {
 	size += chunk.length;
-	if (size > MAX_WIRE_BYTES) { req.destroy(new Error('routed v2 response too large')); return; }
+	if (size > maxBytes) { req.destroy(new Error('routed v2 response too large')); return; }
 	chunks.push(chunk);
       });
       response.once('error', error => finish(error));
@@ -235,7 +262,7 @@ export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
       (status, headers) => {
 	if (status === 429) options.onRateLimit?.(new HubError(429,
 	  'routed v2 request refused', undefined, retryAfter(headers)));
-      });
+      }, path.startsWith('/api/read_routing_input_pair/') ? MAX_PAIR_WIRE_BYTES : MAX_WIRE_BYTES);
     if (response.status === 429) {
       throw new HubError(429, 'routed v2 request refused', undefined, retryAfter(response.headers));
     }
@@ -246,6 +273,15 @@ export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
     return JSON.parse(response.body) as unknown;
   };
   return { now, request };
+}
+
+/** Parent-only one-HTTP observation. It never falls back to the old two routes. */
+export function createTrustedRoutedInputPairV2Reader(options: RoutedV2TransportOptions): {
+  read(): Promise<RoutedServicePrestartPairV2>;
+} {
+  const { now, request } = createRoutedV2Requester(options);
+  return { read: async () => parseRoutedServicePrestartPairV2(
+    await request('/api/read_routing_input_pair/v2', now()), options.expected) };
 }
 
 export function createTrustedRoutedReferenceV2Reader(options: RoutedV2TransportOptions): RoutedReferenceV2Reader {

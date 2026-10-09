@@ -23,6 +23,10 @@ export type RecordedClaimV2 =
   | (Omit<Extract<RoutedClaimV2, { state: 'available' }>, 'protocol' | 'binding'> & {
       protocol: 'routing-recorded-claim-read-v2'; binding: RecordedBindingV2 })
   | { protocol: 'routing-recorded-claim-read-v2'; state: 'unavailable'; workflow: string; run: string };
+export type RoutedServiceRecordedPairV2 = {
+  reference: Extract<RecordedReferenceV2, { state: 'available' }>;
+  claim: Extract<RecordedClaimV2, { state: 'available' }>;
+};
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -82,6 +86,38 @@ export function parseRecordedClaimV2(raw: unknown,
   const binding = recordedBinding(wire.binding, wire.routing);
   parseRoutedClaimV2({ ...wire, protocol: 'routing-claim-read-v2', binding: binding.ordinary }, expected);
   return wire as RecordedClaimV2;
+}
+
+export function parseRoutedServiceRecordedPairV2(raw: unknown,
+  expected: { workflow: string; run: string }): RoutedServiceRecordedPairV2 {
+  let bytes: number;
+  try { bytes = Buffer.byteLength(JSON.stringify(raw)); }
+  catch { throw new Error('routed recorded pair exceeds bounds'); }
+  if (bytes > 4_100_000) throw new Error('routed recorded pair exceeds bounds');
+  const wire = record(raw);
+  if (!wire || wire.protocol !== 'routed-recorded-input-pair-v2' || wire.phase !== 'recorded-live'
+    || !keys(wire, ['protocol', 'phase', 'reference', 'claim']))
+    throw new Error('routed recorded pair envelope refused');
+  const reference = parseRecordedReferenceV2(wire.reference, expected);
+  if (reference.state !== 'available') {
+    const skipped = record(wire.claim);
+    if (!skipped || !keys(skipped, ['state']) || skipped.state !== 'skipped')
+      throw new Error('routed recorded pair skip refused');
+    throw new Error('routed recorded reference unavailable');
+  }
+  const claim = parseRecordedClaimV2(wire.claim, expected);
+  if (claim.state !== 'available' || !isDeepStrictEqual(reference.binding, claim.binding)
+    || !isDeepStrictEqual(reference.order.routing, claim.routing))
+    throw new Error('routed recorded pair changed');
+  return { reference, claim };
+}
+
+export function createRecordedRoutedInputPairV2Reader(options: RoutedV2TransportOptions): {
+  read(): Promise<RoutedServiceRecordedPairV2>;
+} {
+  const { now, request } = createRoutedV2Requester(options);
+  return { read: async () => parseRoutedServiceRecordedPairV2(
+    await request('/api/read_routing_input_pair/live/v2', now()), options.expected) };
 }
 
 export function createRecordedRoutedV2Reader(options: RoutedV2TransportOptions): {
