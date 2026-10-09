@@ -116,8 +116,21 @@ export function createDirectRoutedConcreteCallReader(options: RoutedV2TransportO
   binding: unknown) => Promise<RoutedConcreteCallObservation> {
   const { now, request } = createRoutedV2Requester(options);
   return async (selection, phase, binding) => {
-    if (selection.rootWorkflow !== options.expected.workflow
-      || selection.run !== options.expected.run
+    const body = concreteStructureRequestBody(selection, options.expected);
+    const raw = await request(phase === 'prestart'
+      ? '/api/read_concrete_call_structure' : '/api/read_concrete_call_structure/live/v2',
+    now(), body);
+    return parseRoutedConcreteCallStructure(raw, { request: selection, phase,
+      expected: { ...options.expected, origin: options.origin, orgId: options.orgId,
+	binding } });
+  };
+}
+
+/** Shared exact request projection; private selection markers never cross HTTPS. */
+export function concreteStructureRequestBody(selection: RoutedConcreteCallRequest,
+  expected: { workflow: string; run: string }) {
+    if (selection.rootWorkflow !== expected.workflow
+      || selection.run !== expected.run
       || !ref(selection.frameDefRef)
       || !ref(selection.edge.parentDefRef)
       || selection.ancestry.length >= 64
@@ -128,17 +141,11 @@ export function createDirectRoutedConcreteCallReader(options: RoutedV2TransportO
 	  ? !hex(edge.receiptDigest)
 	  : edge.selectionSource !== 'signed-static'
 	    || edge.receiptDigest !== undefined))) throw refused();
-    const body = { workflow: options.expected.workflow, orderId: options.expected.run,
+    return { workflow: expected.workflow, orderId: expected.run,
       frameDefRef: selection.frameDefRef,
       ancestry: selection.ancestry.map(edge => ({ parentDefRef: edge.parentDefRef,
 	callStep: edge.callStep, callPath: edge.callPath, childDefRef: edge.childDefRef,
 	...(edge.receiptDigest === undefined ? {} : { receiptDigest: edge.receiptDigest }) })),
       callStep: selection.edge.callStep, callPath: selection.edge.callPath };
-    const raw = await request(phase === 'prestart'
-      ? '/api/read_concrete_call_structure' : '/api/read_concrete_call_structure/live/v2',
-    now(), body);
-    return parseRoutedConcreteCallStructure(raw, { request: selection, phase,
-      expected: { ...options.expected, origin: options.origin, orgId: options.orgId,
-	binding } });
-  };
+
 }

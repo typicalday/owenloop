@@ -881,3 +881,68 @@ outputs: [out]
   await assert.rejects(stageRoutedDefinition(args), /routed definition staging refused/);
   assert.equal(readdirSync(join(f.stateDir, '.routing-definitions')).length, 0);
 });
+
+test('coherent structural stage reopens after local awaits and never downgrades to legacy observation', async () => {
+  const source = duplicateStepSource();
+  writeFileSync(join(source, 'parent.yaml'), `name: routing/parent
+inputs: []
+outputs: [parent-out]
+steps:
+  - name: delegate
+    calls: routing/child
+    produces: [folded]
+  - name: build
+    executor: command
+    consumes: []
+    produces: [parent-out]
+    terminal: true
+    command: echo parent
+`);
+  const f = await fixture(workflow, source);
+  const expiresAt = Date.now() + 60_000;
+  const routed = { claim: { claimId: 'run', orderId: 'run', attemptId: 'run', principalId: 'agent',
+    sessionId: 'rs_test', shiftId: 'shf_test', binding: { runId: 'wf_root', frameId: 'wf_frame',
+      def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'routing/parent' } } },
+    decision: { decisionId: 'decision', binding: { runId: 'wf_root', frameId: 'wf_frame',
+      def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'routing/parent' } } },
+    preference: { rosterRevision: 'a'.repeat(64), expiresAt } } as unknown as ReferenceRouting;
+  const packet = { workflow: 'wf_frame', run: 'run', step: 'build', key: '', defDigest: f.packed.digest,
+    worker: 'command', inputs: [], outputs: ['parent-out'], consumes: {}, consumedFingerprint: {},
+    owes: [{ path: 'parent-out', version: 1 }], routing: routed } as unknown as OrderPacket;
+  const original = { ...f.args.order, workflow: packet.workflow, step: packet.step, key: packet.key,
+    routing: routed, consumedFingerprint: {} };
+  const expected = { workflow: 'wf_root', run: 'run' };
+  const binding = { rootWorkflow: 'wf_root', frameWorkflow: 'wf_frame', run: 'run', claimId: 'run',
+    decisionId: 'decision', sessionId: 'rs_test', shiftId: 'shf_test', orderDigest: 'b'.repeat(64),
+    authorityRevision: 'c'.repeat(64), rosterRevision: routed.preference.rosterRevision,
+    routingDigest: valueDigestHex(routed), preferenceExpiresAt: expiresAt };
+  const pair = () => ({ reference: { protocol: 'trusted-routed-reference-read-v2' as const,
+    state: 'available' as const, ...expected, order: packet, inputs: [], lease: { claimed: true as const }, binding },
+  claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
+    ...expected, routing: routed, binding } });
+  let calls = 0, legacyCalls = 0, selectedChild = 'wf_native_B', refuse = false;
+  const stageArgs = { ...f.args, rootWorkflow: expected.workflow, order: original,
+    readCurrentPair: async () => { legacyCalls++; return pair(); },
+    readConcreteCallStructure: async () => { legacyCalls++; throw new Error('legacy route must remain unused'); },
+    readConcreteStructurePair: async () => {
+      calls++;
+      await Promise.resolve();
+      if (refuse) throw new Error('coherent source refused');
+      return { pair: pair(), selected: { kind: 'selected-native-concrete-child' as const,
+	childDefRef: { bundleDigest: f.packed.digest, workflowName: 'routing/child' },
+	parentWorkflow: 'wf_frame', childWorkflow: selectedChild, receiptDigest: 'd'.repeat(64) } };
+    } };
+  const stage = await stageRoutedDefinition(stageArgs);
+  try {
+    const firstCalls = calls;
+    selectedChild = 'wf_native_C';
+    const response: GetOrderResponse = { text: '', workflow: packet.workflow, run: packet.run,
+      lease: { claimed: true }, order: packet };
+    await assert.rejects(stage.verifyOrder(response), /concrete|definition|instruction/);
+    assert.ok(calls > firstCalls, 'signed verification obtains another occurrence observation');
+    assert.equal(legacyCalls, 0);
+    refuse = true;
+    await assert.rejects(stageRoutedDefinition(stageArgs), /refused|unavailable/);
+    assert.equal(legacyCalls, 0, 'new callback refusal never downgrades to three legacy requests');
+  } finally { stage.cleanup(); }
+});

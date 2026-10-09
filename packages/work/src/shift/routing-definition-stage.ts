@@ -17,6 +17,7 @@ import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/orig
 import { parseWorkdirFrom } from '../../../../src/paths.ts';
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
+import type { StructurePairObservation, FoldedPairObservation } from '../hosted/trusted-routed-coherent-observation.ts';
 import { bindTrustedRoutedInputV2, type RoutedInputPair, type RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
 import { validModelOrderFields, outputFor } from '../order-definition-binding.ts';
 import { createStoreInstructionResolver } from '../exec/instructions.ts';
@@ -319,6 +320,10 @@ export async function stageRoutedDefinition(args: {
   readInvocationBinding?: (key: InvocationRelayKey, phase: RoutedInputPhase,
     expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
       Promise<VerifiedInvocationReceipt | undefined>;
+  readConcreteStructurePair?: (selection: RoutedConcreteCallRequest, phase: RoutedInputPhase,
+    expected: { workflow: string; run: string }) => Promise<StructurePairObservation>;
+  readConcreteBindingPair?: (key: ConcreteCallBindingKey, phase: RoutedInputPhase,
+    expected: { workflow: string; run: string }) => Promise<FoldedPairObservation>;
   readConcreteCallStructure?: (selection: RoutedConcreteCallRequest, phase: RoutedInputPhase,
     expected: { workflow: string; run: string }, binding: unknown) =>
       Promise<RoutedConcreteCallObservation>;
@@ -451,16 +456,22 @@ export async function stageRoutedDefinition(args: {
 	frameWorkflow, frameDefRef,
 	stillAuthorized: () => phase === 'recorded-live' || args.stillAuthorized(),
 	observe: async request => {
-	  if (!args.readCurrentPair || !args.readConcreteCallStructure)
+	  if (!args.readConcreteStructurePair && (!args.readCurrentPair || !args.readConcreteCallStructure))
 	    throw new Error('routed concrete call source unavailable');
 	  if (request.rootWorkflow !== args.rootWorkflow || request.run !== args.order.run
 	    || request.frameWorkflow !== frameWorkflow
 	    || !isDeepStrictEqual(request.frameDefRef, frameDefRef))
 	    throw new Error('routed concrete call scope refused');
-	  const before = await args.readCurrentPair(phase, expected);
+	  if (args.readConcreteStructurePair) {
+	    const observed = await args.readConcreteStructurePair(request, phase, expected);
+	    parsePair(observed.pair);
+	    if (phase === 'prestart' && !args.stillAuthorized()) throw new Error('routed concrete call changed');
+	    return observed.selected;
+	  }
+	  const before = await args.readCurrentPair!(phase, expected);
 	  const observedBinding = parsePair(before);
-	  const selected = await args.readConcreteCallStructure(request, phase, expected, observedBinding);
-	  const after = await args.readCurrentPair(phase, expected);
+	  const selected = await args.readConcreteCallStructure!(request, phase, expected, observedBinding);
+	  const after = await args.readCurrentPair!(phase, expected);
 	  parsePair(after);
 	  if (!isDeepStrictEqual(after, before)
 	    || (phase === 'prestart' && !args.stillAuthorized()))
@@ -470,7 +481,7 @@ export async function stageRoutedDefinition(args: {
     };
     const readFoldedConcreteCall = async (phase: RoutedInputPhase,
       key: ConcreteCallBindingKey): Promise<VerifiedConcreteCallReceipt | undefined> => {
-      if (!routing || !args.readCurrentPair || !args.readConcreteCallBinding
+      if (!routing || (!args.readConcreteBindingPair && (!args.readCurrentPair || !args.readConcreteCallBinding))
 	|| key.parentWorkflow !== frameWorkflow
 	|| key.parentDefRef.bundleDigest !== args.order.defDigest
 	|| key.parentDefRef.workflowName !== definitionName
@@ -503,10 +514,16 @@ export async function stageRoutedDefinition(args: {
 	  throw new Error('routed concrete folded pair refused');
 	return reference.binding;
       };
-      const before = await args.readCurrentPair(phase, expected);
+      if (args.readConcreteBindingPair) {
+	const observed = await args.readConcreteBindingPair(key, phase, expected);
+	parse(observed.pair);
+	if (phase === 'prestart' && !args.stillAuthorized()) throw new Error('routed concrete folded pair changed');
+	return observed.selected;
+      }
+      const before = await args.readCurrentPair!(phase, expected);
       const binding = parse(before);
-      const receipt = await args.readConcreteCallBinding(key, phase, expected, binding);
-      const after = await args.readCurrentPair(phase, expected);
+      const receipt = await args.readConcreteCallBinding!(key, phase, expected, binding);
+      const after = await args.readCurrentPair!(phase, expected);
       parse(after);
       if (!isDeepStrictEqual(before, after)
 	|| (phase === 'prestart' && !args.stillAuthorized()))

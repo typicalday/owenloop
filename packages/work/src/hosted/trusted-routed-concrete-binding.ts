@@ -100,15 +100,22 @@ export function createDirectRoutedConcreteCallBindingReader(options:
     Promise<VerifiedConcreteCallReceipt | undefined> {
   const { now, request } = createRoutedV2Requester(options);
   return async (key, phase, binding) => {
-    if (!text(key.parentWorkflow) || !defRef(key.parentDefRef)
-      || !text(key.callPath) || !version(key.parentArtifactVersion)) throw refused();
+    const body = concreteBindingRequestBody(key, options.expected);
     const raw = await request(phase === 'prestart'
       ? '/api/read_concrete_call_binding' : '/api/read_concrete_call_binding/live/v2',
-    now(), { workflow: options.expected.workflow, orderId: options.expected.run,
-      parentWorkflow: key.parentWorkflow, parentDefRef: key.parentDefRef,
-      callPath: key.callPath, parentArtifactVersion: key.parentArtifactVersion });
+    now(), body);
     return parseRoutedConcreteCallBinding(raw, { key, phase,
       expected: { ...options.expected, origin: options.origin, orgId: options.orgId,
 	binding } });
   };
+}
+
+/** The selected native key remains exact in both standalone and composite reads. */
+export function concreteBindingRequestBody(key: ConcreteCallBindingKey,
+  expected: { workflow: string; run: string }) {
+  if (!text(key.parentWorkflow) || !defRef(key.parentDefRef)
+    || !text(key.callPath) || !version(key.parentArtifactVersion)) throw refused();
+  return { workflow: expected.workflow, orderId: expected.run,
+    parentWorkflow: key.parentWorkflow, parentDefRef: key.parentDefRef,
+    callPath: key.callPath, parentArtifactVersion: key.parentArtifactVersion };
 }

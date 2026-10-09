@@ -22,6 +22,8 @@ import { createRecordedRoutedV2Reader, createRecordedRoutedInputPairV2Reader,
   type RoutedServiceRecordedPairV2, type RecordedClaimV2,
   type RecordedBindingV2, type RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { createDirectRoutedInvocationReader } from '../hosted/trusted-routed-invocation.ts';
+import { createCoherentRoutingReaders, type StructurePairObservation, type FoldedPairObservation, type OrderPairObservation } from '../hosted/trusted-routed-coherent-observation.ts';
+import type { ContactHolder } from '../hub/types.ts';
 import { createDirectRoutedConcreteCallReader } from '../hosted/trusted-routed-concrete-call.ts';
 import { createDirectRoutedConcreteCallBindingReader,
   type ConcreteCallBindingKey, type VerifiedConcreteCallReceipt } from '../hosted/trusted-routed-concrete-binding.ts';
@@ -804,6 +806,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	  onRateLimit: routingBackoff!.onRateLimit,
 	  readInvocationBinding: captured.readInvocationBinding,
 	  readConcreteCallStructure: captured.readConcreteCallStructure,
+	  readConcreteStructurePair: captured.readConcreteStructurePair,
+	  readConcreteBindingPair: captured.readConcreteBindingPair,
 	  readConcreteCallBinding: captured.readConcreteCallBinding,
 	  readCurrentPair: async (phase, target) => {
 	    if (target.workflow !== expected.workflow || target.run !== expected.run)
@@ -831,6 +835,16 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       }),
       createRoutingInputAuthority: (stage, target, rootWorkflow) => ({
 	validateInvocationKey: key => stage.validateInvocationKey?.(key) === true,
+	...(target.readRoutingOrderPair ? { observeOrder: async (holder: ContactHolder | undefined,
+	  phase: 'prestart' | 'recorded-live', expected: { workflow: string; run: string }) => {
+	  if (!stage.verifyRoutedInput) throw new Error('routed input authority unavailable');
+	  if (expected.workflow !== rootWorkflow) throw new Error('routed order root changed');
+	  const started = { wall: now(), monotonic: performance.now() };
+	  const observed = await target.readRoutingOrderPair!(holder, phase,
+	    expected);
+	  await stage.verifyRoutedInput(observed.response, observed.pair, phase, started);
+	  return observed;
+	} } : {}),
 	observe: async (response, phase) => {
 	  if (!stage.verifyRoutedInput) throw new Error('routed input authority unavailable');
 	  const started = { wall: now(), monotonic: performance.now() };
@@ -1055,6 +1069,12 @@ export interface ShiftRoutingSession {
     readInvocationBinding: (key: InvocationRelayKey, phase: 'prestart' | 'recorded-live',
       expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
       Promise<VerifiedInvocationReceipt | undefined>;
+    readConcreteStructurePair?: (selection: RoutedConcreteCallRequest, phase: 'prestart' | 'recorded-live',
+      expected: { workflow: string; run: string }) => Promise<StructurePairObservation>;
+    readConcreteBindingPair?: (key: ConcreteCallBindingKey, phase: 'prestart' | 'recorded-live',
+      expected: { workflow: string; run: string }) => Promise<FoldedPairObservation>;
+    readRoutingOrderPair?: (holder: ContactHolder | undefined, phase: 'prestart' | 'recorded-live',
+      expected: { workflow: string; run: string }) => Promise<OrderPairObservation>;
     readConcreteCallStructure: (selection: RoutedConcreteCallRequest,
       phase: 'prestart' | 'recorded-live', expected: { workflow: string; run: string },
       binding: unknown) => Promise<RoutedConcreteCallObservation>;
@@ -1227,7 +1247,10 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
 	routedLiveV2PairRead: incarnation.readRecordedPairV2,
 	readInvocationBinding: incarnation.readInvocationBinding,
 	readConcreteCallStructure: incarnation.readConcreteCallStructure,
-	readConcreteCallBinding: incarnation.readConcreteCallBinding } : undefined;
+	readConcreteCallBinding: incarnation.readConcreteCallBinding,
+	readConcreteStructurePair: incarnation.readConcreteStructurePair,
+	readConcreteBindingPair: incarnation.readConcreteBindingPair,
+	readRoutingOrderPair: incarnation.readRoutingOrderPair } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: (reservation, broker, definitionStage) => {
@@ -1325,6 +1348,9 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
     readRoutedPairV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2PairRead'];
     readRecordedPairV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedLiveV2PairRead'];
     readInvocationBinding: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readInvocationBinding'];
+    readConcreteStructurePair: NonNullable<NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readConcreteStructurePair']>;
+    readConcreteBindingPair: NonNullable<NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readConcreteBindingPair']>;
+    readRoutingOrderPair: NonNullable<NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readRoutingOrderPair']>;
     readConcreteCallStructure: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readConcreteCallStructure'];
     readConcreteCallBinding: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readConcreteCallBinding'];
     stop(): Promise<HubError | undefined>;
@@ -1410,6 +1436,23 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
     })();
     return closing;
   };
+  const withCoherentReader = async <T>(expected: { workflow: string; run: string },
+    read: (reader: ReturnType<typeof createCoherentRoutingReaders>) => Promise<T>): Promise<T> => {
+    if (renewalDenied || !authority || now() >= authority.expiresAt)
+      throw new Error('routed coherent session unavailable');
+    const sessionId = authority.sessionId, shiftId = authority.shiftId;
+    const current = () => {
+      if (renewalDenied || !authority || authority.sessionId !== sessionId
+	|| authority.shiftId !== shiftId || now() >= authority.expiresAt)
+	throw new Error('routed coherent session changed');
+    };
+    const reader = createCoherentRoutingReaders({ origin: opts.origin, orgId: opts.orgId,
+      expected, getToken: opts.getToken, beforeRequest: opts.beforeRequest, onRateLimit: opts.onRateLimit,
+      getSession: async () => { current(); return authority!.credential; } });
+    const result = await read(reader);
+    current();
+    return result;
+  };
   return {
     hub,
     identity: () => renewalDenied ? undefined : authority && ({ orgId: opts.orgId, principalId: opts.principalId,
@@ -1494,6 +1537,12 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	|| now() >= authority.expiresAt) throw new Error('routed invocation session changed');
       return result;
     },
+    readConcreteStructurePair: (selection, phase, expected) =>
+      withCoherentReader(expected, reader => reader.structure(selection, phase)),
+    readConcreteBindingPair: (key, phase, expected) =>
+      withCoherentReader(expected, reader => reader.folded(key, phase)),
+    readRoutingOrderPair: (holder, phase, expected) =>
+      withCoherentReader(expected, reader => reader.order(holder, phase)),
     async readConcreteCallStructure(selection, phase, expected, binding) {
       if (renewalDenied || !authority || now() >= authority.expiresAt)
 	throw new Error('routed concrete call session unavailable');

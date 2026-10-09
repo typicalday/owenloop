@@ -136,6 +136,10 @@ export interface RoutedLaunchAuthority {
 }
 /** Parent-owned input observation. The caller never supplies the phase or a URL. */
 export interface RoutedInputAuthority {
+  /** Fresh full getSessionOrder+pair, verified by the parent stage before return.
+   * Never reused across another consequence or local await. */
+  observeOrder?(holder: ContactHolder | undefined, phase: RoutedInputPhase,
+    expected: { workflow: string; run: string }): Promise<{ response: GetOrderResponse; pair: RoutedInputPair }>;
   observe(response: GetOrderResponse, phase: RoutedInputPhase): Promise<RoutedInputPair>;
   validateInvocationKey?(key: InvocationRelayKey): boolean;
   observeInvocation?(response: GetOrderResponse, phase: RoutedInputPhase,
@@ -457,6 +461,31 @@ async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
   return pair;
 }
 
+/** Replace only an existing get_order followed by parent pair verification. */
+async function readVerifiedParentOrder(grant: Grant, holder: ContactHolder | undefined,
+  phase: RoutedInputPhase, now: () => number, signal: AbortSignal):
+  Promise<{ response: GetOrderResponse; pair: RoutedInputPair | undefined }> {
+  if (!grant.submissionAuthority) throw new Error('routing order authority unavailable');
+  if (grant.inputAuthority?.observeOrder) {
+    if (signal.aborted) throw new Error('routing order observation aborted');
+    if (phase === 'recorded-live' && (!grant.acceptedLaunchReport || !liveChildValid(grant, now())))
+      throw new Error('routing recorded occurrence unavailable');
+    const observed = await checked(grant, grant.inputAuthority.observeOrder(holder, phase,
+      { workflow: grant.reservation.workflow, run: grant.reservation.run }), now, phase === 'prestart');
+    if (signal.aborted) throw new Error('routing order observation aborted');
+    if (!validOrderResponse(grant, observed.response) || !observed.response.lease.claimed || !observed.response.order)
+      throw new Error('routing current order unavailable');
+    acceptVerifiedPair(grant, observed.pair, phase, now);
+    return observed;
+  }
+  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+    run: grant.reservation.run, holder }, signal), now, phase === 'prestart');
+  if (!validOrderResponse(grant, response)) throw new Error('routing current order unavailable');
+  const pair = response.lease.claimed && response.order
+    ? await verifyParentOrder(grant, response, phase, now) : undefined;
+  return { response, pair };
+}
+
 async function verifyCurrentConsequence(grant: Grant, scope: CapScope,
   now: () => number, signal: AbortSignal,
   phase: RoutedInputPhase = 'recorded-live'): Promise<GetOrderResponse | undefined> {
@@ -467,11 +496,9 @@ async function verifyCurrentConsequence(grant: Grant, scope: CapScope,
   const holder: ContactHolder = scope === 'role'
     ? { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }
     : { kind: 'session', id: grant.identity.sessionId, shiftId: grant.identity.shiftId };
-  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
-    run: grant.reservation.run, holder }, signal), now, phase === 'prestart');
+  const { response } = await readVerifiedParentOrder(grant, holder, phase, now, signal);
   if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order)
     throw new Error('routing current order unavailable');
-  await verifyParentOrder(grant, response, phase, now);
   return response;
 }
 
@@ -536,13 +563,9 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
 	|| !Number.isSafeInteger(issued.generation) || issued.generation < 1
 	|| !/^[a-f0-9]{64}$/.test(issued.generationToken))
 	throw new Error('routing submission retry authority refused');
-      const fresh = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
-	run: grant.reservation.run, holder }, signal), now);
+      const { response: fresh } = await readVerifiedParentOrder(grant, holder, 'recorded-live', now, signal);
       if (submissionBinding(fresh, path, grant) !== pending.binding
 	|| authority.canReplay?.(fresh.order!, path) !== true)
-	throw new Error('routing submission retry order changed');
-      await verifyParentOrder(grant, fresh, 'recorded-live', now);
-      if (submissionBinding(fresh, path, grant) !== pending.binding)
 	throw new Error('routing submission retry order changed');
       pending.generationToken = issued.generationToken;
       const replay = await checked(grant, startEffect(grant, () => grant.hub.routingConditionalMutation({
@@ -554,13 +577,8 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
 	  || replay.outcome === 'approved') grant.pendingSubmit = undefined;
 	return replay;
     }
-    const fresh = await checked(grant, grant.hub.getOrder({
-      workflow: grant.reservation.workflow, run: grant.reservation.run, holder,
-    }, signal), now);
+    const { response: fresh } = await readVerifiedParentOrder(grant, holder, 'recorded-live', now, signal);
     const binding = submissionBinding(fresh, path, grant);
-    await verifyParentOrder(grant, fresh, 'recorded-live', now);
-    if (submissionBinding(fresh, path, grant) !== binding)
-      throw new Error('routing submission order changed');
     if (authority.canSubmit?.(fresh.order!, path) !== true)
       throw new Error('routing submission kind unavailable');
     {
@@ -568,12 +586,7 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
       if (typeof proof !== 'string' || !proof) throw new Error('routing submission proof refused');
       // Signing and source verification await external work. Refresh again;
       // the Service enforces the exact version at its final transaction too.
-      const current = await checked(grant, grant.hub.getOrder({
-	workflow: grant.reservation.workflow, run: grant.reservation.run, holder,
-      }, signal), now);
-      if (submissionBinding(current, path, grant) !== binding)
-	throw new Error('routing submission order changed');
-      await verifyParentOrder(grant, current, 'recorded-live', now);
+      const { response: current } = await readVerifiedParentOrder(grant, holder, 'recorded-live', now, signal);
       if (submissionBinding(current, path, grant) !== binding)
 	throw new Error('routing submission order changed');
       const request = { workflow: grant.reservation.workflow, run: grant.reservation.run, path,
@@ -624,13 +637,11 @@ async function verifyParentLaunch(grant: Grant, request: LaunchReservationReques
   if (!grant.inputAuthority) await verifyParentOrder(grant, fresh, 'prestart', now);
   await checked(grant, grant.launchAuthority.verifySelection(fresh.order, structuredClone(request)), now, true);
   if (grant.inputAuthority) {
-    const final = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
-      run: grant.reservation.run, holder: { kind: 'exec', id: grant.execHolderId,
-	shiftId: grant.identity.shiftId } }, signal), now, true);
+    const { response: final } = await readVerifiedParentOrder(grant,
+      { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }, 'prestart', now, signal);
     if (!validOrderResponse(grant, final) || !final.lease.claimed || !final.order
       || !isDeepStrictEqual(final.order, fresh.order))
       throw new Error('routing launch order changed');
-    await verifyParentOrder(grant, final, 'prestart', now);
   }
 }
 
@@ -745,11 +756,9 @@ async function collectionOrder(grant: Grant, sealPath: string, holder: RoutedCol
   const authority = grant.submissionAuthority;
   if (!authority || !grant.ready || !validateSessionGrant(grant, now()))
     throw new Error('routing collection authority unavailable');
-  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
-    run: grant.reservation.run, holder }, signal), now);
+  const { response } = await readVerifiedParentOrder(grant, holder, 'recorded-live', now, signal);
   if (!response.lease.claimed || !response.order) throw new Error('routing collection claim unavailable');
   const binding = submissionBinding(response, sealPath, grant);
-  await verifyParentOrder(grant, response, 'recorded-live', now);
   if (authority.canCollect?.(response.order, sealPath) !== true
     || submissionBinding(response, sealPath, grant) !== binding)
     throw new Error('routing collection target unavailable');
@@ -891,12 +900,10 @@ function postrunHolder(grant: Grant): ContactHolder {
 async function postrunClaim(grant: Grant, now: () => number,
   signal: AbortSignal): Promise<'held'> {
   const phase: RoutedInputPhase = grant.acceptedLaunchReport ? 'recorded-live' : 'prestart';
-  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
-    run: grant.reservation.run, holder: postrunHolder(grant) }, signal), now);
+  const { response } = await readVerifiedParentOrder(grant, postrunHolder(grant), phase, now, signal);
   if (!validOrderResponse(grant, response)) throw new Error('routing command claim unavailable');
   if (!response.lease.claimed || !response.order)
     throw new Error('routing command claim unavailable');
-  await verifyParentOrder(grant, response, phase, now);
   return 'held';
 }
 
@@ -1303,12 +1310,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (!exactKeys(body, ['path', 'holder']) || typeof body.path !== 'string'
 	|| !grant.allowedPaths?.has(body.path) || !validHolder(grant, scope, body.holder))
 	throw new Error('routing broker request refused');
-      const response = await checked(grant, grant.hub.getOrder({ workflow, run,
-	holder: body.holder }, signal), now);
+      const { response } = await readVerifiedParentOrder(grant, body.holder as ContactHolder,
+	'recorded-live', now, signal);
       if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order
 	|| !grant.submissionAuthority) throw new Error('routing collection order unavailable');
-      await verifyParentOrder(grant, response, 'recorded-live', now);
-      return { collection: grant.submissionAuthority.canCollect?.(response.order, body.path) === true };
+	  return { collection: grant.submissionAuthority.canCollect?.(response.order, body.path) === true };
     }
     case 'get_launch_order':
     case 'get_order': {
@@ -1318,7 +1324,10 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       if (prestart && (!grant.reservationRequest || !grant.acceptedLaunchReport || !grant.launchAuthority
 	|| grant.launchExpiresAt === undefined || now() >= grant.launchExpiresAt))
 	throw new Error('routing launch report unavailable');
-      let response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, prestart);
+      // General get_order also observes closure/lease loss. Preserve its plain
+      // read and claimed-only verification; no composite-failure downgrade.
+      let response = await checked(grant, grant.hub.getOrder({ workflow, run,
+	holder: body.holder }, signal), now, prestart);
       if (!validOrderResponse(grant, response)) throw new Error('routing broker response refused');
       if (response.lease.claimed && response.order && (!prestart || !grant.inputAuthority))
 	await verifyParentOrder(grant, response, prestart || scope === 'role'
@@ -1330,12 +1339,11 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	  structuredClone(grant.reservationRequest!)), now, true);
 	if (now() >= grant.launchExpiresAt!) throw new Error('routing launch reservation expired');
 	if (grant.inputAuthority) {
-	  const final = await checked(grant,
-	    grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, true);
+	  const { response: final } = await readVerifiedParentOrder(grant, body.holder as ContactHolder,
+	    'prestart', now, signal);
 	  if (!validOrderResponse(grant, final) || !final.lease.claimed || !final.order
 	    || !isDeepStrictEqual(final.order, response.order))
 	    throw new Error('routing launch order changed');
-	  await verifyParentOrder(grant, final, 'prestart', now);
 	  response = final;
 	}
       }
@@ -1360,11 +1368,9 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	|| !grant.execHolderId) throw new Error('routing broker pair refused');
       const holder: ContactHolder = { kind: 'exec', id: grant.execHolderId,
 	shiftId: grant.identity.shiftId };
-      const response = await checked(grant,
-	grant.hub.getOrder({ workflow, run, holder }, signal), now, true);
+      const { response, pair } = await readVerifiedParentOrder(grant, holder, 'prestart', now, signal);
       if (!validOrderResponse(grant, response) || !response.lease.claimed || !response.order)
 	throw new Error('routing broker pair refused');
-      const pair = await verifyParentOrder(grant, response, 'prestart', now);
       if (!pair || !validateLaunchGrant(grant, now()) || !grant.active || !grant.ready)
 	throw new Error('routing broker pair refused');
       const reference = parseRoutedReferenceV2(pair.reference, { workflow, run });
@@ -1391,8 +1397,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	const holder: ContactHolder = scope === 'role'
 	  ? { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }
 	  : { kind: 'session', id: grant.identity.sessionId, shiftId: grant.identity.shiftId };
-	const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder }, signal), now, true);
-	const pair = await verifyParentOrder(grant, response, 'prestart', now);
+	const { pair } = await readVerifiedParentOrder(grant, holder, 'prestart', now, signal);
 	if (!pair) throw new Error('routing input observation unavailable');
 	return kind === 'reference' ? pair.reference : pair.claim;
       }
@@ -1427,8 +1432,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	if (!grant.execHolderId) throw new Error('routing order holder unavailable');
 	const holder: ContactHolder = { kind: 'exec', id: grant.execHolderId,
 	  shiftId: grant.identity.shiftId };
-	const response = await checked(grant, grant.hub.getOrder({ workflow, run, holder }, signal), now);
-	const pair = await verifyParentOrder(grant, response, 'recorded-live', now);
+	const { pair } = await readVerifiedParentOrder(grant, holder, 'recorded-live', now, signal);
 	if (!pair || !liveChildValid(grant, now()))
 	  throw new Error('routing recorded input changed');
 	return kind === 'reference' ? pair.reference : pair.claim;

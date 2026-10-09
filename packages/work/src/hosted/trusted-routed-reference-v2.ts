@@ -19,7 +19,10 @@ const ROUTES = new Set(['/api/routing_reference_order/v2', '/api/read_routing_cl
   '/api/read_routing_input_pair/v2', '/api/read_routing_input_pair/live/v2',
   '/api/read_invocation_binding', '/api/read_invocation_binding/live/v2',
   '/api/read_concrete_call_structure', '/api/read_concrete_call_structure/live/v2',
-  '/api/read_concrete_call_binding', '/api/read_concrete_call_binding/live/v2']);
+  '/api/read_concrete_call_binding', '/api/read_concrete_call_binding/live/v2',
+  '/api/read_concrete_structure_pair/v3', '/api/read_concrete_structure_pair/live/v3',
+  '/api/read_concrete_binding_pair/v3', '/api/read_concrete_binding_pair/live/v3',
+  '/api/read_routing_order_pair/v3', '/api/read_routing_order_pair/live/v3']);
 const DIGEST = /^[a-f0-9]{64}$/i;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const BINDING_KEYS = ['rootWorkflow', 'frameWorkflow', 'run', 'claimId', 'decisionId', 'sessionId',
@@ -265,7 +268,9 @@ export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
       (status, headers) => {
 	if (status === 429) options.onRateLimit?.(new HubError(429,
 	  'routed v2 request refused', undefined, retryAfter(headers)));
-      }, path.startsWith('/api/read_routing_input_pair/') ? MAX_PAIR_WIRE_BYTES
+      }, path.startsWith('/api/read_concrete_structure_pair/') ? 6_200_000
+	: path.startsWith('/api/read_concrete_binding_pair/') || path.startsWith('/api/read_routing_order_pair/')
+	  ? 34_200_000 : path.startsWith('/api/read_routing_input_pair/') ? MAX_PAIR_WIRE_BYTES
 	: path === '/api/read_concrete_call_binding'
 	  || path === '/api/read_concrete_call_binding/live/v2'
 	  ? MAX_CONCRETE_BINDING_WIRE_BYTES : MAX_WIRE_BYTES);

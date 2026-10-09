@@ -1750,3 +1750,190 @@ test('parent input gate binds the Service root to a nested frame and permits pre
       'a completed witness after grant revocation cannot return a pair');
   } finally { await broker.close(); }
 });
+
+test('coherent order gate is fresh per consequence, preserves plain closure and refuses changed or delayed authority', async () => {
+  let now = 2_000;
+  let witnessChanged = false;
+  let liveIdentity = identity;
+  const routes: string[] = [];
+  const framed = { ...routing, preference: { ...routing.preference,
+    rosterRevision: 'a'.repeat(64) } };
+  const packet = { ...parentOrder().order, workflow: 'frame', routing: framed,
+    owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0,
+      reasons: [] }] };
+  let current = { ...parentOrder(), workflow: 'frame', order: packet };
+  const referenceBinding = { rootWorkflow: 'wf', frameWorkflow: 'frame', run: 'run',
+    claimId: 'run', decisionId: 'decision', sessionId, shiftId: identity.shiftId,
+    orderDigest: 'b'.repeat(64), authorityRevision: 'c'.repeat(64),
+    rosterRevision: framed.preference.rosterRevision, routingDigest: valueDigestHex(framed),
+    preferenceExpiresAt: framed.preference.expiresAt };
+  const pair = (): { reference: RoutedReferenceV2; claim: RoutedClaimV2 } => {
+    const binding = { ...referenceBinding,
+      orderDigest: witnessChanged ? 'd'.repeat(64) : referenceBinding.orderDigest };
+    return { reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
+      workflow: 'wf', run: 'run', order: { ...packet,
+	owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
+      inputs: [], lease: { claimed: true }, binding },
+    claim: { protocol: 'routing-claim-read-v2', state: 'available', workflow: 'wf', run: 'run',
+      routing: framed, binding } };
+  };
+  const phases: string[] = [];
+  assert.equal(parseRoutedReferenceV2(pair().reference,
+    { workflow: 'wf', run: 'run' }).state, 'available');
+  let delayed: Promise<ReturnType<typeof pair>> | undefined;
+  let observing!: () => void;
+  const observed = new Promise<void>(resolve => { observing = resolve; });
+  let finish!: (value: ReturnType<typeof pair>) => void;
+  const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+    routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => now },
+    fetchImpl: (async url => {
+      const route = String(url).split('/api/')[1]!;
+      routes.push(route);
+      return Response.json(route === 'get_order' ? current : { ok: true, text: 'ok' });
+    }) as typeof fetch });
+  const broker = await createRoutingBroker({ now: () => now });
+  try {
+    const agentReservation = { ...reservation, childKind: 'agent-run' as const };
+    const grant = broker.issue({ reservation: agentReservation, routing: framed, identity,
+      currentIdentity: () => liveIdentity, hub, submissionAuthority: transportAuthority,
+      inputAuthority: { observeOrder: async (contact, phase, expected) => {
+	assert.equal(expected.workflow, 'wf'); assert.equal(expected.run, 'run');
+	assert.equal(contact?.kind, 'exec');
+	phases.push(phase);
+	const witness = delayed ? (observing(), await delayed) : pair();
+	return { response: current, pair: witness };
+      }, observe: async (response, phase) => {
+	assert.equal(response.workflow, 'frame');
+	phases.push(phase);
+	if (delayed) { observing(); return delayed; }
+	return pair();
+      } } });
+    grant.activate({ ...child, kind: 'agent-run' });
+    const send = (method: string, body: unknown) => request(grant.socketPath,
+      { cap: grant.cap, method, body });
+    assert.equal((await send('get_order', { holder })).ok, true);
+    assert.equal((await send('heartbeat', { holder })).ok, true);
+    assert.deepEqual(phases, ['prestart', 'prestart']);
+    assert.deepEqual(routes, ['get_order', 'heartbeat']);
+    const role = createRoutingChildClient(handoffFor(grant, agentReservation));
+    const priorReads = routes.length, priorObservations = phases.length;
+    const paired = await role.readRoutedPairV2({ workflow: 'wf', run: 'run' });
+    assert.equal(paired.protocol, 'routed-prestart-pair-v2');
+    assert.equal(paired.phase, 'prestart');
+    assert.equal(paired.reference.state, 'available');
+    assert.equal(paired.claim.state, 'available');
+    assert.deepEqual(routes.slice(priorReads), []);
+    assert.deepEqual(phases.slice(priorObservations), ['prestart']);
+    await role.readRoutedPairV2({ workflow: 'wf', run: 'run' });
+    assert.deepEqual(routes.slice(priorReads), [],
+      'a later request must obtain a fresh current order');
+    assert.deepEqual(phases.slice(priorObservations), ['prestart', 'prestart']);
+    assert.equal((await request(grant.socketPath, { cap: grant.cap,
+      method: 'read_routed_pair_v2', body: { phase: 'recorded-live' } })).ok, false);
+    assert.equal((await request(grant.holder!.socketPath, { cap: grant.holder!.cap,
+      method: 'read_routed_pair_v2', body: {} })).ok, false,
+      'a holder cannot read the role pair');
+    assert.equal(routes.length, priorReads);
+    liveIdentity = { ...identity, sessionId: 'rs_revoked' };
+    await assert.rejects(role.readRoutedPairV2({ workflow: 'wf', run: 'run' }),
+      /routing broker unavailable/);
+    assert.equal(routes.length, priorReads, 'revoked session refuses before current order read');
+    liveIdentity = identity;
+    const held = current;
+    current = { ...current, order: null, lease: { claimed: false, outcome: 'green' } } as unknown as typeof current;
+    const priorPhaseCount = phases.length;
+    const closed = await send('get_order', { holder });
+    assert.equal(closed.ok, true);
+    assert.equal(phases.length, priorPhaseCount, 'no-authority closure skips both observation callbacks');
+    assert.equal(routes.at(-1), 'get_order', 'closure uses the original ordinary read');
+    current = held;
+    witnessChanged = true;
+    await assert.rejects(role.readRoutedPairV2({ workflow: 'wf', run: 'run' }),
+      /routing broker unavailable/);
+    assert.equal((await send('heartbeat', { holder })).ok, false);
+    assert.equal(routes.at(-1), 'get_order', 'changed composite witness cannot issue a heartbeat');
+    now = 75_000;
+    await assert.rejects(role.readRoutedPairV2({ workflow: 'wf', run: 'run' }),
+      /routing broker unavailable/);
+    assert.equal((await send('heartbeat', { holder })).ok, false,
+      'startup preference does not become a fresh launch after expiry');
+    now = 2_000;
+    witnessChanged = false;
+    delayed = new Promise(resolve => { finish = resolve; });
+    const pending = role.readRoutedPairV2({ workflow: 'wf', run: 'run' });
+    await observed;
+    grant.terminal();
+    finish(pair());
+    await assert.rejects(pending, /routing broker unavailable/,
+      'a completed witness after grant revocation cannot return a pair');
+  } finally { await broker.close(); }
+});
+
+test('coherent final launch observation stays after selection and refuses drift before reserve mutation', async () => {
+  for (const childKind of ['exec', 'agent-run'] as const) for (const drift of
+    ['roster', 'order', 'session', 'input'] as const) {
+    const tuple = { id: 'adapter', harness: 'local', model: 'available', effort: 'low' as const };
+    const routed = { ...routing, preference: { ...routing.preference,
+      rosterRevision: 'a'.repeat(64),
+      tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
+    const packet = { ...parentOrder().order, workflow: 'frame',
+      worker: childKind === 'exec' ? 'command' : 'agent',
+      owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      routing: routed } as OrderPacket;
+    let current = { ...parentOrder(), workflow: 'frame', order: packet };
+    let liveIdentity = identity, malformedInput = false;
+    let getOrders = 0, observes = 0, writes = 0;
+    let selectionStarted!: () => void, selectionDone!: () => void;
+    const started = new Promise<void>(resolve => { selectionStarted = resolve; });
+    const done = new Promise<void>(resolve => { selectionDone = resolve; });
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async url => {
+	if (String(url).endsWith('/get_order')) { getOrders++; return Response.json(current); }
+	writes++; return Response.json({ reservationId: 'lr', orderId: 'run', expiresAt: 40_000 });
+      }) as typeof fetch });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const granted = broker.issue({ reservation: { ...reservation, childKind }, routing: routed,
+	identity, currentIdentity: () => liveIdentity, hub,
+	submissionAuthority: transportAuthority, launchAuthority: {
+	  verifySelection: async () => { selectionStarted(); await done;
+	    if (drift === 'roster') throw new Error('current roster moved'); },
+	}, inputAuthority: { observe: async () => { throw new Error('unexpected legacy observation'); },
+	observeOrder: async () => {
+	  observes++;
+	  const pairBinding = { rootWorkflow: 'wf', frameWorkflow: 'frame', run: 'run',
+	    claimId: 'run', decisionId: 'decision', sessionId, shiftId: identity.shiftId,
+	    orderDigest: 'b'.repeat(64), authorityRevision: 'c'.repeat(64),
+	    rosterRevision: routed.preference.rosterRevision,
+	    routingDigest: valueDigestHex(routed), preferenceExpiresAt: routed.preference.expiresAt };
+	  const pair = { reference: { protocol: 'trusted-routed-reference-read-v2' as const,
+	    state: 'available' as const, workflow: 'wf', run: 'run',
+	    order: { ...packet, owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
+	    inputs: [], lease: { claimed: true as const }, binding: { ...pairBinding,
+	      ...(malformedInput ? { orderDigest: 'd'.repeat(64) } : {}) } },
+	  claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
+	    workflow: 'wf', run: 'run', routing: routed, binding: pairBinding } };
+	  getOrders++;
+	  return { response: current, pair };
+	} } });
+      granted.activate({ ...child, kind: childKind });
+      const launch = { version: 'launch-reservation-v1', claimId: 'run', decisionId: 'decision',
+	binding, orderId: 'run', attemptId: 'run', rosterRevision: routed.preference.rosterRevision,
+	candidateIds: childKind === 'exec' ? [] : ['adapter'], assessmentId: null,
+	requested: null, selected: childKind === 'exec' ? null : tuple };
+      const pending = request(granted.socketPath, { cap: granted.cap,
+	method: 'reserve_launch', body: { request: launch } });
+      await started;
+      assert.equal(getOrders, 1, 'selection follows one native current-order read');
+      assert.equal(observes, 0, 'no complete input observation before selection');
+      if (drift === 'order') current = { ...current, order: { ...packet, key: 'changed' } };
+      if (drift === 'session') liveIdentity = { ...identity, sessionId: 'rs_changed' };
+      if (drift === 'input') malformedInput = true;
+      selectionDone();
+      assert.equal((await pending).ok, false, `${childKind}/${drift}`);
+      assert.equal(writes, 0, `${childKind}/${drift} never reaches reserve_launch`);
+      assert.equal(observes, drift === 'input' || drift === 'order' ? 1 : 0);
+    } finally { await broker.close(); }
+  }
+});
