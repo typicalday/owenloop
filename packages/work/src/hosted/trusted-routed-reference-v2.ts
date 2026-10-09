@@ -12,11 +12,14 @@ import { parseTrustedReferenceV2, type TrustedInputWitness } from './trusted-ref
 
 const MAX_WIRE_BYTES = 2_000_000;
 const MAX_PAIR_WIRE_BYTES = 4_100_000;
+const MAX_CONCRETE_BINDING_WIRE_BYTES = 30_000_000;
 const MAX_MS = 5_000;
 const ROUTES = new Set(['/api/routing_reference_order/v2', '/api/read_routing_claim/v2',
   '/api/routing_reference_order/live/v2', '/api/read_routing_claim/live/v2',
   '/api/read_routing_input_pair/v2', '/api/read_routing_input_pair/live/v2',
-  '/api/read_invocation_binding', '/api/read_invocation_binding/live/v2']);
+  '/api/read_invocation_binding', '/api/read_invocation_binding/live/v2',
+  '/api/read_concrete_call_structure', '/api/read_concrete_call_structure/live/v2',
+  '/api/read_concrete_call_binding', '/api/read_concrete_call_binding/live/v2']);
 const DIGEST = /^[a-f0-9]{64}$/i;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const BINDING_KEYS = ['rootWorkflow', 'frameWorkflow', 'run', 'claimId', 'decisionId', 'sessionId',
@@ -262,7 +265,10 @@ export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
       (status, headers) => {
 	if (status === 429) options.onRateLimit?.(new HubError(429,
 	  'routed v2 request refused', undefined, retryAfter(headers)));
-      }, path.startsWith('/api/read_routing_input_pair/') ? MAX_PAIR_WIRE_BYTES : MAX_WIRE_BYTES);
+      }, path.startsWith('/api/read_routing_input_pair/') ? MAX_PAIR_WIRE_BYTES
+	: path === '/api/read_concrete_call_binding'
+	  || path === '/api/read_concrete_call_binding/live/v2'
+	  ? MAX_CONCRETE_BINDING_WIRE_BYTES : MAX_WIRE_BYTES);
     if (response.status === 429) {
       throw new HubError(429, 'routed v2 request refused', undefined, retryAfter(response.headers));
     }

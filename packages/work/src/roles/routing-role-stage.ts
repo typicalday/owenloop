@@ -2,6 +2,12 @@
  * trust authority; it verifies every claimed full order before broker reply. */
 import { constants, closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
+import type { RoutedConcreteCallRequest, RoutedConcreteCallObservation,
+  RoutedConcreteCallSelection } from '../../../../src/store/instruction-source.ts';
+import type { ConcreteCallBindingKey, ConcreteCallBindingSource,
+  VerifiedConcreteCallReceipt } from '../hosted/trusted-routed-concrete-binding.ts';
 import { createBundleIngestor, createExecutionDefinitionVerifier,
   createExecutionOriginVerifier, createStoreInstructionSource, globalStoreRoot,
   resolveOriginRules } from '../../../../src/store/index.ts';
@@ -19,10 +25,10 @@ function privateDir(path: string): void {
     || (process.getuid && stat.uid !== process.getuid())) throw refused();
 }
 
-function descriptor(path: string): unknown {
+function descriptor(path: string, maxBytes = 16_384): unknown {
   const before = lstatSync(path);
   if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
-    || (before.mode & 0o777) !== 0o600 || before.size > 16_384
+    || (before.mode & 0o777) !== 0o600 || before.size > maxBytes
     || (process.getuid && before.uid !== process.getuid())) throw refused();
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -65,12 +71,60 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1,
       || typeof data.bundleDigest !== 'string' || !/^[0-9a-f]{64}$/.test(data.bundleDigest)
       || typeof data.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(data.nonce)
       || !data.originRules || typeof data.originRules !== 'object'
-      || Array.isArray(data.originRules)) throw refused();
+      || Array.isArray(data.originRules)
+      || typeof data.concreteCallsDigest !== 'string'
+      || !/^[0-9a-f]{64}$/.test(data.concreteCallsDigest)
+      || typeof data.concreteCallsBytes !== 'number'
+      || !Number.isSafeInteger(data.concreteCallsBytes)
+      || data.concreteCallsBytes < 2 || data.concreteCallsBytes > 1_000_000) throw refused();
+    if (typeof data.concreteFoldedDigest !== 'string'
+      || !/^[0-9a-f]{64}$/.test(data.concreteFoldedDigest)
+      || typeof data.concreteFoldedBytes !== 'number'
+      || !Number.isSafeInteger(data.concreteFoldedBytes)
+      || data.concreteFoldedBytes < 2 || data.concreteFoldedBytes > 25_000_000) throw refused();
     const publicEnv = { HOME: join(stage.path, 'home'),
       OWENLOOP_CONFIG_DIR: join(stage.path, 'public') };
     const originRules = resolveOriginRules(publicEnv, data.originRules as Record<string, never>);
     const globalRoot = globalStoreRoot(publicEnv.HOME);
-    const source = createStoreInstructionSource({ globalRoot, verifier: createBundleIngestor() });
+    const concreteFile = join(stage.path, 'concrete-calls.json');
+    const concreteStat = lstatSync(concreteFile);
+    if (concreteStat.size !== data.concreteCallsBytes) throw refused();
+    const concrete = descriptor(concreteFile, 1_000_000);
+    if (!Array.isArray(concrete) || concrete.length > 64
+      || valueDigestHex(concrete) !== data.concreteCallsDigest) throw refused();
+    const selections = concrete as Array<{ request: RoutedConcreteCallRequest;
+      observation: RoutedConcreteCallObservation }>;
+    const foldedFile = join(stage.path, 'concrete-folded.json');
+    if (lstatSync(foldedFile).size !== data.concreteFoldedBytes) throw refused();
+    const folded = descriptor(foldedFile, 25_000_000);
+    if (!Array.isArray(folded) || folded.length > 64
+      || valueDigestHex(folded) !== data.concreteFoldedDigest) throw refused();
+    const foldedRows = folded as Array<{ key: ConcreteCallBindingKey;
+      receipt: VerifiedConcreteCallReceipt }>;
+    const concreteCallBindingSource: ConcreteCallBindingSource = { read: async key => {
+      const matches = foldedRows.filter(row => row && typeof row === 'object'
+	&& isDeepStrictEqual(row.key, key));
+      if (matches.length !== 1 || !matches[0]?.receipt) throw refused();
+      return matches[0].receipt;
+    } };
+    const routedConcreteCalls: RoutedConcreteCallSelection = {
+      rootWorkflow: data.rootWorkflow as string,
+      run: data.run as string,
+      frameWorkflow: data.frameWorkflow,
+      frameDefRef: { bundleDigest: data.digest as string,
+	workflowName: data.definitionName },
+      stillAuthorized: () => true,
+      observe: async request => {
+	const matches = selections.filter(row => row && typeof row === 'object'
+	  && isDeepStrictEqual(row.request, request));
+	if (matches.length !== 1 || !matches[0]?.observation) throw refused();
+	return matches[0].observation;
+      },
+    };
+    // This private snapshot is data-only. The parent re-observes each native
+    // selection and the full signed/input witness before the start gate.
+    const source = createStoreInstructionSource({ globalRoot,
+      verifier: createBundleIngestor(), routedConcreteCalls });
     const invocationBindingSource: InvocationBindingSource | undefined = child ? {
       read: key => {
 	if (key.parentWorkflow !== data.frameWorkflow
@@ -94,7 +148,8 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1,
       originVerifier: createExecutionOriginVerifier({ env: publicEnv }),
       consumedVerifier: createConsumedVerifier({ env: publicEnv, now: Date.now,
 	artifactPolicy: 'enforce' }),
-      ...(invocationBindingSource ? { invocationBindingSource } : {}), warn: () => {} });
+      ...(invocationBindingSource ? { invocationBindingSource } : {}),
+      concreteCallBindingSource, warn: () => {} });
     return { publicEnv, frameWorkflow: data.frameWorkflow,
       definitionName: data.definitionName, instructions: {
       ...strict,

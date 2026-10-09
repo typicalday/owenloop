@@ -22,7 +22,11 @@ import { createRecordedRoutedV2Reader, createRecordedRoutedInputPairV2Reader,
   type RoutedServiceRecordedPairV2, type RecordedClaimV2,
   type RecordedBindingV2, type RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { createDirectRoutedInvocationReader } from '../hosted/trusted-routed-invocation.ts';
+import { createDirectRoutedConcreteCallReader } from '../hosted/trusted-routed-concrete-call.ts';
+import { createDirectRoutedConcreteCallBindingReader,
+  type ConcreteCallBindingKey, type VerifiedConcreteCallReceipt } from '../hosted/trusted-routed-concrete-binding.ts';
 import type { InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
+import type { RoutedConcreteCallRequest, RoutedConcreteCallObservation } from '../../../../src/store/instruction-source.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, readHubRosterCache, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
@@ -799,6 +803,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	  beforeRequest: routingBackoff!.beforeRequest,
 	  onRateLimit: routingBackoff!.onRateLimit,
 	  readInvocationBinding: captured.readInvocationBinding,
+	  readConcreteCallStructure: captured.readConcreteCallStructure,
+	  readConcreteCallBinding: captured.readConcreteCallBinding,
 	  readCurrentPair: async (phase, target) => {
 	    if (target.workflow !== expected.workflow || target.run !== expected.run)
 	      throw new Error('routed definition target changed');
@@ -1048,7 +1054,13 @@ export interface ShiftRoutingSession {
     routedLiveV2PairRead: (expected: { workflow: string; run: string }) => Promise<RoutedServiceRecordedPairV2>;
     readInvocationBinding: (key: InvocationRelayKey, phase: 'prestart' | 'recorded-live',
       expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
-      Promise<VerifiedInvocationReceipt | undefined> } | undefined;
+      Promise<VerifiedInvocationReceipt | undefined>;
+    readConcreteCallStructure: (selection: RoutedConcreteCallRequest,
+      phase: 'prestart' | 'recorded-live', expected: { workflow: string; run: string },
+      binding: unknown) => Promise<RoutedConcreteCallObservation>;
+    readConcreteCallBinding: (key: ConcreteCallBindingKey,
+      phase: 'prestart' | 'recorded-live', expected: { workflow: string; run: string },
+      binding: unknown) => Promise<VerifiedConcreteCallReceipt | undefined> } | undefined;
   createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string;
     holder?: { socketPath: string; cap: string } }, definitionStage?: RoutedDefinitionStage): RoutingHandoff;
   maintain(): Promise<void>;
@@ -1476,6 +1488,44 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
       const result = await reader(key, phase, binding);
       if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
 	|| now() >= authority.expiresAt) throw new Error('routed invocation session changed');
+      return result;
+    },
+    async readConcreteCallStructure(selection, phase, expected, binding) {
+      if (renewalDenied || !authority || now() >= authority.expiresAt)
+	throw new Error('routed concrete call session unavailable');
+      const sessionId = authority.sessionId, shiftId = authority.shiftId;
+      const reader = createDirectRoutedConcreteCallReader({ origin: opts.origin,
+	orgId: opts.orgId, getToken: opts.getToken, expected,
+	beforeRequest: opts.beforeRequest, onRateLimit: opts.onRateLimit,
+	getSession: async () => {
+	  if (renewalDenied || !authority || authority.sessionId !== sessionId
+	    || authority.shiftId !== shiftId || now() >= authority.expiresAt)
+	    throw new Error('routed concrete call session changed');
+	  return authority.credential;
+	} });
+      const result = await reader(selection, phase, binding);
+      if (renewalDenied || !authority || authority.sessionId !== sessionId
+	|| authority.shiftId !== shiftId || now() >= authority.expiresAt)
+	throw new Error('routed concrete call session changed');
+      return result;
+    },
+    async readConcreteCallBinding(key, phase, expected, binding) {
+      if (renewalDenied || !authority || now() >= authority.expiresAt)
+	throw new Error('routed concrete binding session unavailable');
+      const sessionId = authority.sessionId, shiftId = authority.shiftId;
+      const reader = createDirectRoutedConcreteCallBindingReader({ origin: opts.origin,
+	orgId: opts.orgId, getToken: opts.getToken, expected,
+	beforeRequest: opts.beforeRequest, onRateLimit: opts.onRateLimit,
+	getSession: async () => {
+	  if (renewalDenied || !authority || authority.sessionId !== sessionId
+	    || authority.shiftId !== shiftId || now() >= authority.expiresAt)
+	    throw new Error('routed concrete binding session changed');
+	  return authority.credential;
+	} });
+      const result = await reader(key, phase, binding);
+      if (renewalDenied || !authority || authority.sessionId !== sessionId
+	|| authority.shiftId !== shiftId || now() >= authority.expiresAt)
+	throw new Error('routed concrete binding session changed');
       return result;
     },
     createHandoff(reservation, broker, definitionStage) {

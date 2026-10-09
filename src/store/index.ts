@@ -120,11 +120,16 @@ export {
   createStoreInstructionSource,
   isResolvableOrderDigest,
   StoreInstructionSourceError,
+  verifyInstalledWorkflowMember,
 } from './instruction-source.ts';
 export type {
   MissingObjectHandler,
   StoreInstructionSource,
   StoreInstructionSourceArgs,
+  RoutedConcreteCallEdge,
+  RoutedConcreteCallRequest,
+  RoutedConcreteCallObservation,
+  RoutedConcreteCallSelection,
   VerifiedDefinitionSelection,
   VerifiedCallsChild,
 } from './instruction-source.ts';

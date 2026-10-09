@@ -34,6 +34,7 @@ import {
   validateDef,
 } from '../defs.ts';
 import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
+import { isBundleWorkflowName } from '../bundle/call-target.ts';
 import { isVersionedReference, parseManifestBytes, parseVersionedCallTarget } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
@@ -195,6 +196,10 @@ export interface InstallWorkflowBundleArgs {
   expectedDigest?: DefDigest;
   /** Explicit publication/origin evidence forwarded to the mandatory verifier. */
   verificationEvidence?: BundleVerificationEvidence;
+  /** Opted-in routed host storage admission only. Signed Hub live slash calls
+   * defer cross-definition validation until an exact native occurrence is
+   * selected; this never grants an executable instruction lookup. */
+  deferHubLiveCallsAtStorage?: true;
   /**
    * Project-level installs ONLY: the installed.json ledger lookup so the
    * inline recovery can roll back/forward a legacy v1 (GitHub-route) journal
@@ -461,7 +466,9 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     const reasons: string[] = [];
     let staged: Map<string, ReturnType<typeof loadBundleDefFile>>;
     let externalVersionedCalls: ReadonlySet<string> = new Set();
+    let deferredHubLiveCalls: ReadonlySet<string> = new Set();
     let stagedBundleLock: Readonly<Record<string, string>> = {};
+    let stagedBundleDialect: 'plain' | 'hub-qualified' = 'plain';
     const manifestPath = join(stagingDir, 'bundle.yaml');
     if (existsSync(manifestPath)) {
       // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
@@ -471,6 +478,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
         const manifest = parseManifestBytes(readFileSync(manifestPath));
 		stagedBundleLock = manifest.lock;
 		const dialect = bundleDialectForManifest(manifest);
+		stagedBundleDialect = dialect;
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
           try {
@@ -508,6 +516,14 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 		[...staged.values()].flatMap((def) => def.steps.map((step) => step.calls)
 		  .filter((target): target is string => target !== undefined && isVersionedReference(target))),
       );
+      if (args.deferHubLiveCallsAtStorage === true && stagedBundleDialect === 'hub-qualified') {
+	deferredHubLiveCalls = new Set([...staged.values()].flatMap(def => def.steps
+	  .map(step => step.calls)
+	  .filter((target): target is string => target !== undefined
+	    && target.includes('/') && isBundleWorkflowName(target)
+	    && !isVersionedReference(target)
+	    && stagedBundleLock[target] === undefined)));
+      }
     }
     for (const stagedDef of staged.values()) {
       const lintResult = lintDef(stagedDef);
@@ -524,7 +540,12 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
     if (reasons.length === 0) {
       try {
-	finalizeDefs(staged, { allowUnresolvedVersionedCalls: externalVersionedCalls });
+	// An unlocked Hub slash call is selected from current native Service
+	// publication state, possibly outside this archive or differently from an
+	// archive sibling. Defer only its cross-definition/cycle edge during
+	// storage admission; executable prime must later bind an exact occurrence.
+	finalizeDefs(staged, { allowUnresolvedVersionedCalls: externalVersionedCalls,
+	  deferredHubLiveCalls });
       } catch (e) {
         if (e instanceof DefError) {
           reasons.push(`cross-definition validation failed: ${e.message}`);

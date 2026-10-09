@@ -47,6 +47,9 @@ export interface HubBundleRecoveryOptions {
   preCommitVerifier?: PreCommitVerifier;
   /** Private routed staging only: install signed locked children before their parent. */
   recoverLockedDependencies?: boolean;
+  /** Private routed staging only: defer signed Hub live slash edges until the
+   * parent authenticates the selected concrete occurrence. */
+  deferHubLiveCallsAtStorage?: true;
 }
 
 function retryAfterMs(response: Response): number | undefined {
@@ -188,6 +191,7 @@ export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): 
 	verifier: args.preCommitVerifier ?? createPreCommitVerifier({ env: args.env,
 	  ...(args.warn !== undefined ? { warn: args.warn } : {}) }),
         expectedDigest: digest,
+	...(args.deferHubLiveCallsAtStorage === true ? { deferHubLiveCallsAtStorage: true as const } : {}),
         verificationEvidence: {
           publication: state === 'signed'
             ? { state, dsseBytes: publicationBytes }

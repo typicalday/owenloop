@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { createRoutedDefinitionMaintenance, stageRoutedDefinition,
-  verifyRoutedSupportObjectsSync } from '../src/shift/routing-definition-stage.ts';
+  sameRoutedConcreteSelections, verifyRoutedSupportObjectsSync } from '../src/shift/routing-definition-stage.ts';
 import { RoutedInputWitnessRefusal } from '../src/shift/routing-input-refusal.ts';
 import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
@@ -29,6 +29,32 @@ import { createBundleIngestor, createStoreInstructionSource,
 
 const temp = (prefix: string) => mkdtempSync(join(tmpdir(), prefix));
 const workflow = 'name: recovered\ninputs: []\nsteps:\n  - name: command\n    consumes: []\n    produces: [out]\n    terminal: true\n    command: echo recovered\n';
+
+test('non-consumed concrete preview V1 may materialize at same signed child bytes after a live repin', () => {
+  const childDefRef = { bundleDigest: 'b'.repeat(64), workflowName: 'routing/child' };
+  const request = { rootWorkflow: 'wf_root', run: 'run', frameWorkflow: 'wf_frame',
+    frameDefRef: { bundleDigest: 'a'.repeat(64), workflowName: 'routing/parent' },
+    parentWorkflow: 'wf_frame', ancestry: [],
+    edge: { parentDefRef: { bundleDigest: 'a'.repeat(64), workflowName: 'routing/parent' },
+      callStep: 'delegate', callPath: 'child', target: 'routing/child' } };
+  const preview = [{ request, observation: { kind: 'prestart-live-concrete-child' as const,
+    parentWorkflow: 'wf_frame', childDefRef, observedLiveVersion: 1,
+    receiptDigest: 'c'.repeat(64) } }];
+  const native = [{ request, observation: { kind: 'selected-native-concrete-child' as const,
+    parentWorkflow: 'wf_frame', childWorkflow: 'wf_child', childDefRef,
+    receiptDigest: 'd'.repeat(64) } }];
+  assert.equal(sameRoutedConcreteSelections(preview, native), true);
+  assert.equal(sameRoutedConcreteSelections(native, preview), false);
+  assert.equal(sameRoutedConcreteSelections(native, [{ ...native[0]!, observation: {
+    ...native[0]!.observation, childWorkflow: 'wf_other_child' } }]), false);
+  assert.equal(sameRoutedConcreteSelections(preview, [{ ...native[0]!, observation: {
+    ...native[0]!.observation, parentWorkflow: 'wf_other_parent' } }]), false);
+  assert.equal(sameRoutedConcreteSelections(preview, [{ ...native[0]!,
+    observation: { ...native[0]!.observation, childDefRef: {
+      ...childDefRef, bundleDigest: 'e'.repeat(64) } } }]), false);
+  assert.equal(sameRoutedConcreteSelections(preview, [{ ...native[0]!,
+    request: { ...request, run: 'other' } }]), false);
+});
 
 async function fixture(workflowSource = workflow, bundleSource?: string) {
   const home = temp('routing-stage-home-');

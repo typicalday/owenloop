@@ -9,10 +9,12 @@ import { keyidFromBlob, publicKeyDescriptor } from '../../../src/crypto/keys.ts'
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import {
   createBundleIngestor,
+  createStoreInstructionSource,
   readWorkflowStoreIndex,
   storeIndexPath,
   writeWorkflowStoreIndex,
 } from '../../../src/store/index.ts';
+import type { StoreInstructionSource } from '../../../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
 import { createDefaultStoreInstructionResolver, createStoreInstructionResolver } from '../src/exec/instructions.ts';
@@ -237,6 +239,58 @@ test('calls relay e2e: a relayed child record admits a calls-produced consumed a
   const result = await resolverFor(fixtureData).resolveCommand(order(fixtureData));
   assert.equal(result.ok, true, JSON.stringify(result));
   if (result.ok) assert.match(result.command, /integrate-ran/);
+});
+
+test('selected native concrete child binds the signed relay to that exact workflow', async () => {
+  const fixtureData = await fixture('qualified');
+  const packet = order(fixtureData);
+  const binding = { runId: 'wf_root', frameId: packet.workflow,
+    def: { bundleDigest: `sha256:${fixtureData.parentDigest}`,
+      workflowName: 'calls-relay-parent' } };
+  packet.routing = { claim: { claimId: packet.run, orderId: packet.run, binding },
+    decision: { binding } } as OrderPacket['routing'];
+  const makeResolver = (selectedWorkflow: string) => {
+    const base = createStoreInstructionSource({ projectRoot: fixtureData.projectRoot,
+      globalRoot: tempDir('owenloop-selected-concrete-global-'),
+      verifier: createBundleIngestor() });
+    const source: StoreInstructionSource = { ...base,
+      selectVerifiedDefinition: (digest, name, step) => {
+	const chosen = base.selectVerifiedDefinition(digest, name, step);
+	return chosen && { ...chosen, callsChild: callsStep => {
+	  const child = chosen.callsChild(callsStep);
+	  return child && { ...child, selectedConcreteCall: {
+	    kind: 'selected-native-concrete-child', parentWorkflow: packet.workflow,
+	    childWorkflow: selectedWorkflow,
+	    childDefRef: { bundleDigest: fixtureData.childDigest,
+	      workflowName: child.definition.name }, receiptDigest: 'a'.repeat(64),
+	  } };
+	} };
+      } };
+    const proof = (JSON.parse(packet.consumesProof!) as Record<string, string>).u1!;
+    const receipt = { kind: 'concrete-call' as const, parentWorkflow: packet.workflow,
+      parentDefRef: { bundleDigest: fixtureData.parentDigest,
+	workflowName: 'calls-relay-parent' }, callStep: 'unit1', callPath: 'u1',
+      parentArtifactVersion: 1, childWorkflow: selectedWorkflow,
+      childDefRef: { bundleDigest: fixtureData.childDigest, workflowName: 'change-unit' },
+      childOutcome: 'result', childOutcomeVersion: CHILD_VERSION,
+      foldedValueDigest: valueDigestHex(U1_VALUE) };
+    return createStoreInstructionResolver({ source,
+      globalRoot: tempDir('owenloop-selected-concrete-global-'),
+      verifier: createBundleIngestor(),
+      routedSelection: { rootWorkflow: 'wf_root', frameWorkflow: packet.workflow,
+	definitionName: 'calls-relay-parent', defDigest: fixtureData.parentDigest,
+	run: packet.run },
+      definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
+      consumedVerifier: verifierFor(fixtureData, 'enforce'), env: fixtureData.env,
+      concreteCallBindingSource: { read: async () => ({ receipt,
+	receiptDigest: valueDigestHex(receipt), proof }) },
+    });
+  };
+  const accepted = await makeResolver('wf-change-unit').resolveRoutedCommandDefinition!(packet);
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  const otherNative = await makeResolver('wf-other-native').resolveRoutedCommandDefinition!(packet);
+  assert.equal(otherNative.ok, false, 'a same-definition proof from another native child must refuse');
+  if (!otherNative.ok) assert.equal(otherNative.kind, 'unverified-consumed');
 });
 
 const NO_RELAY_REASON = /\(calls\) .* artifact 'u1': artifact 'u1' is produced by calls: step 'unit1' \(dep\/change-unit@1\.0\.0\), so only a relayed child proof can prove it, but the order carries no consumesProofRelay entry for it/;

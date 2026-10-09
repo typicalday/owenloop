@@ -2709,7 +2709,38 @@ interface CallsGraph {
   edges: Map<string, string[]>;
 }
 
-function buildCallsGraph(defs: Map<string, WorkflowDef>): CallsGraph {
+/** Exact authored edge key. A routed parent may override only this one edge
+ * after its host has authenticated the selected native or live child. */
+export function callsEdgeKey(parentNodeKey: string, step: StepDef): string {
+  return JSON.stringify([parentNodeKey, step.name,
+    step.calls ?? null, step.produces[0]?.stem ?? null]);
+}
+
+function resolvedCallsStepKey(
+  defs: Map<string, WorkflowDef>, def: WorkflowDef, step: StepDef,
+  routedCalls?: ReadonlyMap<string, string>, parentNodeKey = def.name,
+): string | undefined {
+  if (routedCalls !== undefined) {
+    // Every edge of a routed executable node must be present. Static edges
+    // were resolved from signed bytes before this map was constructed; live
+    // slash edges came from a parent-authenticated native observation.
+    const selected = routedCalls.get(callsEdgeKey(parentNodeKey, step));
+    return selected !== undefined && defs.has(selected) ? selected : undefined;
+  }
+  return step.calls === undefined ? undefined : resolveCallsTargetKey(defs, step.calls, def);
+}
+
+/** Resolve the exact child used by strict validation and cycle detection. */
+export function resolveCallsStep(
+  defs: Map<string, WorkflowDef>, def: WorkflowDef, step: StepDef,
+  routedCalls?: ReadonlyMap<string, string>, parentNodeKey = def.name,
+): WorkflowDef | undefined {
+  const key = resolvedCallsStepKey(defs, def, step, routedCalls, parentNodeKey);
+  return key === undefined ? undefined : defs.get(key);
+}
+
+function buildCallsGraph(defs: Map<string, WorkflowDef>, routedCalls?: ReadonlyMap<string, string>,
+  deferredHubLiveCalls?: ReadonlySet<string>): CallsGraph {
   const keys = [...defs.keys()];
   const edges = new Map<string, string[]>();
   for (const [key, def] of defs) {
@@ -2718,7 +2749,8 @@ function buildCallsGraph(defs: Map<string, WorkflowDef>): CallsGraph {
     const children = new Set<string>();
     for (const step of def.steps) {
       if (step.calls === undefined) continue;
-      const child = resolveCallsTargetKey(defs, step.calls, def);
+      if (deferredHubLiveCalls?.has(step.calls)) continue;
+      const child = resolvedCallsStepKey(defs, def, step, routedCalls, key);
       if (child !== undefined) children.add(child);
     }
     edges.set(key, [...children]);
@@ -2996,11 +3028,20 @@ export interface FinalizeDefsOptions {
    * later validates them against the complete store map before any run starts.
    */
   allowUnresolvedVersionedCalls?: ReadonlySet<string>;
+  /** Install-time only: these verified Hub-dialect unlocked slash targets are
+   * selected from live Service state at native spawn. Their cross-definition
+   * edges cannot be validated from the archive alone. This grants no
+   * executable lookup; ordinary and routed instruction prime remain strict. */
+  deferredHubLiveCalls?: ReadonlySet<string>;
   /**
    * Permit unresolved `calls:` edges in an explicitly partial, read-only map.
    * Never use this option to construct an executable resolver.
    */
   allowUnresolvedCalls?: boolean;
+  /** Parent-authenticated, occurrence-node graph. Every reachable calls edge
+   * has a callsEdgeKey(parentNodeKey, step) entry pointing at another exact
+   * node in raw. Never use for ordinary or child-selected loading. */
+  routedCalls?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -3012,11 +3053,13 @@ export function validateCallsEdges(
   def: WorkflowDef,
   defs: Map<string, WorkflowDef>,
   options: FinalizeDefsOptions = {},
+  parentNodeKey = def.name,
 ): string[] {
   const errors: string[] = [];
   for (const step of def.steps) {
     if (!step.calls) continue;
-    const childDef = resolveCallsTarget(defs, step.calls, def);
+    if (options.deferredHubLiveCalls?.has(step.calls)) continue;
+    const childDef = resolveCallsStep(defs, def, step, options.routedCalls, parentNodeKey);
     if (!childDef) {
       if (
 		options.allowUnresolvedCalls !== true
@@ -3052,7 +3095,7 @@ export function finalizeDefs(
   for (const [name, def] of raw) {
     const expanded = expandIncludes(def, resolver);
 
-    const callsErrors = validateCallsEdges(expanded, raw, options);
+    const callsErrors = validateCallsEdges(expanded, raw, options, name);
     if (callsErrors.length > 0) throw new DefError(callsErrors[0]);
 
     const errors = validateDef(expanded);
@@ -3066,7 +3109,8 @@ export function finalizeDefs(
 
   // Preserve strict loading's first, stable cycle error after all per-def checks
   // without paying the wider authoring reporter's per-member attribution cost.
-  const cycle = findFirstCallsCycle(buildCallsGraph(out));
+  const cycle = findFirstCallsCycle(buildCallsGraph(out, options.routedCalls,
+    options.deferredHubLiveCalls));
   if (cycle !== undefined) throw new DefError(`calls cycle: ${cycle.join(' -> ')}`);
 
   return out;

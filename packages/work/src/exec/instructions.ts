@@ -36,6 +36,7 @@ import {
 import type { OrderPacket } from '../hub/types.ts';
 import { validFixedWorkdir } from '../order-definition-binding.ts';
 import type { ConsumedVerifier, VerifiedCallsProducer } from '../consumed-verifier.ts';
+import type { ConcreteCallBindingSource } from '../hosted/trusted-routed-concrete-binding.ts';
 
 export type InstructionRefusalKind =
   | 'unknown-digest'
@@ -151,6 +152,9 @@ export interface StoreInstructionResolverOptions {
   /** Gate dynamic consumed values before a command can reach the shell. */
   consumedVerifier?: ConsumedVerifier;
   invocationBindingSource?: InvocationBindingSource;
+  /** Original-session folded receipt for an occurrence-selected concrete call.
+   * A structural preview alone is never producer authority. */
+  concreteCallBindingSource?: ConcreteCallBindingSource;
   /** Explicit publication policy override; otherwise env > settings file > warn. */
   defPolicy?: DefPolicy;
   /** Explicit origin policy override; otherwise env > settings file > warn. */
@@ -510,7 +514,61 @@ export function createStoreInstructionResolver(
           `the verified definition produces artifact '${path}' through calls: step '${callsStep.name}' (${callsStep.calls}), but the verified child definition '${child.definition.name}' declares no outcome`,
         );
       }
-      producers[path] = { step: callsStep.name, target: callsStep.calls, childDefDigest: child.bundleDigest, childOutcome };
+      // A live-selected structural preview is not producer evidence. Only a
+      // persisted native child can bind the relay's workflow identity; the
+      // separate folded receipt and stored proof still have to verify below.
+      if (child.selectedConcreteCall !== undefined
+	&& child.selectedConcreteCall.kind !== 'selected-native-concrete-child') {
+	return refusal('unverified-consumed', order,
+	  'selected concrete child has not materialized for consumed proof');
+      }
+      let childVersion: number | undefined;
+      if (child.selectedConcreteCall?.kind === 'selected-native-concrete-child'
+	&& !skipDynamicInvocationRead) {
+	const version = order.consumedFingerprint?.[path];
+	if (!Number.isSafeInteger(version) || version! < 1
+	  || options.concreteCallBindingSource === undefined)
+	  return refusal('unverified-consumed', order,
+	    'selected concrete child has no folded receipt source');
+	const key = { parentWorkflow: order.workflow,
+	  parentDefRef: { bundleDigest: resolved.bundleDigest,
+	    workflowName: resolved.definition.name },
+	  callPath: path, parentArtifactVersion: version! };
+	let folded;
+	try { folded = await options.concreteCallBindingSource.read(key); }
+	catch (error) { return refusal('unverified-consumed', order,
+	  `selected concrete receipt read failed: ${errorText(error)}`); }
+	const receipt = folded?.receipt;
+	let proof: unknown;
+	try {
+	  const raw = JSON.parse(order.consumesProof ?? '{}') as unknown;
+	  proof = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+	    ? (raw as Record<string, unknown>)[path] : undefined;
+	} catch { /* The hard consumed verifier refuses malformed proof maps. */ }
+	const relay = order.consumesProofRelay?.[path];
+	if (!folded || !receipt || valueDigestHex(receipt) !== folded.receiptDigest
+	  || receipt.kind !== 'concrete-call' || receipt.parentWorkflow !== key.parentWorkflow
+	  || !isDeepStrictEqual(receipt.parentDefRef, key.parentDefRef)
+	  || receipt.callStep !== callsStep.name || receipt.callPath !== path
+	  || receipt.parentArtifactVersion !== version
+	  || receipt.childWorkflow !== child.selectedConcreteCall.childWorkflow
+	  || receipt.childDefRef.bundleDigest !== child.bundleDigest
+	  || receipt.childDefRef.workflowName !== child.definition.name
+	  || receipt.childOutcome !== childOutcome
+	  || receipt.foldedValueDigest !== valueDigestHex(order.consumes[path])
+	  || proof !== folded.proof
+	  || relay?.childDefDigest !== child.bundleDigest
+	  || relay.childOutcome !== childOutcome
+	  || relay.childVersion !== receipt.childOutcomeVersion)
+	  return refusal('unverified-consumed', order,
+	    'selected concrete folded receipt is missing or moved');
+	childVersion = receipt.childOutcomeVersion;
+      }
+      producers[path] = { step: callsStep.name, target: callsStep.calls,
+	childDefDigest: child.bundleDigest, childOutcome,
+	...(childVersion === undefined ? {} : { childVersion }),
+	...(child.selectedConcreteCall?.kind === 'selected-native-concrete-child'
+	  ? { childWorkflow: child.selectedConcreteCall.childWorkflow } : {}) };
     }
     return { ok: true, producers, receipts };
   };

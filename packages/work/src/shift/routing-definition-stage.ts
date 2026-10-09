@@ -23,15 +23,21 @@ import { createStoreInstructionResolver } from '../exec/instructions.ts';
 import { createParentRoutedInvocationSource } from './routing-invocation-source.ts';
 import { RoutedInputWitnessRefusal } from './routing-input-refusal.ts';
 import { parseRoutedReferenceV2, parseRoutedClaimV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import { parseRecordedReferenceV2, parseRecordedClaimV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import type { DefRef, InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
+import type { RoutedConcreteCallRequest, RoutedConcreteCallObservation,
+  RoutedConcreteCallSelection } from '../../../../src/store/instruction-source.ts';
 import type { RecordedBindingV2 } from '../hosted/trusted-routed-recorded-v2.ts';
+import type { ConcreteCallBindingKey, ConcreteCallBindingSource,
+  VerifiedConcreteCallReceipt } from '../hosted/trusted-routed-concrete-binding.ts';
 import { HubError, type GetOrderResponse, type OrderPacket, type WorkOrder } from '../hub/types.ts';
 import {
   createBundleIngestor, createExecutionDefinitionVerifier, createExecutionOriginVerifier,
   createPreCommitVerifier, createStoreInstructionSource, globalStoreRoot,
   defDigest, parseWorkflowCoordinate, readWorkflowStoreIndex, resolveOriginRules, storeIndexPath,
   verifyWorkflowObjectSync,
+  verifyInstalledWorkflowMember,
 } from '../../../../src/store/index.ts';
 
 export interface RoutedDefinitionStage {
@@ -107,6 +113,48 @@ export function verifyRoutedSupportObjectsSync(
     verifyWorkflowObjectSync(object.objectPath, defDigest(object.bundleDigest),
       { coordinateRepair: false });
   }
+}
+
+/** Compare two parent-observed concrete-call graphs for one occurrence. The
+ * sole lawful topology change is an unmaterialized preview becoming the
+ * exact same signed child at a Service-attested native workflow ID. */
+export function sameRoutedConcreteSelections(
+  original: readonly { request: RoutedConcreteCallRequest;
+    observation: RoutedConcreteCallObservation }[] | undefined,
+  fresh: readonly { request: RoutedConcreteCallRequest;
+    observation: RoutedConcreteCallObservation }[] | undefined,
+): boolean {
+  if (!original || !fresh || original.length !== fresh.length) return false;
+  for (let index = 0; index < fresh.length; index++) {
+    const beforeRow = original[index]!, afterRow = fresh[index]!;
+    const beforeRequest = beforeRow.request, afterRequest = afterRow.request;
+    if (beforeRequest.rootWorkflow !== afterRequest.rootWorkflow
+      || beforeRequest.run !== afterRequest.run
+      || beforeRequest.frameWorkflow !== afterRequest.frameWorkflow
+      || !isDeepStrictEqual(beforeRequest.frameDefRef, afterRequest.frameDefRef)
+      || !isDeepStrictEqual(beforeRequest.edge, afterRequest.edge)
+      || (beforeRequest.parentWorkflow !== undefined
+	&& beforeRequest.parentWorkflow !== afterRequest.parentWorkflow)
+      || beforeRequest.ancestry.length !== afterRequest.ancestry.length)
+      return false;
+    for (let ancestor = 0; ancestor < beforeRequest.ancestry.length; ancestor++) {
+      const earlier = beforeRequest.ancestry[ancestor]!, current = afterRequest.ancestry[ancestor]!;
+      if (!isDeepStrictEqual(earlier.parentDefRef, current.parentDefRef)
+	|| earlier.callStep !== current.callStep || earlier.callPath !== current.callPath
+	|| earlier.target !== current.target
+	|| earlier.selectionSource !== current.selectionSource
+	|| !isDeepStrictEqual(earlier.childDefRef, current.childDefRef)) return false;
+    }
+    if (isDeepStrictEqual(beforeRow.observation, afterRow.observation)) continue;
+    const before = beforeRow.observation, after = afterRow.observation;
+    if ((before.kind !== 'prestart-live-concrete-child'
+	&& before.kind !== 'virtual-live-concrete-child')
+      || after.kind !== 'selected-native-concrete-child'
+      || !isDeepStrictEqual(before.childDefRef, after.childDefRef)
+      || (before.kind === 'prestart-live-concrete-child'
+	&& before.parentWorkflow !== after.parentWorkflow)) return false;
+  }
+  return true;
 }
 
 function processLiveness(pid: number): boolean | undefined {
@@ -271,6 +319,12 @@ export async function stageRoutedDefinition(args: {
   readInvocationBinding?: (key: InvocationRelayKey, phase: RoutedInputPhase,
     expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
       Promise<VerifiedInvocationReceipt | undefined>;
+  readConcreteCallStructure?: (selection: RoutedConcreteCallRequest, phase: RoutedInputPhase,
+    expected: { workflow: string; run: string }, binding: unknown) =>
+      Promise<RoutedConcreteCallObservation>;
+  readConcreteCallBinding?: (key: ConcreteCallBindingKey, phase: RoutedInputPhase,
+    expected: { workflow: string; run: string }, binding: unknown) =>
+      Promise<VerifiedConcreteCallReceipt | undefined>;
   fetchImpl?: typeof fetch;
 }): Promise<RoutedDefinitionStage> {
   const frameWorkflow = args.order.workflow;
@@ -358,17 +412,114 @@ export async function stageRoutedDefinition(args: {
     const originRules = resolveOriginRules(args.sourceEnv);
     const projectRoot = join(stagePath, 'project-workflows');
     const root = globalStoreRoot(stageHome);
+    const recoverExactDigest = createHubBundleRecoveryHandler({
+      origin: args.origin, token: args.token, home: stageHome, projectRoot,
+      env: stageEnv, beforeRequest, onRateLimit: args.onRateLimit,
+      recoverLockedDependencies: true,
+      deferHubLiveCallsAtStorage: true,
+      preCommitVerifier: createPreCommitVerifier({ env: stageEnv, policy: 'enforce',
+	originPolicy: 'enforce', originRules }),
+      ...(args.fetchImpl === undefined ? {} : { fetchImpl: args.fetchImpl }),
+    });
+    const structuralSelection = (phase: RoutedInputPhase): RoutedConcreteCallSelection | undefined => {
+      if (!routing || !definitionName) return undefined;
+      const expected = { workflow: args.rootWorkflow, run: args.order.run };
+      const frameDefRef = { bundleDigest: args.order.defDigest!, workflowName: definitionName };
+      const parsePair = (pair: RoutedInputPair) => {
+	const reference = phase === 'prestart'
+	  ? parseRoutedReferenceV2(pair.reference, expected)
+	  : parseRecordedReferenceV2(pair.reference, expected);
+	const claim = phase === 'prestart'
+	  ? parseRoutedClaimV2(pair.claim, expected)
+	  : parseRecordedClaimV2(pair.claim, expected);
+	if (reference.state !== 'available' || claim.state !== 'available'
+	  || !isDeepStrictEqual(reference.binding, claim.binding)
+	  || !isDeepStrictEqual(reference.order.routing, routing)
+	  || !isDeepStrictEqual(claim.routing, routing)
+	  || reference.order.workflow !== frameWorkflow
+	  || reference.order.run !== args.order.run
+	  || reference.order.defDigest !== args.order.defDigest
+	  || reference.order.step !== args.order.step
+	  || reference.order.key !== args.order.key
+	  || reference.order.index !== args.order.index
+	  || !isDeepStrictEqual(reference.order.consumes, args.order.consumes)
+	  || !isDeepStrictEqual(reference.order.consumedFingerprint, args.order.consumedFingerprint))
+	  throw new Error('routed concrete call pair refused');
+	return reference.binding;
+      };
+      return { rootWorkflow: args.rootWorkflow, run: args.order.run,
+	frameWorkflow, frameDefRef,
+	stillAuthorized: () => phase === 'recorded-live' || args.stillAuthorized(),
+	observe: async request => {
+	  if (!args.readCurrentPair || !args.readConcreteCallStructure)
+	    throw new Error('routed concrete call source unavailable');
+	  if (request.rootWorkflow !== args.rootWorkflow || request.run !== args.order.run
+	    || request.frameWorkflow !== frameWorkflow
+	    || !isDeepStrictEqual(request.frameDefRef, frameDefRef))
+	    throw new Error('routed concrete call scope refused');
+	  const before = await args.readCurrentPair(phase, expected);
+	  const observedBinding = parsePair(before);
+	  const selected = await args.readConcreteCallStructure(request, phase, expected, observedBinding);
+	  const after = await args.readCurrentPair(phase, expected);
+	  parsePair(after);
+	  if (!isDeepStrictEqual(after, before)
+	    || (phase === 'prestart' && !args.stillAuthorized()))
+	    throw new Error('routed concrete call changed');
+	  return selected;
+	} };
+    };
+    const readFoldedConcreteCall = async (phase: RoutedInputPhase,
+      key: ConcreteCallBindingKey): Promise<VerifiedConcreteCallReceipt | undefined> => {
+      if (!routing || !args.readCurrentPair || !args.readConcreteCallBinding
+	|| key.parentWorkflow !== frameWorkflow
+	|| key.parentDefRef.bundleDigest !== args.order.defDigest
+	|| key.parentDefRef.workflowName !== definitionName
+	|| args.order.consumedFingerprint?.[key.callPath] !== key.parentArtifactVersion
+	|| !Object.hasOwn(args.order.consumes, key.callPath))
+	throw new Error('routed concrete folded key refused');
+      const expected = { workflow: args.rootWorkflow, run: args.order.run };
+      const parse = (pair: RoutedInputPair) => {
+	const reference = phase === 'prestart'
+	  ? parseRoutedReferenceV2(pair.reference, expected)
+	  : parseRecordedReferenceV2(pair.reference, expected);
+	const claim = phase === 'prestart'
+	  ? parseRoutedClaimV2(pair.claim, expected)
+	  : parseRecordedClaimV2(pair.claim, expected);
+	if (reference.state !== 'available' || claim.state !== 'available'
+	  || !isDeepStrictEqual(reference.binding, claim.binding)
+	  || !isDeepStrictEqual(reference.order.routing, routing)
+	  || !isDeepStrictEqual(claim.routing, routing)
+	  || reference.order.workflow !== frameWorkflow
+	  || reference.order.run !== args.order.run
+	  || reference.order.step !== args.order.step
+	  || reference.order.defDigest !== args.order.defDigest
+	  || reference.order.key !== args.order.key
+	  || reference.order.index !== args.order.index
+	  || !isDeepStrictEqual(reference.order.consumes, args.order.consumes)
+	  || !isDeepStrictEqual(reference.order.consumedFingerprint,
+	    args.order.consumedFingerprint)
+	  || reference.order.consumedFingerprint?.[key.callPath] !== key.parentArtifactVersion
+	  || !Object.hasOwn(reference.order.consumes, key.callPath))
+	  throw new Error('routed concrete folded pair refused');
+	return reference.binding;
+      };
+      const before = await args.readCurrentPair(phase, expected);
+      const binding = parse(before);
+      const receipt = await args.readConcreteCallBinding(key, phase, expected, binding);
+      const after = await args.readCurrentPair(phase, expected);
+      parse(after);
+      if (!isDeepStrictEqual(before, after)
+	|| (phase === 'prestart' && !args.stillAuthorized()))
+	throw new Error('routed concrete folded pair changed');
+      return receipt;
+    };
+    const initialStructuralSelection = structuralSelection('prestart');
     const source = createStoreInstructionSource({
       globalRoot: root,
       verifier: createBundleIngestor(),
-      onMissing: createHubBundleRecoveryHandler({
-	origin: args.origin, token: args.token, home: stageHome, projectRoot,
-	env: stageEnv, beforeRequest, onRateLimit: args.onRateLimit,
-	recoverLockedDependencies: true,
-	preCommitVerifier: createPreCommitVerifier({ env: stageEnv, policy: 'enforce',
-	  originPolicy: 'enforce', originRules }),
-	...(args.fetchImpl === undefined ? {} : { fetchImpl: args.fetchImpl }),
-      }),
+      ...(initialStructuralSelection === undefined ? {}
+	: { routedConcreteCalls: initialStructuralSelection }),
+      onMissing: recoverExactDigest,
     });
     // WorkOrder lacks the full get_order packet, so this gate checks only
     // definition identity and step text. The routed role must still bind the
@@ -389,6 +540,8 @@ export async function stageRoutedDefinition(args: {
       throw new Error('routed definition step unavailable');
     const allSupport = [...support];
     const dynamicChildren = new Map<string, DefRef>();
+    const foldedConcrete: Array<{ key: ConcreteCallBindingKey;
+      receipt: VerifiedConcreteCallReceipt }> = [];
     // Apply all configured rules matching the installed namespace. WorkOrder
     // lacks workdir/inputs, so full step and consume binding is deferred.
     const stagedIndex = readWorkflowStoreIndex(storeIndexPath(root));
@@ -410,6 +563,29 @@ export async function stageRoutedDefinition(args: {
       }
     }
     if (routing !== undefined && selected) {
+      for (const [path] of Object.entries(args.order.consumes)) {
+	const producer = selected.definition.steps.find(candidate =>
+	  candidate.calls !== undefined
+	  && candidate.produces.some(produce => produce.stem === path));
+	const structural = producer === undefined ? undefined
+	  : selected.callsChild(producer.name)?.selectedConcreteCall;
+	if (structural === undefined) continue;
+	if (structural.kind !== 'selected-native-concrete-child')
+	  throw new Error('routed concrete consumed child not materialized');
+	const version = args.order.consumedFingerprint?.[path];
+	if (!Number.isSafeInteger(version) || version! < 1)
+	  throw new Error('routed concrete consumed version unavailable');
+	const key = { parentWorkflow: frameWorkflow,
+	  parentDefRef: { bundleDigest: selected.bundleDigest,
+	    workflowName: selected.definition.name },
+	  callPath: path, parentArtifactVersion: version! };
+	const receipt = await readFoldedConcreteCall('prestart', key);
+	if (!receipt || receipt.receipt.childWorkflow !== structural.childWorkflow
+	  || !isDeepStrictEqual(receipt.receipt.childDefRef, structural.childDefRef)
+	  || receipt.receipt.callStep !== producer!.name)
+	  throw new Error('routed concrete folded child changed');
+	foldedConcrete.push({ key, receipt });
+      }
       const dynamicPaths = Object.keys(args.order.consumes).filter(path =>
 	selected.definition.steps.some(candidate => candidate.callsInterface?.selection === 'invocation'
 	  && candidate.produces.some(produce => produce.stem === path)));
@@ -433,9 +609,9 @@ export async function stageRoutedDefinition(args: {
 	  phase: 'prestart', readDirect: args.readInvocationBinding,
 	  readCurrentPair: args.readCurrentPair, stillAuthorized: args.stillAuthorized,
 	  verifyChild: async child => {
-	    if (await source.prime(child.bundleDigest) !== 'resolved')
-	      throw new Error('routed invocation child unavailable');
-	    const chosen = source.selectVerifiedWorkflow(child.bundleDigest, child.workflowName);
+	    const chosen = await verifyInstalledWorkflowMember({ globalRoot: root,
+	      verifier: createBundleIngestor(), bundleDigest: child.bundleDigest,
+	      workflowName: child.workflowName, onMissing: recoverExactDigest });
 	    if (!chosen || chosen.bundleDigest !== child.bundleDigest) throw new Error('routed invocation child changed');
 	    for (const object of chosen.support) {
 	      if ((await verifyDefinition(object)).kind !== 'verified')
@@ -485,10 +661,30 @@ export async function stageRoutedDefinition(args: {
       }
     }
     if (performance.now() >= deadline || !args.stillAuthorized()) throw new Error('routed definition staging expired');
+    const concreteSelections = routing === undefined ? []
+      : source.getRoutedSelections?.(args.order.defDigest!, definitionName!);
+    if (routing !== undefined && (initialStructuralSelection === undefined
+      || concreteSelections === undefined))
+      throw new Error('routed concrete call source unavailable');
+    const concreteBytes = Buffer.from(JSON.stringify(concreteSelections ?? []), 'utf8');
+    if ((concreteSelections?.length ?? 0) > 64 || concreteBytes.length > 1_000_000)
+      throw new Error('routed concrete call snapshot too large');
+    const concreteDigest = valueDigestHex(concreteSelections ?? []);
+    const foldedBytes = Buffer.from(JSON.stringify(foldedConcrete), 'utf8');
+    if (foldedBytes.length > 25_000_000 || foldedConcrete.length > 64)
+      throw new Error('routed concrete folded snapshot too large');
+    if (routing !== undefined)
+      writeFileSync(join(stagePath, 'concrete-calls.json'), concreteBytes, { flag: 'wx', mode: 0o600 });
+    if (routing !== undefined)
+      writeFileSync(join(stagePath, 'concrete-folded.json'), foldedBytes, { flag: 'wx', mode: 0o600 });
     const descriptor = { version: 'routing-definition-stage-v2', rootWorkflow: args.rootWorkflow,
       frameWorkflow, definitionName: definition.name, routed: routing !== undefined,
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
-      bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
+      bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex'),
+      ...(routing === undefined ? {} : { concreteCallsDigest: concreteDigest,
+	concreteCallsBytes: concreteBytes.length,
+	concreteFoldedDigest: valueDigestHex(foldedConcrete),
+	concreteFoldedBytes: foldedBytes.length }) };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
     const supportIdentity = (items: NonNullable<typeof selected>['support']): string[] =>
       items.map(object => `${object.bundleDigest}:${object.objectPath}`).sort();
@@ -500,6 +696,12 @@ export async function stageRoutedDefinition(args: {
 	|| candidate.step.command !== selected.step.command
 	|| !isDeepStrictEqual(supportIdentity(candidate.support), supportIdentity(selected.support)))
 	throw new Error('routed signed selection changed');
+    };
+    const requireOriginalConcreteCalls = (candidateSource: typeof source): void => {
+      if (routing === undefined) return;
+      const fresh = candidateSource.getRoutedSelections?.(args.order.defDigest!, definitionName!);
+      if (!sameRoutedConcreteSelections(concreteSelections, fresh))
+	throw new Error('routed concrete call selection changed');
     };
       const verifyOrderInternal = async (response: GetOrderResponse,
       routed?: { pair: RoutedInputPair; phase: RoutedInputPhase;
@@ -540,9 +742,12 @@ export async function stageRoutedDefinition(args: {
       // or removed object at execution time must refuse, never trigger a new
       // broad-bearer download from a submit/get_order callback.
       const readOnlySource = createStoreInstructionSource({ globalRoot: root,
-	verifier: createBundleIngestor() });
+	verifier: createBundleIngestor(),
+	...(routing === undefined ? {} : { routedConcreteCalls:
+	  structuralSelection(routed?.phase ?? 'prestart') }) });
       if (await readOnlySource.prime(order.defDigest) !== 'resolved')
 	throw new Error('routed definition object changed');
+      requireOriginalConcreteCalls(readOnlySource);
       const currentSelection = routing === undefined ? undefined
 	: readOnlySource.selectVerifiedDefinition(order.defDigest, definitionName!, order.step);
       if (routing !== undefined) requireOriginalSelection(currentSelection);
@@ -551,9 +756,9 @@ export async function stageRoutedDefinition(args: {
 	: currentSelection?.support ?? [])];
       if (!currentSupport?.length) throw new Error('routed definition closure unavailable');
       for (const child of dynamicChildren.values()) {
-	if (await readOnlySource.prime(child.bundleDigest) !== 'resolved')
-	  throw new Error('routed invocation child changed');
-	const chosen = readOnlySource.selectVerifiedWorkflow(child.bundleDigest, child.workflowName);
+	const chosen = await verifyInstalledWorkflowMember({ globalRoot: root,
+	  verifier: createBundleIngestor(), bundleDigest: child.bundleDigest,
+	  workflowName: child.workflowName });
 	if (!chosen || chosen.bundleDigest !== child.bundleDigest)
 	  throw new Error('routed invocation child changed');
 	for (const object of chosen.support)
@@ -586,7 +791,9 @@ export async function stageRoutedDefinition(args: {
 	  readCurrentPair: args.readCurrentPair,
 	  stillAuthorized: () => routed.phase === 'recorded-live' || args.stillAuthorized(),
 	  verifyChild: async child => {
-	    const selectedChild = readOnlySource.selectVerifiedWorkflow(child.bundleDigest, child.workflowName);
+	    const selectedChild = await verifyInstalledWorkflowMember({ globalRoot: root,
+	      verifier: createBundleIngestor(), bundleDigest: child.bundleDigest,
+	      workflowName: child.workflowName });
 	    if (!selectedChild || selectedChild.bundleDigest !== child.bundleDigest)
 	      throw new Error('routed invocation child changed');
 	    for (const object of selectedChild.support) {
@@ -603,6 +810,8 @@ export async function stageRoutedDefinition(args: {
 	  } }) : undefined;
       if (routed && dynamicChildren.size > 0 && !invocationSource)
 	throw new Error('routed invocation source unavailable');
+      const concreteBindingSource: ConcreteCallBindingSource | undefined = routed
+	? { read: key => readFoldedConcreteCall(routed.phase, key) } : undefined;
       const resolver = createStoreInstructionResolver({ globalRoot: root, source: readOnlySource,
 	verifier: createBundleIngestor(), env: args.sourceEnv, defPolicy: 'enforce',
 	...(routing === undefined ? {} : { routedSelection: {
@@ -613,6 +822,7 @@ export async function stageRoutedDefinition(args: {
 	consumedVerifier: createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
 	  artifactPolicy: 'enforce' }),
 	...(invocationSource ? { invocationBindingSource: invocationSource } : {}),
+	...(concreteBindingSource ? { concreteCallBindingSource: concreteBindingSource } : {}),
 	warn: () => {} });
       const verifiedStep = routing === undefined
 	? readOnlySource.getVerifiedStep(order.defDigest, order.step) : currentSelection?.step;
@@ -663,9 +873,12 @@ export async function stageRoutedDefinition(args: {
 	// Reopen the exact signed member after those awaits; a moved index or
 	// object path cannot turn the captured prestart command into a new grant.
 	const finalSource = createStoreInstructionSource({ globalRoot: root,
-	  verifier: createBundleIngestor() });
+	  verifier: createBundleIngestor(),
+	  ...(routing === undefined ? {} : { routedConcreteCalls:
+	    structuralSelection(routed?.phase ?? 'prestart') }) });
 	if (await finalSource.prime(order.defDigest) !== 'resolved')
 	  throw new Error('routed signed selection changed');
+	requireOriginalConcreteCalls(finalSource);
 	requireOriginalSelection(finalSource.selectVerifiedDefinition(order.defDigest,
 	  definitionName!, order.step));
       }
