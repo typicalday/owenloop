@@ -251,7 +251,8 @@ outputs: [result]
     routingDigest: valueDigestHex(routing), preferenceExpiresAt: routing.preference.expiresAt };
   const pair: { reference: RoutedReferenceV2; claim: RoutedClaimV2 } = {
     reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
-      workflow: 'wf_root', run: 'run', order: { ...packet, owes: [{ path: 'out', version: 1 }] },
+      workflow: 'wf_root', run: 'run', order: { ...packet,
+	owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
       inputs: [{ path: 'child', version: 1, present: true, value }],
       lease: { claimed: true }, binding: referenceBinding },
     claim: { protocol: 'routing-claim-read-v2', state: 'available',
