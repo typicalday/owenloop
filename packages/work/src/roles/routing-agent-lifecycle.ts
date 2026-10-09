@@ -4,22 +4,23 @@
 import { performance } from 'node:perf_hooks';
 import type { RoutedAgentLifecycle } from '../agent/loop.ts';
 import type { RoutingChildClient } from '../hub/routing-child-client.ts';
-import { startRoutedCodex, type RoutedCodexLaunch } from '../harness/codex.ts';
+import type { HarnessAdapter, RoutedHarnessLaunch } from '../harness/contract.ts';
 
 const TERMINAL_MS = 45_000;
 
 export function createRoutedAgentLifecycle(args: {
   child: Pick<RoutingChildClient, 'quiesce' | 'agentOutcome' | 'agentFinish'>;
   generation: string;
-  /** Tests inject a local transport; production always uses startRoutedCodex. */
-  start?: typeof startRoutedCodex;
+  /** The exact selected adapter's retained routed start. No ordinary start
+   * fallback is permitted after the parent accepts a launch occurrence. */
+  start: NonNullable<HarnessAdapter['startRouted']>;
   terminalMs?: number;
 }): RoutedAgentLifecycle {
   const budget = args.terminalMs ?? TERMINAL_MS;
   if (!Number.isFinite(budget) || budget <= 0 || budget > TERMINAL_MS)
     throw new Error('routed agent terminal budget refused');
   let startAttempted = false;
-  let launch: RoutedCodexLaunch | undefined;
+  let launch: RoutedHarnessLaunch | undefined;
   let stopped = false;
   let freeze: ReturnType<typeof args.child.quiesce> | undefined;
   let group: Promise<'empty' | 'uncertain'> | undefined;
@@ -58,7 +59,7 @@ export function createRoutedAgentLifecycle(args: {
     start(argsForAdapter, onEvent) {
       if (startAttempted || stopped) throw new Error('routed agent launch already attempted');
       startAttempted = true; // a synchronous spawn throw is still ambiguous
-      return (args.start ?? startRoutedCodex)(argsForAdapter, onEvent, { generation: args.generation,
+      return args.start(argsForAdapter, onEvent, { generation: args.generation,
 	onLaunch(retained) {
 	  if (launch || retained.generation !== args.generation)
 	    throw new Error('routed agent launch generation changed');

@@ -1517,6 +1517,12 @@ export const codexAdapter: HarnessAdapter = {
   },
 
   start: (args, onEvent) => startCodex(args, onEvent),
+  // Only this adapter currently offers retained routed spawn custody. Keep
+  // the vendor-specific holder and generation checks in startRoutedCodex.
+  startRouted: (args, onEvent, launch) => startRoutedCodex(args, onEvent, {
+    generation: launch.generation,
+    onLaunch: retained => launch.onLaunch(retained),
+  }),
 
   async deliver(
     ref: HarnessSessionRef,

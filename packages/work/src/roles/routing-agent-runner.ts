@@ -15,6 +15,7 @@ import { createTrustedRoutedInputV2Admission } from '../hosted/trusted-input-adm
 import { createBrokerRoutedReferenceV2Reader } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RoutingHandoffV1 } from '../shift/runtime.ts';
 import { createRoutedAgentSelection } from './routing-agent-launch.ts';
+import { createRoutedAgentAdapterGate } from './routing-agent-adapter.ts';
 import { createRoutedAgentLifecycle } from './routing-agent-lifecycle.ts';
 import { createRoutedAgentStepLoader } from './routing-agent-step.ts';
 import { assertRoutedAgentWorkdirDisjoint, planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
@@ -82,8 +83,9 @@ export async function prepareRoutedAgentRunner(args: {
     expected: { workflow, run }, monotonicNow: () => performance.now(),
   });
   const sessionsFile = sessionsPath(resolveCacheDir(publicEnv));
+  const adapterGate = createRoutedAgentAdapterGate(adapterFor, registeredHarnessIds);
   const lifecycle = createRoutedAgentLifecycle({ child: client.routed,
-    generation: `${handoff.incarnation}:${handoff.nonce}:${run}` });
+    generation: `${handoff.incarnation}:${handoff.nonce}:${run}`, start: adapterGate.start });
   const sessionHolder: ContactHolder = { kind: 'session', id: handoff.sessionId,
     shiftId: handoff.shiftId };
   const select = createRoutedAgentSelection({ child: client.routed, sessionHolder,
@@ -102,15 +104,10 @@ export async function prepareRoutedAgentRunner(args: {
     loadStep: createRoutedAgentStepLoader({ instructions: stage.instructions,
       instructionCwd: handoff.definitionStage.path, workflow, run, err: args.err,
       admittedRoutedInputV2: order => !!admittedPacket && isDeepStrictEqual(admittedPacket, order) }),
-    resolveAdapter: (chosenHarness, stepHarness) => {
-      const id = chosenHarness ?? stepHarness ?? '';
-      const adapter = id === 'codex' ? adapterFor(id) : undefined;
-      return { id: id || '<none>', ...(adapter ? { adapter } : {}),
-	registered: registeredHarnessIds() };
-    },
+    resolveAdapter: adapterGate.resolveAdapter,
     resolveCrewRosters: crew => ({ ok: false, crew: crew[0] ?? 'routed',
       detail: 'routed server selection required' }),
-    harnessAvailable: id => id === 'codex' && adapterFor(id) !== undefined,
+    harnessAvailable: adapterGate.harnessAvailable,
     consumedVerifier,
     routedInputV2: { observe: async order => {
       if (order.workflow !== stage.frameWorkflow

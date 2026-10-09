@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createRoutedAgentLifecycle } from '../src/roles/routing-agent-lifecycle.ts';
 import type { RoutingChildClient } from '../src/hub/routing-child-client.ts';
-import type { RoutedCodexLaunchRequest } from '../src/harness/codex.ts';
+import type { RoutedHarnessLaunchRequest } from '../src/harness/contract.ts';
 
 const group = { scope: 'original-posix-group' as const, state: 'empty' as const };
 const fakeArgs = {} as Parameters<ReturnType<typeof createRoutedAgentLifecycle>['start']>[0];
@@ -25,7 +25,7 @@ function fixture(opts: { freeze?: 'settled' | 'uncertain'; claim?: 'closed' | 'h
 	calls.includes('group') ? { group } : { observation: 'not-started' });
       return { state: 'released' }; },
   } as unknown as Pick<RoutingChildClient, 'quiesce' | 'agentOutcome' | 'agentFinish'>;
-  const start = ((_args: unknown, _event: unknown, launch: RoutedCodexLaunchRequest) => {
+  const start = ((_args: unknown, _event: unknown, launch: RoutedHarnessLaunchRequest) => {
     calls.push('start');
     if (opts.startThrows) throw new Error('spawn ambiguous');
     launch.onLaunch({ generation: launch.generation, transport: {
@@ -92,7 +92,7 @@ test('stop observes a rejected freeze without abandoning retained group teardown
     child: { quiesce: () => { calls.push('freeze'); return Promise.reject(new Error('lost ACK')); },
       agentOutcome: async () => { calls.push('outcome'); return { claim: 'closed' }; },
       agentFinish: async () => { calls.push('finish'); return { state: 'released' }; } } as never,
-    start: ((_args: unknown, _event: unknown, launch: RoutedCodexLaunchRequest) => {
+    start: ((_args: unknown, _event: unknown, launch: RoutedHarnessLaunchRequest) => {
       launch.onLaunch({ generation: launch.generation, transport: {
 	settleEffects: async () => { calls.push('group'); return {
 	  scope: 'original-posix-group', state: 'empty', evidence: {} }; },
@@ -109,6 +109,7 @@ test('a timed-out finish aborts its socket before a late release can dispatch', 
   let aborted = false;
   let released = 0;
   const lifecycle = createRoutedAgentLifecycle({ generation: 'finish-deadline', terminalMs: 5,
+    start: async () => { throw new Error('unexpected start'); },
     child: { quiesce: async () => ({ quiescing: true, effects: 'settled' }),
       agentOutcome: async () => ({ claim: 'uncertain' }),
       agentFinish: async (_req: unknown, signal?: AbortSignal) => {
