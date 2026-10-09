@@ -483,6 +483,27 @@ export interface ConditionalSubmitResponse extends SubmitResponse {
   conditionApplied: 'expected-version-v1';
 }
 
+/** Parent-owned exact-byte routed conditional submit. No child chooses these
+ * fields; the broker freezes them before the first network dispatch. */
+export interface RoutedConditionalMutationRequest {
+  intentId: string;
+  rawBody: string;
+  generationToken?: string;
+}
+export interface RoutedConditionalMutationResponse extends SubmitResponse {
+  conditionApplied: 'routed-conditional-receipt-v1';
+}
+export interface RoutedConditionalReceiptRequest {
+  workflow: string; run: string; intentId: string; requestDigest: string;
+  holder: RoutedCollectionHolder;
+}
+export type RoutedConditionalReceiptResponse =
+  | { state: 'pending' | 'unavailable' }
+  | { state: 'committed'; result: RoutedConditionalMutationResponse };
+export interface RoutedConditionalRetryIssueResponse {
+  generation: number; generationToken: string; requestDigest: string; expiresAt: number;
+}
+
 /** Versioned, session-scoped collection protocol. The child never supplies a
  * member path or proof to Shift; these wire requests are parent-owned. */
 export interface RoutedCollectionHolder extends ContactHolder { shiftId: string }

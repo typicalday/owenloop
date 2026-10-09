@@ -14,7 +14,7 @@ export interface CommandPostrunRequest {
   group: { scope: 'original-posix-group'; state: 'empty' };
 }
 export interface CommandPostrunResponse {
-  outcome: 'submitted' | 'rejected' | 'judge-rejected' | 'command-failed';
+  outcome: 'submitted' | 'submit-rejected' | 'rejected' | 'judge-rejected' | 'command-failed';
   claim: 'closed' | 'held' | 'uncertain';
 }
 export interface CommandPostrunSnapshot {
