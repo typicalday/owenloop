@@ -618,7 +618,10 @@ async function verifyParentLaunch(grant: Grant, request: LaunchReservationReques
       shiftId: grant.identity.shiftId } }, signal), now, true);
   if (!validOrderResponse(grant, fresh) || !fresh.lease.claimed || !fresh.order)
     throw new Error('routing launch order unavailable');
-  await verifyParentOrder(grant, fresh, 'prestart', now);
+  // The selection check is read-only. With routed input authority, verify
+  // the complete witness once against the fresh, byte-equal order below,
+  // after selection has finished. The legacy verifier keeps its old path.
+  if (!grant.inputAuthority) await verifyParentOrder(grant, fresh, 'prestart', now);
   await checked(grant, grant.launchAuthority.verifySelection(fresh.order, structuredClone(request)), now, true);
   if (grant.inputAuthority) {
     const final = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
@@ -1317,7 +1320,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	throw new Error('routing launch report unavailable');
       let response = await checked(grant, grant.hub.getOrder({ workflow, run, holder: body.holder }, signal), now, prestart);
       if (!validOrderResponse(grant, response)) throw new Error('routing broker response refused');
-      if (response.lease.claimed && response.order)
+      if (response.lease.claimed && response.order && (!prestart || !grant.inputAuthority))
 	await verifyParentOrder(grant, response, prestart || scope === 'role'
 	  && (!grant.acceptedLaunchReport || !liveChildValid(grant, now()))
 	  ? 'prestart' : 'recorded-live', now);

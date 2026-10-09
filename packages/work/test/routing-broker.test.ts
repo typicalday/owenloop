@@ -1516,6 +1516,130 @@ test('final role launch read checks accepted report and current selection withou
   } finally { await broker.close(); }
 });
 
+test('routed command and agent launch requests verify one final input witness after selection', async () => {
+  for (const childKind of ['exec', 'agent-run'] as const) {
+    const tuple = { id: 'adapter', harness: 'local', model: 'available', effort: 'low' as const };
+    const routed = { ...routing, preference: { ...routing.preference,
+      tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
+    const packet = { ...parentOrder().order, workflow: 'frame', worker: childKind === 'exec' ? 'command' : 'agent',
+      routing: routed } as OrderPacket;
+    const current = { ...parentOrder(), workflow: 'frame', order: packet };
+    const pairBinding = { rootWorkflow: 'wf', frameWorkflow: 'frame', run: 'run',
+      claimId: 'run', decisionId: 'decision', sessionId, shiftId: identity.shiftId,
+      orderDigest: 'b'.repeat(64), authorityRevision: 'c'.repeat(64),
+      rosterRevision: routed.preference.rosterRevision, routingDigest: valueDigestHex(routed),
+      preferenceExpiresAt: routed.preference.expiresAt };
+    const pair = () => ({ reference: { protocol: 'trusted-routed-reference-read-v2' as const,
+      state: 'available' as const, workflow: 'wf', run: 'run', order: packet,
+      inputs: [], lease: { claimed: true }, binding: pairBinding },
+    claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
+      workflow: 'wf', run: 'run', routing: routed, binding: pairBinding } });
+    let getOrders = 0, observes = 0, selections = 0, writes = 0;
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async (url, init) => {
+	const route = String(url).split('/api/')[1]!;
+	if (route === 'get_order') { getOrders++; return Response.json(current); }
+	writes++;
+	if (route === 'reserve_launch') return Response.json({ reservationId: 'lr', orderId: 'run', expiresAt: 40_000 });
+	const report = JSON.parse(String(init!.body)).report;
+	return Response.json({ orderId: 'run', digest: valueDigestHex(report), recordedAt: 2_000,
+	  provenance: 'authenticated-worker-report' });
+      }) as typeof fetch });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const granted = broker.issue({ reservation: { ...reservation, childKind }, routing: routed,
+	identity, currentIdentity: () => identity, hub, submissionAuthority: transportAuthority,
+	inputAuthority: { observe: async (_response, phase) => {
+	  observes++; assert.equal(phase, 'prestart'); assert.equal(selections, observes,
+	    'full input observation runs only after the selection check');
+	  return pair();
+	} }, launchAuthority: { verifySelection: async () => { selections++; } } });
+      granted.activate({ ...child, kind: childKind });
+      const launch = { version: 'launch-reservation-v1', claimId: 'run', decisionId: 'decision',
+	binding, orderId: 'run', attemptId: 'run', rosterRevision: routed.preference.rosterRevision,
+	candidateIds: childKind === 'exec' ? [] : ['adapter'], assessmentId: null,
+	requested: null, selected: childKind === 'exec' ? null : tuple };
+      const report = { version: 'launch-v1', reservationId: 'lr', decisionId: 'decision',
+	binding, claimId: 'run', orderId: 'run', attemptId: 'run', requested: null,
+	selected: launch.selected, observation: { state: 'unknown' } };
+      const send = (method: string, body: unknown) => request(granted.socketPath,
+	{ cap: granted.cap, method, body });
+      assert.equal((await send('reserve_launch', { request: launch })).ok, true, childKind);
+      assert.deepEqual([getOrders, observes, writes], [2, 1, 1], childKind);
+      assert.equal((await send('report_launch', { report })).ok, true, childKind);
+      assert.deepEqual([getOrders, observes, writes], [4, 2, 2], childKind);
+      assert.equal((await send('get_launch_order', { holder })).ok, true, childKind);
+      assert.deepEqual([getOrders, observes, writes], [6, 3, 2], childKind);
+      assert.equal((await send('get_launch_order', { holder })).ok, true, childKind);
+      assert.deepEqual([getOrders, observes, writes], [8, 4, 2],
+	'a later request makes fresh native reads and a fresh full observation');
+    } finally { await broker.close(); }
+  }
+});
+
+test('routed launch refuses drift during selection before reserve mutation for command and agent', async () => {
+  for (const childKind of ['exec', 'agent-run'] as const) for (const drift of
+    ['roster', 'order', 'session', 'input'] as const) {
+    const tuple = { id: 'adapter', harness: 'local', model: 'available', effort: 'low' as const };
+    const routed = { ...routing, preference: { ...routing.preference,
+      tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
+    const packet = { ...parentOrder().order, workflow: 'frame',
+      worker: childKind === 'exec' ? 'command' : 'agent', routing: routed } as OrderPacket;
+    let current = { ...parentOrder(), workflow: 'frame', order: packet };
+    let liveIdentity = identity, malformedInput = false;
+    let getOrders = 0, observes = 0, writes = 0;
+    let selectionStarted!: () => void, selectionDone!: () => void;
+    const started = new Promise<void>(resolve => { selectionStarted = resolve; });
+    const done = new Promise<void>(resolve => { selectionDone = resolve; });
+    const hub = createHubClient({ origin, getToken: async () => 'parent-bearer',
+      routingSession: { allowedOrigin: origin, get: () => ({ ...identity, credential }), now: () => 2_000 },
+      fetchImpl: (async url => {
+	if (String(url).endsWith('/get_order')) { getOrders++; return Response.json(current); }
+	writes++; return Response.json({ reservationId: 'lr', orderId: 'run', expiresAt: 40_000 });
+      }) as typeof fetch });
+    const broker = await createRoutingBroker({ now: () => 2_000 });
+    try {
+      const granted = broker.issue({ reservation: { ...reservation, childKind }, routing: routed,
+	identity, currentIdentity: () => liveIdentity, hub,
+	submissionAuthority: transportAuthority, launchAuthority: {
+	  verifySelection: async () => { selectionStarted(); await done;
+	    if (drift === 'roster') throw new Error('current roster moved'); },
+	}, inputAuthority: { observe: async () => {
+	  observes++;
+	  const pairBinding = { rootWorkflow: 'wf', frameWorkflow: 'frame', run: 'run',
+	    claimId: 'run', decisionId: 'decision', sessionId, shiftId: identity.shiftId,
+	    orderDigest: 'b'.repeat(64), authorityRevision: 'c'.repeat(64),
+	    rosterRevision: routed.preference.rosterRevision,
+	    routingDigest: valueDigestHex(routed), preferenceExpiresAt: routed.preference.expiresAt };
+	  return { reference: { protocol: 'trusted-routed-reference-read-v2' as const,
+	    state: 'available' as const, workflow: 'wf', run: 'run', order: packet,
+	    inputs: [], lease: { claimed: true }, binding: { ...pairBinding,
+	      ...(malformedInput ? { orderDigest: 'd'.repeat(64) } : {}) } },
+	  claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
+	    workflow: 'wf', run: 'run', routing: routed, binding: pairBinding } };
+	} } });
+      granted.activate({ ...child, kind: childKind });
+      const launch = { version: 'launch-reservation-v1', claimId: 'run', decisionId: 'decision',
+	binding, orderId: 'run', attemptId: 'run', rosterRevision: routed.preference.rosterRevision,
+	candidateIds: childKind === 'exec' ? [] : ['adapter'], assessmentId: null,
+	requested: null, selected: childKind === 'exec' ? null : tuple };
+      const pending = request(granted.socketPath, { cap: granted.cap,
+	method: 'reserve_launch', body: { request: launch } });
+      await started;
+      assert.equal(getOrders, 1, 'selection follows one native current-order read');
+      assert.equal(observes, 0, 'no complete input observation before selection');
+      if (drift === 'order') current = { ...current, order: { ...packet, key: 'changed' } };
+      if (drift === 'session') liveIdentity = { ...identity, sessionId: 'rs_changed' };
+      if (drift === 'input') malformedInput = true;
+      selectionDone();
+      assert.equal((await pending).ok, false, `${childKind}/${drift}`);
+      assert.equal(writes, 0, `${childKind}/${drift} never reaches reserve_launch`);
+      assert.equal(observes, drift === 'input' ? 1 : 0);
+    } finally { await broker.close(); }
+  }
+});
+
 test('parent input gate binds the Service root to a nested frame and permits prestart heartbeat only with current witness', async () => {
   let now = 2_000;
   let witnessChanged = false;
