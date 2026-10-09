@@ -95,7 +95,9 @@ test('all six composite routes use one original-session request and never downgr
     const reader = createCoherentRoutingReaders({ origin, orgId: scope.orgId, expected: scope,
       getToken: async () => 'test-owned-bearer', getSession: async () => session, trustedCa: readFileSync(cert) });
     for (const phase of ['prestart', 'recorded-live'] as const) {
-      assert.equal((await reader.structure(selection, phase)).selected.childWorkflow, 'wf_native_B');
+      const selected = (await reader.structure(selection, phase)).selected;
+      assert.ok(selected.kind === 'selected-native-concrete-child');
+      assert.equal(selected.childWorkflow, 'wf_native_B');
       assert.equal((await reader.folded(key, phase)).selected?.proof, 'opaque-stored-proof');
       const order = await reader.order({ kind: 'exec', id: 'test-holder' }, phase);
       assert.equal(order.response.text, 'full projection');
