@@ -463,7 +463,8 @@ async function verifyParentOrder(grant: Grant, response: GetOrderResponse,
 
 /** Replace only an existing get_order followed by parent pair verification. */
 async function readVerifiedParentOrder(grant: Grant, holder: ContactHolder | undefined,
-  phase: RoutedInputPhase, now: () => number, signal: AbortSignal):
+  phase: RoutedInputPhase, now: () => number, signal: AbortSignal,
+  expectedOrder?: NonNullable<GetOrderResponse['order']>):
   Promise<{ response: GetOrderResponse; pair: RoutedInputPair | undefined }> {
   if (!grant.submissionAuthority) throw new Error('routing order authority unavailable');
   if (grant.inputAuthority?.observeOrder) {
@@ -475,12 +476,18 @@ async function readVerifiedParentOrder(grant: Grant, holder: ContactHolder | und
     if (signal.aborted) throw new Error('routing order observation aborted');
     if (!validOrderResponse(grant, observed.response) || !observed.response.lease.claimed || !observed.response.order)
       throw new Error('routing current order unavailable');
+    if (expectedOrder && !isDeepStrictEqual(observed.response.order, expectedOrder))
+      throw new Error('routing launch order changed');
     acceptVerifiedPair(grant, observed.pair, phase, now);
     return observed;
   }
   const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
     run: grant.reservation.run, holder }, signal), now, phase === 'prestart');
   if (!validOrderResponse(grant, response)) throw new Error('routing current order unavailable');
+  // Preserve the legacy final-launch order comparison before another awaited
+  // input read; composite callbacks separately verify their captured packet.
+  if (expectedOrder && !isDeepStrictEqual(response.order, expectedOrder))
+    throw new Error('routing launch order changed');
   const pair = response.lease.claimed && response.order
     ? await verifyParentOrder(grant, response, phase, now) : undefined;
   return { response, pair };
@@ -638,7 +645,7 @@ async function verifyParentLaunch(grant: Grant, request: LaunchReservationReques
   await checked(grant, grant.launchAuthority.verifySelection(fresh.order, structuredClone(request)), now, true);
   if (grant.inputAuthority) {
     const { response: final } = await readVerifiedParentOrder(grant,
-      { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }, 'prestart', now, signal);
+      { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId }, 'prestart', now, signal, fresh.order);
     if (!validOrderResponse(grant, final) || !final.lease.claimed || !final.order
       || !isDeepStrictEqual(final.order, fresh.order))
       throw new Error('routing launch order changed');
@@ -1340,7 +1347,7 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
 	if (now() >= grant.launchExpiresAt!) throw new Error('routing launch reservation expired');
 	if (grant.inputAuthority) {
 	  const { response: final } = await readVerifiedParentOrder(grant, body.holder as ContactHolder,
-	    'prestart', now, signal);
+	    'prestart', now, signal, response.order);
 	  if (!validOrderResponse(grant, final) || !final.lease.claimed || !final.order
 	    || !isDeepStrictEqual(final.order, response.order))
 	    throw new Error('routing launch order changed');

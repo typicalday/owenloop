@@ -61,7 +61,7 @@ test('coherent envelopes bind exact phase/domain/root and enforce constituent bo
       { origin: 'https://other.example' }, { extra: true }, { protocol: 'wrong-domain' } ])
       assert.throws(() => parseCoherentObservation({ ...wire, ...change }, domain, phase, scope));
     const mixed = structuredClone(wire);
-    mixed.pair.claim.binding.orderDigest = '0'.repeat(64);
+    mixed.pair.claim.binding = { ...mixed.pair.claim.binding, orderDigest: '0'.repeat(64) };
     assert.throws(() => parseCoherentObservation(mixed, domain, phase, scope));
   }
   const wire = envelope('structure'); let nested: Record<string, unknown> = {}; const deep = nested;
