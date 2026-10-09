@@ -30,6 +30,8 @@ import { outputVersionForSubmission } from '../submit-proof.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import type { RoutedInputPair, RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
+import { snapshotCommandPostrun, type CommandPostrunResponse,
+  type CommandPostrunSnapshot } from './routing-command-postrun.ts';
 
 // Service permits artifact values up to 25 MB. Leave bounded JSON overhead
 // while allowing a normal submit receipt through this private transport.
@@ -48,7 +50,8 @@ type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
-  | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection' | 'quiesce';
+  | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection' | 'quiesce'
+  | 'command_postrun' | 'command_finish';
 type CapScope = 'role' | 'holder';
 export type RoutedQuiesceResult = { quiescing: true; effects: 'settled' | 'uncertain' };
 interface Grant {
@@ -96,6 +99,15 @@ interface Grant {
     result?: RoutedCollectionWriteResponse; done: boolean; sealId?: string };
   collectionSeal?: { intent: string; request?: RoutedCollectionSealRequest;
     result?: RoutedCollectionWriteResponse };
+  commandFor?: (order: import('../hub/types.ts').OrderPacket) => Promise<string>;
+  postrun?: { intent: string; command: string; step: string;
+    snapshot: CommandPostrunSnapshot; nextOwe: number;
+    paths: Array<{ path: string; kind: 'singleton' | 'collection' }>;
+    judge?: string; rejectDone: boolean; askOrRejectDispatched: boolean;
+    terminalClosed?: boolean;
+    result?: CommandPostrunResponse };
+  postrunBusy?: boolean;
+  postrunRelease?: { reason: string; dispatched: boolean; response?: import('../hub/types.ts').ReleaseResponse };
   terminalReason?: 'normal-close' | 'receipt-pending' | 'revoked';
   receiptUntil?: number;
   revokeResult?: Promise<void>;
@@ -114,7 +126,8 @@ export interface RoutingBroker {
     routedV2Read?: Grant['routedV2Read'];
     routedLiveV2Read?: Grant['routedLiveV2Read'];
     submissionAuthority?: RoutedSubmissionAuthority; launchAuthority?: RoutedLaunchAuthority;
-    inputAuthority?: RoutedInputAuthority }): {
+    inputAuthority?: RoutedInputAuthority;
+    commandFor?: Grant['commandFor'] }): {
       socketPath: string; cap: string; holder?: { socketPath: string; cap: string };
       activate(record: ChildRecord): void;
       bindChild(record: ChildRecord, custody: RetainedChildCustody,
@@ -282,10 +295,10 @@ async function checked<T>(grant: Grant, call: Promise<T>, now: () => number, lau
 }
 
 /** Refuse a Hub mutation that reached its wire boundary after parent freeze. */
-const effectContext = new AsyncLocalStorage<{ dispatched: boolean }>();
+const effectContext = new AsyncLocalStorage<{ dispatched: boolean; parentPostrun?: boolean }>();
 function startEffect<T>(grant: Grant, send: () => Promise<T>): Promise<T> {
-  if (grant.quiescing) throw new Error('routing broker quiescing');
   const context = effectContext.getStore();
+  if (grant.quiescing && !context?.parentPostrun) throw new Error('routing broker quiescing');
   if (context) context.dispatched = true;
   return send();
 }
@@ -436,8 +449,8 @@ function submissionBinding(response: GetOrderResponse, path: string, grant: Gran
 }
 
 async function submitFromParent(grant: Grant, body: Record<string, unknown>, now: () => number,
-  signal: AbortSignal): Promise<unknown> {
-  if (grant.quiescing) throw new Error('routing broker quiescing');
+  signal: AbortSignal, parentPostrun = false): Promise<unknown> {
+  if (grant.quiescing && !parentPostrun) throw new Error('routing broker quiescing');
   const authority = grant.submissionAuthority;
   if (!authority || grant.submitBusy) throw new Error('routing submission authority unavailable');
   grant.submitBusy = true;
@@ -683,12 +696,233 @@ async function collectionEmit(grant: Grant, body: Record<string, unknown>, now: 
   return { member, seal, issued: pending.issued };
 }
 
+function postrunHolder(grant: Grant): ContactHolder {
+  if (!grant.execHolderId) throw new Error('routing command holder unavailable');
+  return { kind: 'exec', id: grant.execHolderId, shiftId: grant.identity.shiftId };
+}
+
+async function postrunClaim(grant: Grant, now: () => number,
+  signal: AbortSignal): Promise<'held'> {
+  const phase: RoutedInputPhase = grant.acceptedLaunchReport ? 'recorded-live' : 'prestart';
+  const response = await checked(grant, grant.hub.getOrder({ workflow: grant.reservation.workflow,
+    run: grant.reservation.run, holder: postrunHolder(grant) }, signal), now);
+  if (!validOrderResponse(grant, response)) throw new Error('routing command claim unavailable');
+  if (!response.lease.claimed || !response.order)
+    throw new Error('routing command claim unavailable');
+  await verifyParentOrder(grant, response, phase, now);
+  return 'held';
+}
+
+/** This is the sole post-freeze write path. The role packet supplies data only;
+ * the parent derives every target and the original-session holder. */
+async function commandPostrun(grant: Grant, body: unknown, now: () => number,
+  signal: AbortSignal): Promise<CommandPostrunResponse> {
+  if (grant.reservation.childKind !== 'exec' || !grant.quiescing || !grant.quiesceResult
+    || !grant.acceptedLaunchReport || !grant.launchReservationId || !grant.commandFor
+    || !grant.submissionAuthority || !grant.inputAuthority || !liveChildValid(grant, now())
+    || grant.postrunBusy) throw new Error('routing command postrun unavailable');
+  grant.postrunBusy = true;
+  try {
+    const frozen = await grant.quiesceResult;
+    if (frozen.effects !== 'settled' || [...grant.uncertainEffects].some(method =>
+      !grant.postrun || method !== 'submit' && method !== 'emit_member'
+      && method !== 'seal_collection'))
+      throw new Error('routing command prior effects unresolved');
+    const current = grant.postrun ? undefined : await verifyCurrentConsequence(grant, 'role', now, signal);
+    if (!grant.postrun && (!current?.order || !current.lease.claimed
+      || current.order.worker !== 'command' || current.order.owes.length === 0))
+      throw new Error('routing command order unavailable');
+    const command = grant.postrun?.command ?? await checked(grant, grant.commandFor(current!.order!), now);
+    if (!command || !command.trim()) throw new Error('routing command definition unavailable');
+    if (current) {
+      const repeat = await verifyCurrentConsequence(grant, 'role', now, signal);
+      if (!repeat?.order || !isDeepStrictEqual(repeat.order, current.order))
+        throw new Error('routing command order changed');
+    }
+    const snapshot = snapshotCommandPostrun(body, { command,
+      orchestrator: postrunHolder(grant).id, workflow: grant.reservation.workflow,
+      run: grant.reservation.run, step: grant.postrun?.step ?? current!.order!.step });
+    const intent = valueDigestHex({ receipt: snapshot.canonical, result: snapshot.result,
+      parsed: snapshot.parsed, group: { scope: 'original-posix-group', state: 'empty' } });
+    if (grant.postrun && grant.postrun.intent !== intent)
+      throw new Error('routing command postrun intent changed');
+    if (!grant.postrun) {
+      const paths = current!.order!.owes.map(owe => ({ path: owe.path,
+        kind: grant.submissionAuthority!.canCollect?.(current!.order!, owe.path) === true
+          ? 'collection' as const : 'singleton' as const }));
+      if (paths.some(row => row.kind === 'singleton'
+        && grant.submissionAuthority!.canSubmit(current!.order!, row.path) !== true))
+        throw new Error('routing command output kind unavailable');
+      grant.postrun = { intent, command, step: current!.order!.step, snapshot, paths, nextOwe: 0,
+        ...(current!.order!.judge ? { judge: current!.order!.judge } : {}),
+        rejectDone: false, askOrRejectDispatched: false };
+    }
+    const pending = grant.postrun;
+    if (pending.result) return pending.result;
+    const value = pending.snapshot.receipt();
+    const parsed = pending.snapshot.parsed;
+    const holder = postrunHolder(grant);
+    const perform = async <T>(method: Method, send: () => Promise<T>): Promise<T> => {
+      const context = { dispatched: false, parentPostrun: true };
+      try { return await effectContext.run(context, send); }
+      catch (error) {
+        if (context.dispatched) {
+          grant.uncertainEffects.add(method); grant.syncUncertainty?.();
+        }
+        throw error;
+      }
+    };
+    const reject = async (path: string, text: string): Promise<'closed' | 'held'> => {
+      if (pending.askOrRejectDispatched) throw new Error('routing command reject outcome unresolved');
+      const fresh = await verifyCurrentConsequence(grant, 'role', now, signal);
+      if (!fresh?.order || !fresh.order.inputs.includes(path)
+        && fresh.order.judge !== path)
+        throw new Error('routing command reject target changed');
+      pending.askOrRejectDispatched = true;
+      const response = await perform('reject', () => startEffect(grant, () =>
+        grant.hub.routingReject({ workflow: grant.reservation.workflow,
+          run: grant.reservation.run, path, text }, signal)));
+      if (!response || response.ok !== true || typeof response.closed !== 'boolean')
+        throw new Error('routing command reject outcome unresolved');
+      if (!response.closed) await postrunClaim(grant, now, signal);
+      grant.uncertainEffects.delete('reject'); grant.syncUncertainty?.();
+      return response.closed ? 'closed' : 'held';
+    };
+    if (!pending.rejectDone && !pending.judge && parsed.reject) {
+      const tail = value.outputTail.replace(/\n+$/, '');
+      const text = tail ? `${parsed.reject.text}\n\n--- command output (last ${Buffer.byteLength(tail, 'utf8')} bytes) ---\n${tail}`
+	: parsed.reject.text;
+      const claim = await reject(parsed.reject.path, text);
+      pending.rejectDone = true;
+      pending.askOrRejectDispatched = false;
+      if (claim === 'closed') return pending.result = { outcome: 'rejected', claim };
+    }
+    if (pending.judge && pending.snapshot.result.exitCode !== 0) {
+      const reason = value.payload && typeof value.payload === 'object'
+        && !Array.isArray(value.payload) && typeof (value.payload as Record<string, unknown>).reason === 'string'
+        ? (value.payload as Record<string, string>).reason : undefined;
+      const text = reason?.trim() || value.outputTail ||
+        `judge command exited with code ${pending.snapshot.result.exitCode}`;
+      const claim = await reject(pending.judge, text);
+      return pending.result = { outcome: 'judge-rejected', claim };
+    }
+    if (pending.snapshot.result.exitCode !== 0) {
+      if (pending.askOrRejectDispatched) throw new Error('routing command ask outcome unresolved');
+      const path = pending.paths[0]!.path;
+      const fresh = await verifyCurrentConsequence(grant, 'role', now, signal);
+      if (!fresh?.order?.owes.some(owe => owe.path === path))
+        throw new Error('routing command ask target changed');
+      pending.askOrRejectDispatched = true;
+      const question = `the command for step '${value.step}' exited ${value.exitCode}, so '${path}' was not produced and no receipt was submitted`;
+      const response = await perform('ask', () => startEffect(grant, () =>
+        grant.hub.routingAsk({ workflow: grant.reservation.workflow, run: grant.reservation.run,
+          path, question, context: pending.snapshot.canonical.slice(0, 16_384) }, signal)));
+      if (!response || response.ok !== true || response.closed !== true)
+        throw new Error('routing command ask outcome unresolved');
+      grant.uncertainEffects.delete('ask'); grant.syncUncertainty?.();
+      return pending.result = { outcome: 'command-failed', claim: 'closed' };
+    }
+    while (pending.nextOwe < pending.paths.length) {
+      const { path, kind } = pending.paths[pending.nextOwe]!;
+      // An exact seal may already have closed the claim while its ACK was
+      // lost. Service permits only the latched identical seal replay under
+      // the original session; a fresh get_order now correctly refuses.
+      const exactSealReplay = kind === 'collection' && !!grant.collectionSeal?.request
+        && !grant.collectionSeal.result;
+      if (!exactSealReplay) {
+        const fresh = await verifyCurrentConsequence(grant, 'role', now, signal);
+        if (!fresh?.order?.owes.some(owe => owe.path === path))
+          throw new Error('routing command output target changed');
+      }
+      if (kind === 'collection') {
+        const emissionId = createHash('sha256').update(`routed-command:${pending.intent}:${path}`).digest('hex').slice(0, 32);
+        const answer = await perform('emit_member', () => collectionEmit(grant,
+          { sealPath: path, emissionId, value: pending.snapshot.receipt(), done: true, holder },
+          now, signal)) as { member?: RoutedCollectionWriteResponse; seal?: RoutedCollectionWriteResponse };
+        if (answer.member?.outcome !== 'emitted' || answer.seal?.outcome !== 'sealed')
+          throw new Error('routing command collection outcome unresolved');
+        pending.terminalClosed = answer.seal.closed;
+      } else {
+        const answer = await perform('submit', () => submitFromParent(grant,
+          { path, value: pending.snapshot.receipt(), holder }, now, signal, true)) as
+          import('../hub/types.ts').ConditionalSubmitResponse;
+        if (answer.outcome !== 'green' && answer.outcome !== 'submitted')
+          throw new Error('routing command submit refused');
+        if (typeof answer.closed !== 'boolean')
+          throw new Error('routing command submit closure unavailable');
+        pending.terminalClosed = answer.closed;
+      }
+      grant.uncertainEffects.delete(kind === 'collection' ? 'emit_member' : 'submit');
+      grant.syncUncertainty?.();
+      pending.nextOwe += 1;
+      if (pending.terminalClosed && pending.nextOwe < pending.paths.length)
+        throw new Error('routing command closed before all outputs');
+    }
+    const claim = pending.terminalClosed ? 'closed' : await postrunClaim(grant, now, signal);
+    return pending.result = { outcome: 'submitted', claim };
+  } finally { grant.postrunBusy = false; }
+}
+
+async function commandFinish(grant: Grant, body: unknown, now: () => number,
+  signal: AbortSignal): Promise<{ state: 'released' | 'already-closed' | 'uncertain' }> {
+  const noStart = exactKeys(body, ['observation']) && body.observation === 'not-started';
+  const settledGroup = exactKeys(body, ['group']) && exactKeys(body.group, ['scope', 'state'])
+    && body.group.scope === 'original-posix-group' && body.group.state === 'empty';
+  if (!noStart && !settledGroup)
+    throw new Error('routing command group unsettled');
+  if (grant.reservation.childKind !== 'exec' || !grant.quiescing || !grant.quiesceResult
+    || (settledGroup && !grant.acceptedLaunchReport)
+    || (noStart && grant.postrun)
+    || !liveChildValid(grant, now()) || grant.postrunBusy)
+    throw new Error('routing command finish unavailable');
+  const frozen = await grant.quiesceResult;
+  if (frozen.effects !== 'settled' || grant.uncertainEffects.size)
+    return { state: 'uncertain' };
+  if (grant.postrun && !grant.postrun.result) return { state: 'uncertain' };
+  if (grant.postrunRelease?.response) return { state: 'released' };
+  if (grant.postrunRelease?.dispatched) return { state: 'uncertain' };
+  if (grant.postrun?.result?.claim === 'closed') return { state: 'already-closed' };
+  if (noStart && !grant.acceptedLaunchReport) {
+    // The scoped claim read still applies Service's startup preference bound.
+    // A refusal at that boundary remains held for native TTL/reap; it cannot
+    // authorize a stale new start or an unscoped release fallback.
+    const current = await checked(grant, grant.hub.readRoutingClaim({ workflow: grant.reservation.workflow,
+      run: grant.reservation.run }, signal), now);
+    if (current.freshness !== 'fresh-at-read' || current.atomicLaunch !== false
+      || !isDeepStrictEqual(current.routing, grant.routing))
+      throw new Error('routing command claim changed');
+  } else await postrunClaim(grant, now, signal);
+  const reason = 'routed-command-finished';
+  grant.postrunRelease = { reason, dispatched: true };
+  const context = { dispatched: false, parentPostrun: true };
+  try {
+    const response = await effectContext.run(context, () => startEffect(grant, () =>
+      grant.hub.routingRelease({ workflow: grant.reservation.workflow,
+        run: grant.reservation.run, reason }, signal)));
+    if (!response || response.released !== true)
+      throw new Error('routing command release outcome unresolved');
+    grant.postrunRelease.response = response;
+    return { state: 'released' };
+  } catch {
+    grant.uncertainEffects.add('command_finish'); grant.syncUncertainty?.();
+    return { state: 'uncertain' };
+  }
+}
+
 async function invoke(grant: Grant, scope: CapScope, method: Method, body: unknown, now: () => number,
   signal: AbortSignal): Promise<unknown> {
   if (method === 'quiesce') {
     if (scope !== 'role' || !exactKeys(body, []) || !grant.ready
       || !validateSessionGrant(grant, now())) throw new Error('routing broker request refused');
     return quiesceGrant(grant);
+  }
+  if (method === 'command_postrun') {
+    if (scope !== 'role') throw new Error('routing broker request refused');
+    return commandPostrun(grant, body, now, signal);
+  }
+  if (method === 'command_finish') {
+    if (scope !== 'role') throw new Error('routing broker request refused');
+    return commandFinish(grant, body, now, signal);
   }
   if (grant.quiescing && method !== 'heartbeat'
     && !((method === 'emit_member' || method === 'seal_collection')
@@ -1257,7 +1491,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       'read_live_routed_reference_v2', 'read_live_routing_claim_v2',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection',
-	    'quiesce'];
+	    'quiesce', 'command_postrun', 'command_finish'];
 	  if (!methods.includes(request.method)) throw new Error();
 	  const effect = ['reserve_launch', 'report_launch', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'emit_member', 'seal_collection'].includes(request.method);
@@ -1286,14 +1520,14 @@ export async function createRoutingBroker(args: { now?: () => number;
   return {
     socketPath,
     issue({ reservation, routing, identity, currentIdentity, hub, routedV2Read, routedLiveV2Read,
-      submissionAuthority, launchAuthority, inputAuthority }) {
+      submissionAuthority, launchAuthority, inputAuthority, commandFor }) {
       if (closed) throw new Error('routing broker closed');
       const grant: Grant = { active: true, ready: false, quiescing: false,
 	inFlightEffects: new Set(), uncertainEffects: new Set(), uploadControllers: new Set(),
 	uploadEffectControllers: new Set(),
 	reservation: structuredClone(reservation), routing: structuredClone(routing),
 	identity: { ...identity }, currentIdentity, hub, routedV2Read, routedLiveV2Read,
-	submissionAuthority, launchAuthority, inputAuthority };
+	submissionAuthority, launchAuthority, inputAuthority, commandFor };
       grant.syncUncertainty = () => {
 	if (grant.uncertainEffects.size) unresolvedEffects.add(grant);
 	else unresolvedEffects.delete(grant);

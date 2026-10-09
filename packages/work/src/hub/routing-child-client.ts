@@ -6,6 +6,7 @@ import { PassThrough, Readable } from 'node:stream';
 import type { RoutedClaimV2, RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RecordedClaimV2, RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import type { RoutedQuiesceResult } from '../shift/routing-broker.ts';
+import type { CommandPostrunRequest, CommandPostrunResponse } from '../shift/routing-command-postrun.ts';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
   type LaunchReportV1, type LaunchReportResponse, type LaunchReservationRequestV1,
@@ -28,6 +29,7 @@ type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_lo
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'quiesce'
+  | 'command_postrun' | 'command_finish'
   | 'request_approval' | 'read_invocation_binding';
 type CollectionVerb = Verb | 'collection_target' | 'emit_member' | 'seal_collection';
 
@@ -47,6 +49,12 @@ export interface RoutingChildClient {
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   /** Freeze role and holder effects. ACK is local broker state, not a fleet seal. */
   quiesce(): Promise<RoutedQuiesceResult>;
+  /** Data-only handoff; no child-selected target, signer, holder or URL. */
+  commandPostrun(req: CommandPostrunRequest): Promise<CommandPostrunResponse>;
+  /** Parent checks current native claim and uses only a targeted release. */
+  commandFinish(req: { group: { scope: 'original-posix-group'; state: 'empty' } }
+    | { observation: 'not-started' }):
+    Promise<{ state: 'released' | 'already-closed' | 'uncertain' }>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   collectionTarget(req: { workflow: string; run: string; path: string;
     holder: NonNullable<SubmitRequest['holder']> }): Promise<{ collection: boolean }>;
@@ -344,6 +352,24 @@ export function createRoutingChildClient(handoff: {
 				|| !['settled', 'uncertain'].includes(String((value as Record<string, unknown>).effects)))
 				throw refused();
       return value as RoutedQuiesceResult;
+    },
+    async commandPostrun(req) {
+      const value = await exchange<unknown>('command_postrun', req);
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+        || Object.keys(value).sort().join(',') !== 'claim,outcome'
+        || !['submitted', 'rejected', 'judge-rejected', 'command-failed'].includes(
+          String((value as Record<string, unknown>).outcome))
+        || !['closed', 'held', 'uncertain'].includes(String((value as Record<string, unknown>).claim)))
+        throw refused();
+      return value as CommandPostrunResponse;
+    },
+    async commandFinish(req) {
+      const value = await exchange<unknown>('command_finish', req);
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+        || Object.keys(value).join(',') !== 'state'
+        || !['released', 'already-closed', 'uncertain'].includes(
+          String((value as Record<string, unknown>).state))) throw refused();
+      return value as { state: 'released' | 'already-closed' | 'uncertain' };
     },
     submit(req) {
       bound(req);

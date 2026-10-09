@@ -32,6 +32,8 @@ export interface RoutedDefinitionStage {
   digest: string;
   /** Parent-only, fresh full-order and current operator trust gate. */
   verifyOrder(response: GetOrderResponse): Promise<void>;
+  /** Exact command from the currently verified signed stage, never from a child. */
+  commandFor?(order: OrderPacket): Promise<string>;
   /** Full current trust plus exact Service input/value witness. */
   verifyRoutedInput?(response: GetOrderResponse, pair: RoutedInputPair,
     phase: RoutedInputPhase, started?: { wall: number; monotonic: number }): Promise<void>;
@@ -526,6 +528,15 @@ export async function stageRoutedDefinition(args: {
     };
     return { path: stagePath, digest: args.order.defDigest!,
       verifyOrder: response => verifyOrderInternal(response),
+      commandFor: async order => {
+	if (order.worker !== 'command' || order.defDigest !== args.order.defDigest
+	  || order.step !== args.order.step || order.run !== args.order.run)
+	  throw new Error('routed command definition refused');
+	const verified = source.getVerifiedStep(order.defDigest, order.step);
+	if (typeof verified?.command !== 'string' || !verified.command.trim())
+	  throw new Error('routed command definition refused');
+	return verified.command;
+      },
       verifyRoutedInput: (response, pair, phase, started) => verifyOrderInternal(response,
 	{ pair, phase, ...(started ? { started } : {}) }),
       canSubmit: canReplay, canReplay, canCollect, activate, markGateMayOpen, cleanup, cleanupAfterExit };

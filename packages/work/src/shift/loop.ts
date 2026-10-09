@@ -1581,6 +1581,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 		reservation.workflow) } : {}),
 	    ...(opts.createRoutingSubmissionAuthority && definitionStage
 	      ? { submissionAuthority: opts.createRoutingSubmissionAuthority(definitionStage) } : {}),
+	    ...(definitionStage ? { commandFor: definitionStage.commandFor } : {}),
 	    ...(opts.createRoutingLaunchAuthority ? { launchAuthority: opts.createRoutingLaunchAuthority(
 	      c.order, (() => {
 		const offerId = c.order.routing?.preference.offer?.offerId;
