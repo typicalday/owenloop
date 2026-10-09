@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -353,6 +353,8 @@ test('integrity-only selected member preserves strict locked-child closure', asy
     new Set([store.parentDigest, store.childDigest]));
   const childObject = selected.support.find(object => object.bundleDigest === store.childDigest);
   assert.ok(childObject);
+  chmodSync(childObject.objectPath, 0o755);
+  chmodSync(join(childObject.objectPath, 'workflow.yaml'), 0o644);
   writeFileSync(join(childObject.objectPath, 'workflow.yaml'), '\ncorrupted: true\n');
   await assert.rejects(verifyInstalledWorkflowMember({ globalRoot: store.worker,
     verifier: createBundleIngestor(), bundleDigest: store.parentDigest,
@@ -418,8 +420,8 @@ test('data-only selected child defers an included Hub live call after signed exp
     name: 'included-child',
     workflow: `name: included-child\ninputs: []\nsteps:\n  - name: make\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo included\noutputs: [result]\n`,
     workflows: {
-      child: `name: routing/child\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
-      helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: routing/external\n    produces: [result]\noutputs: [result]\n`,
+      child: `name: routing/child\ninputs: []\nsteps:\n  - include: helper\n    as: nested\n  - name: make\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo own\noutputs: [result]\n`,
+      helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: routing/external\n    produces: [result]\noutputs: []\n`,
     },
     defaultWorkflow: 'routing/child',
   }), 'child', 'routing/child');
@@ -443,8 +445,8 @@ test('included exact locked call is recovered and verified before data-only or o
   addIndexEntry(publisher, target, child.result.digest);
   const parentSource = writeBundleSource({
     name: 'included-parent',
-    workflow: `name: included-parent\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
-    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: [result]\n` },
+    workflow: `name: included-parent\ninputs: []\nsteps:\n  - include: helper\n    as: nested\n  - name: make\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo own\noutputs: [result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: []\n` },
     lock: { [target]: child.result.digest },
   });
   const parentBundle = await installBundleFixture({ root: worker,
@@ -469,6 +471,8 @@ test('included exact locked call is recovered and verified before data-only or o
   assert.equal(await sourceAt(worker).prime(parentBundle.result.digest), 'resolved');
   const childObject = selected.support.find(object => object.bundleDigest === child.result.digest);
   assert.ok(childObject);
+  chmodSync(childObject.objectPath, 0o755);
+  chmodSync(join(childObject.objectPath, 'workflow.yaml'), 0o644);
   writeFileSync(join(childObject.objectPath, 'workflow.yaml'), '\ncorrupted: true\n');
   await assert.rejects(select(), (error: unknown) => error instanceof StoreIntegrityError
     && error.code === 'object-corrupt' && error.digest === child.result.digest);
@@ -480,8 +484,8 @@ test('locked child includes resolve from the child archive despite a same-named 
   const child = await installBundleFixture({ root, sourceDir: writeBundleSource({
     name: 'change-unit',
     defaultWorkflow: 'change-unit',
-    workflow: `name: change-unit\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
-    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: good\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo child\noutputs: [result]\n` },
+    workflow: `name: change-unit\ninputs: []\nsteps:\n  - include: helper\n    as: nested\n  - name: make\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo own\noutputs: [result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: good\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo child\noutputs: []\n` },
   }) });
   addIndexEntry(root, target, child.result.digest);
   const parentBundle = await installBundleFixture({ root, sourceDir: writeBundleSource({
@@ -500,8 +504,8 @@ test('locked child includes resolve from the child archive despite a same-named 
   const callsChild = source.getVerifiedCallsChild?.(parentBundle.result.digest,
     'delegate', 'delegate');
   assert.equal(callsChild?.bundleDigest, child.result.digest);
-  assert.deepEqual(callsChild?.definition.steps.map(step => step.name), ['nested.good']);
-  assert.deepEqual(callsChild?.definition.outputs, ['nested.result']);
+  assert.deepEqual(callsChild?.definition.steps.map(step => step.name), ['nested.good', 'make']);
+  assert.deepEqual(callsChild?.definition.outputs, ['result']);
 });
 
 test('included exact named lock checks its selected member before bundle commit', async () => {
@@ -514,8 +518,8 @@ test('included exact named lock checks its selected member before bundle commit'
   const target = `${coordinate}#missing`;
   const parentSource = writeBundleSource({
     name: 'parent',
-    workflow: `name: parent\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
-    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: [result]\n` },
+    workflow: `name: parent\ninputs: []\nsteps:\n  - include: helper\n    as: nested\n  - name: make\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo own\noutputs: [result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: []\n` },
     lock: { [coordinate]: child.result.digest },
   });
   await assert.rejects(installBundleFixture({ root: worker, level: 'global',
