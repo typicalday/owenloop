@@ -200,17 +200,21 @@ for (const scenario of ['closed-ask', 'held-release', 'claim-moved',
     assert.equal((await client.getOrder({ ...target, holder })).order?.workflow, 'frame');
     if (scenario === 'quiesce-session-revoked') {
       phase = 'paused-quiesce';
-      const approval = client.requestApproval({ ...target, tool_use_id: 'tool-one',
-	tool_name: 'write', tool_input: {}, reason: 'current task' });
+      const approval = assert.rejects(client.requestApproval({ ...target, tool_use_id: 'tool-one',
+	tool_name: 'write', tool_input: {}, reason: 'current task' }),
+	/routing broker unavailable/);
       await startedApproval;
-      const frozen = client.quiesce();
-      const outcome = client.agentOutcome({ group: {
-	scope: 'original-posix-group', state: 'empty' } });
+      // Parent freeze flips before the first await, so revocation happens
+      // while its in-flight effect drain is still pending.
+      const frozen = grant.quiesce();
+      const outcome = assert.rejects(client.agentOutcome({ group: {
+	scope: 'original-posix-group', state: 'empty' } }), /routing broker unavailable/);
+      await sleep(25);
       currentIdentity = undefined;
       resolveApproval();
-      await assert.rejects(approval, /routing broker unavailable/);
+      await approval;
       assert.equal((await frozen).effects, 'uncertain');
-      await assert.rejects(outcome, /routing broker unavailable/);
+      await outcome;
       assert.equal(releases, 0);
       return;
     }
