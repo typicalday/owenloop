@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import {
   classifyFrame,
@@ -25,6 +26,8 @@ import {
   buildThreadStartParams,
   buildTurnStartParams,
   codexAdapter,
+  startRoutedCodex,
+  type RoutedCodexLaunch,
   isResumeMiss,
   mapNotification,
   readFinalAssistantResponse,
@@ -1910,6 +1913,24 @@ test('D8a malformed tool selectors refuse start and resume before spawning an ap
   await assert.rejects(codexAdapter.deliver({ harness: 'codex', token: 'missing' }, 'resume', args, () => {}), /mcp-tools/);
   assert.equal(stub.pid(), undefined);
   assert.deepEqual(stub.received(), []);
+});
+
+test('routed Codex hands retained transport to parent before setup awaits, once per generation', async (t) => {
+  const stub = useStub(t, 'hang-turn');
+  const generation = `routed-${Date.now()}-${Math.random()}`;
+  const args = startArgs(undefined, { cwd: stub.dir,
+    owenloopMcp: { ...MOUNT, args: [...MOUNT.args, '--routing-holder=/tmp/test-holder'] } });
+  let launched: RoutedCodexLaunch | undefined;
+  const turn = startRoutedCodex(args, () => {}, { generation,
+    onLaunch: launch => { launched = launch; } });
+  assert.ok(launched, 'launch custody arrives before the first setup await');
+  assert.equal(launched.generation, generation);
+  assert.throws(() => startRoutedCodex(args, () => {}, { generation,
+    onLaunch: () => { throw new Error('second launch'); } }), /already attempted/);
+  const settled = await launched.transport.settleEffects({ reason: 'stop',
+    deadlineAt: performance.now() + 5_000 });
+  assert.equal(settled.scope, 'original-posix-group');
+  await assert.rejects(turn);
 });
 
 test('D9 owenloop tool-call approvals are granted; every other elicitation is refused', async (t) => {
