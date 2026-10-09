@@ -1520,6 +1520,7 @@ test('routed command and agent launch requests verify one final input witness af
   for (const childKind of ['exec', 'agent-run'] as const) {
     const tuple = { id: 'adapter', harness: 'local', model: 'available', effort: 'low' as const };
     const routed = { ...routing, preference: { ...routing.preference,
+      rosterRevision: 'a'.repeat(64),
       tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
     const packet = { ...parentOrder().order, workflow: 'frame', worker: childKind === 'exec' ? 'command' : 'agent',
       routing: routed } as OrderPacket;
@@ -1530,7 +1531,8 @@ test('routed command and agent launch requests verify one final input witness af
       rosterRevision: routed.preference.rosterRevision, routingDigest: valueDigestHex(routed),
       preferenceExpiresAt: routed.preference.expiresAt };
     const pair = () => ({ reference: { protocol: 'trusted-routed-reference-read-v2' as const,
-      state: 'available' as const, workflow: 'wf', run: 'run', order: packet,
+      state: 'available' as const, workflow: 'wf', run: 'run',
+      order: { ...packet, owes: [{ path: 'out', version: 1 }] },
       inputs: [], lease: { claimed: true }, binding: pairBinding },
     claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
       workflow: 'wf', run: 'run', routing: routed, binding: pairBinding } });
@@ -1583,6 +1585,7 @@ test('routed launch refuses drift during selection before reserve mutation for c
     ['roster', 'order', 'session', 'input'] as const) {
     const tuple = { id: 'adapter', harness: 'local', model: 'available', effort: 'low' as const };
     const routed = { ...routing, preference: { ...routing.preference,
+      rosterRevision: 'a'.repeat(64),
       tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
     const packet = { ...parentOrder().order, workflow: 'frame',
       worker: childKind === 'exec' ? 'command' : 'agent', routing: routed } as OrderPacket;
@@ -1613,7 +1616,8 @@ test('routed launch refuses drift during selection before reserve mutation for c
 	    rosterRevision: routed.preference.rosterRevision,
 	    routingDigest: valueDigestHex(routed), preferenceExpiresAt: routed.preference.expiresAt };
 	  return { reference: { protocol: 'trusted-routed-reference-read-v2' as const,
-	    state: 'available' as const, workflow: 'wf', run: 'run', order: packet,
+	    state: 'available' as const, workflow: 'wf', run: 'run',
+	    order: { ...packet, owes: [{ path: 'out', version: 1 }] },
 	    inputs: [], lease: { claimed: true }, binding: { ...pairBinding,
 	      ...(malformedInput ? { orderDigest: 'd'.repeat(64) } : {}) } },
 	  claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
