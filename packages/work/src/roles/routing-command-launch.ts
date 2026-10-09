@@ -17,6 +17,8 @@ export function createRoutedCommandPrestart(args: {
   privateBase?: string;
   /** Scoped prestart witness; never substitute an ordinary bearer reader. */
   inputAdmission?: { observe(order: OrderPacket): Promise<RoutedInputAdmission> };
+  /** Local effects only after the accepted unknown launch report. */
+  beforeFinalCheck?: (order: OrderPacket, signal?: AbortSignal) => Promise<void> | void;
   prepareFiles?: (order: OrderPacket, signal?: AbortSignal) => Promise<{ envValue: string; cleanup(): Promise<void> }>;
 }): (order: OrderPacket, signal?: AbortSignal) => Promise<{ consumedFilePathsJson: string; cleanup(): Promise<void> } | void> {
   let used = false;
@@ -49,6 +51,7 @@ export function createRoutedCommandPrestart(args: {
     };
     const prepare = args.prepareFiles ?? (args.privateBase === undefined ? undefined
       : (current: OrderPacket, active?: AbortSignal) => materializeRoutedCommandFiles({ order: current,
+	rootWorkflow: args.workflow,
 	holder: args.holder, child: args.child, privateBase: args.privateBase!, signal: active }));
     if (!prepare) throw refused();
     const prepared = await prepare(order, signal);
@@ -76,6 +79,11 @@ export function createRoutedCommandPrestart(args: {
       || !Number.isSafeInteger(accepted.recordedAt) || now() >= reservation.expiresAt)
       throw refused();
       await checkInput(order);
+      if (args.beforeFinalCheck) {
+	await args.beforeFinalCheck(order, signal);
+	if (signal?.aborted || now() >= reservation.expiresAt) throw refused();
+	await checkInput(order);
+      }
       // Every asynchronous boundary can move claim/session/roster authority.
       // The broker itself revalidates parent signed source on this final GET.
       const final = await args.child.getLaunchOrder({ workflow: args.workflow, run: args.run,

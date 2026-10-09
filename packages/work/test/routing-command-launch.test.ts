@@ -45,15 +45,33 @@ test('command launch awaits empty-tuple reserve, exact unknown report, and final
       lease: { claimed: true }, order }; },
   } as unknown as RoutingChildClient;
   const prestart = createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run', now: () => 2_000,
+    beforeFinalCheck: () => { calls.push('workdir'); },
     prepareFiles: async () => { calls.push('files'); return { envValue: '[]',
       cleanup: async () => { calls.push('cleanup'); } }; } });
   const prepared = await prestart(order);
-  assert.deepEqual(calls, ['claim', 'files', 'reserve', 'report', 'order']);
+  assert.deepEqual(calls, ['claim', 'files', 'reserve', 'report', 'workdir', 'order']);
   assert.deepEqual(sent?.observation, { state: 'unknown' });
   assert.equal(prepared?.consumedFilePathsJson, '[]');
   await prepared?.cleanup();
   await assert.rejects(prestart(order), /routed command launch refused/);
-  assert.deepEqual(calls, ['claim', 'files', 'reserve', 'report', 'order', 'cleanup']);
+  assert.deepEqual(calls, ['claim', 'files', 'reserve', 'report', 'workdir', 'order', 'cleanup']);
+});
+
+test('post-report local workdir refusal prevents final order and physical start', async () => {
+  const calls: string[] = [];
+  const child = {
+    readRoutingClaim: async () => { calls.push('claim'); return { routing, freshness: 'fresh-at-read', atomicLaunch: false }; },
+    reserveLaunch: async () => { calls.push('reserve'); return { reservationId: 'lr-one', orderId: 'run', expiresAt: 50_000 }; },
+    reportLaunch: async ({ report }: { report: LaunchReportV1 }) => { calls.push('report'); return {
+      orderId: 'run', digest: valueDigestHex(report), recordedAt: 2_000,
+      provenance: 'authenticated-worker-report' as const }; },
+    getLaunchOrder: async () => { calls.push('order'); throw new Error('must not read'); },
+  } as unknown as RoutingChildClient;
+  await assert.rejects(createRoutedCommandPrestart({ child, holder, workflow: 'wf', frameId: 'frame', run: 'run',
+    now: () => 2_000, beforeFinalCheck: () => { calls.push('workdir'); throw new Error('unsafe workdir'); },
+    prepareFiles: async () => { calls.push('files'); return { envValue: '[]',
+      cleanup: async () => { calls.push('cleanup'); } }; } })(order), /unsafe workdir/);
+  assert.deepEqual(calls, ['claim', 'files', 'reserve', 'report', 'workdir', 'cleanup']);
 });
 
 test('command launch refuses a malformed report before any final-order read', async () => {

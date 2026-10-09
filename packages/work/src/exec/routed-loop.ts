@@ -1,7 +1,7 @@
 /**
- * Fenced routed command composition. This is an injectable parent-controller
- * seam, not a role enablement: the real protected fleet controller and narrow
- * parent postrun authority do not exist yet. No child-supplied proof is accepted.
+ * Fenced routed command composition. The parent broker freezes role/holder
+ * effects and owns every postrun Hub consequence. Original-group settlement
+ * is local evidence only; native reoffer keeps its ordinary at-least-once rule.
  */
 import { performance } from 'node:perf_hooks';
 
@@ -10,7 +10,7 @@ import type { HubClient } from '../hub/client.ts';
 import type { OrderPacket } from '../hub/types.ts';
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import { routedWorkerEnv } from '../roles/routing-role-env.ts';
-import type { CommandResult, RoutedCommandRunner, RoutedRunningCommand } from './runner.ts';
+import type { CommandResult, GroupSettlement, RoutedCommandRunner, RoutedRunningCommand } from './runner.ts';
 import { readPayloadFile, resolvePayload, type ParsedPayload } from './payload.ts';
 import { buildReceipt, type CommandReceipt } from './receipt.ts';
 import { deliverConsumes, deliverFeedback, deliverPayloadFile, removeConsumesDir,
@@ -28,7 +28,7 @@ export interface RoutedPostrunResult {
  * implementation must reobserve after signing and retry sleeps, before every
  * submit/ask/reject/collection write, and reconcile a lost ACK using only the
  * exact already-dispatched request. The production role remains fenced until
- * that implementation and native reoffer fence exist.
+ * that implementation has joined wire and process proof.
  */
 export interface RoutedExecutionController {
   /** Exact signed child frame from the parent grant; HTTP/lease uses root. */
@@ -41,26 +41,18 @@ export interface RoutedExecutionController {
   } | void>;
   /** Synchronous parent freeze begins on invocation, before the first await. */
   quiesce(ctx: { signal: AbortSignal; deadlineAt: number }): Promise<{ quiescing: true; effects: 'settled' | 'uncertain' }>;
-  /**
-   * Begin parent custody synchronously when called, even if quiesce ACK is
-   * delayed. Resolve sealed only after broker effects drain and the protected
-   * external-effect generation closes. Original PGID alone is insufficient.
-   */
-  closeEffects(order: OrderPacket, ctx: { signal: AbortSignal; deadlineAt: number }): Promise<{ state: 'sealed' | 'uncertain' }>;
-  /** Fresh exact original-session/recorded-occurrence/input witness. */
-  recordedWitness(order: OrderPacket, ctx: { signal: AbortSignal; deadlineAt: number }): Promise<void>;
-  /** Narrow parent-owned postrun epoch; never ordinary broad HubClient effects. */
+  /** Parent-owned scoped consequence after broker freeze and local group result. */
   postrun(input: { order: OrderPacket; command: string; result: CommandResult;
-    payload: ParsedPayload; receipt: CommandReceipt },
+    payload: ParsedPayload; receipt: CommandReceipt; group: GroupSettlement },
     ctx: { signal: AbortSignal; deadlineAt: number }): Promise<RoutedPostrunResult>;
-  /** Internally checks current native claim and protected closure before release. */
+  /** Parent checks current native claim before any targeted release. */
   targetedRelease(order: OrderPacket, reason: string,
+    observation: { group: { scope: 'original-posix-group'; state: 'empty' } }
+      | { observation: 'not-started' },
     ctx: { signal: AbortSignal; deadlineAt: number }): Promise<'released' | 'already-closed' | 'uncertain'>;
-  /** Exact generation's stage, payload and cache readers are gone. */
-  readersClosed(order: OrderPacket, ctx: { signal: AbortSignal; deadlineAt: number }): Promise<boolean>;
   /** Monotonic group-settlement budget; defaults to 10 seconds. */
   groupSettleMs?: number;
-  /** One total bounded closure/consequence budget, from first freeze. */
+  /** One total bounded freeze/group/consequence budget, from first freeze. */
   lifecycleDeadlineMs?: number;
   /** One bounded prestart call; startup binding also has its own Service expiry. */
   prestartDeadlineMs?: number;
@@ -90,9 +82,8 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
   let closureDeadlineAt: number | undefined;
   let terminal: LeaseOutcome | undefined;
   let command: RoutedRunningCommand | undefined;
+  let settledGroup: GroupSettlement | undefined;
   let groupSettlePromise: Promise<Awaited<ReturnType<RoutedRunningCommand['settleEffects']>>> | undefined;
-  let closurePromise: Promise<{ state: 'sealed' | 'uncertain' }> | undefined;
-  let currentOrder: OrderPacket | undefined;
   let startAttempted = false;
   let postrunAttempted = false;
   let releaseAttempted = false;
@@ -167,19 +158,6 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
     }
     return groupSettlePromise;
   };
-  const startProtectedClosure = (order: OrderPacket) => {
-    if (!closurePromise) {
-      if (closureDeadlineAt === undefined || performance.now() >= closureDeadlineAt)
-	closurePromise = Promise.reject(new Error('protected closure deadline expired'));
-      else {
-	try { closurePromise = control.closeEffects(order, context(closureDeadlineAt)); }
-	catch (error) { closurePromise = Promise.reject(error); }
-      }
-      // This parent custody request continues even when the role's wait expires.
-      void closurePromise.catch(() => {});
-    }
-    return closurePromise;
-  };
   const active = () => !stopped && terminal === undefined && !abort.signal.aborted;
   const quarantine = async (reason: string): Promise<ExecOutcome> => {
     opts.err(`owenloop work exec: routed ${opts.workflow}/${opts.run} quarantined (${reason})`);
@@ -193,36 +171,43 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
     }
     return 'routed-quarantined';
   };
-  const settle = async (order: OrderPacket, reason: 'natural-exit' | 'stop') => {
+  const settle = async (reason: 'natural-exit' | 'stop'): Promise<GroupSettlement | undefined> => {
     freezeNow();
     const groupWork = startGroupSettlement(reason);
-    const closureWork = startProtectedClosure(order);
     const ack = await awaitBounded('parent quiesce', () => freezeNow(), closureDeadlineAt!);
     if (!ack.quiescing || ack.effects !== 'settled') throw new Error('parent effect freeze is uncertain');
     if (groupWork) {
       const group = await awaitBounded('original group settlement', () => groupWork, closureDeadlineAt!);
       if (group.scope !== 'original-posix-group' || group.state !== 'empty')
 	throw new Error('original process group is uncertain');
+      settledGroup = group;
+      return group;
     }
-    const closure = await awaitBounded('protected closure', () => closureWork, closureDeadlineAt!);
-    if (closure.state !== 'sealed') throw new Error('protected effect closure is uncertain');
+    return undefined;
   };
   const finish = async (order: OrderPacket, reason: string, cleanup: Array<() => Promise<void>>,
     closed: boolean, allowStopped = false): Promise<boolean> => {
     if (timedOut || (stopped && !allowStopped) ||
       (terminal !== undefined && !(closed && terminal === 'completed'))) return false;
     if (!closed) {
+      // The latch flips before runner.start. A synchronous throw after that
+      // point is ambiguous, so it cannot use the no-start assertion.
+      const observation = !startAttempted ? { observation: 'not-started' as const }
+	: settledGroup?.scope === 'original-posix-group' && settledGroup.state === 'empty'
+	  ? { group: { scope: 'original-posix-group' as const, state: 'empty' as const } }
+	  : undefined;
+      if (!observation) return false;
       releaseAttempted = true;
       const released = await awaitBounded('targeted release',
-	() => control.targetedRelease(order, reason,
+	() => control.targetedRelease(order, reason, observation,
 	  allowStopped ? releaseContext(closureDeadlineAt!) : consequenceContext(closureDeadlineAt!)),
 	closureDeadlineAt!);
       if (released === 'uncertain' || timedOut || (stopped && !allowStopped)) return false;
     }
-    if (!await awaitBounded('reader closure',
-      () => control.readersClosed(order, context(closureDeadlineAt!)), closureDeadlineAt!)
-      || timedOut || (stopped && !allowStopped)) return false;
-    // The parent controller has certified both native closure and reader death.
+    // The role has already completed and closed its synchronous payload read;
+    // cache downloads finished before start. The managed runner's original
+    // group was settled before finish. This is local custody, not a claim that
+    // arbitrary escaped descendants have stopped.
     for (const remove of cleanup)
       await awaitBounded('custody cleanup', remove, closureDeadlineAt!);
     lease.stop(reason, { release: false });
@@ -248,10 +233,8 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
     if (first.kind === 'lease') return first.outcome === 'completed' ? 'completed' : quarantine('no live first contact');
     const order = first.order;
     if (!order) return quarantine('missing command order');
-    currentOrder = order;
     const startupDeadlineAt = performance.now() + prestartDeadlineMs;
     const cleanup: Array<() => Promise<void>> = [];
-    let started = false;
     try {
       if (order.worker !== 'command' || !order.routing || !Array.isArray(order.owes)
 	|| order.owes.length === 0 || order.workflow !== control.frameId || order.run !== opts.run)
@@ -291,13 +274,10 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
       // The only physical start in this branch; never retry an ambiguous start.
       startAttempted = true;
       command = control.runner.start(resolved.command, { cwd: order.workdir ?? opts.cwd, env: childEnv });
-      started = true;
       const firstEnd = await Promise.race([
 	command.done.then((result) => { freezeNow(); startGroupSettlement('natural-exit');
-	  startProtectedClosure(order);
 	  return { kind: 'done' as const, result }; }),
 	leasePromise.then(() => { freezeNow(); startGroupSettlement('stop');
-	  startProtectedClosure(order);
 	  return { kind: 'terminal' as const }; }),
 	new Promise<{kind:'stop'}>((resolveStop) => {
 	  if (stopped) resolveStop({ kind:'stop' });
@@ -306,13 +286,14 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
       ]);
       // Freeze immediately on direct exit or stop before interpreting bytes.
       freezeNow();
-      await settle(order, firstEnd.kind === 'done' && active() ? 'natural-exit' : 'stop');
+      const group = await settle(firstEnd.kind === 'done' && active() ? 'natural-exit' : 'stop');
       if (firstEnd.kind !== 'done' || !active()) {
 	if (stopped && terminal === undefined && !timedOut
 	  && await finish(order, 'routed-stop', cleanup, false, true)) return 'killed';
 	return quarantine('stop or lease loss during command');
       }
       const result = firstEnd.result;
+      if (!group) throw new Error('original group settlement missing');
       if (result.exitCode === null || result.error !== undefined || result.signal !== undefined)
 	throw new Error('command output is incomplete');
       const parsed = resolvePayload({ payloadLine: result.payloadLine,
@@ -320,15 +301,12 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
       if (resolved.revalidateAfterRun && await awaitBounded('signed postrun revalidation',
 	resolved.revalidateAfterRun, closureDeadlineAt!))
 	throw new Error('signed command changed after run');
-      if (!active()) return quarantine('stopped before recorded witness');
-      await awaitBounded('recorded witness',
-	() => control.recordedWitness(order, consequenceContext(closureDeadlineAt!)), closureDeadlineAt!);
-      if (!active()) return quarantine('stopped after recorded witness');
+      if (!active()) return quarantine('stopped before parent postrun');
       const receipt = buildReceipt(result, { command: resolved.command,
 	orchestrator: opts.holder.id, workflow: opts.workflow, run: opts.run, step: order.step }, parsed);
       postrunAttempted = true;
       const post = await awaitBounded('parent postrun',
-	() => control.postrun({ order, command: resolved.command, result, payload: parsed, receipt },
+	() => control.postrun({ order, command: resolved.command, result, payload: parsed, receipt, group },
 	  consequenceContext(closureDeadlineAt!)), closureDeadlineAt!);
       if (stopped || post.claim === 'uncertain' ||
 	(terminal !== undefined && !(post.claim === 'closed' && terminal === 'completed')))
@@ -343,7 +321,7 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
 	return quarantine('ambiguous start, postrun or release');
       }
       try {
-	await settle(order, started ? 'stop' : 'stop');
+	await settle('stop');
 	if (terminal !== undefined) return quarantine('lease loss during refusal');
 	if (await finish(order, stopped ? 'routed-stop' : 'routed-refusal', cleanup,
 	  false, stopped)) return stopped ? 'killed' : 'unresolved-instructions';
@@ -362,7 +340,6 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
     consequenceAbort.abort();
     freezeNow();
     startGroupSettlement('stop');
-    if (currentOrder) startProtectedClosure(currentOrder);
     stopWaiter?.();
     // Heartbeat stays active until the bounded closure attempt completes.
     // A controller loss is quarantined; ordinary final-breath release is never used.

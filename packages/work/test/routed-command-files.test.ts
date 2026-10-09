@@ -32,21 +32,43 @@ function order(consumes: Record<string, unknown> = { 'seed.value': { nested: [po
     owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }] };
 }
 
-function client(packet: OrderPacket, options: { claimed?: boolean; stream?: (p: FileArtifactPointer) =>
+function client(packet: OrderPacket, options: { claimed?: boolean;
+  stream?: (p: FileArtifactPointer) =>
   ReturnType<RoutingChildClient['getFileArtifactStream']> } = {}) {
   const seen: Array<{ path: string; key: string }> = [];
+  const roots: string[] = [];
   const child: Pick<RoutingChildClient, 'getOrder' | 'getFileArtifactStream'> = {
-    getOrder: async () => ({ text: '', workflow: 'wf', run: 'run',
-      lease: { claimed: options.claimed ?? true }, order: structuredClone(packet) } satisfies GetOrderResponse),
+    getOrder: async req => { roots.push(req.workflow); return { text: '', workflow: packet.workflow, run: 'run',
+      lease: { claimed: options.claimed ?? true }, order: structuredClone(packet) } satisfies GetOrderResponse; },
     getFileArtifactStream: async req => {
+      roots.push(req.workflow);
       seen.push({ path: req.path, key: req.pointer.__file });
       if (options.stream) return options.stream(req.pointer);
       return { size: req.pointer.size, contentType: req.pointer.contentType,
 		chunks: Readable.from([bytes]), verified: Promise.resolve() };
     },
   };
-  return { child, seen };
+  return { child, seen, roots };
 }
+
+test('canonical root and exact child frame are bound separately during file preparation', async () => {
+  await withBase(async base => {
+    const submitted = { ...order(), workflow: 'routing/child' };
+    const { child, seen, roots } = client(submitted);
+    const prepared = await materializeRoutedCommandFiles({ order: submitted,
+      rootWorkflow: 'root', holder, child, privateBase: base });
+    try {
+      assert.deepEqual(roots, ['root', 'root']);
+      assert.equal(seen.length, 1);
+    } finally { await prepared.cleanup(); }
+    const wrong = client({ ...submitted, workflow: 'routing/sibling' });
+    await assert.rejects(materializeRoutedCommandFiles({ order: submitted,
+      rootWorkflow: 'root', holder, child: wrong.child, privateBase: base }),
+      /routed consumed files refused/);
+    assert.deepEqual(wrong.roots, ['root']);
+    assert.deepEqual(wrong.seen, []);
+  });
+});
 
 async function withBase(body: (base: string) => Promise<void>): Promise<void> {
   const base = mkdtempSync(join(tmpdir(), 'ol-command-files-'));
@@ -60,7 +82,7 @@ test('current nested pointer is fully staged before a command receives its path 
     const submitted = order();
     const original = JSON.stringify(submitted.consumes);
     const { child, seen } = client(submitted);
-    const result = await materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base });
+    const result = await materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base });
     try {
       const map = JSON.parse(result.envValue) as Array<{ artifactPath: string; pointerKey: string; file: string }>;
       assert.equal(map.length, 1);
@@ -80,7 +102,7 @@ test('a routed command with no present file pointer keeps an empty side map', as
   await withBase(async base => {
     const submitted = order({ 'seed.value': { text: 'ordinary JSON' } });
     const { child, seen } = client(submitted);
-    const result = await materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base });
+    const result = await materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base });
     assert.equal(result.envValue, '[]');
     assert.deepEqual(seen, []);
     assert.deepEqual(readdirSync(base), []);
@@ -92,7 +114,7 @@ test('an actual shell child reads a completed cache path from the env map', asyn
   await withBase(async base => {
     const submitted = order();
     const { child } = client(submitted);
-    const prepared = await materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base });
+    const prepared = await materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base });
     try {
       const runner = createDefaultRunner();
       const command = `node -e 'const fs = require("node:fs"); `
@@ -113,7 +135,7 @@ test('stale or released current order refuses before download and leaves no cach
     const changed = order({ 'seed.value': { nested: [{ ...pointer, hash: 'a'.repeat(64) }] } });
     for (const [current, claimed] of [[changed, true], [submitted, false]] as const) {
       const { child, seen } = client(current, { claimed });
-      await assert.rejects(materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base }),
+      await assert.rejects(materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base }),
 		/routed consumed files refused/);
       assert.deepEqual(seen, []);
       assert.deepEqual(readdirSync(base), []);
@@ -131,7 +153,7 @@ test('a later corrupt stream removes earlier complete files before refusing shel
       return { size: p.size, contentType: p.contentType, chunks: Readable.from([bytes]),
 		verified: count === 1 ? Promise.resolve() : Promise.reject(new Error('digest mismatch')) };
     } });
-    await assert.rejects(materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base }),
+    await assert.rejects(materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base }),
       /routed consumed files refused/);
     assert.equal(seen.length, 2);
     assert.deepEqual(readdirSync(base), []);
@@ -148,7 +170,7 @@ test('malformed, oversized or too many pointers refuse without contacting byte s
     ];
     for (const submitted of invalid) {
       const { child, seen } = client(submitted);
-      await assert.rejects(materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base }),
+      await assert.rejects(materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base }),
 		/routed consumed files refused/);
       assert.deepEqual(seen, []);
       assert.deepEqual(readdirSync(base), []);
@@ -160,12 +182,12 @@ test('scoped download refusal or cancellation leaves no publishable command path
   await withBase(async base => {
     const submitted = order();
     const { child } = client(submitted, { stream: async () => { throw new Error('scoped 403'); } });
-    await assert.rejects(materializeRoutedCommandFiles({ order: submitted, holder, child, privateBase: base }),
+    await assert.rejects(materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder, child, privateBase: base }),
       /routed consumed files refused/);
     assert.deepEqual(readdirSync(base), []);
     const stopped = new AbortController();
     stopped.abort();
-    await assert.rejects(materializeRoutedCommandFiles({ order: submitted, holder,
+    await assert.rejects(materializeRoutedCommandFiles({ order: submitted, rootWorkflow: submitted.workflow, holder,
       child, privateBase: base, signal: stopped.signal }), /routed consumed files refused/);
     assert.deepEqual(readdirSync(base), []);
   });

@@ -60,13 +60,15 @@ export function hasConsumedFilePointers(order: OrderPacket): boolean {
  * caller owns cleanup after the command exits or the lease terminates. */
 export async function materializeRoutedCommandFiles(args: {
   order: OrderPacket;
+  /** Parent-bound canonical root; the order may name a nested frame. */
+  rootWorkflow: string;
   holder: ContactHolder;
   child: Pick<RoutingChildClient, 'getOrder' | 'getFileArtifactStream'>;
   privateBase: string;
   signal?: AbortSignal;
 }): Promise<{ envValue: string; cleanup(): Promise<void> }> {
   if (args.signal?.aborted) throw refused();
-  const current = await args.child.getOrder({ workflow: args.order.workflow, run: args.order.run,
+  const current = await args.child.getOrder({ workflow: args.rootWorkflow, run: args.order.run,
     holder: args.holder });
   if (args.signal?.aborted || current.workflow !== args.order.workflow
     || current.run !== args.order.run || !current.lease.claimed
@@ -95,7 +97,7 @@ export async function materializeRoutedCommandFiles(args: {
     const entries: Array<{ artifactPath: string; pointerKey: string; file: string }> = [];
     for (const { artifactPath, pointerKey, pointer } of pointers) {
       if (args.signal?.aborted) throw refused();
-      const ready = await cache.materialize({ workflow: args.order.workflow,
+      const ready = await cache.materialize({ workflow: args.rootWorkflow,
 		run: args.order.run, path: artifactPath, pointer }, args.signal);
       entries.push({ artifactPath, pointerKey, file: ready.file });
     }

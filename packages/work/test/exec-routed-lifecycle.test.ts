@@ -33,6 +33,7 @@ function fixture(events: string[], overrides: Partial<RoutedExecutionController>
     async ask() { throw new Error('ordinary broad ask was called'); },
   } as unknown as HubClient;
   let starts = 0;
+  const releaseObservations: unknown[] = [];
   const control: RoutedExecutionController = {
     frameId,
     runner: { start(): RoutedRunningCommand {
@@ -44,12 +45,10 @@ function fixture(events: string[], overrides: Partial<RoutedExecutionController>
     } },
     async prestart() { events.push('prestart'); return { cleanup: async () => { events.push('cache-cleanup'); } }; },
     async quiesce() { events.push('freeze'); return { quiescing: true, effects: 'settled' }; },
-    async closeEffects() { events.push('fleet-sealed'); return { state: 'sealed' }; },
-    async recordedWitness() { events.push('recorded-witness'); },
     async postrun({ receipt }) { events.push('parent-postrun'); assert.equal(receipt.kind, 'command-receipt');
       return { outcome: 'submitted', claim: 'closed' }; },
-    async targetedRelease() { events.push('targeted-release'); return 'released'; },
-    async readersClosed() { events.push('readers-closed'); return true; },
+    async targetedRelease(_order, _reason, observation) { events.push('targeted-release');
+      releaseObservations.push(observation); return 'released'; },
     ...overrides,
   };
   const opts: ExecLoopOptions = {
@@ -63,18 +62,18 @@ function fixture(events: string[], overrides: Partial<RoutedExecutionController>
     env: { PATH: process.env.PATH, HOME: '/private/original-home' },
     cwd: tmpdir(), sleep: sleepForever, now: Date.now, out: () => {}, err: () => {},
   };
-  return { opts, control, starts: () => starts };
+  return { opts, control, starts: () => starts, releaseObservations };
 }
 
-test('fenced routed success uses one prestart/start and parent postrun only after freeze and both closures', async () => {
+test('fenced routed success uses one prestart/start and parent postrun only after freeze and original-group settlement', async () => {
   const events: string[] = [];
   const { opts, starts } = fixture(events);
   assert.equal(await createExecLoop(opts).run(), 'submitted', JSON.stringify(events));
   assert.equal(starts(), 1);
   assert.equal(events.filter((event) => event === 'prestart').length, 1);
   assert.deepEqual(events.filter((event) => event !== 'get-order' && event !== 'signed-resolve'), [
-    'prestart', 'physical-start', 'freeze', 'group-empty', 'fleet-sealed',
-    'recorded-witness', 'parent-postrun', 'readers-closed', 'cache-cleanup',
+    'prestart', 'physical-start', 'freeze', 'group-empty',
+    'parent-postrun', 'cache-cleanup',
   ]);
 });
 
@@ -108,11 +107,12 @@ test('invalid or unbounded controller budgets refuse before first contact', () =
 
 test('prestart ambiguity yields zero starts and no broad consequence', async () => {
   const events: string[] = [];
-  const { opts, starts } = fixture(events, { async prestart() {
+  const { opts, starts, releaseObservations } = fixture(events, { async prestart() {
     events.push('prestart'); throw new Error('lost report ACK'); } });
   assert.equal(await createExecLoop(opts).run(), 'unresolved-instructions');
   assert.equal(starts(), 0);
-  assert.deepEqual(events.slice(-4), ['freeze', 'fleet-sealed', 'targeted-release', 'readers-closed']);
+  assert.deepEqual(releaseObservations, [{ observation: 'not-started' }]);
+  assert.deepEqual(events.slice(-2), ['freeze', 'targeted-release']);
 });
 
 test('stalled original-session first contact is bounded without ordinary release', async () => {
@@ -133,7 +133,7 @@ test('operator stop during one-use prestart never starts a shell or postrun', as
   let finish!: () => void;
   const waiting = new Promise<void>((resolve) => { entered = resolve; });
   const pending = new Promise<void>((resolve) => { finish = resolve; });
-  const { opts, starts } = fixture(events, { prestart: async () => {
+  const { opts, starts, releaseObservations } = fixture(events, { prestart: async () => {
     events.push('prestart'); entered(); await pending;
     return { cleanup: async () => { events.push('cache-cleanup'); } };
   } });
@@ -144,6 +144,7 @@ test('operator stop during one-use prestart never starts a shell or postrun', as
   finish();
   assert.equal(await running, 'killed');
   assert.equal(starts(), 0);
+  assert.deepEqual(releaseObservations, [{ observation: 'not-started' }]);
   assert.ok(!events.includes('parent-postrun'));
   assert.ok(events.includes('targeted-release'));
   assert.ok(events.includes('cache-cleanup'));
@@ -221,31 +222,32 @@ test('incomplete direct output never enters parent postrun', async () => {
   assert.ok(events.includes('targeted-release'));
 });
 
-test('clean stop during protected closure reaches release and cleanup but no postrun', async () => {
+test('clean stop during broker quiesce reaches release and cleanup but no postrun', async () => {
   const events: string[] = [];
   let enter!: () => void;
   let finish!: () => void;
   const entered = new Promise<void>((resolve) => { enter = resolve; });
-  const closing = new Promise<{state:'sealed'}>((resolve) => { finish = () => resolve({ state:'sealed' }); });
-  const { opts } = fixture(events, { closeEffects: async () => {
-    events.push('fleet-pending'); enter(); return closing; } });
+  const closing = new Promise<{quiescing:true;effects:'settled'}>((resolve) => {
+    finish = () => resolve({ quiescing:true, effects:'settled' }); });
+  const { opts } = fixture(events, { quiesce: async () => {
+    events.push('freeze-pending'); enter(); return closing; } });
   const loop = createExecLoop(opts);
   const running = loop.run();
   await entered;
   loop.stop('test stop');
   finish();
   assert.equal(await running, 'killed');
-  assert.equal(events.filter((event) => event === 'freeze').length, 1);
+  assert.equal(events.filter((event) => event === 'freeze-pending').length, 1);
   assert.ok(!events.includes('parent-postrun'));
-  assert.ok(events.indexOf('fleet-pending') < events.indexOf('targeted-release'));
-  assert.ok(events.indexOf('targeted-release') < events.indexOf('readers-closed'));
-  assert.ok(events.indexOf('readers-closed') < events.indexOf('cache-cleanup'));
+  assert.ok(events.indexOf('freeze-pending') < events.indexOf('targeted-release'));
+  assert.ok(events.indexOf('targeted-release') < events.indexOf('cache-cleanup'));
 });
 
 test('uncertain stop preserves bytes and refuses release', async () => {
   const events: string[] = [];
   const { opts, control } = fixture(events);
-  control.closeEffects = async () => { events.push('fleet-uncertain'); return { state: 'uncertain' }; };
+  control.quiesce = async () => { events.push('freeze-uncertain');
+    return { quiescing: true, effects: 'uncertain' }; };
   let entered!: () => void;
   const beforeDone = new Promise<void>((resolve) => { entered = resolve; });
   control.runner = { start() { events.push('physical-start'); entered(); return {
@@ -310,14 +312,15 @@ test('stalled heartbeat RPC becomes terminal under monotonic failure window', as
   assert.ok(!events.includes('cache-cleanup'));
 });
 
-test('stalled parent closure times out and late completion cannot release or delete', async () => {
+test('stalled parent quiesce times out and late completion cannot release or delete', async () => {
   const events: string[] = [];
   let finish!: () => void;
   let custodySignal: AbortSignal | undefined;
-  const held = new Promise<{state:'sealed'}>((resolve) => { finish = () => resolve({ state:'sealed' }); });
-  const { opts } = fixture(events, { lifecycleDeadlineMs: 25, closeEffects: async (_order, ctx) => {
+  const held = new Promise<{quiescing:true;effects:'settled'}>((resolve) => {
+    finish = () => resolve({ quiescing:true, effects:'settled' }); });
+  const { opts } = fixture(events, { lifecycleDeadlineMs: 25, quiesce: async (ctx) => {
     custodySignal = ctx.signal;
-    events.push('fleet-pending'); return held; } });
+    events.push('freeze-pending'); return held; } });
   assert.equal(await createExecLoop(opts).run(), 'routed-quarantined');
   finish();
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -327,15 +330,13 @@ test('stalled parent closure times out and late completion cannot release or del
   assert.ok(!events.includes('cache-cleanup'));
 });
 
-test('lost quiesce ACK still starts retained group and parent closure custody', async () => {
+test('lost quiesce ACK still starts retained group settlement', async () => {
   const events: string[] = [];
   const { opts } = fixture(events, { lifecycleDeadlineMs: 25,
     quiesce: async () => { events.push('freeze-pending'); return new Promise(() => {}); },
-    closeEffects: async () => { events.push('fleet-custody-started'); return { state: 'sealed' }; },
   });
   assert.equal(await createExecLoop(opts).run(), 'routed-quarantined');
   assert.ok(events.indexOf('group-empty') > events.indexOf('freeze-pending'));
-  assert.ok(events.includes('fleet-custody-started'));
   assert.ok(!events.includes('parent-postrun'));
   assert.ok(!events.includes('targeted-release'));
   assert.ok(!events.includes('cache-cleanup'));
@@ -387,7 +388,6 @@ test('timed-out targeted release keeps bytes even if release resolves later', as
   assert.equal(await createExecLoop(opts).run(), 'routed-quarantined');
   finish();
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.ok(!events.includes('readers-closed'));
   assert.ok(!events.includes('cache-cleanup'));
 });
 
@@ -399,7 +399,7 @@ test('stop aborts a not-yet-dispatched normal targeted release', async () => {
   const pending = new Promise<void>((resolve) => { finish = resolve; });
   const { opts } = fixture(events, {
     postrun: async () => ({ outcome: 'command-failed', claim: 'held' }),
-    targetedRelease: async (_order, _reason, ctx) => {
+    targetedRelease: async (_order, _reason, _group, ctx) => {
       events.push('release-preflight'); entered(); await pending;
       if (ctx.signal.aborted) return 'uncertain';
       events.push('native-release-write'); return 'released';
@@ -423,7 +423,7 @@ test('clean-stop release timeout aborts later write while parent custody persist
   let releaseSignal: AbortSignal | undefined;
   const held = new Promise<void>((resolve) => { finish = resolve; });
   const { opts, control } = fixture(events, { lifecycleDeadlineMs: 25,
-    targetedRelease: async (_order, _reason, ctx) => {
+    targetedRelease: async (_order, _reason, _group, ctx) => {
       releaseSignal = ctx.signal; events.push('clean-stop-release-pending');
       await held;
       if (ctx.signal.aborted) return 'uncertain';
@@ -448,12 +448,13 @@ test('clean-stop release timeout aborts later write while parent custody persist
 
 test('expired lifecycle before postrun invokes no parent consequence callback', async () => {
   const events: string[] = [];
-  const { opts } = fixture(events, { lifecycleDeadlineMs: 5,
-    recordedWitness: async () => { events.push('witness-pending');
-      await new Promise<void>((resolve) => setTimeout(resolve, 15)); },
-  });
+  const { opts } = fixture(events, { lifecycleDeadlineMs: 5 });
+  opts.instructions = { async resolveCommand() { return { ok: true, command: 'printf hello',
+    revalidateAfterRun: async () => { events.push('postrun-revalidate-pending');
+      await new Promise<void>((resolve) => setTimeout(resolve, 15)); return undefined; } }; },
+    async resolveStep() { throw new Error('unused'); } };
   assert.equal(await createExecLoop(opts).run(), 'routed-quarantined');
-  assert.ok(events.includes('witness-pending'));
+  assert.ok(events.includes('postrun-revalidate-pending'));
   assert.ok(!events.includes('parent-postrun'));
   assert.ok(!events.includes('targeted-release'));
 });
@@ -489,6 +490,6 @@ test('real managed runner writes the permitted cwd before parent receipt; origin
     };
     assert.equal(await createExecLoop(opts).run(), 'submitted');
     assert.equal(readFileSync(join(cwd, 'write.txt'), 'utf8'), 'live');
-    assert.ok(events.indexOf('fleet-sealed') < events.indexOf('parent-postrun'));
+    assert.ok(events.indexOf('group-empty') < events.indexOf('parent-postrun'));
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
