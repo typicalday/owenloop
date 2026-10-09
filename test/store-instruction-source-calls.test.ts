@@ -296,12 +296,15 @@ test('installer stores an unresolved Hub live slash but ordinary execution stays
   const lockedRoot = tempDir('owenloop-concrete-locked-install-');
   const lockedSource = qualifyFixtureMember(writeBundleSource({
     name: 'hub-locked', workflow: `name: hub-locked\ninputs: []\nsteps:\n  - name: command\n    consumes: []\n    produces: [out]\n    terminal: true\n    executor: command\n    command: echo carrier\noutputs: [out]\n`,
-    workflows: { parent: authored('routing/parent') },
-    defaultWorkflow: 'routing/parent', lock: { 'routing/missing': 'f'.repeat(64) },
+    workflows: { parent: authored('routing/parent')
+      .replace('calls: routing/missing', 'calls: routing/missing@1.0.0') },
+    defaultWorkflow: 'routing/parent', lock: { 'routing/missing@1.0.0': 'f'.repeat(64) },
   }), 'parent', 'routing/parent');
-  await assert.rejects(installBundleFixture({ root: lockedRoot, sourceDir: lockedSource,
-    deferHubLiveCallsAtStorage: true }),
-  /cross-definition validation failed|calls names workflow/);
+  const locked = await installBundleFixture({ root: lockedRoot, sourceDir: lockedSource,
+    deferHubLiveCallsAtStorage: true });
+  await assert.rejects(sourceAt(lockedRoot).prime(locked.result.digest),
+    (error: unknown) => error instanceof StoreIntegrityError
+      && error.code === 'dependency-missing' && error.digest === 'f'.repeat(64));
 });
 
 test('integrity-only selected member recovery never creates executable cache', async () => {
