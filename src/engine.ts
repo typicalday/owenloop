@@ -498,11 +498,20 @@ export class ModifierRefusalError extends Error {
  * exact digest-scoped alias, while the engine independently verifies the
  * returned definition's digest before accepting or spawning it.
  */
+/** Native, parent-owned coordinates of one unmaterialized concrete calls edge. */
+export interface ConcreteCallOccurrence {
+  readonly parentWorkflowId: string;
+  readonly parentStepName: string;
+  readonly parentPath: string;
+}
+
 export type DefResolver = (
   defName: string,
   from?: WorkflowDef,
   /** Exact CAS bundle digest requested by a persisted interface binding. */
   bundleDigest?: string,
+  /** Present only when provisioning a concrete calls child, never for a caller-supplied lookup. */
+  occurrence?: ConcreteCallOccurrence,
 ) => WorkflowDef;
 
 /**
@@ -1026,6 +1035,16 @@ export class Engine {
     gateStems: string[],
     now?: number,
   ): { childId: string; created: boolean; provided: string[] } | null {
+    // Capture the parent selected by this native occurrence before consulting a
+    // host resolver. The write transaction compares its signed snapshot again;
+    // a host may select a live child outside SQLite, but cannot change the
+    // authored parent edge between selection and insertion.
+    const parentAtSelection = this.store.getWorkflow(parentWf);
+    if (parentAtSelection === undefined) return null;
+    const selectedParentSnapshot = parentAtSelection.defSnapshot;
+    if (step.calls !== undefined && selectedParentSnapshot !== undefined
+      && (parentAtSelection.def !== parentDef.name
+	|| !deepEqual(selectedParentSnapshot, parentDef))) return null;
     // B2: the gate fingerprint of the exact in-tx snapshot the seed/re-provide
     // validation ran against. Captured fresh inside `run()` so a retry re-reads
     // it; carried out on a `SchemaRefusalError` so `recordCallsSchemaReject` can
@@ -1112,6 +1131,16 @@ export class Engine {
         // there is no resolver/catalog/filesystem access inside this boundary.
         const parentRow = this.store.getWorkflow(parentWf);
         if (parentRow === undefined) throw new Error(`no such workflow instance: ${parentWf}`);
+	if (step.calls !== undefined) {
+	  if (parentRow.def !== parentAtSelection.def
+	    || !deepEqual(parentRow.defSnapshot, selectedParentSnapshot)) return null;
+	  if (selectedParentSnapshot !== undefined) {
+	    const freshStep = parentRow.defSnapshot?.steps.find(candidate => candidate.name === step.name);
+	    if (parentRow.def !== parentDef.name || !freshStep || !deepEqual(freshStep, step)
+	      || freshStep.calls !== step.calls
+	      || freshStep.produces[0]?.stem !== callsStem) return null;
+	  }
+	}
         let target: string;
         if (step.callsInterface !== undefined) {
           const freshBinding = invocation ? asLegacy(invocation) : parentRow.interfaceBindings?.find((candidate) =>
@@ -1285,7 +1314,11 @@ export class Engine {
 		  throw new CallsPinError(step.calls!, `the persisted base-coordinate lock differs from the verified parent bundle for ${namedExactLockKey}`);
 		}
       }
-      snapshotDef = this.resolveDef(step.calls!, parentDef);
+      snapshotDef = this.resolveDef(step.calls!, parentDef, undefined, {
+	parentWorkflowId: parentWf,
+	parentStepName: step.name,
+	parentPath: callsStem,
+      });
       result = transact();
       if (result === needsSnapshot) throw new Error('internal error: guarded child provision requested no snapshot');
       return result;

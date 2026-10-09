@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Engine, InterfaceBindingRefusalError, SchemaRefusalError } from '../src/engine.ts';
+import { Engine, InterfaceBindingRefusalError, SchemaRefusalError, type ConcreteCallOccurrence } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { ArtifactData, InterfaceCallBinding, StepDef, WorkflowDef, WorkflowInterfaceSignature } from '../src/types.ts';
@@ -146,6 +146,58 @@ function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
 function getArt(store: Store, wf: string, path: string): ArtifactData | undefined {
   return store.getArtifact(wf, path);
 }
+
+test('concrete calls resolver receives only native parent coordinates and refuses a changed signed edge before child insert', () => {
+  const definitions = new Map([parentFailDef, failingChildDef].map(definition => [definition.name, definition]));
+  const selected: ConcreteCallOccurrence[] = [];
+  const positiveStore = openStore(':memory:');
+  try {
+    const engine = new Engine(positiveStore, (name, _from, _digest, occurrence) => {
+      if (occurrence) selected.push(occurrence);
+      const definition = definitions.get(name);
+      if (!definition) throw new Error(`no def: ${name}`);
+      return definition;
+    });
+    const parent = engine.createInstance(parentFailDef.name);
+    engine.tick(parent, { deep: false });
+    assert.deepEqual(selected, [{ parentWorkflowId: parent, parentStepName: 'deliver', parentPath: 'delivered' }]);
+    assert.ok(positiveStore.findChildByParent(parent, 'delivered'));
+  } finally {
+    positiveStore.close();
+  }
+
+  for (const [label, move] of [
+    ['target', (snapshot: WorkflowDef) => { snapshot.steps[0]!.calls = 'otherChild'; }],
+    ['path', (snapshot: WorkflowDef) => { snapshot.steps[0]!.produces[0]!.stem = 'otherPath'; }],
+    ['step', (snapshot: WorkflowDef) => { snapshot.steps[0]!.name = 'otherStep'; }],
+    ['other signed field', (snapshot: WorkflowDef) => { snapshot.outputs = ['otherOutput']; }],
+  ] as const) {
+    const store = openStore(':memory:');
+    try {
+      let moved = false;
+      const engine = new Engine(store, (name, _from, _digest, occurrence) => {
+	if (occurrence && !moved) {
+	  moved = true;
+	  const row = store.getWorkflow(occurrence.parentWorkflowId)!;
+	  const snapshot = structuredClone(row.defSnapshot!);
+	  move(snapshot);
+	  store.db.prepare('UPDATE workflow SET def_snapshot = ? WHERE id = ?')
+	    .run(JSON.stringify(snapshot), occurrence.parentWorkflowId);
+	}
+	const definition = definitions.get(name);
+	if (!definition) throw new Error(`no def: ${name}`);
+	return definition;
+      });
+      const parent = engine.createInstance(parentFailDef.name);
+      engine.tick(parent, { deep: false });
+      assert.equal(moved, true, `${label}: resolver was not reached`);
+      assert.equal(store.findChildByParent(parent, 'delivered'), undefined,
+	`${label}: stale authored parent minted a child`);
+    } finally {
+      store.close();
+    }
+  }
+});
 
 // ---- callsInterface: immutable start-time binding ---------------------------
 
