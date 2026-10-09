@@ -16,6 +16,7 @@ import { createRoutedCommandPrestart } from './routing-command-launch.ts';
 import { assertRoutedAgentWorkdirDisjoint, planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
 import { createRoutingRoleClient } from './routing-role-client.ts';
 import { openRoutingRoleStage } from './routing-role-stage.ts';
+import { routedProducerVerifier } from './routing-producer-verifier.ts';
 
 const refused = (): Error => new Error('routed command role refused');
 
@@ -62,15 +63,7 @@ export async function prepareRoutedCommandRunner(args: {
     originalEnv: args.originalEnv, publicEnv, err: args.err });
   const strictConsumed = createConsumedVerifier({ env: publicEnv,
     now: Date.now, artifactPolicy: 'enforce' });
-  const consumedVerifier: ConsumedVerifier = async (order, opts) => {
-    try {
-      const hosted = await stage.instructions.resolveHostedStep?.(order);
-      if (!hosted?.ok) throw refused();
-      const checked = await strictConsumed(order, { ...opts,
-	hardRule: true, callsProducers: hosted.callsProducers });
-      return checked.ok ? checked : { ok: false, reason: 'routed consumed proof refused' };
-    } catch { return { ok: false, reason: 'routed consumed proof refused' }; }
-  };
+  const consumedVerifier: ConsumedVerifier = routedProducerVerifier(strictConsumed);
   const observedInput = createTrustedRoutedInputV2Admission({
     reader: createBrokerRoutedReferenceV2Reader(child, { workflow: root, run },
       () => performance.now()),

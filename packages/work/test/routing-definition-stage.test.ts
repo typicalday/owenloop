@@ -10,6 +10,7 @@ import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
 import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import { openRoutingRoleStage } from '../src/roles/routing-role-stage.ts';
+import { routedProducerVerifier } from '../src/roles/routing-producer-verifier.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import { HubError, type GetOrderResponse, type WorkOrder } from '../src/hub/types.ts';
 import { packBundle } from '../../../src/bundle/index.ts';
@@ -230,6 +231,67 @@ test('signed routed command definition admits human seed only through the curren
     }
   } finally { stage.cleanup(); }
 });
+
+for (const worker of ['command', 'agent'] as const) {
+  test(`routed ${worker} v2 admits a human-consumed dotted cwd before producer filtering`, async () => {
+    const source = 'name: recovered\ninputs:\n  - name: seed\n    seedOwed: true\n' +
+      'steps:\n  - name: build\n    consumes: [seed]\n    produces: [out]\n' +
+      '    terminal: true\n    workdirFrom: seed.payload.path\n' +
+      (worker === 'command' ? '    executor: command\n    command: echo routed\n'
+	: '    body: "Continue routed work"\n');
+    const f = await fixture(source);
+    const binding = { runId: 'wf_root', frameId: 'wf_child',
+      def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'recovered' } };
+    const routing = { claim: { claimId: 'run', orderId: 'run', decisionId: 'decision',
+      sessionId: 'rs_12345678-1234-1234-1234-123456789abc', shiftId: 'shf_service',
+      attemptId: 'attempt', binding }, decision: { decisionId: 'decision', binding },
+      preference: { rosterRevision: 'a'.repeat(64), expiresAt: Date.now() + 60_000 },
+    } as unknown as ReferenceRouting;
+    const native = { ...f.args.order, workflow: 'wf_child', step: 'build', worker, routing };
+    const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root', order: native });
+    try {
+      const seed = { payload: { path: f.args.workRoot } };
+      const packet: OrderPacket = { workflow: 'wf_child', run: 'run', step: 'build', key: '',
+	defDigest: f.packed.digest, worker, workdir: f.args.workRoot,
+	inputs: ['seed'], outputs: ['out'], consumes: { seed }, consumedFingerprint: { seed: 1 },
+	owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }], routing };
+      const opened = openRoutingRoleStage({ definitionStage: { path: stage.path, digest: stage.digest },
+	reservation: { workflow: 'wf_root', run: 'run' } } as RoutingHandoffV1);
+      const full = await opened.instructions.resolveHostedStep!(packet);
+      assert.equal(full.ok, true, JSON.stringify(full));
+      const filtered = { ...packet, consumes: {}, consumedFingerprint: {} };
+      const oldReresolution = await opened.instructions.resolveHostedStep!(filtered);
+      assert.equal(oldReresolution.ok, false, 'old wrapper re-resolves a producer-only packet');
+      const referenceBinding = { rootWorkflow: 'wf_root', frameWorkflow: 'wf_child', run: 'run',
+	claimId: 'run', decisionId: 'decision', sessionId: routing.claim.sessionId,
+	shiftId: routing.claim.shiftId, orderDigest: 'b'.repeat(64),
+	authorityRevision: 'c'.repeat(64), rosterRevision: routing.preference.rosterRevision,
+	routingDigest: valueDigestHex(routing), preferenceExpiresAt: routing.preference.expiresAt };
+      const pair: { reference: RoutedReferenceV2; claim: RoutedClaimV2 } = {
+	reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
+	  workflow: 'wf_root', run: 'run', order: { ...packet,
+	    owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
+	  inputs: [{ path: 'seed', version: 1, present: true, value: seed }],
+	  lease: { claimed: true }, binding: referenceBinding },
+	claim: { protocol: 'routing-claim-read-v2', state: 'available',
+	  workflow: 'wf_root', run: 'run', routing, binding: referenceBinding },
+      };
+      const consumed = routedProducerVerifier(createConsumedVerifier({
+	env: opened.publicEnv, now: Date.now, artifactPolicy: 'enforce' }));
+      const admitted = await bindTrustedRoutedInputV2({ phase: 'prestart', pair,
+	privateOrder: packet, instructions: opened.instructions, consumedVerifier: consumed,
+	expected: { workflow: 'wf_root', run: 'run' } });
+      assert.equal(admitted.ok, true, JSON.stringify(admitted));
+      const moved = structuredClone(pair);
+      if (moved.reference.state !== 'available') assert.fail('missing reference');
+      moved.reference.inputs[0]!.value = { payload: { path: f.args.stateDir } };
+      const refused = await bindTrustedRoutedInputV2({ phase: 'prestart', pair: moved,
+	privateOrder: packet, instructions: opened.instructions, consumedVerifier: consumed,
+	expected: { workflow: 'wf_root', run: 'run' } });
+      assert.equal(refused.ok, false);
+    } finally { stage.cleanup(); }
+  });
+}
 
 test('mixed authored namespace origin rule applies at staging and fresh verifyOrder', async () => {
   const f = await fixture(workflow, mixedNamespaceSource());

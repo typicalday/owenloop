@@ -21,6 +21,7 @@ import { createRoutingHolderHandoff } from './routing-holder-handoff.ts';
 import { createRoutingRoleClient } from './routing-role-client.ts';
 import { openRoutingRoleStage } from './routing-role-stage.ts';
 import { routedWorkerEnv } from './routing-role-env.ts';
+import { routedProducerVerifier } from './routing-producer-verifier.ts';
 
 const refused = (): Error => new Error('routed agent role refused');
 
@@ -71,15 +72,7 @@ export async function prepareRoutedAgentRunner(args: {
     shiftId: handoff.shiftId };
   const strictConsumed = createConsumedVerifier({ env: publicEnv,
     now: Date.now, artifactPolicy: 'enforce' });
-  const consumedVerifier: ConsumedVerifier = async (order, opts) => {
-    try {
-      const hosted = await stage.instructions.resolveHostedStep?.(order);
-      if (!hosted?.ok) throw refused();
-      const checked = await strictConsumed(order, { ...opts,
-	hardRule: true, callsProducers: hosted.callsProducers });
-      return checked.ok ? checked : { ok: false, reason: 'routed consumed proof refused' };
-    } catch { return { ok: false, reason: 'routed consumed proof refused' }; }
-  };
+  const consumedVerifier: ConsumedVerifier = routedProducerVerifier(strictConsumed);
   let admittedPacket: OrderPacket | undefined;
   const observedInput = createTrustedRoutedInputV2Admission({
     reader: createBrokerRoutedReferenceV2Reader(client.routed, { workflow, run },
