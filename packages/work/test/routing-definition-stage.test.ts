@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -166,6 +166,7 @@ test('parent current stage refuses changed signed command bytes before a postrun
     await stage.verifyOrder(response);
     const object = join(globalStoreRoot(join(stage.path, 'home')), 'objects', 'sha256',
       f.packed.digest, 'workflow.yaml');
+    chmodSync(object, 0o600);
     writeFileSync(object, workflow.replace('echo recovered', 'echo changed'));
     await assert.rejects(stage.verifyOrder(response),
       /routed definition object changed|routed signed selection changed/);
@@ -238,7 +239,7 @@ outputs: [result]
   const packet: OrderPacket = { workflow: 'wf_frame', run: 'run', step: 'command', key: '',
     defDigest: f.packed.digest, worker: 'command', inputs: ['child'], outputs: ['out'],
     consumes: { child: value }, consumedFingerprint: { child: 1 },
-    consumesProof: JSON.stringify({ child: signedProof.envelope }),
+    consumesProof: JSON.stringify({ child: JSON.stringify(signedProof.envelope) }),
     consumesProofRelay: { child: { childDefDigest: f.packed.digest, childVersion: 1,
       childOutcome: 'result' } },
     owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0,
@@ -288,6 +289,7 @@ outputs: [result]
       assert.equal(enteredBeforeReturn, true, 'the current check awaits the direct relay');
       const object = join(globalStoreRoot(join(stage.path, 'home')), 'objects', 'sha256',
 	f.packed.digest, 'parent.yaml');
+      chmodSync(object, 0o600);
       writeFileSync(object, parent.replace('echo original', 'echo moved'));
     } finally { release(); }
     await assert.rejects(pending, /routed signed selection changed|routed definition object changed|routed input witness refused/);
