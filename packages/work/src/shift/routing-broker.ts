@@ -8,6 +8,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { chmodSync, lstatSync, mkdtempSync, rmdirSync, unlinkSync, type Stats } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { PassThrough } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -36,6 +37,7 @@ import { snapshotCommandPostrun, type CommandPostrunResponse,
 // Service permits artifact values up to 25 MB. Leave bounded JSON overhead
 // while allowing a normal submit receipt through this private transport.
 const MAX_LINE = 32 * 1024 * 1024;
+const CONDITIONAL_ACK_READ_MS = 30_000;
 const MAX_FILE = 500_000_000;
 const MAX_UPLOAD_HEADER = 4096;
 // Service reserves a routed upload for 15 minutes. End our request early so
@@ -542,11 +544,20 @@ async function submitFromParent(grant: Grant, body: Record<string, unknown>, now
 	requestDigest: createHash('sha256').update(rawBody, 'utf8').digest('hex') };
       grant.conditionalTouched = true;
     }
-    const response = await checked(grant,
-      startEffect(grant, () => grant.hub.routingConditionalMutation({
-	intentId: grant.pendingSubmit!.intentId, rawBody: grant.pendingSubmit!.rawBody }, signal)), now);
-    if (!validConditionalReceiptResponse(response))
-      throw new Error('routing broker response refused');
+    let response: import('../hub/types.ts').RoutedConditionalMutationResponse;
+    try {
+      response = await checked(grant,
+	startEffect(grant, () => grant.hub.routingConditionalMutation({
+	  intentId: grant.pendingSubmit!.intentId, rawBody: grant.pendingSubmit!.rawBody }, signal)), now);
+      if (!validConditionalReceiptResponse(response))
+	throw new Error('routing broker response refused');
+    } catch (error) {
+      // Crossing the client send boundary is not proof the bytes reached
+      // Worker. Recover only an exact committed result through Service's
+      // original-session receipt read while this direct role child is live.
+      if (!parentPostrun || !effectContext.getStore()?.dispatched) throw error;
+      response = await readDispatchedConditionalAck(grant, now, signal);
+    }
     // A missing/malformed/failed acknowledgement preserves the one exact
     // request, including its signature. It cannot become a new signed write.
     if (!parentPostrun || response.outcome === 'green' || response.outcome === 'submitted'
@@ -616,6 +627,52 @@ function validConditionalReceiptResponse(value: unknown): value is import('../hu
   if (response.outcome === 'born-rejected') return response.closed === true;
   return (response.outcome === 'schema-rejected' || response.outcome === 'group-rejected')
     && response.closed === undefined;
+}
+/** A failed first mutation ACK may hide an already committed native result.
+ * Read only the one frozen request's receipt while its original role child and
+ * session remain live. This path never issues a retry generation or write. */
+async function readDispatchedConditionalAck(grant: Grant, now: () => number,
+  signal: AbortSignal): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {
+  const pending = grant.pendingSubmit;
+  if (!pending || !grant.postrun || !grant.quiescing)
+    throw new Error('routing submission outcome unresolved');
+  const postrun = grant.postrun;
+  const query = conditionalReceiptRequest(grant);
+  const started = performance.now();
+  let backoff = 100;
+  const stillOwned = () => {
+    const elapsed = performance.now() - started;
+    return grant.pendingSubmit === pending && !signal.aborted
+      && grant.postrun === postrun && liveChildValid(grant, now())
+      && Number.isFinite(elapsed) && elapsed >= 0 && elapsed < CONDITIONAL_ACK_READ_MS;
+  };
+  while (stillOwned()) {
+    const remaining = CONDITIONAL_ACK_READ_MS - (performance.now() - started);
+    if (!Number.isFinite(remaining) || remaining <= 0) break;
+    const readSignal = AbortSignal.any([signal,
+      AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(10_000, remaining))))]);
+    try {
+      const observed = await checked(grant,
+	grant.hub.routingConditionalReceipt(query, readSignal), now);
+      if (!stillOwned()) break;
+      if (!observed || typeof observed !== 'object') break;
+      if (observed.state === 'committed') {
+	if (!validConditionalReceiptResponse(observed.result)) break;
+	return observed.result;
+      }
+      if (observed.state !== 'pending') break;
+    } catch (error) {
+      if (!stillOwned() || error instanceof HubError && error.status !== 429) break;
+      if (error instanceof HubError && error.retryAfterMs)
+	backoff = Math.max(backoff, error.retryAfterMs);
+    }
+    const left = CONDITIONAL_ACK_READ_MS - (performance.now() - started);
+    if (!Number.isFinite(left) || left <= 0) break;
+    try { await delay(Math.min(backoff, left), undefined, { signal }); }
+    catch { break; }
+    backoff = Math.min(backoff * 2, 2_000);
+  }
+  throw new Error('routing submission outcome unresolved');
 }
 async function conditionalReconcile(grant: Grant, now: () => number,
   signal: AbortSignal): Promise<import('../hub/types.ts').RoutedConditionalMutationResponse> {

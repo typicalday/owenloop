@@ -50,8 +50,10 @@ async function waitFor(path: string): Promise<void> {
   throw new Error('routed child did not enter');
 }
 
-for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submit-ack', 'schema-rejected',
-  'born-rejected', 'no-start',
+for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submit-ack',
+  'malformed-submit-ack',
+  'receipt-pending-then-committed', 'receipt-unavailable', 'revoked-during-receipt',
+  'schema-rejected', 'born-rejected', 'no-start',
   'ask-closed', 'ask-lost-ack', 'reject-held', 'reject-closed',
   'reject-lost-ack', 'collection', 'collection-lost-seal-ack', 'multi-output'] as const) test(
   `post-quiesce role data reaches only parent signed conditional submit once (${scenario})`, async () => {
@@ -71,8 +73,10 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
   let closed = false;
   let signs = 0;
   let submits = 0;
+  let receiptReads = 0;
   let seals = 0;
   let drift = false;
+  let currentIdentity: typeof identity | undefined = identity;
   const rejection = scenario === 'reject-held' || scenario === 'reject-closed'
     || scenario === 'reject-lost-ack';
   const inputPresent = scenario === 'reject-closed';
@@ -133,9 +137,18 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
         return Response.json({
         outcome: 'sealed', closed: true, conditionApplied: 'routed-collection-seal-v1' }); }
       if (route === 'routing_submit_conditional_receipt/v1') {
-	assert.ok(scenario === 'lost-submit-ack' || scenario === 'schema-rejected'
-	  || scenario === 'born-rejected');
+	assert.ok(scenario === 'lost-submit-ack' || scenario === 'malformed-submit-ack'
+	  || scenario === 'schema-rejected'
+	  || scenario === 'born-rejected' || scenario === 'receipt-pending-then-committed'
+	  || scenario === 'receipt-unavailable' || scenario === 'revoked-during-receipt');
+	receiptReads++;
+	if (scenario === 'receipt-pending-then-committed' && receiptReads === 1)
+	  return Response.json({ state: 'pending' });
+	if (scenario === 'receipt-unavailable') return Response.json({ state: 'unavailable' });
+	if (scenario === 'revoked-during-receipt') currentIdentity = undefined;
 	return Response.json({ state: 'committed', result: scenario === 'lost-submit-ack'
+	  || scenario === 'malformed-submit-ack'
+	  || scenario === 'receipt-pending-then-committed' || scenario === 'revoked-during-receipt'
 	  ? { text: 'accepted', outcome: 'submitted', closed: true,
 	    conditionApplied: 'routed-conditional-receipt-v1' }
 	  : scenario === 'born-rejected'
@@ -149,7 +162,10 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       if (route === 'routing_submit_conditional/v1') {
 	submits++;
 	closed = scenario !== 'multi-output' && scenario !== 'submit-held' || submits === 2;
-	if (scenario === 'lost-submit-ack' && submits === 1) throw new Error('lost ACK');
+	if (['lost-submit-ack', 'receipt-pending-then-committed',
+	  'receipt-unavailable', 'revoked-during-receipt'].includes(scenario) && submits === 1)
+	  throw new Error('lost ACK');
+	if (scenario === 'malformed-submit-ack') return Response.json({ text: 'truncated' });
 	if (scenario === 'schema-rejected') { closed = false; throw new Error('lost schema ACK'); }
 	if (scenario === 'born-rejected') throw new Error('lost CAS ACK');
 	return Response.json({ text: 'accepted', outcome: 'submitted', closed,
@@ -166,7 +182,7 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
     createdAt: 1_000, expiresAt: 70_000, sessionExpiresAt: 90_000 };
   let digest = '';
   const grant = broker.issue({ reservation: reserved.reservation, routing, identity,
-    currentIdentity: () => identity, hub, commandFor: async () => 'printf ok',
+    currentIdentity: () => currentIdentity, hub, commandFor: async () => 'printf ok',
     inputAuthority: { observe: async (_response, phase) => phase === 'prestart'
       ? { reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
         workflow: 'wf', run: 'run', order: activeOrder, inputs: witnesses,
@@ -257,9 +273,16 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       assert.equal((await client.commandFinish({ group: packet.group })).state, 'uncertain');
       return;
     }
-    if (scenario === 'lost-submit-ack' || scenario === 'born-rejected'
-      || scenario === 'collection-lost-seal-ack')
+    if (scenario === 'collection-lost-seal-ack')
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
+    if (scenario === 'receipt-unavailable' || scenario === 'revoked-during-receipt') {
+      await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
+      assert.equal(submits, 1, 'uncertain receipt never dispatches a second write');
+      assert.equal(signs, 1, 'uncertain receipt never signs again');
+      assert.equal(receiptReads, 1);
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional_retry_issue/v1').length, 0);
+      return;
+    }
     if (scenario === 'ask-lost-ack' || scenario === 'reject-lost-ack') {
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
@@ -271,7 +294,6 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       return;
     }
     if (scenario === 'schema-rejected') {
-      await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
       assert.deepEqual(await client.commandPostrun(packet),
 	{ outcome: 'submit-rejected', claim: 'held' });
       assert.deepEqual(await client.commandPostrun(packet),
@@ -307,7 +329,8 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       scenario === 'multi-output' ? 2 : scenario === 'ask-closed'
         || scenario === 'reject-closed' || scenario === 'collection'
         || scenario === 'collection-lost-seal-ack' ? 0 : 1);
-    if (scenario === 'lost-submit-ack') {
+    if (scenario === 'lost-submit-ack' || scenario === 'malformed-submit-ack'
+      || scenario === 'receipt-pending-then-committed') {
       const write = requests.find(row => row.route === 'routing_submit_conditional/v1')!;
       const read = requests.find(row => row.route === 'routing_submit_conditional_receipt/v1')!;
       assert.equal((read.body as { intentId: string }).intentId, write.intent);
@@ -315,6 +338,10 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
 	createHash('sha256').update(write.rawBody).digest('hex'));
       assert.equal(requests.slice(requests.indexOf(write) + 1).some(row => row.route === 'get_order'), false,
 	'closed-run reconciliation performs no new order read');
+      assert.equal(submits, 1, 'same postrun recovered without a second mutation');
+      assert.equal(signs, 1, 'same postrun recovered without a second signature');
+      assert.equal(receiptReads, scenario === 'receipt-pending-then-committed' ? 2 : 1);
+      assert.equal(requests.filter(row => row.route === 'routing_submit_conditional_retry_issue/v1').length, 0);
     }
     if (scenario === 'collection' || scenario === 'collection-lost-seal-ack') {
       assert.deepEqual(requests.filter(row => row.route.startsWith('routing_collection_'))
