@@ -117,6 +117,31 @@ test('prestart ambiguity yields zero starts and no broad consequence', async () 
   assert.deepEqual(events.slice(-2), ['freeze', 'targeted-release']);
 });
 
+test('signed prestart revalidation logs only its closed refusal kind before any start', async () => {
+  for (const [kind, expected] of [
+    ['unverified-consumed', 'unverified-consumed'],
+    ['unrecognized-private-kind', 'unclassified'],
+  ] as const) {
+    const events: string[] = [], errors: string[] = [];
+    const { opts, starts } = fixture(events);
+    opts.err = line => errors.push(line);
+    opts.instructions = {
+      async resolveCommand() { throw new Error('ordinary command resolver used'); },
+      async resolveRoutedCommandDefinition() { return { ok: true, command: 'printf hello',
+	inputWitnessRequired: true,
+	revalidate: async () => ({ ok: false, kind: kind as 'unverified-consumed',
+	  reason: 'private proof, bearer, and input value must stay hidden' }) }; },
+      async resolveStep() { throw new Error('unused'); },
+    };
+    assert.equal(await createExecLoop(opts).run(), 'unresolved-instructions');
+    assert.equal(starts(), 0);
+    assert.ok(!events.includes('prestart') && !events.includes('parent-postrun'));
+    assert.ok(errors.some(line => line.includes(`signed command changed before prestart (${expected})`)));
+    assert.ok(errors.every(line => !line.includes('private proof') && !line.includes('bearer')
+      && !line.includes('input value')));
+  }
+});
+
 test('stalled original-session first contact is bounded without ordinary release', async () => {
   const events: string[] = [];
   const { opts, starts } = fixture(events, { prestartDeadlineMs: 15, leaseRpcDeadlineMs: 25 });
