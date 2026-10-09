@@ -6,7 +6,9 @@ import { createBundleIngestor, createExecutionDefinitionVerifier,
   createExecutionOriginVerifier, createStoreInstructionSource, globalStoreRoot,
   resolveOriginRules } from '../../../../src/store/index.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
+import type { InvocationBindingSource } from '../../../../src/types.ts';
 import { createStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
+import type { RoutingChildClient } from '../hub/routing-child-client.ts';
 import type { RoutingHandoffV1 } from '../shift/runtime.ts';
 
 const refused = (): Error => new Error('routing definition stage refused');
@@ -38,7 +40,8 @@ function descriptor(path: string): unknown {
   } finally { closeSync(fd); }
 }
 
-export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
+export function openRoutingRoleStage(handoff: RoutingHandoffV1,
+  child?: Pick<RoutingChildClient, 'readInvocationBinding'>): {
   instructions: InstructionResolver;
   publicEnv: Record<string, string | undefined>;
   frameWorkflow: string;
@@ -68,6 +71,19 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
     const originRules = resolveOriginRules(publicEnv, data.originRules as Record<string, never>);
     const globalRoot = globalStoreRoot(publicEnv.HOME);
     const source = createStoreInstructionSource({ globalRoot, verifier: createBundleIngestor() });
+    const invocationBindingSource: InvocationBindingSource | undefined = child ? {
+      read: key => {
+	if (key.parentWorkflow !== data.frameWorkflow
+	  || key.parentDefRef.bundleDigest !== data.bundleDigest
+	  || key.parentDefRef.workflowName !== data.definitionName
+	  || !Number.isSafeInteger(key.parentArtifactVersion)
+	  || key.parentArtifactVersion < 1) throw refused();
+	return child.readInvocationBinding({ workflow: handoff.reservation.workflow,
+	  orderId: handoff.reservation.run, parentWorkflow: key.parentWorkflow,
+	  parentDefRef: key.parentDefRef, callPath: key.callPath,
+	  parentArtifactVersion: key.parentArtifactVersion });
+      },
+    } : undefined;
     const strict = createStoreInstructionResolver({ globalRoot, source,
       verifier: createBundleIngestor(), env: publicEnv,
       routedSelection: { rootWorkflow: data.rootWorkflow as string,
@@ -77,7 +93,8 @@ export function openRoutingRoleStage(handoff: RoutingHandoffV1): {
       definitionVerifier: createExecutionDefinitionVerifier({ env: publicEnv }),
       originVerifier: createExecutionOriginVerifier({ env: publicEnv }),
       consumedVerifier: createConsumedVerifier({ env: publicEnv, now: Date.now,
-	artifactPolicy: 'enforce' }), warn: () => {} });
+	artifactPolicy: 'enforce' }),
+      ...(invocationBindingSource ? { invocationBindingSource } : {}), warn: () => {} });
     return { publicEnv, frameWorkflow: data.frameWorkflow,
       definitionName: data.definitionName, instructions: {
       ...strict,

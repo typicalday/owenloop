@@ -107,12 +107,21 @@ export interface VerifiedDefinitionSelection {
   callsChild(callsStep: string): VerifiedCallsChild | undefined;
 }
 
+/** Exact signed manifest member without choosing a step from a child bundle. */
+export interface VerifiedWorkflowSelection {
+  definition: WorkflowDef;
+  bundleDigest: DefDigest;
+  objectPath: string;
+  support: readonly { bundleDigest: DefDigest; objectPath: string }[];
+}
+
 /** A synchronous lookup source backed by verified local workflow-store objects. */
 export interface StoreInstructionSource extends OrderInstructionSource {
   /** Load and verify the bundle that corresponds to an order or bundle digest. */
   prime(defDigest: string): Promise<'resolved' | 'unknown-digest'>;
   /** Select an exact signed manifest member; never fall back to a sibling or alias. */
   selectVerifiedDefinition(defDigest: string, workflowName: string, step: string): VerifiedDefinitionSelection | undefined;
+  selectVerifiedWorkflow(defDigest: string, workflowName: string): VerifiedWorkflowSelection | undefined;
   /** Return a step only after `prime(defDigest)` has resolved that digest. */
   getVerifiedStep(defDigest: string, step: string): StepDef | undefined;
   /** Return the full verified definition cached by `prime`, narrowed by step when a bundle contains several workflows. */
@@ -711,6 +720,14 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	objectPath: selected.objectPath,
 	support: selected.support.map(({ bundleDigest, objectPath }) => ({ bundleDigest, objectPath })),
 	callsChild: callsStep => selected.callsChildren.get(callsStep) };
+    },
+    selectVerifiedWorkflow: (requestedDigest: string, workflowName: string): VerifiedWorkflowSelection | undefined => {
+      const matches = cache.get(requestedDigest)?.filter(entry => entry.def.name === workflowName) ?? [];
+      if (matches.length !== 1) return undefined;
+      const selected = matches[0]!;
+      return { definition: selected.def, bundleDigest: selected.bundleDigest,
+	objectPath: selected.objectPath,
+	support: selected.support.map(({ bundleDigest, objectPath }) => ({ bundleDigest, objectPath })) };
     },
     getVerifiedStep: (requestedDigest: string, stepName: string): StepDef | undefined => {
       const cached = definitionForStep(requestedDigest, stepName);

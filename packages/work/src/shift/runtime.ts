@@ -18,7 +18,9 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { createTrustedRoutedReferenceV2Reader, type RoutedClaimV2,
   type RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import { createRecordedRoutedV2Reader, type RecordedClaimV2,
-  type RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
+  type RecordedBindingV2, type RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
+import { createDirectRoutedInvocationReader } from '../hosted/trusted-routed-invocation.ts';
+import type { InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, readHubRosterCache, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
@@ -786,27 +788,43 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     ...(routingSession ? { routingSession, selectRoutingTuples, routingRosterSnapshot,
       maintainDefinitionStages: definitionMaintenance!.sweep,
       closeDefinitionStages: definitionMaintenance!.close,
-      stageRoutedDefinition: (order: import('../hub/types.ts').WorkOrder, rootWorkflow: string) => stageRoutedDefinition({
-	order, rootWorkflow, origin, token, stateDir, workRoot, sourceEnv: env,
-	beforeRequest: routingBackoff!.beforeRequest,
-	onRateLimit: routingBackoff!.onRateLimit,
-	stillAuthorized: () => {
-	  const identity = routingSession.identity();
-	  const routing = order.routing;
-	  return !!identity && !!routing
-	    && identity.orgId === routing.decision.binding.orgId
-	    && identity.principalId === routing.claim.principalId
-	    && identity.sessionId === routing.claim.sessionId
-	    && identity.shiftId === routing.claim.shiftId
-	    && now() < Math.min(identity.expiresAt, routing.decision.binding.expiresAt,
-	      routing.preference.expiresAt);
-	},
-      }),
+      stageRoutedDefinition: (order: import('../hub/types.ts').WorkOrder, rootWorkflow: string) => {
+	const captured = routingSession.brokerTarget();
+	if (!captured) throw new Error('routed definition session unavailable');
+	const expected = { workflow: rootWorkflow, run: order.run };
+	return stageRoutedDefinition({
+	  order, rootWorkflow, origin, token, stateDir, workRoot, sourceEnv: env,
+	  beforeRequest: routingBackoff!.beforeRequest,
+	  onRateLimit: routingBackoff!.onRateLimit,
+	  readInvocationBinding: captured.readInvocationBinding,
+	  readCurrentPair: async (phase, target) => {
+	    if (target.workflow !== expected.workflow || target.run !== expected.run)
+	      throw new Error('routed definition target changed');
+	    return phase === 'prestart'
+	      ? { reference: await captured.routedV2Read('reference', target) as RoutedReferenceV2,
+		claim: await captured.routedV2Read('claim', target) as RoutedClaimV2 }
+	      : { reference: await captured.routedLiveV2Read('reference', target) as RecordedReferenceV2,
+		claim: await captured.routedLiveV2Read('claim', target) as RecordedClaimV2 };
+	  },
+	  stillAuthorized: () => {
+	    const identity = routingSession.identity();
+	    const routing = order.routing;
+	    return !!identity && !!routing
+	      && identity.orgId === routing.decision.binding.orgId
+	      && identity.principalId === routing.claim.principalId
+	      && identity.sessionId === routing.claim.sessionId
+	      && identity.shiftId === routing.claim.shiftId
+	      && now() < Math.min(identity.expiresAt, routing.decision.binding.expiresAt,
+		routing.preference.expiresAt);
+	  },
+	});
+      },
       createRoutingSubmissionAuthority: stage => createRoutedSubmissionAuthority({
 	origin, env, now, verifyOrder: stage.verifyOrder,
 	canSubmit: stage.canSubmit, canReplay: stage.canReplay, canCollect: stage.canCollect,
       }),
       createRoutingInputAuthority: (stage, target, rootWorkflow) => ({
+	validateInvocationKey: key => stage.validateInvocationKey?.(key) === true,
 	observe: async (response, phase) => {
 	  if (!stage.verifyRoutedInput) throw new Error('routed input authority unavailable');
 	  const started = { wall: now(), monotonic: performance.now() };
@@ -818,6 +836,17 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 	      claim: await target.routedLiveV2Read('claim', expected) as RecordedClaimV2 };
 	  await stage.verifyRoutedInput(response, pair, phase, started);
 	  return pair;
+	},
+	observeInvocation: async (response, phase, key) => {
+	  if (!stage.readInvocationBinding) throw new Error('routed invocation authority unavailable');
+	  const expected = { workflow: rootWorkflow, run: response.run };
+	  const pair = phase === 'prestart'
+	    ? { reference: await target.routedV2Read('reference', expected) as RoutedReferenceV2,
+		claim: await target.routedV2Read('claim', expected) as RoutedClaimV2 }
+	    : { reference: await target.routedLiveV2Read('reference', expected) as RecordedReferenceV2,
+		claim: await target.routedLiveV2Read('claim', expected) as RecordedClaimV2 };
+	  const relay = await stage.readInvocationBinding(response, pair, phase, key);
+	  return { pair, relay };
 	},
       }),
       createRoutingLaunchAuthority: (order, offer) => createRoutedLaunchAuthority({
@@ -1018,7 +1047,10 @@ export interface ShiftRoutingSession {
     routedV2Read: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
       Promise<RoutedReferenceV2 | RoutedClaimV2>;
     routedLiveV2Read: (kind: 'reference' | 'claim', expected: { workflow: string; run: string }) =>
-      Promise<RecordedReferenceV2 | RecordedClaimV2> } | undefined;
+      Promise<RecordedReferenceV2 | RecordedClaimV2>;
+    readInvocationBinding: (key: InvocationRelayKey, phase: 'prestart' | 'recorded-live',
+      expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
+      Promise<VerifiedInvocationReceipt | undefined> } | undefined;
   createHandoff(reservation: ChildReservation, broker?: { socketPath: string; cap: string;
     holder?: { socketPath: string; cap: string } }, definitionStage?: RoutedDefinitionStage): RoutingHandoff;
   maintain(): Promise<void>;
@@ -1180,7 +1212,8 @@ export async function openShiftRoutingSession(opts: ShiftRoutingSessionOptions):
       const identity = incarnation.identity();
       return identity ? { hub: incarnation.hub, identity, currentIdentity: incarnation.identity,
 	routedV2Read: incarnation.readRoutedV2,
-	routedLiveV2Read: incarnation.readRecordedV2 } : undefined;
+	routedLiveV2Read: incarnation.readRecordedV2,
+	readInvocationBinding: incarnation.readInvocationBinding } : undefined;
     },
     nextRequestAllowedAt: backoff.nextAllowedAt,
     createHandoff: (reservation, broker, definitionStage) => {
@@ -1275,6 +1308,7 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
   Omit<ShiftRoutingSession, 'brokerTarget' | 'ensureScope' | 'nextRequestAllowedAt' | 'stop'> & {
     readRoutedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedV2Read'];
     readRecordedV2: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['routedLiveV2Read'];
+    readInvocationBinding: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>['readInvocationBinding'];
     stop(): Promise<HubError | undefined>;
   }
 > {
@@ -1390,6 +1424,23 @@ async function openRoutingIncarnation(opts: ShiftRoutingSessionOptions & {
 	  return authority.credential;
 	} });
       return kind === 'reference' ? reader.readReference() : reader.readClaim();
+    },
+    async readInvocationBinding(key, phase, expected, binding) {
+      if (renewalDenied || !authority || now() >= authority.expiresAt)
+	throw new Error('routed invocation session unavailable');
+      const sessionId = authority.sessionId, shiftId = authority.shiftId;
+      const reader = createDirectRoutedInvocationReader({ origin: opts.origin,
+	orgId: opts.orgId, getToken: opts.getToken, expected,
+	beforeRequest: opts.beforeRequest, onRateLimit: opts.onRateLimit,
+	getSession: async () => {
+	  if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+	    || now() >= authority.expiresAt) throw new Error('routed invocation session changed');
+	  return authority.credential;
+	} });
+      const result = await reader(key, phase, binding);
+      if (!authority || authority.sessionId !== sessionId || authority.shiftId !== shiftId
+	|| now() >= authority.expiresAt) throw new Error('routed invocation session changed');
+      return result;
     },
     createHandoff(reservation, broker, definitionStage) {
       if (stopped || renewalDenied || !authority || now() >= authority.expiresAt || owned.has(reservation.token)

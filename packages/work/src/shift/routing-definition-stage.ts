@@ -20,6 +20,11 @@ import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { bindTrustedRoutedInputV2, type RoutedInputPair, type RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
 import { validModelOrderFields, outputFor } from '../order-definition-binding.ts';
 import { createStoreInstructionResolver } from '../exec/instructions.ts';
+import { createParentRoutedInvocationSource } from './routing-invocation-source.ts';
+import { parseRoutedReferenceV2, parseRoutedClaimV2 } from '../hosted/trusted-routed-reference-v2.ts';
+import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
+import type { DefRef, InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
+import type { RecordedBindingV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import { HubError, type GetOrderResponse, type OrderPacket, type WorkOrder } from '../hub/types.ts';
 import {
   createBundleIngestor, createExecutionDefinitionVerifier, createExecutionOriginVerifier,
@@ -37,6 +42,11 @@ export interface RoutedDefinitionStage {
   /** Full current trust plus exact Service input/value witness. */
   verifyRoutedInput?(response: GetOrderResponse, pair: RoutedInputPair,
     phase: RoutedInputPhase, started?: { wall: number; monotonic: number }): Promise<void>;
+  /** Pure signed-stage key gate before the first parent Service read. */
+  validateInvocationKey?(key: InvocationRelayKey): boolean;
+  /** Parent-only first phase for a role's exact dynamic invocation key. */
+  readInvocationBinding?(response: GetOrderResponse, pair: RoutedInputPair,
+    phase: RoutedInputPhase, key: InvocationRelayKey): Promise<VerifiedInvocationReceipt | undefined>;
   /** Fixed-path submit remains restricted to singleton and judge outputs. */
   canSubmit(order: OrderPacket, path: string): boolean;
   /** The issued-member protocol requires an owed collection seal in signed source. */
@@ -236,6 +246,11 @@ export async function stageRoutedDefinition(args: {
   beforeRequest: () => void;
   onRateLimit: (error: HubError) => void;
   stillAuthorized: () => boolean;
+  readCurrentPair?: (phase: RoutedInputPhase, expected: { workflow: string; run: string }) =>
+    Promise<RoutedInputPair>;
+  readInvocationBinding?: (key: InvocationRelayKey, phase: RoutedInputPhase,
+    expected: { workflow: string; run: string }, binding?: RecordedBindingV2) =>
+      Promise<VerifiedInvocationReceipt | undefined>;
   fetchImpl?: typeof fetch;
 }): Promise<RoutedDefinitionStage> {
   const frameWorkflow = args.order.workflow;
@@ -352,6 +367,8 @@ export async function stageRoutedDefinition(args: {
     if (!resolved || !definition || !step || !support?.length
       || (routing !== undefined && definition.name !== definitionName))
       throw new Error('routed definition step unavailable');
+    const allSupport = [...support];
+    const dynamicChildren = new Map<string, DefRef>();
     // Apply all configured rules matching the installed namespace. WorkOrder
     // lacks workdir/inputs, so full step and consume binding is deferred.
     const stagedIndex = readWorkflowStoreIndex(storeIndexPath(root));
@@ -372,6 +389,62 @@ export async function stageRoutedDefinition(args: {
 	  throw new Error('routed definition origin refused');
       }
     }
+    if (routing !== undefined && selected) {
+      const dynamicPaths = Object.keys(args.order.consumes).filter(path =>
+	selected.definition.steps.some(candidate => candidate.callsInterface?.selection === 'invocation'
+	  && candidate.produces.some(produce => produce.stem === path)));
+      if (dynamicPaths.length > 0) {
+	if (!args.readCurrentPair || !args.readInvocationBinding) throw new Error('routed invocation source unavailable');
+	const expected = { workflow: args.rootWorkflow, run: args.order.run };
+	const pair = await args.readCurrentPair('prestart', expected);
+	const reference = parseRoutedReferenceV2(pair.reference, expected);
+	const claim = parseRoutedClaimV2(pair.claim, expected);
+	if (reference.state !== 'available' || claim.state !== 'available'
+	  || !isDeepStrictEqual(reference.binding, claim.binding)
+	  || !isDeepStrictEqual(reference.order.routing, routing)
+	  || !isDeepStrictEqual(claim.routing, routing)
+	  || reference.order.workflow !== frameWorkflow || reference.order.run !== args.order.run
+	  || reference.order.defDigest !== args.order.defDigest || reference.order.step !== args.order.step
+	  || !isDeepStrictEqual(reference.order.consumes, args.order.consumes)
+	  || !isDeepStrictEqual(reference.order.consumedFingerprint, args.order.consumedFingerprint))
+	  throw new Error('routed invocation claim changed');
+	const invocationSource = createParentRoutedInvocationSource({ expected,
+	  order: reference.order, selected, pair,
+	  phase: 'prestart', readDirect: args.readInvocationBinding,
+	  readCurrentPair: args.readCurrentPair, stillAuthorized: args.stillAuthorized,
+	  verifyChild: async child => {
+	    if (await source.prime(child.bundleDigest) !== 'resolved')
+	      throw new Error('routed invocation child unavailable');
+	    const chosen = source.selectVerifiedWorkflow(child.bundleDigest, child.workflowName);
+	    if (!chosen || chosen.bundleDigest !== child.bundleDigest) throw new Error('routed invocation child changed');
+	    for (const object of chosen.support) {
+	      if ((await verifyDefinition(object)).kind !== 'verified')
+		throw new Error('routed invocation child publication refused');
+	      const verdict = await verifyOrigin(object);
+	      if (verdict.kind === 'invalid') throw new Error('routed invocation child origin refused');
+	      for (const namespace of originNamespacesForObject(object,
+		readWorkflowStoreIndex(storeIndexPath(root)))) {
+		const rule = matchOriginRule(originRules, namespace);
+		if (rule && !evaluateOriginRule(rule.value, verdict).ok)
+		  throw new Error('routed invocation child origin refused');
+	      }
+	      if (!allSupport.some(existing => existing.bundleDigest === object.bundleDigest
+		&& existing.objectPath === object.objectPath)) allSupport.push(object);
+	    }
+	  } });
+	for (const path of dynamicPaths) {
+	  const version = reference.order.consumedFingerprint?.[path];
+	  if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 1)
+	    throw new Error('routed invocation version unavailable');
+	  const key = { parentWorkflow: frameWorkflow,
+	    parentDefRef: { bundleDigest: selected.bundleDigest, workflowName: selected.definition.name },
+	    callPath: path, parentArtifactVersion: version };
+	  const receipt = await invocationSource.read(key);
+	  if (!receipt) throw new Error('routed invocation receipt unavailable');
+	  dynamicChildren.set(path, receipt.receipt.childDefRef);
+	}
+      }
+    }
     if ((args.order.worker === 'command') !== (step.command !== undefined))
       throw new Error('routed definition worker refused');
     // Snapshot verification is not a substitute for current operator trust.
@@ -380,7 +453,7 @@ export async function stageRoutedDefinition(args: {
     const freshRules = resolveOriginRules(args.sourceEnv);
     const freshDefinition = createExecutionDefinitionVerifier({ env: args.sourceEnv });
     const freshOrigin = createExecutionOriginVerifier({ env: args.sourceEnv });
-    for (const object of support) {
+    for (const object of allSupport) {
       if (performance.now() >= deadline || !args.stillAuthorized()) throw new Error('routed definition staging expired');
       if ((await freshDefinition(object)).kind !== 'verified') throw new Error('routed definition publication changed');
       const verdict = await freshOrigin(object);
@@ -397,9 +470,10 @@ export async function stageRoutedDefinition(args: {
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
       bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
-    const verifyOrderInternal = async (response: GetOrderResponse,
+      const verifyOrderInternal = async (response: GetOrderResponse,
       routed?: { pair: RoutedInputPair; phase: RoutedInputPhase;
-	started?: { wall: number; monotonic: number } }): Promise<void> => {
+	started?: { wall: number; monotonic: number };
+	relayCache?: Map<string, VerifiedInvocationReceipt> }): Promise<void> => {
       const order = response.order;
       // The broker checks the exact original session incarnation around this
       // callback. The pre-start preference deadline must not terminate trust
@@ -440,9 +514,20 @@ export async function stageRoutedDefinition(args: {
 	throw new Error('routed definition object changed');
       const currentSelection = routing === undefined ? undefined
 	: readOnlySource.selectVerifiedDefinition(order.defDigest, definitionName!, order.step);
-      const currentSupport = routing === undefined
-	? readOnlySource.getVerifiedSupport?.(order.defDigest, order.step) : currentSelection?.support;
+      const currentSupport = [...(routing === undefined
+	? readOnlySource.getVerifiedSupport?.(order.defDigest, order.step) ?? []
+	: currentSelection?.support ?? [])];
       if (!currentSupport?.length) throw new Error('routed definition closure unavailable');
+      for (const child of dynamicChildren.values()) {
+	if (await readOnlySource.prime(child.bundleDigest) !== 'resolved')
+	  throw new Error('routed invocation child changed');
+	const chosen = readOnlySource.selectVerifiedWorkflow(child.bundleDigest, child.workflowName);
+	if (!chosen || chosen.bundleDigest !== child.bundleDigest)
+	  throw new Error('routed invocation child changed');
+	for (const object of chosen.support)
+	  if (!currentSupport.some(existing => existing.bundleDigest === object.bundleDigest
+	    && existing.objectPath === object.objectPath)) currentSupport.push(object);
+      }
       for (const object of currentSupport) {
 	if ((await freshDefinition(object)).kind !== 'verified')
 	  throw new Error('routed definition trust changed');
@@ -454,6 +539,38 @@ export async function stageRoutedDefinition(args: {
 	    throw new Error('routed definition origin changed');
 	}
       }
+      const invocationSource = routed && currentSelection && dynamicChildren.size > 0
+	&& args.readInvocationBinding && args.readCurrentPair
+	? createParentRoutedInvocationSource({ expected: { workflow: args.rootWorkflow,
+	    run: args.order.run }, order, selected: currentSelection, pair: routed.pair,
+	  phase: routed.phase,
+	  readDirect: async (key, phase, expected, binding) => {
+	    const relay = await args.readInvocationBinding!(key, phase, expected, binding);
+	    if (!relay || !isDeepStrictEqual(relay.receipt.childDefRef,
+	      dynamicChildren.get(key.callPath))) throw new Error('routed invocation selection moved');
+	    routed.relayCache?.set(valueDigestHex(key), relay);
+	    return relay;
+	  },
+	  readCurrentPair: args.readCurrentPair,
+	  stillAuthorized: () => routed.phase === 'recorded-live' || args.stillAuthorized(),
+	  verifyChild: async child => {
+	    const selectedChild = readOnlySource.selectVerifiedWorkflow(child.bundleDigest, child.workflowName);
+	    if (!selectedChild || selectedChild.bundleDigest !== child.bundleDigest)
+	      throw new Error('routed invocation child changed');
+	    for (const object of selectedChild.support) {
+	      if ((await freshDefinition(object)).kind !== 'verified')
+		throw new Error('routed invocation child publication changed');
+	      const verdict = await freshOrigin(object);
+	      if (verdict.kind === 'invalid') throw new Error('routed invocation child origin changed');
+	      for (const namespace of originNamespacesForObject(object, freshIndex)) {
+		const rule = matchOriginRule(freshRules, namespace);
+		if (rule && !evaluateOriginRule(rule.value, verdict).ok)
+		  throw new Error('routed invocation child origin changed');
+	      }
+	    }
+	  } }) : undefined;
+      if (routed && dynamicChildren.size > 0 && !invocationSource)
+	throw new Error('routed invocation source unavailable');
       const resolver = createStoreInstructionResolver({ globalRoot: root, source: readOnlySource,
 	verifier: createBundleIngestor(), env: args.sourceEnv, defPolicy: 'enforce',
 	...(routing === undefined ? {} : { routedSelection: {
@@ -462,7 +579,9 @@ export async function stageRoutedDefinition(args: {
 	originPolicy: 'enforce', originRules: freshRules,
 	definitionVerifier: freshDefinition, originVerifier: freshOrigin,
 	consumedVerifier: createConsumedVerifier({ env: args.sourceEnv, now: Date.now,
-	  artifactPolicy: 'enforce' }), warn: () => {} });
+	  artifactPolicy: 'enforce' }),
+	...(invocationSource ? { invocationBindingSource: invocationSource } : {}),
+	warn: () => {} });
       const verifiedStep = routing === undefined
 	? readOnlySource.getVerifiedStep(order.defDigest, order.step) : currentSelection?.step;
       const verifiedDefinition = routing === undefined
@@ -558,6 +677,18 @@ export async function stageRoutedDefinition(args: {
 	? source.getVerifiedStep(order.defDigest, order.step) : selected?.step;
       return !!verified && outputFor(verified, order, sealPath)?.kind === 'collection';
     };
+    const validateInvocationKey = (key: InvocationRelayKey): boolean => !!selected
+      && key.parentWorkflow === frameWorkflow
+      && key.parentDefRef.bundleDigest === selected.bundleDigest
+      && key.parentDefRef.workflowName === selected.definition.name
+      && dynamicChildren.has(key.callPath)
+      && Object.hasOwn(args.order.consumes, key.callPath)
+      && typeof key.parentArtifactVersion === 'number'
+      && Number.isSafeInteger(key.parentArtifactVersion) && key.parentArtifactVersion > 0
+      && args.order.consumedFingerprint?.[key.callPath] === key.parentArtifactVersion
+      && selected.definition.steps.filter(candidate =>
+	candidate.callsInterface?.selection === 'invocation'
+	&& candidate.produces.some(produce => produce.stem === key.callPath)).length === 1;
     return { path: stagePath, digest: args.order.defDigest!,
       verifyOrder: response => verifyOrderInternal(response),
       commandFor: async order => {
@@ -575,6 +706,13 @@ export async function stageRoutedDefinition(args: {
       },
       verifyRoutedInput: (response, pair, phase, started) => verifyOrderInternal(response,
 	{ pair, phase, ...(started ? { started } : {}) }),
+      validateInvocationKey,
+      readInvocationBinding: async (response, pair, phase, key) => {
+	if (!validateInvocationKey(key)) throw new Error('routed invocation key refused');
+	const relays = new Map<string, VerifiedInvocationReceipt>();
+	await verifyOrderInternal(response, { pair, phase, relayCache: relays });
+	return relays.get(valueDigestHex(key));
+      },
       canSubmit: canReplay, canReplay, canCollect, activate, markGateMayOpen, cleanup, cleanupAfterExit };
   } catch (error) {
     cleanup();

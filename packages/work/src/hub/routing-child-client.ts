@@ -6,6 +6,7 @@ import { PassThrough, Readable } from 'node:stream';
 import type { RoutedClaimV2, RoutedReferenceV2 } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RecordedClaimV2, RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import type { RoutedQuiesceResult } from '../shift/routing-broker.ts';
+import type { VerifiedInvocationReceipt } from '../../../../src/types.ts';
 import type { CommandPostrunRequest, CommandPostrunResponse } from '../shift/routing-command-postrun.ts';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
@@ -14,7 +15,7 @@ import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRe
   type RoutingClaimReadResponse, type SubmitRequest, type SubmitResponse,
   type AskRequest, type AskResponse, type RejectRequest, type RejectResponse,
   type RequestApprovalRequest, type RequestApprovalResponse,
-  type InvocationBindingReadRequest, type InvocationBindingReadResponse,
+  type InvocationBindingReadRequest,
   type PutFileArtifactRequest, type PutFileArtifactResponse, type FileArtifactPointer,
   type RoutedCollectionWriteResponse, type RoutedMemberIssueResponse } from './types.ts';
 
@@ -74,7 +75,8 @@ export interface RoutingChildClient {
   ask(req: AskRequest): Promise<AskResponse>;
   reject(req: RejectRequest): Promise<RejectResponse>;
   requestApproval(req: RequestApprovalRequest): Promise<RequestApprovalResponse>;
-  readInvocationBinding(req: InvocationBindingReadRequest): Promise<InvocationBindingReadResponse>;
+  readInvocationBinding(req: InvocationBindingReadRequest & { parentArtifactVersion: number }):
+    Promise<VerifiedInvocationReceipt>;
   putFileArtifact(req: PutFileArtifactRequest): Promise<PutFileArtifactResponse>;
   /** Byte stream stays in the child process; no file path crosses the broker. */
   putFileArtifactStream(req: { workflow: string; size: number; chunks: AsyncIterable<Uint8Array>;
@@ -433,9 +435,11 @@ export function createRoutingChildClient(handoff: {
     }); },
     readInvocationBinding(req) {
       if (req.workflow !== workflow || req.orderId !== run) throw new Error('routing order binding refused');
+      if (!Number.isSafeInteger(req.parentArtifactVersion) || req.parentArtifactVersion < 1)
+	throw new Error('routing invocation version refused');
       return exchange('read_invocation_binding', { parentWorkflow: req.parentWorkflow,
 	parentDefRef: req.parentDefRef, callPath: req.callPath,
-	...(req.parentArtifactVersion === undefined ? {} : { parentArtifactVersion: req.parentArtifactVersion }) });
+	parentArtifactVersion: req.parentArtifactVersion });
     },
     putFileArtifact(req) {
       if (!(req.bytes instanceof Uint8Array)) return Promise.reject(refused());

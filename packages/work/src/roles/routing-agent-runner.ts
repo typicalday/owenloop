@@ -50,7 +50,7 @@ export async function prepareRoutedAgentRunner(args: {
   if (handoff.reservation.childKind !== 'agent-run' || !handoff.definitionStage
     || !handoff.broker || !handoff.holderBroker || !handoff.workRoot) throw refused();
   const client = createRoutingRoleClient(handoff);
-  const stage = openRoutingRoleStage(handoff);
+  const stage = openRoutingRoleStage(handoff, client.routed);
   const HOME = stage.publicEnv.HOME, OWENLOOP_CONFIG_DIR = stage.publicEnv.OWENLOOP_CONFIG_DIR;
   if (!HOME || !OWENLOOP_CONFIG_DIR) throw refused();
   const publicEnv = { HOME, OWENLOOP_CONFIG_DIR };

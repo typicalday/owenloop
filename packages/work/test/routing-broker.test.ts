@@ -558,10 +558,6 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
 	return Response.json({ text: 'done', ok: true, closed: true });
       if (route === 'routing_request_approval/v1')
 	return Response.json({ text: 'pending', ok: true, approval: { state: 'pending' } });
-      if (route === 'read_invocation_binding') return Response.json({
-	protocol: 'owenloop-binding-v1', orgId: 'org', freshness: 'fresh-at-read', atomicLaunch: false,
-	binding: { id: 'inv_1' }, bindingJson: '{}', bindingDigest: 'sha256:binding',
-      });
       throw new Error('unexpected scoped route');
     }) as typeof fetch,
   });
@@ -581,8 +577,9 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
     assert.equal((await role.requestApproval({ workflow: 'wf', run: 'run', tool_use_id: 'tool-1',
 	tool_name: 'Bash', tool_input: { command: 'pwd' }, reason: 'needs approval' })).approval?.state, 'pending');
     const invocation = { workflow: 'wf', orderId: 'run', parentWorkflow: 'parent',
-      parentDefRef: { bundleDigest: 'sha256:bundle', workflowName: 'parent' }, callPath: 'out' };
-    assert.equal((await role.readInvocationBinding(invocation)).binding.id, 'inv_1');
+      parentDefRef: { bundleDigest: 'sha256:bundle', workflowName: 'parent' }, callPath: 'out',
+      parentArtifactVersion: 1 };
+    await assert.rejects(role.readInvocationBinding(invocation), /unavailable/);
     const pointer = await holderClient.putFileArtifact({ workflow: 'wf', bytes,
 	contentType: 'application/octet-stream' });
     assert.equal(pointer.size, bytes.byteLength);
@@ -597,7 +594,7 @@ test('holder ask/reject/upload and role approval use only exact scoped routes', 
 	tool_name: 'Bash', tool_input: {}, reason: 'no' }), /unavailable/);
     await assert.rejects(narrow.readInvocationBinding(invocation), /unavailable/);
     assert.deepEqual(calls.map(c => c.route), ['get_order', 'routing_ask/v1', 'routing_reject/v1',
-      'routing_request_approval/v1', 'read_invocation_binding',
+      'routing_request_approval/v1',
       'routing_file_artifacts/v1?workflow=wf&run=run',
       'routing_file_artifacts/v1?workflow=wf&run=run']);
     for (const call of calls) {

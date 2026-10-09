@@ -34,7 +34,7 @@ export async function prepareRoutedCommandRunner(args: {
   const root = handoff.reservation.workflow, run = handoff.reservation.run;
   const client = createRoutingRoleClient(handoff);
   const child = client.routed;
-  const stage = openRoutingRoleStage(handoff);
+  const stage = openRoutingRoleStage(handoff, child);
   const HOME = stage.publicEnv.HOME;
   const OWENLOOP_CONFIG_DIR = stage.publicEnv.OWENLOOP_CONFIG_DIR;
   if (!HOME || !OWENLOOP_CONFIG_DIR) throw refused();

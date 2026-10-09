@@ -11,6 +11,9 @@ import { parseTrustedReferenceV2, type TrustedInputWitness } from './trusted-ref
 
 const MAX_WIRE_BYTES = 2_000_000;
 const MAX_MS = 5_000;
+const ROUTES = new Set(['/api/routing_reference_order/v2', '/api/read_routing_claim/v2',
+  '/api/routing_reference_order/live/v2', '/api/read_routing_claim/live/v2',
+  '/api/read_invocation_binding', '/api/read_invocation_binding/live/v2']);
 const DIGEST = /^[a-f0-9]{64}$/i;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 const BINDING_KEYS = ['rootWorkflow', 'frameWorkflow', 'run', 'claimId', 'decisionId', 'sessionId',
@@ -200,13 +203,14 @@ export interface RoutedV2TransportOptions {
 
 /** Shared original-session transport for separate prestart and recorded reads. */
 export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
-  now: () => number; request: (path: string, started: number) => Promise<unknown>;
+  now: () => number; request: (path: string, started: number, body?: unknown) => Promise<unknown>;
 } {
   const origin = new URL(options.origin);
   if (origin.protocol !== 'https:' || origin.origin !== options.origin || !id(options.expected.workflow)
     || !id(options.expected.run)) throw new Error('routed v2 requires exact HTTPS origin and bound order');
   const now = options.now ?? (() => performance.now());
-  const request = async (path: string, started: number): Promise<unknown> => {
+  const request = async (path: string, started: number, body: unknown = options.expected): Promise<unknown> => {
+    if (!ROUTES.has(path)) throw new Error('routed v2 route refused');
     const remaining = () => MAX_MS - (now() - started);
     let credentialTimer: ReturnType<typeof setTimeout> | undefined;
     const credential = await Promise.race([Promise.all([options.getToken(), options.getSession()]),
@@ -224,7 +228,7 @@ export function createRoutedV2Requester(options: RoutedV2TransportOptions): {
       return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1_000) : undefined;
     };
     const response = await postHttps(new URL(path, origin), token, session,
-      JSON.stringify(options.expected), remaining(), options.trustedCa,
+      JSON.stringify(body), remaining(), options.trustedCa,
       (status, headers) => {
 	if (status === 429) options.onRateLimit?.(new HubError(429,
 	  'routed v2 request refused', undefined, retryAfter(headers)));

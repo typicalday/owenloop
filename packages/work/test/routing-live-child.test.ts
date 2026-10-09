@@ -111,6 +111,15 @@ test('only the retained exact child after gate entry can read a recorded occurre
 	routing, binding: fullBinding };
   };
   const phases: string[] = [];
+  const invocationPhases: string[] = [];
+  let invocationReads = 0;
+  const invocationKey = { workflow: 'wf', orderId: 'run', parentWorkflow: 'frame',
+    parentDefRef: { bundleDigest: 'sha256:bundle', workflowName: 'wf' },
+    callPath: 'child', parentArtifactVersion: 1 };
+  const invocationRelay = { receipt: { invocationId: 'inv', parentDefRef: invocationKey.parentDefRef,
+    callPath: 'child', evidenceDigest: 'a'.repeat(64), parentArtifactVersion: 1,
+    childWorkflow: 'wf_child', childDefRef: invocationKey.parentDefRef,
+    childOutcome: 'ok', childOutcomeVersion: 1 }, receiptDigest: 'b'.repeat(64) };
   const prestartRead = async (kind: 'reference' | 'claim'): Promise<RoutedReferenceV2 | RoutedClaimV2> => kind === 'reference'
     ? { protocol: 'trusted-routed-reference-read-v2', state: 'available', ...expected,
 	order, inputs: [], lease: { claimed: true }, binding: referenceBinding }
@@ -120,7 +129,19 @@ test('only the retained exact child after gate entry can read a recorded occurre
     currentIdentity: () => identity, hub,
     routedV2Read: prestartRead,
     routedLiveV2Read: liveRead as NonNullable<Parameters<typeof broker.issue>[0]['routedLiveV2Read']>,
-    inputAuthority: { observe: async (_response, phase) => {
+    inputAuthority: { validateInvocationKey: key => key.parentWorkflow === 'frame'
+      && key.parentDefRef.bundleDigest === 'sha256:bundle'
+      && key.parentDefRef.workflowName === 'wf'
+      && key.callPath === 'child' && key.parentArtifactVersion === 1,
+      observeInvocation: async (_response, phase) => {
+	invocationReads++;
+	invocationPhases.push(phase);
+	return { pair: phase === 'prestart'
+	  ? { reference: await prestartRead('reference') as RoutedReferenceV2,
+	    claim: await prestartRead('claim') as RoutedClaimV2 }
+	  : { reference: await liveRead('reference') as RecordedReferenceV2,
+	    claim: await liveRead('claim') as RecordedClaimV2 }, relay: invocationRelay };
+      }, observe: async (_response, phase) => {
 	phases.push(phase);
 	return phase === 'prestart'
 	  ? { reference: await prestartRead('reference') as RoutedReferenceV2,
@@ -181,6 +202,16 @@ test('only the retained exact child after gate entry can read a recorded occurre
       nonce: 'f'.repeat(32), reservationToken: reserved.reservation.token })).ok, false,
       'a role-cap socket cannot impersonate the direct child IPC entry');
     await client.readRoutedReferenceV2(expected);
+    const beforeInvalidKey = verbs.length;
+    assert.equal((await send(grant.cap, 'read_invocation_binding', {
+      parentWorkflow: invocationKey.parentWorkflow, parentDefRef: invocationKey.parentDefRef,
+      callPath: invocationKey.callPath })).ok, false);
+    for (const changed of [{ ...invocationKey, parentWorkflow: 'other' },
+      { ...invocationKey, parentArtifactVersion: 2 },
+      { ...invocationKey, parentDefRef: { ...invocationKey.parentDefRef, workflowName: 'sibling' } }])
+      await assert.rejects(client.readInvocationBinding(changed), /routing broker unavailable/);
+    assert.equal(invocationReads, 0, 'wrong key cannot trigger direct parent relay reads');
+    assert.equal(verbs.length, beforeInvalidKey, 'wrong key is refused before a scoped order read');
     assert.equal((await client.heartbeat({ ...expected, holder: { kind: 'exec',
 	id: `${hostname()}:${record.pid}`, shiftId: 'shf_service' } })).text, 'ok');
     assert.equal(phases.at(-1), 'prestart');
@@ -193,6 +224,9 @@ test('only the retained exact child after gate entry can read a recorded occurre
       reservationId: 'lr_one', decisionId: 'decision', binding, claimId: 'run',
       orderId: 'run', attemptId: 'attempt_distinct', requested: null, selected,
       observation: { state: 'unknown' } } });
+    await assert.rejects(client.readInvocationBinding(invocationKey), /routing broker unavailable/,
+      'accepted report without entered child cannot downgrade to prestart read');
+    assert.equal(invocationReads, 0);
     assert.equal((await send(grant.cap, 'read_live_routed_reference_v2', {})).ok, false,
       'an accepted report before direct-child gate entry grants no live read');
     writeFileSync(permit, 'go');
@@ -201,6 +235,10 @@ test('only the retained exact child after gate entry can read a recorded occurre
     assert.equal(retainedChildLive(spawned.custody, spawned.pid), true,
       'successful IPC disconnect is not role exit');
     assert.deepEqual(terminalReasons, []);
+    assert.deepEqual(await client.readInvocationBinding(invocationKey), invocationRelay);
+    assert.deepEqual(invocationPhases, ['recorded-live']);
+    await assert.rejects(createRoutingChildClient({ ...handoff,
+      broker: grant.holder! }).readInvocationBinding(invocationKey), /routing broker unavailable/);
     now = 70_000;
     assert.equal((await client.heartbeat({ ...expected, holder: { kind: 'exec',
 	id: `${hostname()}:${record.pid}`, shiftId: 'shf_service' } })).text, 'ok',

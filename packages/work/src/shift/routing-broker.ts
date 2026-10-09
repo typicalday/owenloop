@@ -31,6 +31,7 @@ import { outputVersionForSubmission } from '../submit-proof.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import type { RoutedInputPair, RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
+import type { InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
 import { snapshotCommandPostrun, type CommandPostrunResponse,
   type CommandPostrunSnapshot } from './routing-command-postrun.ts';
 
@@ -134,6 +135,9 @@ export interface RoutedLaunchAuthority {
 /** Parent-owned input observation. The caller never supplies the phase or a URL. */
 export interface RoutedInputAuthority {
   observe(response: GetOrderResponse, phase: RoutedInputPhase): Promise<RoutedInputPair>;
+  validateInvocationKey?(key: InvocationRelayKey): boolean;
+  observeInvocation?(response: GetOrderResponse, phase: RoutedInputPhase,
+    key: InvocationRelayKey): Promise<{ pair: RoutedInputPair; relay: VerifiedInvocationReceipt | undefined }>;
 }
 export interface RoutingBroker {
   issue(args: { reservation: ChildReservation; routing: ReferenceRouting; identity: Identity;
@@ -1542,29 +1546,34 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
       return response;
     }
     case 'read_invocation_binding': {
-      if (scope !== 'role' || !exactKeys(body, ['parentWorkflow', 'parentDefRef', 'callPath'])
-	&& !exactKeys(body, ['parentWorkflow', 'parentDefRef', 'callPath', 'parentArtifactVersion']))
+      if (scope !== 'role' || !grant.inputAuthority?.observeInvocation
+	|| !exactKeys(body, ['parentWorkflow', 'parentDefRef', 'callPath', 'parentArtifactVersion']))
 	throw new Error('routing broker request refused');
       if (typeof body.parentWorkflow !== 'string' || !body.parentWorkflow
 	|| !exactKeys(body.parentDefRef, ['bundleDigest', 'workflowName'])
 	|| typeof body.parentDefRef.bundleDigest !== 'string' || !body.parentDefRef.bundleDigest
 	|| typeof body.parentDefRef.workflowName !== 'string' || !body.parentDefRef.workflowName
 	|| typeof body.callPath !== 'string' || !body.callPath
-	|| (body.parentArtifactVersion !== undefined && (!Number.isSafeInteger(body.parentArtifactVersion)
-	  || (body.parentArtifactVersion as number) < 1))) throw new Error('routing broker request refused');
-      const response = await checked(grant, grant.hub.readInvocationBinding({ workflow, orderId: run,
-	parentWorkflow: body.parentWorkflow, parentDefRef: {
-	  bundleDigest: body.parentDefRef.bundleDigest,
-	  workflowName: body.parentDefRef.workflowName,
-	},
-	callPath: body.callPath, ...(body.parentArtifactVersion === undefined
-	  ? {} : { parentArtifactVersion: body.parentArtifactVersion as number }) }, signal), now, true);
-      if (!response || response.protocol !== 'owenloop-binding-v1'
-	|| response.orgId !== grant.identity.orgId || response.freshness !== 'fresh-at-read'
-	|| response.atomicLaunch !== false || !response.binding || typeof response.binding.id !== 'string'
-	|| !response.binding.id || typeof response.bindingJson !== 'string'
-	|| typeof response.bindingDigest !== 'string') throw new Error('routing broker response refused');
-      return response;
+	|| !Number.isSafeInteger(body.parentArtifactVersion)
+	|| (body.parentArtifactVersion as number) < 1) throw new Error('routing broker request refused');
+      if (grant.acceptedLaunchReport && !liveChildValid(grant, now()))
+	throw new Error('routing recorded occurrence unavailable');
+      const phase: RoutedInputPhase = grant.acceptedLaunchReport ? 'recorded-live' : 'prestart';
+      const key: InvocationRelayKey = { parentWorkflow: body.parentWorkflow as string,
+	parentDefRef: { bundleDigest: body.parentDefRef.bundleDigest as string,
+	  workflowName: body.parentDefRef.workflowName as string },
+	callPath: body.callPath as string,
+	parentArtifactVersion: body.parentArtifactVersion as number };
+      if (grant.inputAuthority.validateInvocationKey?.(key) !== true)
+	throw new Error('routing invocation key refused');
+      const response = await verifyCurrentConsequence(grant, scope, now, signal, phase);
+      if (!response || !liveChildValid(grant, now()) && phase === 'recorded-live')
+	throw new Error('routing invocation order unavailable');
+      const observed = await checked(grant,
+	grant.inputAuthority.observeInvocation(response, phase, key), now, phase === 'prestart');
+      if (!observed.relay || phase === 'recorded-live' && !liveChildValid(grant, now()))
+	throw new Error('routing invocation witness unavailable');
+      return observed.relay;
     }
   }
 }
