@@ -469,6 +469,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     let staged: Map<string, ReturnType<typeof loadBundleDefFile>>;
     let externalVersionedCalls: ReadonlySet<string> = new Set();
     let deferredHubLiveCalls: ReadonlySet<string> = new Set();
+    let expandedCallTargets: readonly string[] = [];
     let stagedBundleLock: Readonly<Record<string, string>> = {};
     let stagedBundleDialect: 'plain' | 'hub-qualified' = 'plain';
     const manifestPath = join(stagingDir, 'bundle.yaml');
@@ -513,12 +514,6 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       staged = loadDefsRaw(stagingDir, failures);
       reasons.push(...failures.map((failure) => `${failure.file}: ${failure.error}`));
     }
-    if (existsSync(manifestPath)) {
-      externalVersionedCalls = new Set(
-		[...staged.values()].flatMap((def) => def.steps.map((step) => step.calls)
-		  .filter((target): target is string => target !== undefined && isVersionedReference(target))),
-      );
-    }
     for (const stagedDef of staged.values()) {
       const lintResult = lintDef(stagedDef);
       reasons.push(...lintResult.errors.map((err) => `${stagedDef.name}: ${err}`));
@@ -534,9 +529,17 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
     if (reasons.length === 0) {
       try {
+	const expandedStaged = new Map([...staged].map(([nodeKey, raw]) =>
+	  [nodeKey, expandIncludes(raw, member => staged.get(member))] as const));
+	expandedCallTargets = [...expandedStaged.values()].flatMap(def =>
+	  def.steps.map(step => step.calls).filter((target): target is string => target !== undefined));
+	if (existsSync(manifestPath)) {
+	  // Includes are authored steps too. Permit only their exact versioned
+	  // targets to remain unresolved at storage time for later locked recovery.
+	  externalVersionedCalls = new Set(expandedCallTargets.filter(isVersionedReference));
+	}
 	if (args.deferHubLiveCallsAtStorage === true && stagedBundleDialect === 'hub-qualified') {
-	  deferredHubLiveCalls = new Set([...staged.entries()].flatMap(([nodeKey, raw]) => {
-	    const def = expandIncludes(raw, member => staged.get(member));
+	  deferredHubLiveCalls = new Set([...expandedStaged.entries()].flatMap(([nodeKey, def]) => {
 	    return def.steps.filter(step => step.calls !== undefined
 	      && step.calls.includes('/') && isBundleWorkflowName(step.calls)
 	      && !isVersionedReference(step.calls)
@@ -613,7 +616,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       projectRoot: args.projectRoot,
       globalRoot: args.globalRoot,
       lock: stagedBundleLock,
-      callsTargets: [...staged.values()].flatMap((def) => def.steps.map((step) => step.calls).filter((target): target is string => target !== undefined)),
+      callsTargets: expandedCallTargets,
       ...(repairRequired ? { repairReplacement: { root, digest, objectDir: stagingDir } } : {}),
     });
 

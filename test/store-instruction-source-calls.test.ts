@@ -455,8 +455,15 @@ test('included exact locked call is recovered and verified before data-only or o
     workflowName: 'included-parent' });
   await assert.rejects(select(), (error: unknown) => error instanceof StoreIntegrityError
     && error.code === 'dependency-missing' && error.digest === child.result.digest);
-  await installBundleFixture({ root: worker, sourceDir: childSource });
-  const selected = await select();
+  const requested: string[] = [];
+  const selected = await verifyInstalledWorkflowMember({ globalRoot: worker,
+    verifier: createBundleIngestor(), bundleDigest: parentBundle.result.digest,
+    workflowName: 'included-parent', onMissing: { onMissing: async digest => {
+      requested.push(digest);
+      await installBundleFixture({ root: worker, sourceDir: childSource });
+      return 'retry';
+    } } });
+  assert.deepEqual(requested, [child.result.digest]);
   assert.deepEqual(new Set(selected.support.map(object => object.bundleDigest)),
     new Set([parentBundle.result.digest, child.result.digest]));
   assert.equal(await sourceAt(worker).prime(parentBundle.result.digest), 'resolved');
@@ -495,4 +502,24 @@ test('locked child includes resolve from the child archive despite a same-named 
   assert.equal(callsChild?.bundleDigest, child.result.digest);
   assert.deepEqual(callsChild?.definition.steps.map(step => step.name), ['nested.good']);
   assert.deepEqual(callsChild?.definition.outputs, ['nested.result']);
+});
+
+test('included exact named lock checks its selected member before bundle commit', async () => {
+  const publisher = tempDir('owenloop-included-named-publisher-');
+  const worker = tempDir('owenloop-included-named-worker-');
+  const coordinate = 'dep/change-unit@1.0.0';
+  const child = await installBundleFixture({ root: publisher,
+    sourceDir: writeBundleSource({ name: 'change-unit', workflow: CHILD }) });
+  addIndexEntry(publisher, coordinate, child.result.digest);
+  const target = `${coordinate}#missing`;
+  const parentSource = writeBundleSource({
+    name: 'parent',
+    workflow: `name: parent\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: [result]\n` },
+    lock: { [coordinate]: child.result.digest },
+  });
+  await assert.rejects(installBundleFixture({ root: worker, level: 'global',
+    projectRoot: publisher, globalRoot: worker, sourceDir: parentSource }),
+  /lock target 'dep\/change-unit@1\.0\.0' pinned to [0-9a-f]{64} is no longer exactly callable/);
+  assert.deepEqual(readWorkflowStoreIndex(storeIndexPath(worker)).entries, {});
 });
