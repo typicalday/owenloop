@@ -7,7 +7,8 @@ import type { RoutedClaimV2, RoutedReferenceV2 } from '../hosted/trusted-routed-
 import type { RecordedClaimV2, RecordedReferenceV2 } from '../hosted/trusted-routed-recorded-v2.ts';
 import type { RoutedQuiesceResult } from '../shift/routing-broker.ts';
 import type { VerifiedInvocationReceipt } from '../../../../src/types.ts';
-import type { CommandPostrunRequest, CommandPostrunResponse } from '../shift/routing-command-postrun.ts';
+import type { CommandPostrunRequest, CommandPostrunResponse,
+  CommandPostrunStatus } from '../shift/routing-command-postrun.ts';
 import { HubError, type GetOrderRequest, type GetOrderResponse, type HeartbeatRequest,
   type HeartbeatResponse, type LocalModelRequest, type LocalModelResponse,
   type LaunchReportV1, type LaunchReportResponse, type LaunchReservationRequestV1,
@@ -30,7 +31,7 @@ type Verb = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_lo
   | 'read_routed_reference_v2' | 'read_routing_claim_v2'
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'report_launch' | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'quiesce'
-  | 'command_postrun' | 'command_finish' | 'agent_outcome' | 'agent_finish'
+  | 'command_postrun' | 'command_postrun_status' | 'command_finish' | 'agent_outcome' | 'agent_finish'
   | 'request_approval' | 'read_invocation_binding';
 type CollectionVerb = Verb | 'collection_target' | 'emit_member' | 'seal_collection';
 
@@ -51,7 +52,8 @@ export interface RoutingChildClient {
   /** Freeze role and holder effects. ACK is local broker state, not a fleet seal. */
   quiesce(): Promise<RoutedQuiesceResult>;
   /** Data-only handoff; no child-selected target, signer, holder or URL. */
-  commandPostrun(req: CommandPostrunRequest): Promise<CommandPostrunResponse>;
+  commandPostrun(req: CommandPostrunRequest, signal?: AbortSignal, timeoutMs?: number): Promise<CommandPostrunResponse>;
+  commandPostrunStatus(bodyDigest: string, signal?: AbortSignal, timeoutMs?: number): Promise<CommandPostrunStatus>;
   /** Parent checks current native claim and uses only a targeted release. */
   commandFinish(req: { group: { scope: 'original-posix-group'; state: 'empty' } }
     | { observation: 'not-started' }):
@@ -88,6 +90,12 @@ export interface RoutingChildClient {
 }
 
 function refused(): Error { return new Error('routing broker unavailable'); }
+/** Only socket loss or timeout leaves the child unsure whether its exact
+ * request reached the parent. An authenticated refusal is never recoverable
+ * through the status read. */
+export class RoutingBrokerTransportLoss extends Error {
+  constructor() { super('routing broker transport lost'); }
+}
 
 export function createRoutingChildClient(handoff: {
   broker?: { socketPath: string; cap: string };
@@ -120,10 +128,10 @@ export function createRoutingChildClient(handoff: {
 	if (error) reject(error);
 	else resolve(value as T);
       };
-      const deadlineTimer = absoluteMs === undefined ? undefined : setTimeout(() => finish(refused()), absoluteMs);
+      const deadlineTimer = absoluteMs === undefined ? undefined : setTimeout(() => finish(new RoutingBrokerTransportLoss()), absoluteMs);
       const abort = () => finish(refused());
       signal?.addEventListener('abort', abort, { once: true });
-      socket.setTimeout(REQUEST_TIMEOUT_MS, () => finish(refused()));
+      socket.setTimeout(REQUEST_TIMEOUT_MS, () => finish(new RoutingBrokerTransportLoss()));
       socket.once('connect', () => socket.write(frame));
       socket.on('data', (chunk: Buffer) => {
 	length += chunk.length;
@@ -150,8 +158,8 @@ export function createRoutingChildClient(handoff: {
 	}
 	finish(refused());
       });
-      socket.once('error', () => finish(refused()));
-      socket.once('end', () => finish(refused()));
+      socket.once('error', () => finish(new RoutingBrokerTransportLoss()));
+      socket.once('end', () => finish(new RoutingBrokerTransportLoss()));
     });
   };
   const upload = (req: { workflow: string; size: number; chunks: AsyncIterable<Uint8Array>;
@@ -366,8 +374,8 @@ export function createRoutingChildClient(handoff: {
 				throw refused();
       return value as RoutedQuiesceResult;
     },
-    async commandPostrun(req) {
-      const value = await exchange<unknown>('command_postrun', req);
+    async commandPostrun(req, signal, timeoutMs) {
+      const value = await exchange<unknown>('command_postrun', req, timeoutMs, signal);
       if (!value || typeof value !== 'object' || Array.isArray(value)
         || Object.keys(value).sort().join(',') !== 'claim,outcome'
 	|| !['submitted', 'submit-rejected', 'rejected', 'judge-rejected', 'command-failed'].includes(
@@ -375,6 +383,24 @@ export function createRoutingChildClient(handoff: {
         || !['closed', 'held', 'uncertain'].includes(String((value as Record<string, unknown>).claim)))
         throw refused();
       return value as CommandPostrunResponse;
+    },
+    async commandPostrunStatus(bodyDigest, signal, timeoutMs) {
+      if (!/^[a-f0-9]{64}$/.test(bodyDigest)) throw refused();
+      const value = await exchange<unknown>('command_postrun_status', { bodyDigest }, timeoutMs, signal);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw refused();
+      const status = value as Record<string, unknown>;
+      if ((status.state === 'pending' || status.state === 'unavailable')
+	&& Object.keys(status).join(',') === 'state') return value as CommandPostrunStatus;
+      if (status.state === 'committed' && Object.keys(status).sort().join(',') === 'result,state') {
+	const result = status.result;
+	if (result && typeof result === 'object' && !Array.isArray(result)
+	  && Object.keys(result).sort().join(',') === 'claim,outcome'
+	  && ['submitted', 'submit-rejected', 'rejected', 'judge-rejected', 'command-failed'].includes(
+	    String((result as Record<string, unknown>).outcome))
+	  && ['closed', 'held', 'uncertain'].includes(String((result as Record<string, unknown>).claim)))
+	  return value as CommandPostrunStatus;
+      }
+      throw refused();
     },
     async commandFinish(req) {
       const value = await exchange<unknown>('command_finish', req);

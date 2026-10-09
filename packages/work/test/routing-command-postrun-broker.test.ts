@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
+import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
@@ -12,6 +13,7 @@ import { createHubClient } from '../src/hub/client.ts';
 import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
 import type { DecisionBindingV1, OrderPacket, ReferenceRouting } from '../src/hub/types.ts';
 import { createRoutingBroker } from '../src/shift/routing-broker.ts';
+import { commandPostrunBodyDigest } from '../src/shift/routing-command-postrun.ts';
 import { createDefaultSpawner } from '../src/shift/spawn.ts';
 import { finalizeChildReservation, reserveChild, startReservedChild } from '../src/shift/state.ts';
 
@@ -50,7 +52,7 @@ async function waitFor(path: string): Promise<void> {
   throw new Error('routed child did not enter');
 }
 
-for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submit-ack',
+for (const scenario of ['normal', 'child-ack-lost', 'submit-held', 'drift-after-sign', 'lost-submit-ack',
   'malformed-submit-ack',
   'receipt-pending-then-committed', 'receipt-unavailable', 'revoked-during-receipt',
   'schema-rejected', 'born-rejected', 'no-start',
@@ -262,11 +264,39 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
       workflow: 'wf', run: 'run', step: 'build' }, parsed);
     const packet = { result, receipt, parsed: rejection ? { reject: parsed.reject } : {}, group: {
       scope: 'original-posix-group' as const, state: 'empty' as const } };
+    const bodyDigest = commandPostrunBodyDigest(packet);
     await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/,
       'postrun is unavailable before quiesce');
+    await assert.rejects(client.commandPostrunStatus(bodyDigest), /routing broker unavailable/);
     assert.deepEqual(await client.quiesce(), { quiescing: true, effects: 'settled' });
+    if (scenario === 'child-ack-lost') {
+      // The parent completes the real socket request, but this role discards
+      // its final frame. Status reads the cached authenticated result only.
+      await new Promise<void>((resolve, reject) => {
+	const socket = createConnection(broker.socketPath);
+	const timer = setTimeout(() => { socket.destroy(); reject(new Error('postrun ACK not sent')); }, 5_000);
+	socket.once('connect', () => socket.write(JSON.stringify({ cap: grant.cap,
+	  method: 'command_postrun', body: packet }) + '\n'));
+	socket.once('data', () => { clearTimeout(timer); socket.destroy(); resolve(); });
+	socket.once('error', error => { clearTimeout(timer); reject(error); });
+      });
+      const readsBeforeStatus = requests.filter(row => row.route === 'get_order').length;
+      assert.deepEqual(await client.commandPostrunStatus(bodyDigest),
+	{ state: 'committed', result: { outcome: 'submitted', claim: 'closed' } });
+      assert.deepEqual(await client.commandPostrunStatus('f'.repeat(64)), { state: 'unavailable' });
+      assert.equal(signs, 1);
+      assert.equal(submits, 1);
+      assert.equal(requests.filter(row => row.route === 'get_order').length, readsBeforeStatus,
+	'cached status performs no closed-run order read');
+      assert.equal((await client.commandFinish({ group: packet.group })).state, 'already-closed');
+      currentIdentity = undefined;
+      await assert.rejects(client.commandPostrunStatus(bodyDigest), /routing broker unavailable/,
+	'a rotated original session cannot read the old cached outcome');
+      return;
+    }
     if (scenario === 'drift-after-sign') {
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
+      assert.deepEqual(await client.commandPostrunStatus(bodyDigest), { state: 'unavailable' });
       assert.equal(signs, 1);
       assert.equal(requests.filter(row => row.route === 'routing_submit_conditional/v1').length, 0,
         'a changed recorded witness after signing cannot publish a receipt');
@@ -285,6 +315,7 @@ for (const scenario of ['normal', 'submit-held', 'drift-after-sign', 'lost-submi
     }
     if (scenario === 'ask-lost-ack' || scenario === 'reject-lost-ack') {
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
+      assert.deepEqual(await client.commandPostrunStatus(bodyDigest), { state: 'unavailable' });
       await assert.rejects(client.commandPostrun(packet), /routing broker unavailable/);
       const route = scenario === 'ask-lost-ack' ? 'routing_ask/v1' : 'routing_reject/v1';
       assert.equal(requests.filter(row => row.route === route).length, 1,

@@ -16,13 +16,16 @@ import type { DecisionBindingV1, ReferenceRouting, WorkOrder } from '../src/hub/
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import { stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
 import { prepareRoutedCommandRunner } from '../src/roles/routing-command-runner.ts';
+import { commandPostrunBodyDigest } from '../src/shift/routing-command-postrun.ts';
 
 const rootWorkflow = 'root', frameWorkflow = 'wf_child_instance';
 const definitionName = 'routing/child', run = 'native-run';
 const sessionId = 'rs_12345678-1234-1234-1234-123456789abc';
 
 async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
-  postrunClaim?: 'closed' | 'held'; command?: string } = {}) {
+  postrunClaim?: 'closed' | 'held'; postrunLostAck?: boolean;
+  postrunLostAckBeforeCache?: boolean; postrunSemanticRefusal?: boolean;
+  statusPending?: boolean; command?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ol-routed-command-role-'));
   chmodSync(root, 0o700);
   const home = join(root, 'operator-home'), stateDir = join(root, 'state');
@@ -105,6 +108,7 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
   const socketPath = join(socketDir, 'broker.sock');
   const events: string[] = [];
   const errors: string[] = [];
+  let cachedPostrunDigest: string | undefined;
   const server: Server = createServer(socket => {
     let text = '';
     socket.on('data', chunk => {
@@ -127,6 +131,11 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
 	  recordedAt: now, provenance: 'authenticated-worker-report' }; break;
 	case 'quiesce': value = { quiescing: true, effects: 'settled' }; break;
 	case 'command_postrun': {
+	  if (options.postrunLostAckBeforeCache) { socket.destroy(); return; }
+	  if (options.postrunSemanticRefusal) {
+	    socket.end(JSON.stringify({ ok: false, status: 409 }) + '\n');
+	    return;
+	  }
 	  const receipt = request.body.receipt as Record<string, unknown>;
 	  assert.equal(receipt.command, command);
 	  assert.equal(receipt.exitCode, 0);
@@ -134,8 +143,16 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
 	  assert.equal(readFileSync(join(workRoot, rootWorkflow, run, 'started.txt'), 'utf8'), 'x');
 	  assert.equal(readFileSync(join(workRoot, rootWorkflow, run, 'live.txt'), 'utf8'), 'live');
 	  value = { outcome: 'submitted', claim: options.postrunClaim ?? 'closed' };
+	  cachedPostrunDigest = commandPostrunBodyDigest(request.body);
+	  if (options.postrunLostAck) { socket.destroy(); return; }
 	  break;
 	}
+	case 'command_postrun_status':
+	  value = options.statusPending ? { state: 'pending' }
+	    : request.body.bodyDigest === cachedPostrunDigest
+	    ? { state: 'committed', result: { outcome: 'submitted', claim: options.postrunClaim ?? 'closed' } }
+	    : { state: 'unavailable' };
+	  break;
 	case 'command_finish': value = { state: 'released' }; break;
 	default: throw new Error(`unexpected fixture broker method ${request.method}`);
       }
@@ -174,6 +191,76 @@ test('real routed command composition executes signed nested frame in writable c
     await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
     f.stage.cleanup();
     rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('lost child-facing postrun ACK reads one cached parent result without another command or postrun', async () => {
+  const f = await fixture({ postrunLostAck: true });
+  try {
+    const prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
+      originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
+      out: () => {}, err: line => f.errors.push(line) });
+    assert.equal(await prepared.run(), 'submitted', f.errors.join('\n'));
+    assert.equal(f.events.filter(method => method === 'command_postrun').length, 1);
+    assert.equal(f.events.filter(method => method === 'command_postrun_status').length, 1);
+    assert.equal(f.events.filter(method => method === 'command_finish').length, 0);
+    assert.equal(readFileSync(join(f.root, 'work', rootWorkflow, run, 'started.txt'), 'utf8'), 'x');
+  } finally {
+    await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
+    f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('authenticated postrun refusal never reads cached status or replays a command', async () => {
+  const f = await fixture({ postrunSemanticRefusal: true });
+  try {
+    const prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
+      originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
+      out: () => {}, err: line => f.errors.push(line) });
+    assert.equal(await prepared.run(), 'routed-quarantined');
+    assert.equal(f.events.filter(method => method === 'command_postrun').length, 1);
+    assert.equal(f.events.filter(method => method === 'command_postrun_status').length, 0);
+    assert.equal(readFileSync(join(f.root, 'work', rootWorkflow, run, 'started.txt'), 'utf8'), 'x');
+  } finally {
+    await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
+    f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('socket loss before any parent result preserves quarantine with no replay', async () => {
+  const f = await fixture({ postrunLostAckBeforeCache: true });
+  try {
+    const prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
+      originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
+      out: () => {}, err: line => f.errors.push(line) });
+    assert.equal(await prepared.run(), 'routed-quarantined');
+    assert.equal(f.events.filter(method => method === 'command_postrun').length, 1);
+    assert.equal(f.events.filter(method => method === 'command_postrun_status').length, 1);
+    assert.equal(f.events.filter(method => method === 'command_finish').length, 0);
+    assert.equal(readFileSync(join(f.root, 'work', rootWorkflow, run, 'started.txt'), 'utf8'), 'x');
+  } finally {
+    await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
+    f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('stop during cached-status wait cannot accept a later command result', async () => {
+  const f = await fixture({ postrunLostAck: true, statusPending: true });
+  try {
+    const prepared = await prepareRoutedCommandRunner({ handoff: f.handoff,
+      originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
+      out: () => {}, err: line => f.errors.push(line) });
+    const running = prepared.run();
+    for (let index = 0; index < 500 && !f.events.includes('command_postrun_status'); index++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(f.events.includes('command_postrun_status'));
+    prepared.loop.stop();
+    assert.equal(await running, 'routed-quarantined');
+    assert.equal(f.events.filter(method => method === 'command_postrun').length, 1);
+    assert.equal(f.events.filter(method => method === 'command_finish').length, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => f.server.close(error => error ? reject(error) : resolve()));
+    f.stage.cleanup(); rmSync(f.root, { recursive: true, force: true });
   }
 });
 

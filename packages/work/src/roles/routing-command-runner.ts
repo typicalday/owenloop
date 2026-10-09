@@ -3,15 +3,18 @@
 import { hostname } from 'node:os';
 import { dirname } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import { createExecLoop, type ExecLoop, type ExecOutcome } from '../exec/loop.ts';
 import { createRoutedGroupRunner } from '../exec/runner.ts';
 import type { RoutedExecutionController } from '../exec/routed-loop.ts';
 import type { ContactHolder } from '../hub/types.ts';
+import { RoutingBrokerTransportLoss } from '../hub/routing-child-client.ts';
 import { createTrustedRoutedInputV2Admission } from '../hosted/trusted-input-admission.ts';
 import { createBrokerRoutedReferenceV2Reader } from '../hosted/trusted-routed-reference-v2.ts';
 import type { RoutingHandoffV1 } from '../shift/runtime.ts';
+import { commandPostrunBodyDigest } from '../shift/routing-command-postrun.ts';
 import { createRoutedCommandPrestart } from './routing-command-launch.ts';
 import { assertRoutedAgentWorkdirDisjoint, planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
 import { createRoutingRoleClient } from './routing-role-client.ts';
@@ -91,10 +94,33 @@ export async function prepareRoutedCommandRunner(args: {
       if (ctx.signal.aborted || performance.now() >= ctx.deadlineAt
 	|| group.scope !== 'original-posix-group' || group.state !== 'empty') throw refused();
       const { payloadLine: _line, payloadOverCap: _overCap, ...dataResult } = result;
-      return child.commandPostrun({ result: dataResult, receipt,
+      const request = { result: dataResult, receipt,
 	parsed: { ...(payload.reject ? { reject: payload.reject } : {}),
 	  ...(payload.payloadError ? { payloadError: payload.payloadError } : {}) },
-	group: { scope: 'original-posix-group', state: 'empty' } });
+	group: { scope: 'original-posix-group' as const, state: 'empty' as const } };
+      const bodyDigest = commandPostrunBodyDigest(request);
+      const remaining = () => Math.floor(ctx.deadlineAt - performance.now());
+      try {
+	if (remaining() <= 0 || ctx.signal.aborted) throw refused();
+	const answer = await child.commandPostrun(request, ctx.signal, Math.min(30_000, remaining()));
+	if (remaining() <= 0 || ctx.signal.aborted) throw refused();
+	return answer;
+      } catch (error) {
+	// A semantic refusal or malformed parent response is never converted to
+	// success. Only a lost socket may query a result the parent cached already.
+	if (!(error instanceof RoutingBrokerTransportLoss) || ctx.signal.aborted) throw error;
+      }
+      const recoveryDeadlineAt = Math.min(ctx.deadlineAt, performance.now() + 10_000);
+      const recoveryRemaining = () => Math.floor(recoveryDeadlineAt - performance.now());
+      while (recoveryRemaining() > 0 && !ctx.signal.aborted) {
+	const status = await child.commandPostrunStatus(bodyDigest, ctx.signal,
+	  Math.min(1_000, recoveryRemaining()));
+	if (recoveryRemaining() <= 0 || ctx.signal.aborted) throw refused();
+	if (status.state === 'committed') return status.result;
+	if (status.state === 'unavailable') break;
+	await delay(Math.min(50, recoveryRemaining()), undefined, { signal: ctx.signal });
+      }
+      throw refused();
     },
     targetedRelease: async (_order, _reason, observation, ctx) => {
       if (ctx.signal.aborted || performance.now() >= ctx.deadlineAt) throw refused();

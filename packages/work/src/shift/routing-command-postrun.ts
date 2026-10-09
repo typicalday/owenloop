@@ -1,7 +1,7 @@
 /** Parent-owned copy of a routed command's asserted result. The role supplies
  * bytes, never a target, holder, signer, URL or physical-start proof. */
 import { isDeepStrictEqual } from 'node:util';
-import { canonicalValueBytes } from '../../../../src/crypto/canonical.ts';
+import { canonicalValueBytes, valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import { buildReceipt, type CommandReceipt } from '../exec/receipt.ts';
 import type { ParsedPayload, RejectDirective } from '../exec/payload.ts';
 import type { CommandResult } from '../exec/runner.ts';
@@ -16,6 +16,14 @@ export interface CommandPostrunRequest {
 export interface CommandPostrunResponse {
   outcome: 'submitted' | 'submit-rejected' | 'rejected' | 'judge-rejected' | 'command-failed';
   claim: 'closed' | 'held' | 'uncertain';
+}
+export type CommandPostrunStatus = { state: 'pending' | 'unavailable' }
+  | { state: 'committed'; result: CommandPostrunResponse };
+
+/** Hash the exact JSON-shaped child packet, including JSON omission of undefined
+ * fields. The parent hashes the parsed socket body with the same function. */
+export function commandPostrunBodyDigest(value: CommandPostrunRequest | unknown): string {
+  return valueDigestHex(JSON.parse(JSON.stringify(value)));
 }
 export interface CommandPostrunSnapshot {
   /** Exact canonical bytes retained for signing and identical uncertain replay. */

@@ -32,7 +32,8 @@ import { normalizeSubmitValue } from '../submit-value.ts';
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 import type { RoutedInputPair, RoutedInputPhase } from '../hosted/trusted-input-admission.ts';
 import type { InvocationRelayKey, VerifiedInvocationReceipt } from '../../../../src/types.ts';
-import { snapshotCommandPostrun, type CommandPostrunResponse,
+import { commandPostrunBodyDigest, snapshotCommandPostrun, type CommandPostrunResponse,
+  type CommandPostrunStatus,
   type CommandPostrunSnapshot } from './routing-command-postrun.ts';
 
 // Service permits artifact values up to 25 MB. Leave bounded JSON overhead
@@ -54,7 +55,7 @@ type Method = 'get_order' | 'get_launch_order' | 'read_routing_claim' | 'assess_
   | 'read_live_routed_reference_v2' | 'read_live_routing_claim_v2'
   | 'heartbeat' | 'submit' | 'release' | 'ask' | 'reject' | 'request_approval'
   | 'read_invocation_binding' | 'collection_target' | 'emit_member' | 'seal_collection' | 'quiesce'
-  | 'command_postrun' | 'command_finish' | 'agent_outcome' | 'agent_finish';
+  | 'command_postrun' | 'command_postrun_status' | 'command_finish' | 'agent_outcome' | 'agent_finish';
 type CapScope = 'role' | 'holder';
 export type RoutedQuiesceResult = { quiescing: true; effects: 'settled' | 'uncertain' };
 interface Grant {
@@ -111,7 +112,8 @@ interface Grant {
   collectionSeal?: { intent: string; request?: RoutedCollectionSealRequest;
     result?: RoutedCollectionWriteResponse };
   commandFor?: (order: import('../hub/types.ts').OrderPacket) => Promise<string>;
-  postrun?: { intent: string; command: string; step: string;
+  postrun?: { intent: string; bodyDigest: string; childGeneration: NonNullable<Grant['liveChild']>;
+    command: string; step: string;
     snapshot: CommandPostrunSnapshot; nextOwe: number;
     paths: Array<{ path: string; kind: 'singleton' | 'collection' }>;
     judge?: string; rejectDone: boolean; askOrRejectDispatched: boolean;
@@ -925,7 +927,8 @@ async function commandPostrun(grant: Grant, body: unknown, now: () => number,
       if (paths.some(row => row.kind === 'singleton'
         && grant.submissionAuthority!.canSubmit(current!.order!, row.path) !== true))
         throw new Error('routing command output kind unavailable');
-      grant.postrun = { intent, command, step: current!.order!.step, snapshot, paths, nextOwe: 0,
+	grant.postrun = { intent, bodyDigest: commandPostrunBodyDigest(body),
+	  childGeneration: grant.liveChild!, command, step: current!.order!.step, snapshot, paths, nextOwe: 0,
         ...(current!.order!.judge ? { judge: current!.order!.judge } : {}),
         rejectDone: false, askOrRejectDispatched: false };
     }
@@ -1044,6 +1047,35 @@ async function commandPostrun(grant: Grant, body: unknown, now: () => number,
     const claim = pending.terminalClosed ? 'closed' : await postrunClaim(grant, now, signal);
     return pending.result = { outcome: 'submitted', claim };
   } finally { grant.postrunBusy = false; }
+}
+
+/** A lost child-facing ACK can read only a result already authenticated and
+ * cached by this parent. It never invokes Hub or advances a postrun intent. */
+async function commandPostrunStatus(grant: Grant, body: unknown, now: () => number,
+  signal: AbortSignal): Promise<CommandPostrunStatus> {
+  if (!exactKeys(body, ['bodyDigest']) || typeof body.bodyDigest !== 'string'
+    || !/^[a-f0-9]{64}$/.test(body.bodyDigest)
+    || grant.reservation.childKind !== 'exec' || !grant.quiescing || !grant.quiesceResult
+    || !grant.acceptedLaunchReport || signal.aborted || !liveChildValid(grant, now()))
+    throw new Error('routing command postrun status unavailable');
+  const postrun = grant.postrun;
+  if (!postrun || postrun.bodyDigest !== body.bodyDigest
+    || postrun.childGeneration !== grant.liveChild)
+    return { state: 'unavailable' };
+  const frozen = await grant.quiesceResult;
+  if (signal.aborted || !liveChildValid(grant, now())
+    || postrun !== grant.postrun || postrun.childGeneration !== grant.liveChild)
+    throw new Error('routing command postrun status revoked');
+  if (frozen.effects !== 'settled' || grant.pendingSubmit
+    || grant.inFlightEffects.size || grant.uncertainEffects.size || grant.effectLedger.size
+    || grant.effectLedgerOverflow || grant.collectionBusy
+    || grant.postrunRelease?.dispatched && !grant.postrunRelease.response
+    || grant.collectionMember?.emit && !grant.collectionMember.result
+    || grant.collectionSeal?.request && !grant.collectionSeal.result)
+    return { state: 'unavailable' };
+  if (!postrun.result) return { state: grant.postrunBusy ? 'pending' : 'unavailable' };
+  if (postrun.result.claim === 'uncertain') return { state: 'unavailable' };
+  return { state: 'committed', result: postrun.result };
 }
 
 async function commandFinish(grant: Grant, body: unknown, now: () => number,
@@ -1205,6 +1237,10 @@ async function invoke(grant: Grant, scope: CapScope, method: Method, body: unkno
   if (method === 'command_postrun') {
     if (scope !== 'role') throw new Error('routing broker request refused');
     return commandPostrun(grant, body, now, signal);
+  }
+  if (method === 'command_postrun_status') {
+    if (scope !== 'role') throw new Error('routing broker request refused');
+    return commandPostrunStatus(grant, body, now, signal);
   }
   if (method === 'command_finish') {
     if (scope !== 'role') throw new Error('routing broker request refused');
@@ -1800,7 +1836,7 @@ export async function createRoutingBroker(args: { now?: () => number;
       'read_live_routed_reference_v2', 'read_live_routing_claim_v2',
 	    'reserve_launch', 'report_launch', 'heartbeat', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'read_invocation_binding', 'collection_target', 'emit_member', 'seal_collection',
-	    'quiesce', 'command_postrun', 'command_finish', 'agent_outcome', 'agent_finish'];
+	    'quiesce', 'command_postrun', 'command_postrun_status', 'command_finish', 'agent_outcome', 'agent_finish'];
 	  if (!methods.includes(request.method)) throw new Error();
 	  const effect = ['reserve_launch', 'report_launch', 'submit', 'release', 'ask', 'reject',
 	    'request_approval', 'emit_member', 'seal_collection'].includes(request.method);
