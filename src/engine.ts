@@ -1043,8 +1043,7 @@ export class Engine {
     if (parentAtSelection === undefined) return null;
     const selectedParentSnapshot = parentAtSelection.defSnapshot;
     if (step.calls !== undefined && selectedParentSnapshot !== undefined
-      && (parentAtSelection.def !== parentDef.name
-	|| !deepEqual(selectedParentSnapshot, parentDef))) return null;
+      && !deepEqual(selectedParentSnapshot, parentDef)) return null;
     // B2: the gate fingerprint of the exact in-tx snapshot the seed/re-provide
     // validation ran against. Captured fresh inside `run()` so a retry re-reads
     // it; carried out on a `SchemaRefusalError` so `recordCallsSchemaReject` can
@@ -1136,7 +1135,7 @@ export class Engine {
 	    || !deepEqual(parentRow.defSnapshot, selectedParentSnapshot)) return null;
 	  if (selectedParentSnapshot !== undefined) {
 	    const freshStep = parentRow.defSnapshot?.steps.find(candidate => candidate.name === step.name);
-	    if (parentRow.def !== parentDef.name || !freshStep || !deepEqual(freshStep, step)
+	    if (!freshStep || !deepEqual(freshStep, step)
 	      || freshStep.calls !== step.calls
 	      || freshStep.produces[0]?.stem !== callsStem) return null;
 	  }

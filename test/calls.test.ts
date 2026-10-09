@@ -199,6 +199,41 @@ test('concrete calls resolver receives only native parent coordinates and refuse
   }
 });
 
+test('concrete occurrence guard permits a named-coordinate child whose authored name differs from its persisted lookup', () => {
+  const childCoordinate = 'package/child@1.0.0#child';
+  const grandchild = { ...def('grandchild', [], [step({ name: 'work', produces: ['result'] })]),
+    outputs: ['result'] };
+  const child = { ...def('child', [], [{ ...step({ name: 'spawn', produces: ['nested'] }),
+    calls: 'grandchild', callsInputs: {}, consumes: [] }]), outputs: ['nested'] };
+  const parent = def('parent', [], [{ ...step({ name: 'spawn', produces: ['childResult'] }),
+    calls: childCoordinate, callsInputs: {}, consumes: [] }]);
+  const store = openStore(':memory:');
+  const occurrences: ConcreteCallOccurrence[] = [];
+  try {
+    const engine = new Engine(store, (name, _from, _digest, occurrence) => {
+      if (occurrence) occurrences.push(occurrence);
+      if (name === parent.name) return parent;
+      if (name === childCoordinate) return child;
+      if (name === grandchild.name) return grandchild;
+      throw new Error(`no def: ${name}`);
+    });
+    const parentId = engine.createInstance(parent.name);
+    engine.tick(parentId, { deep: false });
+    const childRow = store.findChildByParent(parentId, 'childResult');
+    assert.ok(childRow);
+    assert.equal(childRow.def, childCoordinate);
+    assert.equal(childRow.defSnapshot?.name, child.name);
+    engine.tick(childRow.id, { deep: false });
+    assert.ok(store.findChildByParent(childRow.id, 'nested'));
+    assert.deepEqual(occurrences, [
+      { parentWorkflowId: parentId, parentStepName: 'spawn', parentPath: 'childResult' },
+      { parentWorkflowId: childRow.id, parentStepName: 'spawn', parentPath: 'nested' },
+    ]);
+  } finally {
+    store.close();
+  }
+});
+
 // ---- callsInterface: immutable start-time binding ---------------------------
 
 const INTERFACE_DIGEST = 'a'.repeat(64);
