@@ -12,6 +12,27 @@ import type { RoutedInputPair, RoutedInputPhase } from '../hosted/trusted-input-
 
 const refused = (): Error => new Error('routed invocation source refused');
 
+/** The v2 input read intentionally omits get_order's mutable owed reason
+ * threads, schema hints and advisory human proof. Compare only the claim-bound
+ * identity and input version fields needed to choose the signed producer key;
+ * the full v2 binder below still verifies the entire input witness. */
+function samePreboundOrder(reference: OrderPacket, current: OrderPacket,
+  rootWorkflow: string, selected: VerifiedDefinitionSelection): boolean {
+  const binding = current.routing?.claim.binding;
+  return reference.workflow === current.workflow && reference.run === current.run
+    && reference.step === current.step && reference.key === current.key
+    && reference.index === current.index && reference.defDigest === current.defDigest
+    && reference.defDigest === selected.bundleDigest
+    && reference.workdir === current.workdir
+    && isDeepStrictEqual(reference.inputs, current.inputs)
+    && isDeepStrictEqual(reference.consumedFingerprint, current.consumedFingerprint)
+    && isDeepStrictEqual(reference.routing, current.routing)
+    && binding?.runId === rootWorkflow && binding.frameId === current.workflow
+    && binding.def.bundleDigest === `sha256:${selected.bundleDigest}`
+    && binding.def.workflowName === selected.definition.name
+    && isDeepStrictEqual(binding, current.routing?.decision.binding);
+}
+
 export function createParentRoutedInvocationSource(args: {
   expected: { workflow: string; run: string }; order: OrderPacket;
   selected: VerifiedDefinitionSelection; pair: RoutedInputPair; phase: RoutedInputPhase;
@@ -33,7 +54,7 @@ export function createParentRoutedInvocationSource(args: {
     if (reference.state !== 'available' || claim.state !== 'available'
       || !isDeepStrictEqual(reference.binding, claim.binding)
       || !isDeepStrictEqual(reference.order.routing, claim.routing)
-      || !isDeepStrictEqual(reference.order, args.order)
+      || !samePreboundOrder(reference.order, args.order, args.expected.workflow, args.selected)
       || reference.binding.frameWorkflow !== args.order.workflow)
       throw refused();
     return { reference, claim };
