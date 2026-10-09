@@ -1534,7 +1534,7 @@ test('routed command and agent launch requests verify one final input witness af
     const pair = () => ({ reference: { protocol: 'trusted-routed-reference-read-v2' as const,
       state: 'available' as const, workflow: 'wf', run: 'run',
       order: { ...packet, owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
-      inputs: [], lease: { claimed: true }, binding: pairBinding },
+      inputs: [], lease: { claimed: true as const }, binding: pairBinding },
     claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
       workflow: 'wf', run: 'run', routing: routed, binding: pairBinding } });
     let getOrders = 0, observes = 0, selections = 0, writes = 0;
