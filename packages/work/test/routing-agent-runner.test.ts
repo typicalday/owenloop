@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { prepareRoutedAgentRunner } from '../src/roles/routing-agent-runner.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 
@@ -14,10 +15,15 @@ function fixture() {
   for (const name of ['public', 'home']) mkdirSync(join(stagePath, name), { mode: 0o700 });
   chmodSync(stagePath, 0o700);
   const digest = 'a'.repeat(64);
+  const emptySnapshot = '[]';
+  writeFileSync(join(stagePath, 'concrete-calls.json'), emptySnapshot, { mode: 0o600 });
+  writeFileSync(join(stagePath, 'concrete-folded.json'), emptySnapshot, { mode: 0o600 });
   writeFileSync(join(stagePath, 'stage.json'), JSON.stringify({
     version: 'routing-definition-stage-v2', rootWorkflow: 'wf', frameWorkflow: 'wf',
     definitionName: 'wf', routed: true, run: 'run', step: 'build',
     digest, bundleDigest: 'b'.repeat(64), nonce: 'c'.repeat(32), originRules: {},
+    concreteCallsDigest: valueDigestHex([]), concreteCallsBytes: Buffer.byteLength(emptySnapshot),
+    concreteFoldedDigest: valueDigestHex([]), concreteFoldedBytes: Buffer.byteLength(emptySnapshot),
   }), { mode: 0o600 });
   const now = Date.now();
   const socketPath = join(tmpdir(), 'ol-rb-ABCDEF', 'broker.sock');

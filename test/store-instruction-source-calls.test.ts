@@ -268,7 +268,12 @@ test('routed calls graph keeps two native occurrences of one signed member separ
     new Set([parent.result.digest, first.result.digest, second.result.digest]));
   assert.equal(source.selectVerifiedDefinition(parent.result.digest, 'sub', 'delegate'), undefined);
   assert.equal(source.getRoutedSelections?.(parent.result.digest, 'routing/parent')?.length, 2);
-  await assert.rejects(sourceAt(root).prime(parent.result.digest), /calls names workflow|does not exist|declares no outputs/);
+  const ordinary = sourceAt(root);
+  assert.equal(await ordinary.prime(parent.result.digest), 'resolved');
+  const ordinarySibling = ordinary.selectVerifiedDefinition(parent.result.digest, 'sub', 'delegate')
+    ?.callsChild('delegate');
+  assert.equal(ordinarySibling?.bundleDigest, parent.result.digest);
+  assert.equal(ordinarySibling?.definition.name, 'routing/live');
   await assert.rejects(source.prime(first.result.digest), /cannot prime another occurrence/);
   assert.equal(source.selectVerifiedWorkflow(first.result.digest, 'routing/live'), undefined);
 });
@@ -300,11 +305,9 @@ test('installer stores an unresolved Hub live slash but ordinary execution stays
       .replace('calls: routing/missing', 'calls: routing/missing@1.0.0') },
     defaultWorkflow: 'routing/parent', lock: { 'routing/missing@1.0.0': 'f'.repeat(64) },
   }), 'parent', 'routing/parent');
-  const locked = await installBundleFixture({ root: lockedRoot, sourceDir: lockedSource,
-    deferHubLiveCallsAtStorage: true });
-  await assert.rejects(sourceAt(lockedRoot).prime(locked.result.digest),
-    (error: unknown) => error instanceof StoreIntegrityError
-      && error.code === 'dependency-missing' && error.digest === 'f'.repeat(64));
+  await assert.rejects(installBundleFixture({ root: lockedRoot, sourceDir: lockedSource,
+    deferHubLiveCallsAtStorage: true }),
+  /lock target 'routing\/missing@1\.0\.0' pinned to f{64} is no longer exactly callable/);
 });
 
 test('integrity-only selected member recovery never creates executable cache', async () => {
