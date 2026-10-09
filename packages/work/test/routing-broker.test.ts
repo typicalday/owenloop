@@ -10,7 +10,7 @@ import { PassThrough, Readable } from 'node:stream';
 import { test } from 'node:test';
 
 import { createHubClient } from '../src/hub/client.ts';
-import { createRoutingChildClient } from '../src/hub/routing-child-client.ts';
+import { createRoutingChildClient, RoutingBrokerTransportLoss } from '../src/hub/routing-child-client.ts';
 import { createRoutingHolderClient } from '../src/hub/routing-holder-client.ts';
 import { parseRoutedReferenceV2, type RoutedClaimV2,
   type RoutedReferenceV2 } from '../src/hosted/trusted-routed-reference-v2.ts';
@@ -449,7 +449,7 @@ test('child transport keeps lifecycle bound to one live session after launch win
     assert.equal('getToken' in client, false);
     assert.throws(() => createRoutingChildClient({ ...handoffFor(grant), broker: undefined }), /broker unavailable/);
     const absent = createRoutingChildClient(handoffFor({ socketPath: join(tmpdir(), 'absent-routing-broker.sock'), cap: grant.cap }));
-    await assert.rejects(absent.heartbeat({ workflow: 'wf', run: 'run', holder }), /broker unavailable/);
+    await assert.rejects(absent.heartbeat({ workflow: 'wf', run: 'run', holder }), RoutingBrokerTransportLoss);
     assert.throws(() => client.getOrder({ workflow: 'other', run: 'run', holder }), /binding refused/);
     assert.equal((await client.getOrder({ workflow: 'wf', run: 'run', holder })).lease.claimed, true);
     await assert.rejects(client.submit({ workflow: 'wf', run: 'run', path: 'unowed', value: 'wrong', holder }),
