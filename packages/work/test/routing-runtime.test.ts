@@ -182,7 +182,11 @@ test('role startup consumes an incomplete private handoff before any legacy effe
     const env: Record<string, string | undefined> = { HOME: root, OWENLOOP_ROUTING_HANDOFF: agent.path,
       OWENLOOP_ROUTING_SESSION: '1', OWENLOOP_TOKEN: 'ambient-secret' };
     const errors: string[] = [];
-    assert.equal(await runAgent(['wf/agent', '--origin', origin], { env, err: line => errors.push(line) }), 1);
+    assert.equal(await runAgent(['wf/agent', '--origin', origin, '--shift', 'shf_service',
+      '--harness', 'operator-choice'], { env, err: line => errors.push(line) }), 1);
+    assert.equal(existsSync(agent.path), true, 'an argv selection override cannot consume or launch');
+    assert.equal(await runAgent(['wf/agent', '--origin', origin, '--shift', 'shf_service'],
+      { env, err: line => errors.push(line) }), 1);
     assert.match(errors.at(-1)!, /routing handoff refused/);
     assert.equal(env.OWENLOOP_TOKEN, undefined);
     assert.equal(env.OWENLOOP_ROUTING_HANDOFF, undefined);
@@ -191,10 +195,22 @@ test('role startup consumes an incomplete private handoff before any legacy effe
 
     const command = session.createHandoff(reserve('command', 'exec'));
     const commandEnv: Record<string, string | undefined> = { HOME: root, OWENLOOP_ROUTING_HANDOFF: command.path };
-    assert.equal(await runExec(['wf/command', '--origin', origin], { env: commandEnv, err: line => errors.push(line) }), 1);
+    assert.equal(await runExec(['wf/command', '--origin', origin, '--shift', 'shf_service',
+      '--heartbeat-interval', '1'], { env: commandEnv, err: line => errors.push(line) }), 1);
+    assert.equal(existsSync(command.path), true, 'a timing override cannot consume or launch');
+    assert.equal(await runExec(['wf/command', '--origin', origin, '--shift', 'shf_service'],
+      { env: commandEnv, err: line => errors.push(line) }), 1);
     assert.match(errors.at(-1)!, /routing handoff refused/);
     assert.equal(existsSync(command.path), false);
     command.terminal();
+
+    const wrongShift = session.createHandoff(reserve('wrong-shift', 'exec'));
+    const wrongEnv: Record<string, string | undefined> = { HOME: root,
+      OWENLOOP_ROUTING_HANDOFF: wrongShift.path };
+    assert.equal(await runExec(['wf/wrong-shift', '--origin', origin, '--shift', 'shf_other'],
+      { env: wrongEnv, err: line => errors.push(line) }), 1);
+    assert.equal(existsSync(wrongShift.path), false, 'mismatched Shift cannot reuse the handoff');
+    wrongShift.terminal();
 
     const missing = { HOME: root, OWENLOOP_ROUTING_SESSION: '1' };
     assert.equal(await runAgent(['wf/missing', '--origin', origin], { env: missing, err: line => errors.push(line) }), 1);
@@ -205,7 +221,7 @@ test('role startup consumes an incomplete private handoff before any legacy effe
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('complete routed role preflight opens public stage, then retains the launch fence', async () => {
+test('staged routed roles refuse without a live parent broker grant or external start', async () => {
   const root = mkdtempSync(join(tmpdir(), 'owenloop-routing-stage-role-'));
   const now = Date.now();
   try {
@@ -240,11 +256,11 @@ test('complete routed role preflight opens public stage, then retains the launch
       const handoff = session.createHandoff(reservation, broker, stage);
       const env = { HOME: root, OWENLOOP_ROUTING_HANDOFF: handoff.path };
       const errors: string[] = [];
+      const args = [`wf/${run}`, '--origin', origin, '--shift', 'shf_service'];
       const status = kind === 'agent-run'
-	? await runAgent([`wf/${run}`, '--origin', origin], { env, err: line => errors.push(line) })
-	: await runExec([`wf/${run}`, '--origin', origin], { env, err: line => errors.push(line) });
+	? await runAgent(args, { env, err: line => errors.push(line) })
+	: await runExec(args, { env, err: line => errors.push(line) });
       assert.equal(status, 1);
-      assert.match(errors.at(-1)!, /routed launch fence unavailable/);
       assert.equal(existsSync(handoff.path), false);
       if (kind === 'agent-run') assert.equal(existsSync(join(workRoot, 'wf', 'agent')), false);
       handoff.terminal();

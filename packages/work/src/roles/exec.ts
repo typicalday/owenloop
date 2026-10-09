@@ -36,8 +36,8 @@ import { join } from 'node:path';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { consumeRoutingHandoff } from './routing-handoff.ts';
-import { createRoutingRoleClient } from './routing-role-client.ts';
-import { openRoutingRoleStage } from './routing-role-stage.ts';
+import { prepareRoutedCommandRunner } from './routing-command-runner.ts';
+import { exactRoutedRoleArgs, routingRoleMarker } from './routing-role-marker.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { resolveAllowedWorkdirRoots } from '../agent/workdir.ts';
 import { loadSettings } from '../settings/settings.ts';
@@ -214,22 +214,25 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const env = deps.env ?? process.env;
-  const routingExpected = env['OWENLOOP_ROUTING_SESSION'] === '1'
-    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
-    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined;
-  if (routingExpected) {
-    if (!parsed.origin) { err('owenloop work exec: routing handoff refused'); return 1; }
+  const routing = routingRoleMarker(env);
+  if (routing !== 'ordinary') {
+    const refuse = () => { err('owenloop work exec: routing handoff refused'); return 1; };
+    if (routing === 'invalid' || !parsed.origin || !parsed.shift
+      || !exactRoutedRoleArgs(args, target, parsed.origin, parsed.shift)
+      || parsed.trustedInputV2 || parsed.heartbeatIntervalMs !== undefined
+      || parsed.jumpToleranceMs !== undefined) return refuse();
     try {
       const handoff = consumeRoutingHandoff({ env, origin: parsed.origin, target, kind: 'exec' });
-      if (!handoff) throw new Error('missing routing handoff');
-      createRoutingRoleClient(handoff);
-      openRoutingRoleStage(handoff);
+      if (!handoff || parsed.shift !== handoff.shiftId) return refuse();
+      const prepared = await prepareRoutedCommandRunner({ handoff, originalEnv: env, out, err });
+      installSignalHandlers(prepared.loop, deps.signalHost ?? process, err, {
+	role: 'exec', drainNote: 'killing the command and releasing the order',
+	stopReason: 'signal',
+      });
+      return exitCodeFor(await prepared.run());
     } catch {
-      err('owenloop work exec: routing handoff refused');
-      return 1;
+      return refuse();
     }
-    err('owenloop work exec: routed launch fence unavailable');
-    return 1;
   }
   let settings;
   try {

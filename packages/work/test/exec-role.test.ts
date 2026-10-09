@@ -15,6 +15,7 @@ import type { CommandResult, CommandRunner } from '../src/exec/runner.ts';
 import type { CommandReceipt } from '../src/exec/receipt.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
 import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
+import { buildSpawnPlan } from '../src/shift/spawn.ts';
 import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { parseConsume, parseProduce } from '../../../src/paths.ts';
 import type { StepDef } from '../../../src/types.ts';
@@ -532,8 +533,14 @@ test('default exec wiring preserves unresolved-instructions when recovery cannot
 test('with no OWENLOOP_TOKEN, exec authenticates with the agent slot token from the store', async () => {
   const { server, origin, auths } = await startRecordingHub();
   seedAgentKeys(home, origin, { default: 'olp_from_store' });
+  process.env.OWENLOOP_ROUTING_SESSION = '0';
   try {
-    const code = await run(['wf1/run1', '--origin', origin, '--heartbeat-interval', '5'], { out: () => {}, err: () => {} });
+    const spawn = buildSpawnPlan({ workflow: 'wf1', run: 'run1' },
+      origin, 'default', '/bin/owenloop', '/bin/node');
+    assert.equal(spawn.options.env?.OWENLOOP_ROUTING_SESSION, '0');
+    assert.equal(spawn.options.env?.OWENLOOP_ROUTING_HANDOFF, undefined);
+    const code = await run(['wf1/run1', '--origin', origin, '--heartbeat-interval', '5'],
+      { env: spawn.options.env, out: () => {}, err: () => {} });
     assert.equal(code, 0);
     assert.deepEqual(auths, ['Bearer olp_from_store']);
   } finally {

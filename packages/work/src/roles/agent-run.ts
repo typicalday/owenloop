@@ -96,9 +96,8 @@ import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verif
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { consumeRoutingHandoff } from './routing-handoff.ts';
-import { createRoutingRoleClient } from './routing-role-client.ts';
-import { openRoutingRoleStage } from './routing-role-stage.ts';
-import { planRoutedAgentWorkdir } from './routing-agent-workdir.ts';
+import { prepareRoutedAgentRunner } from './routing-agent-runner.ts';
+import { exactRoutedRoleArgs, routingRoleMarker } from './routing-role-marker.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { effectiveRosterLayers, mergeRosterLayers, type MergedRoster } from '../settings/roster.ts';
@@ -328,34 +327,26 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const env = deps.env ?? process.env;
-  const routingExpected = env['OWENLOOP_ROUTING_SESSION'] === '1'
-    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
-    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined;
-  if (routingExpected) {
-    // The private handoff is consumed before reading an operator settings or
-    // credential path. A routed child must carry Shift's exact origin.
-    if (!parsed.origin) { err('owenloop work agent-run: routing handoff refused'); return 1; }
+  const routing = routingRoleMarker(env);
+  if (routing !== 'ordinary') {
+    const refuse = () => { err('owenloop work agent-run: routing handoff refused'); return 1; };
+    if (routing === 'invalid' || !parsed.origin || !parsed.shift
+      || !exactRoutedRoleArgs(args, target, parsed.origin, parsed.shift)
+      || parsed.harness !== undefined || parsed.trustedInputV2
+      || parsed.heartbeatIntervalMs !== undefined || parsed.jumpToleranceMs !== undefined
+      || parsed.submitGraceMs !== undefined || parsed.confirmIntervalMs !== undefined) return refuse();
     try {
       const handoff = consumeRoutingHandoff({ env, origin: parsed.origin, target, kind: 'agent-run' });
-      if (!handoff) throw new Error('missing routing handoff');
-      createRoutingRoleClient(handoff);
-      const stage = openRoutingRoleStage(handoff);
-      // Validate the Shift-pinned fallback and machine roots without creating
-      // a directory: git worktree provisioning can run repository hooks and
-      // belongs after accepted launch report plus a final broker order read.
-      planRoutedAgentWorkdir({ workRoot: handoff.workRoot,
-	...(handoff.workRepo ? { workRepo: handoff.workRepo } : {}),
-	workflow: target.workflow, run: target.run,
-	definitionStagePath: handoff.definitionStage!.path, originalEnv: env,
-	publicEnv: { HOME: stage.publicEnv.HOME!,
-	  OWENLOOP_CONFIG_DIR: stage.publicEnv.OWENLOOP_CONFIG_DIR! },
-	...(deps.cwd ? { cwd: deps.cwd } : {}) });
+      if (!handoff || parsed.shift !== handoff.shiftId) return refuse();
+      const prepared = await prepareRoutedAgentRunner({ handoff, originalEnv: env, out, err });
+      installSignalHandlers(prepared.loop, deps.signalHost ?? process, err, {
+	role: 'agent-run', drainNote: 'stopping the agent and releasing the order',
+	stopReason: 'signal',
+      });
+      return exitCodeFor(await prepared.run());
     } catch {
-      err('owenloop work agent-run: routing handoff refused');
-      return 1;
+      return refuse();
     }
-    err('owenloop work agent-run: routed launch fence unavailable');
-    return 1;
   }
   let settings;
   try {
