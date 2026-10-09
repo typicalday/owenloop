@@ -195,12 +195,12 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
     assert.ok(pendingStatusSocket);
     assert.ok(cachedPostrunDigest);
     statusStopArmed = true;
-    stop();
-    // Queue an authentic cached success only after stop has aborted the client.
-    // The result must not turn the stopped role into a submitted outcome.
+    // Queue an authentic cached success, then synchronously abort the client
+    // before its data callback can run. No write is attempted on a closed pipe.
     pendingStatusSocket.end(JSON.stringify({ ok: true, value: { state: 'committed',
       result: { outcome: 'submitted', claim: options.postrunClaim ?? 'closed' } } }) + '\n');
     lateStatusReplies++;
+    stop();
   };
   return { root, stage, server, handoff, events, errors, order, statusEntered,
     statusClosed, statusSocketErrors, stopWithLateStatus,
