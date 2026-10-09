@@ -2749,7 +2749,7 @@ function buildCallsGraph(defs: Map<string, WorkflowDef>, routedCalls?: ReadonlyM
     const children = new Set<string>();
     for (const step of def.steps) {
       if (step.calls === undefined) continue;
-      if (deferredHubLiveCalls?.has(step.calls)) continue;
+      if (deferredHubLiveCalls?.has(callsEdgeKey(key, step))) continue;
       const child = resolvedCallsStepKey(defs, def, step, routedCalls, key);
       if (child !== undefined) children.add(child);
     }
@@ -3028,9 +3028,8 @@ export interface FinalizeDefsOptions {
    * later validates them against the complete store map before any run starts.
    */
   allowUnresolvedVersionedCalls?: ReadonlySet<string>;
-  /** Install-time only: these verified Hub-dialect unlocked slash targets are
-   * selected from live Service state at native spawn. Their cross-definition
-   * edges cannot be validated from the archive alone. This grants no
+  /** Storage or data-only integrity verification only: exact authored edge
+   * keys for verified Hub-dialect unlocked slash calls. This grants no
    * executable lookup; ordinary and routed instruction prime remain strict. */
   deferredHubLiveCalls?: ReadonlySet<string>;
   /**
@@ -3058,7 +3057,7 @@ export function validateCallsEdges(
   const errors: string[] = [];
   for (const step of def.steps) {
     if (!step.calls) continue;
-    if (options.deferredHubLiveCalls?.has(step.calls)) continue;
+    if (options.deferredHubLiveCalls?.has(callsEdgeKey(parentNodeKey, step))) continue;
     const childDef = resolveCallsStep(defs, def, step, options.routedCalls, parentNodeKey);
     if (!childDef) {
       if (

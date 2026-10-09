@@ -27,7 +27,9 @@ import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
 import {
   DefError,
+  callsEdgeKey,
   digestScopedCallsTargetKey,
+  expandIncludes,
   finalizeDefs,
   lintDef,
   loadDefsRaw,
@@ -516,14 +518,6 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 		[...staged.values()].flatMap((def) => def.steps.map((step) => step.calls)
 		  .filter((target): target is string => target !== undefined && isVersionedReference(target))),
       );
-      if (args.deferHubLiveCallsAtStorage === true && stagedBundleDialect === 'hub-qualified') {
-	deferredHubLiveCalls = new Set([...staged.values()].flatMap(def => def.steps
-	  .map(step => step.calls)
-	  .filter((target): target is string => target !== undefined
-	    && target.includes('/') && isBundleWorkflowName(target)
-	    && !isVersionedReference(target)
-	    && stagedBundleLock[target] === undefined)));
-      }
     }
     for (const stagedDef of staged.values()) {
       const lintResult = lintDef(stagedDef);
@@ -540,6 +534,16 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
     if (reasons.length === 0) {
       try {
+	if (args.deferHubLiveCallsAtStorage === true && stagedBundleDialect === 'hub-qualified') {
+	  deferredHubLiveCalls = new Set([...staged.entries()].flatMap(([nodeKey, raw]) => {
+	    const def = expandIncludes(raw, member => staged.get(member));
+	    return def.steps.filter(step => step.calls !== undefined
+	      && step.calls.includes('/') && isBundleWorkflowName(step.calls)
+	      && !isVersionedReference(step.calls)
+	      && stagedBundleLock[step.calls] === undefined)
+	      .map(step => callsEdgeKey(nodeKey, step));
+	  }));
+	}
 	// An unlocked Hub slash call is selected from current native Service
 	// publication state, possibly outside this archive or differently from an
 	// archive sibling. Defer only its cross-definition/cycle edge during

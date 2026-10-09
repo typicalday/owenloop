@@ -23,6 +23,7 @@ import { DefError, callsEdgeKey, digestScopedCallsTargetKey, expandIncludes, fin
   validateDef,
   resolveCallsStep, resolveCallsTarget } from '../defs.ts';
 import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
+import { isBundleWorkflowName } from '../bundle/call-target.ts';
 import type { StepDef, WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import {
@@ -60,6 +61,10 @@ export interface StoreInstructionSourceArgs {
    * ordinary instruction source. The callback must authenticate its Service
    * read; the store independently verifies the selected signed child bytes. */
   routedConcreteCalls?: RoutedConcreteCallSelection;
+  /** Internal, throwaway data-only selected-member verification. It never
+   * publishes an executable instruction cache or accepts a routed call grant. */
+  integrityOnlyHubLive?: { workflowName: string;
+    accept(selection: VerifiedWorkflowSelection): void };
 }
 
 export interface RoutedConcreteCallEdge {
@@ -316,16 +321,18 @@ export async function verifyInstalledWorkflowMember(args: {
   onMissing?: MissingObjectHandler;
 }): Promise<VerifiedWorkflowSelection> {
   const digest = defDigest(args.bundleDigest);
-  // A throwaway ordinary strict source preserves the old dynamic child's
-  // complete locked/cross-definition closure checks. It is never passed to a
-  // routed resolver or returned, so it cannot grant an executable lookup for
-  // this child digest in the routed occurrence's cache.
+  let selected: VerifiedWorkflowSelection | undefined;
+  // This source is data-only. It verifies every signed member and exact
+  // locked/static dependency, but leaves a Hub live slash edge to the child's
+  // own later original-session native occurrence. No executable cache entry
+  // is constructed or returned to the parent.
   const isolated = createStoreInstructionSource({ globalRoot: args.globalRoot,
     verifier: args.verifier,
+    integrityOnlyHubLive: { workflowName: args.workflowName,
+      accept: value => { selected = value; } },
     ...(args.onMissing === undefined ? {} : { onMissing: args.onMissing }) });
   if (await isolated.prime(digest) !== 'resolved')
     throw new DefError('selected signed child digest unavailable');
-  const selected = isolated.selectVerifiedWorkflow(digest, args.workflowName);
   if (!selected || selected.bundleDigest !== digest
     || selected.definition.name !== args.workflowName)
     throw new DefError('selected signed child member unavailable');
@@ -359,7 +366,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     level: ResolutionLevel,
   ): Promise<boolean> => {
     const parent = await loadVerifiedObject(root, bundleDigest, level, args.verifier);
-    const validation = new Map<string, WorkflowDef>(parent.defs);
+    // Include lookup is archive-local. Expand the parent's members before
+    // digest-scoped dependency aliases share this validation map.
+    const validation = new Map<string, WorkflowDef>([...parent.defs].map(([name, def]) =>
+      [name, expandIncludes(def, member => parent.defs.get(member))] as const));
     const support = new Map<string, SupportingObject>();
     const loadedByRootAndDigest = new Map<string, LoadedObject>();
     const registeredDependencies = new Set<string>();
@@ -373,7 +383,11 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       if (registeredDependencies.has(key)) return;
       registeredDependencies.add(key);
       for (const [workflowName, def] of object.defs) {
-	validation.set(digestScopedCallsTargetKey(object.bundleDigest, workflowName), def);
+	// A dependency's include names are local to its own signed archive.
+	// Resolve them before adding digest-scoped aliases to the shared map,
+	// where a bare name may belong to the parent archive instead.
+	validation.set(digestScopedCallsTargetKey(object.bundleDigest, workflowName),
+	  expandIncludes(def, member => object.defs.get(member)));
       }
     };
     remember(parent);
@@ -456,7 +470,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       const objectKey = keyFor(object);
       if (walked.has(objectKey)) return;
       walked.add(objectKey);
-      for (const def of object.defs.values()) {
+      for (const raw of object.defs.values()) {
+	// An include contributes authored executable steps to this same signed
+	// object. Traverse its exact locked calls before finalizing the closure.
+	const def = expandIncludes(raw, member => object.defs.get(member));
 	for (const step of def.steps) {
 	  if (step.calls === undefined || !isVersionedReference(step.calls)) continue;
 	  const target = step.calls;
@@ -503,13 +520,45 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	  // All child workflows also retain an internal digest-scoped key so their
 	  // bare sibling calls validate in the bundle that authored them.
 	  if (child !== parent) registerDependencyDefinitions(child);
-	  validation.set(digestScopedCallsTargetKey(childDigest, target), selected);
+	  validation.set(digestScopedCallsTargetKey(childDigest, target),
+	    expandIncludes(selected, member => child.defs.get(member)));
 	  await walkObject(child);
 	}
       }
     };
 
     await walkObject(parent);
+    if (args.integrityOnlyHubLive !== undefined) {
+      if (requestedDigest !== bundleDigest) return false;
+      const deferred = new Set<string>();
+	for (const [nodeKey, raw] of validation) {
+	const def = expandIncludes(raw, member => validation.get(member));
+	if (def.bundleDialect !== 'hub-qualified') continue;
+	for (const step of def.steps) {
+	  const target = step.calls;
+	  if (target !== undefined && target.includes('/')
+	    && isBundleWorkflowName(target)
+	    && !isVersionedReference(target)
+	    && def.bundleLock?.[target] === undefined)
+	    deferred.add(callsEdgeKey(nodeKey, step));
+	}
+      }
+      // This finalization validates all archive members and every static,
+      // plain and locked cross-definition edge/cycle. Its sole deferred edges
+      // are exact signed Hub live slash calls, which cannot authorize this
+      // parent's executable graph without the child's own native occurrence.
+      const finalized = finalizeDefs(validation, { deferredHubLiveCalls: deferred });
+      const workflowName = args.integrityOnlyHubLive.workflowName;
+      const selected = finalized.get(workflowName);
+      if (!parent.defs.has(workflowName) || !selected
+	|| selected.bundleDigest !== bundleDigest)
+	throw new DefError('selected signed child member unavailable');
+      args.integrityOnlyHubLive.accept({ definition: selected, bundleDigest,
+	objectPath: parent.objectPath,
+	support: [...support.values()].map(({ bundleDigest: digest, objectPath }) =>
+	  ({ bundleDigest: digest, objectPath })) });
+      return true;
+    }
     const validateAllSignedMembers = (object: LoadedObject): void => {
       for (const [name, raw] of object.defs) {
 	const expanded = expandIncludes(raw, member => object.defs.get(member));
@@ -541,9 +590,9 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	|| !Number.isSafeInteger(maxReads) || maxReads < 1)
 	throw new DefError('routed concrete call limits unavailable');
       const objectFor = (def: WorkflowDef): LoadedObject | undefined => {
-	if (def.bundleDigest === parent.bundleDigest && parent.defs.get(def.name) === def) return parent;
+	if (def.bundleDigest === parent.bundleDigest && parent.defs.has(def.name)) return parent;
 	for (const object of loadedByRootAndDigest.values())
-	  if (object.bundleDigest === def.bundleDigest && object.defs.get(def.name) === def) return object;
+	  if (object.bundleDigest === def.bundleDigest && object.defs.has(def.name)) return object;
 	return undefined;
       };
       const objectForDigest = async (digest: DefDigest, from: LoadedObject): Promise<LoadedObject> => {

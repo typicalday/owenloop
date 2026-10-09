@@ -351,4 +351,148 @@ test('integrity-only selected member preserves strict locked-child closure', asy
     workflowName: 'parent' });
   assert.deepEqual(new Set(selected.support.map(object => object.bundleDigest)),
     new Set([store.parentDigest, store.childDigest]));
+  const childObject = selected.support.find(object => object.bundleDigest === store.childDigest);
+  assert.ok(childObject);
+  writeFileSync(join(childObject.objectPath, 'workflow.yaml'), '\ncorrupted: true\n');
+  await assert.rejects(verifyInstalledWorkflowMember({ globalRoot: store.worker,
+    verifier: createBundleIngestor(), bundleDigest: store.parentDigest,
+    workflowName: 'parent' }), (error: unknown) => error instanceof StoreIntegrityError
+      && error.code === 'object-corrupt' && error.digest === store.childDigest);
+});
+
+test('selected invocation child verifies signed support before its own live calls occurrence', async () => {
+  const root = tempDir('owenloop-nested-live-child-');
+  const external = await installBundleFixture({ root, sourceDir: qualifyFixtureMember(writeBundleSource({
+    name: 'external-child', workflow: `name: external-child\ninputs: []\nsteps:\n  - name: make\n    consumes: []\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo external\noutputs: [result]\n`,
+    workflows: { external: `name: routing/external\ninputs: []\nsteps:\n  - name: make\n    consumes: []\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo external\noutputs: [result]\n` },
+    defaultWorkflow: 'routing/external',
+  }), 'external', 'routing/external') });
+  const child = await installBundleFixture({ root, deferHubLiveCallsAtStorage: true,
+    sourceDir: qualifyFixtureMember(writeBundleSource({
+      name: 'selected-child', workflow: `name: selected-child\ninputs: []\nsteps:\n  - name: make\n    consumes: []\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo selected\noutputs: [result]\n`,
+      workflows: { child: `name: routing/child\ninputs: []\nsteps:\n  - name: delegate\n    calls: routing/external\n    produces: [result]\noutputs: [result]\n` },
+      defaultWorkflow: 'routing/child',
+    }), 'child', 'routing/child') });
+  const selected = await verifyInstalledWorkflowMember({ globalRoot: root,
+    verifier: createBundleIngestor(), bundleDigest: child.result.digest,
+    workflowName: 'routing/child' });
+  assert.equal(selected.definition.name, 'routing/child');
+  assert.deepEqual(new Set(selected.support.map(object => object.bundleDigest)),
+    new Set([child.result.digest]));
+  await assert.rejects(sourceAt(root).prime(child.result.digest), /calls names workflow/);
+
+  let observed = false;
+  const supportOnly = createStoreInstructionSource({ globalRoot: root,
+    verifier: createBundleIngestor(), integrityOnlyHubLive: {
+      workflowName: 'routing/child', accept: () => { observed = true; },
+    } });
+  assert.equal(await supportOnly.prime(child.result.digest), 'resolved');
+  assert.equal(observed, true);
+  assert.equal(supportOnly.selectVerifiedDefinition(child.result.digest, 'routing/child', 'delegate'), undefined);
+  assert.equal(supportOnly.lookup({ defDigest: child.result.digest, step: 'delegate', key: '' }).status,
+    'unknown-digest');
+
+  const later = createStoreInstructionSource({ globalRoot: root,
+    verifier: createBundleIngestor(), routedConcreteCalls: {
+      rootWorkflow: 'wf_root', frameWorkflow: 'wf_child', run: 'run_child',
+      frameDefRef: { bundleDigest: child.result.digest, workflowName: 'routing/child' },
+      stillAuthorized: () => true,
+      observe: async request => {
+	assert.equal(request.edge.target, 'routing/external');
+	assert.equal(request.frameWorkflow, 'wf_child');
+	return { kind: 'prestart-live-concrete-child', parentWorkflow: 'wf_child',
+	  childDefRef: { bundleDigest: external.result.digest,
+	    workflowName: 'routing/external' },
+	  observedLiveVersion: 1, receiptDigest: 'a'.repeat(64) };
+      },
+    } });
+  assert.equal(await later.prime(child.result.digest), 'resolved');
+  assert.deepEqual(new Set(later.selectVerifiedDefinition(child.result.digest,
+    'routing/child', 'delegate')?.support.map(object => object.bundleDigest)),
+  new Set([child.result.digest, external.result.digest]));
+});
+
+test('data-only selected child defers an included Hub live call after signed expansion', async () => {
+  const root = tempDir('owenloop-included-live-child-');
+  const sourceDir = qualifyFixtureMember(writeBundleSource({
+    name: 'included-child',
+    workflow: `name: included-child\ninputs: []\nsteps:\n  - name: make\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo included\noutputs: [result]\n`,
+    workflows: {
+      child: `name: routing/child\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
+      helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: routing/external\n    produces: [result]\noutputs: [result]\n`,
+    },
+    defaultWorkflow: 'routing/child',
+  }), 'child', 'routing/child');
+  const installed = await installBundleFixture({ root, sourceDir,
+    deferHubLiveCallsAtStorage: true });
+  const selected = await verifyInstalledWorkflowMember({ globalRoot: root,
+    verifier: createBundleIngestor(), bundleDigest: installed.result.digest,
+    workflowName: 'routing/child' });
+  assert.equal(selected.definition.steps[0]?.name, 'nested.delegate');
+  assert.equal(selected.definition.steps[0]?.calls, 'routing/external');
+  await assert.rejects(sourceAt(root).prime(installed.result.digest),
+    /calls names workflow 'routing\/external' which does not exist/);
+});
+
+test('included exact locked call is recovered and verified before data-only or ordinary selection', async () => {
+  const publisher = tempDir('owenloop-included-lock-publisher-');
+  const worker = tempDir('owenloop-included-lock-worker-');
+  const target = 'dep/change-unit@1.0.0';
+  const childSource = writeBundleSource({ name: 'change-unit', workflow: CHILD });
+  const child = await installBundleFixture({ root: publisher, sourceDir: childSource });
+  addIndexEntry(publisher, target, child.result.digest);
+  const parentSource = writeBundleSource({
+    name: 'included-parent',
+    workflow: `name: included-parent\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: [result]\n` },
+    lock: { [target]: child.result.digest },
+  });
+  const parentBundle = await installBundleFixture({ root: worker,
+    level: 'global', projectRoot: publisher, globalRoot: worker,
+    sourceDir: parentSource });
+  const select = () => verifyInstalledWorkflowMember({ globalRoot: worker,
+    verifier: createBundleIngestor(), bundleDigest: parentBundle.result.digest,
+    workflowName: 'included-parent' });
+  await assert.rejects(select(), (error: unknown) => error instanceof StoreIntegrityError
+    && error.code === 'dependency-missing' && error.digest === child.result.digest);
+  await installBundleFixture({ root: worker, sourceDir: childSource });
+  const selected = await select();
+  assert.deepEqual(new Set(selected.support.map(object => object.bundleDigest)),
+    new Set([parentBundle.result.digest, child.result.digest]));
+  assert.equal(await sourceAt(worker).prime(parentBundle.result.digest), 'resolved');
+  const childObject = selected.support.find(object => object.bundleDigest === child.result.digest);
+  assert.ok(childObject);
+  writeFileSync(join(childObject.objectPath, 'workflow.yaml'), '\ncorrupted: true\n');
+  await assert.rejects(select(), (error: unknown) => error instanceof StoreIntegrityError
+    && error.code === 'object-corrupt' && error.digest === child.result.digest);
+});
+
+test('locked child includes resolve from the child archive despite a same-named parent member', async () => {
+  const root = tempDir('owenloop-local-include-root-');
+  const target = 'dep/change-unit@1.0.0';
+  const child = await installBundleFixture({ root, sourceDir: writeBundleSource({
+    name: 'change-unit',
+    defaultWorkflow: 'change-unit',
+    workflow: `name: change-unit\ninputs: []\nsteps:\n  - include: helper\n    as: nested\noutputs: [nested.result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: good\n    produces: [result]\n    terminal: true\n    executor: command\n    command: echo child\noutputs: [result]\n` },
+  }) });
+  addIndexEntry(root, target, child.result.digest);
+  const parentBundle = await installBundleFixture({ root, sourceDir: writeBundleSource({
+    name: 'parent',
+    workflow: `name: parent\ninputs: []\nsteps:\n  - name: delegate\n    calls: ${target}\n    produces: [result]\noutputs: [result]\n`,
+    workflows: { helper: `name: helper\ninputs: []\nsteps:\n  - name: wrong\n    produces: [other]\n    terminal: true\n    executor: command\n    command: echo parent\noutputs: [other]\n` },
+    lock: { [target]: child.result.digest },
+  }) });
+  const selected = await verifyInstalledWorkflowMember({ globalRoot: root,
+    verifier: createBundleIngestor(), bundleDigest: parentBundle.result.digest,
+    workflowName: 'parent' });
+  assert.deepEqual(new Set(selected.support.map(object => object.bundleDigest)),
+    new Set([parentBundle.result.digest, child.result.digest]));
+  const source = sourceAt(root);
+  assert.equal(await source.prime(parentBundle.result.digest), 'resolved');
+  const callsChild = source.getVerifiedCallsChild?.(parentBundle.result.digest,
+    'delegate', 'delegate');
+  assert.equal(callsChild?.bundleDigest, child.result.digest);
+  assert.deepEqual(callsChild?.definition.steps.map(step => step.name), ['nested.good']);
+  assert.deepEqual(callsChild?.definition.outputs, ['nested.result']);
 });
