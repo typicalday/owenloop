@@ -15,7 +15,7 @@ const refused = (): Error => new Error('routed invocation source refused');
 /** The v2 input read intentionally omits get_order's mutable owed reason
  * threads, schema hints and advisory human proof. Compare only the claim-bound
  * identity and input version fields needed to choose the signed producer key;
- * the full v2 binder below still verifies the entire input witness. */
+ * the caller's full v2 binder separately verifies the entire input witness. */
 function samePreboundOrder(reference: OrderPacket, current: OrderPacket,
   rootWorkflow: string, selected: VerifiedDefinitionSelection): boolean {
   const binding = current.routing?.claim.binding;

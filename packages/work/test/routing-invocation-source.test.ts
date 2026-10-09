@@ -42,7 +42,8 @@ function nativeOrder(original = pair()): OrderPacket {
   const reduced = (original.reference as Extract<RoutedReferenceV2, { state: 'available' }>).order;
   return { ...reduced, owes: [{ path: 'result', version: 1, judgmentRejects: 2,
     schemaRejects: 1, reasons: [{ at: 1, action: 'reject', kind: 'human', by: 'reviewer', text: 'rework' }] }],
-    consumesProof: 'advisory human proof', advisory: { model: 'not an authority' } } as OrderPacket;
+    consumesProof: JSON.stringify({ child: 'advisory human proof' }),
+    advisory: { model: 'not an authority' } } as OrderPacket;
 }
 const selected = { bundleDigest: parentDefRef.bundleDigest,
   definition: { name: parentDefRef.workflowName, steps: [{ callsInterface: { selection: 'invocation' },
