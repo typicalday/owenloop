@@ -6,7 +6,7 @@ import { test } from 'node:test';
 
 import { createExecLoop, type ExecLoopOptions } from '../src/exec/loop.ts';
 import { createRoutedGroupRunner, type CommandResult, type RoutedRunningCommand } from '../src/exec/runner.ts';
-import type { RoutedExecutionController } from '../src/exec/routed-loop.ts';
+import { createShiftVerifiedRoutedExecLoop, type RoutedExecutionController } from '../src/exec/routed-loop.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import { HubError, type OrderPacket } from '../src/hub/types.ts';
 
@@ -170,6 +170,26 @@ test('signed postrun revalidation logs only its closed refusal kind after freeze
     assert.ok(errors.every(line => !line.includes('private proof') && !line.includes('bearer')
       && !line.includes('input value') && !line.includes('private-kind') && !line.includes('private-code')));
   }
+});
+
+test('Shift routed postrun delegates the frozen signed witness to its parent broker', async () => {
+  const events: string[] = [];
+  const { opts, control, starts } = fixture(events);
+  opts.instructions = {
+    async resolveCommand() { throw new Error('ordinary command resolver used'); },
+    async resolveRoutedCommandDefinition() { return { ok: true, command: 'printf hello',
+	inputWitnessRequired: true, revalidateAfterRun: async () => {
+	  events.push('forbidden-postfreeze-role-read');
+	  return { ok: false as const, kind: 'unverified-consumed' as const,
+	    reason: 'broker quiescing' };
+	} }; },
+    async resolveStep() { throw new Error('unused'); },
+  };
+  assert.equal(await createShiftVerifiedRoutedExecLoop(opts, control).run(), 'submitted');
+  assert.equal(starts(), 1);
+  assert.ok(events.includes('freeze') && events.includes('group-empty')
+    && events.includes('parent-postrun'));
+  assert.ok(!events.includes('forbidden-postfreeze-role-read'));
 });
 
 test('stalled original-session first contact is bounded without ordinary release', async () => {

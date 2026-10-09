@@ -471,6 +471,17 @@ export async function stageRoutedDefinition(args: {
       run: args.order.run, step: args.order.step, digest: args.order.defDigest,
       bundleDigest: resolved.bundleDigest, originRules: freshRules, nonce: randomBytes(16).toString('hex') };
     writeFileSync(join(stagePath, 'stage.json'), JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 });
+    const supportIdentity = (items: NonNullable<typeof selected>['support']): string[] =>
+      items.map(object => `${object.bundleDigest}:${object.objectPath}`).sort();
+    const requireOriginalSelection = (candidate: typeof selected): void => {
+      if (!selected || !candidate || candidate.bundleDigest !== selected.bundleDigest
+	|| candidate.objectPath !== selected.objectPath
+	|| candidate.definition.name !== selected.definition.name
+	|| candidate.step.name !== selected.step.name
+	|| candidate.step.command !== selected.step.command
+	|| !isDeepStrictEqual(supportIdentity(candidate.support), supportIdentity(selected.support)))
+	throw new Error('routed signed selection changed');
+    };
       const verifyOrderInternal = async (response: GetOrderResponse,
       routed?: { pair: RoutedInputPair; phase: RoutedInputPhase;
 	started?: { wall: number; monotonic: number };
@@ -515,6 +526,7 @@ export async function stageRoutedDefinition(args: {
 	throw new Error('routed definition object changed');
       const currentSelection = routing === undefined ? undefined
 	: readOnlySource.selectVerifiedDefinition(order.defDigest, definitionName!, order.step);
+      if (routing !== undefined) requireOriginalSelection(currentSelection);
       const currentSupport = [...(routing === undefined
 	? readOnlySource.getVerifiedSupport?.(order.defDigest, order.step) ?? []
 	: currentSelection?.support ?? [])];
@@ -644,6 +656,17 @@ export async function stageRoutedDefinition(args: {
 	  if (rule && !evaluateOriginRule(rule.value, verdict).ok)
 	    throw new Error('routed definition origin changed');
 	}
+      }
+      if (routing !== undefined) {
+	// The binder and trust checks above can await a direct invocation relay.
+	// Reopen the exact signed member after those awaits; a moved index or
+	// object path cannot turn the captured prestart command into a new grant.
+	const finalSource = createStoreInstructionSource({ globalRoot: root,
+	  verifier: createBundleIngestor() });
+	if (await finalSource.prime(order.defDigest) !== 'resolved')
+	  throw new Error('routed signed selection changed');
+	requireOriginalSelection(finalSource.selectVerifiedDefinition(order.defDigest,
+	  definitionName!, order.step));
       }
       const finalStage = lstatSync(stagePath);
       const finalWorkdir = order.workdir !== undefined || order.worker === 'command'

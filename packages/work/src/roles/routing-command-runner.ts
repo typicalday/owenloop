@@ -6,9 +6,9 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
-import { createExecLoop, type ExecLoop, type ExecOutcome } from '../exec/loop.ts';
+import type { ExecLoop, ExecLoopOptions, ExecOutcome } from '../exec/loop.ts';
 import { createRoutedGroupRunner } from '../exec/runner.ts';
-import type { RoutedExecutionController } from '../exec/routed-loop.ts';
+import { createShiftVerifiedRoutedExecLoop, type RoutedExecutionController } from '../exec/routed-loop.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { RoutingBrokerTransportLoss } from '../hub/routing-child-client.ts';
 import { createTrustedRoutedInputV2Admission } from '../hosted/trusted-input-admission.ts';
@@ -137,7 +137,7 @@ export async function prepareRoutedCommandRunner(args: {
     pending.timer = setTimeout(() => { pendingSleeps.delete(pending); resolve(); }, ms);
     pendingSleeps.add(pending);
   });
-  const rawLoop = createExecLoop({ hub: client, runner: controller.runner,
+  const loopOptions: ExecLoopOptions = { hub: client, runner: controller.runner,
     workflow: root, run, holder, instructions: stage.instructions,
     routedExecution: controller, routedPublicEnv: publicEnv,
     cwd: planned.cwd, allowedWorkdirRoots: planned.allowedWorkdirRoots,
@@ -145,7 +145,8 @@ export async function prepareRoutedCommandRunner(args: {
     sleep, now: Date.now,
     ...(args.heartbeatIntervalMs ? { heartbeatIntervalMs: args.heartbeatIntervalMs } : {}),
     ...(args.jumpToleranceMs ? { jumpToleranceMs: args.jumpToleranceMs } : {}),
-  });
+  };
+  const rawLoop = createShiftVerifiedRoutedExecLoop(loopOptions, controller);
   const runRole = async (): Promise<ExecOutcome> => {
     try { return await rawLoop.run(); }
     finally {

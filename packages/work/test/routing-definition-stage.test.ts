@@ -149,6 +149,31 @@ test('routed signed selector chooses exact child among same-step siblings', asyn
   } finally { stage.cleanup(); }
 });
 
+test('parent current stage refuses changed signed command bytes before a postrun consequence', async () => {
+  const f = await fixture();
+  const binding = { runId: 'wf_root', frameId: 'wf_child',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'recovered' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', binding },
+    decision: { binding } } as unknown as ReferenceRouting;
+  const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root',
+    order: { ...f.args.order, workflow: 'wf_child', routing } });
+  try {
+    const packet: OrderPacket = { workflow: 'wf_child', run: 'run', step: 'command', key: '',
+      defDigest: f.packed.digest, worker: 'command', inputs: [], outputs: ['out'], consumes: {},
+      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }], routing };
+    const response: GetOrderResponse = { text: '', workflow: 'wf_child', run: 'run',
+      lease: { claimed: true }, order: packet };
+    await stage.verifyOrder(response);
+    const object = join(globalStoreRoot(join(stage.path, 'home')), 'objects', 'sha256',
+      f.packed.digest, 'workflow.yaml');
+    writeFileSync(object, workflow.replace('echo recovered', 'echo changed'));
+    await assert.rejects(stage.verifyOrder(response),
+      /routed definition object changed|routed signed selection changed/);
+    assert.equal(await stage.commandFor!(packet), 'echo recovered',
+      'captured command alone cannot authorize a parent postrun');
+  } finally { stage.cleanup(); }
+});
+
 test('signed routed command definition admits human seed only through the current v2 witness', async () => {
   const f = await fixture('name: recovered\ninputs:\n  - name: seed\n    seedOwed: true\n' +
     'steps:\n  - name: command\n    executor: command\n    consumes: [seed]\n' +
