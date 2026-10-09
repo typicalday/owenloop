@@ -1523,6 +1523,7 @@ test('routed command and agent launch requests verify one final input witness af
       rosterRevision: 'a'.repeat(64),
       tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
     const packet = { ...parentOrder().order, workflow: 'frame', worker: childKind === 'exec' ? 'command' : 'agent',
+      owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
       routing: routed } as OrderPacket;
     const current = { ...parentOrder(), workflow: 'frame', order: packet };
     const pairBinding = { rootWorkflow: 'wf', frameWorkflow: 'frame', run: 'run',
@@ -1532,7 +1533,7 @@ test('routed command and agent launch requests verify one final input witness af
       preferenceExpiresAt: routed.preference.expiresAt };
     const pair = () => ({ reference: { protocol: 'trusted-routed-reference-read-v2' as const,
       state: 'available' as const, workflow: 'wf', run: 'run',
-      order: { ...packet, owes: [{ path: 'out', version: 1 }] },
+      order: { ...packet, owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
       inputs: [], lease: { claimed: true }, binding: pairBinding },
     claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
       workflow: 'wf', run: 'run', routing: routed, binding: pairBinding } });
@@ -1588,7 +1589,9 @@ test('routed launch refuses drift during selection before reserve mutation for c
       rosterRevision: 'a'.repeat(64),
       tuples: childKind === 'agent-run' ? [{ tuple, eligible: true, available: true }] : [] } };
     const packet = { ...parentOrder().order, workflow: 'frame',
-      worker: childKind === 'exec' ? 'command' : 'agent', routing: routed } as OrderPacket;
+      worker: childKind === 'exec' ? 'command' : 'agent',
+      owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      routing: routed } as OrderPacket;
     let current = { ...parentOrder(), workflow: 'frame', order: packet };
     let liveIdentity = identity, malformedInput = false;
     let getOrders = 0, observes = 0, writes = 0;
@@ -1617,7 +1620,7 @@ test('routed launch refuses drift during selection before reserve mutation for c
 	    routingDigest: valueDigestHex(routed), preferenceExpiresAt: routed.preference.expiresAt };
 	  return { reference: { protocol: 'trusted-routed-reference-read-v2' as const,
 	    state: 'available' as const, workflow: 'wf', run: 'run',
-	    order: { ...packet, owes: [{ path: 'out', version: 1 }] },
+	    order: { ...packet, owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
 	    inputs: [], lease: { claimed: true }, binding: { ...pairBinding,
 	      ...(malformedInput ? { orderDigest: 'd'.repeat(64) } : {}) } },
 	  claim: { protocol: 'routing-claim-read-v2' as const, state: 'available' as const,
