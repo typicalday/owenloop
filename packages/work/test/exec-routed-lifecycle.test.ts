@@ -56,6 +56,8 @@ function fixture(events: string[], overrides: Partial<RoutedExecutionController>
     workflow: 'root', run: 'native-run', holder: { kind: 'exec', id: 'host:1' },
     instructions: { async resolveCommand() { events.push('signed-resolve'); return { ok: true,
       command: 'printf hello' }; },
+      async resolveRoutedCommandDefinition() { events.push('signed-resolve'); return { ok: true,
+	command: 'printf hello', inputWitnessRequired: true }; },
       async resolveStep() { throw new Error('unused'); } },
     routedExecution: control, routedPublicEnv: { HOME: '/private/public-stage',
       OWENLOOP_CONFIG_DIR: '/private/public-stage/config' },
@@ -358,6 +360,8 @@ test('real same-group writer stops despite lost quiesce ACK; role stays quaranti
     const written = join(cwd, 'writes.txt');
     opts.instructions = { async resolveCommand() { return { ok: true,
       command: `${JSON.stringify(process.execPath)} -e "setInterval(()=>require('fs').appendFileSync(process.argv[1],'x'),5)" ${JSON.stringify(written)}`,
+    }; }, async resolveRoutedCommandDefinition() { return { ok: true, inputWitnessRequired: true,
+      command: `${JSON.stringify(process.execPath)} -e "setInterval(()=>require('fs').appendFileSync(process.argv[1],'x'),5)" ${JSON.stringify(written)}`,
     }; }, async resolveStep() { throw new Error('unused'); } };
     const loop = createExecLoop(opts);
     const result = loop.run();
@@ -452,6 +456,10 @@ test('expired lifecycle before postrun invokes no parent consequence callback', 
   opts.instructions = { async resolveCommand() { return { ok: true, command: 'printf hello',
     revalidateAfterRun: async () => { events.push('postrun-revalidate-pending');
       await new Promise<void>((resolve) => setTimeout(resolve, 15)); return undefined; } }; },
+    async resolveRoutedCommandDefinition() { return { ok: true, command: 'printf hello',
+      inputWitnessRequired: true, revalidateAfterRun: async () => {
+	events.push('postrun-revalidate-pending');
+	await new Promise<void>((resolve) => setTimeout(resolve, 15)); return undefined; } }; },
     async resolveStep() { throw new Error('unused'); } };
   assert.equal(await createExecLoop(opts).run(), 'routed-quarantined');
   assert.ok(events.includes('postrun-revalidate-pending'));
@@ -481,6 +489,8 @@ test('real managed runner writes the permitted cwd before parent receipt; origin
     opts.cwd = cwd;
     opts.instructions = { async resolveCommand() { return { ok: true,
       command: `printf live > ${JSON.stringify(join(cwd, 'write.txt'))}` }; },
+      async resolveRoutedCommandDefinition() { return { ok: true, inputWitnessRequired: true,
+	command: `printf live > ${JSON.stringify(join(cwd, 'write.txt'))}` }; },
       async resolveStep() { throw new Error('unused'); } };
     control.postrun = async ({ receipt }) => {
       events.push('parent-postrun');

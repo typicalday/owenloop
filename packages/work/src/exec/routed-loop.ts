@@ -243,8 +243,11 @@ export function createRoutedExecLoop(opts: ExecLoopOptions, control: RoutedExecu
 	|| !(opts.dirExists ?? isExistingDirectory)(order.workdir)))
 	throw new Error('routed workdir is unavailable');
       const resolved = await awaitBounded('signed command resolution',
-	() => opts.instructions.resolveCommand(order), startupDeadlineAt);
-      if (!active() || !resolved.ok) throw new Error('signed command resolution refused');
+	() => opts.instructions.resolveRoutedCommandDefinition?.(order)
+	  ?? Promise.resolve({ ok: false as const, kind: 'integrity' as const,
+	    reason: 'routed signed definition resolver unavailable' }), startupDeadlineAt);
+      if (!active() || !resolved.ok || resolved.inputWitnessRequired !== true)
+	throw new Error('signed command resolution refused');
       const childEnv = routedWorkerEnv(opts.env, opts.routedPublicEnv);
       childEnv['OWENLOOP_WORKFLOW'] = opts.workflow;
       childEnv['OWENLOOP_RUN'] = opts.run;

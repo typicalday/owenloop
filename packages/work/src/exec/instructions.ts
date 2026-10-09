@@ -65,6 +65,12 @@ export interface ResolvedCommand {
   bundleDir?: string;
 }
 
+/** Signed command data only. A routed caller still requires its current v2
+ * input witness and accepted one-use launch before external start. */
+export interface ResolvedRoutedCommandDefinition extends ResolvedCommand {
+  inputWitnessRequired: true;
+}
+
 export interface ResolvedStep {
   ok: true;
   step: StepDef;
@@ -85,6 +91,7 @@ export interface ResolvedHostedStep extends ResolvedStep {
 
 export interface InstructionResolver {
   resolveCommand(order: OrderPacket): Promise<ResolvedCommand | InstructionRefusal>;
+  resolveRoutedCommandDefinition?(order: OrderPacket): Promise<ResolvedRoutedCommandDefinition | InstructionRefusal>;
   resolveStep(order: OrderPacket): Promise<ResolvedStep | InstructionRefusal>;
   /** Strict publication gate for a locally hosted, model-facing order adapter. */
   resolveHostedStep?(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal>;
@@ -538,6 +545,39 @@ export function createStoreInstructionResolver(
   };
 
   return {
+    async resolveRoutedCommandDefinition(order: OrderPacket): Promise<ResolvedRoutedCommandDefinition | InstructionRefusal> {
+      if (options.routedSelection === undefined)
+	return refusal('integrity', order, 'routed signed selector is unavailable');
+      const resolved = await resolveVerifiedStep(order);
+      if (!resolved.ok) return resolved;
+      const verdict = await trustFor(order, resolved);
+      if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
+      const originRefusal = await checkOrigin(order, resolved);
+      if (originRefusal !== undefined) return originRefusal;
+      const calls = await verifiedCallsProducers(order, resolved, true);
+      if (!calls.ok) return calls;
+      if (order.worker !== 'command' || resolved.step.executor !== 'command'
+	|| typeof resolved.step.command !== 'string'
+	|| !resolved.step.command.trim())
+	return refusal('missing-command', order, 'the selected signed command step is unavailable');
+      const command = resolved.step.command;
+      const revalidateSigned = async (): Promise<InstructionRefusal | undefined> => {
+	const fresh = await resolveVerifiedStep(order);
+	if (!fresh.ok) return fresh;
+	if (fresh.step.executor !== 'command' || fresh.step.command !== command
+	  || fresh.objectPath !== resolved.objectPath)
+	  return refusal('integrity', order, 'the selected signed command changed');
+	const currentVerdict = await trustFor(order, fresh);
+	if (currentVerdict.kind !== 'verified') return refuseUnverified(order, currentVerdict);
+	const currentOrigin = await checkOrigin(order, fresh);
+	if (currentOrigin !== undefined) return currentOrigin;
+	const currentCalls = await verifiedCallsProducers(order, fresh, true);
+	return currentCalls.ok ? undefined : currentCalls;
+      };
+      return { ok: true, command, inputWitnessRequired: true,
+	revalidate: revalidateSigned, revalidateAfterRun: revalidateSigned,
+	...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
+    },
     async resolveHostedStep(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal> {
       const resolved = await resolveVerifiedStep(order);
       if (!resolved.ok) return resolved;

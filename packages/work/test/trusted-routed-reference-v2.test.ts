@@ -215,7 +215,7 @@ test('routed v2 binder binds both Service reads and local optional input without
       resolveStep: async () => ({ ok: true, step: local }),
       resolveHostedStep: async () => ({ ok: true, step: local, inputNames: ['optional'],
 	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
-    consumedVerifier: async order => { verifications++; assert.equal(order.routing, undefined);
+    consumedVerifier: async order => { verifications++; assert.deepEqual(order.routing, wire.claim.state === 'available' ? wire.claim.routing : undefined);
       return { ok: true, order, warnings: [] }; } });
   const direct = wire.reference as Extract<RoutedReferenceV2, { state: 'available' }>;
   const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,

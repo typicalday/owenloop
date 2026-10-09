@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import { createRoutedDefinitionMaintenance, stageRoutedDefinition } from '../src/shift/routing-definition-stage.ts';
 import { bindTrustedRoutedInputV2 } from '../src/hosted/trusted-input-admission.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
+import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import { openRoutingRoleStage } from '../src/roles/routing-role-stage.ts';
 import type { RoutingHandoffV1 } from '../src/shift/runtime.ts';
 import { HubError, type GetOrderResponse, type WorkOrder } from '../src/hub/types.ts';
@@ -143,6 +144,90 @@ test('routed signed selector chooses exact child among same-step siblings', asyn
     assert.equal(await ordinary.prime(f.packed.digest), 'resolved');
     assert.equal(ordinary.lookup({ defDigest: f.packed.digest, step: 'build', key: '' }).status,
       'ambiguous-step');
+  } finally { stage.cleanup(); }
+});
+
+test('signed routed command definition admits human seed only through the current v2 witness', async () => {
+  const f = await fixture('name: recovered\ninputs:\n  - name: seed\n    seedOwed: true\n' +
+    'steps:\n  - name: command\n    executor: command\n    consumes: [seed]\n' +
+    '    produces: [out]\n    terminal: true\n    command: echo recovered\n');
+  const binding = { runId: 'wf_root', frameId: 'wf_child',
+    def: { bundleDigest: `sha256:${f.packed.digest}`, workflowName: 'recovered' } };
+  const routing = { claim: { claimId: 'run', orderId: 'run', binding,
+    sessionId: 'rs_12345678-1234-1234-1234-123456789abc', shiftId: 'shf_service' },
+    decision: { decisionId: 'decision', binding },
+    preference: { rosterRevision: 'a'.repeat(64), expiresAt: Date.now() + 60_000 },
+  } as unknown as ReferenceRouting;
+  const stage = await stageRoutedDefinition({ ...f.args, rootWorkflow: 'wf_root',
+    order: { ...f.args.order, workflow: 'wf_child', routing } });
+  try {
+    const packet: OrderPacket = { workflow: 'wf_child', run: 'run', step: 'command', key: '',
+      defDigest: f.packed.digest, worker: 'command', inputs: ['seed'], outputs: ['out'],
+      consumes: { seed: 'human-value' }, consumedFingerprint: { seed: 1 },
+      owes: [{ path: 'out', version: 1, judgmentRejects: 0, schemaRejects: 0,
+	reasons: [] }], routing };
+    const handoff = { definitionStage: { path: stage.path, digest: stage.digest },
+      reservation: { workflow: 'wf_root', run: 'run' } } as RoutingHandoffV1;
+    const opened = openRoutingRoleStage(handoff);
+    const unselected = createStoreInstructionResolver({
+      globalRoot: globalStoreRoot(opened.publicEnv.HOME!), verifier: createBundleIngestor(),
+    });
+    const withoutParentSelection = await unselected.resolveRoutedCommandDefinition!(packet);
+    assert.equal(withoutParentSelection.ok, false);
+    if (!withoutParentSelection.ok) assert.equal(withoutParentSelection.kind, 'integrity');
+    const legacy = await opened.instructions.resolveCommand(packet);
+    assert.equal(legacy.ok, false);
+    if (!legacy.ok) assert.equal(legacy.kind, 'unverified-consumed');
+    const signed = await opened.instructions.resolveRoutedCommandDefinition!(packet);
+    assert.equal(signed.ok, true, JSON.stringify(signed));
+    if (signed.ok) {
+      assert.equal(signed.command, 'echo recovered');
+      assert.equal(signed.inputWitnessRequired, true);
+      assert.equal(await signed.revalidate?.(), undefined);
+      assert.equal(await signed.revalidateAfterRun?.(), undefined);
+    }
+    const referenceBinding = { rootWorkflow: 'wf_root', frameWorkflow: 'wf_child', run: 'run',
+      claimId: 'run', decisionId: 'decision', sessionId: routing.claim.sessionId,
+      shiftId: routing.claim.shiftId, orderDigest: 'b'.repeat(64),
+      authorityRevision: 'c'.repeat(64), rosterRevision: routing.preference.rosterRevision,
+      routingDigest: valueDigestHex(routing), preferenceExpiresAt: routing.preference.expiresAt };
+    const pair: { reference: RoutedReferenceV2; claim: RoutedClaimV2 } = {
+      reference: { protocol: 'trusted-routed-reference-read-v2', state: 'available',
+	workflow: 'wf_root', run: 'run', order: { ...packet,
+	  owes: [{ path: 'out', version: 1 }] } as unknown as OrderPacket,
+	inputs: [{ path: 'seed', version: 1, present: true, value: 'human-value' }],
+	lease: { claimed: true }, binding: referenceBinding },
+      claim: { protocol: 'routing-claim-read-v2', state: 'available',
+	workflow: 'wf_root', run: 'run', routing, binding: referenceBinding },
+    };
+    const admitted = await bindTrustedRoutedInputV2({ phase: 'prestart', pair,
+      privateOrder: packet, instructions: opened.instructions,
+      consumedVerifier: createConsumedVerifier({ env: opened.publicEnv,
+	now: Date.now, artifactPolicy: 'enforce' }),
+      expected: { workflow: 'wf_root', run: 'run' } });
+    assert.equal(admitted.ok, true, JSON.stringify(admitted));
+    const forgedProducer = await bindTrustedRoutedInputV2({ phase: 'prestart', pair,
+      privateOrder: { ...packet, consumesProof: '{"producer":"forged"}' },
+      instructions: opened.instructions,
+      consumedVerifier: createConsumedVerifier({ env: opened.publicEnv,
+	now: Date.now, artifactPolicy: 'enforce' }),
+      expected: { workflow: 'wf_root', run: 'run' } });
+    assert.equal(forgedProducer.ok, false);
+    const moved = structuredClone(pair);
+    if (moved.reference.state !== 'available') assert.fail('missing reference');
+    moved.reference.inputs[0]!.value = 'changed';
+    const refused = await bindTrustedRoutedInputV2({ phase: 'prestart', pair: moved,
+      privateOrder: packet, instructions: opened.instructions,
+      consumedVerifier: createConsumedVerifier({ env: opened.publicEnv,
+	now: Date.now, artifactPolicy: 'enforce' }),
+      expected: { workflow: 'wf_root', run: 'run' } });
+    assert.equal(refused.ok, false);
+    if (signed.ok) {
+      writeFileSync(join(stage.path, 'public', 'allowed_signers'), '', { mode: 0o600 });
+      const postrun = await signed.revalidateAfterRun?.();
+      assert.equal(postrun?.ok, false);
+      if (postrun) assert.equal(postrun.kind, 'unverified-def');
+    }
   } finally { stage.cleanup(); }
 });
 
