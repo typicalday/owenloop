@@ -108,6 +108,8 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
   const socketPath = join(socketDir, 'broker.sock');
   const events: string[] = [];
   const errors: string[] = [];
+  let signalStatusEntry: () => void = () => {};
+  const statusEntered = new Promise<void>(resolve => { signalStatusEntry = resolve; });
   let cachedPostrunDigest: string | undefined;
   const server: Server = createServer(socket => {
     let text = '';
@@ -117,6 +119,7 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
       if (newline < 0) return;
       const request = JSON.parse(text.slice(0, newline)) as { method: string; body: Record<string, unknown> };
       events.push(request.method);
+      if (request.method === 'command_postrun_status') signalStatusEntry();
       let value: unknown;
       switch (request.method) {
 	case 'read_routing_claim': value = { routing, freshness: 'fresh-at-read', atomicLaunch: false }; break;
@@ -169,7 +172,7 @@ async function fixture(options: { claimFrame?: string; inputMismatch?: boolean;
     reservation: { recordType: 'reservation', workflow: rootWorkflow, run,
       childKind: 'exec', token: 'f'.repeat(32), reservedAt: now },
     createdAt: now, expiresAt: now + 120_000, sessionExpiresAt: now + 900_000 } as RoutingHandoffV1;
-  return { root, stage, server, handoff, events, errors, order };
+  return { root, stage, server, handoff, events, errors, order, statusEntered };
 }
 
 test('real routed command composition executes signed nested frame in writable cwd and sends one parent postrun', async () => {
@@ -253,11 +256,25 @@ test('stop during cached-status wait cannot accept a later command result', asyn
       originalEnv: { PATH: process.env.PATH, OWENLOOP_ALLOWED_WORKDIR_ROOTS: join(f.root, 'work') },
       out: () => {}, err: line => f.errors.push(line) });
     const running = prepared.run();
-    for (let index = 0; index < 500 && !f.events.includes('command_postrun_status'); index++)
-      await new Promise(resolve => setTimeout(resolve, 10));
-    assert.ok(f.events.includes('command_postrun_status'));
+    // Group settlement can consume the supervisor's full five-second grace
+    // before postrun status is sent. Observe the actual RPC entry and fail if
+    // the role terminates first, rather than racing a five-second poll budget.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const observed = await Promise.race([
+      f.statusEntered.then(() => ({ kind: 'status' as const })),
+      running.then(result => ({ kind: 'terminal' as const, result }),
+	error => ({ kind: 'rejected' as const, error: String(error) })),
+      new Promise<{ kind: 'timeout' }>(resolve => {
+	timer = setTimeout(() => resolve({ kind: 'timeout' }), 15_000);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
     prepared.loop.stop();
-    assert.equal(await running, 'routed-quarantined');
+    const outcome = await running;
+    assert.equal(observed.kind, 'status',
+      `status RPC did not arrive before ${JSON.stringify(observed)}; events=${f.events.join(',')}; errors=${f.errors.join('|')}`);
+    assert.equal(outcome, 'routed-quarantined');
+    assert.ok(f.events.includes('command_postrun_status'));
     assert.equal(f.events.filter(method => method === 'command_postrun').length, 1);
     assert.equal(f.events.filter(method => method === 'command_finish').length, 0);
   } finally {
