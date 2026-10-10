@@ -50,13 +50,17 @@
 import { hostname } from 'node:os';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
+import { createRoutingHolderClient } from '../hub/routing-holder-client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createHoldLoop, type HoldOutcome } from '../hold/loop.ts';
 import type { StopOptions } from '../lease/loop.ts';
-import { createHoldMcp, HOLD_MCP_TOOL_NAMES, type HoldMcpToolName } from '../hold/mcp.ts';
+import { createHoldMcp, HOLD_MCP_TOOL_NAMES, ROUTED_COLLECTION_TOOL_NAME,
+  ROUTED_FILE_TOOL_NAME, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createDefaultHostedOrderAdapter, type HostedOrderResult } from '../hosted/order-adapter.ts';
 import { createVerifiedHostedHoldMcp } from '../hosted/verified-hold-mcp.ts';
+import { createTrustedInputV2Admission } from '../hosted/trusted-input-admission.ts';
+import { createTrustedReferenceV2Reader, type TrustedReferenceV2Reader } from '../hosted/trusted-reference-v2.ts';
 import { buildSubmitProof } from '../submit-proof.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
@@ -64,6 +68,7 @@ import { validModelOrderFields } from '../order-definition-binding.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, watchStdinEof, type SignalHost, type StdinHost } from './signals.ts';
+import { consumeRoutingHolderHandoff } from './routing-holder-handoff.ts';
 
 const DEFAULT_INTERVAL_MS = 60_000;
 // Deliberate duplicate of main.ts's VERSION (also '0.0.0'): the roles must not
@@ -82,9 +87,11 @@ interface ParsedArgs {
   ignoreStdin: boolean;
   mcp: boolean;
   verifiedHosted?: boolean;
+  trustedInputV2?: boolean;
   mcpTools?: HoldMcpToolName[];
   /** Never hand the claim back — another process is the holder of record. */
   neverRelease?: boolean;
+  routingHolder?: string;
   error?: string;
 }
 
@@ -93,11 +100,11 @@ function parseMcpTools(value: string): HoldMcpToolName[] | { error: string } {
   if (names.length === 0 || names.some((name) => name === '')) {
     return { error: '--mcp-tools must be a comma-separated list with no empty names' };
   }
-  const allowed = new Set<string>(HOLD_MCP_TOOL_NAMES);
+  const allowed = new Set<string>([...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME, ROUTED_COLLECTION_TOOL_NAME]);
   const unknown = names.filter((name) => !allowed.has(name));
   if (unknown.length > 0) {
     return {
-      error: `--mcp-tools contains unknown tool(s): ${unknown.join(', ')}; expected ${HOLD_MCP_TOOL_NAMES.join(',')}`,
+      error: `--mcp-tools contains unknown tool(s): ${unknown.join(', ')}; expected ${[...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME, ROUTED_COLLECTION_TOOL_NAME].join(',')}`,
     };
   }
   if (new Set(names).size !== names.length) {
@@ -130,6 +137,9 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--verified-hosted':
 	parsed.verifiedHosted = true;
 	break;
+      case '--trusted-input-v2':
+	parsed.trustedInputV2 = true;
+	break;
       case '--never-release':
         parsed.neverRelease = true;
         break;
@@ -141,7 +151,8 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--shift':
       case '--heartbeat-interval':
       case '--jump-tolerance':
-      case '--mcp-tools': {
+      case '--mcp-tools':
+      case '--routing-holder': {
         const r = takeValue(a, i);
         if ('error' in r) return { ignoreStdin: false, mcp: false, error: r.error };
         i = r.next;
@@ -151,6 +162,7 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--as') parsed.as = r.value;
         else if (name === '--shift') parsed.shift = r.value;
+	else if (name === '--routing-holder') parsed.routingHolder = r.value;
 	else if (name === '--mcp-tools') {
 	  const selected = parseMcpTools(r.value);
 	  if ('error' in selected) return { ignoreStdin: false, mcp: false, error: selected.error };
@@ -211,6 +223,7 @@ function usage(): void {
       '                     [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
       '                     [--mcp-tools <get_order,submit,reject>]\n' +
       '                     [--verified-hosted  (read-only by default; submit requires --mcp-tools get_order,submit)]\n' +
+      '                     [--trusted-input-v2  (MCP only; direct Service HTTPS witness)]\n' +
       '   or: owenloop work hold --order <run> --workflow <wf> [...]\n' +
       '  --mcp requires the order definition in the local workflow store (project cwd or global store).\n',
   );
@@ -290,6 +303,8 @@ export interface RunDeps {
   };
   /** Injected local resolver for model-field binding tests. */
   modelInstructionResolver?: InstructionResolver;
+  /** Test-only local read seam; production uses its own HTTPS reader. */
+  trustedInputV2Reader?: TrustedReferenceV2Reader;
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -345,20 +360,43 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const env = deps.env ?? process.env;
-  let settings;
-  try {
-    settings = loadSettings(env);
-  } catch (e) {
-    err(`owenloop work hold: ${errMsg(e)}`);
+  const routed = parsed.routingHolder !== undefined;
+  if (!routed && parsed.mcpTools?.some(name => name === ROUTED_FILE_TOOL_NAME
+    || name === ROUTED_COLLECTION_TOOL_NAME)) {
+    err('owenloop work hold: routed tools require a routed holder');
     return 1;
   }
-
-  const origin = parsed.origin ?? settings.hubOrigin;
+  const trustedInputV2 = parsed.trustedInputV2 === true || env['OWENLOOP_TRUSTED_INPUT_V2'] === '1';
+  if (trustedInputV2 && (!parsed.mcp || parsed.verifiedHosted || routed)) {
+    err('owenloop work hold: --trusted-input-v2 requires an ordinary --mcp holder');
+    return 2;
+  }
+  // The marker alone never authorizes an account-store fallback. The nested
+  // holder needs a one-use private handoff and is always a never-release MCP.
+  if (!routed && (env['OWENLOOP_ROUTING_SESSION'] === '1'
+    || env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || env['OWENLOOP_ROUTING_HOLDER'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HANDOFF'] !== undefined
+    || process.env['OWENLOOP_ROUTING_HOLDER'] !== undefined)) {
+    err('owenloop work hold: routed holder transport unavailable');
+    return 1;
+  }
+  if (routed && (!parsed.mcp || !parsed.neverRelease || parsed.verifiedHosted
+    || parsed.origin === undefined || parsed.routingHolder === '')) {
+    err('owenloop work hold: routed holder requires --mcp --never-release and an explicit origin');
+    return 1;
+  }
+  let settings: ReturnType<typeof loadSettings> | undefined;
+  if (!routed) {
+    try { settings = loadSettings(env); }
+    catch (e) { err(`owenloop work hold: ${errMsg(e)}`); return 1; }
+  }
+  const origin = parsed.origin ?? settings?.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work hold: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
   }
-  if (parsed.verifiedHosted) {
+  if (parsed.verifiedHosted || trustedInputV2) {
     try {
       const url = new URL(origin);
       if (url.protocol !== 'https:' || url.username !== '' || url.password !== ''
@@ -373,18 +411,43 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     err('owenloop work hold: --as requires a non-empty account name');
     return 2;
   }
-  const account = parsed.as ?? 'default';
-  const bearer = await resolveBearer({ origin, account, env });
-  if (!bearer.ok) {
-    err(`owenloop work hold: ${bearer.message}`);
-    return bearer.code;
+  let token: string | undefined;
+  let holder: ContactHolder;
+  let hub: HubClient;
+  let routedUploadFile: ReturnType<typeof createRoutingHolderClient>['uploadFile'] | undefined;
+  let routedFileClient: ReturnType<typeof createRoutingHolderClient> | undefined;
+  if (routed) {
+    // Strip ambient bearer routes before local definition/consumed verification.
+    // The holder never invokes resolveBearer or accepts an injected broad Hub.
+    for (const source of [env, process.env]) {
+      delete source.OWENLOOP_TOKEN;
+      delete source.OWENLOOP_CREDENTIAL_COMMAND;
+      delete source.OWENLOOP_ROUTING_HANDOFF;
+      delete source.OWENLOOP_ROUTING_HOLDER;
+    }
+    try {
+      const binding = consumeRoutingHolderHandoff({ path: parsed.routingHolder!, origin,
+	workflow: target.workflow, run: target.run });
+      if ((parsed.session !== undefined && parsed.session !== binding.sessionId)
+	|| (parsed.shift !== undefined && parsed.shift !== binding.shiftId)) throw new Error();
+      holder = { kind: 'session', id: binding.sessionId, shiftId: binding.shiftId };
+      const routedHub = createRoutingHolderClient(binding);
+      routedFileClient = routedHub;
+      hub = routedHub;
+      routedUploadFile = routedHub.uploadFile;
+    } catch {
+      err('owenloop work hold: routed holder handoff refused');
+      return 1;
+    }
+  } else {
+    const account = parsed.as ?? 'default';
+    const bearer = await resolveBearer({ origin, account, env });
+    if (!bearer.ok) { err(`owenloop work hold: ${bearer.message}`); return bearer.code; }
+    token = bearer.token;
+    const shiftId = resolveShiftId(parsed.shift, env);
+    holder = resolveHolder(parsed.session, env, { shiftId });
+    hub = deps.hub ?? createHubClient({ origin, getToken: async () => token! });
   }
-  const token = bearer.token;
-
-  const shiftId = resolveShiftId(parsed.shift, env);
-  const holder = resolveHolder(parsed.session, env, { shiftId });
-
-  const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
 
   // --never-release: this hold is NOT the holder of record. `owenloop work
   // agent-run` already claimed the order with its own `exec` lease loop and
@@ -412,6 +475,22 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // `agent-run` child is not and does not.
   if (parsed.mcp) {
     let modelResolver = deps.modelInstructionResolver;
+    const consumedVerifier = createConsumedVerifier({ env, now: () => Date.now() });
+    let trustedAdmission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
+    if (trustedInputV2) {
+      try {
+	modelResolver ??= createDefaultStoreInstructionResolver({
+	  cwd: parsed.neverRelease ? env['OWENLOOP_INSTRUCTION_CWD'] ?? process.cwd() : process.cwd(), env,
+	});
+	const reader = deps.trustedInputV2Reader ?? createTrustedReferenceV2Reader({ origin,
+	  getToken: async () => token!, expected: target });
+	trustedAdmission = createTrustedInputV2Admission({ reader, instructions: modelResolver,
+	  consumedVerifier, expected: target });
+      } catch (error) {
+	err(`owenloop work hold: trusted input v2 unavailable: ${errMsg(error)}`);
+	return 1;
+      }
+    }
     const modelOrderVerifier: NonNullable<Parameters<typeof createHoldMcp>[0]['modelOrderVerifier']> = async (order) => {
       try {
 	modelResolver ??= createDefaultStoreInstructionResolver({
@@ -433,15 +512,18 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       workflow: target.workflow,
       run: target.run,
       workdir: process.cwd(),
+      ...(routedUploadFile ? { uploadFile: routedUploadFile } : {}),
+      ...(routedFileClient ? { downloadFile: routedFileClient.downloadFile,
+	discardDownloadedFile: routedFileClient.discardDownloadedFile } : {}),
+      ...(routedFileClient ? { routedCollection: routedFileClient } : {}),
+      ...(routed ? { routedSubmit: true as const } : {}),
       ...(parsed.verifiedHosted ? { tools: ['get_order' as const] }
 	: parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),
       origin,
       env,
-      consumedVerifier: createConsumedVerifier({
-        env,
-        now: () => Date.now(),
-      }),
+      consumedVerifier,
       modelOrderVerifier,
+      ...(trustedAdmission === undefined ? {} : { trustedInputV2: trustedAdmission }),
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
       err,
@@ -454,7 +536,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       let adapter;
       try {
 	adapter = deps.hostedAdapter ?? createDefaultHostedOrderAdapter({
-	  hub: { origin, getToken: async () => token },
+	  hub: { origin, getToken: async () => token! },
 	  expected: { workflowId: target.workflow, runId: target.run },
 	  cwd: process.cwd(), env, now: () => Date.now(),
 	});
@@ -499,9 +581,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
         resolve();
       });
     });
-    const outcome = await mount.loop.run();
-    await eof;
-    return exitCodeFor(outcome);
+    try {
+      const outcome = await mount.loop.run();
+      await eof;
+      return exitCodeFor(outcome);
+    } finally { await routedFileClient?.closeDownloadedFiles(); }
   }
 
   const loop = createHoldLoop({

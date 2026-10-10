@@ -45,6 +45,22 @@ export interface HarnessSessionRef {
   token: string;
 }
 
+/** Retained at routed spawn time, before provider setup can await. The role
+ * may settle only the original process group; this does not attest descendants
+ * that have left that group or change the native claim's reoffer policy. */
+export interface RoutedHarnessLaunch {
+  readonly generation: string;
+  readonly transport: {
+    settleEffects(opts: { reason: 'normal-exit' | 'stop' | 'setup-failed'; deadlineAt: number }):
+      Promise<{ scope: 'original-posix-group'; state: 'empty' | 'uncertain' }>;
+  };
+}
+
+export interface RoutedHarnessLaunchRequest {
+  generation: string;
+  onLaunch(launch: RoutedHarnessLaunch): void;
+}
+
 /**
  * Telemetry from a running turn.
  *
@@ -313,6 +329,9 @@ export interface StartArgs {
    * argv, never the prompt.
    */
   owenloopMcp: { command: string; args: string[] };
+  /** Worker-created read-only published subtree for verified routed inputs.
+   * Staging and unrelated cache siblings are never exposed to the adapter. */
+  verifiedFileCacheRoot?: string;
   /** Normalized from the step def by `normalizeStepPermissions`. */
   permissions: StepPermissions;
   /**
@@ -352,6 +371,7 @@ export interface StartArgs {
  * miss.
  */
 export type DeliverArgs = Pick<StartArgs, 'cwd' | 'owenloopMcp' | 'permissions'> &
+  Pick<StartArgs, 'verifiedFileCacheRoot'> &
   Pick<StartArgs, 'model' | 'effort' | 'approvals' | 'recoveryPolicy'>;
 
 /** The neutral part of an adapter's opt-in silence recovery configuration. */
@@ -451,6 +471,11 @@ export interface HarnessAdapter {
    * mid-turn crash leaves an authoritative active record behind.
    */
   start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef>;
+  /** Optional one-use routed start. An adapter without spawn-time retained
+   * custody is ineligible for routed selection; ordinary start is never a
+   * fallback. The owning adapter enforces its own generation and holder gate. */
+  startRouted?(args: StartArgs, onEvent: (e: AgentEvent) => void,
+    launch: RoutedHarnessLaunchRequest): Promise<HarnessSessionRef>;
   /**
    * Deliver a message into an EXISTING session (resume). Resolves at turn end.
    * Rejects with `ResumeUnavailableError` when the provider no longer knows the

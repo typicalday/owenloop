@@ -27,13 +27,16 @@ import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
 import {
   DefError,
+  callsEdgeKey,
   digestScopedCallsTargetKey,
+  expandIncludes,
   finalizeDefs,
   lintDef,
-  loadDefFile,
   loadDefsRaw,
   validateDef,
 } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
+import { isBundleWorkflowName } from '../bundle/call-target.ts';
 import { isVersionedReference, parseManifestBytes, parseVersionedCallTarget } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
@@ -195,6 +198,10 @@ export interface InstallWorkflowBundleArgs {
   expectedDigest?: DefDigest;
   /** Explicit publication/origin evidence forwarded to the mandatory verifier. */
   verificationEvidence?: BundleVerificationEvidence;
+  /** Opted-in routed host storage admission only. Signed Hub live slash calls
+   * defer cross-definition validation until an exact native occurrence is
+   * selected; this never grants an executable instruction lookup. */
+  deferHubLiveCallsAtStorage?: true;
   /**
    * Project-level installs ONLY: the installed.json ledger lookup so the
    * inline recovery can roll back/forward a legacy v1 (GitHub-route) journal
@@ -459,21 +466,26 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // Validate the staged tree with the engine's strict pass — the exact
     // bytes that will be committed, with no re-write after validation.
     const reasons: string[] = [];
-    let staged: Map<string, ReturnType<typeof loadDefFile>>;
+    let staged: Map<string, ReturnType<typeof loadBundleDefFile>>;
     let externalVersionedCalls: ReadonlySet<string> = new Set();
+    let deferredHubLiveCalls: ReadonlySet<string> = new Set();
+    let expandedCallTargets: readonly string[] = [];
     let stagedBundleLock: Readonly<Record<string, string>> = {};
+    let stagedBundleDialect: 'plain' | 'hub-qualified' = 'plain';
     const manifestPath = join(stagingDir, 'bundle.yaml');
     if (existsSync(manifestPath)) {
       // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
       // path and key the staged definitions by the manifest's workflow name.
-      staged = new Map<string, ReturnType<typeof loadDefFile>>();
+      staged = new Map<string, ReturnType<typeof loadBundleDefFile>>();
       try {
         const manifest = parseManifestBytes(readFileSync(manifestPath));
 		stagedBundleLock = manifest.lock;
+		const dialect = bundleDialectForManifest(manifest);
+		stagedBundleDialect = dialect;
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
           try {
-            const stagedDef = loadDefFile(workflowFile);
+			const stagedDef = loadBundleDefFile(workflowFile, dialect);
             if (stagedDef.name !== workflowName) {
               reasons.push(
                 `${workflowFile}: definition name '${stagedDef.name}' must equal workflow map key '${workflowName}'`,
@@ -502,12 +514,6 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       staged = loadDefsRaw(stagingDir, failures);
       reasons.push(...failures.map((failure) => `${failure.file}: ${failure.error}`));
     }
-    if (existsSync(manifestPath)) {
-      externalVersionedCalls = new Set(
-		[...staged.values()].flatMap((def) => def.steps.map((step) => step.calls)
-		  .filter((target): target is string => target !== undefined && isVersionedReference(target))),
-      );
-    }
     for (const stagedDef of staged.values()) {
       const lintResult = lintDef(stagedDef);
       reasons.push(...lintResult.errors.map((err) => `${stagedDef.name}: ${err}`));
@@ -523,7 +529,30 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
     if (reasons.length === 0) {
       try {
-	finalizeDefs(staged, { allowUnresolvedVersionedCalls: externalVersionedCalls });
+	const expandedStaged = new Map([...staged].map(([nodeKey, raw]) =>
+	  [nodeKey, expandIncludes(raw, member => staged.get(member))] as const));
+	expandedCallTargets = [...expandedStaged.values()].flatMap(def =>
+	  def.steps.map(step => step.calls).filter((target): target is string => target !== undefined));
+	if (existsSync(manifestPath)) {
+	  // Includes are authored steps too. Permit only their exact versioned
+	  // targets to remain unresolved at storage time for later locked recovery.
+	  externalVersionedCalls = new Set(expandedCallTargets.filter(isVersionedReference));
+	}
+	if (args.deferHubLiveCallsAtStorage === true && stagedBundleDialect === 'hub-qualified') {
+	  deferredHubLiveCalls = new Set([...expandedStaged.entries()].flatMap(([nodeKey, def]) => {
+	    return def.steps.filter(step => step.calls !== undefined
+	      && step.calls.includes('/') && isBundleWorkflowName(step.calls)
+	      && !isVersionedReference(step.calls)
+	      && stagedBundleLock[step.calls] === undefined)
+	      .map(step => callsEdgeKey(nodeKey, step));
+	  }));
+	}
+	// An unlocked Hub slash call is selected from current native Service
+	// publication state, possibly outside this archive or differently from an
+	// archive sibling. Defer only its cross-definition/cycle edge during
+	// storage admission; executable prime must later bind an exact occurrence.
+	finalizeDefs(staged, { allowUnresolvedVersionedCalls: externalVersionedCalls,
+	  deferredHubLiveCalls });
       } catch (e) {
         if (e instanceof DefError) {
           reasons.push(`cross-definition validation failed: ${e.message}`);
@@ -587,7 +616,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       projectRoot: args.projectRoot,
       globalRoot: args.globalRoot,
       lock: stagedBundleLock,
-      callsTargets: [...staged.values()].flatMap((def) => def.steps.map((step) => step.calls).filter((target): target is string => target !== undefined)),
+      callsTargets: expandedCallTargets,
       ...(repairRequired ? { repairReplacement: { root, digest, objectDir: stagingDir } } : {}),
     });
 

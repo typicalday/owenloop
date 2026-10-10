@@ -47,6 +47,8 @@ const EXACT_FILES = new Set([
   'LICENSE',
   'CHANGELOG.md',
   'bin/owenloop.mjs',
+  'bin/owenloop-routing-helper-build.mjs',
+  'native/routing-file-open.c',
   ...PLUGIN_FILES,
 ]);
 
@@ -209,7 +211,8 @@ export function validatePackageEntries(entries) {
     }
 
     const expectedMode =
-      path === 'bin/owenloop.mjs' || PLUGIN_EXECUTABLES.has(path) ? 0o755 : 0o644;
+      path === 'bin/owenloop.mjs' || path === 'bin/owenloop-routing-helper-build.mjs'
+        || PLUGIN_EXECUTABLES.has(path) ? 0o755 : 0o644;
     if ((entry.mode & 0o7777) !== expectedMode) {
       errors.push(
         `unexpected mode for ${path}: expected ${expectedMode.toString(8)}, got ${(entry.mode & 0o7777).toString(8)}`,

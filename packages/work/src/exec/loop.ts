@@ -54,6 +54,8 @@ import type { InstructionResolver } from './instructions.ts';
 import { PAYLOAD_FILE_ENV, PAYLOAD_MAX_BYTES, readPayloadFile, resolvePayload } from './payload.ts';
 import { buildReceipt, type CommandReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import { routedWorkerEnv } from '../roles/routing-role-env.ts';
+import { createRoutedExecLoop, type RoutedExecutionController } from './routed-loop.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
@@ -112,7 +114,8 @@ export type ExecOutcome =
   | 'judge-rejected' // a judge delivered a non-zero verdict through reject (exit 0)
   | 'judge-no-verdict' // a judge ended with machinery/signal failure (exit 1)
   | 'reject-failed' // a reject was refused or threw; nothing was submitted (exit 1)
-  | 'stopped'; // stop() arrived before the hold was established (exit 1)
+  | 'stopped' // stop() arrived before the hold was established (exit 1)
+  | 'routed-quarantined'; // fenced routed lifecycle lacks exact closure; no release or cleanup
 
 export interface ExecLoopOptions {
   hub: HubClient;
@@ -129,6 +132,14 @@ export interface ExecLoopOptions {
   holder: ContactHolder;
   /** Resolves command text from a verified local workflow-store object. */
   instructions: InstructionResolver;
+  /** Routed-only awaited reservation/report/fresh-claim gate immediately before shell start. */
+  routedPrestart?: (order: OrderPacket, signal: AbortSignal) => Promise<void | {
+    consumedFilePathsJson?: string; cleanup?: () => Promise<void>;
+  }>;
+  /** Fenced, parent-owned command lifecycle. Never combine with routedPrestart. */
+  routedExecution?: RoutedExecutionController;
+  /** Public-only stage paths for the command process; removes inherited account-store handles. */
+  routedPublicEnv?: { HOME: string; OWENLOOP_CONFIG_DIR: string };
   /** cwd for the command when the order packet carries no `workdir`. */
   cwd: string;
   /**
@@ -265,7 +276,7 @@ function withCommandOutput(text: string, outputTail: string): string {
  * an input that was declared but never produced is ABSENT from the object, not
  * present as `null`, and a script tests for it with `'key' in consumes`.
  */
-function deliverConsumes(
+export function deliverConsumes(
   childEnv: Record<string, string | undefined>,
   consumes: Record<string, unknown> | undefined,
 ): string | undefined {
@@ -313,7 +324,7 @@ function deliverConsumes(
  * inline-or-file collision rule as consumes applies: a nested command must
  * never inherit stale feedback from its parent order.
  */
-function deliverFeedback(
+export function deliverFeedback(
   childEnv: Record<string, string | undefined>,
   feedback: Array<{ path: string; reasons: unknown[] }> | undefined,
 ): string | undefined {
@@ -376,7 +387,7 @@ function deliverFeedback(
  * one outcome worse than having no channel, because the child would then write
  * its result into its parent order's file.
  */
-function deliverPayloadFile(
+export function deliverPayloadFile(
   childEnv: Record<string, string | undefined>,
   warn: (message: string) => void,
 ): { dir?: string; file?: string } {
@@ -398,7 +409,7 @@ function deliverPayloadFile(
 }
 
 /** Best-effort removal of an overflow directory; a cleanup failure never fails a step. */
-function removeConsumesDir(dir: string | undefined): void {
+export function removeConsumesDir(dir: string | undefined): void {
   if (dir === undefined) return;
   try {
     rmSync(dir, { recursive: true, force: true });
@@ -410,12 +421,17 @@ function removeConsumesDir(dir: string | undefined): void {
 }
 
 export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
+  if (opts.routedExecution) {
+    if (opts.routedPrestart) throw new Error('routed execution cannot use the ordinary prestart seam');
+    return createRoutedExecLoop(opts, opts.routedExecution);
+  }
   const { hub, runner, workflow } = opts;
   const runId = opts.run;
 
   let running: RunningCommand | undefined;
   let signalled = false;
   let leasePromise: Promise<LeaseOutcome> | undefined;
+  const routedPrestartAbort = new AbortController();
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -502,12 +518,30 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     return 'submit-failed';
   }
 
+  /** Recheck the same claim/input observation after any signing or retry wait. */
+  async function checkV2Consequence(
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
+  ): Promise<ExecOutcome | undefined> {
+    if (revalidate === undefined) return undefined;
+    let reason: string | undefined;
+    try { reason = (await revalidate())?.reason; }
+    catch (error) { reason = `trusted input v2 consequence read failed: ${errMsg(error)}`; }
+    if (reason === undefined) return undefined;
+    opts.err(reason);
+    lease.stop('unresolved-instructions');
+    await leasePromise;
+    return 'unresolved-instructions';
+  }
+
   /** Deliver one reject verb and settle the lease after the response arrives. */
   async function issueReject(
     path: string,
     text: string,
     successOutcome: 'rejected' | 'judge-rejected',
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
+    const refused = await checkV2Consequence(revalidate);
+    if (refused !== undefined) return refused;
     try {
       const res = await hub.reject({ workflow, run: runId, path, text });
       if (res.ok !== true) {
@@ -567,10 +601,13 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     text: string,
     outputTail: string,
     owed: number,
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome | 'continue'> {
     const body = withCommandOutput(text, outputTail);
     let res;
     try {
+      const refused = await checkV2Consequence(revalidate);
+      if (refused !== undefined) return refused;
       res = await hub.reject({ workflow, run: runId, path, text: body });
     } catch (e) {
       opts.err(`owenloop work exec: reject of ${path} failed: ${errMsg(e)}`);
@@ -712,6 +749,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     receipt: CommandReceipt,
     order: OrderPacket,
     resolvedCommand: string,
+    revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
     // run() returns misroute when order.owes is empty, so this index is safe.
     const path = order.owes[0]!.path;
@@ -733,6 +771,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 
     let res;
     try {
+      const refused = await checkV2Consequence(revalidate);
+      if (refused !== undefined) return refused;
       res = await hub.ask({
 	workflow,
 	run: runId,
@@ -764,6 +804,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     order: OrderPacket,
     resolvedCommand: string,
     payloadFile: string | undefined,
+    revalidateAfterRun?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
     if (signalled) {
       // The operator killed the work and the command settled before the lease
@@ -775,7 +816,6 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       await leasePromise;
       return 'killed';
     }
-
     // Before any of the branches below decide what to do about the failure.
     // Every one of them is reachable with a useless log otherwise.
     relayChildOutput(result, order.step);
@@ -789,6 +829,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       payloadOverCap: result.payloadOverCap,
       file: readPayloadFile(payloadFile),
     });
+    // The outer run() cleanup may unlink payloadFile on the first await in
+    // this function. Capture its bytes first, then make the v2 network read.
+    if (revalidateAfterRun !== undefined) {
+      const refused = await checkV2Consequence(revalidateAfterRun);
+      if (refused !== undefined) return refused;
+    }
     if (order.judge !== undefined) {
       if (result.exitCode === null) {
         // A signal or machinery failure is not a verdict. Leave the claim for
@@ -807,7 +853,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
           if (typeof reason === 'string' && reason.trim() !== '') text = reason;
         }
         if (text === '') text = `judge command exited with code ${result.exitCode}`;
-        return issueReject(order.judge, text, 'judge-rejected');
+	return issueReject(order.judge, text, 'judge-rejected', revalidateAfterRun);
       }
     }
 
@@ -869,11 +915,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         parsedPayload.reject.text,
         result.outputTail,
         order.owes.length,
+	revalidateAfterRun,
       );
       if (rejected !== 'continue') return rejected;
     }
 
-    if (!commandSucceeded(result)) return escalateCommandFailure(receipt, order, resolvedCommand);
+    if (!commandSucceeded(result)) return escalateCommandFailure(receipt, order, resolvedCommand, revalidateAfterRun);
 
     for (const owe of order.owes) {
       let proof: string | undefined;
@@ -912,6 +959,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       let res: Awaited<ReturnType<HubClient['submit']>> | undefined;
 
       for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
+	const refusedAttempt = await checkV2Consequence(revalidateAfterRun);
+	if (refusedAttempt !== undefined) return refusedAttempt;
         try {
           res = await hub.submit(submitRequest);
           break;
@@ -970,6 +1019,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 
   async function run(): Promise<ExecOutcome> {
     leasePromise = lease.run();
+    // A terminal lease cancels a pending scoped file stream before a shell can
+    // start. Normal completion happens only after the command is already done.
+    void leasePromise.then(() => routedPrestartAbort.abort(), () => routedPrestartAbort.abort());
 
     // First contact race: the order arrives (hold established), or the lease
     // resolves terminally before we ever established it.
@@ -1056,6 +1108,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     let resolvedCommand: string;
     let resolvedBundleDir: string | undefined;
     let revalidate: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
+    let revalidateAfterRun: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     try {
       const resolved = await opts.instructions.resolveCommand(order);
       if (!resolved.ok) {
@@ -1067,6 +1120,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       resolvedCommand = resolved.command;
       resolvedBundleDir = resolved.bundleDir;
       revalidate = resolved.revalidate;
+      revalidateAfterRun = resolved.revalidateAfterRun;
     } catch (e) {
       opts.err(
         `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
@@ -1092,6 +1146,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // that assumes the child is gone.
     let consumesDir: string | undefined;
     let feedbackDir: string | undefined;
+    let routedFilesCleanup: (() => Promise<void>) | undefined;
+    let routedCommandDone = false;
+    let routedCleanupPromise: Promise<void> | undefined;
     // The payload directory differs from the two above: it is created on EVERY
     // command spawn, not only on overflow, because the command has to be told
     // where it may write before anyone knows whether it will.
@@ -1103,7 +1160,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         // spawn's env replaces the child environment. Start from the actual exec
         // process environment so config-only opts.env cannot strip PATH/HOME, then
         // explicitly remove bundle provenance for loose definitions.
-        const childEnv: Record<string, string | undefined> = { ...process.env };
+	const childEnv: Record<string, string | undefined> = opts.routedPublicEnv
+	  ? routedWorkerEnv(process.env, opts.routedPublicEnv) : { ...process.env };
         if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
         else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
         // Run identity is engine-derived from ExecLoopOptions, never a consumed
@@ -1173,15 +1231,45 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
             return 'unresolved-instructions';
           }
         }
+	if (opts.routedPrestart) {
+	  try {
+	    const prepared = await opts.routedPrestart(order, routedPrestartAbort.signal);
+	    if (prepared) {
+	      if (prepared.consumedFilePathsJson !== undefined)
+		childEnv['OWENLOOP_CONSUMED_FILE_PATHS_JSON'] = prepared.consumedFilePathsJson;
+	      routedFilesCleanup = prepared.cleanup;
+	    }
+	  } catch {
+	    opts.err('owenloop work exec: routed launch refused before shell start');
+	    const revoked = routedPrestartAbort.signal.aborted;
+	    lease.stop('routed-launch-refused');
+	    const terminal = await leasePromise;
+	    return signalled ? 'killed' : revoked
+	      ? mapLeaseDuringRun(terminal) : 'unresolved-instructions';
+	  }
+	  if (signalled || routedPrestartAbort.signal.aborted) {
+	    const terminal = await leasePromise;
+	    return signalled ? 'killed' : mapLeaseDuringRun(terminal);
+	  }
+	}
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
-	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
+	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile, revalidateAfterRun);
       }
       running = cmd;
       opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
 
+      const afterCommandExit = () => {
+	routedCommandDone = true;
+	if (routedFilesCleanup && !routedCleanupPromise)
+	  routedCleanupPromise = routedFilesCleanup().catch(() => {
+	    opts.err('owenloop work exec: routed file cache cleanup failed');
+	  });
+      };
+
       const outcome = await Promise.race([
-        cmd.done.then((r) => ({ t: 'done' as const, r })).catch((e: unknown) => ({ t: 'done' as const, r: machineryFailure(e) })),
+	cmd.done.then((r) => { afterCommandExit(); return { t: 'done' as const, r }; })
+	  .catch((e: unknown) => { afterCommandExit(); return { t: 'done' as const, r: machineryFailure(e) }; }),
         leasePromise.then((o) => ({ t: 'lease' as const, o })),
       ]);
 
@@ -1195,17 +1283,26 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return mapLeaseDuringRun(outcome.o);
       }
 
-      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile);
+      return deliverCommandResult(outcome.r, order, resolvedCommand, payloadFile, revalidateAfterRun);
     } finally {
       removeConsumesDir(consumesDir);
       removeConsumesDir(feedbackDir);
       removeConsumesDir(payloadDir);
+      // `runner.kill()` may return before a signalled process group exits.
+      // Preserve the private cache on that uncertain path for a reaper instead
+      // of deleting a file a still-live command could be reading.
+      if (!running && routedFilesCleanup && !routedCleanupPromise)
+	routedCleanupPromise = routedFilesCleanup().catch(() => {
+	  opts.err('owenloop work exec: routed file cache cleanup failed');
+	});
+      if (routedCommandDone && routedCleanupPromise) await routedCleanupPromise;
     }
   }
 
   function stop(reason?: string): void {
     if (signalled) return;
     signalled = true;
+    routedPrestartAbort.abort();
     if (running !== undefined) void running.kill();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

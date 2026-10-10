@@ -303,6 +303,14 @@ test('buildOwenloopMcp never lets the child release the claim', () => {
   assert.equal(args.includes('--never-release'), true);
 });
 
+test('buildOwenloopMcp passes only the private routed holder path, never its cap', () => {
+  const mount = buildOwenloopMcp(spec({ shiftId: 'shf_abc' }), '/bin/owenloop.mjs', '/bin/node',
+    '/private/ol-rh-ABC123/holder.json');
+  assert.deepEqual(mount.args.slice(-3), ['--never-release', '--routing-holder',
+    '/private/ol-rh-ABC123/holder.json']);
+  assert.doesNotMatch(JSON.stringify(mount), /routing.holder.cap|Bearer/);
+});
+
 test('buildOwenloopMcp cannot be hijacked by a stale owenloop earlier on PATH', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-stale-path-'));
   const marker = join(dir, 'stale-ran');

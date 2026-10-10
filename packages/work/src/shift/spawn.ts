@@ -19,7 +19,7 @@
  * argv/option construction is factored into the pure `buildSpawnPlan`, while a
  * focused lifecycle regression uses harmless local children.
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
 
 import { resolveOwenloopBin } from '../owenloop-bin.ts';
@@ -50,6 +50,18 @@ export interface SpawnSpec {
   kind?: 'exec' | 'agent-run';
   /** Closed start gate created by the durable Shift reservation. */
   startGate?: string;
+  /** Private per-reservation handoff path; the capability stays in its file. */
+  routingHandoff?: string;
+  /** Parent-only generation; no additional child env field (gate path contains it). */
+  dispatchToken?: string;
+  /** Parent-only direct-child gate entry, before any role or Hub operation. */
+  onGateEntered?: (entry: { dispatchToken: string; routingHandoff: string; pid: number }) => void;
+  /** Final synchronous parent authority check immediately before queuing IPC allow. */
+  canAllowGateEntry?: () => boolean;
+  /** Authenticated service shift identity associated with this handoff. */
+  routingShiftId?: string;
+  /** Parent-only exact reservation cleanup, never passed to child code. */
+  onTerminal?: (reason?: 'exit' | 'start-failure' | 'cancel') => void;
   /** Stable shift name in force when this worker was dispatched. */
   shiftName?: string;
   /** Stable owner key for session reconciliation. */
@@ -59,6 +71,10 @@ export interface SpawnSpec {
 /** The result the loop records plus best-effort pre-start cancellation handles. */
 export interface SpawnResult {
   pid: number;
+  /** Parent-only custody of the exact process created by the default spawner. */
+  custody?: RetainedChildCustody;
+  /** Start the bounded direct-child IPC handshake after the gate signal write. */
+  armGateEntry?: () => void;
   /**
    * Dispatcher-owned cancellation. The default spawner disarms spontaneous
    * lifecycle reporting before sending SIGTERM, so one failed dispatch emits
@@ -67,6 +83,16 @@ export interface SpawnResult {
   cancel?: () => void;
   /** Legacy injected-spawner compatibility. New dispatcher code prefers cancel. */
   terminate?: () => void;
+}
+
+/** Opaque to callers: a PID or injected spawner cannot manufacture this proof. */
+export interface RetainedChildCustody { readonly pid: number }
+const retainedChildren = new WeakMap<RetainedChildCustody, { child: ChildProcess; live: () => boolean }>();
+
+export function retainedChildLive(custody: RetainedChildCustody | undefined, pid: number): boolean {
+  const retained = custody && retainedChildren.get(custody);
+  return !!retained && custody!.pid === pid && retained.child.pid === pid
+    && retained.child.exitCode === null && retained.child.signalCode === null && retained.live();
 }
 
 /** The spawn seam. Injected; faked in tests. */
@@ -155,6 +181,9 @@ export interface WorkerExit {
   run: string;
   kind: 'exec' | 'agent-run';
   pid: number;
+  /** Unique per-dispatch path, used only to match a routed stage owner. */
+  routingHandoff?: string;
+  dispatchToken?: string;
   exitStatus: number | null;
   signal: NodeJS.Signals | null;
 }
@@ -167,9 +196,12 @@ export type WorkerExitReporter = (exit: WorkerExit) => void;
  * Slot 0 is always `'ignore'`: a worker reads nothing. Slots 1 and 2 are either
  * both `'ignore'` (no log destination resolved, or opening it failed) or both
  * the SAME descriptor number — one file opened once and handed to stdout and
- * stderr together, which is exactly shell `2>&1`.
+ * stderr together, which is exactly shell `2>&1`. Routed workers alone have a
+ * short-lived Node IPC channel in slot 3 for parent-observed gate entry; it is
+ * disconnected before the role imports its CLI or starts provider code.
  */
-export type WorkerStdio = ['ignore', 'ignore', 'ignore'] | ['ignore', number, number];
+export type WorkerStdio = ['ignore', 'ignore', 'ignore'] | ['ignore', number, number]
+  | ['ignore', 'ignore', 'ignore', 'ipc'] | ['ignore', number, number, 'ipc'];
 
 /** The fully-resolved spawn arguments — pure data, asserted directly in tests. */
 export interface SpawnPlan {
@@ -240,6 +272,11 @@ export function buildSpawnPlan(
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
   const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env['OWENLOOP_ROUTING_HANDOFF'];
+  if (spec.routingHandoff !== undefined) {
+    env['OWENLOOP_ROUTING_HANDOFF'] = spec.routingHandoff;
+    delete env['OWENLOOP_TOKEN'];
+  }
   env['OWENLOOP_ACCOUNT'] = account;
   if (spec.startGate !== undefined) env['OWENLOOP_START_GATE'] = spec.startGate;
   if (spec.shiftName !== undefined && spec.shiftName !== '') env['OWENLOOP_SHIFT_NAME'] = spec.shiftName;
@@ -256,11 +293,12 @@ export function buildSpawnPlan(
       `${spec.workflow}/${spec.run}`,
       '--origin',
       origin,
-      ...(shiftId !== undefined && shiftId !== '' ? ['--shift', shiftId] : []),
+      ...((spec.routingShiftId ?? shiftId) ? ['--shift', (spec.routingShiftId ?? shiftId)!] : []),
     ],
     options: {
       detached: true,
-      stdio: ['ignore', 'ignore', 'ignore'],
+      stdio: spec.routingHandoff === undefined
+	? ['ignore', 'ignore', 'ignore'] : ['ignore', 'ignore', 'ignore', 'ipc'],
       env,
     },
     ...(logDir !== undefined && logDir !== '' ? { logFile: runLogFile(logDir, spec.run) } : {}),
@@ -322,7 +360,8 @@ export function createDefaultSpawner(
       : openWorkerLog(plan.logFile, reportOpenFailure);
     const options = logFd === undefined
       ? plan.options
-      : { ...plan.options, stdio: ['ignore', logFd, logFd] as WorkerStdio };
+      : { ...plan.options, stdio: (spec.routingHandoff === undefined
+	? ['ignore', logFd, logFd] : ['ignore', logFd, logFd, 'ipc']) as WorkerStdio };
     let child;
     try {
       child = spawn(plan.command, plan.args, options);
@@ -344,14 +383,15 @@ export function createDefaultSpawner(
     // start its own vendor process later, but reporting or guessing that
     // executable here would couple the neutral dispatcher to one adapter.
     const executable = `${process.execPath} ${binPath}`;
-    // THE INVARIANT: no worker stdio slot is ever a PARENT-OWNED PIPE. Once
+    // Stdout and stderr never use a parent-owned pipe. Once
     // Shift exits, a detached worker may keep writing diagnostics, and a pipe
     // whose reader has vanished kills the writer with EPIPE — losing the worker,
     // not just its output.
     //
     // A FILE DESCRIPTOR IS NOT A PIPE, and slots 1 and 2 are now an appended
     // file: it outlives the parent, needs no live reader, and cannot raise
-    // EPIPE. So the invariant holds unchanged while the bytes are kept.
+    // EPIPE. Routed workers separately use a bounded, short-lived IPC channel
+    // in slot 3 for direct-child gate entry, closed before role code starts.
     //
     // "Agent-run stderr is untrusted" also still holds, and still means what it
     // always meant: worker output is never quoted back as a failure message.
@@ -359,6 +399,21 @@ export function createDefaultSpawner(
     // Untrusted is a reason not to REPEAT those bytes, never a reason to
     // discard them before an operator can read them — reading them is the whole
     // point of `<run>.log`.
+    let terminalReported = false;
+    let gateArmed = false;
+    let gateEntered = false;
+    let gateTimer: ReturnType<typeof setTimeout> | undefined;
+    const disconnect = () => {
+      if (gateTimer) clearTimeout(gateTimer);
+      gateTimer = undefined;
+      try { if (child.connected) child.disconnect(); } catch { /* Exit/disconnect raced. */ }
+    };
+    const terminal = (reason: 'exit' | 'start-failure' | 'cancel') => {
+      if (terminalReported) return;
+      terminalReported = true;
+      disconnect();
+      spec.onTerminal?.(reason);
+    };
     let failureReported = false;
     let exitReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
@@ -378,17 +433,55 @@ export function createDefaultSpawner(
     const reportExit = (exitStatus: number | null, signal: NodeJS.Signals | null): void => {
       if (exitReported || onExit === undefined || child.pid === undefined) return;
       exitReported = true;
-      onExit({ workflow: spec.workflow, run: spec.run, kind, pid: child.pid, exitStatus, signal });
+      onExit({ workflow: spec.workflow, run: spec.run, kind, pid: child.pid,
+	...(spec.routingHandoff ? { routingHandoff: spec.routingHandoff } : {}),
+	...(spec.dispatchToken ? { dispatchToken: spec.dispatchToken } : {}), exitStatus, signal });
     };
-    child.once('error', () => {
+    child.on('error', () => {
+      terminal('start-failure');
       report(null, null, 'worker process failed to start');
       reportExit(null, null);
     });
     child.once('exit', (code, signal) => {
+      terminal('exit');
       reportExit(code, signal);
       if (code === 0) return;
       report(code, signal, 'worker exited without completing successfully');
     });
+    if (spec.routingHandoff !== undefined) {
+      child.once('message', message => {
+	const entry = message !== null && typeof message === 'object' && !Array.isArray(message)
+	  ? message as Record<string, unknown> : undefined;
+	let accepted = false;
+	try {
+	  if (gateArmed && !gateEntered && !terminalReported && child.pid !== undefined
+	    && child.exitCode === null && child.signalCode === null && spec.dispatchToken
+	    && spec.onGateEntered && entry
+	    && Object.keys(entry).sort().join(',') === 'dispatchToken,routingHandoff,type'
+	    && entry.type === 'routing-gate-entered'
+	    && entry.dispatchToken === spec.dispatchToken
+	    && entry.routingHandoff === spec.routingHandoff && spec.routingHandoff !== undefined) {
+	    spec.onGateEntered({ dispatchToken: spec.dispatchToken,
+	      routingHandoff: spec.routingHandoff, pid: child.pid });
+	    if (terminalReported || child.exitCode !== null || child.signalCode !== null
+	      || spec.canAllowGateEntry?.() !== true)
+	      throw new Error('routing child entry ended');
+	    gateEntered = true;
+	    accepted = true;
+	  }
+	} catch { /* Parent grant changed during entry. */ }
+	if (!accepted) terminal('start-failure');
+	if (gateTimer) clearTimeout(gateTimer);
+	gateTimer = undefined;
+	try {
+	  child.send({ type: accepted ? 'routing-gate-entry-allowed' : 'routing-gate-entry-denied',
+	    dispatchToken: spec.dispatchToken }, error => {
+	    if (error) terminal('start-failure');
+	    disconnect();
+	  });
+	} catch { terminal('start-failure'); disconnect(); }
+      });
+    }
     child.unref();
     if (child.pid === undefined) {
       // A synchronous spawn failure leaves no pid AND makes Node emit `error` on
@@ -407,14 +500,28 @@ export function createDefaultSpawner(
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
     const kill = (): void => {
+      terminal('cancel');
       try {
 	child.kill('SIGTERM');
       } catch {
 	// The child may already have exited after a cancelled or missing gate.
       }
     };
+    const custody: RetainedChildCustody = Object.freeze({ pid: child.pid });
+    retainedChildren.set(custody, { child, live: () => !terminalReported });
     return {
       pid: child.pid,
+      custody,
+      ...(spec.routingHandoff === undefined ? {} : { armGateEntry: () => {
+	if (gateArmed || terminalReported || !spec.dispatchToken || !spec.onGateEntered)
+	  throw new Error('routing child gate entry unavailable');
+	gateArmed = true;
+	gateTimer = setTimeout(() => {
+	  terminal('start-failure');
+	  try { child.kill('SIGTERM'); } catch { /* Already exited. */ }
+	}, 5_000);
+	gateTimer.unref();
+      } }),
       cancel: () => {
 	// Dispatcher-owned termination has its own authoritative failure event.
 	// Latch first so the resulting signal exit cannot report a second event.

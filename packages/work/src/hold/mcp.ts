@@ -45,9 +45,12 @@
 import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 
+import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
+import type { ContactHolder, FileArtifactPointer, GetOrderResponse, OrderPacket, PutFileArtifactResponse,
+  RoutedCollectionWriteResponse, RoutedMemberIssueResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
@@ -55,10 +58,39 @@ import { resolveContainedPath } from '../contained-path.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
+import type { TrustedInputAdmission } from '../hosted/trusted-input-admission.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
-export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number];
+export const ROUTED_FILE_TOOL_NAME = 'get_file_artifact' as const;
+export const ROUTED_COLLECTION_TOOL_NAME = 'seal_collection' as const;
+export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number] | typeof ROUTED_FILE_TOOL_NAME
+  | typeof ROUTED_COLLECTION_TOOL_NAME;
+
+function consumedFile(order: OrderPacket, path: string, key: string): FileArtifactPointer | undefined {
+  if (!order.inputs.includes(path) || !Object.hasOwn(order.consumes, path)) return undefined;
+  let found: FileArtifactPointer | undefined;
+  let conflicting = false;
+  const walk = (value: unknown, depth: number): void => {
+    if (depth > 32 || !value || typeof value !== 'object') return;
+    const row = value as Record<string, unknown>;
+    if (Object.hasOwn(row, '__file')) {
+      if (row.__file !== key) return;
+      if (typeof row.hash !== 'string' || !/^[a-f0-9]{64}$/.test(row.hash)
+	|| typeof row.size !== 'number' || !Number.isSafeInteger(row.size)
+	|| row.size < 1 || row.size > 500_000_000
+	|| typeof row.contentType !== 'string' || !row.contentType) return;
+      const pointer = row as unknown as FileArtifactPointer;
+      if (found && JSON.stringify(found) !== JSON.stringify(pointer)) conflicting = true;
+      else found = pointer;
+      return;
+    }
+    if (Array.isArray(value)) for (const item of value) walk(item, depth + 1);
+    else for (const item of Object.values(row)) walk(item, depth + 1);
+  };
+  walk(order.consumes[path], 0);
+  return conflicting ? undefined : found;
+}
 
 export interface HoldMcpDeps {
   hub: HubClient;
@@ -66,6 +98,26 @@ export interface HoldMcpDeps {
   run: string;
   /** Sole containment root for submit value files. */
   workdir: string;
+  /** Routed holder streams a contained local file without materializing all bytes. */
+  uploadFile?: (req: { workflow: string; workdir: string; file: string; contentType: string;
+    filename?: string }) => Promise<PutFileArtifactResponse>;
+  /** Routed only: a file must be pinned in this run's gated consumed values. */
+  downloadFile?: (req: { workflow: string; run: string; path: string; pointer: FileArtifactPointer },
+    signal?: AbortSignal) => Promise<{ file: string; size: number; contentType: string }>;
+  discardDownloadedFile?: (file: string) => Promise<void>;
+  /** Routed child submissions are broker-authorized and carry no local machine proof. */
+  routedSubmit?: true;
+  /** Parent Shift signs and authorizes exact issued collection targets. */
+  routedCollection?: {
+    collectionTarget(req: { workflow: string; run: string; path: string; holder: ContactHolder }):
+      Promise<{ collection: boolean }>;
+    emitCollectionMember(req: { workflow: string; run: string; sealPath: string;
+      emissionId: string; value: unknown; done: boolean; holder: ContactHolder }):
+      Promise<{ member: RoutedCollectionWriteResponse; seal?: RoutedCollectionWriteResponse;
+	issued: RoutedMemberIssueResponse }>;
+    sealCollection(req: { workflow: string; run: string; sealPath: string;
+      sealId: string; holder: ContactHolder }): Promise<RoutedCollectionWriteResponse>;
+  };
   /** Positive registration list. Absent exposes every tool in `HOLD_MCP_TOOL_NAMES`. */
   tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
@@ -78,6 +130,8 @@ export interface HoldMcpDeps {
   consumedVerifier?: ConsumedVerifier;
   /** Local definition binding for fields that signed artifact proofs do not cover. */
   modelOrderVerifier?: (order: OrderPacket) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  /** Opt-in worker-owned v2 read, used in place of v1 model/consume gates. */
+  trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -145,7 +199,7 @@ function guessContentType(path: string): string {
  * passed the gate. The full packet stays private for proof construction. In
  * particular, hub-carried static extensions, schema and previousValue do not
  * inherit authenticity from a valid consumes/reasons proof. */
-function orderView(res: GetOrderResponse): unknown {
+function orderView(res: GetOrderResponse, inputWitnesses?: Array<{ path: string; version: number; present: boolean }>): unknown {
   const order = res.order;
   if (order === null) return { workflow: res.workflow, run: res.run, order: null };
   return {
@@ -160,6 +214,7 @@ function orderView(res: GetOrderResponse): unknown {
       inputs: order.inputs,
       outputs: order.outputs,
       consumes: order.consumes,
+      ...(inputWitnesses === undefined ? {} : { inputWitnesses }),
       owes: order.owes.map((owed) => ({
 	path: owed.path,
 	...(owed.version === undefined ? {} : { version: owed.version }),
@@ -181,6 +236,8 @@ function orderView(res: GetOrderResponse): unknown {
 export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const { hub, workflow, run } = deps;
   const holderReq = deps.holder !== undefined ? { holder: deps.holder } : {};
+  let v2Pin: { packetDigest: string; witnessDigest: string } | undefined;
+  let inputWitnesses: Array<{ path: string; version: number; present: boolean }> | undefined;
 
   // The loop's first contact arrives synchronously, but consume-side verification
   // is asynchronous. Keep the unverified response in a private pending slot until
@@ -188,6 +245,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  let pendingCollection: { path: string; value: unknown; done: boolean; emissionId: string } | undefined;
+  let pendingSeal: { path: string; sealId: string } | undefined;
   let canonicalWorkflow: string | undefined;
   let firstContactIdentityRefusal: ToolResult | undefined;
   let stopping = false;
@@ -196,6 +255,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // registered tools fast-fail with isError and never touch the hub again (plan section 4
   // — a lost claim must not be worked or double-submitted).
   let terminal: HoldOutcome | undefined;
+  const fileTransfers = new Set<AbortController>();
+  const abortFiles = () => { for (const transfer of fileTransfers) transfer.abort(); };
 
   const inner = createHoldLoop({
     hub,
@@ -223,12 +284,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     run: async () => {
       const outcome = await inner.run();
       terminal = outcome;
+      abortFiles();
       return outcome;
     },
     stop: (reason?: string, stopOpts?: StopOptions) => {
       // A closing submit or signal must revoke the model-facing packet before
       // the asynchronous lease loop has finished settling.
       stopping = true;
+      abortFiles();
       inner.stop(reason, stopOpts);
     },
   };
@@ -259,7 +322,21 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     if (firstContactIdentityRefusal !== undefined) return firstContactIdentityRefusal;
     const refusedIdentity = identityGuard(res);
     if (refusedIdentity !== undefined) return refusedIdentity;
-    if (res.order === null) return undefined;
+    if (res.order === null) return deps.trustedInputV2 === undefined ? undefined
+      : textResult({ error: 'trusted input v2 refusal: no live order' }, true);
+    if (deps.trustedInputV2 !== undefined) {
+      let observed: TrustedInputAdmission;
+      try { observed = await deps.trustedInputV2.observe(res.order); }
+      catch { return textResult({ error: 'trusted input v2 refusal: reference unavailable' }, true); }
+      if (!observed.ok) return textResult({ error: `trusted input v2 refusal: ${observed.reason}` }, true);
+      if (v2Pin !== undefined && (v2Pin.packetDigest !== observed.packetDigest
+	|| v2Pin.witnessDigest !== observed.witnessDigest)) {
+	return textResult({ error: 'trusted input v2 refusal: claim input observation changed' }, true);
+      }
+      v2Pin ??= { packetDigest: observed.packetDigest, witnessDigest: observed.witnessDigest };
+      inputWitnesses = observed.inputs.map(({ path, version, present }) => ({ path, version, present }));
+      return undefined;
+    }
     if (deps.modelOrderVerifier === undefined) {
       return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
     }
@@ -295,6 +372,17 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     handler: async () => {
       const gone = terminalGuard();
       if (gone !== undefined) return gone;
+      if (deps.trustedInputV2 !== undefined) {
+	try {
+	  const res = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(res);
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	  if (refused !== undefined) return refused;
+	  captured = res;
+	  return textResult(orderView(res, inputWitnesses));
+	} catch { return textResult({ error: 'trusted input v2 get_order unavailable' }, true); }
+      }
       if (captured !== undefined) {
         const refused = await gate(captured);
         const afterGate = terminalGuard();
@@ -345,7 +433,6 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
     handler: async (args) => {
       const gone = terminalGuard();
-      if (gone !== undefined) return gone;
       const path = args['path'];
       if (typeof path !== 'string' || path === '') {
         return textResult({ error: 'submit requires a non-empty string "path"' }, true);
@@ -370,11 +457,27 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	  ? args['value']
 	  : await readSubmitValueFile(deps.workdir, valueFile);
 	const value = normalizeSubmitValue(rawValue);
+	const samePending = pendingCollection && pendingCollection.path === path
+	  && pendingCollection.done === done && isDeepStrictEqual(pendingCollection.value, value);
+	if (pendingCollection && !samePending)
+	  return textResult({ error: 'collection emission outcome unresolved' }, true);
+	if (samePending) {
+	  if (!deps.routedCollection || !deps.holder)
+	    return textResult({ error: 'routed collection unavailable' }, true);
+	  const res = await deps.routedCollection.emitCollectionMember({ workflow, run,
+	    sealPath: path, emissionId: pendingCollection!.emissionId, value, done: done as boolean,
+	    holder: deps.holder });
+	  if (res.seal?.closed || res.member.closed) loop.stop('submitted', { release: false });
+	  if (res.member.outcome !== 'emitted' || !done || res.seal) pendingCollection = undefined;
+	  return textResult({ member: res.member, ...(res.seal ? { seal: res.seal } : {}),
+	    memberPath: res.issued.memberPath });
+	}
+	if (gone !== undefined) return gone;
         // Submit is also a dynamic-data boundary. Fetch and gate the bound
         // packet even when no origin was supplied for submit-proof signing;
         // otherwise a direct submit call could bypass MCP consume-side
         // verification without first calling get_order.
-        let orderResponse = captured ?? firstContact;
+	let orderResponse = deps.trustedInputV2 === undefined ? captured ?? firstContact : undefined;
         if (orderResponse === undefined) {
           orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
         }
@@ -390,9 +493,25 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	  return textResult({ error: 'submit path refusal: path is not owed by the bound order' }, true);
 	}
         captured = orderResponse;
+	if (deps.routedSubmit) {
+	  if (!deps.routedCollection || !deps.holder)
+	    return textResult({ error: 'routed collection unavailable' }, true);
+	  const target = await deps.routedCollection.collectionTarget({ workflow, run, path, holder: deps.holder });
+	  if (target.collection) {
+	    if (typeof done !== 'boolean')
+	      return textResult({ error: 'collection submit requires boolean done' }, true);
+	    pendingCollection = { path, value, done, emissionId: randomBytes(16).toString('hex') };
+	    const res = await deps.routedCollection.emitCollectionMember({ workflow, run,
+	      sealPath: path, emissionId: pendingCollection.emissionId, value, done, holder: deps.holder });
+	    if (res.seal?.closed || res.member.closed) loop.stop('submitted', { release: false });
+	    if (res.member.outcome !== 'emitted' || !done || res.seal) pendingCollection = undefined;
+	    return textResult({ member: res.member, ...(res.seal ? { seal: res.seal } : {}),
+	      memberPath: res.issued.memberPath });
+	  }
+	}
 
         let proof: string | undefined;
-        if (deps.origin !== undefined && orderResponse.order !== null) {
+	if (!deps.routedSubmit && deps.origin !== undefined && orderResponse.order !== null) {
           proof = await buildSubmitProof({
             origin: deps.origin,
             order: orderResponse.order,
@@ -405,6 +524,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
         }
+	// Signing may await local key access. Re-read the original claim and
+	// its v2 input witness after that await, immediately before the write.
+	if (deps.trustedInputV2 !== undefined) {
+	  const fresh = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refusedFresh = await gate(fresh);
+	  if (refusedFresh !== undefined) return refusedFresh;
+	}
         const beforeSubmit = terminalGuard();
         if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({
@@ -455,6 +581,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'reject "requested" must be a non-empty string when provided' }, true);
       }
       try {
+	if (deps.trustedInputV2 !== undefined) {
+	  const current = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(current);
+	  if (refused !== undefined) return refused;
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	}
         const res = await hub.reject({ workflow, run, path, text, ...(requested === undefined ? {} : { requested }) });
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
@@ -505,6 +638,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'ask "context" must be a string when present' }, true);
       }
       try {
+	if (deps.trustedInputV2 !== undefined) {
+	  const current = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(current);
+	  if (refused !== undefined) return refused;
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	}
         const res = await hub.ask({
           workflow,
           run,
@@ -563,21 +703,30 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'file-artifact-invalid: filename must be a non-empty string when present' }, true);
       }
       try {
-        // Same two-phase containment as a submit value file, under this tool's
-        // own error family: the working directory is the only root a step's
-        // outputs may come from, and a symlink out of it is an exfiltration
-        // path, not a convenience.
-        const resolved = await resolveContainedPath(deps.workdir, file, 'file-artifact');
-        const bytes = new Uint8Array(await readFile(resolved));
-        if (bytes.byteLength === 0) {
-          return textResult({ error: `file-artifact-empty: ${file} is zero bytes` }, true);
-        }
+        // Ordinary uploads use the contained-path check. Routed uploads open
+        // relative to the holder's pinned workdir FD through the native helper,
+        // so an ancestor symlink swap cannot redirect the file read.
+	const resolved = deps.uploadFile ? file : await resolveContainedPath(deps.workdir, file, 'file-artifact');
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
+	if (deps.trustedInputV2 !== undefined) {
+	  const current = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(current);
+	  if (refused !== undefined) return refused;
+	}
         const beforeUpload = terminalGuard();
         if (beforeUpload !== undefined) return beforeUpload;
-        const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
+	let res: PutFileArtifactResponse;
+	if (deps.uploadFile) {
+	  res = await deps.uploadFile({ workflow, workdir: deps.workdir, file, contentType, filename });
+	} else {
+	  const bytes = new Uint8Array(await readFile(resolved));
+	  if (bytes.byteLength === 0) {
+	    return textResult({ error: `file-artifact-empty: ${file} is zero bytes` }, true);
+	  }
+	  res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
+	}
         // Hand back the envelope EXACTLY as it must be submitted. The hub's
         // `text` is dropped from the pointer so the model cannot paste a field
         // the artifact schema does not know about.
@@ -590,10 +739,86 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         };
         return textResult({
           pointer,
-          text: `Stored ${String(bytes.byteLength)} bytes as ${contentType}. Submit this pointer as your value, or embed it in one.`,
+	  text: `Stored ${String(res.size)} bytes as ${contentType}. Submit this pointer as your value, or embed it in one.`,
         });
       } catch (e) {
         return textResult({ error: errMsg(e) }, true);
+      }
+    },
+  };
+
+  const getFileArtifactTool: ToolRegistration = {
+    name: ROUTED_FILE_TOOL_NAME,
+    description: 'Materialize one file pointer from the current consumed inputs. Call get_order first, then pass the consumed artifact path and the envelope __file key. Returns a local file path only after every byte and its SHA-256 have verified.',
+    inputSchema: { type: 'object', required: ['path', 'key'], properties: {
+      path: { type: 'string', description: 'Declared consumed artifact path.' },
+      key: { type: 'string', description: 'The __file key in that consumed value.' },
+    }, additionalProperties: false },
+    handler: async (args, ctx) => {
+      const gone = terminalGuard();
+      if (gone !== undefined) return gone;
+      if (!deps.downloadFile || !deps.discardDownloadedFile)
+	return textResult({ error: 'file-artifact-download-unavailable' }, true);
+      const path = args['path'], key = args['key'];
+      if (typeof path !== 'string' || !path || typeof key !== 'string' || !key
+	|| !captured?.order)
+	return textResult({ error: 'file-artifact-download-refused: call get_order and choose a consumed pointer' }, true);
+      const pointer = consumedFile(captured.order, path, key);
+      if (!pointer) return textResult({ error: 'file-artifact-download-refused: pointer is not consumed by this run' }, true);
+      const controller = new AbortController();
+      fileTransfers.add(controller);
+      ctx.onCancel(() => controller.abort());
+      try {
+	const result = await deps.downloadFile({ workflow, run, path, pointer }, controller.signal);
+	const after = terminalGuard();
+	if (after !== undefined || ctx.cancelled || controller.signal.aborted) {
+	  await deps.discardDownloadedFile(result.file);
+	  return after ?? textResult({ error: 'file-artifact-download-cancelled' }, true);
+	}
+	return textResult({ file: result.file, size: result.size, contentType: result.contentType,
+	  hash: pointer.hash });
+      } catch (e) {
+	return textResult({ error: errMsg(e) }, true);
+      } finally { fileTransfers.delete(controller); }
+    },
+  };
+
+  const sealCollectionTool: ToolRegistration = {
+    name: ROUTED_COLLECTION_TOOL_NAME,
+    description: 'Seal an owed collection without emitting another member. This also supports a zero-member collection.',
+    inputSchema: { type: 'object', required: ['path'], properties: {
+      path: { type: 'string', description: 'The owed collection seal path.' },
+    }, additionalProperties: false },
+    handler: async args => {
+      const path = args['path'];
+      if (typeof path !== 'string' || !path)
+	return textResult({ error: 'collection seal path required' }, true);
+      if (!deps.routedCollection || !deps.holder)
+	return textResult({ error: 'routed collection unavailable' }, true);
+      if (pendingCollection || (pendingSeal && pendingSeal.path !== path))
+	return textResult({ error: 'collection outcome unresolved' }, true);
+      if (!pendingSeal) {
+	const gone = terminalGuard();
+	if (gone !== undefined) return gone;
+	const orderResponse = captured ?? firstContact ?? await hub.getOrder({ workflow, run, ...holderReq });
+	const refused = await gate(orderResponse);
+	if (refused !== undefined) return refused;
+	if (!orderResponse.order || !(orderResponse.order.owes.length
+	  ? orderResponse.order.owes.some(owed => owed.path === path)
+	  : orderResponse.order.outputs.includes(path)))
+	  return textResult({ error: 'collection seal path is not owed' }, true);
+	const target = await deps.routedCollection.collectionTarget({ workflow, run, path, holder: deps.holder });
+	if (!target.collection) return textResult({ error: 'path is not a signed collection target' }, true);
+	pendingSeal = { path, sealId: randomBytes(16).toString('hex') };
+      }
+      try {
+	const response = await deps.routedCollection.sealCollection({ workflow, run,
+	  sealPath: path, sealId: pendingSeal.sealId, holder: deps.holder });
+	pendingSeal = undefined;
+	if (response.closed) loop.stop('submitted', { release: false });
+	return textResult(response);
+      } catch (error) {
+	return textResult({ error: errMsg(error) }, true);
       }
     },
   };
@@ -604,8 +829,12 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     reject: rejectTool,
     ask: askTool,
     put_file_artifact: putFileArtifactTool,
+    get_file_artifact: getFileArtifactTool,
+    seal_collection: sealCollectionTool,
   };
-  const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
+  const selected = deps.tools ?? (deps.routedCollection
+    ? [...HOLD_MCP_TOOL_NAMES, ...(deps.downloadFile ? [ROUTED_FILE_TOOL_NAME] : []), ROUTED_COLLECTION_TOOL_NAME]
+    : deps.downloadFile ? [...HOLD_MCP_TOOL_NAMES, ROUTED_FILE_TOOL_NAME] : HOLD_MCP_TOOL_NAMES);
   return {
     tools: selected.map((name) => registrations[name]), loop,
     readGatedOrder: () => terminal === undefined && !stopping ? captured : undefined,

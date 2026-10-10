@@ -35,7 +35,10 @@
  * pending promise forever.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
+import { ROUTED_STDIO_SUPERVISOR } from './routed-stdio-supervisor.ts';
 
 /** One decoded inbound frame. Every member is optional — see `classifyFrame`. */
 export interface JsonRpcFrame {
@@ -122,6 +125,19 @@ export interface StdioRpcClient {
   /** SIGTERM the child's process group, SIGKILL after a grace period. Idempotent. */
   dispose(): Promise<void>;
   readonly pid: number | undefined;
+}
+
+/** Evidence for the original routed POSIX group only. */
+export interface ManagedStdioSettlement {
+  scope: 'original-posix-group';
+  state: 'empty' | 'uncertain';
+  evidence: { pgid: number | null; observedAt: number; reason: string };
+}
+
+/** The role retains this before any provider initialization await. */
+export interface ManagedStdioRpcClient extends StdioRpcClient {
+  readonly ready: Promise<void>;
+  settleEffects(opts: { reason: 'normal-exit' | 'stop' | 'setup-failed'; deadlineAt: number }): Promise<ManagedStdioSettlement>;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
@@ -446,4 +462,207 @@ function killGroup(pid: number | undefined, signal: NodeJS.Signals, onStderr: (l
     const code = (err as { code?: string }).code;
     if (code !== 'ESRCH') onStderr(`[kill ${signal}] ${String(err)}`);
   }
+}
+
+/**
+ * Routed-only JSON-RPC transport. A retained supervisor is the group leader,
+ * so the provider can exit without making a later negative-PID signal unsafe.
+ * The ordinary transport above is deliberately unchanged.
+ */
+export function startManagedStdioRpc(opts: StdioRpcOptions & {
+  env: Record<string, string | undefined>; graceMs?: number
+}): ManagedStdioRpcClient {
+  // The supervisor itself is in the model-accessible process tree. It must
+  // receive the same already-filtered environment as the provider it starts.
+  if (opts.env === undefined) throw new Error('routed provider requires a filtered environment');
+  const token = randomBytes(24).toString('hex');
+  const child = spawn(process.execPath, ['-e', ROUTED_STDIO_SUPERVISOR], {
+    detached: true, stdio: ['pipe', 'pipe', 'pipe', 'ipc'], env: opts.env,
+  }) as ChildProcessWithoutNullStreams;
+  const pgid = child.pid;
+
+  let disposed = false;
+  let readyState = false;
+  let providerExited = false;
+  let readStdoutBytes = 0;
+  let readStderrBytes = 0;
+  let pendingProviderExit: Record<string, unknown> | undefined;
+  let supervisorExited = false;
+  let supervisorReason = 'supervisor-exit-unobserved';
+  let settlementStarted = false;
+  let settleReason: 'normal-exit' | 'stop' | 'setup-failed' = 'stop';
+  let completeReady!: () => void;
+  let refuseReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    completeReady = resolve;
+    refuseReady = reject;
+  });
+  // The adapter owns `ready`; observing it here also prevents a transport
+  // setup error from becoming an unhandled rejection before the adapter awaits.
+  void ready.catch(() => {});
+  let completeExit!: () => void;
+  const exited = new Promise<void>(resolve => { completeExit = resolve; });
+
+  const core = createRpcCore({
+    ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
+    write: line => {
+      if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.write(line);
+    },
+    onNotification: opts.onNotification,
+    onServerRequest: opts.onServerRequest,
+    onStderr: opts.onStderr,
+  });
+  child.stdout.on('data', (chunk: Buffer) => {
+    readStdoutBytes += chunk.length;
+    core.onData(chunk);
+    finishProviderExit();
+  });
+  child.stdout.on('error', (error: Error) => opts.onStderr(`[routed stdout error] ${error.message}`));
+  const readStderr = createLineReader(line => opts.onStderr(line));
+  child.stderr.on('data', (chunk: Buffer) => {
+    readStderrBytes += chunk.length;
+    readStderr(chunk);
+    finishProviderExit();
+  });
+  child.stderr.on('error', (error: Error) => opts.onStderr(`[routed stderr error] ${error.message}`));
+  child.stdin.on('error', (error: Error) => opts.onStderr(`[routed stdin error] ${error.message}`));
+
+  const refuse = (reason: string): void => {
+    if (!readyState) refuseReady(new Error(reason));
+    core.rejectAll(new Error(reason));
+  };
+  function finishProviderExit(): void {
+    if (providerExited || pendingProviderExit === undefined) return;
+    const frame = pendingProviderExit;
+    if (!Number.isSafeInteger(frame['stdoutBytes']) || !Number.isSafeInteger(frame['stderrBytes'])) {
+      supervisorReason = 'invalid-provider-exit-watermark';
+      refuse('routed provider exit watermark invalid');
+      return;
+    }
+    if (readStdoutBytes < (frame['stdoutBytes'] as number)
+      || readStderrBytes < (frame['stderrBytes'] as number)) return;
+    pendingProviderExit = undefined;
+    providerExited = true;
+    core.rejectAll(new Error(`provider exited (code=${String(frame['code'])}, signal=${String(frame['signal'])})`));
+    opts.onExit(typeof frame['code'] === 'number' ? frame['code'] : null,
+      typeof frame['signal'] === 'string' ? frame['signal'] as NodeJS.Signals : null);
+  }
+  child.on('message', message => {
+    if (typeof message !== 'object' || message === null) return;
+    const frame = message as Record<string, unknown>;
+    if (frame['token'] !== token || typeof frame['type'] !== 'string') return;
+    switch (frame['type']) {
+      case 'ready':
+	if (pgid === undefined || frame['pgid'] !== pgid || !Number.isSafeInteger(frame['providerPid'])) {
+	  supervisorReason = 'invalid-ready';
+	  refuse('routed provider supervisor gave invalid startup evidence');
+	  return;
+	}
+	if (!readyState) { readyState = true; completeReady(); }
+	break;
+      case 'provider-exit':
+	pendingProviderExit = frame;
+	finishProviderExit();
+	break;
+      case 'provider-error':
+	supervisorReason = 'provider-error';
+	refuse('routed provider failed to start');
+	break;
+      case 'unsafe-group':
+      case 'signal-error':
+	supervisorReason = String(frame['type']);
+	refuse(`routed provider ${supervisorReason}`);
+	break;
+      case 'teardown-started':
+	break;
+    }
+  });
+  child.on('error', (error: Error) => {
+    supervisorReason = 'supervisor-error';
+    refuse(`routed provider supervisor error: ${error.message}`);
+  });
+  const onSupervisorExit = (): void => {
+    if (supervisorExited) return;
+    supervisorExited = true;
+    completeExit();
+  };
+  const onSupervisorClose = (): void => {
+    onSupervisorExit();
+    // A leader's exit may precede its final forwarded stdout bytes. Only
+    // `close` means the parent's pipes reached EOF and the decoder drained.
+    if (!readyState) refuse('routed provider supervisor closed before ready');
+    else core.rejectAll(new Error('routed provider supervisor closed'));
+    if (!providerExited) {
+      providerExited = true;
+      opts.onExit(null, null);
+    }
+  };
+  child.on('exit', onSupervisorExit);
+  child.on('close', onSupervisorClose);
+
+  const startMessage = { type: 'start', token, command: opts.command, args: opts.args,
+    ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    graceMs: opts.graceMs ?? 2_000 };
+  try { child.send(startMessage, error => { if (error) refuse('routed provider startup IPC failed'); }); }
+  catch { refuse('routed provider startup IPC failed'); }
+
+  function beginSettlement(reason: typeof settleReason): void {
+    if (settlementStarted) return;
+    settlementStarted = true;
+    settleReason = reason;
+    disposed = true;
+    core.rejectAll(new Error('routed provider settlement started'));
+    try { child.stdin.end(); } catch { /* already closed */ }
+    if (!supervisorExited && child.connected) {
+      try { child.send({ type: 'settle', token }); }
+      catch { supervisorReason = 'settlement-ipc-failed'; }
+    }
+  }
+
+  function groupResult(): ManagedStdioSettlement {
+    let state: ManagedStdioSettlement['state'] = 'uncertain';
+    let reason = supervisorReason;
+    if (pgid !== undefined && supervisorExited && reason === 'supervisor-exit-unobserved' && settlementStarted) {
+      try { process.kill(-pgid, 0); reason = 'group-still-present-or-reused'; }
+      catch (error) {
+	if ((error as { code?: string }).code === 'ESRCH') {
+	  state = 'empty'; reason = `${settleReason}:group-absent`;
+	} else reason = 'group-probe-uncertain';
+      }
+    }
+    return { scope: 'original-posix-group', state,
+      evidence: { pgid: pgid ?? null, observedAt: performance.now(), reason } };
+  }
+
+  return {
+    get pid(): number | undefined { return pgid; },
+    ready,
+    request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
+      if (disposed || supervisorExited || providerExited)
+	return Promise.reject(new Error(`cannot send '${method}': routed client is no longer running`));
+      return core.request<T>(method, params, timeoutMs);
+    },
+    notify(method: string, params?: unknown): void {
+      if (!disposed && !supervisorExited && !providerExited) core.notify(method, params);
+    },
+    async settleEffects({ reason, deadlineAt }): Promise<ManagedStdioSettlement> {
+      beginSettlement(reason);
+      const remaining = deadlineAt - performance.now();
+      if (!Number.isFinite(remaining) || remaining <= 0) return {
+	scope: 'original-posix-group', state: 'uncertain',
+	evidence: { pgid: pgid ?? null, observedAt: performance.now(), reason: 'deadline-expired' },
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([exited, new Promise<void>(resolve => { timer = setTimeout(resolve, remaining); })]);
+      if (timer !== undefined) clearTimeout(timer);
+      return supervisorExited ? groupResult() : {
+	scope: 'original-posix-group', state: 'uncertain',
+	evidence: { pgid: pgid ?? null, observedAt: performance.now(), reason: 'settlement-timeout' },
+      };
+    },
+    async dispose(): Promise<void> {
+      await this.settleEffects({ reason: 'stop', deadlineAt: performance.now() + 5_000 });
+    },
+  };
 }

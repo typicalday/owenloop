@@ -816,6 +816,39 @@ invalidates old advice. Only a successful idle claim consumes its alarm.
 Exceptions during the atomic claim roll back its run/task/Order and lane/slot
 writes, including errors after slot insertion.
 
+### Native claim identity and routed retry consent
+
+Native Store schema 16 adds a stable frame incarnation and a monotone claim
+ledger for each frame/step/key. Every central claim, including ordinary `tick`,
+atomically binds its actual run to that incarnation and generation, then advances
+the next generation. Readiness scans do not allocate a generation. Release,
+reaping, task attempt resets and unchanged input evidence do not reuse a consumed
+claim identity. Deleting and recreating a workflow assigns a new incarnation while
+retaining prior claim history. A stale plan or failed transaction writes no new
+claim binding or generation.
+
+Migration records the exact retained pre-cutover runs as legacy identities in the
+same transaction as the schema upgrade. Reopening must preserve that classification;
+a missing current binding or frame incarnation is corruption, not a reason to
+classify a new run as legacy. Existing in-flight runs retain their completion path.
+
+The opt-in server-routed worker uses `shift-offer-v2` with a
+`firing-offer-binding-v2`: exact task/evidence, native incarnation/generation,
+server-owned consent sequence and executor lane. The paired Service change owns
+consent retirement and fresh authenticated willingness. A new actual claim or a
+retired consent window requires a fresh offer identity; old consumed identities
+stay unusable. Changes only to a candidate descriptor can resubmit the original
+immutable offer bytes, ID and expiry, without extending its authorization. New
+routed claims require the coordinated V2 protocol; representable V1 records are
+retained for already claimed work, not used to mint new willingness.
+
+These are draft source contracts, not evidence of a deployed Service or an
+accepted release. Service schema compatibility, migration and rollback must be
+verified separately before rollout. Jev execution remains an operator-enabled
+server capability. Ordinary Owenloop users need no Jev installation, compiler,
+provider credentials or model settings. Native claim identity is shared Engine
+bookkeeping and does not require enabling the routed worker.
+
 ### Retained proof contract
 
 The pure barrel exports `RoutingProof`, `ROUTING_PROOF_SCHEMA` and

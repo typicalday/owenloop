@@ -196,6 +196,25 @@ test('a subdirectory workflow refuses a bodyFile that sits at the archive root',
   assert.equal(errorCode(() => inspectBundle(buildArchive('instructions/build.md'))), 'WORKFLOW_ERROR');
 });
 
+test('canonical archive inspection refuses an invalid unrelated signed member', () => {
+  const payload = GOLDEN_JSON.entries.filter(entry => entry.path !== 'bundle.yaml')
+    .map(entry => ({ path: entry.path,
+      bytes: entry.path === 'workflows/init.yaml'
+		? Buffer.concat([readFileSync(join(SOURCE, entry.path)), Buffer.from('\nbogus: true\n')])
+		: readFileSync(join(SOURCE, entry.path)),
+      mode: entry.executable ? 0o755 : 0o644 }));
+  const files: Record<string, string> = {};
+  for (const entry of payload)
+    files[entry.path] = createHash('sha256').update(entry.bytes).digest('hex');
+  const manifest = { ...parseManifestBytes(readFileSync(join(SOURCE, 'bundle.yaml'))),
+    integrity: { algorithm: 'sha256' as const, files } };
+  const archive = [{ path: 'bundle.yaml', bytes: Buffer.from(manifestToBytes(manifest)),
+    mode: 0o644 }, ...payload].sort((a, b) =>
+    Buffer.compare(Buffer.from(a.path, 'utf8'), Buffer.from(b.path, 'utf8')));
+  assert.equal(errorCode(() => inspectBundle(gzipSync(buildCanonicalTar(archive)))),
+    'WORKFLOW_ERROR');
+});
+
 test('pack validates every declared workflow and aggregates cross-workflow lock coverage', () => {
   const missing = tempDir();
   cpSync(SOURCE, missing, { recursive: true });

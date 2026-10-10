@@ -12,7 +12,7 @@
 
 import { lstatSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { WORKFLOW_NAME_RE } from '../bundle/manifest.ts';
+import { isBundleWorkflowName } from '../bundle/manifest.ts';
 import { DIGEST_RE, StoreIndexError, parseWorkflowCoordinate } from './types.ts';
 import type { WorkflowStoreIndex } from './types.ts';
 import { readRegularFileNoFollow, writeJsonAtomic } from '../install.ts';
@@ -71,7 +71,7 @@ export function parseWorkflowStoreIndex(parsed: unknown, path: string): Workflow
         return fail(`${at('workflows')} is not an array of workflow names`);
       }
       for (const [index, name] of entry.workflows.entries()) {
-        if (!WORKFLOW_NAME_RE.test(name)) {
+		if (!isBundleWorkflowName(name)) {
           return fail(`${at(`workflows[${index}]`)} is not a valid workflow name`);
         }
       }

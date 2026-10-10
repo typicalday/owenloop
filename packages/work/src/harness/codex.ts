@@ -79,7 +79,10 @@ import type { LintFinding } from './types.ts';
 import { register } from './registry.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
 import { ADMITTED_OWENLOOP_KEYS, filterOwenloopEnv } from './child-env.ts';
-import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdio.ts';
+import { JsonRpcError, startStdioRpc, startManagedStdioRpc,
+  type StdioRpcClient, type ManagedStdioRpcClient, type StdioRpcOptions } from './jsonrpc-stdio.ts';
+import { isInside } from './gatekeeper.ts';
+import { validateRoutedPublishedRoot } from '../hub/routed-file-cache.ts';
 
 /** The adapter id. Matches the `"codex"` key in `harness-versions.json`, so the
  *  worker can use one string for both the version pin and the adapter lookup. */
@@ -365,14 +368,20 @@ function mountEnv(): Record<string, string> {
 // holder tool must not silently acquire exposure or approval in this adapter.
 // Tests compare this contract to HOLD_MCP_TOOL_NAMES and the holder argv parser.
 const OWN_MCP_TOOLS = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
+const ROUTED_FILE_TOOL = 'get_file_artifact';
+const ROUTED_COLLECTION_TOOL = 'seal_collection';
 const HOLD_VALUE_FLAGS = new Set([
   '--order', '--workflow', '--session', '--origin', '--as', '--shift',
   '--heartbeat-interval', '--jump-tolerance',
 ]);
 
 /** Read only the holder's tool selector; preserve the entire launch argv. */
-function ownMcpTools(args: readonly string[]): string[] {
-  let selected: string[] = [...OWN_MCP_TOOLS];
+function ownMcpTools(args: readonly string[], verifiedFileCacheRoot?: string): string[] {
+  const routed = args.some((arg) => arg === '--routing-holder' || arg.startsWith('--routing-holder='));
+  if (verifiedFileCacheRoot !== undefined && !routed) throw new Error('routed file cache requires a routed holder');
+  let selected: string[] = [...OWN_MCP_TOOLS,
+    ...(verifiedFileCacheRoot === undefined ? [] : [ROUTED_FILE_TOOL]),
+    ...(routed ? [ROUTED_COLLECTION_TOOL] : [])];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     // Match hold.parseArgs consumption: a separate value belongs to its flag,
@@ -391,7 +400,9 @@ function ownMcpTools(args: readonly string[]): string[] {
     if (names.some((name) => name === '')) {
       throw new Error('--mcp-tools must be a comma-separated list with no empty names');
     }
-    if (names.some((name) => !(OWN_MCP_TOOLS as readonly string[]).includes(name))) {
+    if (names.some((name) => !(OWN_MCP_TOOLS as readonly string[]).includes(name)
+      && !(name === ROUTED_FILE_TOOL && routed && verifiedFileCacheRoot !== undefined)
+      && !(name === ROUTED_COLLECTION_TOOL && routed))) {
       throw new Error(`--mcp-tools must name only supported own tools: ${OWN_MCP_TOOLS.join(',')}`);
     }
     if (new Set(names).size !== names.length) {
@@ -405,8 +416,8 @@ function ownMcpTools(args: readonly string[]): string[] {
 }
 
 /** Own mount identity from the worker, with per-thread named MCP policy. */
-function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec {
-  const enabledTools = ownMcpTools(mcp.args);
+function owenloopMount(mcp: { command: string; args: string[] }, verifiedFileCacheRoot?: string): McpServerSpec {
+  const enabledTools = ownMcpTools(mcp.args, verifiedFileCacheRoot);
   return {
     command: mcp.command,
     args: [...mcp.args],
@@ -471,10 +482,23 @@ export function buildThreadStartParams(
     // The owenloop mount wins on a key clash, mirroring how the legacy
     // frontmatter builder overwrites an author's own `owenloop` entry. Without
     // it the agent has no `submit` tool and the order can never complete.
-    [OWENLOOP_MCP_NAME]: owenloopMount(args.owenloopMcp),
+    [OWENLOOP_MCP_NAME]: owenloopMount(args.owenloopMcp, args.verifiedFileCacheRoot),
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
+  if (args.verifiedFileCacheRoot !== undefined) {
+    const fileRoot = args.verifiedFileCacheRoot;
+    validateRoutedPublishedRoot(fileRoot);
+    if (sandbox === 'danger-full-access' || isInside(args.cwd, fileRoot)
+      || isInside(fileRoot, args.cwd))
+      throw new Error('routed file cache requires a separate read-only sandbox root');
+    const workspace = isPlainMap(config['sandbox_workspace_write']) ? config['sandbox_workspace_write'] : {};
+    const writable = workspace['writable_roots'];
+    if (writable !== undefined && (!Array.isArray(writable)
+      || writable.some((root) => typeof root !== 'string'
+		|| isInside(root, fileRoot) || isInside(fileRoot, root))))
+      throw new Error('routed file cache overlaps configured writable roots');
+  }
   if (args.permissions.network === 'unrestricted' && sandbox === 'workspace-write') {
     const authored = isPlainMap(config['sandbox_workspace_write'])
       ? config['sandbox_workspace_write']
@@ -1132,12 +1156,28 @@ interface OpenedClient {
   reportExit(exitCode: number | null, error: string | undefined): void;
 }
 
+/** Exposed at spawn time, before initialize or a provider turn can await. */
+export interface RoutedCodexLaunch {
+  readonly generation: string;
+  readonly transport: ManagedStdioRpcClient;
+}
+
+// A routed agent role is a one-shot child process. This local latch prevents
+// another app-server spawn under the same parent-issued role generation.
+const ROUTED_LAUNCH_GENERATIONS = new Set<string>();
+
+export interface RoutedCodexLaunchRequest {
+  generation: string;
+  onLaunch: (launch: RoutedCodexLaunch) => void;
+}
+
 /** Spawn one app-server, complete the handshake, and return the wired client. */
 async function openClient(
   cwd: string,
   onEvent: (e: AgentEvent) => void,
   gate: TurnGate,
   approvals?: ApprovalRequester,
+  routedLaunch?: RoutedCodexLaunchRequest,
 ): Promise<OpenedClient> {
   let exitReported = false;
   const reportExit = (exitCode: number | null, error: string | undefined): void => {
@@ -1146,7 +1186,8 @@ async function openClient(
     onEvent({ kind: 'exited', exitCode, ...(error !== undefined ? { error } : {}) });
   };
 
-  const client = startStdioRpc({
+  const providerEnv = filterOwenloopEnv(process.env);
+  const transportOptions: StdioRpcOptions = {
     command: resolveBin(),
     args: [...APP_SERVER_ARGS],
     cwd,
@@ -1163,7 +1204,7 @@ async function openClient(
     // The value is a FULL environment (`process.env` minus the denied names),
     // because supplying `env` to the transport replaces the child's environment
     // rather than merging into it.
-    env: filterOwenloopEnv(process.env),
+    env: providerEnv,
     // Every unknown notification lands here and is ignored by `mapNotification`
     // — unsolicited traffic arrives before any request completes, and throwing
     // on one would kill a healthy session.
@@ -1184,9 +1225,19 @@ async function openClient(
       // not a finished turn. If the turn already ended this is a no-op.
       gate.fail(new Error(`app-server exited (code=${String(code)}, signal=${String(signal)})`));
     },
-  });
+  };
+  const client = routedLaunch === undefined
+    ? startStdioRpc(transportOptions)
+    : startManagedStdioRpc({ ...transportOptions, env: providerEnv });
 
   try {
+    if (routedLaunch !== undefined) {
+      // This handoff is synchronous and one-use. The role owns the retained
+      // transport even if initialize or thread/start fails before a token exists.
+      routedLaunch.onLaunch({ generation: routedLaunch.generation,
+	transport: client as ManagedStdioRpcClient });
+      await (client as ManagedStdioRpcClient).ready;
+    }
     const init = await client.request<Record<string, unknown>>(
       'initialize',
       { clientInfo: CLIENT_INFO },
@@ -1392,6 +1443,59 @@ function deniesAllWrites(permissions: StepPermissions): boolean {
   return sandbox === 'read-only';
 }
 
+async function startCodex(
+  args: StartArgs,
+  onEvent: (e: AgentEvent) => void,
+  routedLaunch?: RoutedCodexLaunchRequest,
+): Promise<HarnessSessionRef> {
+  const gate = createTurnGate(onEvent);
+  const startParams = buildThreadStartParams(args, onEvent);
+  const { client, reportExit } = await openClient(args.cwd, onEvent, gate, args.approvals, routedLaunch);
+  let threadId: string;
+  let reportedModel: string | undefined;
+  try {
+    const res = await client.request<Record<string, unknown>>('thread/start', startParams, SETUP_TIMEOUT_MS);
+    const id = str(asMap(res['thread'])['id']);
+    if (id === undefined) throw new Error('thread/start returned no thread id');
+    threadId = id;
+    reportedModel = str(res['model']);
+  } catch (err) {
+    reportExit(null, describe(err));
+    await client.dispose();
+    throw err;
+  }
+  const ref: HarnessSessionRef = { harness: HARNESS_ID, token: threadId };
+  const session: CodexSession = { client, startParams, gate };
+  SESSIONS.set(threadId, session);
+  onEvent({ kind: 'started', ref, ...(reportedModel === undefined ? {} : { model: reportedModel }) });
+  try {
+    await runTurn(client, gate,
+      buildTurnStartParams(threadId, args.brief, args.effort ?? args.permissions.effort));
+  } catch (err) {
+    await abandonTurn(threadId, session);
+    throw err;
+  } finally {
+    session.turnId = gate.currentTurnId();
+    delete session.gate;
+  }
+  return ref;
+}
+
+/** Routed-only entry: retains process-group custody before provider setup. */
+export function startRoutedCodex(
+  args: StartArgs,
+  onEvent: (e: AgentEvent) => void,
+  launch: RoutedCodexLaunchRequest,
+): Promise<HarnessSessionRef> {
+  if (launch.generation.trim() === '' ||
+    !args.owenloopMcp.args.some(arg => arg === '--routing-holder' || arg.startsWith('--routing-holder=')))
+    throw new Error('routed Codex launch requires exact holder and generation');
+  if (ROUTED_LAUNCH_GENERATIONS.has(launch.generation))
+    throw new Error('routed Codex generation already attempted');
+  ROUTED_LAUNCH_GENERATIONS.add(launch.generation);
+  return startCodex(args, onEvent, launch);
+}
+
 export const codexAdapter: HarnessAdapter = {
   id: HARNESS_ID,
   resumeTier: 'native-token',
@@ -1412,60 +1516,13 @@ export const codexAdapter: HarnessAdapter = {
     return { command: resolveBin(), args: ['resume', ref.token] };
   },
 
-  async start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
-    const gate = createTurnGate(onEvent);
-    const startParams = buildThreadStartParams(args, onEvent);
-    // Handshake failure disposes the child inside `openClient` — see the catch
-    // there. Nothing is spawned and unowned by the time this rejects.
-    const { client, reportExit } = await openClient(args.cwd, onEvent, gate, args.approvals);
-
-    let threadId: string;
-    let reportedModel: string | undefined;
-    try {
-      const res = await client.request<Record<string, unknown>>(
-        'thread/start',
-        startParams,
-        SETUP_TIMEOUT_MS,
-      );
-      const id = str(asMap(res['thread'])['id']);
-      if (id === undefined) throw new Error('thread/start returned no thread id');
-      threadId = id;
-      // The app-server resolves an omitted model to the actual session model in
-      // this response. Surface it with the durable session reference so callers
-      // can attribute measurements without scraping persisted Codex state.
-      reportedModel = str(res['model']);
-    } catch (err) {
-      // No token exists yet, so there is nothing to hand back and nothing to
-      // invent. Report, tear down, reject.
-      reportExit(null, describe(err));
-      await client.dispose();
-      throw err;
-    }
-
-    const ref: HarnessSessionRef = { harness: HARNESS_ID, token: threadId };
-    // The gate goes on the session BEFORE the turn is started, so a `stop` that
-    // lands mid-turn can read the live turn id off it and interrupt.
-    const session: CodexSession = { client, startParams, gate };
-    SESSIONS.set(threadId, session);
-    // BEFORE the turn runs and before resolving: the caller persists the token
-    // on this event, so a mid-turn crash still leaves a resumable record.
-    onEvent({ kind: 'started', ref, ...(reportedModel === undefined ? {} : { model: reportedModel }) });
-
-    try {
-      await runTurn(
-        client,
-        gate,
-        buildTurnStartParams(threadId, args.brief, args.effort ?? args.permissions.effort),
-      );
-    } catch (err) {
-      await abandonTurn(threadId, session);
-      throw err;
-    } finally {
-      session.turnId = gate.currentTurnId();
-      delete session.gate;
-    }
-    return ref;
-  },
+  start: (args, onEvent) => startCodex(args, onEvent),
+  // Only this adapter currently offers retained routed spawn custody. Keep
+  // the vendor-specific holder and generation checks in startRoutedCodex.
+  startRouted: (args, onEvent, launch) => startRoutedCodex(args, onEvent, {
+    generation: launch.generation,
+    onLaunch: retained => launch.onLaunch(retained),
+  }),
 
   async deliver(
     ref: HarnessSessionRef,

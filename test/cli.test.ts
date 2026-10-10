@@ -1106,8 +1106,8 @@ test('list tolerates a workflow whose definition is no longer available (done: n
   run('list'); // ensures the db file + schema exist before we poke it directly
   const raw = new DatabaseSync(db);
   raw.prepare(
-    `INSERT INTO workflow (id, def, title, params, created_at) VALUES (?, ?, ?, ?, ?)`,
-  ).run('wf_legacy_no_pin', 'delivery', null, '{}', Date.now());
+    `INSERT INTO workflow (id, def, title, params, created_at, firing_incarnation) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run('wf_legacy_no_pin', 'delivery', null, '{}', Date.now(), `fi_${'a'.repeat(24)}`);
   raw.close();
 
   // re-open against a defs dir that no longer contains 'delivery' — status can't be derived
@@ -1171,8 +1171,8 @@ test('status --all isolates an instance whose definition is missing (error field
   run('status', '--all'); // ensures the db file + schema exist before we poke it directly
   const raw = new DatabaseSync(db);
   raw.prepare(
-    `INSERT INTO workflow (id, def, title, params, created_at) VALUES (?, ?, ?, ?, ?)`,
-  ).run('wf_legacy_no_pin', 'delivery', null, '{}', Date.now());
+    `INSERT INTO workflow (id, def, title, params, created_at, firing_incarnation) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run('wf_legacy_no_pin', 'delivery', null, '{}', Date.now(), `fi_${'a'.repeat(24)}`);
   raw.close();
 
   // re-open against a defs dir without 'delivery' — status can't be derived
