@@ -58,6 +58,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { RoutingOfferCandidate, ShiftOffer, LocalTupleEligibility } from '../hub/types.ts';
+import { candidateFiringBinding, canRefreshOfferDescriptor, firingOfferCacheKey, supersedesLocalOffer } from './firing-offer-binding.ts';
 import type { ShiftRoutingSession, RoutingHandoff } from './runtime.ts';
 import type { RoutedInputAuthority, RoutedLaunchAuthority, RoutingBroker } from './routing-broker.ts';
 import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
@@ -1320,7 +1321,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * reservation, not a long critical section, protects capacity during spawn.
    */
   const routingOffers = new Map<string, { candidate: RoutingOfferCandidate; offer: ShiftOffer;
-    rosterSnapshot: string; spentBy?: string }>();
+    rosterSnapshot: string; spentBy?: string; retiredBy?: string }>();
   const routingAttempts = new Map<string, number>();
   const routingRefusals = new Map<string, number>();
   const routingHandoffs = new Map<string, { handoff: RoutingHandoff; stage?: RoutedDefinitionStage;
@@ -1367,11 +1368,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       const candidateProtocol = candidate.localModelProtocol as unknown;
       if (candidateProtocol !== undefined && candidateProtocol !== localModelProtocol) continue;
       const c = candidate.context;
+      const firingBinding = candidateFiringBinding(candidate, workflow);
       if (!c || c.sessionId !== identity.sessionId || c.shiftId !== identity.shiftId || c.orgId !== identity.orgId
 	|| c.principalId !== identity.principalId || c.runId !== workflow || !knownRole(candidate.role)
 	|| candidate.rolePolicy?.unknownRole !== 'refuse' || candidate.rolePolicy.revision !== c.rolePolicyRevision
 	|| !Number.isSafeInteger(c.now) || !Number.isSafeInteger(c.maxTtlMs) || c.maxTtlMs <= 0 || c.maxTtlMs > 300_000
-	|| !selection.capabilities.some(capability => capability === c.capability || capability === c.capability.split(':')[0])) continue;
+	|| !firingBinding || !selection.capabilities.some(capability => capability === c.capability || capability === c.capability.split(':')[0])) continue;
       const tuples = (opts.selectRoutingTuples?.(candidate) ?? []).filter(t => t.eligible && t.available
 	&& candidate.tuples.some(allowed => allowed.eligible && allowed.available && isDeepStrictEqual(t.tuple, allowed.tuple))
 	&& candidate.rolePolicy.rules.some(rule => rule.model === t.tuple.model && rule.roles.some(role => role === candidate.role)));
@@ -1379,34 +1381,41 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       const rosterSnapshot = opts.routingRosterSnapshot
 	? opts.routingRosterSnapshot(candidate) : JSON.stringify(tuples);
       if (!rosterSnapshot) continue;
-      const key = JSON.stringify([workflow, candidate.frameId, candidate.step, candidate.key, candidate.evidenceGeneration, identity.sessionId]);
+      const key = firingOfferCacheKey(firingBinding, identity.sessionId);
+      // Historical cache entries are not current outstanding willingness.
+      // A strictly later server head/claim binding retires only this exact
+      // principal/session/native tuple; it never asserts an unknown claim ACK.
+      for(const prior of routingOffers.values()) {
+	if(prior.offer.version==='shift-offer-v2' && supersedesLocalOffer(candidate,prior.offer))
+	  prior.retiredBy=key;
+      }
       let existing = routingOffers.get(key);
-      if (existing && (existing.spentBy || existing.offer.expiresAt <= opts.now()
-	|| existing.offer.rosterRevision !== c.rosterRevision || existing.offer.rolePolicyRevision !== c.rolePolicyRevision
-	|| existing.candidate.candidateId !== candidate.candidateId
-	|| existing.candidate.localModelProtocol !== candidateProtocol
-	|| existing.rosterSnapshot !== rosterSnapshot
-	|| !isDeepStrictEqual(existing.candidate.rolePolicy, candidate.rolePolicy)
+      if (existing && (existing.spentBy || existing.retiredBy || existing.offer.expiresAt <= opts.now()
+	|| existing.offer.version !== 'shift-offer-v2'
+	|| !canRefreshOfferDescriptor(existing.candidate, candidate, existing.offer, existing.rosterSnapshot, rosterSnapshot)
 	|| !existing.offer.tuples.every(t => tuples.some(current => isDeepStrictEqual(t, current))))) continue;
       if (existing) {
 	const fresh = routingCapacity();
-	const outstanding = [...routingOffers.values()].filter(x => !x.spentBy && x.offer.expiresAt > opts.now()).length;
+	const outstanding = [...routingOffers.values()].filter(x => !x.spentBy && !x.retiredBy && x.offer.expiresAt > opts.now()).length;
 	if (stopped || outstanding > Math.min(fresh.total, fresh.agent)) return 'ready_firing';
+	// An unrelated native state digest change invalidates the prepared claim,
+	// not this identical consent. Submit the fresh descriptor with exact bytes.
+	existing.candidate = structuredClone(candidate);
       }
       if (!existing) {
 	// Re-read under the same lock used for reservations after awaiting the
 	// context. This is willingness, not a reservation or a claim charge.
 	const fresh = routingCapacity();
-	const outstanding = [...routingOffers.values()].filter(x => !x.spentBy && x.offer.expiresAt > opts.now()).length;
+	const outstanding = [...routingOffers.values()].filter(x => !x.spentBy && !x.retiredBy && x.offer.expiresAt > opts.now()).length;
 	if (stopped || outstanding >= Math.min(fresh.total, fresh.agent)) return 'ready_firing';
 	if (routingOffers.size >= 256) {
-	  const old = [...routingOffers].find(([, x]) => x.offer.expiresAt <= opts.now());
+	  const old = [...routingOffers].find(([, x]) => x.offer.expiresAt <= opts.now() || x.retiredBy);
 	  if (!old) return 'ready_firing';
 	  routingOffers.delete(old[0]); // The service retains the nonrenewable tombstone.
 	}
 	const expiresAt = Math.min(c.now + Math.min(120_000, c.maxTtlMs), identity.expiresAt);
 	if (expiresAt <= opts.now() || expiresAt <= c.now) continue;
-	const offer: ShiftOffer = { version: 'shift-offer-v1', offerId: `of_${randomUUID()}`,
+	const offer: ShiftOffer = { version: 'shift-offer-v2', firingBinding: structuredClone(firingBinding), offerId: `of_${randomUUID()}`,
 	  orgId: c.orgId, principalId: c.principalId, sessionId: c.sessionId, shiftId: c.shiftId,
 	  willingness: { runIds: [workflow], crewIds: [c.crewId], capabilities: [c.capability] },
 	  rosterRevision: c.rosterRevision, rolePolicyRevision: c.rolePolicyRevision,
@@ -1447,7 +1456,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       && decision.effect?.kind === 'ready_firing' && decision.effect.firingId === decision.applied.target.firingId;
     const offer = preference.offer;
     const local = offer && [...routingOffers.values()].find(x => x.offer.offerId === offer.offerId);
-    if (!offer || !local || (local.spentBy !== undefined && local.spentBy !== c.order.run)
+    if (!offer || offer.version !== 'shift-offer-v2' || !local || local.retiredBy
+      || !isDeepStrictEqual(candidateFiringBinding(local.candidate, c.workflow), offer.firingBinding)
+      || (local.spentBy !== undefined && local.spentBy !== c.order.run)
       || !isDeepStrictEqual(offer, local.offer) || opts.now() >= offer.expiresAt
       || !knownRole(preference.role) || preference.role !== local.candidate.role
       || !isDeepStrictEqual(preference.rolePolicy, local.candidate.rolePolicy)

@@ -18,12 +18,15 @@ const tuples = [{ tuple: tupleA, eligible: true, available: true },
 const policy = { revision: 'policy', unknownRole: 'refuse' as const,
   rules: [{ model: 'alpha', roles: ['implementation' as const] },
     { model: 'beta', roles: ['implementation' as const] }] };
+const firingBinding = { version: 'firing-offer-binding-v2' as const, workflow: 'wf', frameId: 'frame',
+  step: 'build', key: '', evidenceGeneration: 'one', nativeClaimGeneration: { protocol: 'native-claim-generation-v1' as const,
+    frameIncarnation: `fi_${'a'.repeat(24)}`, generation: 0 }, consentSequence: 0, executorKind: 'agent' as const, laneId: 'lane' };
 const candidate: RoutingOfferCandidate = { candidateId: 'candidate', frameId: 'frame', step: 'build', key: '',
-  evidenceGeneration: 'one', context: { now: 1_000, maxTtlMs: 120_000, orgId: 'org',
+  evidenceGeneration: 'one', context: { firingBinding, now: 1_000, maxTtlMs: 120_000, orgId: 'org',
     principalId: 'agent', sessionId, shiftId: 'shf_shift', rosterRevision: 'roster',
     rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew', capability: 'build' },
   role: 'implementation', rolePolicy: policy, tuples };
-const offer: ShiftOffer = { version: 'shift-offer-v1', offerId: 'of_one', orgId: 'org',
+const offer: ShiftOffer = { version: 'shift-offer-v2', firingBinding, offerId: 'of_one', orgId: 'org',
   principalId: 'agent', sessionId, shiftId: 'shf_shift',
   willingness: { runIds: ['wf'], crewIds: ['crew'], capabilities: ['build'] },
   rosterRevision: 'roster', rolePolicyRevision: 'policy', tuples,

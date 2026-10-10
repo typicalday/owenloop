@@ -4648,7 +4648,10 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent', frame = 'w
   const tuple = { id: 'service-tuple', harness: 'codex', model: 'approved-model', effort: 'high' as const };
   const candidate = {
     candidateId: 'candidate', frameId: frame, step: 'builder', key: '', evidenceGeneration: 'generation-1',
-    context: { now: 1000, maxTtlMs: 300_000, ...id, rosterRevision: 'roster', rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew-id', capability: 'build' },
+    context: { firingBinding: { version: 'firing-offer-binding-v2' as const, workflow: 'wf', frameId: frame, step: 'builder', key: '',
+      evidenceGeneration: 'generation-1', nativeClaimGeneration: { protocol: 'native-claim-generation-v1' as const,
+	frameIncarnation: `fi_${'a'.repeat(24)}`, generation: 0 }, consentSequence: 0, executorKind: 'agent' as const, laneId: 'agent-lane' },
+      now: 1000, maxTtlMs: 300_000, ...id, rosterRevision: 'roster', rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew-id', capability: 'build' },
     role: 'implementation', rolePolicy: { revision: 'policy', unknownRole: 'refuse' as const, rules: [{ model: tuple.model, roles: ['implementation' as const] }] },
     tuples: [{ tuple, eligible: true, available: true }],
   };
@@ -4712,6 +4715,52 @@ async function routedLoopFixture(kind: 'agent' | 'command' = 'agent', frame = 'w
   });
   return { f, session, candidate, offers, requests, hub, calls, spawns, options, edit: (fn: typeof editOrder) => { editOrder = fn; } };
 }
+
+for(const change of ['authority-sequence','input-evidence','recreated-frame'] as const) {
+test(`capacity-one Shift submits current ${change} head before old offer expiry and refuses old launch`,async()=>{
+  const f=await routedLoopFixture();
+  let staleOrder: WorkOrder|undefined;
+  const realWhatsNext=f.hub.whatsNext;
+  f.hub.whatsNext=async()=>({text:'',orders:[]});
+  const loop=createShiftLoop({...f.options,cap:1,execReserve:0});
+  try {
+    await loop.iterate();
+    assert.equal(f.offers.length,1);
+    const original=structuredClone(f.offers[0]!);
+    // Build the actual old claimed descriptor but do not dispatch it yet.
+    staleOrder=(await realWhatsNext({workflow:'wf',serve_capabilities:['build'],routing:{kind:'shift'}})).orders![0];
+    const oldBinding=f.candidate.context.firingBinding;
+    if(change==='authority-sequence') oldBinding.consentSequence++;
+    else if(change==='input-evidence') {
+      f.candidate.evidenceGeneration='new-input';oldBinding.evidenceGeneration='new-input';
+    } else oldBinding.nativeClaimGeneration.frameIncarnation=`fi_${'b'.repeat(24)}`;
+    f.candidate.candidateId='current-descriptor';
+    await loop.iterate();
+    assert.equal(f.offers.length,2,'current willingness must fit capacity one despite historical live TTL');
+    assert.notEqual(f.offers[1]!.offerId,original.offerId);
+    assert.deepEqual(f.offers[0],original,'old offer bytes and TTL are immutable');
+    f.hub.whatsNext=async()=>({text:'',orders:[staleOrder!]});
+    await loop.iterate();
+    assert.equal(f.spawns.length,0,'retired local willingness cannot authorize stale launch');
+  } finally {loop.stop();await f.session.stop();}
+});
+}
+
+test('Shift descriptor churn resubmits exact willingness bytes with fresh candidate ID',async()=>{
+  const f=await routedLoopFixture();
+  f.hub.whatsNext=async()=>({text:'',orders:[]});
+  const submitted: string[]=[];
+  const originalPut=f.session.hub.putShiftOffer;
+  f.session.hub.putShiftOffer=async(request,signal)=>{submitted.push(request.submission.candidateId);return originalPut(request,signal);};
+  const loop=createShiftLoop({...f.options,cap:1,execReserve:0});
+  try {
+    await loop.iterate();const bytes=JSON.stringify(f.offers[0]);
+    f.candidate.candidateId='changed-unrelated-native-state';
+    await loop.iterate();
+    assert.deepEqual(submitted,['candidate','changed-unrelated-native-state']);
+    assert.equal(JSON.stringify(f.offers[1]),bytes);
+  } finally {loop.stop();await f.session.stop();}
+});
 
 test('nested command staging receives canonical root and the unchanged signed frame', async () => {
   const f = await routedLoopFixture('command', 'wf_child_instance');
@@ -5021,7 +5070,9 @@ test('routing retries identical offer bytes without renewing an uncertain firing
   assert.deepEqual(f.offers[0], f.offers[1]);
   f.candidate.candidateId = 'changed-authority-same-window';
   await loop.iterate();
-  assert.equal(f.offers.length, 2, 'an authority ABA cannot issue a replacement allowance');
+  assert.equal(f.offers.length, 3, 'descriptor churn resubmits the current immutable allowance');
+  assert.deepEqual(f.offers[2], f.offers[0], 'resubmission cannot replace the offer ID, bytes or deadline');
+  assert.equal(f.spawns.length, 0, 'an uncertain claim response never starts a worker');
   loop.stop(); await f.session.stop();
 });
 
@@ -5725,7 +5776,9 @@ test('delayed close 429 between offer context and submission blocks the same-ite
   const id = session.identity()!;
   candidate = {
     candidateId: 'candidate', frameId: 'wf', step: 'builder', key: '', evidenceGeneration: 'generation-1',
-    context: { now: clock, maxTtlMs: 300_000, ...id, rosterRevision: 'roster',
+    context: { firingBinding: {version:'firing-offer-binding-v2',workflow:'wf',frameId:'wf',step:'builder',key:'',
+      evidenceGeneration:'generation-1',nativeClaimGeneration:{protocol:'native-claim-generation-v1',frameIncarnation:`fi_${'a'.repeat(24)}`,generation:0},
+      consentSequence:0,executorKind:'agent',laneId:'agent-lane'}, now: clock, maxTtlMs: 300_000, ...id, rosterRevision: 'roster',
       rolePolicyRevision: 'policy', runId: 'wf', crewId: 'crew-id', capability: 'build' },
     role: 'implementation', rolePolicy: { revision: 'policy', unknownRole: 'refuse',
       rules: [{ model: tuple.model, roles: ['implementation'] }] },

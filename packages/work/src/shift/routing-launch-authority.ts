@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { LaunchReservationRequestV1, LocalTupleEligibility, OrderPacket,
   RoutingOfferCandidate, ShiftOffer, WorkOrder } from '../hub/types.ts';
 import type { RoutedLaunchAuthority } from './routing-broker.ts';
+import { candidateFiringBinding } from './firing-offer-binding.ts';
 
 const refused = (): Error => new Error('routed launch selection refused');
 
@@ -30,7 +31,9 @@ export function createRoutedLaunchAuthority(args: {
     if ((order.worker ?? 'agent') !== 'agent') throw refused();
     const offer = args.offer;
     const served = routing.preference.offer;
-    if (!offer || !served || !isDeepStrictEqual(served, offer.offer)
+    if (!offer || !served || served.version !== 'shift-offer-v2'
+      || !isDeepStrictEqual(candidateFiringBinding(offer.candidate, served.firingBinding.workflow), served.firingBinding)
+      || !isDeepStrictEqual(served, offer.offer)
       || offer.rosterSnapshot !== args.currentRosterSnapshot(offer.candidate)
       || served.willingness.crewIds.length !== 1
       || served.willingness.crewIds[0] !== offer.candidate.context.crewId

@@ -857,7 +857,7 @@ export interface RoleModelPolicy {
   unknownRole: 'refuse';
   rules: readonly { model: string; roles: readonly TaskRole[] }[];
 }
-export interface ShiftOffer {
+export interface ShiftOfferV1 {
   version: 'shift-offer-v1';
   /** Exact service protocol required by this offer, when local-model advice is opted in. */
   localModelProtocol?: 'local-model-assessment-v1';
@@ -873,6 +873,29 @@ export interface ShiftOffer {
   issuedAt: number;
   expiresAt: number;
 }
+/** Native claim authority and server consent have independent lifetimes. */
+export interface FiringOfferBindingV2 {
+  version: 'firing-offer-binding-v2';
+  workflow: string;
+  frameId: string;
+  step: string;
+  key: string;
+  evidenceGeneration: string;
+  nativeClaimGeneration: {
+    protocol: 'native-claim-generation-v1';
+    frameIncarnation: string;
+    generation: number;
+  };
+  consentSequence: number;
+  executorKind: 'agent';
+  laneId: string;
+}
+export interface ShiftOfferV2 extends Omit<ShiftOfferV1, 'version'> {
+  version: 'shift-offer-v2';
+  firingBinding: FiringOfferBindingV2;
+}
+/** v1 is retained for already claimed orders, never minted for a new claim. */
+export type ShiftOffer = ShiftOfferV1 | ShiftOfferV2;
 export interface ShiftOfferContext {
   now: number;
   maxTtlMs: number;
@@ -885,6 +908,8 @@ export interface ShiftOfferContext {
   runId: string;
   crewId: string;
   capability: string;
+  /** Required by a modern new willingness submission; absence refuses. */
+  firingBinding?: FiringOfferBindingV2;
 }
 export type DecisionSelectionV1 =
   | { kind: 'workflow'; target: { candidateId: string; def: RoutingDefRef } }

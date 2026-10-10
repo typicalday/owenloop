@@ -2342,18 +2342,35 @@ export class Engine {
 	// buildOrder is read-only. A workdir refusal is not an eligible choice.
 	const preview = this.buildOrder(def, row.id, 'ready-preview', f, arts, computeFingerprint(arts, f.inputs), routing, resolved);
 	if ('deferred' in preview) continue;
+	const nativeClaimGeneration = this.store.getNativeClaimGeneration(row.id,f.step,f.key);
 	const ready: ReadyFiring = immutable({ workflow, frameId: row.id,
 	  DefRef: { bundleDigest: def.bundleDigest!, workflowName: def.name }, step: f.step, key: f.key,
 	  inputFingerprint: computeFingerprint(arts, f.inputs),
 	  admissionEpoch: this.store.getAdmission(this.store.rootWorkflow(row.id))?.epoch ?? null,
 	  executorKind: this.step(def, f.step).executor ?? 'agent',
 	  meaningDigest: valueDigestHex(this.step(def, f.step)),
-	  evidenceGeneration: valueDigestHex(computeFingerprint(arts, f.inputs)), stateDigest, resolved,
+	  evidenceGeneration: valueDigestHex(computeFingerprint(arts, f.inputs)), nativeClaimGeneration,
+	  stateDigest: valueDigestHex({stateDigest,nativeClaimGeneration}), resolved,
 	});
 	entries.push({ ready, firing: f, def, arts, modifier: row.modifier });
       }
     }
     return { kind: 'ready', entries };
+  }
+
+  /** Read persisted eligible firings without maintenance. Unlike snapshotReady,
+   * this never reaps, settles, arms or updates alarms/tasks. A successful empty
+   * read can show a stored consent is currently ineligible; unverified/inactive
+   * outcomes are distinct and must never be inferred as a fresh consent grant. */
+  readReady(workflow: string, options: ReadyOptions): SnapshotReadyResult {
+    const opts = immutable(structuredClone({ ...options, now: options.now ?? nowMs() }));
+    if (!this.store.getWorkflow(workflow) || !this.invocationCurrent(workflow)) return { kind: 'inactive' };
+    const verified = this.verifiedReadyDefinitions(workflow, opts.deep ?? true);
+    if (!(verified instanceof Map)) return { kind: 'unverified', ...verified };
+    return this.withInvocationDefinitions([...verified.values()], () => this.store.readTx(() => {
+      const result = this.collectReady(workflow, opts, verified);
+      return result.kind === 'ready' ? immutable({ kind: 'ready' as const, firings: result.entries.map(e => e.ready) }) : result;
+    }));
   }
 
   /** Maintain the tree, then read actual eligible choices without leases or
@@ -2909,6 +2926,8 @@ export class Engine {
       if (fresh) return 'in-flight'; // genuinely in flight — don't double-claim
     }
 
+    const nativeClaimGeneration = this.store.getNativeClaimGeneration(workflow,f.step,f.key);
+    if (nativeClaimGeneration.generation >= Number.MAX_SAFE_INTEGER) throw new Error('native claim generation exhausted');
     const runId = randId('run');
     const fp = computeFingerprint(arts, f.inputs);
     // Build the order BEFORE inserting the run so the flattened packet lands in
@@ -2934,6 +2953,7 @@ export class Engine {
     if (routing.escalation) this.recordEscalation(workflow, f, routing.escalation, now);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
+    this.store.recordNativeClaim(workflow,f.step,f.key,runId,nativeClaimGeneration);
     // The private prior-version record belongs to this claim, not to the
     // mutable owed target in order.v1. The same in-transaction artifact map
     // supplied buildOrder, so a concurrent commit cannot move either reading.

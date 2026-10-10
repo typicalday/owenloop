@@ -18,7 +18,7 @@ import type { InvocationBinding, InvocationKey, RunAdmission } from './types.ts'
 
 import { DatabaseSync } from 'node:sqlite';
 import { lstatSync } from 'node:fs';
-import { detId, nowMs } from './util.ts';
+import { detId, nowMs, randId } from './util.ts';
 import { compareStoreText, defDigest, isDefDigest, parseWorkflowCoordinate } from './store/types.ts';
 import { parseVersionedCallTarget } from './bundle/manifest.ts';
 import { withWorkflowSnapshotStoreGuard } from './store/snapshot-guard.ts';
@@ -33,6 +33,7 @@ import type {
   Fingerprint,
   InterfaceCallBinding,
   ClaimOrder,
+  NativeClaimGeneration,
   ReasonEntry,
   RunData,
   TaskData,
@@ -69,6 +70,8 @@ export interface WorkflowRow extends WorkflowData {
   /** Mode 2 foundation: parent workflow coordinate for a child instance spawned by a calls: step. */
   producedBy?: { parentWf: string; parentPath: string };
   producedByInvocation?: string;
+  /** Native frame identity; scheduling metadata, never signed Order authority. */
+  firingIncarnation: string;
 }
 
 /** The bundle identities retained by one persisted workflow definition snapshot. */
@@ -356,6 +359,23 @@ CREATE TABLE IF NOT EXISTS claim_prior_version (
   PRIMARY KEY (run_id, path)
 );
 
+CREATE TABLE IF NOT EXISTS native_claim_generations (
+  frame_id TEXT NOT NULL, frame_incarnation TEXT NOT NULL, step TEXT NOT NULL, key TEXT NOT NULL,
+  next_generation INTEGER NOT NULL CHECK(typeof(next_generation)='integer' AND next_generation>=1 AND next_generation<=9007199254740991),
+  last_claim_run TEXT NOT NULL,
+  PRIMARY KEY(frame_id,frame_incarnation,step,key)
+);
+CREATE TABLE IF NOT EXISTS native_claim_bindings (
+  run_id TEXT PRIMARY KEY, frame_id TEXT NOT NULL, frame_incarnation TEXT NOT NULL,
+  step TEXT NOT NULL, key TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>=0 AND generation<9007199254740991),
+  UNIQUE(frame_id,frame_incarnation,step,key,generation)
+);
+CREATE TABLE IF NOT EXISTS native_claim_legacy_runs (
+  run_id TEXT PRIMARY KEY, frame_id TEXT NOT NULL, frame_incarnation TEXT NOT NULL,
+  step TEXT NOT NULL, key TEXT NOT NULL, cutover TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS native_claim_legacy_scope ON native_claim_legacy_runs(frame_id,frame_incarnation,step,key);
 CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -395,7 +415,8 @@ CREATE TABLE IF NOT EXISTS meta (
  */
 // v14 adds internal dispatch lanes and append-only consumed slots.
 // v15 adds private claim-time prior-version snapshots, with no legacy backfill.
-const SCHEMA_VERSION = '15';
+// v16 adds protected native claim generations and exact legacy-run cutover.
+const SCHEMA_VERSION = '16';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -736,6 +757,7 @@ interface WorkflowRowRaw {
   meta: string | null;
   interface_bindings: string | null;
   produced_by_invocation: string | null;
+  firing_incarnation: string | null;
   created_at: number;
 }
 
@@ -745,6 +767,7 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
     def: r.def,
     params: fromJson<Record<string, string>>(r.params, {}, { table: 'workflow', id: r.id, column: 'params' }),
     createdAt: r.created_at,
+    firingIncarnation: r.firing_incarnation ?? '',
   };
   if (r.title !== null) out.title = r.title;
   if (r.produced_by_wf !== null && r.produced_by_path !== null) {
@@ -811,6 +834,7 @@ export class Store {
 		// copied into append-only events exactly once.
 		const backfillLegacyEvents = cur !== undefined && parseInt(cur, 10) < 9;
 		this.migrate(backfillLegacyEvents);
+	this.initializeNativeClaimGenerations(cur);
 	this.validateDispatchState();
 		if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
       });
@@ -1007,6 +1031,9 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'def_hash')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
     }
+    if (!wfCols.some(c => c.name === 'firing_incarnation')) {
+      this.db.exec('ALTER TABLE workflow ADD COLUMN firing_incarnation TEXT');
+    }
     // Routing modifier: the ONE modifier this instance carries. The starter
     // supplies its initial value; a def-declared artifact bind may later update
     // it through the engine's routing writer. NULL on every pre-existing row,
@@ -1133,8 +1160,8 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO workflow
-         (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, interface_bindings, created_at, produced_by_invocation)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	 (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, interface_bindings, created_at, produced_by_invocation, firing_incarnation)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1150,6 +1177,7 @@ export class Store {
         toJson(data.interfaceBindings),
         at,
         producedByInvocation ?? null,
+	randId('fi'),
       );
     return this.getWorkflow(id) as WorkflowRow;
   }
@@ -1508,6 +1536,134 @@ export class Store {
     this.db.prepare('DELETE FROM artifact_event WHERE workflow = ? AND path = ?').run(workflow, path);
     this.db.prepare('DELETE FROM artifact_version WHERE workflow = ? AND path = ?').run(workflow, path);
     this.db.prepare('DELETE FROM artifact WHERE workflow = ? AND path = ?').run(workflow, path);
+  }
+
+  /** Migration classifies exact retained runs once; restart never invents history. */
+  private initializeNativeClaimGenerations(prior: string | undefined): void {
+    const protocol = this.getMeta('native_claim_generation_cutover');
+    if (protocol === undefined) {
+      if (prior === SCHEMA_VERSION) throw new Error('native claim cutover missing');
+      const occupied = this.db.prepare(`SELECT 1 FROM native_claim_generations UNION ALL
+	SELECT 1 FROM native_claim_bindings UNION ALL SELECT 1 FROM native_claim_legacy_runs LIMIT 1`).get();
+      if (occupied) throw new Error('unclassified native claim migration');
+      const cutover = randId('cut');
+      for (const frame of this.db.prepare('SELECT id,firing_incarnation FROM workflow').all() as Array<{id:string;firing_incarnation:string|null}>) {
+	if (frame.firing_incarnation !== null) throw new Error('unclassified frame incarnation');
+	this.db.prepare('UPDATE workflow SET firing_incarnation=? WHERE id=? AND firing_incarnation IS NULL').run(randId('fi'), frame.id);
+      }
+      if (this.db.prepare('SELECT 1 FROM run r LEFT JOIN workflow w ON w.id=r.workflow WHERE w.id IS NULL LIMIT 1').get())
+	throw new Error('orphan native run at cutover');
+      this.db.prepare(`INSERT INTO native_claim_legacy_runs(run_id,frame_id,frame_incarnation,step,key,cutover)
+	SELECT r.id,r.workflow,w.firing_incarnation,r.step,r.key,? FROM run r JOIN workflow w ON w.id=r.workflow`).run(cutover);
+      this.setMeta('native_claim_generation_cutover', cutover);
+    } else if (!/^cut_[0-9a-f]{24}$/.test(protocol)) throw new Error('native claim cutover corrupt');
+    for (const row of this.db.prepare('SELECT firing_incarnation FROM workflow').all() as Array<{firing_incarnation:string|null}>)
+      if (typeof row.firing_incarnation !== 'string' || !/^fi_[0-9a-f]{24}$/.test(row.firing_incarnation))
+	throw new Error('native frame incarnation missing');
+    // Keep scheduling tombstones after workflow deletion; a recreated frame gets
+    // another incarnation and cannot alias them. No resets through putTask.
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS workflow_firing_incarnation ON workflow(firing_incarnation);
+      CREATE TRIGGER IF NOT EXISTS native_frame_identity_immutable BEFORE UPDATE OF firing_incarnation ON workflow
+      WHEN OLD.firing_incarnation IS NOT NULL AND NEW.firing_incarnation IS NOT OLD.firing_incarnation
+      BEGIN SELECT RAISE(ABORT,'native frame identity immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS native_binding_no_update BEFORE UPDATE ON native_claim_bindings
+      BEGIN SELECT RAISE(ABORT,'native claim binding immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS native_binding_no_delete BEFORE DELETE ON native_claim_bindings
+      BEGIN SELECT RAISE(ABORT,'native claim binding retained'); END;
+      CREATE TRIGGER IF NOT EXISTS native_legacy_no_update BEFORE UPDATE ON native_claim_legacy_runs
+      BEGIN SELECT RAISE(ABORT,'native legacy classification immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS native_legacy_no_delete BEFORE DELETE ON native_claim_legacy_runs
+      BEGIN SELECT RAISE(ABORT,'native legacy classification retained'); END;
+      CREATE TRIGGER IF NOT EXISTS native_generation_no_delete BEFORE DELETE ON native_claim_generations
+      BEGIN SELECT RAISE(ABORT,'native claim generation retained'); END;
+      CREATE TRIGGER IF NOT EXISTS native_generation_advance BEFORE UPDATE ON native_claim_generations
+      WHEN NEW.frame_id IS NOT OLD.frame_id OR NEW.frame_incarnation IS NOT OLD.frame_incarnation
+	OR NEW.step IS NOT OLD.step OR NEW.key IS NOT OLD.key OR NEW.next_generation != OLD.next_generation+1
+	OR NEW.last_claim_run IS OLD.last_claim_run
+      BEGIN SELECT RAISE(ABORT,'native claim generation advance refused'); END;
+      CREATE TRIGGER IF NOT EXISTS native_run_identity_no_reuse BEFORE INSERT ON run
+      WHEN EXISTS(SELECT 1 FROM native_claim_bindings WHERE run_id=NEW.id)
+	OR EXISTS(SELECT 1 FROM native_claim_legacy_runs WHERE run_id=NEW.id)
+      BEGIN SELECT RAISE(ABORT,'native run identity consumed'); END;`);
+  }
+
+  private readNativeClaimGeneration(workflow: string, step: string, key: string, insertingRun?: string): NativeClaimGeneration {
+    const incarnation = this.db.prepare('SELECT firing_incarnation FROM workflow WHERE id=?').get(workflow) as {firing_incarnation:string}|undefined;
+    const cutover = this.getMeta('native_claim_generation_cutover');
+    if (!incarnation || !/^fi_[0-9a-f]{24}$/.test(incarnation.firing_incarnation) || !cutover || !/^cut_[0-9a-f]{24}$/.test(cutover))
+      throw new Error('native claim frame unavailable');
+    const frameIncarnation = incarnation.firing_incarnation;
+    const unclassified = this.db.prepare(`SELECT 1 FROM run r
+      LEFT JOIN native_claim_bindings b ON b.run_id=r.id
+      LEFT JOIN native_claim_legacy_runs l ON l.run_id=r.id
+      WHERE r.workflow=? AND r.step=? AND r.key=? AND (? IS NULL OR r.id != ?)
+	AND ((b.run_id IS NULL AND l.run_id IS NULL) OR (b.run_id IS NOT NULL AND l.run_id IS NOT NULL)
+	  OR (b.run_id IS NOT NULL AND (b.frame_id!=r.workflow OR b.step!=r.step OR b.key!=r.key OR b.frame_incarnation!=?))
+	  OR (l.run_id IS NOT NULL AND (l.frame_id!=r.workflow OR l.step!=r.step OR l.key!=r.key OR l.frame_incarnation!=? OR l.cutover!=?))) LIMIT 1`)
+      .get(workflow,step,key,insertingRun ?? null,insertingRun ?? null,frameIncarnation,frameIncarnation,cutover);
+    if (unclassified) throw new Error('native claim history unclassified');
+    // Retained attribution is not a substitute for the real run while this
+    // incarnation exists. A deleted/moved tracked run is corruption, not a
+    // fresh scheduling opportunity. Deleted workflow incarnations are never
+    // read through this current-frame API.
+    const absentTrackedRun = this.db.prepare(`SELECT 1 FROM native_claim_bindings b
+      LEFT JOIN run r ON r.id=b.run_id
+      WHERE b.frame_id=? AND b.frame_incarnation=? AND b.step=? AND b.key=?
+	AND (r.id IS NULL OR r.workflow!=b.frame_id OR r.step!=b.step OR r.key!=b.key) LIMIT 1`)
+      .get(workflow,frameIncarnation,step,key);
+    if (absentTrackedRun) throw new Error('native tracked run missing');
+    const absentLegacyRun = this.db.prepare(`SELECT 1 FROM native_claim_legacy_runs l
+      LEFT JOIN run r ON r.id=l.run_id
+      WHERE l.frame_id=? AND l.frame_incarnation=? AND l.step=? AND l.key=?
+	AND (r.id IS NULL OR r.workflow!=l.frame_id OR r.step!=l.step OR r.key!=l.key OR l.cutover!=?) LIMIT 1`)
+      .get(workflow,frameIncarnation,step,key,cutover);
+    if (absentLegacyRun) throw new Error('native legacy run missing');
+    const row = this.db.prepare(`SELECT next_generation,last_claim_run FROM native_claim_generations
+      WHERE frame_id=? AND frame_incarnation=? AND step=? AND key=?`).get(workflow,frameIncarnation,step,key) as {next_generation:number;last_claim_run:string}|undefined;
+    const last = this.db.prepare(`SELECT generation,run_id FROM native_claim_bindings
+      WHERE frame_id=? AND frame_incarnation=? AND step=? AND key=? ORDER BY generation DESC LIMIT 1`)
+      .get(workflow,frameIncarnation,step,key) as {generation:number;run_id:string}|undefined;
+    if (row ? !Number.isSafeInteger(row.next_generation) || row.next_generation < 1
+      || !last || last.generation !== row.next_generation-1 || last.run_id !== row.last_claim_run : !!last)
+      throw new Error('native claim generation corrupt');
+    return {protocol:'native-claim-generation-v1',frameIncarnation,generation:row?.next_generation ?? 0};
+  }
+
+  getNativeClaimGeneration(workflow: string, step: string, key: string): NativeClaimGeneration {
+    return this.readNativeClaimGeneration(workflow,step,key);
+  }
+
+  getNativeClaimBinding(run: string): NativeClaimGeneration | undefined {
+    const row = this.db.prepare('SELECT frame_incarnation,generation FROM native_claim_bindings WHERE run_id=?').get(run) as
+      {frame_incarnation:string;generation:number}|undefined;
+    if (!row) return undefined;
+    if (!/^fi_[0-9a-f]{24}$/.test(row.frame_incarnation) || !Number.isSafeInteger(row.generation) || row.generation < 0)
+      throw new Error('native claim binding corrupt');
+    return {protocol:'native-claim-generation-v1',frameIncarnation:row.frame_incarnation,generation:row.generation};
+  }
+
+  /** Called only alongside the new real run/task/slot inside the original tx. */
+  recordNativeClaim(workflow: string, step: string, key: string, run: string, expected: NativeClaimGeneration): void {
+    if (!this.inWriteTransaction) throw new Error('native claim requires write transaction');
+    const actual = this.readNativeClaimGeneration(workflow,step,key,run);
+    const currentRun = this.getRun(run);
+    if (expected.protocol !== actual.protocol || expected.frameIncarnation !== actual.frameIncarnation
+      || expected.generation !== actual.generation || actual.generation >= Number.MAX_SAFE_INTEGER
+      || !currentRun || currentRun.workflow !== workflow || currentRun.step !== step || (currentRun.key ?? '') !== key
+      || currentRun.outcome !== undefined || this.getNativeClaimBinding(run)
+      || this.db.prepare('SELECT 1 FROM native_claim_legacy_runs WHERE run_id=?').get(run))
+      throw new Error('native claim generation CAS refused');
+    this.db.prepare(`INSERT INTO native_claim_bindings(run_id,frame_id,frame_incarnation,step,key,generation) VALUES(?,?,?,?,?,?)`)
+      .run(run,workflow,actual.frameIncarnation,step,key,actual.generation);
+    if (actual.generation === 0) {
+      this.db.prepare(`INSERT INTO native_claim_generations(frame_id,frame_incarnation,step,key,next_generation,last_claim_run) VALUES(?,?,?,?,1,?)`)
+	.run(workflow,actual.frameIncarnation,step,key,run);
+    } else {
+      const result=this.db.prepare(`UPDATE native_claim_generations SET next_generation=?,last_claim_run=?
+	WHERE frame_id=? AND frame_incarnation=? AND step=? AND key=? AND next_generation=?`)
+	.run(actual.generation+1,run,workflow,actual.frameIncarnation,step,key,actual.generation);
+      if (Number(result.changes)!==1) throw new Error('native claim generation CAS refused');
+    }
   }
 
   // -- task --------------------------------------------------------------------
