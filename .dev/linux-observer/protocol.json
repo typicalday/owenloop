@@ -1,0 +1,336 @@
+{
+  "protocol": "jev-linux-procfs-observer-source-v2",
+  "executionAdmitted": false,
+  "publicationAdmitted": false,
+  "nativeOriginalAdmitted": false,
+  "recoveryAccepted": false,
+  "scope": "Fresh original-owned harmless multithread Node target; conservative sequential endpoint observer qualification only. No provider secrets; hosted Actions credentials/runtime trust remain.",
+  "job": {
+    "name": "linux-procfs-observer",
+    "runner": "ubuntu-latest",
+    "runnerImmutable": false,
+    "timeoutMinutes": 10,
+    "repository": "typicalday/owenloop",
+    "pr": 369,
+    "event": "pull_request",
+    "action": "synchronize",
+    "branch": "jev-routing-foundation-20261008",
+    "base": "b4ead192326ba607558cd3bb7687209cbb7c8165",
+    "admissionVariable": "OWENLOOP_JEV_OBSERVER_HEAD",
+    "oldMetadataVariableMustBeAbsent": "OWENLOOP_JEV_PREFLIGHT_HEAD",
+    "permissions": {
+      "contents": "read"
+    },
+    "oneShotGuaranteedByVariable": false,
+    "rootMustAuditSelectedRunAndDisableVariable": true
+  },
+  "publication": {
+    "newFiles": [
+      {
+        "source": "owner.py",
+        "destination": ".dev/linux-observer/owner.py",
+        "sha256": "5fe02ef578e6c1c69cdb47f63a7f8615a94ffdc7e4e935dcaea067ee587f52d6"
+      },
+      {
+        "source": "observer.c",
+        "destination": ".dev/linux-observer/observer.c",
+        "sha256": "96797f13e7619054c4036b6553e873609f2be4d73ba47c14f9f23f9d9d57c151"
+      },
+      {
+        "source": "observer.mjs",
+        "destination": ".dev/linux-observer/observer.mjs",
+        "sha256": "4f42fb8948d2bb7acce1570c83900dd100855d506e03912852fdb7eb124c7fe9"
+      },
+      {
+        "source": "target.mjs",
+        "destination": ".dev/linux-observer/target.mjs",
+        "sha256": "b8b05e3644c07eb41e3f68eda6222bf390f1d7738fcb579fdc6482bb79bf7088"
+      },
+      {
+        "source": "controls.mjs",
+        "destination": ".dev/linux-observer/controls.mjs",
+        "sha256": "663c971d4756c1045c6b7b33d70d9fe72d34628477cb9c9363cdbc6b8474bf9d"
+      }
+    ],
+    "protocolDestination": ".dev/linux-observer/protocol.json",
+    "workflowDestination": ".github/workflows/ci.yml",
+    "baselineUnchanged": [
+      {
+        "source": "/Volumes/more/jev-engine369-linux-metadata-preflight-source-v2-20261011/owner.py",
+        "publication": ".dev/linux-metadata/owner.py",
+        "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+        "bytes": 19973
+      },
+      {
+        "source": "/Volumes/more/jev-engine369-linux-metadata-preflight-source-v2-20261011/metadata.mjs",
+        "publication": ".dev/linux-metadata/metadata.mjs",
+        "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+        "bytes": 9232
+      },
+      {
+        "source": "/Volumes/more/jev-engine369-linux-metadata-preflight-source-v2-20261011/controls.py",
+        "publication": ".dev/linux-metadata/controls.py",
+        "sha256": "1221c5bd3409d40dd5a1b1d1d65a049f51676c54e49bf7dc149eae47aaf5f17d",
+        "bytes": 8773
+      },
+      {
+        "source": "/Volumes/more/jev-engine369-linux-metadata-preflight-source-v2-20261011/controls.mjs",
+        "publication": ".dev/linux-metadata/controls.mjs",
+        "sha256": "30d79f23b5be6a9a6dabaca38335f8f72299fc3c3d136272743506674bb93fa3",
+        "bytes": 4775
+      },
+      {
+        "source": "/Volumes/more/jev-engine369-linux-metadata-preflight-source-v2-20261011/protocol.json",
+        "publication": ".dev/linux-metadata/protocol.json",
+        "sha256": "e256a3583d4751360ac56935fe16eaa425d276f1f21ed4a2f50400c968207a52",
+        "bytes": 10388
+      }
+    ],
+    "workflowBaseline": {
+      "path": "/Volumes/more/jev-engine369-linux-metadata-preflight-source-v2-20261011/ci.yml",
+      "sha256": "49fb649f03906e6697b5c33f56d4b8b94d190b01c0cea927120d860cc0fa9e47",
+      "bytes": 6459
+    },
+    "productLogicChanged": false
+  },
+  "execution": {
+    "ownerArgv": [
+      "python3",
+      "-I",
+      "-B",
+      ".dev/linux-observer/owner.py"
+    ],
+    "output": "$RUNNER_TEMP/jev-linux-procfs-observer-v2/observer-result.json",
+    "childEnvironment": "Exact narrow allowlist; no inherited NODE_OPTIONS/provider credentials/user Git configuration",
+    "originals": [
+      "git HEAD",
+      "git HEAD^{tree}",
+      "git clean status",
+      "pure Node controls",
+      "cc dependency discovery",
+      "cc shared addon compile",
+      "fresh retained Node target",
+      "Node observer"
+    ],
+    "nodeVersion": "22.23.0",
+    "napi": 10,
+    "architecture": "linux-x64",
+    "compiler": "Existing /usr/bin/cc only; unavailable => refuse; no installation",
+    "nativeFlags": [
+      "-std=c11",
+      "-O2",
+      "-fPIC",
+      "-Wall",
+      "-Wextra",
+      "-Werror"
+    ],
+    "toolProvenance": "OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION",
+    "compilerDistributionQualified": false,
+    "headerArchive": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
+    "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
+    "headerFiles": [
+      "node_api.h",
+      "node_api_types.h",
+      "js_native_api.h",
+      "js_native_api_types.h"
+    ],
+    "dependencyReceipt": "Same-job before/after bounded selected source/header hash closure; not complete compiler-distribution certification"
+  },
+  "caps": {
+    "ownerSeconds": 120,
+    "cleanupSeconds": 10,
+    "gitAndPureSecondsEach": 10,
+    "dependencyDiscoverySeconds": 10,
+    "compileSeconds": 20,
+    "observerSeconds": 30,
+    "targetEOFSeconds": 10,
+    "headerDownloadSeconds": 20,
+    "nativeSampleSeconds": 5,
+    "fileAndPipeBytes": 65536,
+    "toolFileBytes": 536870912,
+    "toolAndDependencyHashTotalBytes": 1073741824,
+    "artifactBytes": 8388608,
+    "headerArchiveBytes": 16777216,
+    "archiveEntries": 8192,
+    "archiveExpandedBytes": 134217728,
+    "archiveSingleEntryBytes": 16777216,
+    "dependencyPaths": 512,
+    "selectedDependencyFileBytes": 1048576,
+    "nativeSingleReadBytes": 16384,
+    "nativeTotalReadBytes": 8388608,
+    "taskCountMin": 2,
+    "taskCountMax": 127
+  },
+  "ownership": {
+    "identity": "Original Python Popen object + public waitid WNOWAIT; target LIVE/unreaped before/during/after observer; numeric PID private in memory only",
+    "signals": "Retained unreaped original group only during exceptional cleanup; no signal after reap or uncertain identity",
+    "targetReadiness": "One fixed READY newline, not all-thread readiness or recovery timing barrier",
+    "targetEnd": "Owned stdin EOF then original direct terminal/reaped + both pipe EOF",
+    "unknown": "Hold retained original; no PASS, retry, replacement or reconstructed authority",
+    "globalAbsenceClaimed": false
+  },
+  "nativeContract": {
+    "filesystem": "PROCFS verified on retained /proc directory",
+    "handles": "Public open/openat nofollow relative reads; retained branded proc FD; every task FD retained until cleanup",
+    "order": [
+      "process identity/state/count",
+      "first complete EOF task enumeration",
+      "all first task identity/state/status reads",
+      "second complete EOF task enumeration and process count",
+      "paired second-opening inode identity for every retained task FD",
+      "EVERY retained task FD second state/TGID/UID/start/count read",
+      "final process identity/count/credential check",
+      "close all owned task/list descriptors"
+    ],
+    "acceptedStates": [
+      "R",
+      "S",
+      "D"
+    ],
+    "refuseChangedStoppedTerminalUnknown": true,
+    "atomicCoverage": false,
+    "continuousCoverage": false,
+    "darwinEquivalence": false,
+    "providerAccessQualified": false
+  },
+  "loading": {
+    "metadata": "Hash/read same FD, public synchronous registerHooks returns exact verified bytes with original file URL; deregister, stable FD/path checks",
+    "addon": "process.dlopen public API on retained /proc/self/fd descriptor, RTLD_NOW, before/after identity",
+    "custodyDependency": "exec compile of exact verified owner bytes with non-main namespace; old owner main/context never called",
+    "publishedEntryTrust": "Root exact commit/tree/workflow/source readback plus hosted checkout/runtime execution trust; source hashes alone are not general immutable execution provenance"
+  },
+  "controlsPlan": {
+    "orderedNames": [
+      "two-thread-endpoint-shape",
+      "largest-admitted-count",
+      "reject-count-zero",
+      "reject-count-single",
+      "reject-count-cap",
+      "reject-count-fraction",
+      "reject-count-string",
+      "reject-count-nan",
+      "reject-twoPasses",
+      "reject-allStatesLive",
+      "reject-sameTaskDescriptors",
+      "reject-sameProcessIdentity",
+      "reject-completeEOF",
+      "reject-cleanupKnown",
+      "reject-extra-private-key",
+      "reject-symbol-key",
+      "reject-missing-field",
+      "getter-not-called",
+      "proxy-descriptor-failure",
+      "known-code",
+      "unknown-code-not-retained",
+      "error-code-getter-not-called",
+      "error-proxy-fallback"
+    ],
+    "expectedCases": 23,
+    "backendInvoked": false,
+    "pureArgv": [
+      "node",
+      ".dev/linux-observer/controls.mjs"
+    ],
+    "nativeNegativeControls": [
+      "zero",
+      "null",
+      "forged-handle",
+      "closed-handle"
+    ],
+    "nativeNegativeScope": "Same observer original, invalid calls do not enumerate foreign processes; one sample, no retry"
+  },
+  "stageGates": [
+    "Whole private source + independent/root review",
+    "Separate publication/exact commit/tree/workflow/action/variable/source admission",
+    "Fresh same-job context/own-process/tool measurements and bounded header/dependency discovery before compile",
+    "Fresh addon build and one harmless original-owned target qualification",
+    "Whole actual fixed artifact/context/source/settlement independent review; no recovery or sampler replacement admission"
+  ],
+  "publicAPIs": [
+    "https://nodejs.org/download/release/v22.23.0/docs/api/module.html#moduleregisterhooksoptions",
+    "https://raw.githubusercontent.com/nodejs/node/v22.23.0/lib/internal/modules/customization_hooks.js",
+    "https://nodejs.org/download/release/v22.23.0/docs/api/process.html#processdlopenmodule-filename-flags",
+    "https://docs.kernel.org/filesystems/proc.html"
+  ],
+  "limitations": [
+    "Retained proc FD does not itself prevent PID reuse; original unreaped handle is mandatory",
+    "Equal endpoint task sets and states are sequential fences, not continuous complete coverage",
+    "Root must compare actual tree and complete workflow post-run; one mutable SHA variable is scheduling only",
+    "No existing Darwin predicate or provider/full recovery gate is changed",
+    "Prior own-process metadata and Mac UNSUPPORTED histories are context only, not Linux permission/tool/native proof"
+  ],
+  "failureDiagnostics": {
+    "resultProtocol": "jev-linux-procfs-observer-result-v2",
+    "observerStages": [
+      "METADATA_BINDING",
+      "ARTIFACT_BINDING",
+      "METADATA_LOAD",
+      "OWN_METADATA",
+      "ARTIFACT_LOAD",
+      "API_NEGATIVE",
+      "NATIVE_ACQUIRE",
+      "NATIVE_SAMPLE",
+      "NATIVE_CLOSE",
+      "CLOSED_HANDLE_CHECK",
+      "SOURCE_RECHECK",
+      "RESULT_EMIT",
+      "CLEANUP",
+      "UNKNOWN"
+    ],
+    "ownerStages": [
+      "TOOL_BINDING",
+      "GIT_HEAD",
+      "GIT_TREE",
+      "GIT_CLEAN",
+      "WORKFLOW_BINDING",
+      "PURE_CONTROLS",
+      "HEADER_DISCOVERY",
+      "DEPENDENCY_DISCOVERY",
+      "DEPENDENCY_BINDING",
+      "COMPILE",
+      "ARTIFACT_BINDING",
+      "TARGET_START",
+      "TARGET_READINESS",
+      "OBSERVER_START",
+      "OBSERVER_WAIT",
+      "RESULT_VALIDATION",
+      "TARGET_SETTLEMENT",
+      "SOURCE_RECHECK",
+      "RESULT_RETENTION"
+    ],
+    "errorValuesRetained": false,
+    "earlyPreownershipFailure": "Fixed stderr/nonzero; missing artifact is failed retention, never qualification",
+    "observerEmission": "Buffer fixed result; finish protected hook/handle/FD cleanup; exactly one frame. Cleanup failure => CLEANUP/UNSUPPORTED/nonzero.",
+    "originalReceipts": {
+      "orderedSlots": [
+        "head",
+        "tree",
+        "clean",
+        "controls",
+        "dependencies",
+        "compile",
+        "target",
+        "observer"
+      ],
+      "maximum": 8,
+      "keys": [
+        "slot",
+        "directOriginalTerminal",
+        "directOriginalReaped",
+        "ownedPipesEOF",
+        "signalsSent",
+        "globalGroupAbsenceClaimed",
+        "exitCode",
+        "stdoutBytes",
+        "stdoutSha256",
+        "stderrBytes",
+        "stderrSha256"
+      ],
+      "rawStreamsRetainedInArtifact": false,
+      "onRefusal": "Retain previous receipts and available target/observer fixed outcomes after retained-original cleanup. An unstarted original has no fabricated receipt; unknown remains held and cannot finish. Closed original channels remain referenced so later failures preserve the actual settled streams and captured EOF."
+    },
+    "uploadCondition": "always() && !cancelled(); only the exact fixed result file, missing => error; no raw logs or directories"
+  },
+  "sourcePacketRevision": "V3",
+  "sourceCorrection": "Preserve closed target channel receipt after later failure; use captured observer terminal_eof. Exactly two owner expressions changed; native/controls/observer/target unchanged."
+}

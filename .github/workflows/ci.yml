@@ -157,3 +157,63 @@ jobs:
           overwrite: false
           if-no-files-found: error
           retention-days: 7
+
+  # Default-disabled owned-target observer; prior metadata variable must be absent.
+  linux-procfs-observer:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_OBSERVER_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: One harmless original-owned procfs qualification
+        env:
+          JEV_REPOSITORY: ${{ github.repository }}
+          JEV_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          JEV_PR: ${{ github.event.pull_request.number }}
+          JEV_BRANCH: ${{ github.event.pull_request.head.ref }}
+          JEV_EVENT: ${{ github.event_name }}
+          JEV_ACTION: ${{ github.event.action }}
+          JEV_HEAD: ${{ github.event.pull_request.head.sha }}
+          JEV_BASE: ${{ github.event.pull_request.base.sha }}
+          JEV_RUN_ID: ${{ github.run_id }}
+          JEV_RUN_ATTEMPT: ${{ github.run_attempt }}
+          JEV_JOB: linux-procfs-observer
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_PREFLIGHT_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_EXPECTED_OWNER_SHA: 5fe02ef578e6c1c69cdb47f63a7f8615a94ffdc7e4e935dcaea067ee587f52d6
+          JEV_EXPECTED_PROTOCOL_SHA: 8364a6c93394b3929808acb62123278e023a54414570c7abc504ac7e5a6c19b0
+          JEV_EXPECTED_CORE_SHA: 96797f13e7619054c4036b6553e873609f2be4d73ba47c14f9f23f9d9d57c151
+          JEV_EXPECTED_OBSERVER_SHA: 4f42fb8948d2bb7acce1570c83900dd100855d506e03912852fdb7eb124c7fe9
+          JEV_EXPECTED_TARGET_SHA: b8b05e3644c07eb41e3f68eda6222bf390f1d7738fcb579fdc6482bb79bf7088
+          JEV_EXPECTED_CONTROLS_SHA: 663c971d4756c1045c6b7b33d70d9fe72d34628477cb9c9363cdbc6b8474bf9d
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -I -B .dev/linux-observer/owner.py
+      - name: Retain only the bounded fixed observer result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jev-linux-procfs-observer-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-procfs-observer-v2/observer-result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
