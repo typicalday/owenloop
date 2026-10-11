@@ -242,8 +242,9 @@
   "stageGates": [
     "Whole private source + independent/root review",
     "Separate publication/exact commit/tree/workflow/action/variable/source admission",
-    "Fresh same-job context/own-process/tool measurements and bounded header/dependency discovery before compile",
-    "Fresh addon build and one harmless original-owned target qualification",
+    "Before compilation: fresh same-job checkout/context/tool/source validation plus public header and selected dependency closure",
+    "Fresh addon build under the preceding closure; fresh harmless original-owned target",
+    "Before addon load and native acquisition: fresh observer-process credentials, namespaces, procfs and kernel measurements in this same job",
     "Whole actual fixed artifact/context/source/settlement independent review; no recovery or sampler replacement admission"
   ],
   "publicAPIs": [
@@ -331,6 +332,6 @@
     },
     "uploadCondition": "always() && !cancelled(); only the exact fixed result file, missing => error; no raw logs or directories"
   },
-  "sourcePacketRevision": "V3",
+  "sourcePacketRevision": "V4",
   "sourceCorrection": "Preserve closed target channel receipt after later failure; use captured observer terminal_eof. Exactly two owner expressions changed; native/controls/observer/target unchanged."
 }
