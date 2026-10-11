@@ -103,3 +103,57 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: node --test test/bundle.test.ts
+
+  # Private source proposal: publication and exact-head variable remain root-gated.
+  linux-metadata-preflight:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_PREFLIGHT_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: Own-process Linux metadata only
+        env:
+          JEV_REPOSITORY: ${{ github.repository }}
+          JEV_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          JEV_PR: ${{ github.event.pull_request.number }}
+          JEV_BRANCH: ${{ github.event.pull_request.head.ref }}
+          JEV_EVENT: ${{ github.event_name }}
+          JEV_ACTION: ${{ github.event.action }}
+          JEV_HEAD: ${{ github.event.pull_request.head.sha }}
+          JEV_RUN_ID: ${{ github.run_id }}
+          JEV_RUN_ATTEMPT: ${{ github.run_attempt }}
+          JEV_JOB: linux-metadata-preflight
+          JEV_BASE: ${{ github.event.pull_request.base.sha }}
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_EXPECTED_OWNER_SHA: 7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f
+          JEV_EXPECTED_METADATA_SHA: e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b
+          JEV_EXPECTED_PROTOCOL_SHA: e256a3583d4751360ac56935fe16eaa425d276f1f21ed4a2f50400c968207a52
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -I -B .dev/linux-metadata/owner.py
+      - name: Retain one bounded metadata file
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jev-linux-own-metadata-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-metadata-preflight-v2/metadata-result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
