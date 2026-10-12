@@ -250,7 +250,7 @@ jobs:
           JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
           JEV_OLD_PREFLIGHT_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
           JEV_OLD_OBSERVER_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
-          JEV_EXPECTED_BOOTSTRAP_SHA: 8f43b346e3bc1272b1a514d0887892141906373e7259f343aad156941e5c8262
+          JEV_EXPECTED_BOOTSTRAP_SHA: 0cecff28d179d538d146785e3f1fa67d020561df717b0e525fb733507791031c
         run: |
           JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -B -I -S .dev/owned-descriptor-hosted/bootstrap.py
       - name: Retain only the bounded fixed descriptor result

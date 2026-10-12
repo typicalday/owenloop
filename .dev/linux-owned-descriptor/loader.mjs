@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { registerHooks } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-const expected={"fixture.mjs":"e716596073a884c8f74c5329767fe0f4b2c8219626db228f6844407db1b64dff","facade.mjs":"cc5f99facf421991448ad4ec2a78154b806529d1a34ec832bcd9796984848d91","target.mjs":"f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a","nested-owner.mjs":"c4729ad7e3bb62fc2139a8816fc3a9d92d8acdd00d175fe1af77833b1ae6e77f","metadata.mjs":"e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"};
+const expected={"fixture.mjs":"7dded6bcb8d0ebc1cdb2f89d7ee526d47d9bb22e23bab7cf9500fe4a7686be10","facade.mjs":"bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69","target.mjs":"f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a","nested-owner.mjs":"c4729ad7e3bb62fc2139a8816fc3a9d92d8acdd00d175fe1af77833b1ae6e77f","metadata.mjs":"e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"};
 const roles=['fixture.mjs','target.mjs','nested-owner.mjs'];
 const digest=b=>crypto.createHash('sha256').update(b).digest('hex');
 function need(v){if(!v)throw new Error('ENTRY_REFUSED');}

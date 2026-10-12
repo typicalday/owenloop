@@ -449,10 +449,10 @@ static napi_value sample(napi_env env,napi_callback_info info) {
 typedef struct {
     int receiver,sender,owner_pidfd;
     pid_t owner;
-    int sent,received;
+    int sent,received,negative_detail;
 }
 channel;
-static const napi_type_tag CHANNEL_BRAND={0x98cdf35878358921ULL,0x5ab53b3d676bc889ULL};
+static const napi_type_tag CHANNEL_BRAND={0x2dd335a00dd5ff1bULL,0x8afa6934c2db7e48ULL};
 static int channel_dispose(channel *c) {
     int a=closefd(&c->receiver),b=closefd(&c->sender),d=closefd(&c->owner_pidfd);
     return a&&b&&d;
@@ -567,6 +567,74 @@ static napi_value send_pair(napi_env env,napi_callback_info info) {
     if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
     return v;
 }
+/* Private negative fixture only: no caller PID, FD, payload or arbitrary mode.
+   Every alias comes from the same already-bound genuine original pair. */
+static napi_value send_negative(napi_env env,napi_callback_info info) {
+    napi_value args[4],v;
+    size_t n=4,size=0;
+    char mode[32];
+    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=3||
+       napi_get_value_string_utf8(env,args[2],NULL,0,&size)!=napi_ok||size>=sizeof mode||
+       napi_get_value_string_utf8(env,args[2],mode,sizeof mode,&size)!=napi_ok||strlen(mode)!=size)
+        return refused(env,"ARGUMENT");
+    int count;
+    if(!strcmp(mode,"MALFORMED_FRAME"))count=2;
+    else if(!strcmp(mode,"EXTRA_RIGHTS"))count=3;
+    else if(!strcmp(mode,"TRUNCATED_RIGHTS"))count=CAP+16;
+    else return refused(env,"ARGUMENT");
+    channel *c=getchannel(env,args[0]);
+    handle *h=unwrap(env,args[1]);
+    if(!c||!h||c->receiver<0||c->sender<0||c->sent||c->received||
+       c->owner!=getpid()||c->owner_pidfd>=0||!alive(h->pidfd)||!child_live(h->pid))
+        return refused(env,"OWNERSHIP");
+    c->sent=1;
+    int rights[CAP+16],made=0,clean=1;
+    for(int i=0;i<count;i++){
+        int fd=fcntl(i%2?h->fd:h->pidfd,F_DUPFD_CLOEXEC,5);
+        if(fd<0)break;
+        rights[made++]=fd;
+    }
+    char frame[]="JEV_PAIR_V1";
+    if(!strcmp(mode,"MALFORMED_FRAME"))frame[0]='X';
+    struct iovec io={frame,sizeof frame};
+    union {struct cmsghdr align;char bytes[CMSG_SPACE((CAP+16)*sizeof(int))];} control;
+    memset(&control,0,sizeof control);
+    struct msghdr msg={0};
+    msg.msg_iov=&io;msg.msg_iovlen=1;msg.msg_control=control.bytes;
+    msg.msg_controllen=CMSG_SPACE((size_t)count*sizeof(int));
+    struct cmsghdr *header=CMSG_FIRSTHDR(&msg);
+    header->cmsg_level=SOL_SOCKET;header->cmsg_type=SCM_RIGHTS;
+    header->cmsg_len=CMSG_LEN((size_t)count*sizeof(int));
+    ssize_t sent=-1;
+    if(made==count){
+        memcpy(CMSG_DATA(header),rights,(size_t)count*sizeof(int));
+        sent=sendmsg(c->sender,&msg,MSG_DONTWAIT|MSG_NOSIGNAL);
+    }
+    /* No retries, including close uncertainty. Do not short-circuit cleanup. */
+    for(int i=0;i<made;i++)if(close(rights[i]))clean=0;
+    int a=closefd(&c->sender),b=dispose(h);
+    if(!clean||!a||!b)return refused(env,"CLEANUP");
+    if(made!=count||sent!=(ssize_t)sizeof frame)return refused(env,"CHANNEL");
+    if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
+    return v;
+}
+/* Closed, fixed diagnostic over an already-refused receive; no descriptor data.
+   It is not an authority assertion or an alternative successful receive. */
+static napi_value negative_detail(napi_env env,napi_callback_info info) {
+    napi_value args[2],v;
+    size_t n=2;
+    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1)return refused(env,"ARGUMENT");
+    channel *c=getchannel(env,args[0]);
+    if(!c)return refused(env,"ARGUMENT");
+    const char *detail="UNKNOWN";
+    if(c->received&&c->receiver<0){
+        if(c->negative_detail==1)detail="MALFORMED_FRAME";
+        else if(c->negative_detail==2)detail="EXTRA_RIGHTS";
+        else if(c->negative_detail==3)detail="CONTROL_TRUNCATED";
+    }
+    if(napi_create_string_utf8(env,detail,NAPI_AUTO_LENGTH,&v)!=napi_ok)return refused(env,"NAPI");
+    return v;
+}
 static int pidfd_pair(handle *h,budget *b) {
     int own=open("/proc/self/fdinfo",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
     struct statfs fs;
@@ -675,6 +743,19 @@ static napi_value receive_pair(napi_env env,napi_callback_info info) {
     if(bad){
         int clean=cleanup_ok;
         for(int i=0;i<count;i++)if(close(rights[i]))clean=0;
+        /* Publish a reason only after every delivered right was explicitly
+           closed successfully. All original acceptance predicates stay above. */
+        if(clean){
+            if(msg.msg_flags&MSG_CTRUNC)c->negative_detail=3;
+            else if(length==(ssize_t)sizeof expected&&!(msg.msg_flags&MSG_TRUNC)&&
+                    rights_headers==1&&cred_headers==1&&extra_length==0&&
+                    !(extra_msg.msg_flags&(MSG_TRUNC|MSG_CTRUNC))&&
+                    cred.pid==c->owner&&cred.uid==getuid()&&cred.gid==getgid()&&
+                    (c->owner_pidfd<0||alive(c->owner_pidfd))){
+                if(count==2&&memcmp(frame,expected,sizeof expected))c->negative_detail=1;
+                else if(count>2&&!memcmp(frame,expected,sizeof expected))c->negative_detail=2;
+            }
+        }
         return refused(env,clean?"CHANNEL":"CLEANUP");
     }
     handle *h=calloc(1,sizeof(*h));
@@ -719,6 +800,8 @@ static napi_value init(napi_env env,napi_value out){
         {"senderFD",NULL,sender_fd,NULL,NULL,NULL,napi_default,NULL},
         {"attributeOwner",NULL,attribute_owner,NULL,NULL,NULL,napi_default,NULL},
         {"sendPair",NULL,send_pair,NULL,NULL,NULL,napi_default,NULL},
+        {"sendNegative",NULL,send_negative,NULL,NULL,NULL,napi_default,NULL},
+        {"negativeDetail",NULL,negative_detail,NULL,NULL,NULL,napi_default,NULL},
         {"receivePair",NULL,receive_pair,NULL,NULL,NULL,napi_default,NULL},
         {"closeChannel",NULL,close_channel,NULL,NULL,NULL,napi_default,NULL}
     };

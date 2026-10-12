@@ -84,6 +84,16 @@ function createFacade(native, artifact, sha) {
       return bound;
     },
     send: (output, capability) => native.sendPair(channel(output), pair(capability)),
+    /* Finite, own-channel negative fixture port; never a general FD sender. */
+    sendNegative: (output, capability, mode) => {
+      need(['MALFORMED_FRAME','EXTRA_RIGHTS','TRUNCATED_RIGHTS'].includes(mode));
+      return native.sendNegative(channel(output), pair(capability), mode);
+    },
+    negativeDetail: output => {
+      const detail = native.negativeDetail(channel(output));
+      need(['MALFORMED_FRAME','EXTRA_RIGHTS','CONTROL_TRUNCATED','UNKNOWN'].includes(detail));
+      return detail;
+    },
     receive: output => token(pairs, native.receivePair(channel(output))),
     sample: capability => native.sample(pair(capability)),
     closePair: capability => native.close(pair(capability)),

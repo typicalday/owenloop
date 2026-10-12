@@ -17,7 +17,7 @@
     "toolImageBytesEach": 536870912,
     "totalSelectedHashBytesIncludingChildBound": 1073741824
   },
-  "cleanup": "Explicitly close all acquired source/tool FDs and V3 rights/channel handles; error/uncertainty refuses. GC finalizers are best-effort fallback only. Fixed COMPLETE alone is settlement, not qualification.",
+  "cleanup": "Explicitly close all acquired source/tool FDs, sender aliases and eight-case pair/channel handles. Uncertainty refuses; GC fallback is never affirmative cleanup. COMPLETE alone is settlement, not qualification.",
   "compilerFlags": [
     "-std=c11",
     "-O2",
@@ -30,6 +30,27 @@
     "-I",
     "FRESH_SELECTED_HEADERS"
   ],
+  "componentFrameUpperBytes": 2048,
+  "componentIndependentReview": [
+    {
+      "bytes": 5457,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.md",
+      "sha256": "fed40e4fe54b8fc1729ce45a99ed516e030c43cf583060f30ccf4488b38f69c8"
+    },
+    {
+      "bytes": 20494,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.json",
+      "sha256": "6c7cfb0f9d56cdeff484595c441ec29a314238ed988bf1af209051d844e8c3dd"
+    }
+  ],
+  "componentSource": {
+    "bytes": 16302,
+    "mode": 384,
+    "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/manifest.json",
+    "sha256": "bc59a9c82a5d4ca83292cd0860724724fb4a3d044f3173d9e71c1df87122264c"
+  },
   "continuousThreadCoverage": false,
   "custody": "Each of six exact Popen originals is retained, public waitid WNOWAIT precedes any numeric group signal, terminal reap and both owned pipe EOF required. No signal after reap. Qualified Node children use exact genuine ChildProcess same-stack acquisition, not a supplied witness PID.",
   "darwinPolicyReplacement": false,
@@ -38,7 +59,7 @@
     "-B",
     "-I",
     "-S",
-    "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/launch.py",
+    "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/launch.py",
     "FRESH_ROOT_ADMISSION_PATH"
   ],
   "executionAdmitted": false,
@@ -59,13 +80,19 @@
     "inputs/target.mjs"
   ],
   "firstEntryTrustBoundary": "Isolated hosted platform and explicitly admitted launch/entry/loader paths remain trusted first execution inputs; pathname before/after hashes do not prove immutable first-entry execution. Dynamic runtime/compiler libraries and Python stdlib remain platform/distribution trust.",
+  "fixtureAcceptedFrameBytes": 1024,
   "fixtureCaseNames": [
     "DIRECT_OWNER_FRESH_ENDPOINT",
     "CLOSED_HANDLE_REFUSED",
     "UNOWNED_HANDLE_REFUSED",
-    "NESTED_GENUINE_OWNER_FRESH_ENDPOINT"
+    "NESTED_GENUINE_OWNER_FRESH_ENDPOINT",
+    "EXITED_AND_REAPED_HANDLE_REFUSED",
+    "MALFORMED_FRAME_REFUSED",
+    "EXTRA_RIGHTS_REFUSED",
+    "CONTROL_TRUNCATED_RIGHTS_REFUSED"
   ],
-  "fixtureProtocol": "jev-owned-spawn-pair-fixture-v1",
+  "fixtureProtocol": "jev-owned-spawn-pair-negative-fixture-v1",
+  "frameCapExplanation": "Unchanged stricter owner1024 canonical parser; all fixed eight-case frames fit, no output budget increase.",
   "futureBindings": [
     "Externally admitted actual source manifest SHA and source publication/entry map",
     "Actual head/base/runId/runAttempt/job and one selected original admission",
@@ -74,7 +101,7 @@
   ],
   "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
   "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
-  "loadedV3SourceRule": "Public synchronous registerHooks supplies already-read hash-verified bytes; main role query avoids bootstrap cache. Every genuine spawned process has its own declared new entry/loader. No Worker hook inheritance claim.",
+  "loadedV3SourceRule": "Public synchronous registerHooks supplies exact already-read eight-case input bytes. Existing query literal jevExactV3 is only a cache bypass key, not a V3 provenance claim. Every child has declared entry/loader; no Worker inheritance claim.",
   "nativeRecoveryAccepted": false,
   "newExecutionSources": [
     "launch.py",
@@ -98,14 +125,13 @@
   "passRequirements": [
     "Root separately admits exact source/context/tools and one owner original",
     "Owner natural code0 within total bound, six settled/reaped originals and both pipe EOF, no signal/truncation/interruption",
-    "Canonical V3 SUPPORTED with all four cases and cleanupKnown=true",
+    "Canonical eight-case SUPPORTED with exact ordered cases, TRUNCATED_RIGHTS success stage and cleanupKnown=true",
     "Same-job own-process metadata and public libc ABI fixed positive result",
     "Root independently checks final source/custody/selected dependencies/artifact/result"
   ],
   "privacy": "Fixed schemas/enums/counts/hashes only; no PID/UID values, raw exceptions, provider/auth/model data, raw streams or selected dependency paths in public result. No provider secrets; Actions platform credentials/trust are not claimed absent.",
   "privateOnlyFiles": [
-    "*-stdout.private",
-    "*-stderr.private",
+    "Exactly <slot>.stdout and <slot>.stderr",
     "dependency-closure.private.json",
     "all actual source/tool paths"
   ],
@@ -114,6 +140,16 @@
   "publicOutputFiles": [
     "result.json"
   ],
+  "resourceBound": {
+    "addonHashes": 2,
+    "fiveVerifiedSourceSetHashPasses": 8,
+    "fixtureProcessCount": 8,
+    "formula": "node.bytes + 8*sum(fixture,target,nested-owner,facade,metadata source bytes) + 2*artifact.bytes",
+    "genuineChildOriginals": 7,
+    "nodeImageHashes": 1,
+    "overflowRefuses": true,
+    "sharedTotalCapBytes": 1073741824
+  },
   "resultProtocol": "jev-owned-pair-qualification-result-v1",
   "retainedOriginalSlots": [
     "headers",
@@ -146,6 +182,81 @@
     "js_native_api_types.h"
   ],
   "sourceOnly": true,
+  "sourcePacketRevision": "EIGHT_CASE_V1",
+  "sourceReferences": [
+    {
+      "bytes": 16302,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/manifest.json",
+      "sha256": "bc59a9c82a5d4ca83292cd0860724724fb4a3d044f3173d9e71c1df87122264c"
+    },
+    {
+      "bytes": 12381,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/protocol.json",
+      "sha256": "4f2859db779c2b282c05690e86a9884aebb2bb3dce1acb988459534fdbdb1b5a"
+    },
+    {
+      "bytes": 12701,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v1-20261012/manifest.json",
+      "sha256": "fdd23a7c4948f002ba84cd76ed19f2d421153677b1528ba8a8c4625041ea58dd"
+    },
+    {
+      "bytes": 6579,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v1-independent-whole-source-review-20261012-transport.md",
+      "sha256": "ee1e166ddd862cb1a32e4bed49c40908d5bad47f2e69b7550649ca42c2f73c78"
+    },
+    {
+      "bytes": 25803,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v1-independent-whole-source-review-20261012-transport.json",
+      "sha256": "7a2c39dfd4c2da9e8cd30255dcd68a867a06f7bde60219bacf0886203d0b1c41"
+    },
+    {
+      "bytes": 15707,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/manifest.json",
+      "sha256": "47fbb10167c18620c3227abaf050518112a8fabf2ec76d6dbd74e3a037439e6b"
+    },
+    {
+      "bytes": 6357,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-publication-source-v2-20261012/manifest.json",
+      "sha256": "7b7004c80ac82f16d8213b4e330e0b01b31a0f04c5ecaac267a7f272cc1a79a1"
+    },
+    {
+      "bytes": 8109,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-publication-source-v2-20261012/protocol.json",
+      "sha256": "b896dbb6683d1236032e7ed3b212d92f0979ef63d25b0f2e3080fd88035530d9"
+    },
+    {
+      "bytes": 2997,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-descriptor-head75c-attempt2-root-bounded-actual-acceptance-20261012.json",
+      "sha256": "3b07b2d2e4006223ca69576870f6d3643370b8eee5cf9d16780d545b94a3882e"
+    },
+    {
+      "bytes": 3802,
+      "mode": 384,
+      "path": "/Volumes/more/jev-head75c-service67-linux-input-source-prep-20261012/manifest.json",
+      "sha256": "8015318b4671f0436b04a288b1c406001dcd365295d214158f01e0b486ac845b"
+    },
+    {
+      "bytes": 5457,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.md",
+      "sha256": "fed40e4fe54b8fc1729ce45a99ed516e030c43cf583060f30ccf4488b38f69c8"
+    },
+    {
+      "bytes": 20494,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.json",
+      "sha256": "6c7cfb0f9d56cdeff484595c441ec29a314238ed988bf1af209051d844e8c3dd"
+    }
+  ],
   "sourceReviewThenSeparateExecutionRequired": true,
   "stagePlan": [
     {
@@ -173,13 +284,13 @@
       "streamCapBytes": 65536
     },
     {
-      "operation": "Compile exact V3 descriptor.c with the same selected header/compiler inputs",
+      "operation": "Compile exact corrected negative-controls V2 descriptor.c with same selected header/compiler inputs",
       "seconds": 25,
       "slot": "addon-build",
       "streamCapBytes": 65536
     },
     {
-      "operation": "One genuine direct and nested Node owner fixture, four ordered cases; original readiness/SCM/procFD contract unchanged",
+      "operation": "One eight-case genuine direct/nested owner fixture; exited-and-reaped and malformed/extra/control-truncated rights refusal; seven child originals plus fixture process",
       "seconds": 40,
       "slot": "fixture",
       "streamCapBytes": 65536

@@ -50,6 +50,42 @@ try {
   stage = 'NESTED_SETTLEMENT';
   const nestedEnd = await endOriginal(supervisor.original);
   need(nestedEnd.code === 0 && nestedEnd.signal === 'NONE' && nestedEnd.streamPolicyValid);
+  stage = 'EXITED_REAPED_CHANNEL';
+  const exitedChannel = owner.openChannel(); channels.push(exitedChannel);
+  const exited = owner.spawnTarget(); originals.push(exited.original);
+  if (exited.capability) capabilities.push(exited.capability);
+  needBound(exited);
+  owner.send(exitedChannel, exited.capability);
+  const exitedPair = owner.receive(exitedChannel); capabilities.push(exitedPair);
+  await ready(exited.original, 'READY\n');
+  stage = 'EXITED_REAPED_SETTLEMENT';
+  const exitedEnd = await endOriginal(exited.original);
+  need(exitedEnd.code === 0 && exitedEnd.signal === 'NONE' && exitedEnd.bothPipesEOF && exitedEnd.streamPolicyValid);
+  stage = 'EXITED_REAPED_HANDLE';
+  refused = false;
+  try { owner.sample(exitedPair); } catch (error) { refused = fixedCode(error) === 'IDENTITY'; }
+  need(refused); cases.push('EXITED_AND_REAPED_HANDLE_REFUSED');
+  for (const [mode, detail, caseName] of [
+    ['MALFORMED_FRAME','MALFORMED_FRAME','MALFORMED_FRAME_REFUSED'],
+    ['EXTRA_RIGHTS','EXTRA_RIGHTS','EXTRA_RIGHTS_REFUSED'],
+    ['TRUNCATED_RIGHTS','CONTROL_TRUNCATED','CONTROL_TRUNCATED_RIGHTS_REFUSED'],
+  ]) {
+    stage = mode;
+    const output = owner.openChannel(); channels.push(output);
+    const bound = owner.spawnTarget(); originals.push(bound.original);
+    if (bound.capability) capabilities.push(bound.capability);
+    needBound(bound);
+    await ready(bound.original, 'READY\n');
+    owner.sendNegative(output, bound.capability, mode);
+    refused = false;
+    try {
+      const unexpected = owner.receive(output); capabilities.push(unexpected);
+    } catch (error) { refused = fixedCode(error) === 'CHANNEL'; }
+    need(refused && owner.negativeDetail(output) === detail);
+    const ended = await endOriginal(bound.original);
+    need(ended.code === 0 && ended.signal === 'NONE' && ended.bothPipesEOF && ended.streamPolicyValid);
+    cases.push(caseName);
+  }
 } catch (error) {
   status = 'UNSUPPORTED'; code = fixedCode(error); if (code === 'CLEANUP') cleanup = false; process.exitCode = 2;
 } finally {
@@ -58,5 +94,5 @@ try {
   for (const output of channels) { try { owner.closeChannel(output); } catch { cleanup = false; } }
 }
 if (!cleanup) { status = 'UNSUPPORTED'; stage = 'CLEANUP'; code = 'CLEANUP'; process.exitCode = 2; }
-const result = { protocol: 'jev-owned-spawn-pair-fixture-v1', status, stage, code, cases, cleanupKnown: cleanup, sequentialEndpointOnly: true, nativeRecoveryAccepted: false };
+const result = { protocol: 'jev-owned-spawn-pair-negative-fixture-v1', status, stage, code, cases, cleanupKnown: cleanup, sequentialEndpointOnly: true, nativeRecoveryAccepted: false };
 process.stdout.write(JSON.stringify(result) + '\n');

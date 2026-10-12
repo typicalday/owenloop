@@ -15,7 +15,7 @@ CLEANUP_SECONDS=10
 SOURCE_LIMIT=65536
 HASH_TOTAL=1024*1024*1024
 SLOTS=['headers','dependencies','libc-build','libc-abi','addon-build','fixture']
-CASE_NAMES=['DIRECT_OWNER_FRESH_ENDPOINT','CLOSED_HANDLE_REFUSED','UNOWNED_HANDLE_REFUSED','NESTED_GENUINE_OWNER_FRESH_ENDPOINT']
+CASE_NAMES=['DIRECT_OWNER_FRESH_ENDPOINT','CLOSED_HANDLE_REFUSED','UNOWNED_HANDLE_REFUSED','NESTED_GENUINE_OWNER_FRESH_ENDPOINT','EXITED_AND_REAPED_HANDLE_REFUSED','MALFORMED_FRAME_REFUSED','EXTRA_RIGHTS_REFUSED','CONTROL_TRUNCATED_RIGHTS_REFUSED']
 STAGES=['ADMISSION','SOURCE_BINDING','TOOL_BINDING','HEADER_DISCOVERY','DEPENDENCY_DISCOVERY','DEPENDENCY_BINDING','LIBC_BUILD','LIBC_ABI','ADDON_BUILD','ARTIFACT_BINDING','ENTRY_BINDING','FIXTURE','RESULT_VALIDATION','SOURCE_RECHECK','RESULT_RETENTION','CLEANUP','UNKNOWN']
 
 def need(v):
@@ -60,11 +60,11 @@ def save(path,value):
 def canonical_fixture(raw,code,err):
     need(code in [0,2] and err==b'');x=json_value(raw,1024,True)
     keys(x,['protocol','status','stage','code','cases','cleanupKnown','sequentialEndpointOnly','nativeRecoveryAccepted'])
-    need(x['protocol']=='jev-owned-spawn-pair-fixture-v1' and x['sequentialEndpointOnly'] is True and x['nativeRecoveryAccepted'] is False)
+    need(x['protocol']=='jev-owned-spawn-pair-negative-fixture-v1' and x['sequentialEndpointOnly'] is True and x['nativeRecoveryAccepted'] is False)
     need(type(x['cleanupKnown']) is bool and type(x['cases']) is list and x['cases']==CASE_NAMES[:len(x['cases'])])
-    need(type(x['stage']) is str and x['stage'] in ['LOAD','DIRECT_CHANNEL','DIRECT_SPAWN_BIND','DIRECT_SEND_RECEIVE','DIRECT_READY','DIRECT_ENDPOINT','CLOSED_HANDLE','UNOWNED_HANDLE','DIRECT_SETTLEMENT','NESTED_CHANNEL','NESTED_OWNER_BIND','NESTED_READY','NESTED_RECEIVE','NESTED_ENDPOINT','NESTED_SETTLEMENT','CLEANUP'])
+    need(type(x['stage']) is str and x['stage'] in ['LOAD','DIRECT_CHANNEL','DIRECT_SPAWN_BIND','DIRECT_SEND_RECEIVE','DIRECT_READY','DIRECT_ENDPOINT','CLOSED_HANDLE','UNOWNED_HANDLE','DIRECT_SETTLEMENT','NESTED_CHANNEL','NESTED_OWNER_BIND','NESTED_READY','NESTED_RECEIVE','NESTED_ENDPOINT','NESTED_SETTLEMENT','EXITED_REAPED_CHANNEL','EXITED_REAPED_SETTLEMENT','EXITED_REAPED_HANDLE','MALFORMED_FRAME','EXTRA_RIGHTS','TRUNCATED_RIGHTS','CLEANUP'])
     enums=['ARGUMENT','OWNERSHIP','UNSUPPORTED','ALLOCATION','FILESYSTEM','IDENTITY','CLEANUP','NAPI','CLOSED','CHANNEL','PAIR','ACCESS','SHAPE','CAP','COUNT','STATE','SET_CHANGED','UID','DUPLICATE','DEADLINE','UNKNOWN','FIXTURE']
-    if code==0:need(x['status']=='SUPPORTED' and x['stage']=='NESTED_SETTLEMENT' and x['code']=='NOT_APPLICABLE' and x['cases']==CASE_NAMES and x['cleanupKnown'] is True)
+    if code==0:need(x['status']=='SUPPORTED' and x['stage']=='TRUNCATED_RIGHTS' and x['code']=='NOT_APPLICABLE' and x['cases']==CASE_NAMES and x['cleanupKnown'] is True)
     else:need(x['status']=='UNSUPPORTED' and x['code'] in enums)
     return x
 
@@ -216,8 +216,8 @@ def main(admission_path):
             raw=blobs['inputs/'+n] if n=='facade.mjs' else blobs['dependencies/metadata.mjs'];write(entry/n,raw)
         for n in ['fixture.mjs','target.mjs','nested-owner.mjs','facade.mjs']:write(verified/n,blobs['inputs/'+n])
         write(verified/'metadata.mjs',blobs['dependencies/metadata.mjs'])
-        # Fixed four-process source map: fixture, direct target, nested owner, nested target.
-        child_hash_bound=tools['node']['bytes']+4*sum(source_pins[k]['bytes'] for k in ['inputs/fixture.mjs','inputs/target.mjs','inputs/nested-owner.mjs','inputs/facade.mjs','dependencies/metadata.mjs'])+2*artifact_pin['bytes']
+        # Fixed eight-process source map: fixture, five direct targets, nested owner, nested target.
+        child_hash_bound=tools['node']['bytes']+8*sum(source_pins[k]['bytes'] for k in ['inputs/fixture.mjs','inputs/target.mjs','inputs/nested-owner.mjs','inputs/facade.mjs','dependencies/metadata.mjs'])+2*artifact_pin['bytes']
         need(budget[0]+child_hash_bound<=HASH_TOTAL)
         stage='FIXTURE';fixture_env={**env,'JEV_DESCRIPTOR_ARTIFACT':str(artifact),'JEV_DESCRIPTOR_SHA':artifact_pin['sha256'],'JEV_NODE_IMAGE_SHA':tools['node']['sha256'],'JEV_OWN_METADATA_PATH':str(out/'own-metadata.json')}
         raw,err,code=original('fixture',[str(node_copy),str(entry/'fixture.mjs')],40,cap=CAP,child_env=fixture_env,execfd=next(fd for fd,p,_ in held if p==node_copy))
