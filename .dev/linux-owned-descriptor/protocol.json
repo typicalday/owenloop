@@ -1,0 +1,190 @@
+{
+  "admissionProtocol": "jev-owned-pair-qualification-admission-v1",
+  "allCasesUnrun": true,
+  "caps": {
+    "archiveDeclaredTotalBytes": 134217728,
+    "archiveEntries": 8192,
+    "archiveEntryBytes": 16777216,
+    "cleanupSeconds": 10,
+    "compiledImageBytes": 8388608,
+    "dependencyStreamBytes": 131072,
+    "fixtureFrameBytes": 1024,
+    "fixtureSeconds": 40,
+    "headerArchiveBytes": 16777216,
+    "selectedDependencies": 512,
+    "sharedOwnerSeconds": 150,
+    "sourceAdmissionManifestResultBytes": 65536,
+    "toolImageBytesEach": 536870912,
+    "totalSelectedHashBytesIncludingChildBound": 1073741824
+  },
+  "cleanup": "Explicitly close all acquired source/tool FDs and V3 rights/channel handles; error/uncertainty refuses. GC finalizers are best-effort fallback only. Fixed COMPLETE alone is settlement, not qualification.",
+  "compilerFlags": [
+    "-std=c11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fPIC",
+    "-DNAPI_VERSION=8",
+    "-DNODE_GYP_MODULE_NAME=jev_owned_pair",
+    "-I",
+    "FRESH_SELECTED_HEADERS"
+  ],
+  "continuousThreadCoverage": false,
+  "custody": "Each of six exact Popen originals is retained, public waitid WNOWAIT precedes any numeric group signal, terminal reap and both owned pipe EOF required. No signal after reap. Qualified Node children use exact genuine ChildProcess same-stack acquisition, not a supplied witness PID.",
+  "darwinPolicyReplacement": false,
+  "entryCommand": [
+    "QUALIFIED_PYTHON",
+    "-B",
+    "-I",
+    "-S",
+    "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/launch.py",
+    "FRESH_ROOT_ADMISSION_PATH"
+  ],
+  "executionAdmitted": false,
+  "executionFiles": [
+    "owner.py",
+    "launch.py",
+    "headers.py",
+    "loader.mjs",
+    "entry.mjs",
+    "libc-contract.c",
+    "protocol.json",
+    "dependencies/owner.py",
+    "dependencies/metadata.mjs",
+    "inputs/descriptor.c",
+    "inputs/facade.mjs",
+    "inputs/fixture.mjs",
+    "inputs/nested-owner.mjs",
+    "inputs/target.mjs"
+  ],
+  "firstEntryTrustBoundary": "Isolated hosted platform and explicitly admitted launch/entry/loader paths remain trusted first execution inputs; pathname before/after hashes do not prove immutable first-entry execution. Dynamic runtime/compiler libraries and Python stdlib remain platform/distribution trust.",
+  "fixtureCaseNames": [
+    "DIRECT_OWNER_FRESH_ENDPOINT",
+    "CLOSED_HANDLE_REFUSED",
+    "UNOWNED_HANDLE_REFUSED",
+    "NESTED_GENUINE_OWNER_FRESH_ENDPOINT"
+  ],
+  "fixtureProtocol": "jev-owned-spawn-pair-fixture-v1",
+  "futureBindings": [
+    "Externally admitted actual source manifest SHA and source publication/entry map",
+    "Actual head/base/runId/runAttempt/job and one selected original admission",
+    "Actual qualified Python/Node/compiler paths; observed image pins and fresh public headers/dependencies",
+    "Exclusive output parent/name and exact public artifact transport/audit; no workflow provided or modified"
+  ],
+  "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
+  "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
+  "loadedV3SourceRule": "Public synchronous registerHooks supplies already-read hash-verified bytes; main role query avoids bootstrap cache. Every genuine spawned process has its own declared new entry/loader. No Worker hook inheritance claim.",
+  "nativeRecoveryAccepted": false,
+  "newExecutionSources": [
+    "launch.py",
+    "owner.py",
+    "headers.py",
+    "libc-contract.c",
+    "entry.mjs",
+    "loader.mjs"
+  ],
+  "nodeRequirement": {
+    "architectures": [
+      "X86_64",
+      "ARM64"
+    ],
+    "distributionProvenance": "OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION",
+    "napi": 10,
+    "platform": "LINUX",
+    "version": "22.23.0"
+  },
+  "oldActualOrProviderAccess": false,
+  "passRequirements": [
+    "Root separately admits exact source/context/tools and one owner original",
+    "Owner natural code0 within total bound, six settled/reaped originals and both pipe EOF, no signal/truncation/interruption",
+    "Canonical V3 SUPPORTED with all four cases and cleanupKnown=true",
+    "Same-job own-process metadata and public libc ABI fixed positive result",
+    "Root independently checks final source/custody/selected dependencies/artifact/result"
+  ],
+  "privacy": "Fixed schemas/enums/counts/hashes only; no PID/UID values, raw exceptions, provider/auth/model data, raw streams or selected dependency paths in public result. No provider secrets; Actions platform credentials/trust are not claimed absent.",
+  "privateOnlyFiles": [
+    "*-stdout.private",
+    "*-stderr.private",
+    "dependency-closure.private.json",
+    "all actual source/tool paths"
+  ],
+  "protocol": "jev-owned-pair-qualification-source-v1",
+  "providerAccessQualified": false,
+  "publicOutputFiles": [
+    "result.json"
+  ],
+  "resultProtocol": "jev-owned-pair-qualification-result-v1",
+  "retainedOriginalSlots": [
+    "headers",
+    "dependencies",
+    "libc-build",
+    "libc-abi",
+    "addon-build",
+    "fixture"
+  ],
+  "retryPermitted": false,
+  "runtimeAccepted": false,
+  "runtimeEntryMap": {
+    "entry/facade.mjs": "inputs/facade.mjs",
+    "entry/fixture.mjs": "entry.mjs",
+    "entry/loader.mjs": "loader.mjs",
+    "entry/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/nested-owner.mjs": "entry.mjs",
+    "entry/target.mjs": "entry.mjs",
+    "entry/verified/facade.mjs": "inputs/facade.mjs",
+    "entry/verified/fixture.mjs": "inputs/fixture.mjs",
+    "entry/verified/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/verified/nested-owner.mjs": "inputs/nested-owner.mjs",
+    "entry/verified/target.mjs": "inputs/target.mjs"
+  },
+  "scope": "HARMLESS_OWNED_PAIR_ONLY",
+  "selectedHeaders": [
+    "node_api.h",
+    "node_api_types.h",
+    "js_native_api.h",
+    "js_native_api_types.h"
+  ],
+  "sourceOnly": true,
+  "sourceReviewThenSeparateExecutionRequired": true,
+  "stagePlan": [
+    {
+      "operation": "Exact hash-bound Node22.23.0 public header archive fetch; four selected files only; no redirect/extractall",
+      "seconds": 25,
+      "slot": "headers",
+      "streamCapBytes": 65536
+    },
+    {
+      "operation": "Same verified compiler image -M for both retained descriptor and libc source FDs; selected source/header closure recorded privately",
+      "seconds": 15,
+      "slot": "dependencies",
+      "streamCapBytes": 131072
+    },
+    {
+      "operation": "Compile/link public glibc >=2.36 pidfd_open reference; no target call",
+      "seconds": 20,
+      "slot": "libc-build",
+      "streamCapBytes": 65536
+    },
+    {
+      "operation": "Execute held compiled image FD; fixed ABI/version output; no target acquisition",
+      "seconds": 5,
+      "slot": "libc-abi",
+      "streamCapBytes": 65536
+    },
+    {
+      "operation": "Compile exact V3 descriptor.c with the same selected header/compiler inputs",
+      "seconds": 25,
+      "slot": "addon-build",
+      "streamCapBytes": 65536
+    },
+    {
+      "operation": "One genuine direct and nested Node owner fixture, four ordered cases; original readiness/SCM/procFD contract unchanged",
+      "seconds": 40,
+      "slot": "fixture",
+      "streamCapBytes": 65536
+    }
+  ],
+  "unknownHold": "UNKNOWN_HOLD is nonterminal and nonpassing. Retain original Popen/custody/channels; no next stage, reconstructed PID authority, timeout restart, external kill, or global escape/descendant absence claim. Separate root handling is required.",
+  "unsupportedIsTerminal": true
+}

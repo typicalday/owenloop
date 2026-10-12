@@ -1,0 +1,20 @@
+{
+  "context": {
+    "base": "b4ead192326ba607558cd3bb7687209cbb7c8165",
+    "head": null,
+    "job": "linux-owned-descriptor-qualification",
+    "repository": "typicalday/owenloop",
+    "runAttempt": null,
+    "runId": null
+  },
+  "executionAdmitted": false,
+  "outputName": null,
+  "outputParent": null,
+  "protocol": "jev-owned-pair-qualification-admission-v1",
+  "scope": "HARMLESS_OWNED_PAIR_ONLY",
+  "sourceManifestSha256": null,
+  "tools": {
+    "cc": null,
+    "node": null
+  }
+}
