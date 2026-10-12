@@ -110,7 +110,7 @@ test('leader exit does not bypass same-group descendant teardown', async () => {
     assert.ok(before > 0);
     const result = await client.settleEffects({ reason: 'normal-exit', deadlineAt: performance.now() + 5_000 });
     assert.equal(result.scope, 'original-posix-group');
-    assert.equal(result.state, 'empty');
+    assert.equal(result.state, 'empty', result.evidence.reason);
     const atSettlement = readFileSync(marker).length;
     await pause(150);
     assert.equal(readFileSync(marker).length, atSettlement);

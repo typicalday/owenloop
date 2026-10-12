@@ -656,10 +656,24 @@ export function startManagedStdioRpc(opts: StdioRpcOptions & {
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([exited, new Promise<void>(resolve => { timer = setTimeout(resolve, remaining); })]);
       if (timer !== undefined) clearTimeout(timer);
-      return supervisorExited ? groupResult() : {
+      if (!supervisorExited) return {
 	scope: 'original-posix-group', state: 'uncertain',
 	evidence: { pgid: pgid ?? null, observedAt: performance.now(), reason: 'settlement-timeout' },
       };
+      // Leader exit is not a barrier for every other member's termination.
+      // Observe only; the retained supervisor already sent the final signal.
+      for (;;) {
+	const remaining = deadlineAt - performance.now();
+	if (remaining <= 0) return {
+	  scope: 'original-posix-group', state: 'uncertain',
+	  evidence: { pgid: pgid ?? null, observedAt: performance.now(), reason: 'deadline-expired' },
+	};
+	const result = groupResult();
+	if (result.state === 'empty' || result.evidence.reason !== 'group-still-present-or-reused')
+	  return result;
+	// The next iteration checks the same absolute deadline before probing.
+	await new Promise<void>(resolve => setTimeout(resolve, Math.min(20, remaining)));
+      }
     },
     async dispose(): Promise<void> {
       await this.settleEffects({ reason: 'stop', deadlineAt: performance.now() + 5_000 });
