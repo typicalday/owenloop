@@ -1,0 +1,164 @@
+{
+  "protocol": "jev-current-production-owner-qualification-source-v1",
+  "sourceOnly": true,
+  "executionAdmitted": false,
+  "publicationAdmitted": false,
+  "runtimeAccepted": false,
+  "normalRecoveryAccepted": false,
+  "canonicalRelease": false,
+  "rootRelease": false,
+  "engineBaselineHead": "8892b0aa4e3d00b750b330bc4e534553cba59d4d",
+  "engineBaselineTree": "8d996573b5f646db6c038950943054a8521631ac",
+  "serviceHead": "67ec99101ea18dc27b14ddf8a209df317f5bbdf5",
+  "serviceVendoredEngine": "a76c75a7b0d21625980afc67d5943564be854819",
+  "scope": "HARMLESS_CURRENT_PRODUCTION_OWNER_ONLY",
+  "job": "linux-production-owner-qualification",
+  "gate": "OWENLOOP_JEV_PRODUCTION_OWNER_HEAD",
+  "oldGatesMustBeAbsent": [
+    "OWENLOOP_JEV_PREFLIGHT_HEAD",
+    "OWENLOOP_JEV_OBSERVER_HEAD",
+    "OWENLOOP_JEV_DESCRIPTOR_HEAD",
+    "OWENLOOP_JEV_ONE_RELAY_HEAD",
+    "OWENLOOP_JEV_ONE_RELAY_Q2_HEAD"
+  ],
+  "futureHead": "Actual successor commit/tree/run/attempt/job externally observed and separately root admitted, never relabel baseline8892 as successor. Eight ordinary jobs green required before one selected-job action; unknown POST has no repost/retry. Remove only the owned matching gate after terminal reconciliation.",
+  "executionFiles": [
+    "owner.py",
+    "launch.py",
+    "headers.py",
+    "libc-contract.c",
+    "loader.mjs",
+    "fixture.mjs",
+    "role.mjs",
+    "private-entry.mjs",
+    "provider.mjs",
+    "source-inventory.json",
+    "source-composition.json",
+    "protocol.json",
+    "dependencies/owner.py",
+    "dependencies/metadata.mjs",
+    "inputs/relay.c",
+    "inputs/direct/descriptor.c",
+    "overlay/packages/work/src/harness/routed-owner-observer.ts"
+  ],
+  "caseNames": [
+    "CURRENT_PRODUCTION_MANAGED_OWNER_SEAM",
+    "PRIVATE_AGENT_ENTRY_PARSE_REFUSAL_CLEANUP"
+  ],
+  "fixtureProtocol": "jev-current-production-owner-fixture-v1",
+  "fixtureSeconds": 40,
+  "cleanupSeconds": 10,
+  "ownerSeconds": 360,
+  "bootstrapSeconds": 450,
+  "jobMinutes": 10,
+  "resultCapBytes": 65536,
+  "eventInputCapBytes": 1048576,
+  "sourceInputCapBytes": 1048576,
+  "moduleLoadCapBytes": 16777216,
+  "loadedModuleCapPerInitializerBytes": 33554432,
+  "addonCapBytes": 8388608,
+  "toolCapBytes": 536870912,
+  "innerSelectedHashCapBytes": 1073741824,
+  "outerSelectedHashCapBytes": 33554432,
+  "innerMemoryBudgetBytes": 1073741824,
+  "outerMemoryBudgetBytes": 33554432,
+  "memoryEnforcementClaimed": false,
+  "memoryLimits": "Single nonconcurrent TypeScript source-build original uses Node old-space512MiB; install uses256MiB; fixture/role/supervisor/provider use192MiB each, at most four concurrent Node processes. These heap allowances are planning limits within the inner1GiB budget, not hard RSS enforcement; native/RSS overhead and npm subordinate-process peaks require actual root audit. No future success is implied.",
+  "nodeVersion": "22.23.0",
+  "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
+  "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
+  "selectedCompilerScope": "Fresh -M source/header selection plus observed cc executable; not compiler frontend/as/ld/specs/startup/runtime distribution closure. npm and TypeScript run only after fresh lock-bound install and measured selected dependencies; npm/runtime/compiler distributions remain trusted, unverified.",
+  "retainedSlots": [
+    "node-dependencies",
+    "typescript",
+    "headers",
+    "dependencies",
+    "libc-build",
+    "libc-abi",
+    "addon-build",
+    "fixture"
+  ],
+  "externalOriginals": 12,
+  "bootstrapOriginals": 4,
+  "innerOriginals": 8,
+  "genuineNestedNodeOriginals": 4,
+  "nodeInitializerEntriesAcrossFixtureCycles": 5,
+  "maximumConcurrentNodeProcesses": 4,
+  "publicTransport": [
+    "result.json"
+  ],
+  "privateStreams": "Exact <slot>.stdout / <slot>.stderr; npm/cache/source tree/dependency paths and all raw role stderr are private and never uploaded.",
+  "stagePlan": [
+    {
+      "slot": "node-dependencies",
+      "seconds": 90,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "typescript",
+      "seconds": 60,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "headers",
+      "seconds": 25,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "dependencies",
+      "seconds": 15,
+      "streamCapBytes": 131072
+    },
+    {
+      "slot": "libc-build",
+      "seconds": 20,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "libc-abi",
+      "seconds": 5,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "addon-build",
+      "seconds": 25,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "fixture",
+      "seconds": 40,
+      "streamCapBytes": 65536
+    }
+  ],
+  "firstEntry": "Workflow/bootstrap/launch/Node loader entry and setup-selected npm/runtime are declared platform-trusted first entries. Runtime imports after public registerHooks registration execute same already-read SHA-verified module bytes, canonical URLs with no aliases/query/fragments. No claim initial entry bytes proven by before/after path hash alone.",
+  "moduleIdentity": "Current dist/packages/work/src/harness/routed-owner-observer.js is the one shared canonical branded instance in each process. The actual private agent-run and runner imports resolve the same URL; loader rejects external/unmapped imports.",
+  "notification": "Fresh exclusive owner-created directory, fixed adjacent binding, producer role writes O_EXCL0600 canonical ready.json after ordinary managed ready and fixed RPC issuance. uid/nlink/stable FD/path/size/canonical keys checked; notification is separate nonnative evidence, never consent/authority. One bounded wait, one native sample, no retry/restart/deadline extension. No parent acknowledgment or lifetime hold.",
+  "terminal": "Positive role natural0; actual early parser role natural2. Role stdio intentionally ignored, not invented EOF. Managed settlement must be original-posix-group/empty/normal-exit:group-absent; nested individual supervisor/provider reap and pipe EOF remain UNPROVED. Supervisor existing group signals stay intact. Full native terminal closure remains unqualified.",
+  "cleanup": "Role token-only status overlay makes latched cleanup refusal observable even without child. Every constructor CLEANUP and checked close failure dominates cleanupKnown/exit. Original child remains in production custody on observer refusal. External fixture cleanup sends SIGTERM only through retained original custody; fixture cancellation uses issued SpawnResult, never numeric witness. No force-kill of owner retaining detached originals; UNKNOWN_HOLD is nonterminal, no next stage/restart.",
+  "remainingInputs": [
+    "Actual fresh successor head/tree/run/attempt/job and whole workflow/source audit",
+    "Fresh Linux tool/runtime/lock dependency/emitted/header/artifact closure",
+    "Separate genuine authorized Linux provider/account and complete Shift/Service NORMAL consent/native/ingress/effect/DSSE/fourguard/terminal closure"
+  ],
+  "providerAccessQualified": false,
+  "all23ExitsPreserved": true,
+  "healthyBigserver": "STOP",
+  "compilerHookInitializerEntries": 1,
+  "hashAccounting": "Owner reads reserve one measured Node image plus six32MiB module initializer ceilings (five fixture entries, one compiler hook) plus three8MiB addon ceilings before dependency/compiler/fixture actions; final addon bound uses actual measured bytes. Same generated binding/declaration/runtime-closure pins are retained before fixture and checked after; emitted/nondependency module bytes are rehashed, installed dependency metadata rechecked, runtime imports hash/execute same read bytes.",
+  "runtimeResultShape": {
+    "fixtureKeys": 14,
+    "sampleKeys": 7,
+    "notificationKeys": 4,
+    "positiveKeys": 11,
+    "parseKeys": 7,
+    "nestedIndividualEOF": "UNPROVED",
+    "roleStdio": "IGNORED"
+  },
+  "buildInvocation": "Actual owned Node22.23 executable + fixed compiler-entry.mjs registerHooks + fresh lock-selected node_modules/typescript/bin/tsc -p tsconfig.build.json; no Mac emitted outputs/native artifacts are used.",
+  "childEnvironment": "Fixed narrow PATH/LANG/LC_ALL/TZ/Node heap and fresh private HOME; npm receives distinct exclusive empty user/global config files plus private cache and ignore-scripts/no-audit/no-fund. No provider/service/user config or credential environment is inherited. Actions platform credentials/trust remain separate.",
+  "sourcePacketRevision": "V2",
+  "correctionScope": [
+    "PO1: passive UNKNOWN_HOLD stderr write/error containment leaves original retention independent of notification",
+    "PO2: transferred raw FD4 with no returned observer token reports cleanupKnown=false/CLEANUP without raw close retry"
+  ]
+}

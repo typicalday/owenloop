@@ -1,0 +1,187 @@
+{
+  "protocol": "jev-production-owner-execution-manifest-v1",
+  "sourceOnly": true,
+  "files": [
+    {
+      "relative": "owner.py",
+      "sha256": "ff723b2e5892354913b35bf112eeaf0fbc0649f7942dfea571d089685a3e293e",
+      "bytes": 32370
+    },
+    {
+      "relative": "launch.py",
+      "sha256": "60c554c77e993e70dbac442b8b4ae98f07f4712921296663e80b20744ec8159f",
+      "bytes": 1646
+    },
+    {
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e",
+      "bytes": 2383
+    },
+    {
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5",
+      "bytes": 853
+    },
+    {
+      "relative": "loader.mjs",
+      "sha256": "28d3bf07d96a8b1a59131d419908c0bd4324560459d2aa1015994c5b05c8f666",
+      "bytes": 5829
+    },
+    {
+      "relative": "fixture.mjs",
+      "sha256": "a1eaa01457fb4a37d4faa3ab0e0cc1a5c4c3fd8f7db89cdc0516bef8da10d0dc",
+      "bytes": 7180
+    },
+    {
+      "relative": "role.mjs",
+      "sha256": "a3d07cf23c8d1ba5e2f95dab21cacbcd35c289bc12909b19d1f5246ac61ec2bd",
+      "bytes": 6989
+    },
+    {
+      "relative": "private-entry.mjs",
+      "sha256": "af7238cfccdf249263a417a99f5d97e244f0760445c70e26895c5e76237fe284",
+      "bytes": 9221
+    },
+    {
+      "relative": "provider.mjs",
+      "sha256": "be176b433acb999587289dbecdc91fc9d7cd0d59a7154baeb728fe29e43b8310",
+      "bytes": 987
+    },
+    {
+      "relative": "source-inventory.json",
+      "sha256": "b1a4ca6fbbc999038cc2c02d848d35d56a8b9ff6216c1924f91462e49bee64f7",
+      "bytes": 35522
+    },
+    {
+      "relative": "source-composition.json",
+      "sha256": "b1a4c43f958917eefa203f7b9d836e8d643a4dd6299eaecbd9f99f59abd07008",
+      "bytes": 877
+    },
+    {
+      "relative": "protocol.json",
+      "sha256": "eea7a7aae2d029455cba22c8243622b2c0820afe31d70266818d39f2e51c0b76",
+      "bytes": 8713
+    },
+    {
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+      "bytes": 19973
+    },
+    {
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+      "bytes": 9232
+    },
+    {
+      "relative": "inputs/relay.c",
+      "sha256": "0ab068dbbd8e2b5b4cdb6a951b4619e8999658c8c818af50b0030cf976ce0576",
+      "bytes": 24083
+    },
+    {
+      "relative": "inputs/direct/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d",
+      "bytes": 33334
+    },
+    {
+      "relative": "overlay/packages/work/src/harness/routed-owner-observer.ts",
+      "sha256": "d80fa25cbac4081009fc8e57008d95635249c9d04129b4efd33641daf3c4869d",
+      "bytes": 15642
+    }
+  ],
+  "executionFiles": [
+    {
+      "relative": "owner.py",
+      "sha256": "ff723b2e5892354913b35bf112eeaf0fbc0649f7942dfea571d089685a3e293e",
+      "bytes": 32370
+    },
+    {
+      "relative": "launch.py",
+      "sha256": "60c554c77e993e70dbac442b8b4ae98f07f4712921296663e80b20744ec8159f",
+      "bytes": 1646
+    },
+    {
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e",
+      "bytes": 2383
+    },
+    {
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5",
+      "bytes": 853
+    },
+    {
+      "relative": "loader.mjs",
+      "sha256": "28d3bf07d96a8b1a59131d419908c0bd4324560459d2aa1015994c5b05c8f666",
+      "bytes": 5829
+    },
+    {
+      "relative": "fixture.mjs",
+      "sha256": "a1eaa01457fb4a37d4faa3ab0e0cc1a5c4c3fd8f7db89cdc0516bef8da10d0dc",
+      "bytes": 7180
+    },
+    {
+      "relative": "role.mjs",
+      "sha256": "a3d07cf23c8d1ba5e2f95dab21cacbcd35c289bc12909b19d1f5246ac61ec2bd",
+      "bytes": 6989
+    },
+    {
+      "relative": "private-entry.mjs",
+      "sha256": "af7238cfccdf249263a417a99f5d97e244f0760445c70e26895c5e76237fe284",
+      "bytes": 9221
+    },
+    {
+      "relative": "provider.mjs",
+      "sha256": "be176b433acb999587289dbecdc91fc9d7cd0d59a7154baeb728fe29e43b8310",
+      "bytes": 987
+    },
+    {
+      "relative": "source-inventory.json",
+      "sha256": "b1a4ca6fbbc999038cc2c02d848d35d56a8b9ff6216c1924f91462e49bee64f7",
+      "bytes": 35522
+    },
+    {
+      "relative": "source-composition.json",
+      "sha256": "b1a4c43f958917eefa203f7b9d836e8d643a4dd6299eaecbd9f99f59abd07008",
+      "bytes": 877
+    },
+    {
+      "relative": "protocol.json",
+      "sha256": "eea7a7aae2d029455cba22c8243622b2c0820afe31d70266818d39f2e51c0b76",
+      "bytes": 8713
+    },
+    {
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+      "bytes": 19973
+    },
+    {
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+      "bytes": 9232
+    },
+    {
+      "relative": "inputs/relay.c",
+      "sha256": "0ab068dbbd8e2b5b4cdb6a951b4619e8999658c8c818af50b0030cf976ce0576",
+      "bytes": 24083
+    },
+    {
+      "relative": "inputs/direct/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d",
+      "bytes": 33334
+    },
+    {
+      "relative": "overlay/packages/work/src/harness/routed-owner-observer.ts",
+      "sha256": "d80fa25cbac4081009fc8e57008d95635249c9d04129b4efd33641daf3c4869d",
+      "bytes": 15642
+    }
+  ],
+  "privateSourceMode": "0600",
+  "publishedSourceMode": "100644",
+  "sourceComposition": {
+    "sha256": "b1a4c43f958917eefa203f7b9d836e8d643a4dd6299eaecbd9f99f59abd07008",
+    "bytes": 877
+  },
+  "executionAdmitted": false,
+  "runtimeAccepted": false,
+  "sourcePacketRevision": "V2"
+}

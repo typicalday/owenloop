@@ -361,3 +361,52 @@ jobs:
           overwrite: false
           if-no-files-found: error
           retention-days: 7
+
+  # Default-disabled private current-production owner/entry seam only.
+  linux-production-owner-qualification:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD == '' &&
+      vars.OWENLOOP_JEV_DESCRIPTOR_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD == '' &&
+      vars.OWENLOOP_JEV_PRODUCTION_OWNER_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_PRODUCTION_OWNER_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with: { node-version: 22.23.0, check-latest: false }
+      - name: One scoped current-production owner qualification
+        env:
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_PRODUCTION_OWNER_HEAD }}
+          JEV_OLD_PREFLIGHT_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_OLD_OBSERVER_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_OLD_DESCRIPTOR_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
+          JEV_OLD_ONE_RELAY_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_HEAD }}
+          JEV_OLD_ONE_RELAY_Q2_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD }}
+          JEV_EXPECTED_BOOTSTRAP_SHA: c29cf033bb886f7f9dd4308b96887bc667399b44688066f6c4bc184dc45713ea
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" JEV_NPM_CLI="$(command -v npm)" python3 -B -I -S .dev/production-owner-hosted/bootstrap.py
+      - name: Retain only the fixed scoped result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jev-production-owner-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-production-owner-qualification/result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7

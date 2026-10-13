@@ -273,3 +273,11 @@ export function outerOwnerObserverStatus(observer: RoutedOwnerOuterObserver):
   return Object.freeze({ protocol: 'private-outer-owner-observer-status-v1',
     refusal: owner.refusal ?? null, runtimeAccepted: false });
 }
+
+/** Private status for early entry refusal before any managed child exists. */
+export function roleOwnerObserverStatus(observer: RoutedOwnerRoleObserver):
+  Readonly<{ protocol: string; refusal: string | null; runtimeAccepted: false }> {
+  const owner = roles.get(observer); need(owner);
+  return Object.freeze({ protocol: 'private-role-owner-observer-status-v1',
+    refusal: owner.refusal ?? null, runtimeAccepted: false });
+}
