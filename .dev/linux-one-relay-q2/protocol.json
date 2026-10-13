@@ -1,0 +1,306 @@
+{
+  "protocol": "jev-one-relay-q2-qualification-source-v1",
+  "sourceOnly": true,
+  "executionAdmitted": false,
+  "scope": "HARMLESS_ONE_RELAY_Q2_ONLY",
+  "sourcePacketRevision": "V1",
+  "job": "linux-one-relay-q2-qualification",
+  "admissionProtocol": "jev-one-relay-q2-qualification-admission-v1",
+  "resultProtocol": "jev-one-relay-q2-qualification-result-v1",
+  "fixtureProtocol": "jev-private-one-relay-q2-fixture-v1",
+  "fixtureSuccessStage": "VALID",
+  "fixtureCaseNames": [
+    "MISSING_RIGHTS_REFUSED",
+    "DUPLICATE_RIGHTS_REFUSED",
+    "REORDERED_RIGHTS_REFUSED",
+    "DUPLICATE_PACKET_REFUSED",
+    "CONSUMED_ENVELOPE_SECOND_SEND_REFUSED",
+    "CONSUMED_CHANNEL_SECOND_RECEIVE_REFUSED",
+    "LOCAL_PAIR_ALIAS_INDEPENDENCE"
+  ],
+  "fixtureClosedKeys": [
+    "protocol",
+    "status",
+    "stage",
+    "code",
+    "cases",
+    "receipts",
+    "observations",
+    "cleanupKnown",
+    "sequentialEndpointOnly",
+    "nativeRecoveryAccepted"
+  ],
+  "childReceiptCount": 15,
+  "childReceiptKeys": [
+    "terminal",
+    "nodeCloseObserved",
+    "code",
+    "signal",
+    "ownedPipeEOF",
+    "pipePolicyValid",
+    "cleanupKnown"
+  ],
+  "observationCount": 5,
+  "observationClosedKeys": [
+    "mode",
+    "receivedRefusal",
+    "receivedDetail",
+    "sent"
+  ],
+  "sendClosedKeys": [
+    "mode",
+    "packets",
+    "rightsPerPacket",
+    "sendComplete",
+    "consumed",
+    "cleanupKnown"
+  ],
+  "caseEvidence": [
+    {
+      "mode": "MISSING_RIGHTS",
+      "refusal": "CHANNEL",
+      "detail": "MISSING_RIGHTS",
+      "rightsPerPacket": 3,
+      "packets": 1
+    },
+    {
+      "mode": "DUPLICATE_RIGHTS",
+      "refusal": "PAIR",
+      "detail": "DUPLICATE_PAIR",
+      "rightsPerPacket": 4,
+      "packets": 1
+    },
+    {
+      "mode": "REORDERED_RIGHTS",
+      "refusal": "PAIR",
+      "detail": "REVERSED_PARENT_CHAIN",
+      "rightsPerPacket": 4,
+      "packets": 1
+    },
+    {
+      "mode": "TWO_PACKETS",
+      "refusal": "CHANNEL",
+      "detail": "SECOND_RIGHTS_PACKET",
+      "rightsPerPacket": 4,
+      "packets": 2
+    },
+    {
+      "mode": "VALID",
+      "refusal": "NOT_APPLICABLE",
+      "detail": "NOT_APPLICABLE",
+      "rightsPerPacket": 4,
+      "packets": 1
+    }
+  ],
+  "executionFiles": [
+    "dependencies/metadata.mjs",
+    "dependencies/owner.py",
+    "direct-entry.mjs",
+    "entry.mjs",
+    "headers.py",
+    "inputs/base/direct/descriptor.c",
+    "inputs/base/direct/facade.mjs",
+    "inputs/base/direct/target.mjs",
+    "inputs/q2-facade.mjs",
+    "inputs/q2-fixture.mjs",
+    "inputs/q2-native-additions.c",
+    "inputs/q2-receiver.c",
+    "inputs/q2-role.mjs",
+    "inputs/q2-supervisor.mjs",
+    "inputs/q2.c",
+    "launch.py",
+    "libc-contract.c",
+    "loader.mjs",
+    "owner.py",
+    "protocol.json"
+  ],
+  "caps": {
+    "ownerSeconds": 150,
+    "fixtureSeconds": 40,
+    "cleanupSeconds": 10,
+    "sourceAdmissionManifestResultBytes": 65536,
+    "dependencyStreamBytes": 131072,
+    "compiledImageBytes": 8388608,
+    "toolImageBytesEach": 536870912,
+    "totalSelectedHashBytesIncludingChildBound": 1073741824,
+    "selectedDependencies": 512,
+    "headerArchiveBytes": 16777216,
+    "archiveEntries": 8192,
+    "archiveEntryBytes": 16777216,
+    "archiveDeclaredTotalBytes": 134217728
+  },
+  "resourceAccounting": {
+    "nodeImageHashPasses": 1,
+    "nodeInitializerEntries": 16,
+    "addonHashPasses": 11,
+    "genuineNestedChildOriginals": 15,
+    "maximumConcurrentNodeProcesses": 4,
+    "rootConcurrentNodeCap": 5,
+    "verifiedJSFilesPerInitializer": 7,
+    "formula": "budgetSelectedBytes + node.bytes +16*sum(six runtime JS inputs and metadata source bytes)+11*artifact.bytes <=1073741824",
+    "memoryEnforcementClaimed": false,
+    "workerThreadAdditionalToNodeProcessCount": true
+  },
+  "runtimeEntryMap": {
+    "entry/q2-fixture.mjs": "entry.mjs",
+    "entry/q2-role.mjs": "entry.mjs",
+    "entry/q2-supervisor.mjs": "entry.mjs",
+    "entry/base/direct/target.mjs": "direct-entry.mjs",
+    "entry/loader.mjs": "loader.mjs",
+    "entry/q2-facade.mjs": "inputs/q2-facade.mjs",
+    "entry/base/direct/facade.mjs": "inputs/base/direct/facade.mjs",
+    "entry/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/verified/q2-fixture.mjs": "inputs/q2-fixture.mjs",
+    "entry/verified/q2-role.mjs": "inputs/q2-role.mjs",
+    "entry/verified/q2-supervisor.mjs": "inputs/q2-supervisor.mjs",
+    "entry/verified/q2-facade.mjs": "inputs/q2-facade.mjs",
+    "entry/verified/base/direct/facade.mjs": "inputs/base/direct/facade.mjs",
+    "entry/verified/base/direct/target.mjs": "inputs/base/direct/target.mjs",
+    "entry/verified/metadata.mjs": "dependencies/metadata.mjs"
+  },
+  "retainedOriginalSlots": [
+    "headers",
+    "dependencies",
+    "libc-build",
+    "libc-abi",
+    "addon-build",
+    "fixture"
+  ],
+  "stagePlan": [
+    {
+      "slot": "headers",
+      "seconds": 25,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "dependencies",
+      "seconds": 15,
+      "streamCapBytes": 131072
+    },
+    {
+      "slot": "libc-build",
+      "seconds": 20,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "libc-abi",
+      "seconds": 5,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "addon-build",
+      "seconds": 25,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "fixture",
+      "seconds": 40,
+      "streamCapBytes": 65536
+    }
+  ],
+  "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
+  "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
+  "selectedHeaders": [
+    "node_api.h",
+    "node_api_types.h",
+    "js_native_api.h",
+    "js_native_api_types.h"
+  ],
+  "buildIncludeBinding": "All four Q2 native inputs are exact exclusive build copies; main and libc passed through retained FDs. -I build resolves q2-native-additions.c, q2-receiver.c and base/direct/descriptor.c. Fresh selected -M must include all native/libc inputs and selected four Node public headers; exclusive-path no-external-writer premise remains.",
+  "contextBinding": "Same-job actual platform event/job/run/attempt and Git HEAD/tree/clean plus source pins are checked by separate bootstrap; external root independently binds selected publication/workflow/source/actual run. Supplied inner admission is not alone platform authority.",
+  "firstEntryTrustBoundary": "Public registerHooks supplies already-read SHA-verified exact sources only after separately pinned entry/loader execution. Hooks not asserted to inherit to Workers; current target worker source remains source-owned.",
+  "selectedCompilerScope": "First entry/runtime/compiler/Actions platform remains trusted external boundary; before/after pathname hashes are not an immutable initial-execution proof. Public process.dlopen reads retained addonFD; selected dependency checks are -M preprocessing scope, not complete frontend/as/ld/specs/startup/runtime library qualification.",
+  "unknownHold": "Durable nonterminal/nonpassing retained-original authority; no next stage/restart, reconstructed PID or global absence. External root settlement required; cancellation not cleanup proof.",
+  "passRequirements": [
+    "Decode <=65536 exact UTF-8 with duplicate-key and nonfinite-number rejection; require canonical compact JSON plus exactly one newline and closed shapes at every nested record.",
+    "Success requires exit type=int0, empty stderr, all ten keys, exact protocol/SUPPORTED/VALID/NOT_APPLICABLE, all seven ordered cases, exactly15 ordered seven-key receipts and5 observations.",
+    "All five receipt obligations exact bool true; code exact int0 (not bool); signal NONE. Groups of three are ROLE/SUPERVISOR/TARGET in each fixed cycle, as source-attributed Node records, not separately measured external Popen authority.",
+    "Each observation has exact mode/refusal/detail against caseEvidence; sent has exactly six keys, exact integer packets/rightsPerPacket, sendComplete/consumed/cleanupKnown exact true. Reordered and duplicate actual structure details cannot be inferred from chosen mode.",
+    "All six inner and four outer originals natural0/reaped/actual both-pipe EOF/signals0/no truncation/interruption/deadline;15 nested source-attributed Node receipts distinct from Popen originals.",
+    "Same-job fixture own credentials/kernel/namespaces/procfs/Node measured before addon/native load; public glibc ABI and selected sources/headers/dependencies/artifact freshly bound.",
+    "Supported file alone is insufficient; final natural0 and whole selected-source/actual audit required."
+  ],
+  "privacy": "Fixed enums/counts/hashes and reviewed context only. No raw event/error/private streams/native rows/PID/UID/provider/auth/model. No provider secrets; Actions platform credentials/runtime trust remain.",
+  "privateStreams": "Exact <slot>.stdout/.stderr; dependency-closure.private.json never uploaded.",
+  "publicOutputFiles": [
+    "result.json"
+  ],
+  "targetEnvironment": {},
+  "retryPermitted": false,
+  "allSevenControlsUnrun": true,
+  "priorResultTransferred": false,
+  "nativeRecoveryAccepted": false,
+  "normalRecoveryAccepted": false,
+  "productionGeneralizationAllowed": false,
+  "providerAccessQualified": false,
+  "runtimeAccepted": false,
+  "all23ExitsPreserved": true,
+  "remainingCoverage": [
+    "wrong sender/creator/fixed slot",
+    "enqueue/allocation/close injection",
+    "individual role/supervisor/provider exit isolation",
+    "other Q2 rows"
+  ],
+  "futureFields": [
+    "Future complete private owner/loader/bootstrap/workflow bytes and manifest/self-SHA literals are not authored by this plan.",
+    "Actual fresh head/tree/source/base/workflow/run/attempt/job and original root admission are not known or admitted.",
+    "Actual Linux Node/Python/Git/compiler/header/libc/dependency/artifact pins and public API availability must be measured in selected job; cannot be fabricated here.",
+    "All other Q2 rows, production wiring, provider/account and NORMAL recovery remain separately unresolved; this action has no provider requirement or permission transfer."
+  ],
+  "sourceReferences": [
+    {
+      "path": "/Volumes/more/jev-one-relay-q2-control-component-source-v1-20261013/manifest.json",
+      "sha256": "acae12fbba1cef942784c7ac356be58fcf48098244a185cf43f1a76d975e04d7",
+      "bytes": 9044,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/jev-one-relay-q2-control-component-source-v1-20261013/protocol.json",
+      "sha256": "8c76ef75c4f3db3596265be81d2f41f08d6ee48bf251c34341a0c00b9c2d0a00",
+      "bytes": 9786,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-component-v1-independent-whole-source-review-20261013-transport.md",
+      "sha256": "debc1128efd8b9820bb034830312c1097e3cded11fe805bf57b209cc9fb1dd12",
+      "bytes": 3825,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-component-v1-independent-whole-source-review-20261013-transport.json",
+      "sha256": "46e1c100e2671fbf6f0a77fb0bc774472d968326851ea1cd987e031ea14c1dc3",
+      "bytes": 20385,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-source-plan-v1-20261013.md",
+      "sha256": "80bd6c83c53da49dcbdc4de1acafa458e6829ee29104c68f7d1bca39580111f2",
+      "bytes": 8033,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-source-plan-v1-20261013.json",
+      "sha256": "82c3f9471d1de40c5ffc723ba975e37224c492b103beb630c7d370900051cc9a",
+      "bytes": 29935,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-plan-v1-independent-whole-source-review-20261013-transport.md",
+      "sha256": "79f85109b34ab781cf7bcb0eb062608a93b9ae6614ff238257c69d5a1b4afd60",
+      "bytes": 4185,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-plan-v1-independent-whole-source-review-20261013-transport.json",
+      "sha256": "193a57c3169997e7d202c320494fc0162d2910a1673e76c4043cdea05315325b",
+      "bytes": 22471,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-publication-plan-root-source-disposition-20261013.json",
+      "sha256": "8d2921d44c8670ae38f680c76a7ccb232528c1acf20ba9d57d54ab55e2332d34",
+      "bytes": 1565,
+      "mode": 384
+    }
+  ]
+}
