@@ -7,8 +7,8 @@
   "normalRecoveryAccepted": false,
   "canonicalRelease": false,
   "rootRelease": false,
-  "engineBaselineHead": "918faa92421b4f7ec687634d7e2db345abfbf821",
-  "engineBaselineTree": "945ca91d85c3c92239b846af1f06b620146be0cd",
+  "engineBaselineHead": "7dc6ea2c96147bf6e8f23a82f673a1e56c0fe813",
+  "engineBaselineTree": "19203025aa3ddcbe5a62841c3069869bdfae7d3c",
   "serviceHead": "67ec99101ea18dc27b14ddf8a209df317f5bbdf5",
   "serviceVendoredEngine": "a76c75a7b0d21625980afc67d5943564be854819",
   "scope": "HARMLESS_CURRENT_PRODUCTION_OWNER_ONLY",
@@ -21,7 +21,7 @@
     "OWENLOOP_JEV_ONE_RELAY_HEAD",
     "OWENLOOP_JEV_ONE_RELAY_Q2_HEAD"
   ],
-  "futureHead": "Fresh actual successor commit/tree/run/attempt/job/workflow and eight ordinary current-head SUCCESS jobs require external root observation, exact staged review and separate one-selected-job admission. Baseline918faa is a consumed failed qualifier, not a future qualifier head. Unknown POST never permits repost; remove only the owned matching gate after terminal reconciliation.",
+  "futureHead": "Fresh actual successor head/tree/run/attempt/job/workflow and eight ordinary SUCCESS jobs require external root comparison and separate one-selected-job admission. Current7dc6 original115329386159 is failed and consumed; no permission/result transfers. Unknown POST never permits repost; remove only owned matching gate after terminal reconciliation.",
   "executionFiles": [
     "owner.py",
     "launch.py",
@@ -157,15 +157,9 @@
     "roleStdio": "IGNORED"
   },
   "childEnvironment": "Fixed narrow PATH/LANG/LC_ALL/TZ/Node heap and fresh private HOME; npm receives distinct exclusive empty user/global config files plus private cache and ignore-scripts/no-audit/no-fund. No provider/service/user config or credential environment is inherited. Actions platform credentials/trust remain separate.",
-  "sourcePacketRevision": "SELECTED_COMPILER_CATALOG_PROJECTION_V1",
-  "scopeContract": "Explicit selected-consumed-input authority redesign; never equivalent to the original full installed content inventory. Original npm ci remains unchanged. Production/native source and the two-case acceptance parser remain unchanged.",
-  "sourceByteOrigin": {
-    "historicalProductionInventoryHead": "8892b0aa4e3d00b750b330bc4e534553cba59d4d",
-    "currentProductionRows": 206,
-    "currentProductionBytes": 4351035,
-    "currentRowsByteIdentical": true,
-    "compiledProofTransferred": false
-  },
+  "sourcePacketRevision": "CHECKED_PACKAGE_METADATA_REUSE_V1",
+  "scopeContract": "Existing selected-consumed-input authority unchanged; narrow owner-local checked canonical package metadata reuse plus passive first-closure diagnostic. All closure rows/form/serialization authority retained. No actual cause/fit or generic CLI parity proved.",
+  "sourceByteOrigin": "Exact current7dc6 publication baseline plus declared five mapped successor changes; all206 tracked compilation inputs and all production/Service sources unchanged. Whole private source review precedes publication/CI/action.",
   "hashAccounting": {
     "innerCapBytes": 1073741824,
     "outerCapBytes": 33554432,
@@ -379,5 +373,72 @@
     "bootstrap": "Known closed/context-consistent frames forwarded unchanged. Invalid companions replaced with null without replacing original refusal, original raw result pin remains separately retained. Companion validity is never qualification acceptance.",
     "noAdditionalReadsHashesCustodyOperations": true,
     "passiveFailurePolicy": "All tracker/classifier/validation failures contained. No error object, args, path, package, environment, stream or raw payload retained."
+  },
+  "firstClosureDiagnostic": {
+    "protocol": "jev-first-runtime-closure-diagnostic-v1",
+    "failureOnly": true,
+    "enclosingStatus": "REFUSED",
+    "enclosingStage": "DEPENDENCY_INVENTORY",
+    "frameKeys": [
+      "protocol",
+      "phase",
+      "error",
+      "counters",
+      "saturated",
+      "unknown"
+    ],
+    "maxEncodedBytesIncludingNewline": 1024,
+    "phaseEnums": [
+      "ROW_READ",
+      "PACKAGE_LOOKUP",
+      "PACKAGE_ACQUIRE",
+      "PACKAGE_REUSE",
+      "SERIALIZE",
+      "WRITE",
+      "UNKNOWN"
+    ],
+    "errorEnums": [
+      "PREDICATE_REFUSED",
+      "ALLOCATION",
+      "SERIALIZATION",
+      "OTHER",
+      "UNKNOWN"
+    ],
+    "counterKeys": [
+      "heldInputs",
+      "uniquePackages",
+      "cacheRawBytes",
+      "cacheLogicalBytes",
+      "rows",
+      "closureBytes"
+    ],
+    "counterType": "null until observed; exact builtin nonnegative int saturated at2147483647; bool forbidden",
+    "flagTypes": "saturated and unknown exact booleans",
+    "serializationContext": "SERIALIZATION only at SERIALIZE; exact TypeError/ValueError/OverflowError",
+    "originalPredicateRecognition": "Exact inert RuntimeError and BaseException.args descriptor equals singleton PRODUCTION_OWNER_REFUSED, no arbitrary errors/messages retained",
+    "window": "State initialized immediately before first runtime_closure; cleared only after it returns. Later calls untracked. Failure-only enclosing DEPENDENCY_INVENTORY/REFUSED; original exception and custody precedence unchanged.",
+    "bootstrap": "Known closed/context-consistent frames forwarded unchanged. Invalid companions replaced with null without replacing original refusal, original raw result pin remains separately retained. Companion validity is never qualification acceptance.",
+    "noAdditionalReadsHashesCustodyOperations": true,
+    "passiveFailurePolicy": "All tracker/classifier/validation failures contained. No error object, args, path, package, environment, stream or raw payload retained."
+  },
+  "packageMetadataReuse": {
+    "scope": "nearest positive package metadata only, one owner lifetime across three runtime_closure calls; no negative/shared/reset cache",
+    "baselineSites": "First closure402, later calls460/463 in immutable7dc6 owner; corrected research line erratum. Successor line numbers differ.",
+    "acquisition": "existing input_fd registers genuine FD/raw/pin/full initial identity in held before cache allocation/JSON parsing; pin equals selected/source authority",
+    "key": "exact contained canonical project-relative path, no alias/symlink resolution substitution; encoded length<=4096; distinct cache keys cannot share retained dev/ino",
+    "hit": "original absolute deadline/sticky interruption; canonical identity and known pin plus exact full FD/path shape; no reopen/refresh",
+    "form": "every call preserves nearest ancestor search and json_value(raw,SOURCE_LIMIT).get(type) expression",
+    "ownership": "held solely owns all genuine package FDs; cache borrows; final held recheck and one checked close; uncertainty sticky UNKNOWN_HOLD, no numeric retry",
+    "heldCap": 4096,
+    "uniqueCount": "available global held capacity only",
+    "rawCapBytes": 1048576,
+    "logicalCapBytes": 8388608,
+    "reservationBytes": 1048576,
+    "entryLogicalCharge": "raw length+256+4*encoded canonical key length, before retention; same remaining global logical ledger including existing1MiB reservation; bounded map/string/raw representation, not measured RSS",
+    "meter": "Every actual miss read/hash including rejected attempt fully charged; hits reuse already verified raw bytes without fictional charge/refund; all nonpackage/final reads and reserves unchanged",
+    "actualCauseProved": false,
+    "fullFitProved": false,
+    "trust": "sealed source-owned execution tree/retained stat identity; no hostile same-user writer guarantee; OS FD capacity and rglob internal storage remain unqualified",
+    "newConservativeGuards": "Cache raw/logical/alias/known-authority guard may refuse; no cap expansion, skipped inventory or equivalent-full-inventory claim"
   }
 }

@@ -14,7 +14,7 @@ EVENT_INPUT_CAP=1048576
 TOTAL_SECONDS=450
 HASH_CAP=32*1024*1024
 GIT_CAP=16*1024*1024
-QUALIFICATION_MANIFEST='94a2c239603786655381f2bd27b8f4991aa8424b79ca8af4fa14eda0b0706fde'
+QUALIFICATION_MANIFEST='3d9168f009aa48c9ccca39d119ad4f77f3cd1c824487e5570de8a4c6209d9ef1'
 JOB='linux-production-owner-qualification'
 BASE='b4ead192326ba607558cd3bb7687209cbb7c8165'
 REPOSITORY='typicalday/owenloop'
@@ -69,6 +69,21 @@ def sanitize_catalog_diagnostic(inner):
         if not valid:inner['postSelectionDiagnostic']=None
     except BaseException:
         try:inner['postSelectionDiagnostic']=None
+        except BaseException:pass
+
+def sanitize_closure_diagnostic(inner):
+    try:
+        if 'firstClosureDiagnostic' not in inner or inner['firstClosureDiagnostic'] is None:return
+        value=inner['firstClosureDiagnostic']
+        valid=inner.get('status')=='REFUSED' and inner.get('stage')=='DEPENDENCY_INVENTORY' and type(value) is dict and set(value)=={'protocol','phase','error','counters','saturated','unknown'}
+        valid=valid and value['protocol']=='jev-first-runtime-closure-diagnostic-v1' and value['phase'] in ('ROW_READ','PACKAGE_LOOKUP','PACKAGE_ACQUIRE','PACKAGE_REUSE','SERIALIZE','WRITE','UNKNOWN') and value['error'] in ('PREDICATE_REFUSED','ALLOCATION','SERIALIZATION','OTHER','UNKNOWN')
+        valid=valid and (value['error']!='SERIALIZATION' or value['phase']=='SERIALIZE')
+        valid=valid and type(value['saturated']) is bool and type(value['unknown']) is bool and type(value['counters']) is dict and set(value['counters'])=={'heldInputs','uniquePackages','cacheRawBytes','cacheLogicalBytes','rows','closureBytes'}
+        valid=valid and all(v is None or (type(v) is int and 0<=v<=2147483647) for v in value['counters'].values())
+        valid=valid and len((json.dumps(value,separators=(',',':'))+'\n').encode('ascii'))<=1024
+        if not valid:inner['firstClosureDiagnostic']=None
+    except BaseException:
+        try:inner['firstClosureDiagnostic']=None
         except BaseException:pass
 
 def main():
@@ -255,6 +270,7 @@ def main():
         need(inner['protocol']=='jev-production-owner-qualification-result-v1')
         need((code==0 and stdout==b'JEV_PRODUCTION_OWNER_COMPLETE\n' and stderr==b'' and inner['status']=='SUPPORTED') or (code==2 and inner['status'] in ['REFUSED','UNSUPPORTED']))
         sanitize_catalog_diagnostic(inner)
+        sanitize_closure_diagnostic(inner)
         stage='SOURCE_RECHECK';REFUSAL_STATE['stage']=stage
         need([r['slot'] for r in receipts]==['head','tree','clean','qualification-launch'])
         if code==0:need(all(r['directOriginalTerminal'] is True and r['directOriginalReaped'] is True and r['ownedPipesEOF'] is True and type(r['exitCode']) is int and r['exitCode']==0 and r['signalsSent']==0 for r in receipts))

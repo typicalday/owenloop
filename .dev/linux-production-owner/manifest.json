@@ -4,8 +4,8 @@
   "files": [
     {
       "relative": "owner.py",
-      "sha256": "0c445572d6d128447ad07a58eb7afd2e64caa48a23117fd31fc805e5ffb558aa",
-      "bytes": 44749
+      "sha256": "cf796689c5b3b4801c2ebba845ae47283f3bbc9d52ca17daca4287271b701d97",
+      "bytes": 49460
     },
     {
       "relative": "launch.py",
@@ -59,8 +59,8 @@
     },
     {
       "relative": "protocol.json",
-      "sha256": "8271f5e3036f4e10604a59741f66de3440242327ab022c6b7be5008efaed8fd0",
-      "bytes": 19887
+      "sha256": "becc3a18a4ce74a9e72cdbdc925eb52c572cca3bb4e7474777048c35b63b05c9",
+      "bytes": 23959
     },
     {
       "relative": "dependencies/owner.py",
@@ -106,8 +106,8 @@
   "executionFiles": [
     {
       "relative": "owner.py",
-      "sha256": "0c445572d6d128447ad07a58eb7afd2e64caa48a23117fd31fc805e5ffb558aa",
-      "bytes": 44749
+      "sha256": "cf796689c5b3b4801c2ebba845ae47283f3bbc9d52ca17daca4287271b701d97",
+      "bytes": 49460
     },
     {
       "relative": "launch.py",
@@ -161,8 +161,8 @@
     },
     {
       "relative": "protocol.json",
-      "sha256": "8271f5e3036f4e10604a59741f66de3440242327ab022c6b7be5008efaed8fd0",
-      "bytes": 19887
+      "sha256": "becc3a18a4ce74a9e72cdbdc925eb52c572cca3bb4e7474777048c35b63b05c9",
+      "bytes": 23959
     },
     {
       "relative": "dependencies/owner.py",
@@ -213,6 +213,6 @@
   },
   "executionAdmitted": false,
   "runtimeAccepted": false,
-  "sourcePacketRevision": "SELECTED_COMPILER_CATALOG_PROJECTION_V1",
+  "sourcePacketRevision": "CHECKED_PACKAGE_METADATA_REUSE_V1",
   "selectedAuthorityEquivalentFullInventory": false
 }

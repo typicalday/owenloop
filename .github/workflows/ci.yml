@@ -397,7 +397,7 @@ jobs:
           JEV_OLD_DESCRIPTOR_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
           JEV_OLD_ONE_RELAY_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_HEAD }}
           JEV_OLD_ONE_RELAY_Q2_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD }}
-          JEV_EXPECTED_BOOTSTRAP_SHA: 553e9a04a2b365a881fae9a837a24f2afbd670ad0f639054f3cceb694d2a2dc1
+          JEV_EXPECTED_BOOTSTRAP_SHA: 30f98fe3bae5e07444b956f45532c790c2a6880a738ec692bfe98422f08d8ca7
         run: |
           JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" JEV_NPM_CLI="$(command -v npm)" python3 -B -I -S .dev/production-owner-hosted/bootstrap.py
       - name: Retain only the fixed scoped result

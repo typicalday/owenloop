@@ -138,11 +138,43 @@ def catalog_snapshot(state,error,stage):
     except BaseException:pass
     return None
 
+# Passive first-closure companion. No content/acceptance authority.
+CLOSURE_PHASES=('ROW_READ','PACKAGE_LOOKUP','PACKAGE_ACQUIRE','PACKAGE_REUSE','SERIALIZE','WRITE','UNKNOWN')
+CLOSURE_COUNTERS=('heldInputs','uniquePackages','cacheRawBytes','cacheLogicalBytes','rows','closureBytes')
+def closure_state():
+    try:return {'phase':'UNKNOWN','counters':dict.fromkeys(CLOSURE_COUNTERS),'saturated':False,'unknown':False}
+    except BaseException:return None
+def closure_note(state,phase,**values):
+    try:
+        if type(state) is not dict:return
+        state['phase']=phase if phase in CLOSURE_PHASES else 'UNKNOWN'
+        for name,value in values.items():
+            if name not in CLOSURE_COUNTERS:state['unknown']=True;continue
+            if type(value) is int and value>=0:
+                state['counters'][name]=min(value,2147483647)
+                if value>2147483647:state['saturated']=True
+            else:state['counters'][name]=None;state['unknown']=True
+    except BaseException:
+        try:state['unknown']=True
+        except BaseException:pass
+def closure_snapshot(state,error,stage):
+    try:
+        if type(state) is not dict or stage!='DEPENDENCY_INVENTORY':return None
+        code='OTHER'
+        if type(error) is RuntimeError and BaseException.args.__get__(error)==('PRODUCTION_OWNER_REFUSED',):code='PREDICATE_REFUSED'
+        elif type(error) is MemoryError:code='ALLOCATION'
+        elif state['phase']=='SERIALIZE' and type(error) in (TypeError,ValueError,OverflowError):code='SERIALIZATION'
+        value={'protocol':'jev-first-runtime-closure-diagnostic-v1','phase':state['phase'],'error':code,'counters':state['counters'].copy(),'saturated':state['saturated'],'unknown':state['unknown']}
+        raw=(json.dumps(value,separators=(',',':'))+'\n').encode('ascii')
+        if len(raw)<=1024:return value
+    except BaseException:pass
+    return None
+
 def main(admission_path):
     os.umask(0o077)
     need(sys.platform=='linux' and all(hasattr(os,k) for k in ['waitid','WNOWAIT','WEXITED','WNOHANG','P_PID']))
     result=None;selection_custody={'cleanupKnown':True};selection=None;meter=None
-    post_catalog=None
+    post_catalog=None;first_closure=None
     root=Path(__file__).resolve().parent;deadline=time.monotonic()+TOTAL_SECONDS;budget=[0,0];held=[];receipts=[];stage='ADMISSION';out=None;active=None;interrupted=[False]
     def interrupt(_s,_f):interrupted[0]=True
     signal.signal(signal.SIGTERM,interrupt);signal.signal(signal.SIGINT,interrupt)
@@ -373,6 +405,36 @@ def main(admission_path):
         # No live mirror directory traversal or zero-content files are used.
         (project/'catalog-metadata').mkdir(mode=0o700)
         meter.kind='late'
+        # held solely owns these registered package FDs; cache borrows records.
+        package_cache={};package_raw_bytes=0;package_logical_bytes=0
+        def package_bytes(pkg,installed):
+            nonlocal logical_storage,package_raw_bytes,package_logical_bytes
+            need(not interrupted[0] and time.monotonic()<deadline)
+            key=str(pkg.relative_to(project))
+            need(pkg.is_absolute() and pkg.is_relative_to(project) and len(os.fsencode(key))<=4096 and '..' not in Path(key).parts and pkg.resolve()==pkg)
+            known=installed.get(key)
+            if known is None:
+                known=next((row for row in source_observations if row['relative']==key),None)
+            need(known is not None)
+            expected={k:known[k] for k in ['sha256','bytes']}
+            record=package_cache.get(key)
+            if record is not None:
+                closure_note(first_closure,'PACKAGE_REUSE',heldInputs=len(held),uniquePackages=len(package_cache),cacheRawBytes=package_raw_bytes,cacheLogicalBytes=package_logical_bytes)
+                raw,pin,fd,z,original_path=record
+                need(original_path==pkg and pin==expected and shape(z)==shape(os.fstat(fd))==shape(pkg.lstat()))
+                return raw
+            closure_note(first_closure,'PACKAGE_ACQUIRE',heldInputs=len(held),uniquePackages=len(package_cache),cacheRawBytes=package_raw_bytes,cacheLogicalBytes=package_logical_bytes)
+            need(len(package_cache)<4096)
+            # input_fd registers the genuine FD before any parse/cache allocation.
+            raw,pin,fd,z=input_fd(pkg,SOURCE_LIMIT)
+            need(pin==expected)
+            need(all((r[3].st_dev,r[3].st_ino)!=(z.st_dev,z.st_ino) for r in package_cache.values()))
+            charge=len(raw)+256+4*len(os.fsencode(key))
+            need(package_raw_bytes+len(raw)<=1048576 and logical_storage+charge<=8388608)
+            logical_storage+=charge;package_raw_bytes+=len(raw);package_logical_bytes+=charge
+            package_cache[key]=(raw,pin,fd,z,pkg)
+            closure_note(first_closure,'PACKAGE_ACQUIRE',heldInputs=len(held),uniquePackages=len(package_cache),cacheRawBytes=package_raw_bytes,cacheLogicalBytes=package_logical_bytes)
+            return raw
         def runtime_closure():
             result=[];installed={v['relative']:v for v in dependency_rows}
             for q in sorted(project.rglob('*')):
@@ -381,25 +443,33 @@ def main(admission_path):
                 if q.is_symlink():need(q.resolve().is_relative_to(project));continue
                 if not q.is_file():continue
                 need(len(result)<16384)
+                closure_note(first_closure,'ROW_READ',heldInputs=len(held),rows=len(result))
                 if rel in installed:pin={k:installed[rel][k] for k in ['sha256','bytes']}
                 else:_,pin=input_bytes(q,16777216)
                 form='json' if q.suffix=='.json' else 'module' if q.suffix=='.mjs' else 'commonjs' if q.suffix in ['.js','.cjs'] else 'resource'
                 if q.suffix=='.js':
+                    closure_note(first_closure,'PACKAGE_LOOKUP',rows=len(result))
                     parent=q.parent
                     while parent.is_relative_to(project):
                         pkg=parent/'package.json'
                         if pkg.is_file():
-                            pr,_=input_bytes(pkg);form='module' if json_value(pr,SOURCE_LIMIT).get('type')=='module' else 'commonjs';break
+                            pr=package_bytes(pkg,installed);form='module' if json_value(pr,SOURCE_LIMIT).get('type')=='module' else 'commonjs';break
                         if parent==project:break
                         parent=parent.parent
                 result.append({'relative':rel,**pin,'format':form})
-            raw=(json.dumps({'protocol':'jev-production-runtime-closure-v1','files':result},separators=(',',':'))+'\n').encode();need(len(raw)<=SOURCE_LIMIT)
+            closure_note(first_closure,'SERIALIZE',heldInputs=len(held),rows=len(result))
+            raw=(json.dumps({'protocol':'jev-production-runtime-closure-v1','files':result},separators=(',',':'))+'\n').encode()
+            closure_note(first_closure,'SERIALIZE',closureBytes=len(raw))
+            need(len(raw)<=SOURCE_LIMIT)
             p=project/'runtime-closure.json'
             if p.exists():p.unlink()
+            closure_note(first_closure,'WRITE',closureBytes=len(raw))
             write(p,raw);return result,{'sha256':integrity_digest(raw),'bytes':len(raw)}
         write(project/'binding.json',(json.dumps({'protocol':'jev-production-binding-v1','enabled':False,'artifact':None},separators=(',',':'))+'\n').encode())
         (project/'dist').mkdir(mode=0o700)
+        first_closure=closure_state()
         runtime_closure()
+        first_closure=None
         def node_flags(profile,heap=192):
             v=['--max-old-space-size='+str(heap),'--permission','--allow-fs-read='+str(project)]
             writable=['dist','compiler-result.json','integrity-results'] if profile=='compiler' else ['entry-results','gates','integrity-results','warnings','own-metadata.json']
@@ -519,7 +589,7 @@ def main(admission_path):
         if active:hold_without_authority()
         if not close_inputs():hold_without_authority()
         if out:
-            try:save(out/'result.json',{'selectedAuthority':{'protocol':'jev-selected-consumed-input-authority-v1','equivalentFullInventory':False,'selectedBytes':None if selection is None else selection['selectedBytes'],'metadataSnapshotOnly':True},'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'hashBudget':None if meter is None else meter.report(),'postSelectionDiagnostic':catalog_snapshot(post_catalog,error,stage)})
+            try:save(out/'result.json',{'selectedAuthority':{'protocol':'jev-selected-consumed-input-authority-v1','equivalentFullInventory':False,'selectedBytes':None if selection is None else selection['selectedBytes'],'metadataSnapshotOnly':True},'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'hashBudget':None if meter is None else meter.report(),'postSelectionDiagnostic':catalog_snapshot(post_catalog,error,stage),'firstClosureDiagnostic':closure_snapshot(first_closure,error,stage)})
             except BaseException:pass
         print('JEV_PRODUCTION_OWNER_REFUSED',file=sys.stderr);return 2
     finally:
