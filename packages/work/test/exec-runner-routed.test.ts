@@ -246,6 +246,7 @@ test('parent IPC disconnect leaves sentinel-owned bounded teardown running', asy
     for (let i = 0; i < 100 && !existsSync(ready); i++) await sleep(10);
     assert.equal(existsSync(ready), true);
     const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    const settlementDeadline = performance.now() + 5_000;
     child.disconnect();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -257,7 +258,15 @@ test('parent IPC disconnect leaves sentinel-owned bounded teardown running', asy
       ]);
     } finally { if (timeout) clearTimeout(timeout); }
     assert.equal(child.signalCode, 'SIGKILL');
-    assert.throws(() => process.kill(-(child.pid as number), 0), { code: 'ESRCH' });
+    // Sentinel exit is not group absence. Observe the unchanged ESRCH
+    // predicate under a monotonic bound, as the production runner does.
+    let groupAbsent = false;
+    while (performance.now() < settlementDeadline) {
+      try { process.kill(-(child.pid as number), 0); }
+      catch (error) { assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH'); groupAbsent = true; break; }
+      await sleep(10);
+    }
+    assert.equal(groupAbsent, true, 'disconnected sentinel group remained present at deadline');
     const count = existsSync(writes) ? readFileSync(writes).length : 0;
     await sleep(180);
     assert.equal(existsSync(writes) ? readFileSync(writes).length : 0, count);
