@@ -18,25 +18,99 @@ SLOTS=['node-dependencies','typescript','headers','dependencies','libc-build','l
 CASE_NAMES=['CURRENT_PRODUCTION_MANAGED_OWNER_SEAM','PRIVATE_AGENT_ENTRY_PARSE_REFUSAL_CLEANUP']
 STAGES=['ADMISSION','SOURCE_BINDING','TOOL_BINDING','SOURCE_MATERIALIZATION','NODE_DEPENDENCIES','DEPENDENCY_INVENTORY','TYPESCRIPT','HEADER_DISCOVERY','DEPENDENCY_DISCOVERY','DEPENDENCY_BINDING','LIBC_BUILD','LIBC_ABI','ADDON_BUILD','ARTIFACT_BINDING','ENTRY_BINDING','FIXTURE','RESULT_VALIDATION','SOURCE_RECHECK','RESULT_RETENTION','CLEANUP','UNKNOWN']
 
+# Passive inventory diagnostics: no source paths, values or acceptance authority.
+INVENTORY_STEPS=frozenset(('ENUMERATE','ENTRY_CLASSIFICATION','LINK_RESOLVE','LINK_CONTAINMENT','FILE_CLASSIFICATION','ROW_LIMIT','READ_DEADLINE','READ_OPEN','READ_STAT','READ_METADATA_POLICY','READ_CHUNK_DEADLINE','READ_CHUNK','READ_CAP_AND_HASH_BUDGET','READ_HASH_AND_BUFFER','READ_FINAL_POLICY','READ_RETURN','READ_CLEANUP','LEAF_STABILITY','LEAF_CLOSE','RELATIVE_PATH','ROW_RETENTION','CLOSURE_ENUMERATE','CLOSURE_LINK_POLICY','CLOSURE_FILE_CLASSIFICATION','CLOSURE_ROW_POLICY','CLOSURE_FORMAT','CLOSURE_PACKAGE_PATH','CLOSURE_PACKAGE_READ','CLOSURE_PACKAGE_DECODE','CLOSURE_READ_CLOSE','CLOSURE_LEAF_STABILITY','CLOSURE_ROW_RETENTION','CLOSURE_SERIALIZE','CLOSURE_SIZE_POLICY','CLOSURE_REPLACE','CLOSURE_WRITE','COMPLETE','UNKNOWN'))
+INVENTORY_COUNTER_CAPS={'entriesObserved':65536,'symlinksObserved':65536,'rowsCompleted':16384,'runtimeRowsCompleted':16384,'closureBytesObserved':SOURCE_LIMIT+1,'bytesHashed':HASH_TOTAL+65536,'bytesReserved':HASH_TOTAL}
+def inventory_mark(d,step,budget=None,increment=None,**values):
+    try:
+        if d is None:return
+        d['step']=step if type(step) is str and step in INVENTORY_STEPS else 'UNKNOWN'
+        if budget is not None:values.update(bytesHashed=budget[0],bytesReserved=budget[1])
+        if increment in INVENTORY_COUNTER_CAPS:
+            value=d.get(increment)
+            if type(value) is int and value>=0:values[increment]=value+1
+            else:d[increment]=None;d['counterState']='UNKNOWN'
+        for key,value in values.items():
+            if key not in INVENTORY_COUNTER_CAPS:continue
+            if type(value) is not int or value<0:d[key]=None;d['counterState']='UNKNOWN'
+            else:
+                cap=INVENTORY_COUNTER_CAPS[key];d[key]=min(value,cap)
+                if value>cap and d['counterState']!='UNKNOWN':d['counterState']='SATURATED'
+    except BaseException:
+        try:
+            if type(d) is dict:d['step']='UNKNOWN';d['counterState']='UNKNOWN'
+        except BaseException:pass
+def inventory_step(d):
+    try:return d['step'] if d is not None else 'UNKNOWN'
+    except BaseException:return 'UNKNOWN'
+def inventory_error(d,error):
+    try:
+        if d is None:return
+        category='OTHER'
+        if type(error) is RuntimeError:
+            args=BaseException.args.__get__(error)
+            if type(args) is tuple and len(args)==1 and type(args[0]) is str and args[0]=='PRODUCTION_OWNER_REFUSED':category='PREDICATE_REFUSED'
+        elif type(error) in (OSError,FileNotFoundError,PermissionError,NotADirectoryError,IsADirectoryError,BlockingIOError,InterruptedError):category='OS_ERROR'
+        d['errorCategory']=category
+    except BaseException:
+        try:
+            if type(d) is dict:d['errorCategory']='UNKNOWN';d['counterState']='UNKNOWN'
+        except BaseException:pass
+def inventory_snapshot(d):
+    try:
+        result={'protocol':'jev-dependency-inventory-diagnostic-v1','step':'UNKNOWN','errorCategory':'UNKNOWN','counterState':'UNKNOWN',**{key:None for key in INVENTORY_COUNTER_CAPS}}
+        if type(d) is dict:
+            step=d.get('step');category=d.get('errorCategory');state=d.get('counterState')
+            if type(step) is str and step in INVENTORY_STEPS:result['step']=step
+            if type(category) is str and category in ('UNKNOWN','PREDICATE_REFUSED','OS_ERROR','OTHER'):result['errorCategory']=category
+            if type(state) is str and state in ('KNOWN','SATURATED','UNKNOWN'):result['counterState']=state
+            for key,cap in INVENTORY_COUNTER_CAPS.items():
+                value=d.get(key)
+                if type(value) is int and 0<=value<=cap:result[key]=value
+                else:result['counterState']='UNKNOWN'
+        raw=(json.dumps(result,separators=(',',':'))+'\n').encode('ascii')
+        if len(raw)<=1024:return result
+    except BaseException:pass
+    return None
+
 def need(v):
     if not v:raise RuntimeError('PRODUCTION_OWNER_REFUSED')
 def shape(s):
     return tuple(getattr(s,k) for k in ['st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_nlink','st_mtime_ns','st_ctime_ns'])
 def sha(v):need(type(v) is str and len(v)==64 and all(c in '0123456789abcdef' for c in v))
 def keys(v,w):need(type(v) is dict and set(v)==set(w))
-def read(path,cap,deadline,budget):
+def read(path,cap,deadline,budget,diagnostic=None):
+    inventory_mark(diagnostic,'READ_DEADLINE',budget)
     need(time.monotonic()<deadline)
+    inventory_mark(diagnostic,'READ_OPEN',budget)
     fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
     try:
-        a=os.fstat(fd);need(stat.S_ISREG(a.st_mode) and a.st_nlink==1 and 0<=a.st_size<=cap)
+        inventory_mark(diagnostic,'READ_STAT',budget)
+        a=os.fstat(fd)
+        inventory_mark(diagnostic,'READ_METADATA_POLICY',budget)
+        need(stat.S_ISREG(a.st_mode) and a.st_nlink==1 and 0<=a.st_size<=cap)
         chunks=[];h=hashlib.sha256();count=0
         while True:
-            need(time.monotonic()<deadline);b=os.read(fd,65536)
+            inventory_mark(diagnostic,'READ_CHUNK_DEADLINE',budget)
+            need(time.monotonic()<deadline)
+            inventory_mark(diagnostic,'READ_CHUNK',budget)
+            b=os.read(fd,65536)
             if not b:break
-            count+=len(b);budget[0]+=len(b);need(count<=cap and budget[0]+budget[1]<=HASH_TOTAL);h.update(b);chunks.append(b)
+            count+=len(b);budget[0]+=len(b)
+            inventory_mark(diagnostic,'READ_CAP_AND_HASH_BUDGET',budget)
+            need(count<=cap and budget[0]+budget[1]<=HASH_TOTAL)
+            inventory_mark(diagnostic,'READ_HASH_AND_BUFFER',budget)
+            h.update(b);chunks.append(b)
+        inventory_mark(diagnostic,'READ_FINAL_POLICY',budget)
         need(count==a.st_size and shape(a)==shape(os.fstat(fd))==shape(path.lstat()))
+        inventory_mark(diagnostic,'READ_RETURN',budget)
         return b''.join(chunks),{'sha256':h.hexdigest(),'bytes':count},fd,a
-    except BaseException:os.close(fd);raise
+    except BaseException as error:
+        inventory_error(diagnostic,error);previous=inventory_step(diagnostic)
+        inventory_mark(diagnostic,'READ_CLEANUP',budget)
+        os.close(fd)
+        inventory_mark(diagnostic,previous,budget)
+        raise
     # Caller owns the retained FD, including on every post-read failure.
 def json_value(raw,cap=CAP,canonical=False):
     need(0<len(raw)<=cap)
@@ -81,7 +155,9 @@ def canonical_fixture(raw,code,err):
 def main(admission_path):
     os.umask(0o077)
     need(sys.platform=='linux' and all(hasattr(os,k) for k in ['waitid','WNOWAIT','WEXITED','WNOHANG','P_PID']))
-    result=None
+    result=None;inventory_diagnostic=None
+    try:inventory_diagnostic={'step':'UNKNOWN','errorCategory':'UNKNOWN','counterState':'KNOWN',**{key:0 for key in INVENTORY_COUNTER_CAPS}}
+    except BaseException:pass
     root=Path(__file__).resolve().parent;deadline=time.monotonic()+TOTAL_SECONDS;budget=[0,0];held=[];receipts=[];stage='ADMISSION';out=None;active=None;interrupted=[False]
     def interrupt(_s,_f):interrupted[0]=True
     signal.signal(signal.SIGTERM,interrupt);signal.signal(signal.SIGINT,interrupt)
@@ -246,48 +322,92 @@ def main(admission_path):
         need(nc==0)
         stage='DEPENDENCY_INVENTORY'
         module_rows=[];dependency_rows=[];dependency_stats=[];module_paths=set()
+        inventory_mark(inventory_diagnostic,'ENUMERATE',budget)
         for path in sorted((project/'node_modules').rglob('*')):
+            inventory_mark(inventory_diagnostic,'ENTRY_CLASSIFICATION',budget,increment='entriesObserved')
             if path.is_symlink():
-                resolved=path.resolve();need(resolved.is_relative_to(project));continue
+                inventory_mark(inventory_diagnostic,'LINK_RESOLVE',budget,increment='symlinksObserved')
+                resolved=path.resolve()
+                inventory_mark(inventory_diagnostic,'LINK_CONTAINMENT',budget)
+                need(resolved.is_relative_to(project));continue
+            inventory_mark(inventory_diagnostic,'FILE_CLASSIFICATION',budget)
             if not path.is_file():continue
+            inventory_mark(inventory_diagnostic,'ROW_LIMIT',budget,rowsCompleted=len(dependency_rows))
             need(len(dependency_rows)<16384)
-            raw,pin,dfd,z=read(path,512*1024*1024,deadline,budget)
-            try:need(shape(z)==shape(path.lstat()))
-            finally:os.close(dfd)
-            rel=str(path.relative_to(project));dependency_rows.append({'relative':rel,**pin});dependency_stats.append((path,z))
+            raw,pin,dfd,z=read(path,512*1024*1024,deadline,budget,diagnostic=inventory_diagnostic)
+            try:
+                inventory_mark(inventory_diagnostic,'LEAF_STABILITY',budget)
+                need(shape(z)==shape(path.lstat()))
+            finally:
+                previous=inventory_step(inventory_diagnostic);inventory_mark(inventory_diagnostic,'LEAF_CLOSE',budget)
+                os.close(dfd)
+                inventory_mark(inventory_diagnostic,previous,budget)
+            inventory_mark(inventory_diagnostic,'RELATIVE_PATH',budget)
+            rel=str(path.relative_to(project))
+            inventory_mark(inventory_diagnostic,'ROW_RETENTION',budget)
+            dependency_rows.append({'relative':rel,**pin});dependency_stats.append((path,z))
+            inventory_mark(inventory_diagnostic,'ROW_RETENTION',budget,rowsCompleted=len(dependency_rows))
+        inventory_mark(inventory_diagnostic,'COMPLETE',budget)
         def runtime_closure():
+            diagnostic=inventory_diagnostic if stage=='DEPENDENCY_INVENTORY' else None
+            inventory_mark(diagnostic,'CLOSURE_ENUMERATE',budget,runtimeRowsCompleted=0,closureBytesObserved=0)
             result=[];seen=set();package_types={};installed={r['relative']:r for r in dependency_rows}
             for p in sorted(project.rglob('*')):
+                inventory_mark(diagnostic,'CLOSURE_LINK_POLICY',budget)
                 if p.is_symlink():need(p.resolve().is_relative_to(project));continue
+                inventory_mark(diagnostic,'CLOSURE_FILE_CLASSIFICATION',budget)
                 if not p.is_file() or (p.suffix not in ['.js','.mjs','.cjs','.json'] and str(p.relative_to(project))!='node_modules/typescript/bin/tsc'):continue
                 rel=str(p.relative_to(project))
                 if rel in ['runtime-closure.json','binding.json'] or rel.startswith(('entry-results/','gates/')):continue
+                inventory_mark(diagnostic,'CLOSURE_ROW_POLICY',budget)
                 need(len(result)<16384 and rel not in seen);seen.add(rel)
                 if rel in installed:pin={k:installed[rel][k] for k in ['sha256','bytes']}
                 else:
-                    raw,pin,dfd,z=read(p,16777216,deadline,budget)
-                    try:need(shape(z)==shape(p.lstat()))
-                    finally:os.close(dfd)
+                    raw,pin,dfd,z=read(p,16777216,deadline,budget,diagnostic=diagnostic)
+                    try:
+                        inventory_mark(diagnostic,'CLOSURE_LEAF_STABILITY',budget)
+                        need(shape(z)==shape(p.lstat()))
+                    finally:
+                        previous=inventory_step(diagnostic);inventory_mark(diagnostic,'CLOSURE_READ_CLOSE',budget)
+                        os.close(dfd)
+                        inventory_mark(diagnostic,previous,budget)
+                inventory_mark(diagnostic,'CLOSURE_FORMAT',budget)
                 form='json' if p.suffix=='.json' else 'module' if p.suffix=='.mjs' else 'commonjs'
                 if p.suffix=='.js':
                     parent=p.parent
                     while parent.is_relative_to(project):
+                        inventory_mark(diagnostic,'CLOSURE_PACKAGE_PATH',budget)
                         pkg=parent/'package.json'
                         if pkg.is_file():
                             # Every such manifest is included and same-byte loaded by the hook.
                             if pkg not in package_types:
-                                pr,_,pfd,_=read(pkg,SOURCE_LIMIT,deadline,budget)
-                                try:package_types[pkg]=json_value(pr,SOURCE_LIMIT).get('type')
-                                finally:os.close(pfd)
+                                inventory_mark(diagnostic,'CLOSURE_PACKAGE_READ',budget)
+                                pr,_,pfd,_=read(pkg,SOURCE_LIMIT,deadline,budget,diagnostic=diagnostic)
+                                try:
+                                    inventory_mark(diagnostic,'CLOSURE_PACKAGE_DECODE',budget)
+                                    package_types[pkg]=json_value(pr,SOURCE_LIMIT).get('type')
+                                finally:
+                                    previous=inventory_step(diagnostic);inventory_mark(diagnostic,'CLOSURE_READ_CLOSE',budget)
+                                    os.close(pfd)
+                                    inventory_mark(diagnostic,previous,budget)
                             if package_types[pkg]=='module':form='module'
                             break
                         if parent==project:break
                         parent=parent.parent
+                inventory_mark(diagnostic,'CLOSURE_ROW_RETENTION',budget)
                 result.append({'relative':rel,**pin,'format':form})
-            raw=(json.dumps({'protocol':'jev-production-runtime-closure-v1','files':result},separators=(',',':'))+'\n').encode();need(len(raw)<=SOURCE_LIMIT)
+                inventory_mark(diagnostic,'CLOSURE_ROW_RETENTION',budget,runtimeRowsCompleted=len(result))
+            inventory_mark(diagnostic,'CLOSURE_SERIALIZE',budget)
+            raw=(json.dumps({'protocol':'jev-production-runtime-closure-v1','files':result},separators=(',',':'))+'\n').encode()
+            inventory_mark(diagnostic,'CLOSURE_SIZE_POLICY',budget,closureBytesObserved=len(raw))
+            need(len(raw)<=SOURCE_LIMIT)
+            inventory_mark(diagnostic,'CLOSURE_REPLACE',budget)
             p=project/'runtime-closure.json'
             if p.exists():p.unlink()
-            write(p,raw);return result,{'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
+            inventory_mark(diagnostic,'CLOSURE_WRITE',budget)
+            write(p,raw)
+            inventory_mark(diagnostic,'COMPLETE',budget)
+            return result,{'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
         runtime_closure()
         stage='TYPESCRIPT'
         good(original('typescript',[str(node_copy),'--import',str(project/'compiler-entry.mjs'),str(project/'node_modules/typescript/bin/tsc'),'-p',str(project/'tsconfig.build.json')],60,tool='node',child_env={**env,'NODE_OPTIONS':'--max-old-space-size=512'}))
@@ -365,11 +485,13 @@ def main(admission_path):
         save(out/'result.json',summary)
         need(not interrupted[0] and time.monotonic()<deadline)
         print('JEV_PRODUCTION_OWNER_COMPLETE' if code==0 else 'JEV_PRODUCTION_OWNER_UNSUPPORTED');return code
-    except BaseException:
+    except BaseException as error:
+        inventory_failed=stage=='DEPENDENCY_INVENTORY'
+        if inventory_failed:inventory_error(inventory_diagnostic,error)
         if active:hold_without_authority()
         if not close_inputs():stage='CLEANUP'
         if out:
-            try:save(out/'result.json',{'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']}})
+            try:save(out/'result.json',{'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'inventoryDiagnostic':inventory_snapshot(inventory_diagnostic) if inventory_failed else None})
             except BaseException:pass
         print('JEV_PRODUCTION_OWNER_REFUSED',file=sys.stderr);return 2
     finally:
