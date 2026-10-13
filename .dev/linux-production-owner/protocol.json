@@ -7,8 +7,8 @@
   "normalRecoveryAccepted": false,
   "canonicalRelease": false,
   "rootRelease": false,
-  "engineBaselineHead": "d2d604065c75c05fe76e5030482cc4ae549ec9d2",
-  "engineBaselineTree": "70e29979bc276c19a93fcea90a31063ac980a69d",
+  "engineBaselineHead": "918faa92421b4f7ec687634d7e2db345abfbf821",
+  "engineBaselineTree": "945ca91d85c3c92239b846af1f06b620146be0cd",
   "serviceHead": "67ec99101ea18dc27b14ddf8a209df317f5bbdf5",
   "serviceVendoredEngine": "a76c75a7b0d21625980afc67d5943564be854819",
   "scope": "HARMLESS_CURRENT_PRODUCTION_OWNER_ONLY",
@@ -21,7 +21,7 @@
     "OWENLOOP_JEV_ONE_RELAY_HEAD",
     "OWENLOOP_JEV_ONE_RELAY_Q2_HEAD"
   ],
-  "futureHead": "Fresh actual successor commit/tree/run/attempt/job/workflow and eight ordinary current-head SUCCESS jobs require external root observation, staged review and separate one-selected-job admission. Baseline d2d604 is not a future qualifier head. Unknown POST never permits repost; remove only the owned matching gate after terminal reconciliation.",
+  "futureHead": "Fresh actual successor commit/tree/run/attempt/job/workflow and eight ordinary current-head SUCCESS jobs require external root observation, exact staged review and separate one-selected-job admission. Baseline918faa is a consumed failed qualifier, not a future qualifier head. Unknown POST never permits repost; remove only the owned matching gate after terminal reconciliation.",
   "executionFiles": [
     "owner.py",
     "launch.py",
@@ -157,7 +157,7 @@
     "roleStdio": "IGNORED"
   },
   "childEnvironment": "Fixed narrow PATH/LANG/LC_ALL/TZ/Node heap and fresh private HOME; npm receives distinct exclusive empty user/global config files plus private cache and ignore-scripts/no-audit/no-fund. No provider/service/user config or credential environment is inherited. Actions platform credentials/trust remain separate.",
-  "sourcePacketRevision": "SELECTED_INPUT_V2",
+  "sourcePacketRevision": "SELECTED_COMPILER_CATALOG_PROJECTION_V1",
   "scopeContract": "Explicit selected-consumed-input authority redesign; never equivalent to the original full installed content inventory. Original npm ci remains unchanged. Production/native source and the two-case acceptance parser remain unchanged.",
   "sourceByteOrigin": {
     "historicalProductionInventoryHead": "8892b0aa4e3d00b750b330bc4e534553cba59d4d",
@@ -210,7 +210,7 @@
     ],
     "discardedSdkRuntimeAllowed": false,
     "workerAllowed": false,
-    "catalogProtocol": "jev-selected-original-catalog-v1",
+    "catalogProtocol": "jev-selected-compiler-catalog-v2",
     "completeOriginalMetadataRequired": true,
     "catalogCapBytes": 1048576,
     "entriesCap": 32768,
@@ -308,5 +308,76 @@
     "npmCli": 33554432,
     "selfPs": 33554432
   },
-  "nativeSelectedDependencyInputCapBytes": 536870912
+  "nativeSelectedDependencyInputCapBytes": 536870912,
+  "catalogProjection": {
+    "catalogKeys": [
+      "protocol",
+      "entries",
+      "links",
+      "selectedCount",
+      "metadataOps",
+      "logicalStorageBytes",
+      "selectedBytes",
+      "snapshotOnly"
+    ],
+    "selectedCountType": "exact integer0..16384; equals len(dependency_rows)",
+    "authority": "Complete entries/links retained without filtering. Complete selection and dependency_rows remain private authoritative owner data; separate runtime-closure SHA/bytes rows and all hash reads/rechecks unchanged. Only unconsumed selected hash array duplicate serialization is omitted from compiler catalogue.",
+    "storageReservationBytes": 1048576,
+    "catalogCapBytes": 1048576,
+    "logicalStorageCapBytes": 8388608,
+    "fitProved": false,
+    "failureCauseProved": false
+  },
+  "postSelectionDiagnostic": {
+    "protocol": "jev-post-selected-catalog-diagnostic-v1",
+    "failureOnly": true,
+    "enclosingStatus": "REFUSED",
+    "enclosingStage": "DEPENDENCY_INVENTORY",
+    "frameKeys": [
+      "protocol",
+      "phase",
+      "error",
+      "counters",
+      "saturated",
+      "unknown"
+    ],
+    "maxEncodedBytesIncludingNewline": 1024,
+    "phaseEnums": [
+      "SELECTED_RETURN",
+      "PROJECT_STORAGE_BASE",
+      "PROJECT_ROWS",
+      "PROJECT_STORAGE_EXTEND",
+      "CATALOG_ENTRY_CAP",
+      "CATALOG_PROJECTION",
+      "CATALOG_SERIALIZE",
+      "CATALOG_INPUT_CAP",
+      "CATALOG_WRITE",
+      "UNKNOWN"
+    ],
+    "errorEnums": [
+      "PREDICATE_REFUSED",
+      "ALLOCATION",
+      "SERIALIZATION",
+      "OTHER",
+      "UNKNOWN"
+    ],
+    "counterKeys": [
+      "selectionEntries",
+      "selectedRows",
+      "selectionLogicalStorage",
+      "projectLogicalStorage",
+      "extraFiles",
+      "extraDirs",
+      "catalogEntries",
+      "catalogBytes"
+    ],
+    "counterType": "null until observed; exact builtin nonnegative int saturated at2147483647; bool forbidden",
+    "flagTypes": "saturated and unknown exact booleans",
+    "serializationContext": "SERIALIZATION only at CATALOG_SERIALIZE; exact TypeError/ValueError/OverflowError",
+    "originalPredicateRecognition": "Exact inert RuntimeError and BaseException.args descriptor equals singleton PRODUCTION_OWNER_REFUSED, no arbitrary errors/messages retained",
+    "window": "Initialized only after selected_installed returned; cleared after successful catalogue digest/write, all other failures null",
+    "bootstrap": "Known closed/context-consistent frames forwarded unchanged. Invalid companions replaced with null without replacing original refusal, original raw result pin remains separately retained. Companion validity is never qualification acceptance.",
+    "noAdditionalReadsHashesCustodyOperations": true,
+    "passiveFailurePolicy": "All tracker/classifier/validation failures contained. No error object, args, path, package, environment, stream or raw payload retained."
+  }
 }

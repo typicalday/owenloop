@@ -97,10 +97,52 @@ def canonical_fixture(raw,code,err):
     else:need(x['status']=='REFUSED')
     return x
 
+# Passive post-selection companion. No extra reads, hash authority or acceptance.
+CATALOG_PHASES=('SELECTED_RETURN','PROJECT_STORAGE_BASE','PROJECT_ROWS','PROJECT_STORAGE_EXTEND','CATALOG_ENTRY_CAP','CATALOG_PROJECTION','CATALOG_SERIALIZE','CATALOG_INPUT_CAP','CATALOG_WRITE','UNKNOWN')
+CATALOG_COUNTERS=('selectionEntries','selectedRows','selectionLogicalStorage','projectLogicalStorage','extraFiles','extraDirs','catalogEntries','catalogBytes')
+def catalog_state():
+    try:return {'phase':'UNKNOWN','counters':dict.fromkeys(CATALOG_COUNTERS),'saturated':False,'unknown':False}
+    except BaseException:return None
+def catalog_note(state,phase,selection=None,logical_storage=None,extra_files=None,extra_dirs=None,catalog_entries=None,catalog_raw=None):
+    try:
+        if type(state) is not dict:return
+        state['phase']=phase if phase in CATALOG_PHASES else 'UNKNOWN'
+        values={}
+        if type(selection) is dict:
+            values['selectionEntries']=len(selection['entries'])
+            values['selectedRows']=len(selection['selected'])
+            values['selectionLogicalStorage']=selection['logicalStorageBytes']
+        if logical_storage is not None:values['projectLogicalStorage']=logical_storage
+        if extra_files is not None:values['extraFiles']=len(extra_files)
+        if extra_dirs is not None:values['extraDirs']=len(extra_dirs)
+        if catalog_entries is not None:values['catalogEntries']=len(catalog_entries)
+        if catalog_raw is not None:values['catalogBytes']=len(catalog_raw)
+        for name,value in values.items():
+            if type(value) is int and value>=0:
+                state['counters'][name]=min(value,2147483647)
+                if value>2147483647:state['saturated']=True
+            else:state['counters'][name]=None;state['unknown']=True
+    except BaseException:
+        try:state['unknown']=True
+        except BaseException:pass
+def catalog_snapshot(state,error,stage):
+    try:
+        if type(state) is not dict or stage!='DEPENDENCY_INVENTORY':return None
+        code='OTHER'
+        if type(error) is RuntimeError and BaseException.args.__get__(error)==('PRODUCTION_OWNER_REFUSED',):code='PREDICATE_REFUSED'
+        elif type(error) is MemoryError:code='ALLOCATION'
+        elif state['phase']=='CATALOG_SERIALIZE' and type(error) in (TypeError,ValueError,OverflowError):code='SERIALIZATION'
+        value={'protocol':'jev-post-selected-catalog-diagnostic-v1','phase':state['phase'],'error':code,'counters':state['counters'].copy(),'saturated':state['saturated'],'unknown':state['unknown']}
+        raw=(json.dumps(value,separators=(',',':'))+'\n').encode('ascii')
+        if len(raw)<=1024:return value
+    except BaseException:pass
+    return None
+
 def main(admission_path):
     os.umask(0o077)
     need(sys.platform=='linux' and all(hasattr(os,k) for k in ['waitid','WNOWAIT','WEXITED','WNOHANG','P_PID']))
     result=None;selection_custody={'cleanupKnown':True};selection=None;meter=None
+    post_catalog=None
     root=Path(__file__).resolve().parent;deadline=time.monotonic()+TOTAL_SECONDS;budget=[0,0];held=[];receipts=[];stage='ADMISSION';out=None;active=None;interrupted=[False]
     def interrupt(_s,_f):interrupted[0]=True
     signal.signal(signal.SIGTERM,interrupt);signal.signal(signal.SIGINT,interrupt)
@@ -282,10 +324,13 @@ def main(admission_path):
         # Explicit changed authority: catalog the full installation metadata,
         # copy only declared candidates, and refuse every omitted content request.
         selection=selected_ns['selected_installed'](installation,project,deadline,interrupted,read,write,meter,selection_custody)
+        post_catalog=catalog_state()
+        catalog_note(post_catalog,'SELECTED_RETURN',selection=selection)
         if selection_custody['cleanupKnown'] is not True:hold_without_authority()
         dependency_rows=selection['selected'];dependency_stats=[]
         catalog_entries=selection['entries']
         logical_storage=selection['logicalStorageBytes']+1048576
+        catalog_note(post_catalog,'PROJECT_STORAGE_BASE',logical_storage=logical_storage)
         need(logical_storage<=8388608)
         # This finite map is declared from already-read source bytes, not a
         # second filesystem iterator or guessed absence projection.
@@ -298,19 +343,31 @@ def main(admission_path):
         for rel in extra_files:
             parts=Path(rel).parts
             for n in range(1,len(parts)):extra_dirs.add('/'.join(parts[:n]))
+        catalog_note(post_catalog,'PROJECT_ROWS',extra_files=extra_files,extra_dirs=extra_dirs)
         need(len(extra_files)+len(extra_dirs)<=4096)
         for rel in sorted(extra_dirs):
-            logical_storage+=192+4*len(os.fsencode(rel));need(logical_storage<=8388608)
+            logical_storage+=192+4*len(os.fsencode(rel))
+            catalog_note(post_catalog,'PROJECT_STORAGE_EXTEND',logical_storage=logical_storage)
+            need(logical_storage<=8388608)
             catalog_entries.append([rel,'DIRECTORY',0])
         for rel,size in sorted(extra_files.items()):
-            logical_storage+=192+4*len(os.fsencode(rel));need(logical_storage<=8388608)
+            logical_storage+=192+4*len(os.fsencode(rel))
+            catalog_note(post_catalog,'PROJECT_STORAGE_EXTEND',logical_storage=logical_storage)
+            need(logical_storage<=8388608)
             catalog_entries.append([rel,'CONTENT',size])
         catalog_entries.append(['','DIRECTORY',0])
+        catalog_note(post_catalog,'CATALOG_ENTRY_CAP',catalog_entries=catalog_entries)
         need(len(catalog_entries)<=32768)
-        catalog={**selection,'entries':catalog_entries,'logicalStorageBytes':logical_storage}
+        catalog_note(post_catalog,'CATALOG_PROJECTION')
+        catalog={'protocol':'jev-selected-compiler-catalog-v2','entries':catalog_entries,'links':selection['links'],'selectedCount':len(dependency_rows),'metadataOps':selection['metadataOps'],'logicalStorageBytes':logical_storage,'selectedBytes':selection['selectedBytes'],'snapshotOnly':selection['snapshotOnly']}
         meter.kind='metadata'
-        catalog_raw=(json.dumps(catalog,separators=(',',':'))+'\n').encode();need(len(catalog_raw)<=SOURCE_LIMIT)
+        catalog_note(post_catalog,'CATALOG_SERIALIZE')
+        catalog_raw=(json.dumps(catalog,separators=(',',':'))+'\n').encode()
+        catalog_note(post_catalog,'CATALOG_INPUT_CAP',catalog_raw=catalog_raw)
+        need(len(catalog_raw)<=SOURCE_LIMIT)
+        catalog_note(post_catalog,'CATALOG_WRITE')
         integrity_digest(catalog_raw);write(project/'original-catalog.json',catalog_raw)
+        post_catalog=None
         write(project/'source-input-contract.json',blobs['source-inventory.json'])
         # Public TypeScript sys reads a catalog-backed virtual metadata mirror.
         # No live mirror directory traversal or zero-content files are used.
@@ -462,7 +519,7 @@ def main(admission_path):
         if active:hold_without_authority()
         if not close_inputs():hold_without_authority()
         if out:
-            try:save(out/'result.json',{'selectedAuthority':{'protocol':'jev-selected-consumed-input-authority-v1','equivalentFullInventory':False,'selectedBytes':None if selection is None else selection['selectedBytes'],'metadataSnapshotOnly':True},'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'hashBudget':None if meter is None else meter.report()})
+            try:save(out/'result.json',{'selectedAuthority':{'protocol':'jev-selected-consumed-input-authority-v1','equivalentFullInventory':False,'selectedBytes':None if selection is None else selection['selectedBytes'],'metadataSnapshotOnly':True},'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'hashBudget':None if meter is None else meter.report(),'postSelectionDiagnostic':catalog_snapshot(post_catalog,error,stage)})
             except BaseException:pass
         print('JEV_PRODUCTION_OWNER_REFUSED',file=sys.stderr);return 2
     finally:

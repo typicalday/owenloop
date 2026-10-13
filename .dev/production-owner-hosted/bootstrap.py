@@ -14,7 +14,7 @@ EVENT_INPUT_CAP=1048576
 TOTAL_SECONDS=450
 HASH_CAP=32*1024*1024
 GIT_CAP=16*1024*1024
-QUALIFICATION_MANIFEST='2a7ed812f5b45a1cb0989891246b714150c942ef82aaaf847478ea8784491f6c'
+QUALIFICATION_MANIFEST='94a2c239603786655381f2bd27b8f4991aa8424b79ca8af4fa14eda0b0706fde'
 JOB='linux-production-owner-qualification'
 BASE='b4ead192326ba607558cd3bb7687209cbb7c8165'
 REPOSITORY='typicalday/owenloop'
@@ -54,6 +54,22 @@ def decode(raw,cap=CAP,canonical=False):
     value=json.loads(raw.decode('utf-8'),object_pairs_hook=pairs,parse_constant=lambda _:need(False))
     if canonical:need((json.dumps(value,separators=(',',':'),ensure_ascii=False)+'\n').encode()==raw)
     return value
+
+# Failure-only companion validation cannot replace the inner original refusal.
+def sanitize_catalog_diagnostic(inner):
+    try:
+        if 'postSelectionDiagnostic' not in inner or inner['postSelectionDiagnostic'] is None:return
+        value=inner['postSelectionDiagnostic']
+        valid=(inner.get('status')=='REFUSED' and inner.get('stage')=='DEPENDENCY_INVENTORY' and type(value) is dict and set(value)=={'protocol','phase','error','counters','saturated','unknown'})
+        valid=valid and value['protocol']=='jev-post-selected-catalog-diagnostic-v1' and value['phase'] in ('SELECTED_RETURN','PROJECT_STORAGE_BASE','PROJECT_ROWS','PROJECT_STORAGE_EXTEND','CATALOG_ENTRY_CAP','CATALOG_PROJECTION','CATALOG_SERIALIZE','CATALOG_INPUT_CAP','CATALOG_WRITE','UNKNOWN') and value['error'] in ('PREDICATE_REFUSED','ALLOCATION','SERIALIZATION','OTHER','UNKNOWN')
+        valid=valid and (value['error']!='SERIALIZATION' or value['phase']=='CATALOG_SERIALIZE')
+        valid=valid and type(value['saturated']) is bool and type(value['unknown']) is bool and type(value['counters']) is dict and set(value['counters'])=={'selectionEntries','selectedRows','selectionLogicalStorage','projectLogicalStorage','extraFiles','extraDirs','catalogEntries','catalogBytes'}
+        valid=valid and all(v is None or (type(v) is int and 0<=v<=2147483647) for v in value['counters'].values())
+        valid=valid and len((json.dumps(value,separators=(',',':'))+'\n').encode('ascii'))<=1024
+        if not valid:inner['postSelectionDiagnostic']=None
+    except BaseException:
+        try:inner['postSelectionDiagnostic']=None
+        except BaseException:pass
 
 def main():
     REFUSAL_STATE.update({'stage':'PLATFORM','eventBytes':None,'marked':False})
@@ -238,6 +254,7 @@ def main():
         raw,inner_pin,_=read(out/admission['outputName']/'result.json');inner=decode(raw,canonical=True)
         need(inner['protocol']=='jev-production-owner-qualification-result-v1')
         need((code==0 and stdout==b'JEV_PRODUCTION_OWNER_COMPLETE\n' and stderr==b'' and inner['status']=='SUPPORTED') or (code==2 and inner['status'] in ['REFUSED','UNSUPPORTED']))
+        sanitize_catalog_diagnostic(inner)
         stage='SOURCE_RECHECK';REFUSAL_STATE['stage']=stage
         need([r['slot'] for r in receipts]==['head','tree','clean','qualification-launch'])
         if code==0:need(all(r['directOriginalTerminal'] is True and r['directOriginalReaped'] is True and r['ownedPipesEOF'] is True and type(r['exitCode']) is int and r['exitCode']==0 and r['signalsSent']==0 for r in receipts))

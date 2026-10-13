@@ -4,8 +4,8 @@
   "files": [
     {
       "relative": "owner.py",
-      "sha256": "de7a3d6e6f6e3b10fd56dd8da630dcc75a0f947e51ef740eaf23e23e265c03e3",
-      "bytes": 40835
+      "sha256": "0c445572d6d128447ad07a58eb7afd2e64caa48a23117fd31fc805e5ffb558aa",
+      "bytes": 44749
     },
     {
       "relative": "launch.py",
@@ -24,8 +24,8 @@
     },
     {
       "relative": "loader.mjs",
-      "sha256": "34290fca55a3f6a319890dff8a3c7247c9b86865ccc1e3df667840c5a634cf80",
-      "bytes": 16245
+      "sha256": "3b4da6e4e1fe95374593004749cba19bcb7fbb4bd924916e8fd9f9353244eac5",
+      "bytes": 16286
     },
     {
       "relative": "fixture.mjs",
@@ -59,8 +59,8 @@
     },
     {
       "relative": "protocol.json",
-      "sha256": "b3ddfeaa0086e590b8bbb4e3e4f5c6bc126656d7e1906583787eabd4e45fe384",
-      "bytes": 16941
+      "sha256": "8271f5e3036f4e10604a59741f66de3440242327ab022c6b7be5008efaed8fd0",
+      "bytes": 19887
     },
     {
       "relative": "dependencies/owner.py",
@@ -106,8 +106,8 @@
   "executionFiles": [
     {
       "relative": "owner.py",
-      "sha256": "de7a3d6e6f6e3b10fd56dd8da630dcc75a0f947e51ef740eaf23e23e265c03e3",
-      "bytes": 40835
+      "sha256": "0c445572d6d128447ad07a58eb7afd2e64caa48a23117fd31fc805e5ffb558aa",
+      "bytes": 44749
     },
     {
       "relative": "launch.py",
@@ -126,8 +126,8 @@
     },
     {
       "relative": "loader.mjs",
-      "sha256": "34290fca55a3f6a319890dff8a3c7247c9b86865ccc1e3df667840c5a634cf80",
-      "bytes": 16245
+      "sha256": "3b4da6e4e1fe95374593004749cba19bcb7fbb4bd924916e8fd9f9353244eac5",
+      "bytes": 16286
     },
     {
       "relative": "fixture.mjs",
@@ -161,8 +161,8 @@
     },
     {
       "relative": "protocol.json",
-      "sha256": "b3ddfeaa0086e590b8bbb4e3e4f5c6bc126656d7e1906583787eabd4e45fe384",
-      "bytes": 16941
+      "sha256": "8271f5e3036f4e10604a59741f66de3440242327ab022c6b7be5008efaed8fd0",
+      "bytes": 19887
     },
     {
       "relative": "dependencies/owner.py",
@@ -213,6 +213,6 @@
   },
   "executionAdmitted": false,
   "runtimeAccepted": false,
-  "sourcePacketRevision": "SELECTED_INPUT_V2",
+  "sourcePacketRevision": "SELECTED_COMPILER_CATALOG_PROJECTION_V1",
   "selectedAuthorityEquivalentFullInventory": false
 }
