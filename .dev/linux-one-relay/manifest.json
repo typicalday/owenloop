@@ -1,0 +1,274 @@
+{
+  "caseCount": 8,
+  "childReceiptCount": 13,
+  "compilerDistributionQualified": false,
+  "executionAdmitted": false,
+  "executionFiles": [
+    {
+      "bytes": 9232,
+      "mode": 384,
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"
+    },
+    {
+      "bytes": 19973,
+      "mode": 384,
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f"
+    },
+    {
+      "bytes": 176,
+      "mode": 384,
+      "relative": "direct-entry.mjs",
+      "sha256": "b6780e0c391a0a5685b25a89cb369018b0781469fd13a5e731c377e2ae4a26ed"
+    },
+    {
+      "bytes": 175,
+      "mode": 384,
+      "relative": "entry.mjs",
+      "sha256": "71dff9af4fafb1e2e11b20194807e188ae37bf353df94cbbc9b250cb612c303f"
+    },
+    {
+      "bytes": 2383,
+      "mode": 384,
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e"
+    },
+    {
+      "bytes": 33334,
+      "mode": 384,
+      "relative": "inputs/direct/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d"
+    },
+    {
+      "bytes": 8918,
+      "mode": 384,
+      "relative": "inputs/direct/facade.mjs",
+      "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69"
+    },
+    {
+      "bytes": 444,
+      "mode": 384,
+      "relative": "inputs/direct/target.mjs",
+      "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a"
+    },
+    {
+      "bytes": 4067,
+      "mode": 384,
+      "relative": "inputs/fixture.mjs",
+      "sha256": "c1d889469c4349183e4920f42e02846d8ba86315b7695d1ed6b444acfd49da05"
+    },
+    {
+      "bytes": 8689,
+      "mode": 384,
+      "relative": "inputs/relay-facade.mjs",
+      "sha256": "110de79bbaf86a3bf5b674056571147bed0c81bef0d5c9032ee3b03625806bba"
+    },
+    {
+      "bytes": 24083,
+      "mode": 384,
+      "relative": "inputs/relay.c",
+      "sha256": "0ab068dbbd8e2b5b4cdb6a951b4619e8999658c8c818af50b0030cf976ce0576"
+    },
+    {
+      "bytes": 2578,
+      "mode": 384,
+      "relative": "inputs/role.mjs",
+      "sha256": "643835d2d5533f8aa127df7f250bfa27e7dda25de900985b23a1d4f4ecbc585c"
+    },
+    {
+      "bytes": 1395,
+      "mode": 384,
+      "relative": "inputs/supervisor.mjs",
+      "sha256": "599a4e90d65faa2a3881ab5cddc7e0b112a963c725375244127efe55200ca10b"
+    },
+    {
+      "bytes": 1636,
+      "mode": 384,
+      "relative": "launch.py",
+      "sha256": "3b4dd6b8ef5ff7d93137fc66ad41193034ce1b1f86611df991ccdbe29c31a65c"
+    },
+    {
+      "bytes": 853,
+      "mode": 384,
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5"
+    },
+    {
+      "bytes": 5540,
+      "mode": 384,
+      "relative": "loader.mjs",
+      "sha256": "02d758e544dee659849c5ca8642dd567cc45f83ce3fb87583f8ecb64aefc1410"
+    },
+    {
+      "bytes": 21989,
+      "mode": 384,
+      "relative": "owner.py",
+      "sha256": "b55903863f03dbb5a1754b1899d3b5012d22c53bf01b9ab4ba12852ee59f245d"
+    },
+    {
+      "bytes": 8964,
+      "mode": 384,
+      "relative": "protocol.json",
+      "sha256": "ce1c6b1539cf79ffd7b3446dd92b483aa9ef262890e8ac680089457a59d8fdd8"
+    }
+  ],
+  "files": [
+    {
+      "bytes": 2954,
+      "mode": 384,
+      "relative": "README.md",
+      "sha256": "8b1b676454ed93dbea7302bf4f1e3b8fdfcc6b600ba70b4768b1778a19823c4d"
+    },
+    {
+      "bytes": 479,
+      "mode": 384,
+      "relative": "admission-template.json",
+      "sha256": "5d80ac6a0093d4a025684498737e724b95f76b23563be77216fadd66c397e55a"
+    },
+    {
+      "bytes": 9232,
+      "mode": 384,
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"
+    },
+    {
+      "bytes": 19973,
+      "mode": 384,
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f"
+    },
+    {
+      "bytes": 176,
+      "mode": 384,
+      "relative": "direct-entry.mjs",
+      "sha256": "b6780e0c391a0a5685b25a89cb369018b0781469fd13a5e731c377e2ae4a26ed"
+    },
+    {
+      "bytes": 175,
+      "mode": 384,
+      "relative": "entry.mjs",
+      "sha256": "71dff9af4fafb1e2e11b20194807e188ae37bf353df94cbbc9b250cb612c303f"
+    },
+    {
+      "bytes": 2383,
+      "mode": 384,
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e"
+    },
+    {
+      "bytes": 33334,
+      "mode": 384,
+      "relative": "inputs/direct/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d"
+    },
+    {
+      "bytes": 8918,
+      "mode": 384,
+      "relative": "inputs/direct/facade.mjs",
+      "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69"
+    },
+    {
+      "bytes": 444,
+      "mode": 384,
+      "relative": "inputs/direct/target.mjs",
+      "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a"
+    },
+    {
+      "bytes": 4067,
+      "mode": 384,
+      "relative": "inputs/fixture.mjs",
+      "sha256": "c1d889469c4349183e4920f42e02846d8ba86315b7695d1ed6b444acfd49da05"
+    },
+    {
+      "bytes": 8689,
+      "mode": 384,
+      "relative": "inputs/relay-facade.mjs",
+      "sha256": "110de79bbaf86a3bf5b674056571147bed0c81bef0d5c9032ee3b03625806bba"
+    },
+    {
+      "bytes": 24083,
+      "mode": 384,
+      "relative": "inputs/relay.c",
+      "sha256": "0ab068dbbd8e2b5b4cdb6a951b4619e8999658c8c818af50b0030cf976ce0576"
+    },
+    {
+      "bytes": 2578,
+      "mode": 384,
+      "relative": "inputs/role.mjs",
+      "sha256": "643835d2d5533f8aa127df7f250bfa27e7dda25de900985b23a1d4f4ecbc585c"
+    },
+    {
+      "bytes": 1395,
+      "mode": 384,
+      "relative": "inputs/supervisor.mjs",
+      "sha256": "599a4e90d65faa2a3881ab5cddc7e0b112a963c725375244127efe55200ca10b"
+    },
+    {
+      "bytes": 1636,
+      "mode": 384,
+      "relative": "launch.py",
+      "sha256": "3b4dd6b8ef5ff7d93137fc66ad41193034ce1b1f86611df991ccdbe29c31a65c"
+    },
+    {
+      "bytes": 853,
+      "mode": 384,
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5"
+    },
+    {
+      "bytes": 5540,
+      "mode": 384,
+      "relative": "loader.mjs",
+      "sha256": "02d758e544dee659849c5ca8642dd567cc45f83ce3fb87583f8ecb64aefc1410"
+    },
+    {
+      "bytes": 21989,
+      "mode": 384,
+      "relative": "owner.py",
+      "sha256": "b55903863f03dbb5a1754b1899d3b5012d22c53bf01b9ab4ba12852ee59f245d"
+    },
+    {
+      "bytes": 8964,
+      "mode": 384,
+      "relative": "protocol.json",
+      "sha256": "ce1c6b1539cf79ffd7b3446dd92b483aa9ef262890e8ac680089457a59d8fdd8"
+    }
+  ],
+  "firstEntryTrustRequired": true,
+  "normalRecoveryAccepted": false,
+  "protocol": "jev-one-relay-qualification-manifest-v1",
+  "references": [
+    {
+      "bytes": 10494,
+      "mode": 384,
+      "path": "/Volumes/more/jev-normal-one-relay-native-component-source-v2-20261013/manifest.json",
+      "sha256": "abafbdfb3a0439dbbc80c3edfe08c7e5cb18425c05508854f532c1fa1eaef449"
+    },
+    {
+      "bytes": 4388,
+      "mode": 384,
+      "path": "/Volumes/more/jev-normal-one-relay-native-component-source-v2-20261013/protocol.json",
+      "sha256": "e6e536c95189846c2606b5ef40a1187d0537f1520a1223738c0d7954add704df"
+    },
+    {
+      "bytes": 6833,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-normal-one-relay-component-v2-independent-whole-source-review-20261013-transport.md",
+      "sha256": "3864b76ce289aa1ed75b5041683dd3f9cba08b2985edc9e10530c73a98414e1b"
+    },
+    {
+      "bytes": 26266,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-normal-one-relay-component-v2-independent-whole-source-review-20261013-transport.json",
+      "sha256": "e453a0ef803ced32d8e788bfcf717765b68e4324461c139dfe8364d5ac1abf7b"
+    },
+    {
+      "bytes": 2852,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-component-v2-root-source-disposition-20261013.json",
+      "sha256": "ae39dca5f8ecbfa21ab1cbf01d86f40004fc7d9faef160c3748cefc3f0c5e1f3"
+    }
+  ],
+  "sourceOnly": true
+}
