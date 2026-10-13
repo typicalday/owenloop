@@ -7,8 +7,8 @@
   "normalRecoveryAccepted": false,
   "canonicalRelease": false,
   "rootRelease": false,
-  "engineBaselineHead": "8892b0aa4e3d00b750b330bc4e534553cba59d4d",
-  "engineBaselineTree": "8d996573b5f646db6c038950943054a8521631ac",
+  "engineBaselineHead": "d2d604065c75c05fe76e5030482cc4ae549ec9d2",
+  "engineBaselineTree": "70e29979bc276c19a93fcea90a31063ac980a69d",
   "serviceHead": "67ec99101ea18dc27b14ddf8a209df317f5bbdf5",
   "serviceVendoredEngine": "a76c75a7b0d21625980afc67d5943564be854819",
   "scope": "HARMLESS_CURRENT_PRODUCTION_OWNER_ONLY",
@@ -21,7 +21,7 @@
     "OWENLOOP_JEV_ONE_RELAY_HEAD",
     "OWENLOOP_JEV_ONE_RELAY_Q2_HEAD"
   ],
-  "futureHead": "Actual successor commit/tree/run/attempt/job externally observed and separately root admitted, never relabel baseline8892 as successor. Eight ordinary jobs green required before one selected-job action; unknown POST has no repost/retry. Remove only the owned matching gate after terminal reconciliation.",
+  "futureHead": "Fresh actual successor commit/tree/run/attempt/job/workflow and eight ordinary current-head SUCCESS jobs require external root observation, staged review and separate one-selected-job admission. Baseline d2d604 is not a future qualifier head. Unknown POST never permits repost; remove only the owned matching gate after terminal reconciliation.",
   "executionFiles": [
     "owner.py",
     "launch.py",
@@ -39,7 +39,10 @@
     "dependencies/metadata.mjs",
     "inputs/relay.c",
     "inputs/direct/descriptor.c",
-    "overlay/packages/work/src/harness/routed-owner-observer.ts"
+    "overlay/packages/work/src/harness/routed-owner-observer.ts",
+    "selected-inputs.py",
+    "compiler-entry.mjs",
+    "initializer.mjs"
   ],
   "caseNames": [
     "CURRENT_PRODUCTION_MANAGED_OWNER_SEAM",
@@ -57,7 +60,6 @@
   "moduleLoadCapBytes": 16777216,
   "loadedModuleCapPerInitializerBytes": 33554432,
   "addonCapBytes": 8388608,
-  "toolCapBytes": 536870912,
   "innerSelectedHashCapBytes": 1073741824,
   "outerSelectedHashCapBytes": 33554432,
   "innerMemoryBudgetBytes": 1073741824,
@@ -67,7 +69,6 @@
   "nodeVersion": "22.23.0",
   "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
   "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
-  "selectedCompilerScope": "Fresh -M source/header selection plus observed cc executable; not compiler frontend/as/ld/specs/startup/runtime distribution closure. npm and TypeScript run only after fresh lock-bound install and measured selected dependencies; npm/runtime/compiler distributions remain trusted, unverified.",
   "retainedSlots": [
     "node-dependencies",
     "typescript",
@@ -136,15 +137,16 @@
   "terminal": "Positive role natural0; actual early parser role natural2. Role stdio intentionally ignored, not invented EOF. Managed settlement must be original-posix-group/empty/normal-exit:group-absent; nested individual supervisor/provider reap and pipe EOF remain UNPROVED. Supervisor existing group signals stay intact. Full native terminal closure remains unqualified.",
   "cleanup": "Role token-only status overlay makes latched cleanup refusal observable even without child. Every constructor CLEANUP and checked close failure dominates cleanupKnown/exit. Original child remains in production custody on observer refusal. External fixture cleanup sends SIGTERM only through retained original custody; fixture cancellation uses issued SpawnResult, never numeric witness. No force-kill of owner retaining detached originals; UNKNOWN_HOLD is nonterminal, no next stage/restart.",
   "remainingInputs": [
-    "Actual fresh successor head/tree/run/attempt/job and whole workflow/source audit",
-    "Fresh Linux tool/runtime/lock dependency/emitted/header/artifact closure",
-    "Separate genuine authorized Linux provider/account and complete Shift/Service NORMAL consent/native/ingress/effect/DSSE/fourguard/terminal closure"
+    "Whole actual packet independent/root source review",
+    "Separately reviewed actual publication and fresh current-head source/run/workflow context",
+    "Fresh Linux observed tools/npm selected metadata/content/header/artifact/emitted closure; enforced caps can still refuse",
+    "Separately admitted ordinary compiler parity validation before CLI parity claim",
+    "Genuine authorized Linux provider/account and complete Shift/Service NORMAL consent/native/ingress/effect/DSSE/four-guard/terminal closure remain separate"
   ],
   "providerAccessQualified": false,
   "all23ExitsPreserved": true,
   "healthyBigserver": "STOP",
   "compilerHookInitializerEntries": 1,
-  "hashAccounting": "Owner reads reserve one measured Node image plus six32MiB module initializer ceilings (five fixture entries, one compiler hook) plus three8MiB addon ceilings before dependency/compiler/fixture actions; final addon bound uses actual measured bytes. Same generated binding/declaration/runtime-closure pins are retained before fixture and checked after; emitted/nondependency module bytes are rehashed, installed dependency metadata rechecked, runtime imports hash/execute same read bytes.",
   "runtimeResultShape": {
     "fixtureKeys": 14,
     "sampleKeys": 7,
@@ -154,11 +156,157 @@
     "nestedIndividualEOF": "UNPROVED",
     "roleStdio": "IGNORED"
   },
-  "buildInvocation": "Actual owned Node22.23 executable + fixed compiler-entry.mjs registerHooks + fresh lock-selected node_modules/typescript/bin/tsc -p tsconfig.build.json; no Mac emitted outputs/native artifacts are used.",
   "childEnvironment": "Fixed narrow PATH/LANG/LC_ALL/TZ/Node heap and fresh private HOME; npm receives distinct exclusive empty user/global config files plus private cache and ignore-scripts/no-audit/no-fund. No provider/service/user config or credential environment is inherited. Actions platform credentials/trust remain separate.",
-  "sourcePacketRevision": "V2",
-  "correctionScope": [
-    "PO1: passive UNKNOWN_HOLD stderr write/error containment leaves original retention independent of notification",
-    "PO2: transferred raw FD4 with no returned observer token reports cleanupKnown=false/CLEANUP without raw close retry"
-  ]
+  "sourcePacketRevision": "SELECTED_INPUT_V2",
+  "scopeContract": "Explicit selected-consumed-input authority redesign; never equivalent to the original full installed content inventory. Original npm ci remains unchanged. Production/native source and the two-case acceptance parser remain unchanged.",
+  "sourceByteOrigin": {
+    "historicalProductionInventoryHead": "8892b0aa4e3d00b750b330bc4e534553cba59d4d",
+    "currentProductionRows": 206,
+    "currentProductionBytes": 4351035,
+    "currentRowsByteIdentical": true,
+    "compiledProofTransferred": false
+  },
+  "hashAccounting": {
+    "innerCapBytes": 1073741824,
+    "outerCapBytes": 33554432,
+    "conditionalEnvelopeBytes": 1016070144,
+    "unassignedSlackBytes": 57671680,
+    "fitMeasured": false,
+    "partitionsMiB": {
+      "initial": 288,
+      "ownNode": 128,
+      "modules": 192,
+      "addons": 40,
+      "headers": 17,
+      "selected": 128,
+      "compiler": 64,
+      "late": 64,
+      "native": 32,
+      "metadata": 16
+    },
+    "reserveBeforeActions": [
+      "ownNode",
+      "modules",
+      "addons",
+      "headers",
+      "compiler"
+    ],
+    "reservationBytes": 462422016,
+    "moduleInitializers": 6,
+    "modulePerInitializerCap": 33554432,
+    "addonActualPasses": 5,
+    "addonPerPassCap": 8388608,
+    "headerArchiveCap": 16777216,
+    "headerSelectedCap": 262144,
+    "policy": "Nonrefundable attempted parent reads and metadata digests; child read inputs plus public private-source hash updates conservatively charged, even where the same bytes are counted twice. Initializer and addon cardinality is enforced for these exact trusted entries; actual child receipt charges replace their reserved credit once only. Reservations are not released as savings. Rejected/unknown child work retains its reservation and cannot pass. No universal npm/compiler/runtime distribution crypto gate is asserted. readFixed checks remaining declared input allowance before allocation/read; metadata resource chunk overrun refuses. All six accepted process receipts are closed, integer-bounded and lifetime-specific; any failed or missing receipt retains reservation. Logical catalogue storage and bounded runtime-closure containers are not claimed as measured RSS."
+  },
+  "selectedAuthority": {
+    "npmOriginal": "unchanged ci --ignore-scripts --no-audit --no-fund, separate owned installation",
+    "candidate": "All TypeScript and semver/yaml/@cfworker/json-schema package contents plus .ts/.mts/.cts/.js/.mjs/.cjs/.json candidates from all installed package paths. Suffixes are candidate selection, never proof of consumed closure. Any omitted existing consumer refuses.",
+    "runtimePackages": [
+      "semver",
+      "yaml",
+      "@cfworker/json-schema"
+    ],
+    "discardedSdkRuntimeAllowed": false,
+    "workerAllowed": false,
+    "catalogProtocol": "jev-selected-original-catalog-v1",
+    "completeOriginalMetadataRequired": true,
+    "catalogCapBytes": 1048576,
+    "entriesCap": 32768,
+    "directoriesCap": 4096,
+    "depthCap": 64,
+    "frontierCap": 65,
+    "pathBytesCap": 4096,
+    "metadataOpsCap": 260000,
+    "cleanupMetadataOpsCap": 262144,
+    "logicalStorageCapBytes": 8388608,
+    "selectedOriginalContentCapBytes": 67108864,
+    "selectedCopyTwoReadChargeCapBytes": 134217728,
+    "metadataSemantics": "Original directory/regular/link names and types are completely bounded or selection refuses. Existing omitted leaf is METADATA_ONLY, distinct from genuine catalogue absence. Source-owned anchored no-follow directory FDs and leaf same-FD/path shape protect acquisition; links remain contained in the fresh owned tree. This is a snapshot, not a global filesystem immutability claim. Logical storage is accounting, not allocator/RSS proof. Core operations are metered and anticipated same-FD read/write metadata credits are reserved before content copy. Fresh destination directories are created once; no parent recursion is used in selected copy. Extra tracked/private catalogue rows come from finite verified source maps rather than a second filesystem scan."
+  },
+  "compilerContract": {
+    "version": "5.9.3",
+    "publicAPI": "getParsedCommandLineOfConfigFile, createCompilerHost, createProgram, getPreEmitDiagnostics, emit",
+    "config": "Exact tracked tsconfig.build.json and tsconfig.json, options/root names/project references/config diagnostics are retained. Declared root names must exactly equal the existing tracked .ts inventory.",
+    "host": "All read/existence/directory/realpath/current-dir/default-lib/environment/write callbacks are explicit. Default getSourceFile closes over overridden compilerHost.readFile; its caught read failure is made sticky. Default option-specific getNewLine and createHash remain from createCompilerHost. UTF8 BOM/UTF16 LE/BE handling is source-declared.",
+    "metadata": "ts.sys.readDirectory keeps TypeScript glob semantics. Its mirror readdir/stat/realpath public-fs calls use only catalogue metadata; there are no live mirror directory reads, symlink follows or zero-content substitutions. Calls/row scans cap1048576; catalogue entries/path/depth/storage caps bound arrays.",
+    "outputCapBytes": 33554432,
+    "readBufferCacheCapBytes": 67108864,
+    "hostileSameProcessSandboxClaimed": false,
+    "ordinaryCliParityProved": false,
+    "ordinaryCliParityGate": "A separately admitted actual compiler parity review/original is required before claiming CLI diagnostic/emit/exit parity. This source implements the explicit API contract; current fixture does not constitute generic tsc CLI equivalence."
+  },
+  "lifetimeContract": {
+    "entryProfiles": [
+      "compiler",
+      "fixture",
+      "positiveRole",
+      "parserRole",
+      "supervisor",
+      "provider"
+    ],
+    "hookInstallCapPerProcess": 1,
+    "uninstall": "Assert policy and retain hook until original exit; no deregister/reset/unhooked tail.",
+    "worker": "Node22.23 permission denies Worker; worker_threads/cluster/vm imports are additionally refused; no allow-worker flag.",
+    "childQuotas": {
+      "compiler": 0,
+      "fixture": 2,
+      "positiveRole": 1,
+      "parserRole": 0,
+      "supervisor": 1,
+      "provider": 0
+    },
+    "addonQuotas": {
+      "compiler": 0,
+      "fixture": 2,
+      "positiveRole": 1,
+      "parserRole": 1,
+      "supervisor": 1,
+      "provider": 0
+    },
+    "firstEntry": "Node/loader/compiler entry and permission implementation remain trusted first entries. Hooks affect later canonical registered loads. Every six-entry preload map is explicit; no env/Hub remote module or provider selection is admitted.",
+    "rawResources": "Only declared copied rows and fixed gate/result/own-proc resources are admitted. Raw async/open-stream consumers outside implemented interfaces refuse; runtime package/resource URLs must be canonical declared rows. Runtime SDK use refuses. Source inputs are read-only under private Node permission; output write scope is fixed. Trusted native/platform/tool code is not a malicious-process security boundary."
+  },
+  "warningPolicy": {
+    "source": "Node22.23 pre_execution.js and warning.js; no suppression",
+    "privateFiles": [
+      "warnings/fixture.txt",
+      "warnings/positiveRole.txt",
+      "warnings/parserRole.txt",
+      "warnings/supervisor.txt",
+      "warnings/provider.txt"
+    ],
+    "recordsPerFile": 1,
+    "fileInputCapBytes": 65536,
+    "expectedFlags": {
+      "fixture": [
+        "--allow-addons",
+        "--allow-child-process"
+      ],
+      "positiveRole": [
+        "--allow-addons",
+        "--allow-child-process"
+      ],
+      "parserRole": [
+        "--allow-addons"
+      ],
+      "supervisor": [
+        "--allow-addons",
+        "--allow-child-process"
+      ],
+      "provider": []
+    },
+    "interpretation": "Each exact initializer has a separate source-owned precreated empty private file, with no cross-original inheritance. Provider NODE_OPTIONS is separately source-owned. Exact version-specific messages, one hint per warning-bearing process and complete distinct source record are privately checked; only length/hash/count/fixed classification is public. Subsequent public emitWarning calls refuse; unknown/additional/oversize records cannot pass. Node first-entry warning scheduling/append and internal FD teardown are explicit platform trust, not a claimed hard file-size limit or independently checked native FD close. Terminal scoped settlement and stable owner FD/path checks precede acceptance. External stderr remains empty for good()/fixture; raw warning bytes are never uploaded."
+  },
+  "buildInvocation": "Same source-owned Node22.23 executable, explicit compiler-entry.mjs public API, exact config/root/options/declarations/emission contract. No Mac output/artifact transfer. Actual CLI behavior parity remains unproved.",
+  "selectedCompilerScope": "Fresh bounded -M preprocessing selection and measured selected header bytes plus observed cc image; not frontend/as/ld/specs/startup/linker/runtime distribution closure. npm/TypeScript/runtime/compiler distributions remain explicit trusted unverified inputs.",
+  "observedExecutableInputCapsBytes": {
+    "node": 134217728,
+    "cc": 33554432,
+    "python": 33554432,
+    "npmCli": 33554432,
+    "selfPs": 33554432
+  },
+  "nativeSelectedDependencyInputCapBytes": 536870912
 }

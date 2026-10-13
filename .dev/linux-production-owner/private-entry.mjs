@@ -106,7 +106,7 @@ process.stdout.on('error', handleStreamError);
 process.stderr.on('error', handleStreamError);
 
 import { install, writeFixed, uninstall } from '../loader.mjs';
-install();
+install('parserRole');
 // This separate private entry is selected only by the trusted local Shift
 // composition. Public bin/owenloop.mjs is unchanged. FD4 belongs to this entry;
 // the original IPC3 gate above must complete before loading any role code.

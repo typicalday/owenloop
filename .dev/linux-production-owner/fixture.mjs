@@ -1,9 +1,9 @@
-import { install,binding,jsonFixed,readFixed,fixed,uninstall,measureOwn } from './loader.mjs';
+import { install,binding,jsonFixed,readFixed,fixed,uninstall,measureOwn,privateNodeOptions } from './loader.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-install();
+install('fixture');
 await measureOwn();
 const b=binding();
 const {createRoutedOwnerOuterObserver,outerOwnerObserverStatus}=await import('./dist/packages/work/src/harness/routed-owner-observer.js');
@@ -19,7 +19,10 @@ async function runRole(observer,which){
  const g=gate(which);let exitResolve,terminal=false;
  const ended=new Promise(r=>{exitResolve=r;});let entered=false;
  const spawn=createDefaultSpawner('https://invalid.invalid','harmless',which==='positive'?b.roleEntry:b.privateEntry,undefined,()=>{},undefined,undefined,r=>{terminal=true;exitResolve({code:r.exitStatus,signal:r.signal===null?'NONE':'SIGNAL'});},observer);
- const r=spawn({workflow:which==='positive'?'harmless':'',run:which,kind:'agent-run',startGate:g.path,routingHandoff:g.handoff,dispatchToken:g.token,onGateEntered(){entered=true;},canAllowGateEntry:()=>!terminal,onTerminal(){}});
+ let r;const priorOptions=process.env.NODE_OPTIONS;
+ try{process.env.NODE_OPTIONS=privateNodeOptions(which==='positive'?'positiveRole':'parserRole');
+ r=spawn({workflow:which==='positive'?'harmless':'',run:which,kind:'agent-run',startGate:g.path,routingHandoff:g.handoff,dispatchToken:g.token,onGateEntered(){entered=true;},canAllowGateEntry:()=>!terminal,onTerminal(){}});
+ }finally{if(priorOptions===undefined)delete process.env.NODE_OPTIONS;else process.env.NODE_OPTIONS=priorOptions;}
  need(r.custody&&r.armGateEntry);roles.push({observer,custody:r.custody,ended,cancel:r.cancel,terminal:()=>terminal});
  r.armGateEntry();fs.writeFileSync(g.path,'start',{flag:'w',mode:0o600});return {r,ended,entered:()=>entered};
 }

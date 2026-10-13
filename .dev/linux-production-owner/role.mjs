@@ -107,8 +107,8 @@ process.stderr.on('error', handleStreamError);
 
 
 // Private harmless entry; gate/IPC3 prefix above is unchanged.
-import { install,binding,writeFixed,fixed,uninstall } from '../loader.mjs';
-install();
+import { install,binding,writeFixed,fixed,uninstall,privateNodeOptions,declareSupervisor } from '../loader.mjs';
+install('positiveRole');
 let observer,ownerModule,client,stage='ENTRY',code='NOT_APPLICABLE',cleanup=true,settlement=null,workComplete=false;
 let raw4=true,fd4Adopted=false,interrupted=false;process.on('SIGTERM',()=>{interrupted=true;});process.on('SIGINT',()=>{interrupted=true;});
 try{
@@ -117,8 +117,10 @@ try{
  ownerModule=await import('../dist/packages/work/src/harness/routed-owner-observer.js');
  raw4=false;observer=ownerModule.createRoutedOwnerRoleObserver(b.artifact,b.artifactSha256);fd4Adopted=true;
  const {startManagedStdioRpc}=await import('../dist/packages/work/src/harness/jsonrpc-stdio.js');
+ const {ROUTED_OBSERVED_STDIO_SUPERVISOR}=await import('../dist/packages/work/src/harness/routed-stdio-supervisor.js');
+ declareSupervisor(ROUTED_OBSERVED_STDIO_SUPERVISOR);
  stage='MANAGED_START';
- client=startManagedStdioRpc({command:process.execPath,args:[b.provider],env:{NODE_OPTIONS:'--max-old-space-size=192'},ownerObserver:observer,requestTimeoutMs:10000,onNotification(){},onServerRequest:async()=>null,onStderr(){},onExit(){}});
+ client=startManagedStdioRpc({command:process.execPath,args:[b.provider],env:{NODE_OPTIONS:privateNodeOptions('supervisor')},ownerObserver:observer,requestTimeoutMs:10000,onNotification(){},onServerRequest:async()=>null,onStderr(){},onExit(){}});
  await client.ready;
  // No sample count barrier. Ordinary fixture RPC lifetime is independent.
  const work=client.request('bounded-work',{},10000);

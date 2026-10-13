@@ -18,261 +18,43 @@ SLOTS=['node-dependencies','typescript','headers','dependencies','libc-build','l
 CASE_NAMES=['CURRENT_PRODUCTION_MANAGED_OWNER_SEAM','PRIVATE_AGENT_ENTRY_PARSE_REFUSAL_CLEANUP']
 STAGES=['ADMISSION','SOURCE_BINDING','TOOL_BINDING','SOURCE_MATERIALIZATION','NODE_DEPENDENCIES','DEPENDENCY_INVENTORY','TYPESCRIPT','HEADER_DISCOVERY','DEPENDENCY_DISCOVERY','DEPENDENCY_BINDING','LIBC_BUILD','LIBC_ABI','ADDON_BUILD','ARTIFACT_BINDING','ENTRY_BINDING','FIXTURE','RESULT_VALIDATION','SOURCE_RECHECK','RESULT_RETENTION','CLEANUP','UNKNOWN']
 
-# Passive inventory diagnostics: no source paths, values or acceptance authority.
-INVENTORY_STEPS=frozenset(('ENUMERATE','ENTRY_CLASSIFICATION','LINK_RESOLVE','LINK_CONTAINMENT','FILE_CLASSIFICATION','ROW_LIMIT','READ_DEADLINE','READ_OPEN','READ_STAT','READ_METADATA_POLICY','READ_CHUNK_DEADLINE','READ_CHUNK','READ_CAP_AND_HASH_BUDGET','READ_HASH_AND_BUFFER','READ_FINAL_POLICY','READ_RETURN','READ_CLEANUP','LEAF_STABILITY','LEAF_CLOSE','RELATIVE_PATH','ROW_RETENTION','CLOSURE_ENUMERATE','CLOSURE_LINK_POLICY','CLOSURE_FILE_CLASSIFICATION','CLOSURE_ROW_POLICY','CLOSURE_FORMAT','CLOSURE_PACKAGE_PATH','CLOSURE_PACKAGE_READ','CLOSURE_PACKAGE_DECODE','CLOSURE_READ_CLOSE','CLOSURE_LEAF_STABILITY','CLOSURE_ROW_RETENTION','CLOSURE_SERIALIZE','CLOSURE_SIZE_POLICY','CLOSURE_REPLACE','CLOSURE_WRITE','COMPLETE','UNKNOWN'))
-INVENTORY_COUNTER_CAPS={'entriesObserved':65536,'symlinksObserved':65536,'rowsCompleted':16384,'runtimeRowsCompleted':16384,'closureBytesObserved':SOURCE_LIMIT+1,'bytesHashed':HASH_TOTAL+65536,'bytesReserved':HASH_TOTAL}
-def inventory_mark(d,step,budget=None,increment=None,**values):
-    try:
-        if d is None:return
-        d['step']=step if type(step) is str and step in INVENTORY_STEPS else 'UNKNOWN'
-        if budget is not None:values.update(bytesHashed=budget[0],bytesReserved=budget[1])
-        if increment in INVENTORY_COUNTER_CAPS:
-            value=d.get(increment)
-            if type(value) is int and value>=0:values[increment]=value+1
-            else:d[increment]=None;d['counterState']='UNKNOWN'
-        for key,value in values.items():
-            if key not in INVENTORY_COUNTER_CAPS:continue
-            if type(value) is not int or value<0:d[key]=None;d['counterState']='UNKNOWN'
-            else:
-                cap=INVENTORY_COUNTER_CAPS[key];d[key]=min(value,cap)
-                if value>cap and d['counterState']!='UNKNOWN':d['counterState']='SATURATED'
-    except BaseException:
-        try:
-            if type(d) is dict:d['step']='UNKNOWN';d['counterState']='UNKNOWN'
-        except BaseException:pass
-def inventory_step(d):
-    try:return d['step'] if d is not None else 'UNKNOWN'
-    except BaseException:return 'UNKNOWN'
-def inventory_error(d,error):
-    try:
-        if d is None:return
-        category='OTHER'
-        if type(error) is RuntimeError:
-            args=BaseException.args.__get__(error)
-            if type(args) is tuple and len(args)==1 and type(args[0]) is str and args[0]=='PRODUCTION_OWNER_REFUSED':category='PREDICATE_REFUSED'
-        elif type(error) in (OSError,FileNotFoundError,PermissionError,NotADirectoryError,IsADirectoryError,BlockingIOError,InterruptedError):category='OS_ERROR'
-        d['errorCategory']=category
-    except BaseException:
-        try:
-            if type(d) is dict:d['errorCategory']='UNKNOWN';d['counterState']='UNKNOWN'
-        except BaseException:pass
-def inventory_snapshot(d):
-    try:
-        result={'protocol':'jev-dependency-inventory-diagnostic-v1','step':'UNKNOWN','errorCategory':'UNKNOWN','counterState':'UNKNOWN',**{key:None for key in INVENTORY_COUNTER_CAPS}}
-        if type(d) is dict:
-            step=d.get('step');category=d.get('errorCategory');state=d.get('counterState')
-            if type(step) is str and step in INVENTORY_STEPS:result['step']=step
-            if type(category) is str and category in ('UNKNOWN','PREDICATE_REFUSED','OS_ERROR','OTHER'):result['errorCategory']=category
-            if type(state) is str and state in ('KNOWN','SATURATED','UNKNOWN'):result['counterState']=state
-            for key,cap in INVENTORY_COUNTER_CAPS.items():
-                value=d.get(key)
-                if type(value) is int and 0<=value<=cap:result[key]=value
-                else:result['counterState']='UNKNOWN'
-        raw=(json.dumps(result,separators=(',',':'))+'\n').encode('ascii')
-        if len(raw)<=1024:return result
-    except BaseException:pass
-    return None
-
-# Passive stat sizing owns only no-follow directory descriptors/iterators.
-# Its observations never replace the original content selection or predicates.
-SIZING_LIMITS={'entries':32768,'directories':4096,'depth':64,'frontier':65,
-    'pathBytes':4096,'storageBytes':8388608,'workMetadataOps':260000,
-    'metadataOps':262144,'regularFiles':16384,'integer':9007199254740991}
-SIZING_REASONS=frozenset(('NONE','ENTRY_LIMIT','DIRECTORY_LIMIT','DEPTH_LIMIT',
-    'FRONTIER_LIMIT','PATH_LIMIT','STORAGE_LIMIT','METADATA_LIMIT','ROW_LIMIT',
-    'DEADLINE','METADATA_UNCERTAIN','TYPE_OR_IDENTITY_CHANGED','INVALID_SIZE',
-    'SATURATED','INTERNAL_UNKNOWN','CLEANUP_UNCERTAIN'))
-class SizingStop(Exception):pass
-def installed_stat_sizing(project,owner_deadline,budget,interrupted,custody):
-    values={'entries':0,'links':0,'regularFiles':0,'directories':0,
-        'metadataOps':0,'storedPathBytes':0,'storageBytes':262144,
-        'selectedBytes':0,'oversizedFiles':0}
-    start_owner,start_reserve=budget[0],budget[1]
-    deadline=min(owner_deadline,time.monotonic()+5)
-    fds=[];iterators=[];stack=[];seen=set();cleanup_known=True
-    custody['cleanupKnown']=False;custody['resources']=(fds,iterators)
-    uncertain_records=[None]*264;custody['uncertainCloseRecords']=uncertain_records
-    uncertain_count=0
-    state='UNKNOWN';reason='INTERNAL_UNKNOWN'
-    def stop(code):raise SizingStop(code)
-    def check():
-        if interrupted[0] or time.monotonic()>=deadline:stop('DEADLINE')
-    def op(call):
-        check()
-        if values['metadataOps']>=SIZING_LIMITS['workMetadataOps']:stop('METADATA_LIMIT')
-        values['metadataOps']+=1
-        return call()
-    def path_storage(parent,name):
-        # Bound characters before allocating the combined encoded path.
-        if type(name) is not str or name in ('','.','..') or '/' in name:stop('METADATA_UNCERTAIN')
-        if len(parent)+len(name)+1>SIZING_LIMITS['pathBytes']:stop('PATH_LIMIT')
-        rel=parent+'/'+name if parent else name
-        n=len(os.fsencode(rel))
-        if n>SIZING_LIMITS['pathBytes']:stop('PATH_LIMIT')
-        # Logical diagnostic accounting, not allocator/RSS certification.
-        charge=1024+4*n
-        if values['storageBytes']+charge>SIZING_LIMITS['storageBytes']:stop('STORAGE_LIMIT')
-        values['storageBytes']+=charge;values['storedPathBytes']+=n
-        return rel
-    def acquire_fd(call):
-        record=[None,False];fds.append(record)
-        record[0]=op(call);return record[0]
-    def acquire_iterator(call):
-        record=[None,False];iterators.append(record)
-        record[0]=op(call);return record[0]
-    def uncertain(record):
-        nonlocal cleanup_known,uncertain_count
-        cleanup_known=False;custody['cleanupKnown']=False
-        uncertain_records[uncertain_count]=record;uncertain_count+=1
-    def close_resource(record,kind):
-        nonlocal cleanup_known
-        if record[0] is None or record[1]:return cleanup_known
-        try:values['metadataOps']+=1
-        except BaseException:uncertain(record)
-        # Own fixed list data, not caller objects; retain the record and mark a
-        # single attempted close before invoking the syscall/iterator closer.
-        record[1]=True
-        try:
-            if kind=='FD':os.close(record[0])
-            else:record[0].close()
-        except BaseException:uncertain(record)
-        return cleanup_known
-    def enter(parent_fd,name,rel,depth,expected):
-        if depth>SIZING_LIMITS['depth']:stop('DEPTH_LIMIT')
-        if len(stack)>=SIZING_LIMITS['frontier']:stop('FRONTIER_LIMIT')
-        if len(seen)>=SIZING_LIMITS['directories']:stop('DIRECTORY_LIMIT')
-        fd=acquire_fd(lambda:os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd))
-        actual=op(lambda:os.fstat(fd))
-        if not stat.S_ISDIR(actual.st_mode) or shape(actual)!=shape(expected):stop('TYPE_OR_IDENTITY_CHANGED')
-        ident=(actual.st_dev,actual.st_ino)
-        if ident in seen:stop('TYPE_OR_IDENTITY_CHANGED')
-        seen.add(ident);values['directories']+=1
-        it=acquire_iterator(lambda:os.scandir(fd))
-        stack.append((fd,it,actual,rel,depth,fds[-1],iterators[-1]))
-    try:
-        # The project is a freshly created private source-owned directory.
-        projectfd=acquire_fd(lambda:os.open(project,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC))
-        project_stat=op(lambda:os.fstat(projectfd))
-        if not stat.S_ISDIR(project_stat.st_mode):stop('TYPE_OR_IDENTITY_CHANGED')
-        root_stat=op(lambda:os.stat('node_modules',dir_fd=projectfd,follow_symlinks=False))
-        enter(projectfd,'node_modules','node_modules',0,root_stat)
-        while stack:
-            fd,it,before,parent,depth,fd_record,it_record=stack[-1]
-            # One bounded nonrecursive iterator step. No rglob-internal descent.
-            try:entry=op(lambda:next(it))
-            except StopIteration:
-                after=op(lambda:os.fstat(fd))
-                if shape(before)!=shape(after):stop('TYPE_OR_IDENTITY_CHANGED')
-                ok_iterator=close_resource(it_record,'ITERATOR');ok_fd=close_resource(fd_record,'FD')
-                iterators.remove(it_record);fds.remove(fd_record);stack.pop()
-                if not ok_iterator or not ok_fd:stop('CLEANUP_UNCERTAIN')
-                continue
-            if values['entries']>=SIZING_LIMITS['entries']:stop('ENTRY_LIMIT')
-            values['entries']+=1
-            name=entry.name;rel=path_storage(parent,name)
-            first=op(lambda:os.stat(name,dir_fd=fd,follow_symlinks=False))
-            if stat.S_ISLNK(first.st_mode):values['links']+=1;continue
-            second=op(lambda:os.stat(name,dir_fd=fd,follow_symlinks=False))
-            if shape(first)!=shape(second):stop('TYPE_OR_IDENTITY_CHANGED')
-            if stat.S_ISDIR(first.st_mode):
-                enter(fd,name,rel,depth+1,second)
-            elif stat.S_ISREG(first.st_mode):
-                if values['regularFiles']>=SIZING_LIMITS['regularFiles']:stop('ROW_LIMIT')
-                size=first.st_size
-                if type(size) is not int or size<0:stop('INVALID_SIZE')
-                if size>SIZING_LIMITS['integer'] or values['selectedBytes']+size>SIZING_LIMITS['integer']:stop('SATURATED')
-                values['regularFiles']+=1
-                values['selectedBytes']+=size
-                if size>512*1024*1024:values['oversizedFiles']+=1
-        # Anonymous sums need no leaf rows, sort keys or diagnostic sorting.
-        # The original sorted content walk still executes independently.
-        check()
-        if shape(project_stat)!=shape(op(lambda:os.fstat(projectfd))):stop('TYPE_OR_IDENTITY_CHANGED')
-        state='SIZED_SNAPSHOT';reason='NONE'
-    except SizingStop as error:
-        args=BaseException.args.__get__(error)
-        reason=args[0] if len(args)==1 and args[0] in SIZING_REASONS else 'INTERNAL_UNKNOWN'
-    except BaseException:reason='METADATA_UNCERTAIN'
-    finally:
-        # Reserve2044 operation credits for <=66 FDs and65 iterators. Attempt
-        # every known resource once even after the deadline or an earlier close.
-        while iterators:
-            close_resource(iterators[-1],'ITERATOR');iterators.pop()
-        while fds:
-            close_resource(fds[-1],'FD');fds.pop()
-        custody['cleanupKnown']=cleanup_known
-        if not cleanup_known:state='UNKNOWN';reason='CLEANUP_UNCERTAIN'
-    result={'protocol':'jev-installed-stat-sizing-v1','observationState':state,
-        'reason':reason,**values,'ownerBytesAtStart':start_owner,
-        'reserveBytesAtStart':start_reserve,'projectedInventoryTotal':None,
-        'exceedsCurrentCap':None,'correspondence':'NOT_CHECKED',
-        'linkContainment':'UNCHECKED_BY_SIZING','cleanupKnown':cleanup_known,
-        'fullFitProved':False}
-    if state=='SIZED_SNAPSHOT':
-        total=start_owner+start_reserve+values['selectedBytes']
-        if total<=SIZING_LIMITS['integer']:
-            result['projectedInventoryTotal']=total;result['exceedsCurrentCap']=total>HASH_TOTAL
-        else:result['observationState']='UNKNOWN';result['reason']='SATURATED'
-    return result,cleanup_known
-def sizing_snapshot(d):
-    # Only internal owned dict primitives; malformed/serializer failures do not
-    # replace the original exception or export paths, exception args or objects.
-    try:
-        names=['protocol','observationState','reason','entries','links','regularFiles',
-            'directories','metadataOps','storedPathBytes','storageBytes','selectedBytes',
-            'oversizedFiles','ownerBytesAtStart','reserveBytesAtStart',
-            'projectedInventoryTotal','exceedsCurrentCap','correspondence',
-            'linkContainment','cleanupKnown','fullFitProved']
-        if type(d) is not dict or set(d)!=set(names):return None
-        if d['protocol']!='jev-installed-stat-sizing-v1' or d['observationState'] not in ('SIZED_SNAPSHOT','UNKNOWN'):return None
-        if d['reason'] not in SIZING_REASONS or d['correspondence']!='NOT_CHECKED' or d['linkContainment']!='UNCHECKED_BY_SIZING' or d['fullFitProved'] is not False:return None
-        for key in names[3:14]:
-            if type(d[key]) is not int or not 0<=d[key]<=SIZING_LIMITS['integer']:return None
-        if d['projectedInventoryTotal'] is not None and (type(d['projectedInventoryTotal']) is not int or not 0<=d['projectedInventoryTotal']<=SIZING_LIMITS['integer']):return None
-        if d['exceedsCurrentCap'] is not None and type(d['exceedsCurrentCap']) is not bool:return None
-        if type(d['cleanupKnown']) is not bool:return None
-        raw=(json.dumps(d,separators=(',',':'))+'\n').encode('ascii')
-        if len(raw)<=1024:return d.copy()
-    except BaseException:pass
-    return None
-
 def need(v):
     if not v:raise RuntimeError('PRODUCTION_OWNER_REFUSED')
+CLOSE_UNCERTAIN=False
+UNCERTAIN_CLOSE_RECORDS=[None]*8192
+UNCERTAIN_CLOSE_COUNT=0
+def checked_close(fd):
+    global CLOSE_UNCERTAIN,UNCERTAIN_CLOSE_COUNT
+    try:os.close(fd)
+    except BaseException:
+        CLOSE_UNCERTAIN=True
+        # Fixed preallocated retention; never retry a failed numeric close.
+        if UNCERTAIN_CLOSE_COUNT<len(UNCERTAIN_CLOSE_RECORDS):
+            UNCERTAIN_CLOSE_RECORDS[UNCERTAIN_CLOSE_COUNT]=fd;UNCERTAIN_CLOSE_COUNT+=1
+        raise
+
 def shape(s):
     return tuple(getattr(s,k) for k in ['st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_nlink','st_mtime_ns','st_ctime_ns'])
 def sha(v):need(type(v) is str and len(v)==64 and all(c in '0123456789abcdef' for c in v))
 def keys(v,w):need(type(v) is dict and set(v)==set(w))
-def read(path,cap,deadline,budget,diagnostic=None):
-    inventory_mark(diagnostic,'READ_DEADLINE',budget)
+def read(path,cap,deadline,budget):
     need(time.monotonic()<deadline)
-    inventory_mark(diagnostic,'READ_OPEN',budget)
     fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
     try:
-        inventory_mark(diagnostic,'READ_STAT',budget)
         a=os.fstat(fd)
-        inventory_mark(diagnostic,'READ_METADATA_POLICY',budget)
         need(stat.S_ISREG(a.st_mode) and a.st_nlink==1 and 0<=a.st_size<=cap)
         chunks=[];h=hashlib.sha256();count=0
         while True:
-            inventory_mark(diagnostic,'READ_CHUNK_DEADLINE',budget)
             need(time.monotonic()<deadline)
-            inventory_mark(diagnostic,'READ_CHUNK',budget)
             b=os.read(fd,65536)
             if not b:break
             count+=len(b);budget[0]+=len(b)
-            inventory_mark(diagnostic,'READ_CAP_AND_HASH_BUDGET',budget)
             need(count<=cap and budget[0]+budget[1]<=HASH_TOTAL)
-            inventory_mark(diagnostic,'READ_HASH_AND_BUFFER',budget)
             h.update(b);chunks.append(b)
-        inventory_mark(diagnostic,'READ_FINAL_POLICY',budget)
         need(count==a.st_size and shape(a)==shape(os.fstat(fd))==shape(path.lstat()))
-        inventory_mark(diagnostic,'READ_RETURN',budget)
         return b''.join(chunks),{'sha256':h.hexdigest(),'bytes':count},fd,a
     except BaseException as error:
-        inventory_error(diagnostic,error);previous=inventory_step(diagnostic)
-        inventory_mark(diagnostic,'READ_CLEANUP',budget)
-        os.close(fd)
-        inventory_mark(diagnostic,previous,budget)
+        checked_close(fd)
         raise
     # Caller owns the retained FD, including on every post-read failure.
 def json_value(raw,cap=CAP,canonical=False):
@@ -291,7 +73,7 @@ def write(path,raw,mode=0o600):
         while view:
             n=os.write(fd,view);need(n>0);view=view[n:]
         os.fsync(fd)
-    finally:os.close(fd)
+    finally:checked_close(fd)
 def save(path,value):
     raw=(json.dumps(value,separators=(',',':'))+'\n').encode();need(len(raw)<=CAP);write(path,raw)
 def canonical_fixture(raw,code,err):
@@ -318,14 +100,19 @@ def canonical_fixture(raw,code,err):
 def main(admission_path):
     os.umask(0o077)
     need(sys.platform=='linux' and all(hasattr(os,k) for k in ['waitid','WNOWAIT','WEXITED','WNOHANG','P_PID']))
-    result=None;inventory_diagnostic=None;sizing_observation=None;sizing_custody={'cleanupKnown':False}
-    try:inventory_diagnostic={'step':'UNKNOWN','errorCategory':'UNKNOWN','counterState':'KNOWN',**{key:0 for key in INVENTORY_COUNTER_CAPS}}
-    except BaseException:pass
+    result=None;selection_custody={'cleanupKnown':True};selection=None;meter=None
     root=Path(__file__).resolve().parent;deadline=time.monotonic()+TOTAL_SECONDS;budget=[0,0];held=[];receipts=[];stage='ADMISSION';out=None;active=None;interrupted=[False]
     def interrupt(_s,_f):interrupted[0]=True
     signal.signal(signal.SIGTERM,interrupt);signal.signal(signal.SIGINT,interrupt)
     def input_bytes(path,cap=SOURCE_LIMIT):
-        raw,pin,fd,a=read(path,cap,deadline,budget);held.append((fd,path,a));return raw,pin
+        need(len(held)<4096)
+        raw,pin,fd,a=read(path,cap,deadline,budget)
+        try:held.append((fd,path,a))
+        except BaseException:
+            checked_close(fd);raise
+        return raw,pin
+    def input_fd(path,cap=SOURCE_LIMIT):
+        raw,pin=input_bytes(path,cap);fd,_,z=held[-1];return raw,pin,fd,z
     def unknown():
         if out:
             try:save(out/'unknown-hold.json',{'protocol':'jev-production-owner-unknown-v1','status':'UNKNOWN_HOLD','stage':stage,'originalSlot':active['slot'] if active else 'UNKNOWN','nativeQualified':False,'recoveryAccepted':False})
@@ -334,7 +121,7 @@ def main(admission_path):
         failed=False
         while held:
             fd,_,_=held.pop()
-            try:os.close(fd)
+            try:checked_close(fd)
             except BaseException:failed=True
         return not failed
     def hold_without_authority():
@@ -362,19 +149,22 @@ def main(admission_path):
         required=manifest['executionFiles']
         need(set(blobs)=={r['relative'] for r in required})
         protocol=json_value(blobs['protocol.json'],SOURCE_LIMIT);need(protocol['protocol']=='jev-current-production-owner-qualification-source-v1' and protocol['executionAdmitted'] is False)
+        selected_ns={'__name__':'jev_verified_selected_inputs'}
+        exec(compile(blobs['selected-inputs.py'],str(root/'selected-inputs.py'),'exec'),selected_ns)
+        meter=selected_ns['IntegrityMeter']();meter.charge('initial',budget[0]);budget=meter
+        def integrity_digest(raw):
+            meter.charge('metadata',len(raw));return hashlib.sha256(raw).hexdigest()
         ns={'__name__':'jev_verified_original_custody','__file__':str(root/'dependencies/owner.py')}
         exec(compile(blobs['dependencies/owner.py'],ns['__file__'],'exec'),ns)
         base=types.SimpleNamespace(**ns);base.CLEANUP_SECONDS=CLEANUP_SECONDS
         stage='TOOL_BINDING';keys(admission['tools'],['node','cc','npmCli'])
         tools={};tool_fds={};tool_paths={}
         for label,p in [('node',Path(admission['tools']['node'])),('cc',Path(admission['tools']['cc'])),('python',Path(sys.executable)),('npmCli',Path(admission['tools']['npmCli'])),('selfPs',Path('/bin/ps') if Path('/bin/ps').exists() else Path('/usr/bin/ps'))]:
-            need(p.is_absolute());p=p.resolve();raw,pin,fd,z=read(p,512*1024*1024,deadline,budget);held.append((fd,p,z));tool_fds[label]=fd;tool_paths[label]=str(p);tools[label]={**pin,'provenance':'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION'}
+            need(p.is_absolute());p=p.resolve();raw,pin,fd,z=input_fd(p,134217728 if label=='node' else 33554432);tool_fds[label]=fd;tool_paths[label]=str(p);tools[label]={**pin,'provenance':'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION'}
             if label=='node':
                 # A dedicated private executable path for genuine nested cp.spawn.
-                project=out/'project';project.mkdir(mode=0o700);node_copy=project/'node';write(node_copy,raw,0o700);node_raw,node_pin=input_bytes(node_copy,512*1024*1024);need(node_pin==pin)
-        # Reserve child hashing before any dependency/compiler/fixture original.
-        # Six bounded module hooks, one own-node image, three maximum addon reads.
-        budget[1]=tools['node']['bytes']+6*33554432+3*8388608
+                project=out/'project';project.mkdir(mode=0o700);node_copy=project/'node';write(node_copy,raw,0o700);node_raw,node_pin=input_bytes(node_copy,134217728);need(node_pin==pin)
+        # Every future child allowance is reserved by the partition meter.
         need(budget[0]+budget[1]<=HASH_TOTAL)
         home=out/'home';home.mkdir(mode=0o700)
         env={'PATH':'/usr/bin:/bin','HOME':str(home),'LANG':'C.UTF-8','LC_ALL':'C.UTF-8','TZ':'UTC','NODE_OPTIONS':'--max-old-space-size=192'}
@@ -404,7 +194,7 @@ def main(admission_path):
                     try:stream.close()
                     except BaseException:failed=True
                 for fd in self.fds.values():
-                    try:os.close(fd)
+                    try:checked_close(fd)
                     except BaseException:failed=True
                 need(not failed)
         def original(label,argv,seconds,cap=CAP,child_env=None,extra_fds=(),tool=None,execfd=None):
@@ -448,7 +238,7 @@ def main(admission_path):
                 finally:
                     if not c.reaped:hold_without_authority()
                     stdout,stderr=channel.output();eof=channel.eof()
-                    receipts.append({'slot':label,'directOriginalTerminal':True,'directOriginalReaped':True,'ownedPipesEOF':eof,'exitCode':proc.returncode,'signalsSent':c.signals,'stdoutBytes':len(stdout),'stdoutSha256':hashlib.sha256(stdout).hexdigest(),'stderrBytes':len(stderr),'stderrSha256':hashlib.sha256(stderr).hexdigest(),'streamTruncated':channel.overflow,'globalGroupAbsenceClaimed':False})
+                    receipts.append({'slot':label,'directOriginalTerminal':True,'directOriginalReaped':True,'ownedPipesEOF':eof,'exitCode':proc.returncode,'signalsSent':c.signals,'stdoutBytes':len(stdout),'stdoutSha256':integrity_digest(stdout),'stderrBytes':len(stderr),'stderrSha256':integrity_digest(stderr),'streamTruncated':channel.overflow,'globalGroupAbsenceClaimed':False})
                     try:channel.close()
                     finally:active=None
                 need(c.reaped and channel.terminal_eof and not channel.overflow and not interrupted[0] and time.monotonic()<deadline)
@@ -472,128 +262,118 @@ def main(admission_path):
             dest=project/rel;dest.parent.mkdir(parents=True,exist_ok=True,mode=0o700);write(dest,raw)
             source_observations.append({'relative':rel,**p})
         overlay='packages/work/src/harness/routed-owner-observer.ts';(project/overlay).unlink();write(project/overlay,blobs['overlay/'+overlay])
-        for n in ['loader.mjs','fixture.mjs','provider.mjs']:write(project/n,blobs[n])
+        for n in ['loader.mjs','fixture.mjs','provider.mjs','compiler-entry.mjs','initializer.mjs']:write(project/n,blobs[n])
         write(project/'metadata.mjs',blobs['dependencies/metadata.mjs'])
-        write(project/'compiler-entry.mjs',b"import { install } from './loader.mjs'; install();\n")
         (project/'entry-results').mkdir(mode=0o700);(project/'gates').mkdir(mode=0o700)
+        (project/'integrity-results').mkdir(mode=0o700);(project/'warnings').mkdir(mode=0o700)
+        for name in ['fixture','positiveRole','parserRole','supervisor','provider']:write(project/'warnings'/(name+'.txt'),b'')
+        installation=out/'installation';installation.mkdir(mode=0o700)
+        for rel in ['package.json','package-lock.json','packages/work/package.json']:
+            q=installation/rel;q.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+            raw,_=input_bytes(project/rel);write(q,raw)
         stage='NODE_DEPENDENCIES'
         # npm/runtime distribution is explicit platform trust; ignore every project install script.
         user_config=out/'npm-user.config';global_config=out/'npm-global.config'
         write(user_config,b'');write(global_config,b'')
         npm_env={**env,'NODE_OPTIONS':'--max-old-space-size=256','NPM_CONFIG_USERCONFIG':str(user_config),'NPM_CONFIG_GLOBALCONFIG':str(global_config),'NPM_CONFIG_CACHE':str(out/'npm-cache')}
-        nr,ne,nc=original('node-dependencies',[tool_paths['node'],tool_paths['npmCli'],'--prefix',str(project),'ci','--ignore-scripts','--no-audit','--no-fund'],90,child_env=npm_env,tool='node')
+        nr,ne,nc=original('node-dependencies',[tool_paths['node'],tool_paths['npmCli'],'--prefix',str(installation),'ci','--ignore-scripts','--no-audit','--no-fund'],90,child_env=npm_env,tool='node')
         need(nc==0)
         stage='DEPENDENCY_INVENTORY'
-        # Passive metadata snapshot; no content predicate or budget is replaced.
-        try:sizing_observation,_=installed_stat_sizing(project,deadline,budget,interrupted,sizing_custody)
-        except BaseException:sizing_observation=None
-        # Added diagnostic descriptor ownership: uncertainty retains the exact
-        # registered records and uses existing nonterminal custody hold.
-        if sizing_custody['cleanupKnown'] is not True:hold_without_authority()
-        module_rows=[];dependency_rows=[];dependency_stats=[];module_paths=set()
-        inventory_mark(inventory_diagnostic,'ENUMERATE',budget)
-        for path in sorted((project/'node_modules').rglob('*')):
-            inventory_mark(inventory_diagnostic,'ENTRY_CLASSIFICATION',budget,increment='entriesObserved')
-            if path.is_symlink():
-                inventory_mark(inventory_diagnostic,'LINK_RESOLVE',budget,increment='symlinksObserved')
-                resolved=path.resolve()
-                inventory_mark(inventory_diagnostic,'LINK_CONTAINMENT',budget)
-                need(resolved.is_relative_to(project));continue
-            inventory_mark(inventory_diagnostic,'FILE_CLASSIFICATION',budget)
-            if not path.is_file():continue
-            inventory_mark(inventory_diagnostic,'ROW_LIMIT',budget,rowsCompleted=len(dependency_rows))
-            need(len(dependency_rows)<16384)
-            raw,pin,dfd,z=read(path,512*1024*1024,deadline,budget,diagnostic=inventory_diagnostic)
-            try:
-                inventory_mark(inventory_diagnostic,'LEAF_STABILITY',budget)
-                need(shape(z)==shape(path.lstat()))
-            finally:
-                previous=inventory_step(inventory_diagnostic);inventory_mark(inventory_diagnostic,'LEAF_CLOSE',budget)
-                os.close(dfd)
-                inventory_mark(inventory_diagnostic,previous,budget)
-            inventory_mark(inventory_diagnostic,'RELATIVE_PATH',budget)
-            rel=str(path.relative_to(project))
-            inventory_mark(inventory_diagnostic,'ROW_RETENTION',budget)
-            dependency_rows.append({'relative':rel,**pin});dependency_stats.append((path,z))
-            inventory_mark(inventory_diagnostic,'ROW_RETENTION',budget,rowsCompleted=len(dependency_rows))
-        inventory_mark(inventory_diagnostic,'COMPLETE',budget)
+        # Explicit changed authority: catalog the full installation metadata,
+        # copy only declared candidates, and refuse every omitted content request.
+        selection=selected_ns['selected_installed'](installation,project,deadline,interrupted,read,write,meter,selection_custody)
+        if selection_custody['cleanupKnown'] is not True:hold_without_authority()
+        dependency_rows=selection['selected'];dependency_stats=[]
+        catalog_entries=selection['entries']
+        logical_storage=selection['logicalStorageBytes']+1048576
+        need(logical_storage<=8388608)
+        # This finite map is declared from already-read source bytes, not a
+        # second filesystem iterator or guessed absence projection.
+        extra_files={r['relative']:r['bytes'] for r in source_observations}
+        for n in ['loader.mjs','fixture.mjs','provider.mjs','compiler-entry.mjs','initializer.mjs']:
+            extra_files[n]=len(blobs[n])
+        extra_files['metadata.mjs']=len(blobs['dependencies/metadata.mjs']);extra_files['node']=tools['node']['bytes']
+        for n in ['fixture','positiveRole','parserRole','supervisor','provider']:extra_files['warnings/'+n+'.txt']=0
+        extra_dirs={'entry-results','gates','integrity-results','warnings'}
+        for rel in extra_files:
+            parts=Path(rel).parts
+            for n in range(1,len(parts)):extra_dirs.add('/'.join(parts[:n]))
+        need(len(extra_files)+len(extra_dirs)<=4096)
+        for rel in sorted(extra_dirs):
+            logical_storage+=192+4*len(os.fsencode(rel));need(logical_storage<=8388608)
+            catalog_entries.append([rel,'DIRECTORY',0])
+        for rel,size in sorted(extra_files.items()):
+            logical_storage+=192+4*len(os.fsencode(rel));need(logical_storage<=8388608)
+            catalog_entries.append([rel,'CONTENT',size])
+        catalog_entries.append(['','DIRECTORY',0])
+        need(len(catalog_entries)<=32768)
+        catalog={**selection,'entries':catalog_entries,'logicalStorageBytes':logical_storage}
+        meter.kind='metadata'
+        catalog_raw=(json.dumps(catalog,separators=(',',':'))+'\n').encode();need(len(catalog_raw)<=SOURCE_LIMIT)
+        integrity_digest(catalog_raw);write(project/'original-catalog.json',catalog_raw)
+        write(project/'source-input-contract.json',blobs['source-inventory.json'])
+        # Public TypeScript sys reads a catalog-backed virtual metadata mirror.
+        # No live mirror directory traversal or zero-content files are used.
+        (project/'catalog-metadata').mkdir(mode=0o700)
+        meter.kind='late'
         def runtime_closure():
-            diagnostic=inventory_diagnostic if stage=='DEPENDENCY_INVENTORY' else None
-            inventory_mark(diagnostic,'CLOSURE_ENUMERATE',budget,runtimeRowsCompleted=0,closureBytesObserved=0)
-            result=[];seen=set();package_types={};installed={r['relative']:r for r in dependency_rows}
-            for p in sorted(project.rglob('*')):
-                inventory_mark(diagnostic,'CLOSURE_LINK_POLICY',budget)
-                if p.is_symlink():need(p.resolve().is_relative_to(project));continue
-                inventory_mark(diagnostic,'CLOSURE_FILE_CLASSIFICATION',budget)
-                if not p.is_file() or (p.suffix not in ['.js','.mjs','.cjs','.json'] and str(p.relative_to(project))!='node_modules/typescript/bin/tsc'):continue
-                rel=str(p.relative_to(project))
-                if rel in ['runtime-closure.json','binding.json'] or rel.startswith(('entry-results/','gates/')):continue
-                inventory_mark(diagnostic,'CLOSURE_ROW_POLICY',budget)
-                need(len(result)<16384 and rel not in seen);seen.add(rel)
+            result=[];installed={v['relative']:v for v in dependency_rows}
+            for q in sorted(project.rglob('*')):
+                rel=str(q.relative_to(project))
+                if rel.startswith(('catalog-metadata/','entry-results/','gates/','integrity-results/','warnings/')) or rel in ['node','runtime-closure.json','binding.json','original-catalog.json','compiler-result.json']:continue
+                if q.is_symlink():need(q.resolve().is_relative_to(project));continue
+                if not q.is_file():continue
+                need(len(result)<16384)
                 if rel in installed:pin={k:installed[rel][k] for k in ['sha256','bytes']}
-                else:
-                    raw,pin,dfd,z=read(p,16777216,deadline,budget,diagnostic=diagnostic)
-                    try:
-                        inventory_mark(diagnostic,'CLOSURE_LEAF_STABILITY',budget)
-                        need(shape(z)==shape(p.lstat()))
-                    finally:
-                        previous=inventory_step(diagnostic);inventory_mark(diagnostic,'CLOSURE_READ_CLOSE',budget)
-                        os.close(dfd)
-                        inventory_mark(diagnostic,previous,budget)
-                inventory_mark(diagnostic,'CLOSURE_FORMAT',budget)
-                form='json' if p.suffix=='.json' else 'module' if p.suffix=='.mjs' else 'commonjs'
-                if p.suffix=='.js':
-                    parent=p.parent
+                else:_,pin=input_bytes(q,16777216)
+                form='json' if q.suffix=='.json' else 'module' if q.suffix=='.mjs' else 'commonjs' if q.suffix in ['.js','.cjs'] else 'resource'
+                if q.suffix=='.js':
+                    parent=q.parent
                     while parent.is_relative_to(project):
-                        inventory_mark(diagnostic,'CLOSURE_PACKAGE_PATH',budget)
                         pkg=parent/'package.json'
                         if pkg.is_file():
-                            # Every such manifest is included and same-byte loaded by the hook.
-                            if pkg not in package_types:
-                                inventory_mark(diagnostic,'CLOSURE_PACKAGE_READ',budget)
-                                pr,_,pfd,_=read(pkg,SOURCE_LIMIT,deadline,budget,diagnostic=diagnostic)
-                                try:
-                                    inventory_mark(diagnostic,'CLOSURE_PACKAGE_DECODE',budget)
-                                    package_types[pkg]=json_value(pr,SOURCE_LIMIT).get('type')
-                                finally:
-                                    previous=inventory_step(diagnostic);inventory_mark(diagnostic,'CLOSURE_READ_CLOSE',budget)
-                                    os.close(pfd)
-                                    inventory_mark(diagnostic,previous,budget)
-                            if package_types[pkg]=='module':form='module'
-                            break
+                            pr,_=input_bytes(pkg);form='module' if json_value(pr,SOURCE_LIMIT).get('type')=='module' else 'commonjs';break
                         if parent==project:break
                         parent=parent.parent
-                inventory_mark(diagnostic,'CLOSURE_ROW_RETENTION',budget)
                 result.append({'relative':rel,**pin,'format':form})
-                inventory_mark(diagnostic,'CLOSURE_ROW_RETENTION',budget,runtimeRowsCompleted=len(result))
-            inventory_mark(diagnostic,'CLOSURE_SERIALIZE',budget)
-            raw=(json.dumps({'protocol':'jev-production-runtime-closure-v1','files':result},separators=(',',':'))+'\n').encode()
-            inventory_mark(diagnostic,'CLOSURE_SIZE_POLICY',budget,closureBytesObserved=len(raw))
-            need(len(raw)<=SOURCE_LIMIT)
-            inventory_mark(diagnostic,'CLOSURE_REPLACE',budget)
+            raw=(json.dumps({'protocol':'jev-production-runtime-closure-v1','files':result},separators=(',',':'))+'\n').encode();need(len(raw)<=SOURCE_LIMIT)
             p=project/'runtime-closure.json'
             if p.exists():p.unlink()
-            inventory_mark(diagnostic,'CLOSURE_WRITE',budget)
-            write(p,raw)
-            inventory_mark(diagnostic,'COMPLETE',budget)
-            return result,{'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
+            write(p,raw);return result,{'sha256':integrity_digest(raw),'bytes':len(raw)}
+        write(project/'binding.json',(json.dumps({'protocol':'jev-production-binding-v1','enabled':False,'artifact':None},separators=(',',':'))+'\n').encode())
+        (project/'dist').mkdir(mode=0o700)
         runtime_closure()
+        def node_flags(profile,heap=192):
+            v=['--max-old-space-size='+str(heap),'--permission','--allow-fs-read='+str(project)]
+            writable=['dist','compiler-result.json','integrity-results'] if profile=='compiler' else ['entry-results','gates','integrity-results','warnings','own-metadata.json']
+            v+=['--allow-fs-write='+str(project/p) for p in writable]
+            if profile!='compiler':v+=['--allow-fs-read=/proc/self','--allow-fs-read=/bin/ps','--allow-fs-read=/usr/bin/ps','--allow-fs-read='+str(artifact),'--allow-addons','--allow-child-process','--redirect-warnings='+str(project/'warnings'/(profile+'.txt'))]
+            return v
         stage='TYPESCRIPT'
-        good(original('typescript',[str(node_copy),'--import',str(project/'compiler-entry.mjs'),str(project/'node_modules/typescript/bin/tsc'),'-p',str(project/'tsconfig.build.json')],60,tool='node',child_env={**env,'NODE_OPTIONS':'--max-old-space-size=512'}))
+        good(original('typescript',[str(node_copy),*node_flags('compiler',512),str(project/'compiler-entry.mjs')],60,tool='node',child_env={**env,'NODE_OPTIONS':''}))
+        compiler_raw,compiler_pin=input_bytes(project/'compiler-result.json');compiler_observation=json_value(compiler_raw)
+        need(compiler_observation['protocol']=='jev-selected-compiler-result-v1' and compiler_observation['status']=='COMPILED' and compiler_observation['policyRefused'] is False)
+        compiler_integrity_raw,compiler_integrity_pin=input_bytes(project/'integrity-results/compiler.json');compiler_integrity=json_value(compiler_integrity_raw)
+        keys(compiler_integrity,['protocol','profile','moduleBytes','compilerBytes','ownNodeBytes','addonPasses','nodeEntrants','refusal','workerDenied','lifetimeInstallCount'])
+        need(compiler_integrity['protocol']=='jev-selected-process-integrity-v1' and compiler_integrity['profile']=='compiler' and type(compiler_integrity['lifetimeInstallCount']) is int)
+        need(compiler_integrity['refusal'] is None and compiler_integrity['lifetimeInstallCount']==1 and compiler_integrity['workerDenied'] is True and compiler_integrity['addonPasses']==0 and compiler_integrity['nodeEntrants']==0 and compiler_integrity['ownNodeBytes']==0 and type(compiler_integrity['moduleBytes']) is int and 0<=compiler_integrity['moduleBytes']<=33554432)
+        meter.child('modules',compiler_integrity['moduleBytes']);meter.child('compiler',compiler_integrity['compilerBytes'])
+        meter.kind='native'
         stage='HEADER_DISCOVERY';headers=out/'headers';headers.mkdir(mode=0o700)
         # Execute the same verified header helper bytes through a retained FD.
-        hf=out/'headers.py';write(hf,blobs['headers.py']);_,_,hfd,z=read(hf,SOURCE_LIMIT,deadline,budget);held.append((hfd,hf,z))
+        hf=out/'headers.py';write(hf,blobs['headers.py']);_,_,hfd,z=input_fd(hf)
         header_result=json_value(good(original('headers',[tool_paths['python'],'-B','-I','-S','/proc/self/fd/'+str(hfd),str(headers)],25,extra_fds=(hfd,),tool='python')),canonical=True)
         need(header_result['protocol']=='jev-owned-pair-headers-v1' and header_result['archiveSha256']==protocol['headerArchiveSha256'])
         need(set(header_result['selected'])=={'node_api.h','node_api_types.h','js_native_api.h','js_native_api_types.h'})
+        meter.child('headers',header_result['archiveBytes']+sum(v['bytes'] for v in header_result['selected'].values()))
         for n,p in header_result['selected'].items():_,actual=input_bytes(headers/n);need(actual==p)
         stage='DEPENDENCY_DISCOVERY';build=out/'build';build.mkdir(mode=0o700)
         direct=build/'direct';direct.mkdir(mode=0o700)
         direct_source=direct/'descriptor.c';write(direct_source,blobs['inputs/direct/descriptor.c']);_,direct_pin=input_bytes(direct_source);need(direct_pin==source_pins['inputs/direct/descriptor.c'])
-        source=build/'relay.c';write(source,blobs['inputs/relay.c']);_,source_pin,sfd,z=read(source,SOURCE_LIMIT,deadline,budget);held.append((sfd,source,z));need(source_pin==source_pins['inputs/relay.c'])
+        source=build/'relay.c';write(source,blobs['inputs/relay.c']);_,source_pin,sfd,z=input_fd(source);need(source_pin==source_pins['inputs/relay.c'])
         flags=['-std=c11','-O2','-Wall','-Wextra','-Werror','-fPIC','-DNAPI_VERSION=8','-DNODE_GYP_MODULE_NAME=jev_one_relay','-I',str(headers),'-I',str(build)]
         source_arg='/proc/self/fd/'+str(sfd)
-        libc_source=build/'libc-contract.c';write(libc_source,blobs['libc-contract.c']);_,_,lfd,z=read(libc_source,SOURCE_LIMIT,deadline,budget);held.append((lfd,libc_source,z));libc_exe=build/'libc-contract';libc_arg='/proc/self/fd/'+str(lfd)
+        libc_source=build/'libc-contract.c';write(libc_source,blobs['libc-contract.c']);_,_,lfd,z=input_fd(libc_source);libc_exe=build/'libc-contract';libc_arg='/proc/self/fd/'+str(lfd)
         raw=good(original('dependencies',[tool_paths['cc'],*flags,'-x','c','-M','-MT','JEV_ONE_RELAY',source_arg,libc_arg],15,cap=131072,extra_fds=(sfd,lfd),tool='cc'))
         text=raw.decode('ascii').replace('\\\n',' ');parts=text.split('JEV_ONE_RELAY:');need(len(parts)==3 and parts[0]=='');tokens=' '.join(parts[1:]).split();need(1<=len(tokens)<=512)
         dependency_paths=[];dependencies=[]
@@ -601,66 +381,88 @@ def main(admission_path):
         for token in tokens:
             need(token.startswith('/') and all(c.isalnum() or c in '/_.+-' for c in token));p=source if token==source_arg else (libc_source if token==libc_arg else Path(token).resolve())
             if p in dependency_paths:continue
-            need(p.is_absolute());raw,pin=input_bytes(p,512*1024*1024);dependency_paths.append(p);dependencies.append({'pathSha256':hashlib.sha256(str(p).encode()).hexdigest(),**pin})
+            need(p.is_absolute());raw,pin=input_bytes(p,512*1024*1024);dependency_paths.append(p);dependencies.append({'pathSha256':integrity_digest(str(p).encode()),**pin})
         need(source in dependency_paths and direct_source in dependency_paths and libc_source in dependency_paths and all((headers/n).resolve() in dependency_paths for n in header_result['selected']))
         stage='LIBC_BUILD'
         good(original('libc-build',[tool_paths['cc'],*flags,'-x','c',libc_arg,'-o',str(libc_exe)],20,extra_fds=(lfd,),tool='cc'))
-        libc_bytes,libc_pin,libcfd,z=read(libc_exe,8388608,deadline,budget);held.append((libcfd,libc_exe,z))
+        libc_bytes,libc_pin,libcfd,z=input_fd(libc_exe,8388608)
         stage='LIBC_ABI';need(good(original('libc-abi',[str(libc_exe)],5,execfd=libcfd))==b'JEV_PUBLIC_GLIBC_PIDFD_ABI_V1\n')
         stage='ADDON_BUILD';artifact=build/'relay.node'
         good(original('addon-build',[tool_paths['cc'],*flags,'-shared','-x','c',source_arg,'-o',str(artifact)],25,extra_fds=(sfd,),tool='cc'))
         stage='ARTIFACT_BINDING';artifact_bytes,artifact_pin=input_bytes(artifact,8388608)
         for p,expected in zip(dependency_paths,dependencies):
             _,current=input_bytes(p,512*1024*1024);need(current=={k:expected[k] for k in ['sha256','bytes']})
+        meter.kind='late'
         stage='ENTRY_BINDING'
         # Fixed adjacent declarations are measured only after actual builds.
         composition=json_value(blobs['source-composition.json'],SOURCE_LIMIT)
         binding={'protocol':'jev-production-binding-v1','enabled':True,'artifact':str(artifact),'artifactSha256':artifact_pin['sha256'],'roleEntry':str(project/'bin/harmless-role.mjs'),'privateEntry':str(project/'bin/private-entry.mjs'),'provider':str(project/'provider.mjs'),'gateDirectory':str(project/'gates'),'nodeSha256':tools['node']['sha256'],'fixtureDeadlineUnixMs':int(time.time()*1000)+40000}
+        (project/'binding.json').unlink()
         write(project/'binding.json',(json.dumps(binding,separators=(',',':'))+'\n').encode());_,binding_pin=input_bytes(project/'binding.json')
         write(project/'bin/harmless-role.mjs',blobs['role.mjs']);write(project/'bin/private-entry.mjs',blobs['private-entry.mjs'])
         emitted,emitted_pin=runtime_closure()
         declaration={'protocol':'private-routed-role-observer-build-v2','enabled':True,'artifact':str(artifact),'artifactSha256':artifact_pin['sha256'],'sourceCompositionSha256':source_pins['source-composition.json']['sha256'],'compiledSourceManifestSha256':emitted_pin['sha256']}
         write(project/'bin/private-role-observer-build.mjs',('export const ROLE_OBSERVER_BUILD = Object.freeze('+json.dumps(declaration,separators=(',',':'))+');\n').encode())
         runtime_rows,final_runtime_pin=runtime_closure();_,actual_runtime_pin=input_bytes(project/'runtime-closure.json');need(actual_runtime_pin==final_runtime_pin);_,declaration_pin=input_bytes(project/'bin/private-role-observer-build.mjs')
-        # Five fixture Node entries plus one compiler hook; at most four fixture Nodes concurrent. Nested native
-        # source is the exact embedded current production string, not a facade.
-        child_hash_bound=tools['node']['bytes']+6*33554432+3*artifact_pin['bytes']
-        budget[1]=child_hash_bound
-        need(budget[0]+budget[1]<=HASH_TOTAL)
+        # Lifetime child allowances were reserved before any original.
+        child_hash_bound=budget[1]
         stage='FIXTURE'
-        raw,err,code=original('fixture',[str(node_copy),str(project/'fixture.mjs')],40,cap=CAP,child_env=env,execfd=next(fd for fd,p,_ in held if p==node_copy))
+        raw,err,code=original('fixture',[str(node_copy),*node_flags('fixture'),str(project/'fixture.mjs')],40,cap=CAP,child_env={**env,'NODE_OPTIONS':''},execfd=next(fd for fd,p,_ in held if p==node_copy))
         stage='RESULT_VALIDATION';result=canonical_fixture(raw,code,err)
         own_raw,own_pin=input_bytes(project/'own-metadata.json');own=json_value(own_raw,canonical=True)
         keys(own,['protocol','platform','architecture','kernel','credentials','procfs','namespaces','node','priorJobPermissionTransferred','continuousCoverage','providerAccessQualified','recoveryAccepted'])
         need(own['platform']=='LINUX' and own['architecture'] in ['X86_64','ARM64'] and own['priorJobPermissionTransferred'] is False and own['continuousCoverage'] is False)
-        need(own['protocol']=='jev-production-owner-own-metadata-v1' and own['node']['sha256']==tools['node']['sha256'] and own['node']['version']=='22.23.0' and own['providerAccessQualified'] is False and own['recoveryAccepted'] is False)
+        need(own['protocol']=='jev-production-owner-own-metadata-v1' and own['node']['sha256']==tools['node']['sha256'] and own['node']['version']=='22.23.0' and type(own['node']['bytes']) is int and own['node']['bytes']==tools['node']['bytes'] and own['providerAccessQualified'] is False and own['recoveryAccepted'] is False)
+        process_integrity=[]
+        expected={'fixture':(2,2),'positiveRole':(1,1),'parserRole':(1,0),'supervisor':(1,1),'provider':(0,0)}
+        for profile,(loads,children) in expected.items():
+            rr,rp=input_bytes(project/'integrity-results'/(profile+'.json'));v=json_value(rr)
+            keys(v,['protocol','profile','moduleBytes','compilerBytes','ownNodeBytes','addonPasses','nodeEntrants','refusal','workerDenied','lifetimeInstallCount'])
+            need(v['protocol']=='jev-selected-process-integrity-v1' and v['profile']==profile and v['refusal'] is None and v['workerDenied'] is True and type(v['lifetimeInstallCount']) is int and v['lifetimeInstallCount']==1)
+            need(type(v['addonPasses']) is int and v['addonPasses']==loads and type(v['nodeEntrants']) is int and v['nodeEntrants']==children and type(v['moduleBytes']) is int and 0<=v['moduleBytes']<=33554432 and type(v['compilerBytes']) is int and v['compilerBytes']==0 and type(v['ownNodeBytes']) is int and v['ownNodeBytes']==(own['node']['bytes'] if profile=='fixture' else 0))
+            meter.child('modules',v['moduleBytes']);meter.child('addons',loads*artifact_pin['bytes']);process_integrity.append({'profile':profile,**rp,'moduleBytes':v['moduleBytes'],'addonPasses':loads,'nodeEntrants':children})
+        meter.child('ownNode',own['node']['bytes'])
+        # Warnings are retained privately in full; no suppression or wildcard stderr allowance.
+        warning_receipts=[]
+        import re
+        for label,processes in [('fixture',1),('positiveRole',1),('parserRole',1),('supervisor',1),('provider',1)]:
+            wr,wp=input_bytes(project/'warnings'/(label+'.txt'));need(len(wr)<=65536)
+            text=wr.decode('ascii');matched=re.findall(r'\(node:([1-9][0-9]{0,9})\) SecurityWarning: The flag (--allow-addons|--allow-child-process) must be used with extreme caution\. It could invalidate the permission model\.\n',text)
+            hints=re.findall(r'\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\n',text)
+            stripped=re.sub(r'\(node:([1-9][0-9]{0,9})\) SecurityWarning: The flag (--allow-addons|--allow-child-process) must be used with extreme caution\. It could invalidate the permission model\.\n','',text)
+            stripped=re.sub(r'\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\n','',stripped)
+            need(stripped=='' and len(hints)==(processes if label!='provider' else 0) and len(set(pid for pid,_ in matched))==(processes if label!='provider' else 0))
+            wanted=[] if label=='provider' else ['--allow-addons'] if label=='parserRole' else ['--allow-addons','--allow-child-process']
+            for pid in set(pid for pid,_ in matched):need(sorted(flag for p,flag in matched if p==pid)==sorted(wanted))
+            warning_receipts.append({'slot':label,**wp,'expectedProcessRecords':processes,'warningMessages':len(matched),'hintRecords':len(hints),'classification':'EXACT_NODE22_23_SECURITY_WARNINGS'})
         stage='SOURCE_RECHECK'
         for name,before in blobs.items():raw,after=input_bytes(root/name);need(after==source_pins[name] and raw==before)
         for fd,p,z in held:need(shape(z)==shape(os.fstat(fd))==shape(p.lstat()))
         for rel,expected in [('binding.json',binding_pin),('runtime-closure.json',final_runtime_pin),('bin/private-role-observer-build.mjs',declaration_pin)]:
             _,after=input_bytes(project/rel,SOURCE_LIMIT);need(after==expected)
+        installed_names={d['relative'] for d in dependency_rows}
         for row in runtime_rows:
-            if row['relative'] not in {d['relative'] for d in dependency_rows}:
+            if row['relative'] not in installed_names:
                 _,after=input_bytes(project/row['relative'],16777216);need(after=={k:row[k] for k in ['sha256','bytes']})
         # Per-file stat closure, not a compiler-distribution execution-byte claim.
         # Runtime imports separately hash and execute the same read bytes.
-        for p,z in dependency_stats:need(shape(z)==shape(p.lstat()))
-        need(not interrupted[0] and time.monotonic()<deadline and budget[0]+child_hash_bound<=HASH_TOTAL and [r['slot'] for r in receipts]==SLOTS and all(r['directOriginalTerminal'] is True and r['directOriginalReaped'] is True and r['exitCode']==0 and r['signalsSent']==0 and not r['streamTruncated'] and r['ownedPipesEOF'] is True for r in receipts))
+        # Selected copied inputs remain in the sealed source-owned execution tree.
+        need(not interrupted[0] and time.monotonic()<deadline and budget[0]+budget[1]<=HASH_TOTAL and [r['slot'] for r in receipts]==SLOTS and all(r['directOriginalTerminal'] is True and r['directOriginalReaped'] is True and r['exitCode']==0 and r['signalsSent']==0 and not r['streamTruncated'] and r['ownedPipesEOF'] is True for r in receipts))
         stage='CLEANUP';need(close_inputs())
         stage='RESULT_RETENTION'
-        summary={'installedSizing':sizing_snapshot(sizing_observation),'protocol':'jev-production-owner-qualification-result-v1','status':'SUPPORTED' if code==0 else 'UNSUPPORTED','stage':stage,'fixture':result,'originals':receipts,'sourceManifestSha256':m_pin['sha256'],'sourcePins':source_pins,'context':ctx,'tools':tools,'headers':header_result,'selectedDependencyCount':len(dependencies),'selectedDependenciesSha256':hashlib.sha256(json.dumps(dependencies,separators=(',',':')).encode()).hexdigest(),'artifact':artifact_pin,'libcContract':libc_pin,'ownMetadata':own,'ownMetadataPin':own_pin,'hashBudget':{'ownerSelectedBytes':budget[0],'fixtureAdditionalBoundBytes':child_hash_bound,'nodeInitializers':5,'compilerHookInitializers':1,'maximumConcurrentNodeProcesses':4,'addonHashPasses':3,'perInitializerLoadedModuleCapBytes':33554432,'totalCapBytes':HASH_TOTAL},'currentSourceComposition':source_pins['source-composition.json'],'trackedCompileInputCount':len(source_observations),'dependencyInventorySha256':hashlib.sha256(json.dumps(dependency_rows,separators=(',',':')).encode()).hexdigest(),'emittedBeforeDeclaration':emitted_pin,'runtimeModuleClosure':final_runtime_pin,'privateBinding':binding_pin,'privateBuildDeclaration':declaration_pin,'ordinaryCompilationCompleted':True,'inputFDsClosed':True,'deadlineReached':False,'interrupted':False,'platformRuntimeTrustRequired':True,'compilerDistributionQualified':False,'globalGroupAbsenceClaimed':False,'providerAccessQualified':False,'recoveryAccepted':False}
+        summary={'selectedAuthority':{'protocol':'jev-selected-consumed-input-authority-v1','equivalentFullInventory':False,'selectedBytes':None if selection is None else selection['selectedBytes'],'metadataSnapshotOnly':True},'protocol':'jev-production-owner-qualification-result-v1','status':'SUPPORTED' if code==0 else 'UNSUPPORTED','stage':stage,'fixture':result,'originals':receipts,'sourceManifestSha256':m_pin['sha256'],'sourcePins':source_pins,'context':ctx,'tools':tools,'headers':header_result,'selectedDependencyCount':len(dependencies),'selectedDependenciesSha256':integrity_digest(json.dumps(dependencies,separators=(',',':')).encode()),'artifact':artifact_pin,'libcContract':libc_pin,'ownMetadata':own,'ownMetadataPin':own_pin,'hashBudget':meter.report(),'processIntegrity':process_integrity,'warningReceipts':warning_receipts,'compilerResultPin':compiler_pin,'currentSourceComposition':source_pins['source-composition.json'],'trackedCompileInputCount':len(source_observations),'dependencyInventorySha256':integrity_digest(json.dumps(dependency_rows,separators=(',',':')).encode()),'emittedBeforeDeclaration':emitted_pin,'runtimeModuleClosure':final_runtime_pin,'privateBinding':binding_pin,'privateBuildDeclaration':declaration_pin,'ordinaryCompilationCompleted':True,'inputFDsClosed':True,'deadlineReached':False,'interrupted':False,'platformRuntimeTrustRequired':True,'compilerDistributionQualified':False,'globalGroupAbsenceClaimed':False,'providerAccessQualified':False,'recoveryAccepted':False}
+        summary['hashBudget']=meter.report()
         # Private raw streams and dependency paths never enter the result.
         save(out/'dependency-closure.private.json',{'paths':[str(p) for p in dependency_paths],'pins':dependencies})
         save(out/'result.json',summary)
         need(not interrupted[0] and time.monotonic()<deadline)
         print('JEV_PRODUCTION_OWNER_COMPLETE' if code==0 else 'JEV_PRODUCTION_OWNER_UNSUPPORTED');return code
     except BaseException as error:
-        inventory_failed=stage=='DEPENDENCY_INVENTORY'
-        if inventory_failed:inventory_error(inventory_diagnostic,error)
+        if CLOSE_UNCERTAIN or selection_custody['cleanupKnown'] is not True:hold_without_authority()
         if active:hold_without_authority()
-        if not close_inputs():stage='CLEANUP'
+        if not close_inputs():hold_without_authority()
         if out:
-            try:save(out/'result.json',{'installedSizing':sizing_snapshot(sizing_observation),'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'inventoryDiagnostic':inventory_snapshot(inventory_diagnostic) if inventory_failed else None})
+            try:save(out/'result.json',{'selectedAuthority':{'protocol':'jev-selected-consumed-input-authority-v1','equivalentFullInventory':False,'selectedBytes':None if selection is None else selection['selectedBytes'],'metadataSnapshotOnly':True},'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'hashBudget':None if meter is None else meter.report()})
             except BaseException:pass
         print('JEV_PRODUCTION_OWNER_REFUSED',file=sys.stderr);return 2
     finally:

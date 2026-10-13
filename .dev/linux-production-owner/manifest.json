@@ -4,8 +4,8 @@
   "files": [
     {
       "relative": "owner.py",
-      "sha256": "2e45e17a8560305b5d2d4ac29e1b311296baf9d6ab8eaed0e73d084f4a684b4e",
-      "bytes": 51102
+      "sha256": "de7a3d6e6f6e3b10fd56dd8da630dcc75a0f947e51ef740eaf23e23e265c03e3",
+      "bytes": 40835
     },
     {
       "relative": "launch.py",
@@ -24,23 +24,23 @@
     },
     {
       "relative": "loader.mjs",
-      "sha256": "28d3bf07d96a8b1a59131d419908c0bd4324560459d2aa1015994c5b05c8f666",
-      "bytes": 5829
+      "sha256": "34290fca55a3f6a319890dff8a3c7247c9b86865ccc1e3df667840c5a634cf80",
+      "bytes": 16245
     },
     {
       "relative": "fixture.mjs",
-      "sha256": "a1eaa01457fb4a37d4faa3ab0e0cc1a5c4c3fd8f7db89cdc0516bef8da10d0dc",
-      "bytes": 7180
+      "sha256": "e775220697e2619e9d973307f371c269571a26f61183179893f5e30d134c31c9",
+      "bytes": 7467
     },
     {
       "relative": "role.mjs",
-      "sha256": "a3d07cf23c8d1ba5e2f95dab21cacbcd35c289bc12909b19d1f5246ac61ec2bd",
-      "bytes": 6989
+      "sha256": "06f5b01f864c3be150f312fff5c960da71ffc9d63f16a4269da5f7d5749f075e",
+      "bytes": 7220
     },
     {
       "relative": "private-entry.mjs",
-      "sha256": "af7238cfccdf249263a417a99f5d97e244f0760445c70e26895c5e76237fe284",
-      "bytes": 9221
+      "sha256": "5b288b406af2b419795b99863a96fb6f1f375fbb6d940f7aff1c9c5e18b52514",
+      "bytes": 9233
     },
     {
       "relative": "provider.mjs",
@@ -59,8 +59,8 @@
     },
     {
       "relative": "protocol.json",
-      "sha256": "eea7a7aae2d029455cba22c8243622b2c0820afe31d70266818d39f2e51c0b76",
-      "bytes": 8713
+      "sha256": "b3ddfeaa0086e590b8bbb4e3e4f5c6bc126656d7e1906583787eabd4e45fe384",
+      "bytes": 16941
     },
     {
       "relative": "dependencies/owner.py",
@@ -86,13 +86,28 @@
       "relative": "overlay/packages/work/src/harness/routed-owner-observer.ts",
       "sha256": "d80fa25cbac4081009fc8e57008d95635249c9d04129b4efd33641daf3c4869d",
       "bytes": 15642
+    },
+    {
+      "relative": "selected-inputs.py",
+      "sha256": "f739142bf72b455f6af9ad694c3d4a724116563cc3a24a006fbef57da04fe745",
+      "bytes": 7244
+    },
+    {
+      "relative": "compiler-entry.mjs",
+      "sha256": "fc3baa5ed447685ebcaa9845456662eb2f5bc679a1a4638b702bd208ebfa303d",
+      "bytes": 8238
+    },
+    {
+      "relative": "initializer.mjs",
+      "sha256": "077a275c5d531409d19f91ad49e0485147df77e2d977c6d5926abc398e459e08",
+      "bytes": 416
     }
   ],
   "executionFiles": [
     {
       "relative": "owner.py",
-      "sha256": "2e45e17a8560305b5d2d4ac29e1b311296baf9d6ab8eaed0e73d084f4a684b4e",
-      "bytes": 51102
+      "sha256": "de7a3d6e6f6e3b10fd56dd8da630dcc75a0f947e51ef740eaf23e23e265c03e3",
+      "bytes": 40835
     },
     {
       "relative": "launch.py",
@@ -111,23 +126,23 @@
     },
     {
       "relative": "loader.mjs",
-      "sha256": "28d3bf07d96a8b1a59131d419908c0bd4324560459d2aa1015994c5b05c8f666",
-      "bytes": 5829
+      "sha256": "34290fca55a3f6a319890dff8a3c7247c9b86865ccc1e3df667840c5a634cf80",
+      "bytes": 16245
     },
     {
       "relative": "fixture.mjs",
-      "sha256": "a1eaa01457fb4a37d4faa3ab0e0cc1a5c4c3fd8f7db89cdc0516bef8da10d0dc",
-      "bytes": 7180
+      "sha256": "e775220697e2619e9d973307f371c269571a26f61183179893f5e30d134c31c9",
+      "bytes": 7467
     },
     {
       "relative": "role.mjs",
-      "sha256": "a3d07cf23c8d1ba5e2f95dab21cacbcd35c289bc12909b19d1f5246ac61ec2bd",
-      "bytes": 6989
+      "sha256": "06f5b01f864c3be150f312fff5c960da71ffc9d63f16a4269da5f7d5749f075e",
+      "bytes": 7220
     },
     {
       "relative": "private-entry.mjs",
-      "sha256": "af7238cfccdf249263a417a99f5d97e244f0760445c70e26895c5e76237fe284",
-      "bytes": 9221
+      "sha256": "5b288b406af2b419795b99863a96fb6f1f375fbb6d940f7aff1c9c5e18b52514",
+      "bytes": 9233
     },
     {
       "relative": "provider.mjs",
@@ -146,8 +161,8 @@
     },
     {
       "relative": "protocol.json",
-      "sha256": "eea7a7aae2d029455cba22c8243622b2c0820afe31d70266818d39f2e51c0b76",
-      "bytes": 8713
+      "sha256": "b3ddfeaa0086e590b8bbb4e3e4f5c6bc126656d7e1906583787eabd4e45fe384",
+      "bytes": 16941
     },
     {
       "relative": "dependencies/owner.py",
@@ -173,6 +188,21 @@
       "relative": "overlay/packages/work/src/harness/routed-owner-observer.ts",
       "sha256": "d80fa25cbac4081009fc8e57008d95635249c9d04129b4efd33641daf3c4869d",
       "bytes": 15642
+    },
+    {
+      "relative": "selected-inputs.py",
+      "sha256": "f739142bf72b455f6af9ad694c3d4a724116563cc3a24a006fbef57da04fe745",
+      "bytes": 7244
+    },
+    {
+      "relative": "compiler-entry.mjs",
+      "sha256": "fc3baa5ed447685ebcaa9845456662eb2f5bc679a1a4638b702bd208ebfa303d",
+      "bytes": 8238
+    },
+    {
+      "relative": "initializer.mjs",
+      "sha256": "077a275c5d531409d19f91ad49e0485147df77e2d977c6d5926abc398e459e08",
+      "bytes": 416
     }
   ],
   "privateSourceMode": "0600",
@@ -183,5 +213,6 @@
   },
   "executionAdmitted": false,
   "runtimeAccepted": false,
-  "sourcePacketRevision": "STAT_SIZING_V1"
+  "sourcePacketRevision": "SELECTED_INPUT_V2",
+  "selectedAuthorityEquivalentFullInventory": false
 }
