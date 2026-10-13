@@ -1,0 +1,317 @@
+{
+  "protocol": "jev-one-relay-q2-qualification-manifest-v1",
+  "sourceOnly": true,
+  "executionAdmitted": false,
+  "files": [
+    {
+      "sha256": "b20905234e2bf016b659ee73ff18d91bbfbbac008c5d9f20caf8f41c6fd9a039",
+      "bytes": 2741,
+      "mode": 384,
+      "relative": "README.md"
+    },
+    {
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+      "bytes": 9232,
+      "mode": 384,
+      "relative": "dependencies/metadata.mjs"
+    },
+    {
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+      "bytes": 19973,
+      "mode": 384,
+      "relative": "dependencies/owner.py"
+    },
+    {
+      "sha256": "0799d74ac5a6ff59286cc878552cf708cc5237e8f7abe509b7b613d830961b1b",
+      "bytes": 182,
+      "mode": 384,
+      "relative": "direct-entry.mjs"
+    },
+    {
+      "sha256": "09c583ff5ad6d505e127c27365b6e33e0fdb1ef2bff62ba3dd07685743d2ff6a",
+      "bytes": 178,
+      "mode": 384,
+      "relative": "entry.mjs"
+    },
+    {
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e",
+      "bytes": 2383,
+      "mode": 384,
+      "relative": "headers.py"
+    },
+    {
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d",
+      "bytes": 33334,
+      "mode": 384,
+      "relative": "inputs/base/direct/descriptor.c"
+    },
+    {
+      "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69",
+      "bytes": 8918,
+      "mode": 384,
+      "relative": "inputs/base/direct/facade.mjs"
+    },
+    {
+      "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a",
+      "bytes": 444,
+      "mode": 384,
+      "relative": "inputs/base/direct/target.mjs"
+    },
+    {
+      "sha256": "7be5bf8de64ef6d176880bb173d2703589a60d2bb808c151e4e3e9e411386407",
+      "bytes": 9460,
+      "mode": 384,
+      "relative": "inputs/q2-facade.mjs"
+    },
+    {
+      "sha256": "a19e46c5fd234f7830c51ac73ec38485c6aebffd2be1788ed0f2ece56148f770",
+      "bytes": 4223,
+      "mode": 384,
+      "relative": "inputs/q2-fixture.mjs"
+    },
+    {
+      "sha256": "348ad22ba120b3a4a0654cb29ea7564770c31a4a75c03da50181fe1f6cfd8e7d",
+      "bytes": 6606,
+      "mode": 384,
+      "relative": "inputs/q2-native-additions.c"
+    },
+    {
+      "sha256": "18dd374a2654d3762af26628da7e8fb7b4ed8cd26ab007ad66febce7593a5cc1",
+      "bytes": 8718,
+      "mode": 384,
+      "relative": "inputs/q2-receiver.c"
+    },
+    {
+      "sha256": "3bdeaf93095dcb95e848d36fcfcb0a0e973d18f82741cbdb7c8835aa31ba98bd",
+      "bytes": 2012,
+      "mode": 384,
+      "relative": "inputs/q2-role.mjs"
+    },
+    {
+      "sha256": "93d8ec207fcc29011d40a81df169abae8a63551dc038d73aa2489a92edfbf348",
+      "bytes": 1386,
+      "mode": 384,
+      "relative": "inputs/q2-supervisor.mjs"
+    },
+    {
+      "sha256": "560911efc0f9f6b1f9948ecceb9aa8e60313bbd15bac2c4f8e7c55c12e649c93",
+      "bytes": 25474,
+      "mode": 384,
+      "relative": "inputs/q2.c"
+    },
+    {
+      "sha256": "e9f04429dc46d72568a889e4a07674d557cb4dec4a984891362d519c19eccea4",
+      "bytes": 1642,
+      "mode": 384,
+      "relative": "launch.py"
+    },
+    {
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5",
+      "bytes": 853,
+      "mode": 384,
+      "relative": "libc-contract.c"
+    },
+    {
+      "sha256": "515d081df03e457c045c5023b474b6c7376488d0a28106e819bed4c232a022a7",
+      "bytes": 5580,
+      "mode": 384,
+      "relative": "loader.mjs"
+    },
+    {
+      "sha256": "354d5535431d22dc3b1e9f1f8227d57e951e8c64978fb91ab01ab8f90e50667c",
+      "bytes": 23131,
+      "mode": 384,
+      "relative": "owner.py"
+    },
+    {
+      "sha256": "e76f772b827a3c892b373454cae57ccb176343a481440eab6af59d8137cff930",
+      "bytes": 12624,
+      "mode": 384,
+      "relative": "protocol.json"
+    }
+  ],
+  "executionFiles": [
+    {
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+      "bytes": 9232,
+      "mode": 384,
+      "relative": "dependencies/metadata.mjs"
+    },
+    {
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+      "bytes": 19973,
+      "mode": 384,
+      "relative": "dependencies/owner.py"
+    },
+    {
+      "sha256": "0799d74ac5a6ff59286cc878552cf708cc5237e8f7abe509b7b613d830961b1b",
+      "bytes": 182,
+      "mode": 384,
+      "relative": "direct-entry.mjs"
+    },
+    {
+      "sha256": "09c583ff5ad6d505e127c27365b6e33e0fdb1ef2bff62ba3dd07685743d2ff6a",
+      "bytes": 178,
+      "mode": 384,
+      "relative": "entry.mjs"
+    },
+    {
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e",
+      "bytes": 2383,
+      "mode": 384,
+      "relative": "headers.py"
+    },
+    {
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d",
+      "bytes": 33334,
+      "mode": 384,
+      "relative": "inputs/base/direct/descriptor.c"
+    },
+    {
+      "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69",
+      "bytes": 8918,
+      "mode": 384,
+      "relative": "inputs/base/direct/facade.mjs"
+    },
+    {
+      "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a",
+      "bytes": 444,
+      "mode": 384,
+      "relative": "inputs/base/direct/target.mjs"
+    },
+    {
+      "sha256": "7be5bf8de64ef6d176880bb173d2703589a60d2bb808c151e4e3e9e411386407",
+      "bytes": 9460,
+      "mode": 384,
+      "relative": "inputs/q2-facade.mjs"
+    },
+    {
+      "sha256": "a19e46c5fd234f7830c51ac73ec38485c6aebffd2be1788ed0f2ece56148f770",
+      "bytes": 4223,
+      "mode": 384,
+      "relative": "inputs/q2-fixture.mjs"
+    },
+    {
+      "sha256": "348ad22ba120b3a4a0654cb29ea7564770c31a4a75c03da50181fe1f6cfd8e7d",
+      "bytes": 6606,
+      "mode": 384,
+      "relative": "inputs/q2-native-additions.c"
+    },
+    {
+      "sha256": "18dd374a2654d3762af26628da7e8fb7b4ed8cd26ab007ad66febce7593a5cc1",
+      "bytes": 8718,
+      "mode": 384,
+      "relative": "inputs/q2-receiver.c"
+    },
+    {
+      "sha256": "3bdeaf93095dcb95e848d36fcfcb0a0e973d18f82741cbdb7c8835aa31ba98bd",
+      "bytes": 2012,
+      "mode": 384,
+      "relative": "inputs/q2-role.mjs"
+    },
+    {
+      "sha256": "93d8ec207fcc29011d40a81df169abae8a63551dc038d73aa2489a92edfbf348",
+      "bytes": 1386,
+      "mode": 384,
+      "relative": "inputs/q2-supervisor.mjs"
+    },
+    {
+      "sha256": "560911efc0f9f6b1f9948ecceb9aa8e60313bbd15bac2c4f8e7c55c12e649c93",
+      "bytes": 25474,
+      "mode": 384,
+      "relative": "inputs/q2.c"
+    },
+    {
+      "sha256": "e9f04429dc46d72568a889e4a07674d557cb4dec4a984891362d519c19eccea4",
+      "bytes": 1642,
+      "mode": 384,
+      "relative": "launch.py"
+    },
+    {
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5",
+      "bytes": 853,
+      "mode": 384,
+      "relative": "libc-contract.c"
+    },
+    {
+      "sha256": "515d081df03e457c045c5023b474b6c7376488d0a28106e819bed4c232a022a7",
+      "bytes": 5580,
+      "mode": 384,
+      "relative": "loader.mjs"
+    },
+    {
+      "sha256": "354d5535431d22dc3b1e9f1f8227d57e951e8c64978fb91ab01ab8f90e50667c",
+      "bytes": 23131,
+      "mode": 384,
+      "relative": "owner.py"
+    },
+    {
+      "sha256": "e76f772b827a3c892b373454cae57ccb176343a481440eab6af59d8137cff930",
+      "bytes": 12624,
+      "mode": 384,
+      "relative": "protocol.json"
+    }
+  ],
+  "references": [
+    {
+      "path": "/Volumes/more/jev-one-relay-q2-control-component-source-v1-20261013/manifest.json",
+      "sha256": "acae12fbba1cef942784c7ac356be58fcf48098244a185cf43f1a76d975e04d7",
+      "bytes": 9044,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/jev-one-relay-q2-control-component-source-v1-20261013/protocol.json",
+      "sha256": "8c76ef75c4f3db3596265be81d2f41f08d6ee48bf251c34341a0c00b9c2d0a00",
+      "bytes": 9786,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-component-v1-independent-whole-source-review-20261013-transport.md",
+      "sha256": "debc1128efd8b9820bb034830312c1097e3cded11fe805bf57b209cc9fb1dd12",
+      "bytes": 3825,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-component-v1-independent-whole-source-review-20261013-transport.json",
+      "sha256": "46e1c100e2671fbf6f0a77fb0bc774472d968326851ea1cd987e031ea14c1dc3",
+      "bytes": 20385,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-source-plan-v1-20261013.md",
+      "sha256": "80bd6c83c53da49dcbdc4de1acafa458e6829ee29104c68f7d1bca39580111f2",
+      "bytes": 8033,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-source-plan-v1-20261013.json",
+      "sha256": "82c3f9471d1de40c5ffc723ba975e37224c492b103beb630c7d370900051cc9a",
+      "bytes": 29935,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-plan-v1-independent-whole-source-review-20261013-transport.md",
+      "sha256": "79f85109b34ab781cf7bcb0eb062608a93b9ae6614ff238257c69d5a1b4afd60",
+      "bytes": 4185,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-qualification-publication-plan-v1-independent-whole-source-review-20261013-transport.json",
+      "sha256": "193a57c3169997e7d202c320494fc0162d2910a1673e76c4043cdea05315325b",
+      "bytes": 22471,
+      "mode": 384
+    },
+    {
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-q2-publication-plan-root-source-disposition-20261013.json",
+      "sha256": "8d2921d44c8670ae38f680c76a7ccb232528c1acf20ba9d57d54ab55e2332d34",
+      "bytes": 1565,
+      "mode": 384
+    }
+  ],
+  "caseCount": 7,
+  "childReceiptCount": 15,
+  "observationCount": 5,
+  "firstEntryTrustRequired": true,
+  "compilerDistributionQualified": false,
+  "normalRecoveryAccepted": false
+}

@@ -190,6 +190,8 @@ test('digest with no indexed namespace is mode-dependent and never guesses a nam
     digestOf: () => { throw new Error('not used'); },
     lookup: () => ({ status: 'resolved', instructions: { maxAttempts: installed.definition.steps[0]!.maxAttempts } }),
     prime: async () => 'resolved',
+    selectVerifiedDefinition: () => undefined,
+    selectVerifiedWorkflow: () => undefined,
     getVerifiedStep: () => installed.definition.steps.find((step) => step.name === 'agent-step'),
     getVerifiedDefinition: () => installed.definition,
     getVerifiedObject: () => ({ bundleDigest: defDigest(installed.objectPath.split('/').at(-1)!), objectPath: installed.objectPath }),

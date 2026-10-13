@@ -22,6 +22,7 @@
  * No retries/backoff and no token refresh in C1 — the roles own their retry
  * policy later, and oauth-kind token refresh stays inside owenloop.
  */
+import { Readable } from 'node:stream';
 import { HubError } from './types.ts';
 import type {
   AnswerApprovalRequest,
@@ -30,6 +31,11 @@ import type {
   AskResponse,
   ConditionalSubmitRequest,
   ConditionalSubmitResponse,
+  RoutedConditionalMutationRequest,
+  RoutedConditionalMutationResponse,
+  RoutedConditionalReceiptRequest,
+  RoutedConditionalReceiptResponse,
+  RoutedConditionalRetryIssueResponse,
   GetRostersResponse,
   ListHarnessModelsResponse,
   ListPendingApprovalsResponse,
@@ -43,6 +49,7 @@ import type {
   PresencePingResponse,
   PutFileArtifactRequest,
   PutFileArtifactResponse,
+  FileArtifactPointer,
   ReleaseRequest,
   ReleaseResponse,
   RejectRequest,
@@ -57,6 +64,29 @@ import type {
   WhatsNextRequest,
   WhatsNextResponse,
   WhoamiResponse,
+  RoutingScope,
+  RoutingSessionOpenResponse,
+  RoutingSessionRenewResponse,
+  RoutingOfferRequest,
+  RoutingOfferSubmission,
+  RoutingOfferResponse,
+  RoutingClaimReadResponse,
+  InvocationBindingReadRequest,
+  InvocationBindingReadResponse,
+  LaunchReportV1,
+  LaunchReportResponse,
+  LaunchReservationRequestV1,
+  LaunchReservationResponse,
+  LocalModelRequest,
+  LocalModelResponse,
+  RoutedMemberIssueRequest,
+  RoutedMemberIssueResponse,
+  RoutedMemberEmitRequest,
+  RoutedMemberCancelRequest,
+  RoutedCollectionSealRequest,
+  RoutedCollectionReceiptRequest,
+  RoutedCollectionReceiptResponse,
+  RoutedCollectionWriteResponse,
 } from './types.ts';
 
 export interface HubClientOptions {
@@ -66,6 +96,16 @@ export interface HubClientOptions {
   getToken: () => Promise<string>;
   /** Override the transport in tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
+  /** Trusted per-client closure; the capability never enters a request body. */
+  routingSession?: {
+    allowedOrigin: string;
+    get: () => RoutingSessionOpenResponse | undefined;
+    now?: () => number;
+    /** Shared monotonic Retry-After fence, checked immediately before transport. */
+    beforeRequest?: () => void;
+    /** Observe a routed 429 as soon as its response arrives. */
+    onRateLimit?: (error: HubError) => void;
+  };
 }
 
 export interface HubClient {
@@ -77,7 +117,7 @@ export interface HubClient {
    * a fake that ignores it simply cannot be cut short.
    */
   whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
-  getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
+  getOrder(req: GetOrderRequest, signal?: AbortSignal): Promise<GetOrderResponse>;
   /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
   getReferenceOrder?(req: GetOrderRequest): Promise<unknown>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
@@ -127,6 +167,8 @@ export interface HubClient {
   getRosters?(signal?: AbortSignal): Promise<GetRostersResponse>;
   /** Read the hub's known harness/model registry. */
   listHarnessModels?(): Promise<ListHarnessModelsResponse>;
+  /** Ask the authorized routing service for one local-model advisory. */
+  assessLocalModel?(req: LocalModelRequest, signal?: AbortSignal): Promise<LocalModelResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
   wake(cursor?: number, signal?: AbortSignal): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
@@ -142,7 +184,42 @@ export interface HubClient {
   putFileArtifact(req: PutFileArtifactRequest): Promise<PutFileArtifactResponse>;
 }
 
-export function createHubClient(opts: HubClientOptions): HubClient {
+export interface RoutingHubClient extends HubClient {
+  assessLocalModel(req: LocalModelRequest, signal?: AbortSignal): Promise<LocalModelResponse>;
+  /** Explicit session-scoped lifecycle. Legacy HubClient verbs remain fenced. */
+  routingHeartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
+  routingSubmit(req: SubmitRequest, signal?: AbortSignal): Promise<SubmitResponse>;
+  routingSubmitConditional(req: ConditionalSubmitRequest, signal?: AbortSignal): Promise<ConditionalSubmitResponse>;
+  routingConditionalMutation(req: RoutedConditionalMutationRequest, signal?: AbortSignal): Promise<RoutedConditionalMutationResponse>;
+  routingConditionalReceipt(req: RoutedConditionalReceiptRequest, signal?: AbortSignal): Promise<RoutedConditionalReceiptResponse>;
+  routingConditionalRetryIssue(req: RoutedConditionalReceiptRequest, signal?: AbortSignal): Promise<RoutedConditionalRetryIssueResponse>;
+  routingConditionalRevoke(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<{ revoked: true }>;
+  routingRelease(req: { workflow: string; run: string; reason?: string }, signal?: AbortSignal): Promise<ReleaseResponse>;
+  routingAsk(req: AskRequest, signal?: AbortSignal): Promise<AskResponse>;
+  routingReject(req: RejectRequest, signal?: AbortSignal): Promise<RejectResponse>;
+  routingRequestApproval(req: RequestApprovalRequest, signal?: AbortSignal): Promise<RequestApprovalResponse>;
+  routingCollectionIssue(req: RoutedMemberIssueRequest, signal?: AbortSignal): Promise<RoutedMemberIssueResponse>;
+  routingCollectionCancel(req: RoutedMemberCancelRequest, signal?: AbortSignal): Promise<RoutedCollectionWriteResponse>;
+  routingCollectionEmit(req: RoutedMemberEmitRequest, signal?: AbortSignal): Promise<RoutedCollectionWriteResponse>;
+  routingCollectionSeal(req: RoutedCollectionSealRequest, signal?: AbortSignal): Promise<RoutedCollectionWriteResponse>;
+  routingCollectionReceipt(req: RoutedCollectionReceiptRequest, signal?: AbortSignal): Promise<RoutedCollectionReceiptResponse>;
+  routingCollectionRevoke(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<{ revoked: true }>;
+  routingPutFileArtifact(req: { workflow: string; run: string; body: Readable; size: number;
+    contentType: string; filename?: string }, signal?: AbortSignal): Promise<PutFileArtifactResponse>;
+  routingGetFileArtifact(req: { workflow: string; run: string; key: string;
+    pointer: FileArtifactPointer }, signal?: AbortSignal): Promise<{ body: Readable; size: number; contentType: string }>;
+  openRoutingSession(req: { scope?: RoutingScope }, signal?: AbortSignal): Promise<RoutingSessionOpenResponse>;
+  renewRoutingSession(signal?: AbortSignal): Promise<RoutingSessionRenewResponse>;
+  closeRoutingSession(signal?: AbortSignal): Promise<{ closed: true }>;
+  routingOfferContext(req: RoutingOfferRequest, signal?: AbortSignal): Promise<RoutingOfferResponse>;
+  putShiftOffer(req: RoutingOfferRequest & { submission: RoutingOfferSubmission }, signal?: AbortSignal): Promise<RoutingOfferResponse>;
+  readRoutingClaim(req: { workflow: string; run: string }, signal?: AbortSignal): Promise<RoutingClaimReadResponse>;
+  readInvocationBinding(req: InvocationBindingReadRequest, signal?: AbortSignal): Promise<InvocationBindingReadResponse>;
+  reportLaunch(req: { workflow: string; report: LaunchReportV1 }, signal?: AbortSignal): Promise<LaunchReportResponse>;
+  reserveLaunch(req: { workflow: string; request: LaunchReservationRequestV1 }, signal?: AbortSignal): Promise<LaunchReservationResponse>;
+}
+
+export function createHubClient(opts: HubClientOptions): RoutingHubClient {
   const base = opts.origin.replace(/\/+$/, '');
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
 
@@ -184,6 +261,9 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   async function post<T>(verb: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    // A routing claim has additional authority and launch fences. Legacy
+    // lifecycle verbs cannot settle it through bearer-only routes.
+    if (opts.routingSession) throw new Error('routing session legacy POST refused');
     const res = await fetchImpl(`${base}/api/${verb}`, {
       method: 'POST',
       headers: await authHeaders(),
@@ -193,17 +273,187 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     return parse<T>(res);
   }
 
+  async function scopedPost<T>(verb: string, body: unknown, signal?: AbortSignal, opening = false): Promise<T> {
+    // Validate before resolving either credential. URL normalization must not
+    // quietly bless a path, userinfo, another origin, or an HTTP endpoint.
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password) throw new Error('routing origin refused');
+    const session = opening ? undefined : routing.get();
+    if (!opening && (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)) throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      if (session) headers['X-Owenloop-Routing-Session'] = session.credential;
+      routing.beforeRequest?.();
+      const res = await fetchImpl(`${base}/api/${verb}`, {
+	method: 'POST', headers, body: JSON.stringify(body), redirect: 'error',
+	...(signal === undefined ? {} : { signal }),
+      });
+      // Response bodies and fetch errors can echo credentials. Keep them out
+      // of persisted worker diagnostics while retaining status/backoff metadata.
+      if (!res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) routing.onRateLimit?.(error);
+	throw error;
+      }
+      return await res.json() as T;
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
+  async function scopedConditionalMutation(req: RoutedConditionalMutationRequest,
+    signal?: AbortSignal): Promise<RoutedConditionalMutationResponse> {
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password
+      || !/^[a-f0-9]{32,64}$/.test(req.intentId)
+      || (req.generationToken !== undefined && !/^[a-f0-9]{64}$/.test(req.generationToken))
+      || typeof req.rawBody !== 'string' || Buffer.byteLength(req.rawBody, 'utf8') === 0
+      || Buffer.byteLength(req.rawBody, 'utf8') > 32 * 1024 * 1024)
+      throw new Error('routing conditional request refused');
+    const session = routing.get();
+    if (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
+      throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      headers['X-Owenloop-Routing-Session'] = session.credential;
+      headers['X-Owenloop-Routing-Intent'] = req.intentId;
+      if (req.generationToken) headers['X-Owenloop-Routing-Generation'] = req.generationToken;
+      routing.beforeRequest?.();
+      const res = await fetchImpl(`${base}/api/routing_submit_conditional/v1`, {
+	method: 'POST', headers, body: req.rawBody, redirect: 'error',
+	...(signal === undefined ? {} : { signal }),
+      });
+      if (!res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) routing.onRateLimit?.(error);
+	throw error;
+      }
+      return await res.json() as RoutedConditionalMutationResponse;
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
+  async function scopedFileArtifact(req: { workflow: string; run: string; body: Readable; size: number;
+    contentType: string; filename?: string }, signal?: AbortSignal): Promise<PutFileArtifactResponse> {
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password
+      || !Number.isSafeInteger(req.size) || req.size <= 0 || req.size > 500_000_000)
+      throw new Error('routing file artifact refused');
+    const session = routing.get();
+    if (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
+      throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      headers['X-Owenloop-Routing-Session'] = session.credential;
+      headers['content-type'] = req.contentType;
+      headers['content-length'] = String(req.size);
+      if (req.filename !== undefined) headers['x-file-name'] = req.filename;
+      routing.beforeRequest?.();
+      const url = `${base}/api/routing_file_artifacts/v1?workflow=${encodeURIComponent(req.workflow)}&run=${encodeURIComponent(req.run)}`;
+      const res = await fetchImpl(url, {
+	method: 'POST', headers, body: req.body as unknown as RequestInit['body'],
+	duplex: 'half', redirect: 'error',
+	...(signal === undefined ? {} : { signal }),
+      } as RequestInit & { duplex: 'half' });
+      if (!res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) routing.onRateLimit?.(error);
+	throw error;
+      }
+      return await res.json() as PutFileArtifactResponse;
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
+  async function scopedFileArtifactRead(req: { workflow: string; run: string; key: string;
+    pointer: FileArtifactPointer }, signal?: AbortSignal): Promise<{ body: Readable; size: number; contentType: string }> {
+    const routing = opts.routingSession;
+    let origin: URL;
+    try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+    if (!routing || origin.protocol !== 'https:' || origin.origin !== routing.allowedOrigin
+      || base !== origin.origin || origin.username || origin.password
+      || !req.workflow || !req.run || !req.key || req.pointer.__file !== req.key
+      || !Number.isSafeInteger(req.pointer.size) || req.pointer.size <= 0 || req.pointer.size > 500_000_000
+      || !/^[a-f0-9]{64}$/.test(req.pointer.hash)) throw new Error('routing file artifact refused');
+    const session = routing.get();
+    if (!session || !Number.isFinite(session.expiresAt)
+      || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
+      throw new Error('routing session unavailable');
+    try {
+      const headers = await authHeaders();
+      headers['X-Owenloop-Routing-Session'] = session.credential;
+      routing.beforeRequest?.();
+      const url = `${base}/api/routing_file_artifacts/v1?workflow=${encodeURIComponent(req.workflow)}`
+        + `&run=${encodeURIComponent(req.run)}&key=${encodeURIComponent(req.key)}`;
+      const res = await fetchImpl(url, { method: 'GET', headers, redirect: 'error',
+        ...(signal === undefined ? {} : { signal }) });
+      if (!res.ok) {
+        const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+        if (error.status === 429) routing.onRateLimit?.(error);
+        throw error;
+      }
+      const size = Number(res.headers.get('Content-Length'));
+      const contentType = res.headers.get('Content-Type');
+      const hash = res.headers.get('X-File-Hash');
+      if (!res.body || !Number.isSafeInteger(size) || size !== req.pointer.size
+        || contentType !== req.pointer.contentType || hash !== req.pointer.hash) {
+        void res.body?.cancel().catch(() => {});
+        throw new Error('routing file artifact response refused');
+      }
+      return { body: Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), size, contentType };
+    } catch (error) {
+      if (error instanceof HubError) throw error;
+      throw new Error('routing request failed');
+    }
+  }
+
   async function get<T>(verb: string, query?: string, signal?: AbortSignal): Promise<T> {
+    if (opts.routingSession) {
+      let origin: URL;
+      try { origin = new URL(opts.origin); } catch { throw new Error('routing origin refused'); }
+      if (origin.protocol !== 'https:' || base !== origin.origin || origin.origin !== opts.routingSession.allowedOrigin
+	|| origin.username || origin.password) throw new Error('routing origin refused');
+    }
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
-    const res = await fetchImpl(url, {
-      method: 'GET',
-      headers: await authHeaders(),
-      ...(signal === undefined ? {} : { signal }),
-    });
-    return parse<T>(res);
+    try {
+      const headers = await authHeaders();
+      opts.routingSession?.beforeRequest?.();
+      const res = await fetchImpl(url, {
+	method: 'GET', headers,
+	...(opts.routingSession ? { redirect: 'error' as const } : {}),
+	...(signal === undefined ? {} : { signal }),
+      });
+      if (opts.routingSession && !res.ok) {
+	const error = new HubError(res.status, 'routing request refused', undefined, retryAfterMs(res));
+	if (error.status === 429) opts.routingSession.onRateLimit?.(error);
+	throw error;
+      }
+      return await parse<T>(res);
+    } catch (error) {
+      if (opts.routingSession && !(error instanceof HubError)) throw new Error('routing request failed');
+      throw error;
+    }
   }
 
   async function postBytes<T>(path: string, req: PutFileArtifactRequest): Promise<T> {
+    if (opts.routingSession) throw new Error('routing session legacy POST refused');
     const token = await opts.getToken();
     const headers: Record<string, string> = {
       authorization: `Bearer ${token}`,
@@ -221,9 +471,46 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   return {
-    whatsNext: (req, signal) => post<WhatsNextResponse>('whats_next', req, signal),
-    getOrder: (req) => post<GetOrderResponse>('get_order', req),
-    getReferenceOrder: (req) => post<unknown>('reference_order/v1', req),
+    whatsNext: (req, signal) => opts.routingSession !== undefined || req.routing !== undefined
+      ? scopedPost<WhatsNextResponse>('whats_next', req, signal)
+      : post<WhatsNextResponse>('whats_next', req, signal),
+    getOrder: (req, signal) => opts.routingSession !== undefined
+      ? scopedPost<GetOrderResponse>('get_order', req, signal)
+      : post<GetOrderResponse>('get_order', req, signal),
+    openRoutingSession: (req, signal) => scopedPost('routing_session_open', req, signal, true),
+    renewRoutingSession: (signal) => scopedPost('routing_session_renew', {}, signal),
+    closeRoutingSession: (signal) => scopedPost('routing_session_close', {}, signal),
+    routingOfferContext: (req, signal) => scopedPost('routing_offer_context', req, signal),
+    putShiftOffer: (req, signal) => scopedPost('put_shift_offer', req, signal),
+    readRoutingClaim: (req, signal) => scopedPost('read_routing_claim', req, signal),
+    readInvocationBinding: (req, signal) => scopedPost('read_invocation_binding', req, signal),
+    reportLaunch: (req, signal) => scopedPost('report_launch', req, signal),
+    reserveLaunch: (req, signal) => scopedPost('reserve_launch', req, signal),
+    routingHeartbeat: (req, signal) => scopedPost('heartbeat', req, signal),
+    routingSubmit: (req, signal) => scopedPost('submit', req, signal),
+    routingSubmitConditional: (req, signal) => scopedPost('submit/conditional-v1', req, signal),
+    routingConditionalMutation: (req, signal) => scopedConditionalMutation(req, signal),
+    routingConditionalReceipt: (req, signal) => scopedPost('routing_submit_conditional_receipt/v1', req, signal),
+    routingConditionalRetryIssue: (req, signal) => scopedPost('routing_submit_conditional_retry_issue/v1', req, signal),
+    routingConditionalRevoke: (req, signal) => scopedPost('routing_submit_conditional_receipt_revoke/v1', req, signal),
+    routingRelease: (req, signal) => scopedPost('release', req, signal),
+    routingAsk: (req, signal) => scopedPost('routing_ask/v1', req, signal),
+    routingReject: (req, signal) => scopedPost('routing_reject/v1', req, signal),
+    routingRequestApproval: (req, signal) => scopedPost('routing_request_approval/v1', req, signal),
+    routingCollectionIssue: (req, signal) => scopedPost('routing_collection_member_issue/v1', req, signal),
+    routingCollectionCancel: (req, signal) => scopedPost('routing_collection_member_cancel/v1', req, signal),
+    routingCollectionEmit: (req, signal) => scopedPost('routing_collection_member_emit/v1', req, signal),
+    routingCollectionSeal: (req, signal) => scopedPost('routing_collection_seal/v1', req, signal),
+    routingCollectionReceipt: (req, signal) => scopedPost('routing_collection_receipt/v1', req, signal),
+    routingCollectionRevoke: (req, signal) => scopedPost('routing_collection_receipt_revoke/v1', req, signal),
+    routingPutFileArtifact: (req, signal) => scopedFileArtifact(req, signal),
+    routingGetFileArtifact: (req, signal) => scopedFileArtifactRead(req, signal),
+    assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
+    // Hosted-holder preflight only. Routing orders return routing-unsupported;
+    // get_order plus read_routing_claim supply Jev authority instead.
+    getReferenceOrder: (req) => opts.routingSession !== undefined
+      ? scopedPost<unknown>('reference_order/v1', req)
+      : post<unknown>('reference_order/v1', req),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
@@ -235,6 +522,8 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     answerApproval: (req) => post<AnswerApprovalResponse>('answer_approval', req),
     listPendingApprovals: () => post<ListPendingApprovalsResponse>('list_pending_approvals', {}),
     reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
+    // Bearer-only identity bootstrap. Routed clients still pin HTTPS origin
+    // and disallow redirects, but send no routing-session capability here.
     whoami: (signal) => get<WhoamiResponse>('whoami', undefined, signal),
     getRosters: (signal) => get<GetRostersResponse>('rosters', undefined, signal),
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),

@@ -1,0 +1,213 @@
+{
+  "admissionProtocol": "jev-one-relay-qualification-admission-v1",
+  "all23ExitsPreserved": true,
+  "buildIncludeBinding": "Write exact inputs/direct/descriptor.c into exclusive build/direct/descriptor.c, retain and hash it; -I build resolves include from retained main source FD. Require both main and direct source in selected -M dependencies and recheck selected bytes after build.",
+  "caps": {
+    "archiveDeclaredTotalBytes": 134217728,
+    "archiveEntries": 8192,
+    "archiveEntryBytes": 16777216,
+    "cleanupSeconds": 10,
+    "compiledImageBytes": 8388608,
+    "dependencyStreamBytes": 131072,
+    "fixtureSeconds": 40,
+    "headerArchiveBytes": 16777216,
+    "ownerSeconds": 150,
+    "selectedDependencies": 512,
+    "sourceAdmissionManifestResultBytes": 65536,
+    "toolImageBytesEach": 536870912,
+    "totalSelectedHashBytesIncludingChildBound": 1073741824
+  },
+  "childReceiptCount": 13,
+  "childReceiptKeys": [
+    "terminal",
+    "nodeCloseObserved",
+    "code",
+    "signal",
+    "ownedPipeEOF",
+    "pipePolicyValid",
+    "cleanupKnown"
+  ],
+  "contextBinding": "Actual platform event/job/run values plus same-job Git HEAD/tree/clean and exact source pins are checked; mutable scheduling SHA is not global one-shot authority. Fresh root external comparison selects actual job/run/attempt and source before admission and audits afterward.",
+  "executionAdmitted": false,
+  "executionFiles": [
+    "dependencies/metadata.mjs",
+    "dependencies/owner.py",
+    "direct-entry.mjs",
+    "entry.mjs",
+    "headers.py",
+    "inputs/direct/descriptor.c",
+    "inputs/direct/facade.mjs",
+    "inputs/direct/target.mjs",
+    "inputs/fixture.mjs",
+    "inputs/relay-facade.mjs",
+    "inputs/relay.c",
+    "inputs/role.mjs",
+    "inputs/supervisor.mjs",
+    "launch.py",
+    "libc-contract.c",
+    "loader.mjs",
+    "owner.py",
+    "protocol.json"
+  ],
+  "firstEntryTrustBoundary": "Platform runs separately pinned bootstrap/launch/entry/loader first entries; path/FD before-after checks do not prove initial-entry executed bytes. Public registerHooks serves already-read verified module bytes after registration; no Worker inheritance claim.",
+  "fixtureCaseNames": [
+    "GENUINE_THREE_EDGE_ONE_RELAY_ENDPOINT",
+    "ORDINARY_PAIR_NOT_FORWARDABLE",
+    "LOCAL_SUPERVISOR_MISMATCH_REFUSED",
+    "EXITED_REAPED_ANCESTOR_REFUSED",
+    "CLOSED_CHAIN_REFUSED",
+    "MALFORMED_FRAME_CHAIN_REFUSED",
+    "EXTRA_RIGHTS_CHAIN_REFUSED",
+    "TRUNCATED_RIGHTS_CHAIN_REFUSED"
+  ],
+  "fixtureProtocol": "jev-private-one-relay-fixture-v1",
+  "fixtureSuccessStage": "TRUNCATED_RIGHTS",
+  "futureFields": [
+    "Fresh root-selected publication head/base/tree/run/attempt/job/original admission",
+    "Fresh tool executable paths/pins, public header and selected preprocessor dependency closure, artifact",
+    "Exclusive actual output and root source/actual audit; no old passing-prefix transfer"
+  ],
+  "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
+  "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
+  "job": "linux-one-relay-qualification",
+  "nativeRecoveryAccepted": false,
+  "normalRecoveryAccepted": false,
+  "passRequirements": [
+    "Exactly eight ordered cases and thirteen closed seven-key records; exact int code0, signal NONE, all five boolean obligations true",
+    "Six owner original slots in exact order, each natural0/reaped/both pipe EOF/no signal/no truncation/no interruption/deadline",
+    "Four hosted original slots head/tree/clean/qualification-launch natural0/reaped/both pipe EOF/no signal",
+    "Same-job fixture process credentials/namespaces/kernel/procfs metadata before addon load; prior metadata is history only",
+    "Public glibc>=2.36 header/symbol ABI positive and fresh selected Node22.23.0 public headers; unsupported refuses without retry",
+    "Root whole source/context/actual-run/custody/result audit remains separately required"
+  ],
+  "privacy": "Fixed schemas/enums/counts/hashes, no raw stream/event/error/provider/auth/model or PID/UID/path values in public transport; no provider secrets, Actions platform credentials/trust remain.",
+  "privateStreams": "Exact <slot>.stdout and <slot>.stderr only; private dependency-closure.private.json contains selected paths and is never uploaded.",
+  "productionGeneralizationAllowed": false,
+  "protocol": "jev-one-relay-qualification-source-v1",
+  "providerAccessQualified": false,
+  "publicOutputFiles": [
+    "result.json"
+  ],
+  "remainingCoverage": [
+    "wrong actual sender/creator/fixed slot",
+    "reordered/duplicate/missing rights or packets",
+    "enqueue/allocation/close uncertainty injection",
+    "individual role/supervisor/provider exit or closed isolation"
+  ],
+  "resourceAccounting": {
+    "addonHashPasses": 9,
+    "formula": "node.bytes + 14*sum(fixture,role,supervisor,relay-facade,direct/facade,direct/target,metadata source bytes) + 9*artifact.bytes",
+    "genuineNestedChildOriginals": 13,
+    "maximumConcurrentNodeProcesses": 5,
+    "memoryEnforcementClaimed": false,
+    "nodeImageHashPasses": 1,
+    "nodeInitializerEntries": 14,
+    "totalHashCapBytes": 1073741824,
+    "verifiedJSFilesPerInitializer": 7,
+    "workerThreadAdditionalToNodeProcessCount": true
+  },
+  "resultProtocol": "jev-one-relay-qualification-result-v1",
+  "retainedOriginalSlots": [
+    "headers",
+    "dependencies",
+    "libc-build",
+    "libc-abi",
+    "addon-build",
+    "fixture"
+  ],
+  "retryPermitted": false,
+  "runtimeAccepted": false,
+  "runtimeEntryMap": {
+    "entry/direct/facade.mjs": "inputs/direct/facade.mjs",
+    "entry/direct/target.mjs": "direct-entry.mjs",
+    "entry/fixture.mjs": "entry.mjs",
+    "entry/loader.mjs": "loader.mjs",
+    "entry/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/relay-facade.mjs": "inputs/relay-facade.mjs",
+    "entry/role.mjs": "entry.mjs",
+    "entry/supervisor.mjs": "entry.mjs",
+    "entry/verified/direct/facade.mjs": "inputs/direct/facade.mjs",
+    "entry/verified/direct/target.mjs": "inputs/direct/target.mjs",
+    "entry/verified/fixture.mjs": "inputs/fixture.mjs",
+    "entry/verified/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/verified/relay-facade.mjs": "inputs/relay-facade.mjs",
+    "entry/verified/role.mjs": "inputs/role.mjs",
+    "entry/verified/supervisor.mjs": "inputs/supervisor.mjs"
+  },
+  "scope": "HARMLESS_ONE_RELAY_ONLY",
+  "selectedCompilerScope": "-M selected preprocessor source/header inputs only; compiler image hash is observed unverified, not frontend/as/ld/specs/startup/linker/runtime distribution closure. Trusted hosted compiler/runtime distribution remains explicit.",
+  "selectedHeaders": [
+    "node_api.h",
+    "node_api_types.h",
+    "js_native_api.h",
+    "js_native_api_types.h"
+  ],
+  "sourceOnly": true,
+  "sourcePacketRevision": "V1",
+  "sourceReferences": [
+    {
+      "bytes": 10494,
+      "mode": 384,
+      "path": "/Volumes/more/jev-normal-one-relay-native-component-source-v2-20261013/manifest.json",
+      "sha256": "abafbdfb3a0439dbbc80c3edfe08c7e5cb18425c05508854f532c1fa1eaef449"
+    },
+    {
+      "bytes": 4388,
+      "mode": 384,
+      "path": "/Volumes/more/jev-normal-one-relay-native-component-source-v2-20261013/protocol.json",
+      "sha256": "e6e536c95189846c2606b5ef40a1187d0537f1520a1223738c0d7954add704df"
+    },
+    {
+      "bytes": 6833,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-normal-one-relay-component-v2-independent-whole-source-review-20261013-transport.md",
+      "sha256": "3864b76ce289aa1ed75b5041683dd3f9cba08b2985edc9e10530c73a98414e1b"
+    },
+    {
+      "bytes": 26266,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-normal-one-relay-component-v2-independent-whole-source-review-20261013-transport.json",
+      "sha256": "e453a0ef803ced32d8e788bfcf717765b68e4324461c139dfe8364d5ac1abf7b"
+    },
+    {
+      "bytes": 2852,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-one-relay-component-v2-root-source-disposition-20261013.json",
+      "sha256": "ae39dca5f8ecbfa21ab1cbf01d86f40004fc7d9faef160c3748cefc3f0c5e1f3"
+    }
+  ],
+  "stagePlan": [
+    {
+      "seconds": 25,
+      "slot": "headers",
+      "streamCapBytes": 65536
+    },
+    {
+      "seconds": 15,
+      "slot": "dependencies",
+      "streamCapBytes": 131072
+    },
+    {
+      "seconds": 20,
+      "slot": "libc-build",
+      "streamCapBytes": 65536
+    },
+    {
+      "seconds": 5,
+      "slot": "libc-abi",
+      "streamCapBytes": 65536
+    },
+    {
+      "seconds": 25,
+      "slot": "addon-build",
+      "streamCapBytes": 65536
+    },
+    {
+      "seconds": 40,
+      "slot": "fixture",
+      "streamCapBytes": 65536
+    }
+  ],
+  "targetEnvironment": {},
+  "unknownHold": "Nonterminal/nonpassing original authority retained with no next stage, no reconstructed PID or restart; external root settlement required."
+}

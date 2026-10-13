@@ -56,7 +56,9 @@
  * cold replay WITHIN THE SAME FIRING — the order is still leased, so handing it
  * back would waste a whole re-offer cycle to learn something already known.
  */
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { hasConsumedFilePointers } from '../hub/routed-command-files.ts';
 
 import { isExistingDirectory, isWorkdirAllowed } from './workdir.ts';
 
@@ -64,8 +66,9 @@ import { createApprovalRequester } from './approvals.ts';
 
 import { createLeaseLoop, type LeaseLoop, type LeaseLoopOptions, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
+import type { ContactHolder, GetOrderResponse, LocalModelTuple, OrderPacket, ResolutionPayload } from '../hub/types.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
+import type { TrustedInputAdmission } from '../hosted/trusted-input-admission.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import type {
   AgentEvent,
@@ -116,6 +119,8 @@ export type AgentRunOutcome =
   | 'unstamped-order' // a capability-bearing order had no usable hub crew stamp (exit 1)
   | 'unresolvable-crew' // a stamped crew's local roster could not be read (exit 1)
   | 'unresolvable-capability' // no settings row for the order's capabilities (exit 1)
+  | 'routed-launch-refused' // exact routed pre-provider authorization was unavailable (exit 1)
+  | 'routed-quarantined' // routed effects or provider group could not be settled (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'session-store-failed' // durable active-row gate failed before provider work (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
@@ -124,6 +129,13 @@ export type AgentRunOutcome =
   | 'ownership-error' // 403 — the run is not ours (exit 1)
   | 'hub-unreachable' // transient failures spanned the window (exit 1)
   | 'stopped'; // stop() arrived before the hold was established (exit 1)
+
+export interface RoutedAgentLifecycle {
+  start(args: StartArgs, onEvent: (event: AgentEvent) => void): Promise<HarnessSessionRef>;
+  requestStop(): void;
+  complete(reason: 'prestart' | 'turn-ended' | 'lease-ended' | 'stop'):
+    Promise<'submitted' | 'released' | 'uncertain'>;
+}
 
 /**
  * Locate the normalized step spec for an order. Injected because the lookup is
@@ -181,6 +193,7 @@ const DEFAULT_RECOVERY_STOP_GRACE_MS = 5_000;
 const HARNESS_FAILURE_TAIL_SIZE = 4;
 const HARNESS_FAILURE_FRAGMENT_CAP = 700;
 const HARNESS_FAILURE_TAIL_CAP = 2_000;
+class TrustedInputV2Refusal extends Error {}
 
 export interface AgentRunLoopOptions {
   hub: HubClient;
@@ -221,8 +234,31 @@ export interface AgentRunLoopOptions {
    * root. A real binary/credential probe needs new adapter-contract surface.
    */
   harnessAvailable: (harnessId: string) => boolean;
+  /** Optional Shift-authorized selection. Reserve/report remain deferred until
+   * local adapter policy passes, and the routed role stays fenced until all
+   * provider/holder lifecycle paths have launch proof. */
+  routedSelect?: (order: OrderPacket, signal: AbortSignal) => Promise<{
+    selected: LocalModelTuple;
+    authorize(signal: AbortSignal): Promise<{ selected: LocalModelTuple; expiresAt: number }>;
+  }>;
+  /** Routed-only process and consequence owner. It retains the managed launch
+   * at spawn time and owns freeze/group/parent outcome before any release. */
+  routedLifecycle?: RoutedAgentLifecycle;
+  /** One-use private holder subcap for nested MCP. Required for routed starts;
+   * never substitute the operator account selector or a bearer fallback. */
+  routingHolderPath?: string;
+  /** Issue the one-use routed holder handoff immediately after the final
+   * launch-order gate, so preflight cannot consume its short lifetime. */
+  createRoutingHolderPath?: () => string;
+  /** Published read-only cache view, used only when a routed input actually
+   * contains a verified file pointer. Never attach it to every routed agent. */
+  routedFileCacheRoot?: string;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
+  /** Explicit v2 mode; no v1 consume fallback when supplied. */
+  trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
+  /** Routed v2 uses the original-session broker and is distinct from the ordinary reader. */
+  routedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** Append one session record. Wired to `appendSession` by the role. */
   appendSession: (rec: SessionRecord) => void;
   /**
@@ -556,6 +592,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   let reportRecoveryPersistenceFailure: ((error: unknown) => void) | undefined;
   /** Provider-selected model, when a harness reports it after its synchronous start gate. */
   let runtimeModel: string | undefined;
+  const routedAbort = new AbortController();
   /** Recent unique harness diagnostics for the capability-silent no-submit log only. */
   const harnessFailures: string[] = [];
 
@@ -849,6 +886,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
   /** Release and finish. Used by every path that hands the order back. */
   async function releaseWith(reason: string, outcome: AgentRunOutcome): Promise<AgentRunOutcome> {
+    if (opts.routedLifecycle) {
+      let terminal: 'submitted' | 'released' | 'uncertain' = 'uncertain';
+      try { terminal = await opts.routedLifecycle.complete(signalled ? 'stop' : 'prestart'); }
+      catch { /* Parent/group custody was not proved. */ }
+      lease.stop(reason, { release: false });
+      if (leasePromise) await Promise.race([leasePromise,
+	new Promise<void>(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref(); })]);
+      return terminal === 'uncertain' ? 'routed-quarantined' : outcome;
+    }
     lease.stop(reason);
     await leasePromise;
     return outcome;
@@ -859,6 +905,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     void leasePromise.then((outcome) => {
       leaseSettled = true;
       settledLeaseOutcome = outcome;
+      routedAbort.abort();
     });
 
     // First contact race: the order arrives (hold established), or the lease
@@ -874,15 +921,31 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       opts.err(`owenloop work agent-run: ${order} is not an agent order (misroute) — releasing`);
       return releaseWith('misroute', 'misroute');
     }
+    if (opts.routedSelect && opts.trustedInputV2
+      || !opts.routedSelect && opts.routedInputV2) {
+      return releaseWith('routed-v2-authority-unavailable', 'routed-launch-refused');
+    }
+    const inputAdmission = opts.routedSelect ? opts.routedInputV2 : opts.trustedInputV2;
 
     // Consume-side verification is the prompt boundary. Do this before loading
     // or rendering any step brief: `owes[].reasons` is dynamic text supplied by
     // the transport, and an unverified rejection thread must never reach a
     // provider session. The same whole-order gate also protects `consumes`.
+    let v2Pin: { packetDigest: string; witnessDigest: string } | undefined;
+    if (inputAdmission !== undefined) {
+      let admission: TrustedInputAdmission;
+      try { admission = await inputAdmission.observe(packet); }
+      catch { admission = { ok: false, reason: 'reference-v2-unavailable' }; }
+      if (!admission.ok) {
+	opts.err(`owenloop work agent-run: trusted input v2 refusal: ${admission.reason}`);
+	return releaseWith('unverified-consumed', 'unverified-consumed');
+      }
+      v2Pin = { packetDigest: admission.packetDigest, witnessDigest: admission.witnessDigest };
+    }
     const hasConsumedData =
       Object.keys(packet.consumes).length > 0
       || packet.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
-    if (hasConsumedData) {
+    if (inputAdmission === undefined && hasConsumedData) {
       if (opts.consumedVerifier === undefined) {
         const detail =
           `consume-side verifier is not configured; dynamic values cannot be admitted to an agent prompt`;
@@ -890,7 +953,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return releaseWith('unverified-consumed', 'unverified-consumed');
       }
       try {
-        const checked = await opts.consumedVerifier(packet, { hardRule: false });
+	const checked = await opts.consumedVerifier(packet, { hardRule: opts.routedSelect !== undefined });
         if (!checked.ok) {
           opts.err(`owenloop work agent-run: ${checked.reason} — releasing ${order}`);
           return releaseWith('unverified-consumed', 'unverified-consumed');
@@ -903,6 +966,17 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return releaseWith('unverified-consumed', 'unverified-consumed');
       }
     }
+
+    const freshTrustedInputV2 = async (): Promise<void> => {
+      if (inputAdmission === undefined || v2Pin === undefined) return;
+      let fresh: TrustedInputAdmission;
+      try { fresh = await inputAdmission.observe(packet); }
+      catch { throw new TrustedInputV2Refusal('reference-v2-unavailable'); }
+      if (!fresh.ok) throw new TrustedInputV2Refusal(fresh.reason);
+      if (fresh.packetDigest !== v2Pin.packetDigest || fresh.witnessDigest !== v2Pin.witnessDigest) {
+	throw new TrustedInputV2Refusal('claim-input-observation-changed');
+      }
+    };
 
     stepName = packet.step;
     stepKey = packet.key;
@@ -979,8 +1053,29 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     const step: NormalizedStepSpec = material;
 
     // ---- ROUTING: select a roster candidate before resolving an adapter ----
-    const routing = resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
-    await reportResolution(routing);
+    let routedSelection: Awaited<ReturnType<NonNullable<AgentRunLoopOptions['routedSelect']>>> | undefined;
+    if (opts.routedSelect) {
+      try { routedSelection = await opts.routedSelect(packet, routedAbort.signal); }
+      catch {
+	opts.err('owenloop work agent-run: routed selection refused');
+	return releaseWith('routed-selection-refused', 'routed-launch-refused');
+      }
+    }
+    const routing: OrderRouting = routedSelection
+      ? { kind: 'resolved', capability: packet.capabilities?.[0] ?? 'routed', match: 'exact',
+	harness: routedSelection.selected.harness, model: routedSelection.selected.model,
+	effort: routedSelection.selected.effort }
+      : resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
+    if (!routedSelection) await reportResolution(routing);
+    let routedFileCacheRoot: string | undefined;
+    if (routedSelection) {
+      try {
+	if (hasConsumedFilePointers(packet)) {
+	  if (!opts.routedFileCacheRoot || !isAbsolute(opts.routedFileCacheRoot)) throw new Error();
+	  routedFileCacheRoot = opts.routedFileCacheRoot;
+	}
+      } catch { return releaseWith('routed-file-cache-unavailable', 'routed-launch-refused'); }
+    }
     if (routing.kind === 'refused') {
       if (routing.reason === 'harness-policy') {
         opts.err(
@@ -1011,6 +1106,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     const chosenHarnessId = routing.kind === 'resolved' ? routing.harness : undefined;
+    if (routedSelection && step.harness && step.harness !== chosenHarnessId)
+      return releaseWith('routed-harness-policy', 'routed-launch-refused');
     const resolution = opts.resolveAdapter(chosenHarnessId, step.harness);
     adapterId = resolution.id;
     if (resolution.adapter === undefined) {
@@ -1018,6 +1115,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       opts.err(`owenloop work agent-run: no adapter registered for harness '${resolution.id}' (registered: ${known}) — releasing`);
       return releaseWith('no-harness', 'no-harness');
     }
+    if (routedSelection && resolution.id !== routedSelection.selected.harness)
+      return releaseWith('routed-adapter-mismatch', 'routed-launch-refused');
     adapter = resolution.adapter;
     /** The same object as `adapter`, but narrowed — the module-scope `adapter`
      *  stays `HarnessAdapter | undefined` for `teardown`/`stop`. */
@@ -1062,9 +1161,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       .map((owed) => owed.path)
       .filter((path) => path !== '');
     const recoveryConfigurationIsTerminal = isHarnessTurnError(recoveryConfigurationFailure);
-    const recoveryEnabled =
+    const recoveryEnabled = !routedSelection &&
       recoveryPaths.length === 1 &&
       (recoveryPolicy !== undefined || recoveryConfigurationIsTerminal);
+    // Existing recovery can resume or start a different provider process.
+    // Routed firings use the initial start only until those paths have their
+    // own launch proof; a configured recovery policy must not block that start.
 
     // A present-but-invalid adapter setting must stop before *any* provider
     // delivery, including multi-output orders that cannot use bounded recovery.
@@ -1168,6 +1270,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       prev.cwd === recordCwd &&
       dirExists(prev.cwd) &&
       delta.message !== '';
+    // A native token may open a new vendor process on deliver. Until that
+    // process receives its own admission proof, no routed resume can run.
+    if (routedSelection && resumable)
+      return releaseWith('routed-resume-unavailable', 'routed-launch-refused');
 
     // The watermark this firing's records carry. It STARTS at the prior value —
     // never at the delta's — and advances only once the reasons have actually
@@ -1196,7 +1302,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       if (delta.deliveredReasonAt !== undefined) deliveredReasonAt = delta.deliveredReasonAt;
     }
 
-    const owenloopMcp = buildOwenloopMcp(spec);
+    if (routedSelection && !opts.createRoutingHolderPath
+      && (!opts.routingHolderPath || !isAbsolute(opts.routingHolderPath)))
+      return releaseWith('routed-holder-unavailable', 'routed-launch-refused');
+    let owenloopMcp = routedSelection && opts.createRoutingHolderPath
+      ? undefined : buildOwenloopMcp(spec, undefined, undefined, opts.routingHolderPath,
+	inputAdmission !== undefined);
+    const holderMount = () => {
+      if (!owenloopMcp) throw new Error('routed holder handoff unavailable');
+      return owenloopMcp;
+    };
     /**
      * The human approval channel for this session's escalated tool calls.
      *
@@ -1224,14 +1339,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       routing.kind === 'resolved'
         ? { model: routing.model, effort: routing.effort }
         : undefined;
-    const deliverArgs: DeliverArgs = {
+    const deliverArgs = (): DeliverArgs => ({
       cwd: recordCwd,
-      owenloopMcp,
+      owenloopMcp: holderMount(),
       permissions,
       approvals,
+      ...(routedFileCacheRoot ? { verifiedFileCacheRoot: routedFileCacheRoot } : {}),
       ...(resolvedModel ?? {}),
       ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
-    };
+    });
     /** Built lazily: a cold start after a refused resume needs a FRESH one. */
     const coldArgs = (): StartArgs => ({
       // The replay brief is the ordinary brief PLUS a trailing rejection section,
@@ -1243,9 +1359,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
           : {}),
       }),
       cwd: recordCwd,
-      owenloopMcp,
+      owenloopMcp: holderMount(),
       permissions,
       approvals,
+      ...(routedFileCacheRoot ? { verifiedFileCacheRoot: routedFileCacheRoot } : {}),
       ...(resolvedModel ?? {}),
       ...(recoveryEnabled && recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
     });
@@ -1449,6 +1566,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							return { outcome: await sessionStoreFailedAfterDispatch() };
 					}
 					const failure = 'failure' in raced ? raced.failure : undefined;
+					if (failure instanceof TrustedInputV2Refusal) {
+						opts.err(`owenloop work agent-run: trusted input v2 prestart refusal: ${failure.message}`);
+						return { outcome: await releaseWith('unverified-consumed', 'unverified-consumed') };
+					}
 					if (failure !== undefined) {
 						setFailure(failure);
 						if (isHarnessTurnError(failure)) {
@@ -1582,10 +1703,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						if (resumable && prev !== null) {
 							sessionRef = { harness: prev.harness, token: prev.token };
 							createdAt = prev.createdAt;
-							await active.deliver(sessionRef, delta.message, deliverArgs, onEvent);
+							await freshTrustedInputV2();
+							await active.deliver(sessionRef, delta.message, deliverArgs(), onEvent);
 							markDelivered();
 							return;
 						}
+						await freshTrustedInputV2();
 						const ref = await active.start(coldArgs(), onEvent);
 						sessionRef = ref;
 						markDelivered();
@@ -1607,7 +1730,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 						next = 'cold-restart';
 					} else {
 						const wake = await dispatch('wake', { wakeUsed: true }, async () => {
-							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs, onEvent);
+							await freshTrustedInputV2();
+							await active.deliver(sessionRef!, renderRecoveryWake(recoveryPath, recovery!), deliverArgs(), onEvent);
 						});
 							if ('outcome' in wake) return wake.outcome;
 							if (isHarnessTurnError(wake.failure) && wake.failure.terminal) {
@@ -1629,6 +1753,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 							packet,
 							...(prev?.deliveredReasonAt !== undefined ? { deliveredReasonAt: prev.deliveredReasonAt } : {}),
 						});
+						await freshTrustedInputV2();
 						const ref = await active.start(
 							{ ...coldArgs(), brief: `${base}\n\n---\n\n${renderColdRecoveryAppendix(recovery!)}` },
 							onEvent,
@@ -1651,13 +1776,37 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       `owenloop work agent-run: hosting ${order} (step '${packet.step}', harness '${resolution.id}', attempt ${attempt}, ${path})`,
     );
 
-    type TurnResult = { t: 'turn'; failure?: unknown; persistenceFailure?: unknown };
+    type TurnResult = { t: 'turn'; failure?: unknown; persistenceFailure?: unknown;
+      routedRefused?: boolean };
+
+    let routedStartUsed = false;
+    async function beforeColdStart(): Promise<boolean> {
+      if (!routedSelection) return true;
+      if (routedStartUsed || signalled || leaseSettled || routedAbort.signal.aborted) return false;
+      routedStartUsed = true;
+      try {
+	const admitted = await routedSelection.authorize(routedAbort.signal);
+	if (signalled || leaseSettled || routedAbort.signal.aborted
+	  || opts.now() >= admitted.expiresAt
+	  || !isDeepStrictEqual(admitted.selected, routedSelection.selected)) return false;
+	if (opts.createRoutingHolderPath) {
+	  const path = opts.createRoutingHolderPath();
+	  if (!isAbsolute(path)) return false;
+	  owenloopMcp = buildOwenloopMcp(spec, undefined, undefined, path);
+	}
+	return !signalled && !leaseSettled && !routedAbort.signal.aborted
+	  && opts.now() < admitted.expiresAt;
+      } catch { return false; }
+    }
 
     /** Cold-start this firing. Shared by the ordinary path and the fallback. */
     async function coldStart(): Promise<TurnResult> {
       activePersistenceFailure = undefined;
+      if (!await beforeColdStart()) return { t: 'turn', routedRefused: true };
       try {
-        const ref = await active.start(coldArgs(), onEvent);
+	await freshTrustedInputV2();
+	const ref = await (opts.routedLifecycle
+	  ? opts.routedLifecycle.start(coldArgs(), onEvent) : active.start(coldArgs(), onEvent));
         sessionRef = ref;
         // The replay brief carried the reasons, and the turn it opened has now
         // ended — only here is the watermark honest. (The `active` row written
@@ -1668,7 +1817,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         return { t: 'turn' };
       } catch (e: unknown) {
 	if (activePersistenceFailure !== undefined) {
-	  await teardown();
+	  if (opts.routedLifecycle) opts.routedLifecycle.requestStop();
+	  else await teardown();
 	  return { t: 'turn', persistenceFailure: activePersistenceFailure };
 	}
         return { t: 'turn', failure: e };
@@ -1705,7 +1855,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       }
 
       try {
-        await active.deliver(sessionRef, delta.message, deliverArgs, onEvent);
+	await freshTrustedInputV2();
+	await active.deliver(sessionRef, delta.message, deliverArgs(), onEvent);
         markDelivered();
         return { t: 'turn' };
       } catch (e: unknown) {
@@ -1730,6 +1881,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     const raced = await Promise.race([turnDone, leasePromise.then((o) => ({ t: 'lease' as const, o }))]);
 
     if (raced.t === 'lease') {
+      if (opts.routedLifecycle) {
+	let terminal: 'submitted' | 'released' | 'uncertain' = 'uncertain';
+	try { terminal = await opts.routedLifecycle.complete(signalled ? 'stop' : 'lease-ended'); }
+	catch { /* The provider or parent state is uncertain. */ }
+	lease.stop('routed-terminal', { release: false });
+	return terminal === 'submitted' ? 'submitted'
+	  : terminal === 'released' && signalled ? 'killed' : 'routed-quarantined';
+      }
       await teardown();
       if (raced.o === 'completed') {
         opts.out(`owenloop work agent-run: ${order} completed mid-turn (the hub reported an outcome)`);
@@ -1751,6 +1910,27 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 	`${errMsg(raced.persistenceFailure)} — releasing`,
       );
       return releaseWith('session-store-failed', 'session-store-failed');
+    }
+
+    if (raced.routedRefused) {
+      opts.err('owenloop work agent-run: routed launch authorization refused before provider start');
+      return releaseWith('routed-launch-refused', 'routed-launch-refused');
+    }
+    if (raced.failure instanceof TrustedInputV2Refusal) {
+      opts.err(`owenloop work agent-run: trusted input v2 prestart refusal: ${raced.failure.message}`);
+      return releaseWith('unverified-consumed', 'unverified-consumed');
+    }
+
+    if (opts.routedLifecycle) {
+      let terminal: 'submitted' | 'released' | 'uncertain' = 'uncertain';
+      try { terminal = await opts.routedLifecycle.complete(signalled ? 'stop' : 'turn-ended'); }
+      catch { /* A failed final observation retains all routed custody. */ }
+      lease.stop('routed-terminal', { release: false });
+      if (leasePromise) await Promise.race([leasePromise,
+	new Promise<void>(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref(); })]);
+      if (terminal === 'submitted') return 'submitted';
+      if (terminal === 'released') return signalled ? 'killed' : 'no-submit';
+      return 'routed-quarantined';
     }
 
     // TURN END — NOT task end. Log the failure shape for humans, then confirm.
@@ -1830,6 +2010,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   function stop(reason?: string): void {
     if (signalled) return;
     signalled = true;
+    routedAbort.abort();
+    if (opts.routedLifecycle) { opts.routedLifecycle.requestStop(); return; }
     void teardown();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

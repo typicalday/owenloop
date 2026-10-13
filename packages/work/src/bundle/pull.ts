@@ -5,6 +5,7 @@
  * evidence that the normal install trust boundary must validate.
  */
 import { defaultRecoveryMarkerDir } from '../../../../src/install.ts';
+import { inspectBundle } from '../../../../src/bundle/index.ts';
 import { readBodyBounded } from '../../../../src/credentials.ts';
 import {
   createBundleIngestor,
@@ -15,6 +16,8 @@ import {
   workflowStoreStatePaths,
 } from '../../../../src/store/index.ts';
 import type { MissingObjectHandler } from '../../../../src/store/index.ts';
+import type { PreCommitVerifier } from '../../../../src/store/index.ts';
+import { HubError } from '../hub/types.ts';
 
 const BUNDLE_MAX_BYTES = 25_000_000;
 const EVIDENCE_MAX_BYTES = 64 * 1024;
@@ -37,6 +40,25 @@ export interface HubBundleRecoveryOptions {
   fetchImpl?: typeof fetch;
   /** Per-request deadline; production uses the fixed 30-second default. */
   timeoutMs?: number;
+  /** Routed Shift only: the same monotonic fence used by session transport. */
+  beforeRequest?: () => void;
+  onRateLimit?: (error: HubError) => void;
+  /** Routed Shift may require stricter trust without changing ordinary recovery. */
+  preCommitVerifier?: PreCommitVerifier;
+  /** Private routed staging only: install signed locked children before their parent. */
+  recoverLockedDependencies?: boolean;
+  /** Private routed staging only: defer signed Hub live slash edges until the
+   * parent authenticates the selected concrete occurrence. */
+  deferHubLiveCallsAtStorage?: true;
+}
+
+function retryAfterMs(response: Response): number | undefined {
+  const raw = response.headers.get('retry-after')?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
 }
 
 function originBase(origin: string): string {
@@ -62,13 +84,22 @@ async function request(
 ): Promise<Response> {
   const timeoutMs = args.timeoutMs ?? RECOVERY_TIMEOUT_MS;
   try {
-    return await (args.fetchImpl ?? globalThis.fetch)(route, {
+    args.beforeRequest?.();
+    const response = await (args.fetchImpl ?? globalThis.fetch)(route, {
       method: 'GET',
       headers: { Authorization: `Bearer ${args.token}` },
       signal: AbortSignal.timeout(timeoutMs),
       redirect: 'error',
     });
+    if (response.status === 429 && args.onRateLimit) {
+      const error = new HubError(429, 'routing request refused', undefined, retryAfterMs(response));
+      args.onRateLimit(error);
+      await response.body?.cancel().catch(() => {});
+      throw error;
+    }
+    return response;
   } catch (error) {
+    if (error instanceof HubError) throw error;
     const name = error instanceof Error ? error.name : 'request error';
     const detail = name === 'TimeoutError' || name === 'AbortError'
       ? `timed out after ${timeoutMs / 1_000}s`
@@ -96,7 +127,17 @@ async function bytesFrom(
 export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): MissingObjectHandler {
   return {
     async onMissing(requestedDigest: string): Promise<'retry'> {
+      // Each recovery is independent. A long-lived ordinary handler must not
+      // retain old digests across runs or skip an object removed by GC.
+      const installed = new Set<string>();
+      const visiting = new Set<string>();
+      const recover = async (requestedDigest: string): Promise<void> => {
       const digest = defDigest(requestedDigest);
+      if (installed.has(digest)) return;
+      if (visiting.has(digest) || (args.recoverLockedDependencies && installed.size + visiting.size >= 64))
+	throw new Error('workflow bundle recovery closure refused');
+      visiting.add(digest);
+      try {
       const bundleRoute = routeFor(args.origin, 'bundles', digest);
       const bundleResponse = await request(args, bundleRoute);
       if (!bundleResponse.ok) throw failure(bundleRoute, `hub returned HTTP ${bundleResponse.status}`);
@@ -127,6 +168,13 @@ export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): 
         if (originDsseBytes.byteLength === 0) throw failure(originRoute, 'origin evidence is empty');
       }
 
+      if (args.recoverLockedDependencies) {
+	const inspected = inspectBundle(bytes);
+	if (inspected.digest !== digest) throw failure(bundleRoute, 'canonical bundle digest mismatch');
+	for (const childDigest of new Set(Object.values(inspected.manifest.lock)))
+	  await recover(childDigest);
+      }
+
       const globalRoot = globalStoreRoot(args.home);
       const statePaths = workflowStoreStatePaths(globalRoot);
       await installWorkflowBundle({
@@ -140,8 +188,10 @@ export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): 
         journalPath: statePaths.journalPath,
         recoveryMarkerDir: defaultRecoveryMarkerDir(args.home),
         ingestor: createBundleIngestor(),
-        verifier: createPreCommitVerifier({ env: args.env, ...(args.warn !== undefined ? { warn: args.warn } : {}) }),
+	verifier: args.preCommitVerifier ?? createPreCommitVerifier({ env: args.env,
+	  ...(args.warn !== undefined ? { warn: args.warn } : {}) }),
         expectedDigest: digest,
+	...(args.deferHubLiveCallsAtStorage === true ? { deferHubLiveCallsAtStorage: true as const } : {}),
         verificationEvidence: {
           publication: state === 'signed'
             ? { state, dsseBytes: publicationBytes }
@@ -149,6 +199,10 @@ export function createHubBundleRecoveryHandler(args: HubBundleRecoveryOptions): 
           ...(originDsseBytes !== undefined ? { originDsseBytes } : {}),
         },
       });
+      installed.add(digest);
+      } finally { visiting.delete(digest); }
+      };
+      await recover(requestedDigest);
       return 'retry';
     },
   };

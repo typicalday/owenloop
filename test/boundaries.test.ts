@@ -220,6 +220,8 @@ test('native ready identity and outcomes stay exhaustive through the pure public
     workflow: 'root', frameId: 'child', DefRef: { bundleDigest: 'a'.repeat(64), workflowName: 'work' },
     step: 'B', key: '', inputFingerprint: { seed: 2 }, admissionEpoch: 0, executorKind: 'agent',
     meaningDigest: 'b'.repeat(64), evidenceGeneration: 'c'.repeat(64), stateDigest: 'd'.repeat(64),
+    nativeClaimGeneration: { protocol: 'native-claim-generation-v1', frameIncarnation: `fi_${'e'.repeat(24)}`,
+      generation: 0 },
     resolved: { capabilities: ['scoped'], crews: ['crew'], matchModes: { scoped: 'exact' }, revision: 'r1' },
   } as const satisfies ReadyFiring;
   function outcome(result: ClaimReadyResult | SnapshotReadyResult): string {

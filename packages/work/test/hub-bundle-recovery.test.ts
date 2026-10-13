@@ -148,6 +148,29 @@ test('hub bundle recovery installs exact signed bytes and re-primes a store miss
   }
 });
 
+test('ordinary recovery handler fetches a digest again after an earlier successful miss', async () => {
+  const fixture = await signedFixture();
+  const seen: string[] = [];
+  const fetchImpl: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname;
+    seen.push(path);
+    if (path === `/api/bundles/${fixture.digest}`) return new Response(fixture.bytes, { status: 200 });
+    if (path === `/api/publications/${fixture.digest}`) return new Response(fixture.publication, { status: 200,
+      headers: { 'x-owenloop-publication-state': 'signed' } });
+    if (path === `/api/origins/${fixture.digest}`) return new Response(null, { status: 404 });
+    throw new Error('unexpected request');
+  };
+  const handler = createHubBundleRecoveryHandler({ origin: 'https://hub.example', token: 'token',
+    home: fixture.home, projectRoot: join(temp('owenloop-repeat-project-'), 'workflows'),
+    env: { HOME: fixture.home }, fetchImpl });
+  assert.equal(await handler.onMissing(fixture.digest), 'retry');
+  assert.equal(await handler.onMissing(fixture.digest), 'retry');
+  assert.deepEqual(seen, [
+    `/api/bundles/${fixture.digest}`, `/api/publications/${fixture.digest}`, `/api/origins/${fixture.digest}`,
+    `/api/bundles/${fixture.digest}`, `/api/publications/${fixture.digest}`, `/api/origins/${fixture.digest}`,
+  ]);
+});
+
 test('hub bundle recovery rejects mismatched content before an object is committed', async () => {
   const fixture = await signedFixture();
   const expected = 'b'.repeat(64);

@@ -133,6 +133,8 @@ test('npm pack includes everything a consumer needs', () => {
     'dist/packages/work/src/main.js',
     'dist/packages/work/src/main.d.ts',
     'bin/owenloop.mjs',
+    'bin/owenloop-routing-helper-build.mjs',
+    'native/routing-file-open.c',
     'examples/workflows/delivery.yaml',
     'docs/design.md',
   ]) {
@@ -140,9 +142,18 @@ test('npm pack includes everything a consumer needs', () => {
   }
   assert.deepEqual(
     files.filter((f) => f.startsWith('bin/')),
-    ['bin/owenloop.mjs'],
-    'tarball should publish exactly one owenloop binary',
+    ['bin/owenloop-routing-helper-build.mjs', 'bin/owenloop.mjs'],
+    'tarball should publish the CLI and explicit server helper builder',
   );
+  assert.equal(files.some((file) => file.startsWith('native/bin/')), false,
+    'ordinary installs must not receive host-specific generated helper binaries');
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as {
+    scripts?: Record<string, string>;
+  };
+  for (const hook of ['preinstall', 'install', 'postinstall']) {
+    assert.equal(manifest.scripts?.[hook], undefined,
+      'ordinary installs must not compile the server helper');
+  }
 });
 
 test('npm pack ships compiled output, not TypeScript source', () => {

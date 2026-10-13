@@ -8,6 +8,7 @@ import { test } from 'node:test';
 
 import {
 	assertShiftDaemonPlatform,
+	assertRoutedShiftPlatform,
 	resolveCap,
 	resolveStateDirOverride,
 	resolveMaxConcurrentAgents,
@@ -49,6 +50,12 @@ test('public Shift daemon fails explicitly on Windows while direct Shift remains
   );
   assert.doesNotThrow(() => assertShiftDaemonPlatform('darwin'));
   assert.doesNotThrow(() => assertShiftDaemonPlatform('linux'));
+});
+
+test('opted routed Shift refuses Windows before opening a session or child broker', () => {
+  assert.throws(() => assertRoutedShiftPlatform('win32'), /routed Shift is not supported on Windows.*named-pipe ACLs/);
+  assert.doesNotThrow(() => assertRoutedShiftPlatform('darwin'));
+  assert.doesNotThrow(() => assertRoutedShiftPlatform('linux'));
 });
 
 // C6 wired settings-file fallbacks into shift's cap + dir resolution. These pin

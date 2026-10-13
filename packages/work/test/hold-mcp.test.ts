@@ -15,6 +15,7 @@ import type { SubmissionKeyManager } from '../src/submit-proof.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { ToolCallContext, ToolRegistration } from '../src/mcp/server.ts';
+import type { TrustedInputAdmission } from '../src/hosted/trusted-input-admission.ts';
 
 // ---- fakes ------------------------------------------------------------------
 
@@ -56,6 +57,74 @@ function fakeSshProcess(): SshProcessAdapter {
 
 afterEach(() => {
   resetSshKeygenProbe();
+});
+
+test('routed collection submit replays one exact emission and seal uses its own tool', async () => {
+  const order = producerOrderResponse();
+  order.order!.outputs = ['items.sealed'];
+  order.order!.owes = [{ path: 'items.sealed', version: 1,
+    judgmentRejects: 0, schemaRejects: 0, reasons: [] }];
+  const { hub, calls: ordinary } = mockHub({ getOrder: order });
+  const emissions: Array<{ emissionId: string; value: unknown; done: boolean }> = [];
+  const seals: string[] = [];
+  let lose = true;
+  const routedCollection = {
+    collectionTarget: async () => ({ collection: true }),
+    emitCollectionMember: async (req: { emissionId: string; value: unknown; done: boolean }) => {
+      emissions.push(req);
+      if (lose) { lose = false; throw new Error('ACK unavailable'); }
+      return { issued: { emissionId: req.emissionId, sealPath: 'items.sealed',
+	sealTargetVersion: 1, memberPath: 'items[0]', memberVersion: 1 as const,
+	valueDigest: 'a'.repeat(64), conditionApplied: 'routed-collection-member-v1' as const },
+      member: { outcome: 'emitted', closed: false,
+	conditionApplied: 'routed-collection-member-v1' as const } };
+    },
+    sealCollection: async (req: { sealId: string }) => {
+      seals.push(req.sealId);
+      return { outcome: 'green', closed: true,
+	conditionApplied: 'routed-collection-seal-v1' as const };
+    },
+  };
+  const holder = { kind: 'session' as const, id: 'rs', shiftId: 'shf' };
+  const mount = createHoldMcp(deps(hub, { holder, routedSubmit: true, routedCollection }));
+  const submit = tool(mount.tools, 'submit');
+  const first = await submit.handler({ path: 'items.sealed', value: { id: 1 }, done: false }, ctx);
+  assert.equal(first.isError, true);
+  assert.equal((await submit.handler({ path: 'items.sealed', value: { id: 2 }, done: false }, ctx)).isError, true);
+  const replay = await submit.handler({ path: 'items.sealed', value: { id: 1 }, done: false }, ctx);
+  assert.equal(replay.isError, undefined);
+  assert.equal(parse(replay).memberPath, 'items[0]');
+  assert.equal(emissions.length, 2);
+  assert.equal(emissions[0]!.emissionId, emissions[1]!.emissionId);
+  assert.equal(ordinary.some(call => call.verb === 'submit'), false);
+  const sealed = await tool(mount.tools, 'seal_collection').handler({ path: 'items.sealed' }, ctx);
+  assert.equal(sealed.isError, undefined);
+  assert.equal(parse(sealed).closed, true);
+  assert.equal(seals.length, 1);
+});
+
+test('routed collection seals with zero members and never calls ordinary submit', async () => {
+  const order = producerOrderResponse();
+  order.order!.outputs = ['items.sealed'];
+  order.order!.owes = [{ path: 'items.sealed', version: 1,
+    judgmentRejects: 0, schemaRejects: 0, reasons: [] }];
+  const { hub, calls } = mockHub({ getOrder: order });
+  const seals: string[] = [];
+  const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 'rs', shiftId: 'shf' },
+    routedSubmit: true,
+    routedCollection: {
+      collectionTarget: async () => ({ collection: true }),
+      emitCollectionMember: async () => { throw new Error('unexpected emit'); },
+      sealCollection: async req => {
+	seals.push(req.sealId);
+	return { outcome: 'green', closed: true, conditionApplied: 'routed-collection-seal-v1' as const };
+      },
+    } }));
+  const result = await tool(mount.tools, 'seal_collection').handler({ path: 'items.sealed' }, ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(parse(result).closed, true);
+  assert.equal(seals.length, 1);
+  assert.equal(calls.some(call => call.verb === 'submit'), false);
 });
 
 function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
@@ -103,7 +172,7 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
       if (cfg.putFileArtifact instanceof Error) throw cfg.putFileArtifact;
       return {
         text: 'stored',
-        __file: true,
+	__file: 'orgs/org/artifacts/wf/files/hash',
         hash: 'a'.repeat(64),
         size: req.bytes.byteLength,
         contentType: req.contentType,
@@ -221,6 +290,67 @@ test('a positive restricted selection exposes exactly get_order and submit', () 
   const { hub } = mockHub({});
   const mount = createHoldMcp(deps(hub, { tools: ['get_order', 'submit'] }));
   assert.deepEqual(mount.tools.map((t) => t.name), ['get_order', 'submit']);
+});
+
+test('opt-in held v2 shows only gated optional presence and refuses changed witness before submit', async () => {
+  const response = producerOrderResponse();
+  response.order!.inputs = ['optional'];
+  response.order!.consumedFingerprint = { optional: 1 };
+  const { hub, calls } = mockHub({ getOrder: response });
+  let observations = 0;
+  const mount = createHoldMcp(deps(hub, {
+    modelOrderVerifier: async () => { throw new Error('v1 model verifier must not run'); },
+    consumedVerifier: async () => { throw new Error('v1 consumed verifier must not run'); },
+    trustedInputV2: { observe: async order => ({
+      ok: true, order, step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+      packetDigest: 'packet-a', witnessDigest: ++observations === 1 ? 'witness-a' : 'witness-b',
+      observedAt: 0, expiresAt: 5000, inputs: [{ path: 'optional', version: 1, present: false }],
+    }) },
+  }));
+  const shown = await tool(mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, undefined);
+  assert.deepEqual(parse(shown).order.inputWitnesses, [{ path: 'optional', version: 1, present: false }]);
+  const submitted = await tool(mount.tools, 'submit').handler({ path: 'result', value: { ok: true } }, ctx);
+  assert.equal(submitted.isError, true);
+  assert.match(parse(submitted).error, /claim input observation changed/);
+  assert.equal(calls.filter(call => call.verb === 'submit').length, 0);
+});
+
+test('held v2 rechecks the pinned witness after an awaited signer before submit', async () => {
+  const response = producerOrderResponse();
+  response.order!.judge = 'result';
+  response.order!.inputs = ['result'];
+  response.order!.consumes = { result: { value: 'seen' } };
+  response.order!.consumedFingerprint = { result: 2 };
+  const { hub, calls } = mockHub({ getOrder: response });
+  let entered!: () => void;
+  let resume!: () => void;
+  const signing = new Promise<void>(resolve => { resume = resolve; });
+  const signerEntered = new Promise<void>(resolve => { entered = resolve; });
+  let observations = 0;
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: { ...signingKeys(), withSigningKey: async (_ref, callback) => {
+      entered();
+      await signing;
+      return callback('/fake/private-key');
+    } },
+    sshProcess: fakeSshProcess(),
+    trustedInputV2: { observe: async order => ({
+      ok: true, order, step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+      packetDigest: 'packet-a', witnessDigest: ++observations === 1 ? 'witness-a' : 'witness-b',
+      observedAt: 0, expiresAt: 5000, inputs: [],
+    }) },
+  }));
+  const pending = tool(mount.tools, 'submit').handler({ path: 'result', value: { ok: true } }, ctx);
+  await signerEntered;
+  assert.equal(calls.some(call => call.verb === 'submit'), false);
+  resume();
+  const refused = await pending;
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /claim input observation changed/);
+  assert.equal(observations, 2);
+  assert.equal(calls.some(call => call.verb === 'submit'), false);
 });
 
 // ---- get_order --------------------------------------------------------------
@@ -1127,7 +1257,7 @@ test('put_file_artifact uploads a contained file and returns the submittable env
     assert.notEqual((res as { isError?: boolean }).isError, true);
     const body = parse(res);
     assert.deepEqual(body.pointer, {
-      __file: true,
+      __file: 'orgs/org/artifacts/wf/files/hash',
       hash: 'a'.repeat(64),
       size: 5,
       contentType: 'image/png',
@@ -1142,6 +1272,26 @@ test('put_file_artifact uploads a contained file and returns the submittable env
   } finally {
     cleanup();
   }
+});
+
+test('routed put_file_artifact uses the contained streaming seam without a legacy byte upload', async () => {
+  const { dir, cleanup } = fileFixture();
+  try {
+    const file = join(dir, 'render.png');
+    writeFileSync(file, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]));
+    const { hub, calls } = mockHub({});
+    const uploads: unknown[] = [];
+    const mount = createHoldMcp(deps(hub, { workdir: dir, uploadFile: async req => {
+      uploads.push(req);
+      return { text: 'stored', __file: 'orgs/org/artifacts/wf/files/routed/run/unique/key',
+	hash: 'a'.repeat(64), size: 5, contentType: 'image/png', filename: 'render.png' };
+    } }));
+    const result = await tool(mount.tools, 'put_file_artifact').handler({ file: 'render.png' }, ctx);
+    assert.notEqual((result as { isError?: boolean }).isError, true);
+    assert.deepEqual(uploads, [{ workflow: 'wf1', workdir: dir, file: 'render.png',
+      contentType: 'image/png', filename: 'render.png' }]);
+    assert.equal(calls.some(call => call.verb === 'put_file_artifact'), false);
+  } finally { cleanup(); }
 });
 
 test('put_file_artifact honours an explicit contentType and filename over the extension guess', async () => {

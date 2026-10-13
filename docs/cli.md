@@ -290,6 +290,33 @@ explicitly limited to the direct `owenloop work shift` loop: the public
 named-pipe transport has not been implemented. A Windows daemon start fails
 with that diagnostic instead of treating a Unix-domain socket path as usable.
 
+**Routed worker development boundary (operators).** `OWENLOOP_ROUTING_SESSION=1`
+is an opt-in server and worker infrastructure setting. Ordinary workflow users
+need no Jev installation, credentials, or model selection. Routed child startup
+is implemented behind the opt-in Shift session and a one-use handoff. It remains
+a development capability pending end-to-end qualification and deployment.
+Its private Shift broker restricts a child to one bound dispatch and an
+allowlisted set of Hub requests while Shift retains the account credential.
+Shift may prepare a provisional, signed definition snapshot in a private
+operator state subdirectory. Routed roles recheck the fresh full order, workdir
+and current operator trust before command or provider use; a failed check
+refuses startup. Snapshot validation, Unix
+directory permissions, and the broker protocol do not isolate processes under
+the same user ID; hostile child code needs a separate OS isolation design.
+Activated snapshots survive every role exit, including status `0`, because a
+detached shell or provider may still read them. A safe descendant-group reaper
+is not yet implemented, so these snapshots may require operator cleanup.
+
+Routed holder file uploads require a server administrator to run
+`owenloop-routing-helper-build` from a trusted package installation on macOS
+or Linux with a C compiler. This builds the packaged, read-only native opener
+for that server's architecture. The package and helper executable must remain
+outside the workflow's writable directory and under operator-controlled file
+permissions. A missing helper refuses the routed upload; ordinary installs
+never compile it. The opener starts from a held working-directory descriptor,
+so its authority follows that directory object if a pathname is renamed. It
+does not assert where the object appears in the current filesystem namespace.
+
 The `shift start` positional argument is a **crew** name. The routing API calls
 that field a **crew**: `serve_crews` contains the selected crew names. Passing
 `--all` maps to an empty `serve_crews` list, which means all crews available to

@@ -273,6 +273,15 @@ Rules a script can rely on:
 - The overflow file lives in a private temp directory that owenloop removes
   after the command exits. Read it during the run; do not stash the path.
 
+For the opt-in server-operated routed worker path, a command with consumed file
+pointers will also receive `OWENLOOP_CONSUMED_FILE_PATHS_JSON`. It is a JSON array
+of `{artifactPath,pointerKey,file}` entries: `artifactPath` names the declared
+input artifact, `pointerKey` is that value's immutable `__file` key, and `file`
+is a verified read-only local copy. `OWENLOOP_CONSUMES` keeps its original value;
+the extra paths are data files valid only until this command exits. Routed
+child startup remains fenced in the current source, so this is the pending
+worker contract, not an available ordinary workflow feature.
+
 These values are attacker-influenceable artifact data, which is why they travel
 only in the environment block. Owenloop never puts a consumed value in argv or
 in command text, and a command step's text is passed to `/bin/sh -c` exactly as

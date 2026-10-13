@@ -395,10 +395,10 @@ function signalGate(path: string, signal: 'start' | 'cancel', allowMissing: bool
   return true;
 }
 
-/** Open a child's gate only after the PID-bearing record is durable. */
-export function startReservedChild(stateDir: string, record: ChildRecord): void {
-  if (record.gateToken === undefined) return;
-  signalGate(gateFile(stateDir, record.gateToken), 'start', false);
+/** Report the successful signal write; consumption still needs a child ACK. */
+export function startReservedChild(stateDir: string, record: ChildRecord): boolean {
+  if (record.gateToken === undefined) return false;
+  return signalGate(gateFile(stateDir, record.gateToken), 'start', false);
 }
 
 /** Cancel a gated child and remove the matching reservation/record. */

@@ -36,7 +36,8 @@
  * RESILIENCE: presence/wake/whats_next failures are logged and never kill the
  * loop. `stop()` flips a flag checked between awaits; the in-flight sweep
  * finishes, `run()` resolves 0, and no hub call is made afterward. Detached
- * children are never killed on shutdown — that is the drain semantic.
+ * children are never killed on shutdown. This is detached parent exit; an
+ * opted-in routing session closes only after its owned workers finish.
  *
  * LEGACY PINNED-HASH DISPATCH (E, DD-4): the old wire shape omits both `worker`
  * and `defDigest` and serves only a def NAME. Only that explicitly legacy shape
@@ -54,6 +55,14 @@
  * on the very next `iterate()`.
  */
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import type { RoutingOfferCandidate, ShiftOffer, LocalTupleEligibility } from '../hub/types.ts';
+import { candidateFiringBinding, canRefreshOfferDescriptor, firingOfferCacheKey, supersedesLocalOffer } from './firing-offer-binding.ts';
+import type { ShiftRoutingSession, RoutingHandoff } from './runtime.ts';
+import type { RoutedInputAuthority, RoutedLaunchAuthority, RoutingBroker } from './routing-broker.ts';
+import type { RoutedDefinitionStage } from './routing-definition-stage.ts';
+import type { RoutedSubmissionAuthority } from './routing-submit-authority.ts';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -88,7 +97,7 @@ import { withHubCallTimeout } from '../hub/deadline.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import { checkHost, type HostFault } from './host-preflight.ts';
 import { formatBytes, type DiskSpace } from './disk-floor.ts';
-import type { Spawner, WorkerFailure } from './spawn.ts';
+import type { RetainedChildCustody, Spawner, WorkerFailure } from './spawn.ts';
 import {
   stampShiftEvent,
   type OrderDroppedEvent,
@@ -97,6 +106,27 @@ import {
 } from './protocol.ts';
 
 export interface ShiftLoopOptions {
+  /** Explicit opt-in; absence preserves legacy serving. */
+  routingSession?: ShiftRoutingSession;
+  routingBroker?: RoutingBroker;
+  /** Synchronously revoke routed caps before Shift awaits session close. */
+  onStopRouting?: () => Promise<void>;
+  /** Required for routed dispatch; prepares exact signed bytes without a role credential. */
+  stageRoutedDefinition?: (order: WorkOrder, rootWorkflow: string) => Promise<RoutedDefinitionStage>;
+  /** Parent-owned signer and full-order verifier bound to the staged source. */
+  createRoutingSubmissionAuthority?: (stage: RoutedDefinitionStage) => RoutedSubmissionAuthority;
+  /** Fixed original-session reads plus signed input and current trust gate. */
+  createRoutingInputAuthority?: (stage: RoutedDefinitionStage,
+    target: NonNullable<ReturnType<ShiftRoutingSession['brokerTarget']>>,
+    rootWorkflow: string) => RoutedInputAuthority;
+  createRoutingLaunchAuthority?: (order: WorkOrder,
+    offer: { candidate: RoutingOfferCandidate; offer: ShiftOffer; rosterSnapshot: string } | undefined) => RoutedLaunchAuthority;
+  maintainDefinitionStages?: () => void;
+  closeDefinitionStages?: () => void;
+  /** Intersect service-authorized tuples with this account's current local roster. */
+  selectRoutingTuples?: (candidate: RoutingOfferCandidate) => readonly LocalTupleEligibility[];
+  /** Digest of the exact ordered machine roster row used to make an offer. */
+  routingRosterSnapshot?: (candidate: RoutingOfferCandidate) => string | undefined;
   hub: HubClient;
   spawner: Spawner;
   /** Injected sleep — tests pass an instant/scriptable stub (no real timers). */
@@ -391,6 +421,10 @@ export interface ShiftLoop {
     run: string;
     kind: 'exec' | 'agent-run';
     pid: number;
+    routingHandoff?: string;
+    dispatchToken?: string;
+    exitStatus?: number | null;
+    signal?: NodeJS.Signals | null;
   }): void;
   /**
    * A dispatched child exited non-zero. Charges one failure against that run's
@@ -723,6 +757,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let stalledReported = false;
   let cancelWatchdog: (() => void) | undefined;
   let cancelHeartbeat: (() => void) | undefined;
+  let cancelRoutingMaintenance: (() => void) | undefined;
   // Live shift identity (MCP `clock_in`, D3-D7 of the plan). Seeded from opts,
   // which are now INITIAL values only. Arrays are copied so neither the loop
   // nor a caller of getShift/setShift can mutate the other's state afterward.
@@ -904,6 +939,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     return true;
   }
 
+  function syncRoutingBackoff(): void {
+    if (opts.routingSession) backoffUntil = Math.max(backoffUntil, opts.routingSession.nextRequestAllowedAt());
+  }
+
   /**
    * Ask whether a LOCAL fault is the reason this shift cannot work, and stop if
    * one is. Returns true when the shift has been wedged.
@@ -990,6 +1029,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * one that never settles is exactly what the watchdog below is for.
    */
   async function cycle(): Promise<number> {
+    try { opts.maintainDefinitionStages?.(); }
+    catch { opts.err('routed definition stage maintenance failed'); }
     const dispatched = await iteration();
     cyclesCompleted += 1;
     lastPollAt = opts.now();
@@ -1047,11 +1088,23 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
   /** Daemon mode only: `once` runs one cycle and returns, so has nothing to watch. */
   function startTimers(): void {
+    let maintenanceRunning = false;
+    if (opts.routingSession) cancelRoutingMaintenance = schedule(() => {
+      syncRoutingBackoff();
+      if (stopped || maintenanceRunning || monotonicNow() < backoffUntil) return;
+      maintenanceRunning = true;
+      void opts.routingSession!.maintain().catch(error => {
+	noteServerBackoff(error);
+	opts.err('routing session maintenance failed');
+      }).finally(() => { maintenanceRunning = false; });
+    }, 30_000);
     cancelWatchdog = schedule(checkStall, Math.max(MIN_WATCHDOG_CHECK_MS, opts.pollIntervalMs));
     if (heartbeatIntervalMs > 0) cancelHeartbeat = schedule(heartbeat, heartbeatIntervalMs);
   }
 
   function stopTimers(): void {
+    cancelRoutingMaintenance?.();
+    cancelRoutingMaintenance = undefined;
     cancelWatchdog?.();
     cancelWatchdog = undefined;
     cancelHeartbeat?.();
@@ -1129,6 +1182,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * back to the existing pickup-window behavior and is observable.
    */
   function releaseClaim(workflow: string, run: string, reason?: string): void {
+    // Service lifecycle routes do not yet fence the routing session. A routed
+    // claim remains with Service until its pickup window expires.
+    if (opts.routingSession) return;
     void opts.hub.release({ workflow, run, ...(reason !== undefined ? { reason } : {}) }).catch((e) => {
       noteServerBackoff(e);
       const message = errMsg(e);
@@ -1173,6 +1229,16 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       ...lockedRemovalCallbacks,
     });
     for (const rec of result.reaped) {
+      const owned = routingHandoffs.get(rec.run);
+      if (owned && owned.pid === rec.pid && owned.spawnedAt === rec.spawnedAt) {
+	try { owned.handoff.terminal(owned.normalClosed ? 'normal-close' : 'child-exit'); }
+	catch { opts.err('routing handoff cleanup failed'); }
+	if (!owned.gateMayHaveOpened)
+	  owned.stage?.cleanupAfterExit({ workflow: rec.workflow, run: rec.run,
+	    pid: rec.pid, spawnedAt: rec.spawnedAt });
+	// After the gate could open, a detached descendant remains uncertain.
+	routingHandoffs.delete(rec.run);
+      }
       emit({
         type: 'reaped',
         workflow: rec.workflow,
@@ -1254,6 +1320,177 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    * state-directory-wide lock. The lock ends before spawn: the durable
    * reservation, not a long critical section, protects capacity during spawn.
    */
+  const routingOffers = new Map<string, { candidate: RoutingOfferCandidate; offer: ShiftOffer;
+    rosterSnapshot: string; spentBy?: string; retiredBy?: string }>();
+  const routingAttempts = new Map<string, number>();
+  const routingRefusals = new Map<string, number>();
+  const routingHandoffs = new Map<string, { handoff: RoutingHandoff; stage?: RoutedDefinitionStage;
+    pid?: number; spawnedAt?: number; custody?: RetainedChildCustody; dispatchToken: string;
+    gateMayHaveOpened?: boolean; normalClosed?: boolean }>();
+  const knownRole = (role: string) => ['research', 'implementation', 'review', 'judge'].includes(role);
+  const localModelProtocol = 'local-model-assessment-v1' as const;
+
+  function routingCapacity() {
+    const lock = acquireDispatchLock(30_000, 'owenloop routing capacity');
+    try {
+      const fresh = reconcileInFlight(opts.stateDir, { ...(isAlive ? { isAlive } : {}), now: opts.now() });
+      return {
+	total: Math.max(0, cap - fresh.live.length - fresh.reserved.length),
+	agent: Math.max(0, agentLane().ceiling - fresh.live.filter(r => r.kind === 'agent-run').length
+	  - fresh.reserved.filter(r => r.childKind === 'agent-run').length),
+      };
+    } finally { releaseFileLock(lock); }
+  }
+
+  async function prepareWillingOffer(workflow: string, signal: AbortSignal, selection: { capabilities: string[]; crews: string[] }): Promise<'shift' | 'ready_firing'> {
+    const session = opts.routingSession!;
+    const identity = session.identity();
+    if (!identity || identity.expiresAt <= opts.now() || stopped) throw new Error('routing session unavailable');
+    for (const map of [routingAttempts, routingRefusals]) {
+      for (const [run, expiry] of map) if (opts.now() >= expiry) map.delete(run);
+    }
+    for (const [key, value] of routingOffers) {
+      if (value.offer.sessionId !== identity.sessionId) routingOffers.delete(key);
+    }
+    const capacity = routingCapacity();
+    // Command-only capacity does not advertise an agent/model allowance.
+    if (capacity.total <= 0 || capacity.agent <= 0) return 'ready_firing';
+    const request = { workflow, serve_capabilities: selection.capabilities, serve_crews: selection.crews };
+    let response;
+    try { response = await session.hub.routingOfferContext(request, signal); }
+    catch (error) {
+      if (signal.aborted || !(error instanceof HubError) || error.status !== 500) throw error;
+      opts.err('routing model offer context unavailable; requesting authenticated command routing');
+      return 'ready_firing';
+    }
+    if (!Array.isArray(response.contexts) || response.contexts.length > 64) throw new Error('routing context refused');
+    for (const candidate of response.contexts) {
+      const candidateProtocol = candidate.localModelProtocol as unknown;
+      if (candidateProtocol !== undefined && candidateProtocol !== localModelProtocol) continue;
+      const c = candidate.context;
+      const firingBinding = candidateFiringBinding(candidate, workflow);
+      if (!c || c.sessionId !== identity.sessionId || c.shiftId !== identity.shiftId || c.orgId !== identity.orgId
+	|| c.principalId !== identity.principalId || c.runId !== workflow || !knownRole(candidate.role)
+	|| candidate.rolePolicy?.unknownRole !== 'refuse' || candidate.rolePolicy.revision !== c.rolePolicyRevision
+	|| !Number.isSafeInteger(c.now) || !Number.isSafeInteger(c.maxTtlMs) || c.maxTtlMs <= 0 || c.maxTtlMs > 300_000
+	|| !firingBinding || !selection.capabilities.some(capability => capability === c.capability || capability === c.capability.split(':')[0])) continue;
+      const tuples = (opts.selectRoutingTuples?.(candidate) ?? []).filter(t => t.eligible && t.available
+	&& candidate.tuples.some(allowed => allowed.eligible && allowed.available && isDeepStrictEqual(t.tuple, allowed.tuple))
+	&& candidate.rolePolicy.rules.some(rule => rule.model === t.tuple.model && rule.roles.some(role => role === candidate.role)));
+      if (!tuples.length) continue;
+      const rosterSnapshot = opts.routingRosterSnapshot
+	? opts.routingRosterSnapshot(candidate) : JSON.stringify(tuples);
+      if (!rosterSnapshot) continue;
+      const key = firingOfferCacheKey(firingBinding, identity.sessionId);
+      // Historical cache entries are not current outstanding willingness.
+      // A strictly later server head/claim binding retires only this exact
+      // principal/session/native tuple; it never asserts an unknown claim ACK.
+      for(const prior of routingOffers.values()) {
+	if(prior.offer.version==='shift-offer-v2' && supersedesLocalOffer(candidate,prior.offer))
+	  prior.retiredBy=key;
+      }
+      let existing = routingOffers.get(key);
+      if (existing && (existing.spentBy || existing.retiredBy || existing.offer.expiresAt <= opts.now()
+	|| existing.offer.version !== 'shift-offer-v2'
+	|| !canRefreshOfferDescriptor(existing.candidate, candidate, existing.offer, existing.rosterSnapshot, rosterSnapshot)
+	|| !existing.offer.tuples.every(t => tuples.some(current => isDeepStrictEqual(t, current))))) continue;
+      if (existing) {
+	const fresh = routingCapacity();
+	const outstanding = [...routingOffers.values()].filter(x => !x.spentBy && !x.retiredBy && x.offer.expiresAt > opts.now()).length;
+	if (stopped || outstanding > Math.min(fresh.total, fresh.agent)) return 'ready_firing';
+	// An unrelated native state digest change invalidates the prepared claim,
+	// not this identical consent. Submit the fresh descriptor with exact bytes.
+	existing.candidate = structuredClone(candidate);
+      }
+      if (!existing) {
+	// Re-read under the same lock used for reservations after awaiting the
+	// context. This is willingness, not a reservation or a claim charge.
+	const fresh = routingCapacity();
+	const outstanding = [...routingOffers.values()].filter(x => !x.spentBy && !x.retiredBy && x.offer.expiresAt > opts.now()).length;
+	if (stopped || outstanding >= Math.min(fresh.total, fresh.agent)) return 'ready_firing';
+	if (routingOffers.size >= 256) {
+	  const old = [...routingOffers].find(([, x]) => x.offer.expiresAt <= opts.now() || x.retiredBy);
+	  if (!old) return 'ready_firing';
+	  routingOffers.delete(old[0]); // The service retains the nonrenewable tombstone.
+	}
+	const expiresAt = Math.min(c.now + Math.min(120_000, c.maxTtlMs), identity.expiresAt);
+	if (expiresAt <= opts.now() || expiresAt <= c.now) continue;
+	const offer: ShiftOffer = { version: 'shift-offer-v2', firingBinding: structuredClone(firingBinding), offerId: `of_${randomUUID()}`,
+	  orgId: c.orgId, principalId: c.principalId, sessionId: c.sessionId, shiftId: c.shiftId,
+	  willingness: { runIds: [workflow], crewIds: [c.crewId], capabilities: [c.capability] },
+	  rosterRevision: c.rosterRevision, rolePolicyRevision: c.rolePolicyRevision,
+	  tuples: structuredClone(tuples), issuedAt: c.now, expiresAt };
+	if (candidateProtocol === localModelProtocol) offer.localModelProtocol = localModelProtocol;
+	existing = { candidate: structuredClone(candidate), offer, rosterSnapshot };
+	routingOffers.set(key, existing);
+      }
+      // Keep bytes/ID/deadline on an uncertain retry. Replacing any of these is
+      // not a way to renew the firing window or its consumed allowance.
+      await session.hub.putShiftOffer({ ...request, submission: { candidateId: existing.candidate.candidateId,
+	crewId: existing.candidate.context.crewId, capability: existing.candidate.context.capability, offer: existing.offer } }, signal);
+      return 'shift';
+    }
+    // Bounded explicit service ready-firing path for commands. Agent claims on
+    // this path are refused below rather than launching without willingness.
+    return 'ready_firing';
+  }
+
+  function routingClaimAllowed(c: Candidate): boolean {
+    const identity = opts.routingSession?.identity();
+    const r = c.order.routing;
+    if (!identity || !r?.claim || !r.decision || !r.preference) return false;
+    const { claim, decision, preference } = r;
+    const binding = claim.binding;
+    if (!binding || claim.state !== 'claimed' || claim.orderId !== c.order.run || claim.claimId !== c.order.run
+      || claim.attemptId !== c.order.run || claim.sessionId !== identity.sessionId || claim.shiftId !== identity.shiftId
+      || claim.principalId !== identity.principalId || binding.orgId !== identity.orgId || binding.runId !== c.workflow
+      || binding.frameId !== c.order.workflow
+      || binding.authority?.sessionId !== identity.sessionId || binding.authority?.principalId !== identity.principalId
+      || claim.decisionId !== decision.decisionId || !isDeepStrictEqual(binding, decision.binding)
+      || !['applied', 'fallback'].includes(decision.status) || !Number.isFinite(preference.expiresAt)
+      || !Number.isFinite(binding.expiresAt) || !Number.isFinite(binding.issuedAt) || binding.issuedAt > opts.now()
+      || opts.now() >= Math.min(preference.expiresAt, binding.expiresAt, identity.expiresAt)) return false;
+    if (c.kind === 'command' && preference.offer === null) return preference.localModel === undefined
+      && decision.applied?.kind === 'ready_firing'
+      && decision.applied.target.step === c.order.step && decision.applied.target.key === (c.order.key ?? '')
+      && decision.effect?.kind === 'ready_firing' && decision.effect.firingId === decision.applied.target.firingId;
+    const offer = preference.offer;
+    const local = offer && [...routingOffers.values()].find(x => x.offer.offerId === offer.offerId);
+    if (!offer || offer.version !== 'shift-offer-v2' || !local || local.retiredBy
+      || !isDeepStrictEqual(candidateFiringBinding(local.candidate, c.workflow), offer.firingBinding)
+      || (local.spentBy !== undefined && local.spentBy !== c.order.run)
+      || !isDeepStrictEqual(offer, local.offer) || opts.now() >= offer.expiresAt
+      || !knownRole(preference.role) || preference.role !== local.candidate.role
+      || !isDeepStrictEqual(preference.rolePolicy, local.candidate.rolePolicy)
+      || preference.rosterRevision !== offer.rosterRevision
+      // Service binding.revisions.roster is the scoped generation, not the
+      // roster-content revision stamped on the offer and preference.
+      || binding.frameId !== local.candidate.frameId || c.order.step !== local.candidate.step
+      || (c.order.key ?? '') !== local.candidate.key
+      || binding.revisions?.rolePolicy !== offer.rolePolicyRevision || decision.applied?.kind !== 'shift'
+      || decision.applied.target.offerId !== offer.offerId || decision.applied.target.shiftId !== identity.shiftId
+      || decision.effect?.kind !== 'shift' || decision.effect.claimId !== c.order.run
+      || decision.effect.orderId !== c.order.run || decision.effect.attemptId !== c.order.run
+      || !preference.tuples.length || !preference.tuples.every(t => t.eligible && t.available
+	&& offer.tuples.some(allowed => allowed.eligible && allowed.available && isDeepStrictEqual(t.tuple, allowed.tuple)))) return false;
+    const candidateProtocol = local.candidate.localModelProtocol as unknown;
+    if ((candidateProtocol !== undefined && candidateProtocol !== localModelProtocol)
+      || offer.localModelProtocol !== candidateProtocol) return false;
+    const localModelPolicy = preference.localModel;
+    if (localModelPolicy !== undefined) {
+      if (localModelPolicy.version !== 'local-model-policy-v1'
+	|| (localModelPolicy.onFailure !== 'fallback' && localModelPolicy.onFailure !== 'refuse')
+	|| candidateProtocol !== localModelProtocol) return false;
+    } else if (candidateProtocol !== undefined) return false;
+    const current = opts.selectRoutingTuples?.(local.candidate) ?? [];
+    const currentSnapshot = opts.routingRosterSnapshot
+	? opts.routingRosterSnapshot(local.candidate) : JSON.stringify(current);
+    if (!currentSnapshot || currentSnapshot !== local.rosterSnapshot) return false;
+    if (!preference.tuples.some(t => current.some(allowed => allowed.eligible && allowed.available && isDeepStrictEqual(t.tuple, allowed.tuple)))) return false;
+    local.spentBy = c.order.run;
+    return true;
+  }
+
   function reserveCandidate(c: Candidate): ReservedChild | Exclude<DispatchResult, 'dispatched' | 'failed'> {
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
     const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
@@ -1284,7 +1521,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
   }
 
-  function dispatchCandidate(c: Candidate): DispatchResult {
+  async function dispatchCandidate(c: Candidate): Promise<DispatchResult> {
+    if (opts.routingSession) {
+      if (routingAttempts.has(c.order.run) || routingRefusals.has(c.order.run)) return 'duplicate';
+      if (stopped || !routingClaimAllowed(c)) {
+	routingRefusals.set(c.order.run, opts.now() + HUB_PICKUP_WINDOW_MS);
+	releaseClaim(c.workflow, c.order.run, 'routing claim or willingness unavailable');
+	return 'failed';
+      }
+    }
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
     // THE BRAKE. This function is the single choke point every spawn passes
     // through — both the sweep's dispatch loop and `drainPending` reach a child
@@ -1309,11 +1554,77 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       return 'braked';
     }
     let reservation: ChildReservation | undefined;
+    let handoff: RoutingHandoff | undefined;
+    let brokerGrant: ReturnType<RoutingBroker['issue']> | undefined;
+    let definitionStage: RoutedDefinitionStage | undefined;
+    let terminalBeforeStart = false;
     let cancel: (() => void) | undefined;
+    let gateRecord: ChildRecord | undefined;
     try {
+      if (opts.routingSession) {
+	if (!opts.stageRoutedDefinition) throw new Error('routed definition staging unavailable');
+	definitionStage = await opts.stageRoutedDefinition(c.order, c.workflow);
+	if (definitionStage.digest !== c.order.defDigest) throw new Error('routed definition digest changed');
+	// Stage downloads can outlive a decision or session. Re-read the
+	// authoritative claim after every staging await, then re-check local
+	// willingness, roster and deadlines before reserving child capacity.
+	const fresh = await opts.routingSession.hub.readRoutingClaim({ workflow: c.workflow,
+	  run: c.order.run }, AbortSignal.timeout(DEFAULT_HUB_CALL_TIMEOUT_MS));
+	if (fresh.freshness !== 'fresh-at-read' || fresh.atomicLaunch !== false
+	  || !isDeepStrictEqual(fresh.routing, c.order.routing)
+	  || stopped || !routingClaimAllowed(c))
+	  throw new Error('routed definition claim changed');
+      }
       const reserved = reserveCandidate(c);
-      if (typeof reserved === 'string') return reserved;
+      if (typeof reserved === 'string') {
+	definitionStage?.cleanup();
+	return reserved;
+      }
       reservation = reserved.reservation;
+      if (opts.routingSession) {
+	routingAttempts.set(c.order.run, c.order.routing!.preference.expiresAt);
+	if (opts.routingBroker) {
+	  const target = opts.routingSession.brokerTarget();
+	  if (!target) throw new Error('routing broker incarnation unavailable');
+	  brokerGrant = opts.routingBroker.issue({ reservation, routing: c.order.routing!,
+	    ...target,
+	    ...(opts.createRoutingInputAuthority && definitionStage
+	      ? { inputAuthority: opts.createRoutingInputAuthority(definitionStage, target,
+		reservation.workflow) } : {}),
+	    ...(opts.createRoutingSubmissionAuthority && definitionStage
+	      ? { submissionAuthority: opts.createRoutingSubmissionAuthority(definitionStage) } : {}),
+	    ...(definitionStage ? { commandFor: definitionStage.commandFor } : {}),
+	    ...(opts.createRoutingLaunchAuthority ? { launchAuthority: opts.createRoutingLaunchAuthority(
+	      c.order, (() => {
+		const offerId = c.order.routing?.preference.offer?.offerId;
+		if (!offerId) return undefined;
+		const local = [...routingOffers.values()].find(entry => entry.offer.offerId === offerId);
+		return local ? { candidate: local.candidate, offer: local.offer,
+		  rosterSnapshot: local.rosterSnapshot } : undefined;
+	      })()) } : {}) });
+	}
+	const privateHandoff = opts.routingSession.createHandoff(reservation,
+	  brokerGrant && { socketPath: brokerGrant.socketPath, cap: brokerGrant.cap,
+	    ...(brokerGrant.holder ? { holder: brokerGrant.holder } : {}) }, definitionStage);
+	handoff = { path: privateHandoff.path, incarnation: privateHandoff.incarnation,
+	  nonce: privateHandoff.nonce, terminal: (reason) => {
+	  const drained = brokerGrant?.terminal(reason);
+	  if (drained) {
+	    void drained.then(() => privateHandoff.terminal(), () => {
+	      opts.err('routing collection outcome quarantined; original session custody retained');
+	    });
+	  } else privateHandoff.terminal();
+	} };
+	routingHandoffs.set(c.order.run, { handoff, dispatchToken: reservation.token,
+	  ...(definitionStage ? { stage: definitionStage } : {}) });
+      }
+      const terminal = (reason?: 'exit' | 'start-failure' | 'cancel') => {
+	terminalBeforeStart = true;
+	const disposition = reason === 'exit' ? 'child-exit' : 'revoked';
+	brokerGrant?.terminal(disposition);
+	try { handoff?.terminal(disposition); }
+	catch { opts.err('routing handoff cleanup failed'); }
+      };
       const spawned = opts.spawner({
 	workflow: c.workflow,
 	run: c.order.run,
@@ -1322,20 +1633,56 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	...(childKind === 'agent-run' ? { shiftName } : {}),
 	...(childKind === 'agent-run' && opts.shiftOwner !== undefined ? { shiftOwner: opts.shiftOwner } : {}),
 	startGate: reserved.gatePath,
+	...(handoff ? { routingHandoff: handoff.path, dispatchToken: reservation.token,
+	  routingShiftId: opts.routingSession!.identity()!.shiftId, onTerminal: terminal,
+	  onGateEntered: (entry: { dispatchToken: string; routingHandoff: string; pid: number }) => {
+	    if (terminalBeforeStart || !gateRecord || !brokerGrant || !spawned.custody
+	      || entry.dispatchToken !== reservation!.token
+	      || entry.routingHandoff !== handoff!.path || entry.pid !== gateRecord.pid)
+	      throw new Error('routing child generation changed');
+	    brokerGrant.markChildEntered(gateRecord);
+	  }, canAllowGateEntry: () => !!gateRecord && brokerGrant?.canAllowEntry(gateRecord) === true } : {}),
       });
       cancel = spawned.cancel ?? spawned.terminate;
+      if (terminalBeforeStart) throw new Error('routing worker terminated before start');
+      const spawnedAt = opts.now();
+      // Pin the child before the durable PID record and before opening its
+      // gate. A crash after record finalization cannot leave an unowned stage.
+      definitionStage?.activate({ workflow: c.workflow, run: c.order.run, pid: spawned.pid, spawnedAt });
+      const ownedBeforeGate = routingHandoffs.get(c.order.run);
+      if (ownedBeforeGate && ownedBeforeGate.handoff === handoff) {
+	ownedBeforeGate.pid = spawned.pid;
+	ownedBeforeGate.spawnedAt = spawnedAt;
+	ownedBeforeGate.custody = spawned.custody;
+      }
       const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
       let rec: ChildRecord;
       try {
 	rec = finalizeChildReservation(opts.stateDir, reservation, {
 	  pid: spawned.pid,
-	  spawnedAt: opts.now(),
+	  spawnedAt,
 	  kind: childKind,
 	  ...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
 	  ...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
 	  ...(childKind === 'agent-run' ? { step: c.order.step } : {}),
 	});
-	startReservedChild(opts.stateDir, rec);
+	gateRecord = rec;
+	brokerGrant?.activate(rec);
+	if (spawned.custody && handoff?.incarnation && handoff.nonce)
+	  brokerGrant?.bindChild(rec, spawned.custody,
+	    { incarnation: handoff.incarnation, nonce: handoff.nonce });
+	if (terminalBeforeStart) throw new Error('routing worker terminated before gate');
+	definitionStage?.markGateMayOpen({ workflow: c.workflow, run: c.order.run,
+	  pid: rec.pid, spawnedAt: rec.spawnedAt });
+	if (ownedBeforeGate && ownedBeforeGate.handoff === handoff) ownedBeforeGate.gateMayHaveOpened = true;
+	if (opts.routingSession && !startReservedChild(opts.stateDir, rec))
+	  throw new Error('routing child start gate unavailable');
+	else if (!opts.routingSession) startReservedChild(opts.stateDir, rec);
+	if (spawned.custody && handoff?.incarnation && handoff.nonce)
+	  brokerGrant?.markGateSignalled(rec);
+	if (handoff && spawned.custody) spawned.armGateEntry?.();
+	const owned = routingHandoffs.get(c.order.run);
+	if (owned) { owned.pid = rec.pid; owned.spawnedAt = rec.spawnedAt; }
       } finally {
 	releaseFileLock(dispatchLock);
       }
@@ -1360,6 +1707,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       return 'dispatched';
     } catch (e) {
       cancel?.();
+      brokerGrant?.terminal();
+      try { handoff?.terminal(); } catch { opts.err('routing handoff cleanup failed'); }
+      definitionStage?.cleanup();
+      const owned = routingHandoffs.get(c.order.run);
+      if (owned && owned.handoff === handoff && owned.pid === undefined) routingHandoffs.delete(c.order.run);
       if (reservation !== undefined) {
 	try {
 	  const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
@@ -1447,7 +1799,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   /** Dispatch already-claimed orders when local child capacity becomes free. */
-  function drainPending(live: ChildRecord[], reserved: ChildReservation[]): number {
+  async function drainPending(live: ChildRecord[], reserved: ChildReservation[]): Promise<number> {
     let remaining = cap - live.length - reserved.length;
     if (pendingCandidates.size === 0) return 0;
 
@@ -1476,7 +1828,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       // blocked agent does not head-of-line-block the whole queue.
       if (candidate.kind === 'agent' && agentRoom <= 0) continue;
 
-      const result = dispatchCandidate(candidate);
+      const result = await dispatchCandidate(candidate);
       if (result === 'total-capacity') {
 	remaining = 0;
 	continue;
@@ -1668,12 +2020,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       let res;
       const requestStartedAt = monotonicNow();
       try {
-	res = await hubCall(`whats_next ${wf}`, (signal) =>
-	  opts.hub.whatsNext({
+	res = await hubCall(`whats_next ${wf}`, async (signal) => {
+	  const selection = { capabilities: [...serveCapabilities], crews: [...serveCrews] };
+	  await opts.routingSession?.ensureScope(selection);
+	  const routing = opts.routingSession ? { kind: await prepareWillingOffer(wf, signal, selection) } : undefined;
+	  return opts.hub.whatsNext({
 	    workflow: wf,
-	    serve_crews: serveCrews,
-	    serve_capabilities: [...serveCapabilities],
-	  }, signal));
+	    serve_crews: selection.crews,
+	    serve_capabilities: selection.capabilities,
+	    ...(routing ? { routing } : {}),
+	  }, signal);
+	});
       } catch (e) {
 	if (isNonServableRace(e)) {
 	  // Treat the targeted call as a successful empty observation for the
@@ -1905,7 +2262,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // instead of sitting INFLIGHT behind a heartbeat that will never tick.
     for (const candidate of candidates) {
       if (discardExpiredCandidate(candidate, false)) continue;
-      const result = dispatchCandidate(candidate);
+      const result = await dispatchCandidate(candidate);
       if (result === 'dispatched') {
 	dispatched++;
 	continue;
@@ -1982,6 +2339,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   async function iteration(): Promise<number> {
+    // A detached handoff may have closed an old session between iterations.
+    // Its 429 must gate roster sync, which runs before scope reconciliation.
+    syncRoutingBackoff();
     const backoffActiveAtStart = monotonicNow() < backoffUntil;
     let rateLimitedThisIteration = false;
 
@@ -2008,10 +2368,22 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       }
     }
 
+    if (opts.routingSession && !backoffActiveAtStart && !rateLimitedThisIteration) {
+      try {
+	await opts.routingSession.ensureScope({ capabilities: [...serveCapabilities], crews: [...serveCrews] });
+	await opts.routingSession.maintain();
+      } catch (error) {
+	noteServerBackoff(error);
+	opts.err('routing serving scope unavailable; dispatch refused');
+	return 0;
+      }
+    }
+
     // Presence when due (starts immediately — this shift exists to conduct).
     // A server backoff suppresses every hub poll, including presence, while local
     // reconciliation and queued dispatch continue below.
     if (
+      !opts.routingSession &&
       !backoffActiveAtStart &&
 	!rateLimitedThisIteration &&
       monotonicNow() - lastPresence >= opts.presenceIntervalMs
@@ -2044,7 +2416,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // so use the freed slot to dispatch claims retained from an earlier sweep
     // before consulting the wake cursor.
     let inFlight = reconcile();
-    let dispatched = drainPending(inFlight.live, inFlight.reserved);
+    let dispatched = await drainPending(inFlight.live, inFlight.reserved);
     if (dispatched > 0) inFlight = reconcile();
     const live = inFlight.live;
     const reserved = inFlight.reserved;
@@ -2235,7 +2607,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
   function stop(): void {
     stopped = true;
+    opts.closeDefinitionStages?.();
     stopTimers();
+    if (opts.onStopRouting) void opts.onStopRouting();
+    else void opts.routingSession?.stop();
   }
 
   return {
@@ -2272,6 +2647,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     getCyclesCompleted: () => cyclesCompleted,
     getLastPollAt: () => lastPollAt,
     noteRunEnded: (run: string) => {
+      const owned = routingHandoffs.get(run);
+      if (owned) {
+	owned.normalClosed = true;
+	try { owned.handoff.terminal('normal-close'); } catch { opts.err('routing handoff cleanup failed'); }
+	// A closed Hub run revokes Hub access but does not prove the child exited.
+      }
       pendingCandidates.delete(run);
       // A run that ENDED is a run that progressed — the shift's MCP `submit`
       // tool calls this only when the hub reports the submit closed the run.
@@ -2285,8 +2666,26 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	// The hub's closed-run report is authoritative but carries no record identity.
 	removeRecordUnderDispatchLock(run);
     },
-    noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number }) => {
+    noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number;
+      routingHandoff?: string; dispatchToken?: string;
+      exitStatus?: number | null; signal?: NodeJS.Signals | null }) => {
+      const owned = routingHandoffs.get(exit.run);
+      // A late old exit can reuse the same PID after a new dispatch. Its
+      // per-dispatch handoff path must match before touching stage or slot.
+      if (owned && (owned.handoff.path !== exit.routingHandoff
+	|| (owned.custody && owned.dispatchToken !== exit.dispatchToken))) return;
       pendingCandidates.delete(exit.run);
+      if (owned?.pid === exit.pid && owned.handoff.path === exit.routingHandoff) {
+	try { owned.handoff.terminal(owned.normalClosed ? 'normal-close' : 'child-exit'); }
+	catch { opts.err('routing handoff cleanup failed'); }
+	// Once the gate may have opened, role exit does not prove that its detached
+	// shell or provider descendants stopped. Retain their bytes until a separate
+	// process-group termination proof exists, even after exit status zero.
+	if (owned.spawnedAt !== undefined && !owned.gateMayHaveOpened)
+	  owned.stage?.cleanupAfterExit({ workflow: exit.workflow, run: exit.run,
+	    pid: exit.pid, spawnedAt: owned.spawnedAt });
+	routingHandoffs.delete(exit.run);
+      }
       let removed = false;
       try {
 	removed = removeRecordUnderDispatchLock(

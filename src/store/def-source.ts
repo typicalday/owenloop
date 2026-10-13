@@ -16,7 +16,8 @@ import { join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import { parseVersionedCallTarget } from '../bundle/call-target.ts';
 import type { BundleManifest } from '../bundle/types.ts';
-import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile } from '../defs.ts';
+import { digestScopedCallsTargetKey, finalizeDefs } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
@@ -171,6 +172,7 @@ function loadObjectDefs(
 	try {
 		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false, requireHardenedModes });
 		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
+		const dialect = bundleDialectForManifest(manifest);
 		const defs = new Map<string, WorkflowDef>();
 		// Sorted, not YAML key order. `defs` is handed to callers as a Map, whose
 		// iteration order is this insertion order; nothing downstream currently
@@ -181,7 +183,7 @@ function loadObjectDefs(
 		const manifestWorkflows = Object.entries(manifest.workflows)
 			.sort(([a], [b]) => compareStoreText(a, b));
 		for (const [workflowName, workflowPath] of manifestWorkflows) {
-			const def = loadDefFile(join(objectDir, workflowPath));
+			const def = loadBundleDefFile(join(objectDir, workflowPath), dialect);
 			if (def.name !== workflowName) {
 				throw new Error(
 					`workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
@@ -365,6 +367,11 @@ function selectWorkflowRegistrations(
 	);
 	for (const { loaded, indexedLevel } of ordered) {
 		for (const def of loaded.defs.values()) {
+			// Authored Hub namespace/name is already a complete identity.
+			// Register it only through exact digest/coordinate selectors below;
+			// prepending the package would create a misleading three-segment
+			// ambient alias that can collide with unrelated package discovery.
+			if (def.name.includes('/')) continue;
 			const qualified = `${loaded.manifest.package.name}/${def.name}`;
 			const candidate: WorkflowCandidate = {
 				qualified,
@@ -522,7 +529,7 @@ function discoverCasDefs(
 					registeredCoordinateKeys.add(key);
 					registrations.push({
 						key,
-						qualified: `${loaded.manifest.package.name}/${workflowName}`,
+						qualified: workflowName.includes('/') ? workflowName : `${loaded.manifest.package.name}/${workflowName}`,
 						bare: workflowName,
 						def,
 						bundleDigest: digest,
@@ -555,7 +562,7 @@ function discoverCasDefs(
 				registeredCoordinateKeys.add(key);
 				registrations.push({
 					key,
-					qualified: `${loaded.manifest.package.name}/${target.name}`,
+					qualified: target.name.includes('/') ? target.name : `${loaded.manifest.package.name}/${target.name}`,
 					bare: target.name,
 					def: target,
 					bundleDigest: digest,

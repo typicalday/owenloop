@@ -87,12 +87,13 @@ function optionsFor(
     exactWorkdir?: boolean;
     env?: Record<string, string | undefined>;
     cwd?: string;
+    owenloopMcp?: { command: string; args: string[] };
   } = {},
 ): { options: ReturnType<typeof buildClaudeOptions>; events: AgentEvent[] } {
   const events: AgentEvent[] = [];
   const inputs: ClaudeOptionInputs = {
     cwd: opts.cwd ?? '/tmp/work',
-    owenloopMcp: MOUNT,
+    owenloopMcp: opts.owenloopMcp ?? MOUNT,
     permissions: normalizeStepPermissions(bag, opts.step),
     ...(opts.startModel !== undefined ? { model: opts.startModel } : {}),
     ...(opts.startEffort !== undefined ? { effort: opts.startEffort } : {}),
@@ -152,6 +153,17 @@ test('a full bag maps onto the SDK options, setting BOTH tools and allowedTools'
   });
   assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'ask']);
   assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
+});
+
+test('restricted routed holder exposes collection seal while ordinary holder does not', () => {
+  const bag = bagOf(stepByName('builder'));
+  const routed = optionsFor(bag, { owenloopMcp: { ...MOUNT,
+    args: [...MOUNT.args, '--routing-holder=/private/holder'] } }).options;
+  assert.ok(mountedOwenloopTools(routed).includes('seal_collection'));
+  assert.ok(routed.allowedTools?.includes('mcp__owenloop__seal_collection'));
+  const ordinary = optionsFor(bag).options;
+  assert.ok(!mountedOwenloopTools(ordinary).includes('seal_collection'));
+  assert.ok(!ordinary.allowedTools?.includes('mcp__owenloop__seal_collection'));
 });
 
 test('an empty bag leaves every optional key ABSENT, not empty', () => {

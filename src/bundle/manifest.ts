@@ -32,13 +32,14 @@ import { canonicalBundlePathViolation } from '../archive.ts';
 import { parseWorkflowCoordinate } from '../store/types.ts';
 import {
   isVersionedReference as isPortableVersionedReference,
+  isBundleWorkflowName,
   parseVersionedCallTarget as parsePortableVersionedCallTarget,
-  WORKFLOW_NAME_RE,
 } from './call-target.ts';
 import { assertCurrentRuntimeCompatible, isCanonicalSemver } from './runtime.ts';
 import { BundleError } from './types.ts';
 import type { BundleManifest, BundleRuntimeRequirements } from './types.ts';
 export { WORKFLOW_NAME_RE } from './call-target.ts';
+export { isBundleWorkflowName } from './call-target.ts';
 
 /** Parse an exact call using the store's canonical coordinate validator. */
 export function parseVersionedCallTarget(text: string): { coordinate: string; workflow?: string } {
@@ -286,10 +287,10 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   const workflows: Record<string, string> = Object.create(null) as Record<string, string>;
   const workflowPaths = new Set<string>();
   for (const [workflowName, workflowPathRaw] of workflowEntries) {
-    if (!WORKFLOW_NAME_RE.test(workflowName)) {
+    if (!isBundleWorkflowName(workflowName)) {
       throw new BundleError(
         'MANIFEST_ERROR',
-        `bundle.yaml.workflows: name '${workflowName}' must match /^[a-z][a-z0-9-]*$/`,
+		`bundle.yaml.workflows: name '${workflowName}' must be a portable name or one qualified Hub namespace/name`,
       );
     }
     const workflowPath = asString(workflowPathRaw, `bundle.yaml.workflows['${workflowName}']`);

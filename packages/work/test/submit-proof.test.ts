@@ -306,3 +306,31 @@ test('buildSubmitProof treats missing HOME as an absent-key fallback', async () 
   assert.equal(warnings.length, 1);
   assert.match(warnings[0]!, /machine signing is unavailable/);
 });
+
+test('required parent signing refuses missing target, fingerprint or key without unsigned fallback', async () => {
+  for (const kind of ['target', 'fingerprint', 'fractional-fingerprint', 'no-key', 'missing-key'] as const) {
+    const order = structuredClone(ORDER);
+    if (kind === 'target') order.owes[0]!.version = undefined;
+    if (kind === 'fingerprint') order.consumedFingerprint = undefined;
+    if (kind === 'fractional-fingerprint') order.consumedFingerprint = { input: 0.5 };
+    const keys = keysFor();
+    if (kind === 'no-key') keys.resolveRef = () => null;
+    if (kind === 'missing-key') keys.inspect = async () => ({ exists: false, backend: 'file', source: 'generated', publicKey: undefined });
+    const warnings: string[] = [];
+    await assert.rejects(buildSubmitProof({ origin: ORIGIN, order, path: 'result', value: { ok: true },
+      now: () => 1, warn: line => warnings.push(line), required: true, principalKeys: keys,
+      sshProcess: fakeSshProcess([]) }), /routed/);
+    assert.deepEqual(warnings, [], kind);
+  }
+});
+
+test('required parent signing returns exact DSSE proof for authoritative target and normalized value', async () => {
+  const proof = await buildSubmitProof({ origin: ORIGIN, order: ORDER, path: 'result', value: { ok: true },
+    now: () => 123, warn: () => { throw new Error('no fallback'); }, required: true,
+    principalKeys: keysFor(), sshProcess: fakeSshProcess([]) });
+  const payload = JSON.parse(Buffer.from(JSON.parse(proof!).payload, 'base64').toString('utf8'));
+  assert.equal(payload.produced[0].version, 4);
+  assert.equal(payload.workflow, ORDER.workflow);
+  assert.equal(payload.defDigest, ORDER.defDigest);
+  assert.deepEqual(payload.consumedFingerprint, ORDER.consumedFingerprint);
+});

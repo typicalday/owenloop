@@ -11,12 +11,14 @@ import type { InvocationBindingSource, VerifiedInvocationReceipt } from '../../.
  */
 
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../../src/store/index.ts';
-import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource } from '../../../../src/store/index.ts';
+import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource,
+  VerifiedDefinitionSelection } from '../../../../src/store/index.ts';
 import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
 import { compareStoreText, parseWorkflowCoordinate } from '../../../../src/store/types.ts';
-import type { StepDef, WorkflowDef } from '../../../../src/types.ts';
+import type { InputDef, StepDef, WorkflowDef } from '../../../../src/types.ts';
 import type { DefPolicy, DefVerdict } from '../../../../src/crypto/verify-publication.ts';
 import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
 import type { OriginRuleMatch, OriginRules } from '../../../../src/crypto/origin-rules.ts';
@@ -34,6 +36,7 @@ import {
 import type { OrderPacket } from '../hub/types.ts';
 import { validFixedWorkdir } from '../order-definition-binding.ts';
 import type { ConsumedVerifier, VerifiedCallsProducer } from '../consumed-verifier.ts';
+import type { ConcreteCallBindingSource } from '../hosted/trusted-routed-concrete-binding.ts';
 
 export type InstructionRefusalKind =
   | 'unknown-digest'
@@ -46,19 +49,39 @@ export type InstructionRefusalKind =
   | 'origin-policy'
   | 'unverified-consumed';
 
+/** Fixed diagnostic only; it never changes admission or contains a relay key. */
+export type InvocationRefusalCode =
+  | 'invocation-source-absent'
+  | 'invocation-version-missing'
+  | 'invocation-read-failed'
+  | 'invocation-receipt-moved';
+
 export interface InstructionRefusal {
   ok: false;
   reason: string;
   kind: InstructionRefusalKind;
+  code?: InvocationRefusalCode;
 }
 
 export interface ResolvedCommand {
   /** Trusted capability, called after payload preparation immediately before start. */
   revalidate?: () => Promise<InstructionRefusal | undefined>;
+  /** Opt-in v2 consequence fence after the child exits, before any submit/reject/ask. */
+  revalidateAfterRun?: () => Promise<InstructionRefusal | undefined>;
   ok: true;
   command: string;
   /** Verified installed bundle root, when resolution has bundle provenance. */
   bundleDir?: string;
+}
+
+/** Signed command data only. A routed caller still requires its current v2
+ * input witness and accepted one-use launch before external start. */
+export interface ResolvedRoutedCommandDefinition extends ResolvedCommand {
+  inputWitnessRequired: true;
+  /** Local signed source, command, origin and locked calls closure after run.
+   * Dynamic invocation producer/current-input proof remains parent-owned after
+   * broker quiesce; generic callers keep revalidateAfterRun's full read. */
+  revalidateLocalAfterRun?: () => Promise<InstructionRefusal | undefined>;
 }
 
 export interface ResolvedStep {
@@ -73,10 +96,15 @@ export interface ResolvedStep {
 /** Static step and calls-boundary facts from one verified local publication. */
 export interface ResolvedHostedStep extends ResolvedStep {
   callsProducers: Readonly<Record<string, VerifiedCallsProducer>>;
+  /** From the same verified local publication as step and calls closure. */
+  declaredInputs: readonly InputDef[];
+  /** Allowed run/escalation modifiers from this same verified publication. */
+  allowedModifiers?: readonly string[];
 }
 
 export interface InstructionResolver {
   resolveCommand(order: OrderPacket): Promise<ResolvedCommand | InstructionRefusal>;
+  resolveRoutedCommandDefinition?(order: OrderPacket): Promise<ResolvedRoutedCommandDefinition | InstructionRefusal>;
   resolveStep(order: OrderPacket): Promise<ResolvedStep | InstructionRefusal>;
   /** Strict publication gate for a locally hosted, model-facing order adapter. */
   resolveHostedStep?(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal>;
@@ -108,6 +136,9 @@ export interface OriginVerifierInput {
 export type OriginVerifier = (input: OriginVerifierInput) => Promise<OriginVerdict> | OriginVerdict;
 
 export interface StoreInstructionResolverOptions {
+  /** Parent-bound routed identity; absent keeps ordinary digest/step ambiguity. */
+  routedSelection?: { rootWorkflow: string; frameWorkflow: string;
+    definitionName: string; defDigest: string; run: string };
   projectRoot?: string;
   globalRoot: string;
   verifier: BundleIngestor;
@@ -121,6 +152,9 @@ export interface StoreInstructionResolverOptions {
   /** Gate dynamic consumed values before a command can reach the shell. */
   consumedVerifier?: ConsumedVerifier;
   invocationBindingSource?: InvocationBindingSource;
+  /** Original-session folded receipt for an occurrence-selected concrete call.
+   * A structural preview alone is never producer authority. */
+  concreteCallBindingSource?: ConcreteCallBindingSource;
   /** Explicit publication policy override; otherwise env > settings file > warn. */
   defPolicy?: DefPolicy;
   /** Explicit origin policy override; otherwise env > settings file > warn. */
@@ -143,11 +177,13 @@ function refusal(
   kind: InstructionRefusalKind,
   order: OrderPacket,
   detail: string,
+  code?: InvocationRefusalCode,
 ): InstructionRefusal {
   const digest = order.defDigest === undefined || order.defDigest === '' ? '<missing>' : order.defDigest;
   return {
     ok: false,
     kind,
+    ...(code === undefined ? {} : { code }),
     reason: `instruction refusal (${kind}) for ${order.workflow}/${order.run} step '${order.step}' defDigest '${digest}': ${detail}`,
   };
 }
@@ -165,6 +201,7 @@ interface ResolvedDefinition {
   step: StepDef;
   bundleDigest: string;
   objectPath: string;
+  callsChild?: VerifiedDefinitionSelection['callsChild'];
 }
 
 type ResolvedDefinitionOrRefusal = ResolvedDefinition | InstructionRefusal;
@@ -211,6 +248,28 @@ export function createStoreInstructionResolver(
       const primed = await source.prime(digest);
       if (primed === 'unknown-digest') {
         return refusal('unknown-digest', order, 'no verified local workflow bundle matches the order digest');
+      }
+      const routed = options.routedSelection;
+      if (routed !== undefined) {
+	const claim = order.routing?.claim;
+	const binding = claim?.binding;
+	if (digest !== routed.defDigest || order.run !== routed.run
+	  || order.workflow !== routed.frameWorkflow || !binding
+	  || binding.runId !== routed.rootWorkflow || binding.frameId !== routed.frameWorkflow
+	  || binding.def.workflowName !== routed.definitionName
+	  || binding.def.bundleDigest !== `sha256:${routed.defDigest}`
+	  || claim.orderId !== routed.run || claim.claimId !== routed.run
+	  || !isDeepStrictEqual(binding, order.routing?.decision.binding))
+	  return refusal('integrity', order, 'routed signed definition identity changed');
+	const selected = source.selectVerifiedDefinition(digest, routed.definitionName, order.step);
+	if (selected === undefined) return refusal('unknown-step', order,
+	  'signed routed definition or step is unavailable in the verified bundle');
+	if (!validFixedWorkdir(selected.step, order,
+	  selected.definition.inputs.map(input => input.name)))
+	  return refusal('integrity', order, 'order workdir differs from the locally verified step');
+	return { ok: true, definition: selected.definition, step: selected.step,
+	  bundleDigest: selected.bundleDigest, objectPath: selected.objectPath,
+	  callsChild: selected.callsChild };
       }
       const lookup = source.lookup({ defDigest: digest, step: order.step, key: order.key });
       if (lookup.status === 'unknown-digest') {
@@ -400,6 +459,7 @@ export function createStoreInstructionResolver(
     order: OrderPacket,
     resolved: ResolvedDefinition,
     requireClosure = false,
+    skipDynamicInvocationRead = false,
   ): Promise<{ ok: true; producers: Record<string, VerifiedCallsProducer>; receipts: VerifiedInvocationReceipt[] } | InstructionRefusal> => {
     const receipts: VerifiedInvocationReceipt[] = [];
     const producers: Record<string, VerifiedCallsProducer> = {};
@@ -408,18 +468,23 @@ export function createStoreInstructionResolver(
         (step) => (step.calls !== undefined || step.callsInterface !== undefined) && step.produces.some((produce) => produce.stem === path),
       );
       if (callsStep?.callsInterface?.selection === 'invocation') {
-        if (!options.invocationBindingSource) return refusal('unverified-consumed', order, 'dynamic relay requires a trusted InvocationBindingSource');
+	if (skipDynamicInvocationRead) continue;
+	if (!options.invocationBindingSource) return refusal('unverified-consumed', order,
+	  'dynamic relay requires a trusted InvocationBindingSource', 'invocation-source-absent');
         const version = order.consumedFingerprint?.[path];
-        if (version === undefined) return refusal('unverified-consumed', order, 'dynamic relay requires the parent artifact version');
+	if (version === undefined) return refusal('unverified-consumed', order,
+	  'dynamic relay requires the parent artifact version', 'invocation-version-missing');
         const key = { parentWorkflow: order.workflow, parentDefRef: { bundleDigest: resolved.bundleDigest, workflowName: resolved.definition.name },
           callPath: path, parentArtifactVersion: version };
         let trusted: VerifiedInvocationReceipt | undefined;
         try { trusted = await options.invocationBindingSource.read(key); }
-        catch (error) { return refusal('unverified-consumed', order, `trusted invocation read failed: ${errorText(error)}`); }
+	catch (error) { return refusal('unverified-consumed', order,
+	  `trusted invocation read failed: ${errorText(error)}`, 'invocation-read-failed'); }
         if (!trusted || valueDigestHex(trusted.receipt) !== trusted.receiptDigest
           || valueDigestHex(trusted.receipt.parentDefRef) !== valueDigestHex(key.parentDefRef)
           || trusted.receipt.callPath !== path || trusted.receipt.parentArtifactVersion !== version) {
-          return refusal('unverified-consumed', order, 'trusted invocation receipt is missing or moved');
+	  return refusal('unverified-consumed', order,
+	    'trusted invocation receipt is missing or moved', 'invocation-receipt-moved');
         }
         receipts.push(trusted);
         producers[path] = { step: callsStep.name, target: trusted.receipt.childDefRef.workflowName,
@@ -429,7 +494,9 @@ export function createStoreInstructionResolver(
       }
       if (callsStep?.calls === undefined) continue;
       const relayed = order.consumesProofRelay?.[path] !== undefined;
-      const child = source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
+      const child = resolved.callsChild !== undefined
+	? resolved.callsChild(callsStep.name)
+	: source.getVerifiedCallsChild?.(order.defDigest, order.step, callsStep.name);
       if (child === undefined) {
 	if (!relayed && !requireClosure) continue;
         return refusal(
@@ -447,7 +514,61 @@ export function createStoreInstructionResolver(
           `the verified definition produces artifact '${path}' through calls: step '${callsStep.name}' (${callsStep.calls}), but the verified child definition '${child.definition.name}' declares no outcome`,
         );
       }
-      producers[path] = { step: callsStep.name, target: callsStep.calls, childDefDigest: child.bundleDigest, childOutcome };
+      // A live-selected structural preview is not producer evidence. Only a
+      // persisted native child can bind the relay's workflow identity; the
+      // separate folded receipt and stored proof still have to verify below.
+      if (child.selectedConcreteCall !== undefined
+	&& child.selectedConcreteCall.kind !== 'selected-native-concrete-child') {
+	return refusal('unverified-consumed', order,
+	  'selected concrete child has not materialized for consumed proof');
+      }
+      let childVersion: number | undefined;
+      if (child.selectedConcreteCall?.kind === 'selected-native-concrete-child'
+	&& !skipDynamicInvocationRead) {
+	const version = order.consumedFingerprint?.[path];
+	if (!Number.isSafeInteger(version) || version! < 1
+	  || options.concreteCallBindingSource === undefined)
+	  return refusal('unverified-consumed', order,
+	    'selected concrete child has no folded receipt source');
+	const key = { parentWorkflow: order.workflow,
+	  parentDefRef: { bundleDigest: resolved.bundleDigest,
+	    workflowName: resolved.definition.name },
+	  callPath: path, parentArtifactVersion: version! };
+	let folded;
+	try { folded = await options.concreteCallBindingSource.read(key); }
+	catch (error) { return refusal('unverified-consumed', order,
+	  `selected concrete receipt read failed: ${errorText(error)}`); }
+	const receipt = folded?.receipt;
+	let proof: unknown;
+	try {
+	  const raw = JSON.parse(order.consumesProof ?? '{}') as unknown;
+	  proof = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+	    ? (raw as Record<string, unknown>)[path] : undefined;
+	} catch { /* The hard consumed verifier refuses malformed proof maps. */ }
+	const relay = order.consumesProofRelay?.[path];
+	if (!folded || !receipt || valueDigestHex(receipt) !== folded.receiptDigest
+	  || receipt.kind !== 'concrete-call' || receipt.parentWorkflow !== key.parentWorkflow
+	  || !isDeepStrictEqual(receipt.parentDefRef, key.parentDefRef)
+	  || receipt.callStep !== callsStep.name || receipt.callPath !== path
+	  || receipt.parentArtifactVersion !== version
+	  || receipt.childWorkflow !== child.selectedConcreteCall.childWorkflow
+	  || receipt.childDefRef.bundleDigest !== child.bundleDigest
+	  || receipt.childDefRef.workflowName !== child.definition.name
+	  || receipt.childOutcome !== childOutcome
+	  || receipt.foldedValueDigest !== valueDigestHex(order.consumes[path])
+	  || proof !== folded.proof
+	  || relay?.childDefDigest !== child.bundleDigest
+	  || relay.childOutcome !== childOutcome
+	  || relay.childVersion !== receipt.childOutcomeVersion)
+	  return refusal('unverified-consumed', order,
+	    'selected concrete folded receipt is missing or moved');
+	childVersion = receipt.childOutcomeVersion;
+      }
+      producers[path] = { step: callsStep.name, target: callsStep.calls,
+	childDefDigest: child.bundleDigest, childOutcome,
+	...(childVersion === undefined ? {} : { childVersion }),
+	...(child.selectedConcreteCall?.kind === 'selected-native-concrete-child'
+	  ? { childWorkflow: child.selectedConcreteCall.childWorkflow } : {}) };
     }
     return { ok: true, producers, receipts };
   };
@@ -502,6 +623,40 @@ export function createStoreInstructionResolver(
   };
 
   return {
+    async resolveRoutedCommandDefinition(order: OrderPacket): Promise<ResolvedRoutedCommandDefinition | InstructionRefusal> {
+      if (options.routedSelection === undefined)
+	return refusal('integrity', order, 'routed signed selector is unavailable');
+      const resolved = await resolveVerifiedStep(order);
+      if (!resolved.ok) return resolved;
+      const verdict = await trustFor(order, resolved);
+      if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
+      const originRefusal = await checkOrigin(order, resolved);
+      if (originRefusal !== undefined) return originRefusal;
+      const calls = await verifiedCallsProducers(order, resolved, true);
+      if (!calls.ok) return calls;
+      if (order.worker !== 'command' || resolved.step.executor !== 'command'
+	|| typeof resolved.step.command !== 'string'
+	|| !resolved.step.command.trim())
+	return refusal('missing-command', order, 'the selected signed command step is unavailable');
+      const command = resolved.step.command;
+      const revalidateSigned = async (localOnly = false): Promise<InstructionRefusal | undefined> => {
+	const fresh = await resolveVerifiedStep(order);
+	if (!fresh.ok) return fresh;
+	if (fresh.step.executor !== 'command' || fresh.step.command !== command
+	  || fresh.objectPath !== resolved.objectPath)
+	  return refusal('integrity', order, 'the selected signed command changed');
+	const currentVerdict = await trustFor(order, fresh);
+	if (currentVerdict.kind !== 'verified') return refuseUnverified(order, currentVerdict);
+	const currentOrigin = await checkOrigin(order, fresh);
+	if (currentOrigin !== undefined) return currentOrigin;
+	const currentCalls = await verifiedCallsProducers(order, fresh, true, localOnly);
+	return currentCalls.ok ? undefined : currentCalls;
+      };
+      return { ok: true, command, inputWitnessRequired: true,
+	revalidate: () => revalidateSigned(), revalidateAfterRun: () => revalidateSigned(),
+	revalidateLocalAfterRun: () => revalidateSigned(true),
+	...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
+    },
     async resolveHostedStep(order: OrderPacket): Promise<ResolvedHostedStep | InstructionRefusal> {
       const resolved = await resolveVerifiedStep(order);
       if (!resolved.ok) return resolved;
@@ -518,6 +673,8 @@ export function createStoreInstructionResolver(
 	  ok: true,
 	  step: resolved.step,
 	  inputNames: resolved.definition.inputs.map((input) => input.name),
+	  declaredInputs: resolved.definition.inputs,
+	  allowedModifiers: resolved.definition.modifiers ?? [],
 	  callsProducers: calls.producers ?? {},
 	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
       };

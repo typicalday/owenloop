@@ -94,6 +94,7 @@ jobs:
               && npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$TARBALL" \
               && ./node_modules/.bin/owenloop --help \
               && ./node_modules/.bin/owenloop work --help \
+              && ./node_modules/.bin/owenloop-routing-helper-build \
               && [ "$(./node_modules/.bin/owenloop list --db ./state.db)" = "[]" ]
           )
 

@@ -73,6 +73,22 @@ jobs:
 
       - run: npm run test:crypto
 
+  routed-file-opener:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, macos-latest] }
+    name: routed file opener (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:routing-helper
+      - run: node --test packages/work/test/routing-file-source.test.ts packages/work/test/routing-broker.test.ts
+
   bundle-vector:
     name: bundle golden vector (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -87,3 +103,310 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: node --test test/bundle.test.ts
+
+  # Private source proposal: publication and exact-head variable remain root-gated.
+  linux-metadata-preflight:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_PREFLIGHT_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: Own-process Linux metadata only
+        env:
+          JEV_REPOSITORY: ${{ github.repository }}
+          JEV_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          JEV_PR: ${{ github.event.pull_request.number }}
+          JEV_BRANCH: ${{ github.event.pull_request.head.ref }}
+          JEV_EVENT: ${{ github.event_name }}
+          JEV_ACTION: ${{ github.event.action }}
+          JEV_HEAD: ${{ github.event.pull_request.head.sha }}
+          JEV_RUN_ID: ${{ github.run_id }}
+          JEV_RUN_ATTEMPT: ${{ github.run_attempt }}
+          JEV_JOB: linux-metadata-preflight
+          JEV_BASE: ${{ github.event.pull_request.base.sha }}
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_EXPECTED_OWNER_SHA: 7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f
+          JEV_EXPECTED_METADATA_SHA: e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b
+          JEV_EXPECTED_PROTOCOL_SHA: e256a3583d4751360ac56935fe16eaa425d276f1f21ed4a2f50400c968207a52
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -I -B .dev/linux-metadata/owner.py
+      - name: Retain one bounded metadata file
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jev-linux-own-metadata-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-metadata-preflight-v2/metadata-result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
+
+  # Default-disabled owned-target observer; prior metadata variable must be absent.
+  linux-procfs-observer:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_OBSERVER_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: One harmless original-owned procfs qualification
+        env:
+          JEV_REPOSITORY: ${{ github.repository }}
+          JEV_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          JEV_PR: ${{ github.event.pull_request.number }}
+          JEV_BRANCH: ${{ github.event.pull_request.head.ref }}
+          JEV_EVENT: ${{ github.event_name }}
+          JEV_ACTION: ${{ github.event.action }}
+          JEV_HEAD: ${{ github.event.pull_request.head.sha }}
+          JEV_BASE: ${{ github.event.pull_request.base.sha }}
+          JEV_RUN_ID: ${{ github.run_id }}
+          JEV_RUN_ATTEMPT: ${{ github.run_attempt }}
+          JEV_JOB: linux-procfs-observer
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_PREFLIGHT_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_EXPECTED_OWNER_SHA: 5fe02ef578e6c1c69cdb47f63a7f8615a94ffdc7e4e935dcaea067ee587f52d6
+          JEV_EXPECTED_PROTOCOL_SHA: 0399f06a85dcf55614aef90f0087fe7858f4f12abeb6d56c46528f63c0aad062
+          JEV_EXPECTED_CORE_SHA: 96797f13e7619054c4036b6553e873609f2be4d73ba47c14f9f23f9d9d57c151
+          JEV_EXPECTED_OBSERVER_SHA: 4f42fb8948d2bb7acce1570c83900dd100855d506e03912852fdb7eb124c7fe9
+          JEV_EXPECTED_TARGET_SHA: b8b05e3644c07eb41e3f68eda6222bf390f1d7738fcb579fdc6482bb79bf7088
+          JEV_EXPECTED_CONTROLS_SHA: 663c971d4756c1045c6b7b33d70d9fe72d34628477cb9c9363cdbc6b8474bf9d
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -I -B .dev/linux-observer/owner.py
+      - name: Retain only the bounded fixed observer result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jev-linux-procfs-observer-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-procfs-observer-v2/observer-result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
+
+  # Default-disabled harmless descriptor ownership/transport qualification only.
+  linux-owned-descriptor-qualification:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD == '' &&
+      vars.OWENLOOP_JEV_DESCRIPTOR_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_DESCRIPTOR_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: One bounded harmless owned descriptor qualification
+        env:
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
+          JEV_OLD_PREFLIGHT_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_OLD_OBSERVER_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_EXPECTED_BOOTSTRAP_SHA: 8c9c8f7b16bd68898bbab1464e929a76c3237c8f40f811d0fcf7bfd38aefc7ae
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -B -I -S .dev/owned-descriptor-hosted/bootstrap.py
+      - name: Retain only the bounded fixed descriptor result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jev-owned-descriptor-qualification-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-owned-descriptor-qualification/result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
+
+  # Default-disabled harmless one-relay ownership/transport qualification only.
+  linux-one-relay-qualification:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD == '' &&
+      vars.OWENLOOP_JEV_DESCRIPTOR_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_ONE_RELAY_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: One bounded harmless one-relay qualification
+        env:
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_HEAD }}
+          JEV_OLD_PREFLIGHT_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_OLD_OBSERVER_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_OLD_DESCRIPTOR_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
+          JEV_EXPECTED_BOOTSTRAP_SHA: 8ef36469d9b1695f17fb4c0b46a652cd5a0e75e80f4d91f877a1b35943c7858a
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -B -I -S .dev/one-relay-hosted/bootstrap.py
+      - name: Retain only the bounded fixed descriptor result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jev-one-relay-qualification-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-one-relay-qualification/result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
+
+  # Default-disabled harmless one-relay-q2 ownership/transport qualification only.
+  linux-one-relay-q2-qualification:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD == '' &&
+      vars.OWENLOOP_JEV_DESCRIPTOR_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.0
+          check-latest: false
+      - name: One bounded harmless one-relay-q2 qualification
+        env:
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD }}
+          JEV_OLD_PREFLIGHT_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_OLD_OBSERVER_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_OLD_DESCRIPTOR_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
+          JEV_OLD_ONE_RELAY_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_HEAD }}
+          JEV_EXPECTED_BOOTSTRAP_SHA: 919a3cc1914156bdf4f8c844258b1249f011cc088b8219dcd601d89f75249d9e
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" python3 -B -I -S .dev/one-relay-q2-hosted/bootstrap.py
+      - name: Retain only the bounded fixed descriptor result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jev-one-relay-q2-qualification-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-one-relay-q2-qualification/result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7
+
+  # Default-disabled private current-production owner/entry seam only.
+  linux-production-owner-qualification:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.repository == 'typicalday/owenloop' &&
+      github.event.pull_request.number == 369 &&
+      github.event.pull_request.head.repo.full_name == 'typicalday/owenloop' &&
+      github.event.pull_request.head.ref == 'jev-routing-foundation-20261008' &&
+      github.event.pull_request.base.sha == 'b4ead192326ba607558cd3bb7687209cbb7c8165' &&
+      vars.OWENLOOP_JEV_PREFLIGHT_HEAD == '' &&
+      vars.OWENLOOP_JEV_OBSERVER_HEAD == '' &&
+      vars.OWENLOOP_JEV_DESCRIPTOR_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_HEAD == '' &&
+      vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD == '' &&
+      vars.OWENLOOP_JEV_PRODUCTION_OWNER_HEAD != '' &&
+      github.event.pull_request.head.sha == vars.OWENLOOP_JEV_PRODUCTION_OWNER_HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with: { node-version: 22.23.0, check-latest: false }
+      - name: One scoped current-production owner qualification
+        env:
+          JEV_ADMITTED_HEAD: ${{ vars.OWENLOOP_JEV_PRODUCTION_OWNER_HEAD }}
+          JEV_OLD_PREFLIGHT_HEAD: ${{ vars.OWENLOOP_JEV_PREFLIGHT_HEAD }}
+          JEV_OLD_OBSERVER_HEAD: ${{ vars.OWENLOOP_JEV_OBSERVER_HEAD }}
+          JEV_OLD_DESCRIPTOR_HEAD: ${{ vars.OWENLOOP_JEV_DESCRIPTOR_HEAD }}
+          JEV_OLD_ONE_RELAY_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_HEAD }}
+          JEV_OLD_ONE_RELAY_Q2_HEAD: ${{ vars.OWENLOOP_JEV_ONE_RELAY_Q2_HEAD }}
+          JEV_EXPECTED_BOOTSTRAP_SHA: 30f98fe3bae5e07444b956f45532c790c2a6880a738ec692bfe98422f08d8ca7
+        run: |
+          JEV_NODE_EXECUTABLE="$(command -v node)" JEV_GIT_EXECUTABLE="$(command -v git)" JEV_NPM_CLI="$(command -v npm)" python3 -B -I -S .dev/production-owner-hosted/bootstrap.py
+      - name: Retain only the fixed scoped result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jev-production-owner-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jev-linux-production-owner-qualification/result.json
+          include-hidden-files: false
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 7

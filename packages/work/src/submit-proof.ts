@@ -23,6 +23,8 @@ export interface SubmitProofOptions {
   env?: Record<string, string | undefined>;
   /** Injectable ssh-keygen seam for hermetic callers and tests. */
   sshProcess?: SshProcessAdapter;
+  /** Parent-owned routed signing has no unsigned compatibility fallback. */
+  required?: true;
 }
 
 let warnedUnsigned = false;
@@ -34,6 +36,12 @@ let warnedUnsigned = false;
  */
 export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string | undefined> {
   const version = outputVersionForSubmission(opts.order, opts.path, opts.version);
+  if (opts.required && (!Number.isSafeInteger(version) || version! < 1
+    || opts.order.consumedFingerprint === undefined
+    || typeof opts.order.consumedFingerprint !== 'object'
+    || Array.isArray(opts.order.consumedFingerprint)
+    || Object.values(opts.order.consumedFingerprint).some(v => !Number.isSafeInteger(v) || v < 0)))
+    throw new Error('routed submission authority unavailable');
   if (version === undefined) {
     warnUnsigned(
       opts.warn,
@@ -48,17 +56,20 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
   try {
     keys = opts.principalKeys ?? new PrincipalKeyManager({ env: opts.env ?? process.env });
   } catch (error) {
+    if (opts.required) throw new Error('routed machine signer unavailable');
     warnUnsigned(opts.warn, `machine signing is unavailable (${errorMessage(error)}); submitting without a proof`);
     return undefined;
   }
   const ref = keys.resolveRef(opts.origin, 'machine');
   if (ref === null) {
+    if (opts.required) throw new Error('routed machine signer unavailable');
     warnUnsigned(opts.warn, `no machine signing key for ${opts.origin}; submitting without a proof`);
     return undefined;
   }
 
   const inspected = await keys.inspect(ref);
   if (!inspected.exists || inspected.publicKey === undefined) {
+    if (opts.required) throw new Error('routed machine signer unavailable');
     warnUnsigned(opts.warn, `machine signing key for ${opts.origin} is unavailable; submitting without a proof`);
     return undefined;
   }

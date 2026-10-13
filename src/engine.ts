@@ -498,11 +498,20 @@ export class ModifierRefusalError extends Error {
  * exact digest-scoped alias, while the engine independently verifies the
  * returned definition's digest before accepting or spawning it.
  */
+/** Native, parent-owned coordinates of one unmaterialized concrete calls edge. */
+export interface ConcreteCallOccurrence {
+  readonly parentWorkflowId: string;
+  readonly parentStepName: string;
+  readonly parentPath: string;
+}
+
 export type DefResolver = (
   defName: string,
   from?: WorkflowDef,
   /** Exact CAS bundle digest requested by a persisted interface binding. */
   bundleDigest?: string,
+  /** Present only when provisioning a concrete calls child, never for a caller-supplied lookup. */
+  occurrence?: ConcreteCallOccurrence,
 ) => WorkflowDef;
 
 /**
@@ -1026,6 +1035,15 @@ export class Engine {
     gateStems: string[],
     now?: number,
   ): { childId: string; created: boolean; provided: string[] } | null {
+    // Capture the parent selected by this native occurrence before consulting a
+    // host resolver. The write transaction compares its signed snapshot again;
+    // a host may select a live child outside SQLite, but cannot change the
+    // authored parent edge between selection and insertion.
+    const parentAtSelection = this.store.getWorkflow(parentWf);
+    if (parentAtSelection === undefined) return null;
+    const selectedParentSnapshot = parentAtSelection.defSnapshot;
+    if (step.calls !== undefined && selectedParentSnapshot !== undefined
+      && !deepEqual(selectedParentSnapshot, parentDef)) return null;
     // B2: the gate fingerprint of the exact in-tx snapshot the seed/re-provide
     // validation ran against. Captured fresh inside `run()` so a retry re-reads
     // it; carried out on a `SchemaRefusalError` so `recordCallsSchemaReject` can
@@ -1112,6 +1130,16 @@ export class Engine {
         // there is no resolver/catalog/filesystem access inside this boundary.
         const parentRow = this.store.getWorkflow(parentWf);
         if (parentRow === undefined) throw new Error(`no such workflow instance: ${parentWf}`);
+	if (step.calls !== undefined) {
+	  if (parentRow.def !== parentAtSelection.def
+	    || !deepEqual(parentRow.defSnapshot, selectedParentSnapshot)) return null;
+	  if (selectedParentSnapshot !== undefined) {
+	    const freshStep = parentRow.defSnapshot?.steps.find(candidate => candidate.name === step.name);
+	    if (!freshStep || !deepEqual(freshStep, step)
+	      || freshStep.calls !== step.calls
+	      || freshStep.produces[0]?.stem !== callsStem) return null;
+	  }
+	}
         let target: string;
         if (step.callsInterface !== undefined) {
           const freshBinding = invocation ? asLegacy(invocation) : parentRow.interfaceBindings?.find((candidate) =>
@@ -1285,7 +1313,11 @@ export class Engine {
 		  throw new CallsPinError(step.calls!, `the persisted base-coordinate lock differs from the verified parent bundle for ${namedExactLockKey}`);
 		}
       }
-      snapshotDef = this.resolveDef(step.calls!, parentDef);
+      snapshotDef = this.resolveDef(step.calls!, parentDef, undefined, {
+	parentWorkflowId: parentWf,
+	parentStepName: step.name,
+	parentPath: callsStem,
+      });
       result = transact();
       if (result === needsSnapshot) throw new Error('internal error: guarded child provision requested no snapshot');
       return result;
@@ -2310,18 +2342,35 @@ export class Engine {
 	// buildOrder is read-only. A workdir refusal is not an eligible choice.
 	const preview = this.buildOrder(def, row.id, 'ready-preview', f, arts, computeFingerprint(arts, f.inputs), routing, resolved);
 	if ('deferred' in preview) continue;
+	const nativeClaimGeneration = this.store.getNativeClaimGeneration(row.id,f.step,f.key);
 	const ready: ReadyFiring = immutable({ workflow, frameId: row.id,
 	  DefRef: { bundleDigest: def.bundleDigest!, workflowName: def.name }, step: f.step, key: f.key,
 	  inputFingerprint: computeFingerprint(arts, f.inputs),
 	  admissionEpoch: this.store.getAdmission(this.store.rootWorkflow(row.id))?.epoch ?? null,
 	  executorKind: this.step(def, f.step).executor ?? 'agent',
 	  meaningDigest: valueDigestHex(this.step(def, f.step)),
-	  evidenceGeneration: valueDigestHex(computeFingerprint(arts, f.inputs)), stateDigest, resolved,
+	  evidenceGeneration: valueDigestHex(computeFingerprint(arts, f.inputs)), nativeClaimGeneration,
+	  stateDigest: valueDigestHex({stateDigest,nativeClaimGeneration}), resolved,
 	});
 	entries.push({ ready, firing: f, def, arts, modifier: row.modifier });
       }
     }
     return { kind: 'ready', entries };
+  }
+
+  /** Read persisted eligible firings without maintenance. Unlike snapshotReady,
+   * this never reaps, settles, arms or updates alarms/tasks. A successful empty
+   * read can show a stored consent is currently ineligible; unverified/inactive
+   * outcomes are distinct and must never be inferred as a fresh consent grant. */
+  readReady(workflow: string, options: ReadyOptions): SnapshotReadyResult {
+    const opts = immutable(structuredClone({ ...options, now: options.now ?? nowMs() }));
+    if (!this.store.getWorkflow(workflow) || !this.invocationCurrent(workflow)) return { kind: 'inactive' };
+    const verified = this.verifiedReadyDefinitions(workflow, opts.deep ?? true);
+    if (!(verified instanceof Map)) return { kind: 'unverified', ...verified };
+    return this.withInvocationDefinitions([...verified.values()], () => this.store.readTx(() => {
+      const result = this.collectReady(workflow, opts, verified);
+      return result.kind === 'ready' ? immutable({ kind: 'ready' as const, firings: result.entries.map(e => e.ready) }) : result;
+    }));
   }
 
   /** Maintain the tree, then read actual eligible choices without leases or
@@ -2877,6 +2926,8 @@ export class Engine {
       if (fresh) return 'in-flight'; // genuinely in flight — don't double-claim
     }
 
+    const nativeClaimGeneration = this.store.getNativeClaimGeneration(workflow,f.step,f.key);
+    if (nativeClaimGeneration.generation >= Number.MAX_SAFE_INTEGER) throw new Error('native claim generation exhausted');
     const runId = randId('run');
     const fp = computeFingerprint(arts, f.inputs);
     // Build the order BEFORE inserting the run so the flattened packet lands in
@@ -2902,6 +2953,7 @@ export class Engine {
     if (routing.escalation) this.recordEscalation(workflow, f, routing.escalation, now);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
+    this.store.recordNativeClaim(workflow,f.step,f.key,runId,nativeClaimGeneration);
     // The private prior-version record belongs to this claim, not to the
     // mutable owed target in order.v1. The same in-transaction artifact map
     // supplied buildOrder, so a concurrent commit cannot move either reading.
