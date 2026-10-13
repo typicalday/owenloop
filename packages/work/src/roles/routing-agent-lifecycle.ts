@@ -1,3 +1,4 @@
+import type { RoutedOwnerRoleObserver } from '../harness/routed-owner-observer.ts';
 /** Routed agent process and terminal custody. The model sees none of the
  * original-session authority; this role owns one retained supervisor and the
  * broker owns every Service mutation and terminal classification. */
@@ -15,6 +16,7 @@ export function createRoutedAgentLifecycle(args: {
    * fallback is permitted after the parent accepts a launch occurrence. */
   start: NonNullable<HarnessAdapter['startRouted']>;
   terminalMs?: number;
+  ownerObserver?: RoutedOwnerRoleObserver;
 }): RoutedAgentLifecycle {
   const budget = args.terminalMs ?? TERMINAL_MS;
   if (!Number.isFinite(budget) || budget <= 0 || budget > TERMINAL_MS)
@@ -60,6 +62,7 @@ export function createRoutedAgentLifecycle(args: {
       if (startAttempted || stopped) throw new Error('routed agent launch already attempted');
       startAttempted = true; // a synchronous spawn throw is still ambiguous
       return args.start(argsForAdapter, onEvent, { generation: args.generation,
+	...(args.ownerObserver === undefined ? {} : { ownerObserver: args.ownerObserver }),
 	onLaunch(retained) {
 	  if (launch || retained.generation !== args.generation)
 	    throw new Error('routed agent launch generation changed');

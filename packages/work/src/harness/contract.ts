@@ -1,3 +1,4 @@
+import type { RoutedOwnerRoleObserver } from './routed-owner-observer.ts';
 /**
  * The harness contract — the ONLY thing every harness adapter implements, and
  * the only shapes the worker speaks.
@@ -58,6 +59,8 @@ export interface RoutedHarnessLaunch {
 
 export interface RoutedHarnessLaunchRequest {
   generation: string;
+  /** Explicit private composition; not serialized in routed authority. */
+  ownerObserver?: RoutedOwnerRoleObserver;
   onLaunch(launch: RoutedHarnessLaunch): void;
 }
 

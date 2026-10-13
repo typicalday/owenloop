@@ -1,3 +1,4 @@
+import type { RoutedOwnerRoleObserver } from './routed-owner-observer.ts';
 /**
  * `codexAdapter` — the `HarnessAdapter` for OpenAI's `codex app-server`
  * (pinned to `codex-cli 0.146.0`, the `"codex"` key in `harness-versions.json`).
@@ -1168,6 +1169,7 @@ const ROUTED_LAUNCH_GENERATIONS = new Set<string>();
 
 export interface RoutedCodexLaunchRequest {
   generation: string;
+  ownerObserver?: RoutedOwnerRoleObserver;
   onLaunch: (launch: RoutedCodexLaunch) => void;
 }
 
@@ -1228,7 +1230,8 @@ async function openClient(
   };
   const client = routedLaunch === undefined
     ? startStdioRpc(transportOptions)
-    : startManagedStdioRpc({ ...transportOptions, env: providerEnv });
+    : startManagedStdioRpc({ ...transportOptions, env: providerEnv,
+      ...(routedLaunch.ownerObserver === undefined ? {} : { ownerObserver: routedLaunch.ownerObserver }) });
 
   try {
     if (routedLaunch !== undefined) {
@@ -1521,6 +1524,7 @@ export const codexAdapter: HarnessAdapter = {
   // the vendor-specific holder and generation checks in startRoutedCodex.
   startRouted: (args, onEvent, launch) => startRoutedCodex(args, onEvent, {
     generation: launch.generation,
+    ...(launch.ownerObserver === undefined ? {} : { ownerObserver: launch.ownerObserver }),
     onLaunch: retained => launch.onLaunch(retained),
   }),
 

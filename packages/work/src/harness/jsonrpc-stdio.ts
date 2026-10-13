@@ -38,7 +38,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
-import { ROUTED_STDIO_SUPERVISOR } from './routed-stdio-supervisor.ts';
+import { ROUTED_STDIO_SUPERVISOR, ROUTED_OBSERVED_STDIO_SUPERVISOR } from './routed-stdio-supervisor.ts';
+import { spawnObservedSupervisor, forwardObservedProvider, closeObservedSupervisor,
+  type RoutedOwnerRoleObserver } from './routed-owner-observer.ts';
 
 /** One decoded inbound frame. Every member is optional — see `classifyFrame`. */
 export interface JsonRpcFrame {
@@ -470,15 +472,19 @@ function killGroup(pid: number | undefined, signal: NodeJS.Signals, onStderr: (l
  * The ordinary transport above is deliberately unchanged.
  */
 export function startManagedStdioRpc(opts: StdioRpcOptions & {
-  env: Record<string, string | undefined>; graceMs?: number
+  env: Record<string, string | undefined>; graceMs?: number;
+  /** Private source-composed dependency; never selected by handoff/env/Hub. */
+  ownerObserver?: RoutedOwnerRoleObserver;
 }): ManagedStdioRpcClient {
   // The supervisor itself is in the model-accessible process tree. It must
   // receive the same already-filtered environment as the provider it starts.
   if (opts.env === undefined) throw new Error('routed provider requires a filtered environment');
   const token = randomBytes(24).toString('hex');
-  const child = spawn(process.execPath, ['-e', ROUTED_STDIO_SUPERVISOR], {
-    detached: true, stdio: ['pipe', 'pipe', 'pipe', 'ipc'], env: opts.env,
-  }) as ChildProcessWithoutNullStreams;
+  const child = (opts.ownerObserver === undefined
+    ? spawn(process.execPath, ['-e', ROUTED_STDIO_SUPERVISOR], {
+      detached: true, stdio: ['pipe', 'pipe', 'pipe', 'ipc'], env: opts.env,
+    })
+    : spawnObservedSupervisor(opts.ownerObserver, ROUTED_OBSERVED_STDIO_SUPERVISOR, opts.env)) as ChildProcessWithoutNullStreams;
   const pgid = child.pid;
 
   let disposed = false;
@@ -558,7 +564,11 @@ export function startManagedStdioRpc(opts: StdioRpcOptions & {
 	  refuse('routed provider supervisor gave invalid startup evidence');
 	  return;
 	}
-	if (!readyState) { readyState = true; completeReady(); }
+	if (!readyState) {
+	  // No wait or retry. Refusal belongs to the observer, not normal ready.
+	  if (opts.ownerObserver !== undefined) forwardObservedProvider(opts.ownerObserver, child);
+	  readyState = true; completeReady();
+	}
 	break;
       case 'provider-exit':
 	pendingProviderExit = frame;
@@ -599,6 +609,9 @@ export function startManagedStdioRpc(opts: StdioRpcOptions & {
   };
   child.on('exit', onSupervisorExit);
   child.on('close', onSupervisorClose);
+  if (opts.ownerObserver !== undefined) child.on('close', () => {
+    closeObservedSupervisor(opts.ownerObserver!, child);
+  });
 
   const startMessage = { type: 'start', token, command: opts.command, args: opts.args,
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),

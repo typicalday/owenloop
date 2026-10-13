@@ -1,3 +1,4 @@
+import type { RoutedOwnerRoleObserver } from '../harness/routed-owner-observer.ts';
 /**
  * `owenloop work agent-run <order-id>` (Phase 3) — the detached, self-leasing worker
  * that HOSTS one step agent, and the harness-registry COMPOSITION ROOT.
@@ -258,6 +259,8 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
  * or reaching a real hub.
  */
 export interface RunDeps {
+  /** Explicit private entry dependency, never an env/Hub/handoff selector. */
+  ownerObserver?: RoutedOwnerRoleObserver;
   signalHost?: SignalHost;
   hub?: HubClient;
   out?: (line: string) => void;
@@ -338,7 +341,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     try {
       const handoff = consumeRoutingHandoff({ env, origin: parsed.origin, target, kind: 'agent-run' });
       if (!handoff || parsed.shift !== handoff.shiftId) return refuse();
-      const prepared = await prepareRoutedAgentRunner({ handoff, originalEnv: env, out, err });
+      const prepared = await prepareRoutedAgentRunner({ handoff, originalEnv: env, out, err,
+        ...(deps.ownerObserver === undefined ? {} : { ownerObserver: deps.ownerObserver }) });
       installSignalHandlers(prepared.loop, deps.signalHost ?? process, err, {
 	role: 'agent-run', drainNote: 'stopping the agent and releasing the order',
 	stopReason: 'signal',

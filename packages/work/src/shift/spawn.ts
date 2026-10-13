@@ -21,6 +21,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
+import { spawnObservedRole, closeObservedRole, sampleObservedRole, observedOwnerStatus, type RoutedOwnerOuterObserver } from '../harness/routed-owner-observer.ts';
 
 import { resolveOwenloopBin } from '../owenloop-bin.ts';
 import { runLogFile } from './logretention.ts';
@@ -88,6 +89,28 @@ export interface SpawnResult {
 /** Opaque to callers: a PID or injected spawner cannot manufacture this proof. */
 export interface RetainedChildCustody { readonly pid: number }
 const retainedChildren = new WeakMap<RetainedChildCustody, { child: ChildProcess; live: () => boolean }>();
+
+/** Private collector seam: only an actual issued custody token resolves the
+ * same retained ChildProcess. Its public pid field is never observer authority. */
+export function sampleRetainedChildOwner(observer: RoutedOwnerOuterObserver,
+  custody: RetainedChildCustody): unknown {
+  const retained = retainedChildren.get(custody);
+  if (!retained) throw new Error('retained child observer custody refused');
+  return sampleObservedRole(observer, retained.child);
+}
+export function retainedChildOwnerObserverStatus(observer: RoutedOwnerOuterObserver,
+  custody: RetainedChildCustody): ReturnType<typeof observedOwnerStatus> {
+  const retained = retainedChildren.get(custody);
+  if (!retained) throw new Error('retained child observer custody refused');
+  return observedOwnerStatus(observer, retained.child);
+}
+export function closeRetainedChildOwnerObserver(observer: RoutedOwnerOuterObserver,
+  custody: RetainedChildCustody): void {
+  const retained = retainedChildren.get(custody);
+  if (!retained) throw new Error('retained child observer custody refused');
+  closeObservedRole(observer, retained.child);
+}
+
 
 export function retainedChildLive(custody: RetainedChildCustody | undefined, pid: number): boolean {
   const retained = custody && retainedChildren.get(custody);
@@ -322,6 +345,8 @@ export function createDefaultSpawner(
   logging?: WorkerLogOptions,
   allowedWorkdirRoots?: string[],
   onExit?: WorkerExitReporter,
+  /** Explicit private test composition; absent changes no FD or native load. */
+  ownerObserver?: RoutedOwnerOuterObserver,
 ): Spawner {
   // ONE report per shift, not one per dispatch. Every condition that stops a
   // worker log from opening — a full disk, a read-only log directory, an
@@ -364,7 +389,9 @@ export function createDefaultSpawner(
 	? ['ignore', logFd, logFd] : ['ignore', logFd, logFd, 'ipc']) as WorkerStdio };
     let child;
     try {
-      child = spawn(plan.command, plan.args, options);
+      child = ownerObserver === undefined || spec.routingHandoff === undefined
+        ? spawn(plan.command, plan.args, options)
+        : spawnObservedRole(ownerObserver, plan.command, plan.args, options);
     } finally {
       // The parent's copy must go once the child has inherited its own dup, and
       // it must go even when `spawn` throws. A long-lived shift that leaked one
@@ -481,6 +508,9 @@ export function createDefaultSpawner(
 	  });
 	} catch { terminal('start-failure'); disconnect(); }
       });
+    }
+    if (ownerObserver !== undefined && spec.routingHandoff !== undefined) {
+      child.once('close', () => closeObservedRole(ownerObserver, child));
     }
     child.unref();
     if (child.pid === undefined) {

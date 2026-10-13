@@ -1,3 +1,4 @@
+import { closeRoutedOwnerRoleObserver, type RoutedOwnerRoleObserver } from '../harness/routed-owner-observer.ts';
 /** Credential-free routed agent composition, still held behind agent-run's
  * top-level startup fence until provider resume/terminal acceptance is proven. */
 import { dirname } from 'node:path';
@@ -45,6 +46,8 @@ export async function prepareRoutedAgentRunner(args: {
   out: (line: string) => void; err: (line: string) => void;
   heartbeatIntervalMs?: number; jumpToleranceMs?: number;
   submitGraceMs?: number; confirmIntervalMs?: number;
+  /** Source-owned private entry only; never read from handoff or environment. */
+  ownerObserver?: RoutedOwnerRoleObserver;
 }): Promise<{ loop: ReturnType<typeof createAgentRunLoop>;
   run(): Promise<AgentRunOutcome> }> {
   const { handoff } = args;
@@ -85,7 +88,8 @@ export async function prepareRoutedAgentRunner(args: {
   const sessionsFile = sessionsPath(resolveCacheDir(publicEnv));
   const adapterGate = createRoutedAgentAdapterGate(adapterFor, registeredHarnessIds);
   const lifecycle = createRoutedAgentLifecycle({ child: client.routed,
-    generation: `${handoff.incarnation}:${handoff.nonce}:${run}`, start: adapterGate.start });
+    generation: `${handoff.incarnation}:${handoff.nonce}:${run}`, start: adapterGate.start,
+    ...(args.ownerObserver === undefined ? {} : { ownerObserver: args.ownerObserver }) });
   const sessionHolder: ContactHolder = { kind: 'session', id: handoff.sessionId,
     shiftId: handoff.shiftId };
   const select = createRoutedAgentSelection({ child: client.routed, sessionHolder,
@@ -146,6 +150,7 @@ export async function prepareRoutedAgentRunner(args: {
       throw refused();
     }
     finally {
+      if (args.ownerObserver !== undefined) closeRoutedOwnerRoleObserver(args.ownerObserver);
       restore();
       // Unknown mutation or group state keeps the holder/cache custody for
       // exact parent recovery; a role exit is not a cleanup proof.
@@ -156,6 +161,7 @@ export async function prepareRoutedAgentRunner(args: {
     }
   } };
   } catch {
+    if (args.ownerObserver !== undefined) closeRoutedOwnerRoleObserver(args.ownerObserver);
     holderHandoff?.cleanup();
     await cache.cleanup();
     throw refused();
