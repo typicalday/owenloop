@@ -44,6 +44,9 @@ function load(artifact: string, sha: string): Native {
   need(process.platform === 'linux' && process.versions.node === '22.23.0');
   need(typeof artifact === 'string' && artifact.startsWith('/') && /^[a-f0-9]{64}$/.test(sha));
   let fd: number | undefined;
+  let methods: Native | undefined;
+  let failed = false;
+  let failure: unknown;
   try {
     fd = openSync(artifact, constants.O_RDONLY | constants.O_NOFOLLOW);
     const a = fstatSync(fd, { bigint: true });
@@ -59,19 +62,24 @@ function load(artifact: string, sha: string): Native {
     need(same(a, fstatSync(fd, { bigint: true })) && same(a, lstatSync(artifact, { bigint: true })));
     const module = { exports: {} as object }; process.dlopen(module, `/proc/self/fd/${fd}`);
     need(same(a, fstatSync(fd, { bigint: true })) && same(a, lstatSync(artifact, { bigint: true })));
-    const methods: Record<string, (...args: unknown[]) => unknown> = {};
+    const loaded: Record<string, (...args: unknown[]) => unknown> = {};
     for (const name of ['spawnAndBind','createChannel','inheritedSender','senderFD','attributeOwner',
       'receiveImportedPair','sendBoundOwnerChain','receiveBoundOwnerChain','sampleBoundOwnerChain',
       'close','closeChannel','closeRelay']) {
       const method = data(module.exports, name); need(typeof method === 'function');
-      methods[name] = (...args) => Reflect.apply(method, module.exports, args);
+      loaded[name] = (...args) => Reflect.apply(method, module.exports, args);
     }
-    return Object.freeze(methods);
-  } finally {
-    if (fd !== undefined) try { closeSync(fd); } catch {
-      throw Object.assign(new Error('OWNER_OBSERVER_REFUSED'), { code: 'CLEANUP' });
-    }
+    methods = Object.freeze(loaded);
+  } catch (error) {
+    failed = true; failure = error;
   }
+  // Close the held descriptor once before returning or rethrowing. A close
+  // refusal takes precedence over load failure and cannot be masked by it.
+  if (fd !== undefined) try { closeSync(fd); } catch {
+    throw Object.assign(new Error('OWNER_OBSERVER_REFUSED'), { code: 'CLEANUP' });
+  }
+  if (failed) throw failure;
+  return methods!;
 }
 function capture(native: Native, command: string, args: string[], options: SpawnOptions,
   state: RecordState): ChildProcess {
