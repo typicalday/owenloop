@@ -73,6 +73,169 @@ def inventory_snapshot(d):
     except BaseException:pass
     return None
 
+# Passive stat sizing owns only no-follow directory descriptors/iterators.
+# Its observations never replace the original content selection or predicates.
+SIZING_LIMITS={'entries':32768,'directories':4096,'depth':64,'frontier':65,
+    'pathBytes':4096,'storageBytes':8388608,'workMetadataOps':260000,
+    'metadataOps':262144,'regularFiles':16384,'integer':9007199254740991}
+SIZING_REASONS=frozenset(('NONE','ENTRY_LIMIT','DIRECTORY_LIMIT','DEPTH_LIMIT',
+    'FRONTIER_LIMIT','PATH_LIMIT','STORAGE_LIMIT','METADATA_LIMIT','ROW_LIMIT',
+    'DEADLINE','METADATA_UNCERTAIN','TYPE_OR_IDENTITY_CHANGED','INVALID_SIZE',
+    'SATURATED','INTERNAL_UNKNOWN','CLEANUP_UNCERTAIN'))
+class SizingStop(Exception):pass
+def installed_stat_sizing(project,owner_deadline,budget,interrupted,custody):
+    values={'entries':0,'links':0,'regularFiles':0,'directories':0,
+        'metadataOps':0,'storedPathBytes':0,'storageBytes':262144,
+        'selectedBytes':0,'oversizedFiles':0}
+    start_owner,start_reserve=budget[0],budget[1]
+    deadline=min(owner_deadline,time.monotonic()+5)
+    fds=[];iterators=[];stack=[];seen=set();cleanup_known=True
+    custody['cleanupKnown']=False;custody['resources']=(fds,iterators)
+    uncertain_records=[None]*264;custody['uncertainCloseRecords']=uncertain_records
+    uncertain_count=0
+    state='UNKNOWN';reason='INTERNAL_UNKNOWN'
+    def stop(code):raise SizingStop(code)
+    def check():
+        if interrupted[0] or time.monotonic()>=deadline:stop('DEADLINE')
+    def op(call):
+        check()
+        if values['metadataOps']>=SIZING_LIMITS['workMetadataOps']:stop('METADATA_LIMIT')
+        values['metadataOps']+=1
+        return call()
+    def path_storage(parent,name):
+        # Bound characters before allocating the combined encoded path.
+        if type(name) is not str or name in ('','.','..') or '/' in name:stop('METADATA_UNCERTAIN')
+        if len(parent)+len(name)+1>SIZING_LIMITS['pathBytes']:stop('PATH_LIMIT')
+        rel=parent+'/'+name if parent else name
+        n=len(os.fsencode(rel))
+        if n>SIZING_LIMITS['pathBytes']:stop('PATH_LIMIT')
+        # Logical diagnostic accounting, not allocator/RSS certification.
+        charge=1024+4*n
+        if values['storageBytes']+charge>SIZING_LIMITS['storageBytes']:stop('STORAGE_LIMIT')
+        values['storageBytes']+=charge;values['storedPathBytes']+=n
+        return rel
+    def acquire_fd(call):
+        record=[None,False];fds.append(record)
+        record[0]=op(call);return record[0]
+    def acquire_iterator(call):
+        record=[None,False];iterators.append(record)
+        record[0]=op(call);return record[0]
+    def uncertain(record):
+        nonlocal cleanup_known,uncertain_count
+        cleanup_known=False;custody['cleanupKnown']=False
+        uncertain_records[uncertain_count]=record;uncertain_count+=1
+    def close_resource(record,kind):
+        nonlocal cleanup_known
+        if record[0] is None or record[1]:return cleanup_known
+        try:values['metadataOps']+=1
+        except BaseException:uncertain(record)
+        # Own fixed list data, not caller objects; retain the record and mark a
+        # single attempted close before invoking the syscall/iterator closer.
+        record[1]=True
+        try:
+            if kind=='FD':os.close(record[0])
+            else:record[0].close()
+        except BaseException:uncertain(record)
+        return cleanup_known
+    def enter(parent_fd,name,rel,depth,expected):
+        if depth>SIZING_LIMITS['depth']:stop('DEPTH_LIMIT')
+        if len(stack)>=SIZING_LIMITS['frontier']:stop('FRONTIER_LIMIT')
+        if len(seen)>=SIZING_LIMITS['directories']:stop('DIRECTORY_LIMIT')
+        fd=acquire_fd(lambda:os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd))
+        actual=op(lambda:os.fstat(fd))
+        if not stat.S_ISDIR(actual.st_mode) or shape(actual)!=shape(expected):stop('TYPE_OR_IDENTITY_CHANGED')
+        ident=(actual.st_dev,actual.st_ino)
+        if ident in seen:stop('TYPE_OR_IDENTITY_CHANGED')
+        seen.add(ident);values['directories']+=1
+        it=acquire_iterator(lambda:os.scandir(fd))
+        stack.append((fd,it,actual,rel,depth,fds[-1],iterators[-1]))
+    try:
+        # The project is a freshly created private source-owned directory.
+        projectfd=acquire_fd(lambda:os.open(project,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC))
+        project_stat=op(lambda:os.fstat(projectfd))
+        if not stat.S_ISDIR(project_stat.st_mode):stop('TYPE_OR_IDENTITY_CHANGED')
+        root_stat=op(lambda:os.stat('node_modules',dir_fd=projectfd,follow_symlinks=False))
+        enter(projectfd,'node_modules','node_modules',0,root_stat)
+        while stack:
+            fd,it,before,parent,depth,fd_record,it_record=stack[-1]
+            # One bounded nonrecursive iterator step. No rglob-internal descent.
+            try:entry=op(lambda:next(it))
+            except StopIteration:
+                after=op(lambda:os.fstat(fd))
+                if shape(before)!=shape(after):stop('TYPE_OR_IDENTITY_CHANGED')
+                ok_iterator=close_resource(it_record,'ITERATOR');ok_fd=close_resource(fd_record,'FD')
+                iterators.remove(it_record);fds.remove(fd_record);stack.pop()
+                if not ok_iterator or not ok_fd:stop('CLEANUP_UNCERTAIN')
+                continue
+            if values['entries']>=SIZING_LIMITS['entries']:stop('ENTRY_LIMIT')
+            values['entries']+=1
+            name=entry.name;rel=path_storage(parent,name)
+            first=op(lambda:os.stat(name,dir_fd=fd,follow_symlinks=False))
+            if stat.S_ISLNK(first.st_mode):values['links']+=1;continue
+            second=op(lambda:os.stat(name,dir_fd=fd,follow_symlinks=False))
+            if shape(first)!=shape(second):stop('TYPE_OR_IDENTITY_CHANGED')
+            if stat.S_ISDIR(first.st_mode):
+                enter(fd,name,rel,depth+1,second)
+            elif stat.S_ISREG(first.st_mode):
+                if values['regularFiles']>=SIZING_LIMITS['regularFiles']:stop('ROW_LIMIT')
+                size=first.st_size
+                if type(size) is not int or size<0:stop('INVALID_SIZE')
+                if size>SIZING_LIMITS['integer'] or values['selectedBytes']+size>SIZING_LIMITS['integer']:stop('SATURATED')
+                values['regularFiles']+=1
+                values['selectedBytes']+=size
+                if size>512*1024*1024:values['oversizedFiles']+=1
+        # Anonymous sums need no leaf rows, sort keys or diagnostic sorting.
+        # The original sorted content walk still executes independently.
+        check()
+        if shape(project_stat)!=shape(op(lambda:os.fstat(projectfd))):stop('TYPE_OR_IDENTITY_CHANGED')
+        state='SIZED_SNAPSHOT';reason='NONE'
+    except SizingStop as error:
+        args=BaseException.args.__get__(error)
+        reason=args[0] if len(args)==1 and args[0] in SIZING_REASONS else 'INTERNAL_UNKNOWN'
+    except BaseException:reason='METADATA_UNCERTAIN'
+    finally:
+        # Reserve2044 operation credits for <=66 FDs and65 iterators. Attempt
+        # every known resource once even after the deadline or an earlier close.
+        while iterators:
+            close_resource(iterators[-1],'ITERATOR');iterators.pop()
+        while fds:
+            close_resource(fds[-1],'FD');fds.pop()
+        custody['cleanupKnown']=cleanup_known
+        if not cleanup_known:state='UNKNOWN';reason='CLEANUP_UNCERTAIN'
+    result={'protocol':'jev-installed-stat-sizing-v1','observationState':state,
+        'reason':reason,**values,'ownerBytesAtStart':start_owner,
+        'reserveBytesAtStart':start_reserve,'projectedInventoryTotal':None,
+        'exceedsCurrentCap':None,'correspondence':'NOT_CHECKED',
+        'linkContainment':'UNCHECKED_BY_SIZING','cleanupKnown':cleanup_known,
+        'fullFitProved':False}
+    if state=='SIZED_SNAPSHOT':
+        total=start_owner+start_reserve+values['selectedBytes']
+        if total<=SIZING_LIMITS['integer']:
+            result['projectedInventoryTotal']=total;result['exceedsCurrentCap']=total>HASH_TOTAL
+        else:result['observationState']='UNKNOWN';result['reason']='SATURATED'
+    return result,cleanup_known
+def sizing_snapshot(d):
+    # Only internal owned dict primitives; malformed/serializer failures do not
+    # replace the original exception or export paths, exception args or objects.
+    try:
+        names=['protocol','observationState','reason','entries','links','regularFiles',
+            'directories','metadataOps','storedPathBytes','storageBytes','selectedBytes',
+            'oversizedFiles','ownerBytesAtStart','reserveBytesAtStart',
+            'projectedInventoryTotal','exceedsCurrentCap','correspondence',
+            'linkContainment','cleanupKnown','fullFitProved']
+        if type(d) is not dict or set(d)!=set(names):return None
+        if d['protocol']!='jev-installed-stat-sizing-v1' or d['observationState'] not in ('SIZED_SNAPSHOT','UNKNOWN'):return None
+        if d['reason'] not in SIZING_REASONS or d['correspondence']!='NOT_CHECKED' or d['linkContainment']!='UNCHECKED_BY_SIZING' or d['fullFitProved'] is not False:return None
+        for key in names[3:14]:
+            if type(d[key]) is not int or not 0<=d[key]<=SIZING_LIMITS['integer']:return None
+        if d['projectedInventoryTotal'] is not None and (type(d['projectedInventoryTotal']) is not int or not 0<=d['projectedInventoryTotal']<=SIZING_LIMITS['integer']):return None
+        if d['exceedsCurrentCap'] is not None and type(d['exceedsCurrentCap']) is not bool:return None
+        if type(d['cleanupKnown']) is not bool:return None
+        raw=(json.dumps(d,separators=(',',':'))+'\n').encode('ascii')
+        if len(raw)<=1024:return d.copy()
+    except BaseException:pass
+    return None
+
 def need(v):
     if not v:raise RuntimeError('PRODUCTION_OWNER_REFUSED')
 def shape(s):
@@ -155,7 +318,7 @@ def canonical_fixture(raw,code,err):
 def main(admission_path):
     os.umask(0o077)
     need(sys.platform=='linux' and all(hasattr(os,k) for k in ['waitid','WNOWAIT','WEXITED','WNOHANG','P_PID']))
-    result=None;inventory_diagnostic=None
+    result=None;inventory_diagnostic=None;sizing_observation=None;sizing_custody={'cleanupKnown':False}
     try:inventory_diagnostic={'step':'UNKNOWN','errorCategory':'UNKNOWN','counterState':'KNOWN',**{key:0 for key in INVENTORY_COUNTER_CAPS}}
     except BaseException:pass
     root=Path(__file__).resolve().parent;deadline=time.monotonic()+TOTAL_SECONDS;budget=[0,0];held=[];receipts=[];stage='ADMISSION';out=None;active=None;interrupted=[False]
@@ -321,6 +484,12 @@ def main(admission_path):
         nr,ne,nc=original('node-dependencies',[tool_paths['node'],tool_paths['npmCli'],'--prefix',str(project),'ci','--ignore-scripts','--no-audit','--no-fund'],90,child_env=npm_env,tool='node')
         need(nc==0)
         stage='DEPENDENCY_INVENTORY'
+        # Passive metadata snapshot; no content predicate or budget is replaced.
+        try:sizing_observation,_=installed_stat_sizing(project,deadline,budget,interrupted,sizing_custody)
+        except BaseException:sizing_observation=None
+        # Added diagnostic descriptor ownership: uncertainty retains the exact
+        # registered records and uses existing nonterminal custody hold.
+        if sizing_custody['cleanupKnown'] is not True:hold_without_authority()
         module_rows=[];dependency_rows=[];dependency_stats=[];module_paths=set()
         inventory_mark(inventory_diagnostic,'ENUMERATE',budget)
         for path in sorted((project/'node_modules').rglob('*')):
@@ -479,7 +648,7 @@ def main(admission_path):
         need(not interrupted[0] and time.monotonic()<deadline and budget[0]+child_hash_bound<=HASH_TOTAL and [r['slot'] for r in receipts]==SLOTS and all(r['directOriginalTerminal'] is True and r['directOriginalReaped'] is True and r['exitCode']==0 and r['signalsSent']==0 and not r['streamTruncated'] and r['ownedPipesEOF'] is True for r in receipts))
         stage='CLEANUP';need(close_inputs())
         stage='RESULT_RETENTION'
-        summary={'protocol':'jev-production-owner-qualification-result-v1','status':'SUPPORTED' if code==0 else 'UNSUPPORTED','stage':stage,'fixture':result,'originals':receipts,'sourceManifestSha256':m_pin['sha256'],'sourcePins':source_pins,'context':ctx,'tools':tools,'headers':header_result,'selectedDependencyCount':len(dependencies),'selectedDependenciesSha256':hashlib.sha256(json.dumps(dependencies,separators=(',',':')).encode()).hexdigest(),'artifact':artifact_pin,'libcContract':libc_pin,'ownMetadata':own,'ownMetadataPin':own_pin,'hashBudget':{'ownerSelectedBytes':budget[0],'fixtureAdditionalBoundBytes':child_hash_bound,'nodeInitializers':5,'compilerHookInitializers':1,'maximumConcurrentNodeProcesses':4,'addonHashPasses':3,'perInitializerLoadedModuleCapBytes':33554432,'totalCapBytes':HASH_TOTAL},'currentSourceComposition':source_pins['source-composition.json'],'trackedCompileInputCount':len(source_observations),'dependencyInventorySha256':hashlib.sha256(json.dumps(dependency_rows,separators=(',',':')).encode()).hexdigest(),'emittedBeforeDeclaration':emitted_pin,'runtimeModuleClosure':final_runtime_pin,'privateBinding':binding_pin,'privateBuildDeclaration':declaration_pin,'ordinaryCompilationCompleted':True,'inputFDsClosed':True,'deadlineReached':False,'interrupted':False,'platformRuntimeTrustRequired':True,'compilerDistributionQualified':False,'globalGroupAbsenceClaimed':False,'providerAccessQualified':False,'recoveryAccepted':False}
+        summary={'installedSizing':sizing_snapshot(sizing_observation),'protocol':'jev-production-owner-qualification-result-v1','status':'SUPPORTED' if code==0 else 'UNSUPPORTED','stage':stage,'fixture':result,'originals':receipts,'sourceManifestSha256':m_pin['sha256'],'sourcePins':source_pins,'context':ctx,'tools':tools,'headers':header_result,'selectedDependencyCount':len(dependencies),'selectedDependenciesSha256':hashlib.sha256(json.dumps(dependencies,separators=(',',':')).encode()).hexdigest(),'artifact':artifact_pin,'libcContract':libc_pin,'ownMetadata':own,'ownMetadataPin':own_pin,'hashBudget':{'ownerSelectedBytes':budget[0],'fixtureAdditionalBoundBytes':child_hash_bound,'nodeInitializers':5,'compilerHookInitializers':1,'maximumConcurrentNodeProcesses':4,'addonHashPasses':3,'perInitializerLoadedModuleCapBytes':33554432,'totalCapBytes':HASH_TOTAL},'currentSourceComposition':source_pins['source-composition.json'],'trackedCompileInputCount':len(source_observations),'dependencyInventorySha256':hashlib.sha256(json.dumps(dependency_rows,separators=(',',':')).encode()).hexdigest(),'emittedBeforeDeclaration':emitted_pin,'runtimeModuleClosure':final_runtime_pin,'privateBinding':binding_pin,'privateBuildDeclaration':declaration_pin,'ordinaryCompilationCompleted':True,'inputFDsClosed':True,'deadlineReached':False,'interrupted':False,'platformRuntimeTrustRequired':True,'compilerDistributionQualified':False,'globalGroupAbsenceClaimed':False,'providerAccessQualified':False,'recoveryAccepted':False}
         # Private raw streams and dependency paths never enter the result.
         save(out/'dependency-closure.private.json',{'paths':[str(p) for p in dependency_paths],'pins':dependencies})
         save(out/'result.json',summary)
@@ -491,7 +660,7 @@ def main(admission_path):
         if active:hold_without_authority()
         if not close_inputs():stage='CLEANUP'
         if out:
-            try:save(out/'result.json',{'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'inventoryDiagnostic':inventory_snapshot(inventory_diagnostic) if inventory_failed else None})
+            try:save(out/'result.json',{'installedSizing':sizing_snapshot(sizing_observation),'protocol':'jev-production-owner-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False,'fixtureDiagnostic':None if result is None else {k:result[k] for k in ['status','stage','code','cleanupKnown','roleTerminalObserved']},'inventoryDiagnostic':inventory_snapshot(inventory_diagnostic) if inventory_failed else None})
             except BaseException:pass
         print('JEV_PRODUCTION_OWNER_REFUSED',file=sys.stderr);return 2
     finally:
