@@ -1260,7 +1260,7 @@ test('put_file_artifact refuses once the hold is terminal', async () => {
 
 // Hermetic input-boundary tests, not deployed workflow acceptance evidence.
 function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supplied?: boolean;
-  workdir?: string; canonicalChild?: boolean } = {}) {
+  workdir?: string; canonicalChild?: boolean; admissionNow?: () => number } = {}) {
   const definition = buildDef({ name: 'optional-input-holder',
     inputs: [{ name: 'optional', seedOwed: cfg.required ?? false }],
     steps: [{ name: 'planner', consumes: ['optional'], produces: ['plan'] }] });
@@ -1280,6 +1280,7 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
   let unavailable = false;
   let serviceRefused = false;
   const trustedInputV2 = createTrustedInputV2Admission({ expected: { workflow: 'wf1', run: 'run1' },
+    ...(cfg.admissionNow ? { now: cfg.admissionNow, elapsedNow: () => 10 } : {}),
     reader: { async read() {
       reads++;
       if (unavailable) throw new Error('offline');
@@ -1653,6 +1654,30 @@ test('zero-input routing appearing at final submit read fences the write and lat
   const removed = await tool(f.mount.tools, 'get_order').handler({}, ctx);
   assert.equal(removed.isError, true);
   assert.match(parse(removed).error, /reference-v2-unavailable/);
+  assert.equal(f.mount.readGatedOrder(), undefined);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+// Injected local clocks exercise admission expiry, not native clock-fault proof.
+test('ordinary holder refuses wall-expired admission before exposing an input order', async () => {
+  let samples = 0;
+  const f = optionalInputHolder({ admissionNow: () => ++samples === 1 ? 1_000 : 6_000 });
+  const result = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, true);
+  assert.match(parse(result).error, /observation-expired/);
+  assert.equal(f.mount.readGatedOrder(), undefined);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+test('ordinary holder fences wall expiry during the final observation after signing', async () => {
+  let samples = 0;
+  const f = optionalInputHolder({ admissionNow: () => ++samples < 6 ? 1_000 : 6_000 });
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const result = await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx);
+  assert.equal(result.isError, true);
+  assert.match(parse(result).error, /observation-expired/);
+  assert.equal(samples, 6, 'initial, pre-sign and final observations sampled');
+  assert.equal(f.reads(), 3);
   assert.equal(f.mount.readGatedOrder(), undefined);
   assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
 });

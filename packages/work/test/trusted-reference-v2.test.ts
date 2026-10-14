@@ -376,3 +376,30 @@ for (const phase of ['before-post', 'after-post', 'frozen-wall'] as const) {
     }
   });
 }
+
+test('v2 admission refuses its wall deadline after local verification even with unchanged elapsed time', async () => {
+  const direct = available();
+  const local = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+    reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  for (const delta of [4_999, 5_000, 5_001]) {
+    let wall = 1_000;
+    const admission = createTrustedInputV2Admission({ expected,
+      reader: { read: async () => direct }, now: () => wall, elapsedNow: () => 10,
+      instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+	resolveStep: async () => ({ ok: true, step: local }),
+	resolveHostedStep: async () => ({ ok: true, step: local,
+	  declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+      consumedVerifier: async (order, options) => {
+	assert.equal(options.hardRule, true);
+	wall += delta;
+	return { ok: true, order, warnings: [] };
+      } });
+    const result = await admission.observe(privateOrder);
+    if (delta < 5_000) {
+      assert.equal(result.ok, true);
+      if (result.ok) assert.ok(result.expiresAt > wall);
+    } else assert.deepEqual(result, { ok: false, reason: 'observation-expired' });
+  }
+});

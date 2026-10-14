@@ -130,7 +130,11 @@ export function createTrustedInputV2Admission(args: {
     const finished = now();
     const finishedElapsed = elapsedNow();
     const elapsed = finishedElapsed - startedElapsed;
+    // Local publication and producer verification follow the Service read.
+    // Their result must still be inside both clocks' original budget; a
+    // forward wall jump cannot return an already-expired admission to MCP.
     if (!Number.isSafeInteger(finished) || finished < started
+      || finished - started >= MAX_OBSERVATION_MS
       || !Number.isFinite(startedElapsed) || !Number.isFinite(finishedElapsed)
       || !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= MAX_OBSERVATION_MS) {
       return refused('observation-expired');
