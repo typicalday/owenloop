@@ -419,7 +419,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     let modelResolver = deps.modelInstructionResolver;
     const consumedVerifier = createConsumedVerifier({ env, now: () => Date.now() });
     // Build the Service reader lazily for all declared input paths, whether
-    // supplied or absent. Zero-input static orders retain their compatibility.
+    // supplied or absent, and unsupported feedback. Empty zero-input static
+    // orders retain their compatibility; producer proofs are not actor grants.
     let admission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
     const trustedInputV2 = { async observe(order: Parameters<InstructionResolver['resolveStep']>[0]) {
       modelResolver ??= createDefaultStoreInstructionResolver({

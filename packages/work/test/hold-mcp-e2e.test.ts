@@ -276,14 +276,15 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const supplied = mode === 'supplied';
   const workdirInput = mode === 'workdir';
+  const feedback = mode === 'feedback';
   const canonicalWorkflow = mode === 'child' ? 'wf_child' : 'wf1';
   const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
 inputs:
-${workdirInput ? `  - name: config
+${feedback ? '  []' : workdirInput ? `  - name: config
     seedOwed: true` : `
   - name: proposal
     seedOwed: true
@@ -291,7 +292,7 @@ ${workdirInput ? `  - name: config
     seedOwed: ${supplied}`}
 steps:
   - name: planner
-    consumes: ${workdirInput ? '[]\n    workdirFrom: config.path' : '[proposal, optional]'}
+    consumes: ${feedback ? '[]' : workdirInput ? '[]\n    workdirFrom: config.path' : '[proposal, optional]'}
     produces: [plan]
     terminal: true
     body: "Produce plan."
@@ -308,14 +309,14 @@ steps:
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
       '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
     { stdio: 'ignore' });
-    const consumes: Record<string, unknown> = workdirInput ? {}
+    const consumes: Record<string, unknown> = workdirInput || feedback ? {}
       : { proposal: 'a local test proposal', ...(supplied ? { optional: 'supplied required input' } : {}) };
     const packet = { workflow: canonicalWorkflow, run: 'run1', step: 'planner', key: '',
-      defDigest: defInstructionDigest(definition), inputs: workdirInput ? [] : ['proposal', 'optional'], outputs: ['plan'],
+      defDigest: defInstructionDigest(definition), inputs: workdirInput || feedback ? [] : ['proposal', 'optional'], outputs: ['plan'],
       consumes,
-      consumedFingerprint: workdirInput ? {} : { proposal: 1, optional: 1 },
+      consumedFingerprint: workdirInput || feedback ? {} : { proposal: 1, optional: 1 },
       ...(workdirInput ? { workdir: configDir } : {}),
-      owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+      owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: feedback ? 1 : 0, schemaRejects: 0 }] };
     const seen: string[] = [];
     let witnessAvailable = true;
     let witnessWorkflow = canonicalWorkflow;
@@ -329,9 +330,13 @@ steps:
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       if (req.url === '/api/reference_order/v2') {
 	assert.deepEqual(body, { workflow: 'wf1', run: 'run1' });
+	if (feedback) {
+	  res.end(JSON.stringify({ protocol: 'trusted-reference-read-v2', state: 'unsupported-feedback', workflow: 'wf1', run: 'run1' }));
+	  return;
+	}
 	res.end(JSON.stringify(witnessAvailable ? {
 	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: witnessWorkflow, run: 'run1',
-	  order: { ...packet, workflow: witnessWorkflow, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput ? [] : [
+	  order: { ...packet, workflow: witnessWorkflow, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput || feedback ? [] : [
 	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
 	    { path: 'optional', version: 1, present: supplied,
 	      ...(supplied ? { value: packet.consumes.optional } : {}) },
@@ -350,6 +355,18 @@ steps:
       '--heartbeat-interval', '25', '--mcp'], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
     const viewed = await callTool(mcp, 'get_order');
+    if (feedback) {
+      assert.equal(viewed.isError, true, 'normal zero-input holder must refuse unsupported feedback');
+      assert.match(viewed.body.error, /service-unsupported-feedback/);
+      for (const [name, args] of [['submit', { path: 'plan', value: {} }], ['ask', { path: 'plan', question: 'why' }], ['reject', { path: 'plan', text: 'retry' }]] as const) {
+	assert.equal((await callTool(mcp, name, args)).isError, true);
+      }
+      assert.ok(seen.includes('/api/reference_order/v2'));
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
     assert.equal(viewed.isError, false, mcp.stderr());
     assert.equal(viewed.body.order.workflow, canonicalWorkflow);
     assert.deepEqual(viewed.body.order.consumes, packet.consumes);

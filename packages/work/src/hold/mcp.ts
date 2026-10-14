@@ -271,8 +271,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       ? textResult({ error: 'trusted input v2 refusal: no live order' }, true) : undefined;
     // Normal role wiring supplies the independent reader. Input presence must
     // not select the compatibility gate; a v2 holder never falls back later.
-    // Zero-input packets retain the existing static-definition compatibility.
-    v2Required ||= (deps.trustedInputV2 !== undefined && res.order.inputs.length > 0)
+    // Only empty static zero-input packets retain compatibility. Producer
+    // proofs do not authenticate rejecting actors, counters or prior values;
+    // the normal holder must observe Service's unsupported-feedback refusal.
+    const hasFeedback = res.order.owes.some(owed => owed.reasons.length > 0
+      || owed.judgmentRejects !== 0 || owed.schemaRejects !== 0
+      || owed.proof !== undefined || owed.previousValue !== undefined);
+    v2Required ||= (deps.trustedInputV2 !== undefined && (res.order.inputs.length > 0 || hasFeedback))
       || res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path));
     if (!v2Required) {
       if (deps.modelOrderVerifier === undefined) {

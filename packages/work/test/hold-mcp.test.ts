@@ -1557,3 +1557,61 @@ test('a claim changing during submit preparation is refused by the final observa
   assert.equal(submitReads, 2);
   assert.equal(f.calls.some(call => call.verb === 'submit'), false);
 });
+
+// A producer proof is not rejecting-actor or history authority. Normal holders
+// must consult the existing Service refusal even when the step consumes nothing.
+function zeroInputFeedbackHolder() {
+  const response = defaultOrderResponse();
+  response.order = { ...response.order!, inputs: [], consumes: {}, consumedFingerprint: {},
+    owes: [{ path: 'pr', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  let reads = 0;
+  let offline = false;
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, {
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    trustedInputV2: { async observe() {
+      reads++;
+      return { ok: false, reason: offline ? 'reference-v2-unavailable' : 'service-unsupported-feedback' };
+    } },
+  }));
+  return { response, mount, hub, calls, reads: () => reads, offline: () => { offline = true; } };
+}
+
+test('normal zero-input feedback cannot enter the static compatibility path', async () => {
+  for (const field of ['reasons', 'judgmentRejects', 'schemaRejects', 'proof', 'previousValue'] as const) {
+    const f = zeroInputFeedbackHolder();
+    const owed = f.response.order!.owes[0]!;
+    if (field === 'reasons') owed.reasons = [{ text: 'untrusted actor feedback', at: 1,
+      action: 'reject', by: 'unverified-test-actor', kind: 'judgment' }];
+    else if (field === 'proof') owed.proof = 'producer-proof-is-not-actor-authority';
+    else if (field === 'previousValue') owed.previousValue = 'untrusted history';
+    else owed[field] = 1;
+    for (const [name, args] of [['get_order', {}], ['submit', { path: 'pr', value: {} }],
+      ['ask', { path: 'pr', question: 'why' }], ['reject', { path: 'pr', text: 'retry' }]] as const) {
+      const refused = await tool(f.mount.tools, name).handler(args, ctx);
+      assert.equal(refused.isError, true, field + ': ' + name);
+      assert.match(parse(refused).error, /service-unsupported-feedback/);
+      assert.doesNotMatch(JSON.stringify(parse(refused)), /untrusted actor feedback|untrusted history/);
+    }
+    assert.equal(f.reads(), 4);
+    assert.equal(f.mount.readGatedOrder(), undefined);
+    assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+  }
+});
+
+test('zero-input feedback arriving before submit is refused and its required witness stays latched', async () => {
+  const f = zeroInputFeedbackHolder();
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  assert.equal(f.reads(), 0, 'an empty static packet retains compatibility');
+  f.response.order!.owes[0]!.judgmentRejects = 1;
+  const refused = await tool(f.mount.tools, 'submit').handler({ path: 'pr', value: {} }, ctx);
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /service-unsupported-feedback/);
+  f.response.order!.owes[0]!.judgmentRejects = 0;
+  f.offline();
+  const removed = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(removed.isError, true);
+  assert.match(parse(removed).error, /reference-v2-unavailable/);
+  assert.equal(f.mount.readGatedOrder(), undefined);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
