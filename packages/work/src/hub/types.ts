@@ -21,6 +21,8 @@ export interface WhatsNextRequest {
    * matching. An empty array legitimately means the shift serves nothing.
    */
   serve_capabilities: string[];
+  /** Explicit command-only poll, authorized by a separate scoped Hub grant. */
+  serve_commands?: boolean;
 }
 
 /**
@@ -87,6 +89,8 @@ export interface InboxInstance {
  * optional because a single type covers both modes.
  */
 export interface WhatsNextResponse extends HubResponse {
+  /** Feature acknowledgement only; not an execution or integrity proof. */
+  command_lane?: 'grant-v1';
   /** Per-workflow mode: the instance id echoed back. */
   workflow?: string;
   /** Per-workflow mode: the def name (used to locate the cached bundle). */

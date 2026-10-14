@@ -311,3 +311,17 @@ test('presencePing forwards attended_at using the exact snake_case wire field', 
   assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: [], serve_capabilities: [], attended_at: 456789 });
   assert.equal((captured[0]!.body as Record<string, unknown>)['attendedAt'], undefined);
 });
+
+
+test('command-only transport carries opt-in and refuses a legacy or mixed response', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { body: { text: '', command_lane: 'grant-v1', orders: [], instances: [] } }));
+  await c.whatsNext({ serve_capabilities: [], serve_commands: true });
+  await c.wake(3, undefined, true);
+  assert.deepEqual(captured[0]!.body, { serve_capabilities: [], serve_commands: true });
+  assert.equal(captured[1]!.url, 'https://hub.example/api/wake?cursor=3&serve_commands=true');
+  for (const body of [{ text: '', orders: [] }, { text: '', command_lane: 'grant-v1', orders: [{ worker: 'agent' }] }]) {
+    const old = client(fakeFetch([], { body }));
+    await assert.rejects(old.whatsNext({ serve_capabilities: [], serve_commands: true }), /command-only grant lane/);
+  }
+});
