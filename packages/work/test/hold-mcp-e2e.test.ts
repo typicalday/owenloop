@@ -9,7 +9,12 @@
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:https';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -268,3 +273,173 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
     mcp.child.kill('SIGKILL');
   }
 });
+
+// Local signed test publication and loopback TLS only. This verifies the normal
+// production role wiring; it is not hosted Delivery acceptance evidence.
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled'] as const) {
+test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
+  const supplied = mode === 'supplied';
+  const workdirInput = mode === 'workdir';
+  const feedback = mode === 'feedback';
+  const routing = mode === 'routing';
+  const emptyInputs = feedback || routing;
+  const canonicalWorkflow = mode === 'child' ? 'wf_child' : 'wf1';
+  const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
+inputs:
+${emptyInputs ? '  []' : workdirInput ? `  - name: config
+    seedOwed: true` : `
+  - name: proposal
+    seedOwed: true
+  - name: optional
+    seedOwed: ${supplied}`}
+steps:
+  - name: planner
+    consumes: ${emptyInputs ? '[]' : workdirInput ? '[]\n    workdirFrom: config.path' : '[proposal, optional]'}
+    produces: [plan]
+    terminal: true
+    body: "Produce plan."
+` });
+  let server: ReturnType<typeof createServer> | undefined;
+  let mcp: McpChild | undefined;
+  try {
+    const installed = await installSignedBundleFixture({ sourceDir,
+      root: join(configDir, '.owenloop', 'workflows'), home: configDir });
+    const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+    const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name)!;
+    const key = join(configDir, 'tls.key');
+    const cert = join(configDir, 'tls.crt');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+    { stdio: 'ignore' });
+    const consumes: Record<string, unknown> = workdirInput || emptyInputs ? {}
+      : { proposal: 'a local test proposal', ...(supplied ? { optional: 'supplied required input' } : {}) };
+    const packet = { workflow: canonicalWorkflow, run: 'run1', step: 'planner', key: '',
+      defDigest: defInstructionDigest(definition), inputs: workdirInput || emptyInputs ? [] : ['proposal', 'optional'], outputs: ['plan'],
+      consumes,
+      consumedFingerprint: workdirInput || emptyInputs ? {} : { proposal: 1, optional: 1 },
+      ...(workdirInput ? { workdir: configDir } : {}),
+      // Synthetic unsupported sidecar; no native routing authority is claimed.
+      ...(routing ? { routing: {} } : {}),
+      owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: feedback ? 1 : 0, schemaRejects: 0 }] };
+    const seen: string[] = [];
+    let witnessAvailable = true;
+    let witnessWorkflow = canonicalWorkflow;
+    let witnessReads = 0;
+    let firstWitnessEntered!: () => void;
+    let releaseFirstWitness!: () => void;
+    const firstWitnessPaused = new Promise<void>(resolve => { firstWitnessEntered = resolve; });
+    const firstWitnessResume = new Promise<void>(resolve => { releaseFirstWitness = resolve; });
+    server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      seen.push(req.url!);
+      assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      assert.equal(body.workflow, 'wf1');
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      if (req.url === '/api/reference_order/v2') {
+	assert.deepEqual(body, { workflow: 'wf1', run: 'run1' });
+	if (emptyInputs) {
+	  res.end(JSON.stringify({ protocol: 'trusted-reference-read-v2', state: routing ? 'routing-unsupported' : 'unsupported-feedback', workflow: 'wf1', run: 'run1' }));
+	  return;
+	}
+	const availableAtRead = witnessAvailable;
+	if ((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) {
+	  firstWitnessEntered();
+	  await firstWitnessResume;
+	}
+	res.end(JSON.stringify(availableAtRead ? {
+	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: witnessWorkflow, run: 'run1',
+	  order: { ...packet, workflow: witnessWorkflow, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput || emptyInputs ? [] : [
+	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
+	    { path: 'optional', version: 1, present: supplied,
+	      ...(supplied ? { value: packet.consumes.optional } : {}) },
+	  ], ...(workdirInput ? { workdirInput: { stem: 'config', version: 1, value: { path: configDir } } } : {}),
+	  lease: { claimed: true },
+	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
+      } else if (req.url === '/api/get_order') {
+	res.end(JSON.stringify({ text: '', workflow: canonicalWorkflow, run: 'run1', order: packet, lease: { claimed: true } }));
+      } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
+      else res.end(JSON.stringify({ text: '' }));
+    });
+    await new Promise<void>(resolve => server!.listen(0, 'localhost', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
+      '--heartbeat-interval', '25', '--mcp'], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
+    await handshake(mcp);
+    if (mode === 'cancelled') {
+      const requestId = mcp.fireRequest('tools/call', { name: 'ask',
+	arguments: { path: 'plan', question: 'local cancellation boundary test' } });
+      await firstWitnessPaused;
+      mcp.notify('notifications/cancelled', { requestId });
+      await mcp.request('ping'); // The notification has been processed before the witness resumes.
+      releaseFirstWitness();
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      assert.equal(mcp.frames.some(frame => frame.id === requestId), false, 'cancelled response stays suppressed');
+      assert.equal(seen.includes('/api/ask'), false, 'cancelled request must not send a later consequence');
+      assert.equal(seen.includes('/api/submit'), false);
+      return;
+    }
+    if (mode === 'overlap') {
+      const older = callTool(mcp, 'get_order');
+      await firstWitnessPaused;
+      witnessAvailable = false;
+      const newer = await callTool(mcp, 'get_order');
+      assert.equal(newer.isError, true);
+      assert.match(newer.body.error, /service-unavailable/);
+      releaseFirstWitness();
+      const late = await older;
+      assert.equal(late.isError, true, 'delayed old HTTPS response cannot undo newer refusal');
+      assert.match(late.body.error, /superseded.*refusal/);
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    const viewed = await callTool(mcp, 'get_order');
+    if (emptyInputs) {
+      assert.equal(viewed.isError, true, 'normal zero-input holder must refuse unsupported dynamic state');
+      assert.match(viewed.body.error, routing ? /service-routing-unsupported/ : /service-unsupported-feedback/);
+      for (const [name, args] of [['submit', { path: 'plan', value: {} }], ['ask', { path: 'plan', question: 'why' }], ['reject', { path: 'plan', text: 'retry' }]] as const) {
+	assert.equal((await callTool(mcp, name, args)).isError, true);
+      }
+      assert.ok(seen.includes('/api/reference_order/v2'));
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    assert.equal(viewed.isError, false, mcp.stderr());
+    assert.equal(viewed.body.order.workflow, canonicalWorkflow);
+    assert.deepEqual(viewed.body.order.consumes, packet.consumes);
+    if (workdirInput) assert.deepEqual(viewed.body.order.inputWitnesses, []);
+    else assert.equal(viewed.body.order.inputWitnesses.find((w: { path: string }) => w.path === 'optional').present, supplied);
+    assert.ok(seen.includes('/api/reference_order/v2'), 'normal mode must use the independent service witness');
+    if (mode === 'child') {
+      witnessWorkflow = 'wf_changed';
+      const moved = await callTool(mcp, 'get_order');
+      assert.equal(moved.isError, true);
+      const refusedWrite = await callTool(mcp, 'ask', { path: 'plan', question: 'changed child control' });
+      assert.equal(refusedWrite.isError, true);
+      assert.equal(seen.includes('/api/ask'), false);
+      witnessWorkflow = canonicalWorkflow;
+    }
+    witnessAvailable = false;
+    const rejected = workdirInput
+      ? await callTool(mcp, 'ask', { path: 'plan', question: 'local boundary test' })
+      : await callTool(mcp, 'reject', { path: 'proposal', text: 'local boundary test' });
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.body.error, /service-unavailable/);
+    assert.equal(seen.includes('/api/reject'), false);
+    assert.equal(seen.includes('/api/ask'), false);
+    mcp.endStdin();
+    assert.equal(await mcp.exited, 0);
+  } finally {
+    if (mcp?.child.exitCode === null) { mcp.endStdin(); await mcp.exited; }
+    if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+    rmSync(sourceDir, { recursive: true, force: true });
+  }
+});
+}

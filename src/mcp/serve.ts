@@ -588,13 +588,13 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 23 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 25 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 23, plus `createAgentTool`, plus the four crew tools from
+ * set: these 25, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
@@ -617,10 +617,37 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 	      'Raw capability keys this caller serves (bare names and exact compounds). ' +
 	      'Shifts derive them from their effective rosters; other callers normally omit them.',
 	  },
+          serve_commands: { type: 'boolean', description: 'Poll only explicitly granted command steps; grants no agent work or host access.' },
 	},
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/whats_next', body: a })),
+      handler: async (a) => {
+        const commandOnly = a['serve_commands'] === true;
+        const r = await callHub(deps, { method: 'POST', path: '/api/whats_next',
+          body: commandOnly ? { serve_capabilities: [], ...a } : a });
+        if (r.authFailed) return errorText(r.authMessage ?? loginHint(deps.origin));
+        if (commandOnly && isOk(r.status) && (!isObject(r.json)
+          || r.json['command_lane'] !== 'grant-v1'
+          || (r.json['orders'] !== undefined && (!Array.isArray(r.json['orders'])
+            || r.json['orders'].some(order => !isObject(order) || order['worker'] !== 'command'))))) {
+          return errorText('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
+        }
+        return toolResultFromRest(r);
+      },
+    },
+    {
+      name: 'grant_command_lane',
+      description: 'Admin-only. Grant an active principal one pinned command step in one live workflow until expiresAt. Grants no agent work, host access or credentials. Cancellation cleanup needs a separate grant after cancellation starts.',
+      inputSchema: { type: 'object', properties: {
+        principalKind: { type: 'string', enum: ['member', 'agent'] }, principalId: { type: 'string' },
+        workflow: { type: 'string' }, step: { type: 'string' }, expiresAt: { type: 'integer', minimum: 0 },
+      }, required: ['principalKind', 'principalId', 'workflow', 'step', 'expiresAt'], additionalProperties: false },
+      handler: passthrough(deps, a => ({ method: 'POST', path: '/api/grant_command_lane', body: a })),
+    },
+    {
+      name: 'revoke_command_lane', description: 'Admin-only. Immediately revoke a command grant, including its held claims. A replacement cannot revive an old claim.',
+      inputSchema: { type: 'object', properties: { grantId: { type: 'string' } }, required: ['grantId'], additionalProperties: false },
+      handler: passthrough(deps, a => ({ method: 'POST', path: '/api/revoke_command_lane', body: a })),
     },
     {
       name: 'pending_gates',
@@ -946,12 +973,14 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 		'The cheap place to park between changes: a polling pre-check returning only { cursor, changed }. Keep the returned cursor and pass it next time; call whats_next ONLY when changed is true. Omit cursor to bootstrap. It is not a substitute for whats_next — it never returns work orders, only whether to ask.',
       inputSchema: {
         type: 'object',
-        properties: { cursor: { type: 'integer', minimum: 0 } },
+        properties: { cursor: { type: 'integer', minimum: 0 }, serve_commands: { type: 'boolean' } },
         additionalProperties: false,
       },
       handler: passthrough(deps, (a) => {
         const cursor = a['cursor'];
-        const query = typeof cursor === 'number' ? `?cursor=${encodeURIComponent(String(cursor))}` : undefined;
+        const parts = typeof cursor === 'number' ? [`cursor=${encodeURIComponent(String(cursor))}`] : [];
+        if (a['serve_commands'] === true) parts.push('serve_commands=true');
+        const query = parts.length ? `?${parts.join('&')}` : undefined;
         return { method: 'GET', path: '/api/wake', query };
       }),
     },

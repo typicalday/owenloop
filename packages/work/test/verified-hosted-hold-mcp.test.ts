@@ -674,3 +674,103 @@ test('an older v1 read cannot reconcile a newer ambiguous submit', async () => {
   assert.equal(third.isError, undefined, third.content[0]?.text);
   assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1, 2, 3]);
 });
+
+
+test('a newer independent refusal fences an older verified holder read', async () => {
+  let release!: (result: HostedOrderResult) => void;
+  let started!: () => void;
+  const pending = new Promise<HostedOrderResult>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { started = resolve; });
+  let opens = 0;
+  const f = fixture(false, { open: async () => {
+    opens++;
+    if (opens === 1) { started(); return pending; }
+    if (opens === 2) return { protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable' };
+    return ready();
+  } });
+  const older = f.call();
+  await waiting;
+  const newer = await f.call();
+  assert.equal(newer.isError, true);
+  assert.match(newer.content[0]!.text, /reference-read-unavailable/);
+  release(ready());
+  const stale = await older;
+  assert.equal(stale.isError, true, stale.content[0]?.text);
+  assert.match(stale.content[0]!.text, /observation-superseded/);
+  assert.doesNotMatch(stale.content[0]!.text, /VERIFIED INSTRUCTION/);
+  const fresh = await f.call();
+  assert.equal(fresh.isError, undefined, fresh.content[0]?.text);
+});
+
+test('a newer independent refusal fences a verified submit waiting for its read', async () => {
+  let release!: (result: HostedOrderResult) => void;
+  let started!: () => void;
+  const pending = new Promise<HostedOrderResult>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { started = resolve; });
+  let opens = 0;
+  const f = fixture(true, { open: async () => {
+    opens++;
+    if (opens === 1) { started(); return pending; }
+    return { protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable' };
+  } });
+  const older = f.submit({ path: 'out', value: { n: 1 } });
+  await waiting;
+  assert.equal((await f.call()).isError, true);
+  release(ready());
+  const stale = await older;
+  assert.equal(stale.isError, true, stale.content[0]?.text);
+  assert.match(stale.content[0]!.text, /observation-superseded/);
+  assert.equal(f.calls.includes('sign'), false);
+  assert.deepEqual(f.submits, []);
+});
+
+test('a newer independent refusal fences a verified submit after proof signing', async () => {
+  let release!: (proof: string) => void;
+  let started!: () => void;
+  const pending = new Promise<string>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { started = resolve; });
+  let opens = 0;
+  const f = fixture(true, {
+    open: async () => ++opens === 1 ? ready()
+      : { protocol: 'local-hosted-order-v1', state: 'refused', code: 'unsupported-feedback' },
+    sign: async () => { started(); return pending; },
+  });
+  const older = f.submit({ path: 'out', value: { n: 1 } });
+  await waiting;
+  const newer = await f.call();
+  assert.equal(newer.isError, true);
+  assert.match(newer.content[0]!.text, /unsupported-feedback/);
+  release('SIGNED PROOF');
+  const stale = await older;
+  assert.equal(stale.isError, true, stale.content[0]?.text);
+  assert.match(stale.content[0]!.text, /observation-superseded/);
+  assert.deepEqual(f.submits, []);
+});
+
+
+test('healthy overlapping verified reads and a cancelled sibling preserve fresh verification', async () => {
+  for (const cancelOlder of [false, true]) {
+    let release!: (result: HostedOrderResult) => void;
+    let started!: () => void;
+    const pending = new Promise<HostedOrderResult>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    let opens = 0;
+    let cancelled = false;
+    const callContext: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: () => {}, sendProgress: () => {} };
+    const f = fixture(false, { open: async () => {
+      if (++opens === 1) { started(); return pending; }
+      return ready();
+    } });
+    const older = f.wrapped.tools[0]!.handler({}, callContext);
+    await waiting;
+    cancelled = cancelOlder;
+    const fresh = await f.call();
+    assert.equal(fresh.isError, undefined, fresh.content[0]?.text);
+    release(ready());
+    const completed = await older;
+    assert.equal(completed.isError, cancelOlder ? true : undefined, completed.content[0]?.text);
+    if (cancelOlder) assert.match(completed.content[0]!.text, /call-cancelled/);
+    const later = await f.call();
+    assert.equal(later.isError, undefined, later.content[0]?.text);
+  }
+});

@@ -264,6 +264,7 @@ const NO_OP_SCHEMAS: Readonly<Record<FixtureNoOpToolName, Record<string, unknown
   whats_next: {
     type: 'object',
     properties: {
+      serve_commands: { type: 'boolean', description: 'Poll only explicitly granted command steps; grants no agent work or host access.' },
       workflow: { type: 'string' },
       serve_crews: { type: 'array', items: { type: 'string' } },
       serve_capabilities: {
@@ -317,7 +318,7 @@ const NO_OP_SCHEMAS: Readonly<Record<FixtureNoOpToolName, Record<string, unknown
   },
   wake: {
     type: 'object',
-    properties: { cursor: { type: 'integer', minimum: 0 } },
+    properties: { cursor: { type: 'integer', minimum: 0 }, serve_commands: { type: 'boolean' } },
     additionalProperties: false,
   },
 };

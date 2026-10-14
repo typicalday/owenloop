@@ -7,7 +7,7 @@
  * `realHttpServer` — no ambient network, no real keychain.
  *
  * The load-bearing assertions:
- *   - the handshake advertises the 28 baseline+create_agent+crew tools;
+ *   - the handshake advertises the 30 baseline+create_agent+crew tools;
  *     `stage_enrollment` is gated (Decision 7);
  *   - a `tools/call` becomes ONE authenticated `/api/*` request and the REST
  *     reply maps to a tool result (2xx → body, non-2xx → isError);
@@ -131,7 +131,7 @@ function resultJson(frame: Frame): unknown {
 
 // ---- handshake + tool advertising -------------------------------------------
 
-test('mcp: handshake advertises 28 tools (23 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
+test('mcp: handshake advertises 30 tools (25 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
   // Probe hits POST /api/stage_enrollment → 404 (route unregistered) → hidden.
   const routes: Record<string, RouteHandler> = { 'POST /api/stage_enrollment': () => ({ status: 404, json: { error: 'not_found' } }) };
   const { fetch } = routedFetch(routes);
@@ -144,11 +144,11 @@ test('mcp: handshake advertises 28 tools (23 baseline + create_agent + 4 crew to
   assert.notEqual(serverInfo.version, '0.0.1');
   assert.equal(serverInfo.version, PACKAGE_VERSION);
   const names = frames[1]!.result!.tools!.map((x) => x.name);
-  assert.equal(names.length, 28, names.join(','));
+  assert.equal(names.length, 30, names.join(','));
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
-  // Sanity: the 23 baseline names are all present.
-  for (const n of ['whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'search_workflows', 'delete_workflow', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
+  // Sanity: the 25 baseline names are all present.
+  for (const n of ['grant_command_lane', 'revoke_command_lane', 'whats_next', 'pending_gates', 'submit', 'reject_artifact', 'retry_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'search_workflows', 'delete_workflow', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
   // The four crew tools are all present.
@@ -1522,5 +1522,33 @@ test('mcp: end-to-end over a real loopback server — handshake, then a tool cal
     assert.equal(whats[0]!.authorization, 'Bearer mcpat_human');
   } finally {
     await server.close();
+  }
+});
+
+
+test('mcp: command-only polls require the Hub acknowledgement and preserve explicit grants', async () => {
+  for (const body of [
+    { orders: [] },
+    { command_lane: 'grant-v1', orders: [{ worker: 'agent' }] },
+    { command_lane: 'grant-v1', orders: [{ worker: 'command' }] },
+  ]) {
+    const { fetch, calls } = routedFetch({
+      'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+      'POST /api/whats_next': () => ({ status: 200, json: body }),
+      'POST /api/grant_command_lane': () => ({ status: 200, json: { grant: { id: 'g1' } } }),
+      'POST /api/revoke_command_lane': () => ({ status: 200, json: { revoked: true } }),
+    });
+    const t = makeIo({ fetch }); seedHuman(t);
+    const grant = { principalKind: 'agent', principalId: 'a1', workflow: 'wf', step: 'build', expiresAt: 123456 };
+    const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT,
+      call(3, 'whats_next', { workflow: 'wf', serve_commands: true }),
+      call(4, 'grant_command_lane', grant), call(5, 'revoke_command_lane', { grantId: 'g1' }),
+    ]);
+    const reply = frames.find(frame => frame.id === 3)!;
+    assert.equal(reply.result!.isError === true, body.orders[0]?.worker !== 'command');
+    assert.deepEqual(JSON.parse(calls.find(c => c.pathname === '/api/whats_next')!.body!),
+      { serve_capabilities: [], workflow: 'wf', serve_commands: true });
+    assert.deepEqual(JSON.parse(calls.find(c => c.pathname === '/api/grant_command_lane')!.body!), grant);
+    assert.deepEqual(JSON.parse(calls.find(c => c.pathname === '/api/revoke_command_lane')!.body!), { grantId: 'g1' });
   }
 });

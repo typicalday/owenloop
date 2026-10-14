@@ -4460,3 +4460,22 @@ test('#300: the heartbeat fires on its own cadence, never under `once`, and is f
   assert.equal(reachesSocketConsumer('heartbeat'), false);
   assert.equal(reachesSocketConsumer('stalled'), true);
 });
+
+
+test('command-only Shift carries opt-in through wake, inbox and targeted polls', async () => {
+  const { hub } = mockHub({});
+  const polls: unknown[] = [];
+  const modes: Array<boolean | undefined> = [];
+  hub.whatsNext = async req => {
+    polls.push(req);
+    return req.workflow ? { text: '', command_lane: 'grant-v1', orders: [] }
+      : { text: '', command_lane: 'grant-v1', instances: [{ workflow: 'wf1', def: 'demo', done: false, eligible: 1, blocked: 0, owedSeededInputs: [] }] };
+  };
+  hub.wake = async (_cursor, _signal, mode) => { modes.push(mode); return { text: '', cursor: 1, changed: true }; };
+  const { spawner, spawns } = fakeSpawner();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, serveCommands: true })).run();
+  assert.deepEqual(modes, [true]);
+  assert.equal(polls.length, 2);
+  for (const req of polls) assert.equal((req as { serve_commands?: boolean }).serve_commands, true);
+  assert.equal(spawns.length, 0);
+});

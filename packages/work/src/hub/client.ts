@@ -128,7 +128,7 @@ export interface HubClient {
   /** Read the hub's known harness/model registry. */
   listHarnessModels?(): Promise<ListHarnessModelsResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
-  wake(cursor?: number, signal?: AbortSignal): Promise<WakeResponse>;
+  wake(cursor?: number, signal?: AbortSignal, serveCommands?: boolean): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
   presencePing(req: PresencePingRequest, signal?: AbortSignal): Promise<PresencePingResponse>;
   /**
@@ -221,7 +221,13 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   return {
-    whatsNext: (req, signal) => post<WhatsNextResponse>('whats_next', req, signal),
+    whatsNext: async (req, signal) => {
+      const result = await post<WhatsNextResponse>('whats_next', req, signal);
+      if (req.serve_commands && (result.command_lane !== 'grant-v1' || result.orders?.some(order => order.worker !== 'command'))) {
+        throw new Error('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
+      }
+      return result;
+    },
     getOrder: (req) => post<GetOrderResponse>('get_order', req),
     getReferenceOrder: (req) => post<unknown>('reference_order/v1', req),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
@@ -240,8 +246,11 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).
-    wake: (cursor, signal) =>
-      get<WakeResponse>('wake', typeof cursor === 'number' ? `cursor=${encodeURIComponent(String(cursor))}` : undefined, signal),
+    wake: (cursor, signal, serveCommands = false) => {
+      const parts = typeof cursor === 'number' ? [`cursor=${encodeURIComponent(String(cursor))}`] : [];
+      if (serveCommands) parts.push('serve_commands=true');
+      return get<WakeResponse>('wake', parts.length ? parts.join('&') : undefined, signal);
+    },
     presencePing: (req, signal) => post<PresencePingResponse>('presence_ping', req, signal),
     putFileArtifact: (req) => postBytes<PutFileArtifactResponse>('/api/file-artifacts', req),
   };
