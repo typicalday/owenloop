@@ -333,3 +333,46 @@ test('a real capability claim remains unsupported until Service v2 witnesses the
       { ok: false, reason: 'private-order-v2-mismatch' });
   } finally { store.close(); }
 });
+
+// Exercise the existing reader over real TLS. Advancing/frozen wall time must
+// never extend its credential-plus-request budget or admit an expired reply.
+for (const phase of ['before-post', 'after-post', 'frozen-wall'] as const) {
+  test(`v2 reader deadline fences ${phase} clock movement over HTTPS`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'trusted-v2-clock-'));
+    let server: ReturnType<typeof createServer> | undefined;
+    try {
+      const key = join(dir, 'key.pem');
+      const cert = join(dir, 'cert.pem');
+      execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+	'-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+      { stdio: 'ignore' });
+      let calls = 0;
+      server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+	calls++;
+	assert.equal(req.headers.authorization, 'Bearer worker-secret');
+	for await (const _chunk of req) { /* consume the fixed POST */ }
+	res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+	res.end(JSON.stringify(available()));
+      });
+      await new Promise<void>(resolve => server!.listen(0, 'localhost', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      let wallReads = 0;
+      let elapsedReads = 0;
+      const options = { origin: `https://localhost:${address.port}`, expected,
+	getToken: async () => 'worker-secret', trustedCa: readFileSync(cert),
+	now: () => {
+	  const n = wallReads++;
+	  return phase === 'before-post' && n > 0 || phase === 'after-post' && n > 1 ? 999 : 1_000;
+	},
+	elapsedNow: () => phase === 'frozen-wall' && elapsedReads++ > 0 ? 5_000 : 0,
+      };
+      await assert.rejects(createTrustedReferenceV2Reader(options).read(), /deadline|clock|transport/);
+      assert.equal(calls, phase === 'after-post' ? 1 : 0,
+	'no bearer POST after the credential budget or clock fence fails');
+    } finally {
+      if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

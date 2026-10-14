@@ -180,6 +180,8 @@ export function createTrustedReferenceV2Reader(options: {
   getToken: () => Promise<string>;
   expected: { workflow: string; run: string };
   now?: () => number;
+  /** Monotonic elapsed time across credential resolution and HTTPS awaits. */
+  elapsedNow?: () => number;
   /** Optional locally provisioned TLS trust root; never sourced from a Hub response. */
   trustedCa?: string | Buffer;
 }): TrustedReferenceV2Reader {
@@ -190,9 +192,27 @@ export function createTrustedReferenceV2Reader(options: {
   }
   const url = new URL('/api/reference_order/v2', origin);
   const now = options.now ?? Date.now;
+  const elapsedNow = options.elapsedNow ?? (() => performance.now());
   let canonicalWorkflow: string | undefined;
   return { async read() {
     const began = now();
+    const beganElapsed = elapsedNow();
+    if (!Number.isSafeInteger(began) || !Number.isFinite(beganElapsed) || beganElapsed < 0) {
+      throw new Error('trusted reference v2 clock unavailable');
+    }
+    let lastWall = began;
+    let lastElapsed = beganElapsed;
+    const remainingBudget = (): number => {
+      const wall = now();
+      const elapsed = elapsedNow();
+      if (!Number.isSafeInteger(wall) || wall < lastWall
+	|| !Number.isFinite(elapsed) || elapsed < lastElapsed) {
+	throw new Error('trusted reference v2 clock regressed or unavailable');
+      }
+      lastWall = wall;
+      lastElapsed = elapsed;
+      return MAX_MS - Math.max(wall - began, elapsed - beganElapsed);
+    };
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const token = await Promise.race([
       options.getToken(),
@@ -200,17 +220,18 @@ export function createTrustedReferenceV2Reader(options: {
 	timeout = setTimeout(() => reject(new Error('trusted reference v2 credential deadline exceeded')), MAX_MS);
       }),
     ]).finally(() => clearTimeout(timeout));
-    const remaining = MAX_MS - (now() - began);
+    const remaining = remainingBudget();
     if (typeof token !== 'string' || token.length === 0 || /[\r\n]/.test(token) || remaining <= 0) {
       throw new Error('trusted reference v2 credential or deadline unavailable');
     }
     const response = await postHttps(url, token, JSON.stringify(options.expected), remaining, options.trustedCa);
-    if (now() - began >= MAX_MS || response.status !== 200
+    if (remainingBudget() <= 0 || response.status !== 200
       || !String(response.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')
       || !String(response.headers['cache-control'] ?? '').toLowerCase().split(',').map(part => part.trim()).includes('no-store')) {
       throw new Error('trusted reference v2 transport refused');
     }
     const parsed = parseTrustedReferenceV2(JSON.parse(response.body) as unknown, options.expected);
+    if (remainingBudget() <= 0) throw new Error('trusted reference v2 deadline exceeded');
     if (parsed.state === 'available') {
       // Service authorizes requested-root -> canonical-child through durable
       // ancestry. Keep every POST argv-bound; the private packet cannot choose
