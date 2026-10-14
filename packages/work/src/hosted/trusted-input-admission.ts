@@ -58,16 +58,23 @@ export function createTrustedInputV2Admission(args: {
   const now = args.now ?? Date.now;
   const elapsedNow = args.elapsedNow ?? (() => performance.now());
   const refused = (reason: string): TrustedInputAdmission => ({ ok: false, reason });
+  let canonicalWorkflow: string | undefined;
   return { async observe(privateOrder) {
     const started = now();
     const startedElapsed = elapsedNow();
-    if (!Number.isSafeInteger(started) || privateOrder.workflow !== args.expected.workflow
-      || privateOrder.run !== args.expected.run) return refused('private-order-out-of-scope');
+    if (!Number.isSafeInteger(started) || privateOrder.run !== args.expected.run) {
+      return refused('private-order-out-of-scope');
+    }
     let response: Awaited<ReturnType<TrustedReferenceV2Reader['read']>>;
     try { response = await args.reader.read(); }
     catch { return refused('reference-v2-unavailable'); }
     if (response.state !== 'available') return refused(`service-${response.state}`);
     const direct = response.order;
+    if (response.run !== args.expected.run || direct.run !== args.expected.run
+      || response.workflow !== direct.workflow) return refused('private-order-v2-mismatch');
+    if (canonicalWorkflow !== undefined && direct.workflow !== canonicalWorkflow) {
+      return refused('canonical-workflow-changed');
+    }
     const dynamic = (order: OrderPacket) => ({
       workflow: order.workflow, run: order.run, step: order.step, key: order.key,
       index: order.index ?? null, defDigest: order.defDigest,
@@ -115,7 +122,8 @@ export function createTrustedInputV2Admission(args: {
       return refused('private-order-worker-mismatch');
     }
     const bound = await bindTrustedReferenceV2({ response,
-      expected: { ...args.expected, defDigest: direct.defDigest, step: privateOrder.step, key: privateOrder.key },
+      expected: { workflow: direct.workflow, run: args.expected.run,
+	defDigest: direct.defDigest, step: privateOrder.step, key: privateOrder.key },
       step: step.step, declaredInputs: step.declaredInputs,
       consumedVerifier: args.consumedVerifier, callsProducers: step.callsProducers });
     if (!bound.ok) return refused(bound.reason);
@@ -127,6 +135,7 @@ export function createTrustedInputV2Admission(args: {
       || !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= MAX_OBSERVATION_MS) {
       return refused('observation-expired');
     }
+    canonicalWorkflow ??= direct.workflow;
     return { ok: true, order: privateOrder, step,
       packetDigest: valueDigestHex(dynamic(direct)), witnessDigest: bound.witnessDigest,
       observedAt: started, expiresAt: started + MAX_OBSERVATION_MS,

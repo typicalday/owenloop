@@ -1259,17 +1259,20 @@ test('put_file_artifact refuses once the hold is terminal', async () => {
 });
 
 // Hermetic input-boundary tests, not deployed workflow acceptance evidence.
-function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supplied?: boolean; workdir?: string } = {}) {
+function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supplied?: boolean;
+  workdir?: string; canonicalChild?: boolean } = {}) {
   const definition = buildDef({ name: 'optional-input-holder',
     inputs: [{ name: 'optional', seedOwed: cfg.required ?? false }],
     steps: [{ name: 'planner', consumes: ['optional'], produces: ['plan'] }] });
   const local = definition.steps[0]!;
   const response = defaultOrderResponse();
+  if (cfg.canonicalChild) response.workflow = 'wf_child';
   response.order = { ...response.order!, step: 'planner', defDigest: 'a'.repeat(64),
+    workflow: response.workflow,
     inputs: ['optional'], outputs: ['plan'], consumes: cfg.supplied ? { optional: 'supplied input' } : {},
     consumedFingerprint: { optional: 1 },
     owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
-  const wire = { protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
+  const wire = { protocol: 'trusted-reference-read-v2', state: 'available', workflow: response.workflow, run: 'run1',
     order: { ...response.order, owes: [{ path: 'plan', version: 1 }] },
     inputs: [{ path: 'optional', version: 1, present: cfg.supplied ?? false,
       ...(cfg.supplied ? { value: 'supplied input' as unknown } : {}) }], lease: { claimed: true } };
@@ -1281,7 +1284,7 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
       reads++;
       if (unavailable) throw new Error('offline');
       if (serviceRefused) return parseTrustedReferenceV2({ protocol: wire.protocol, state: 'unavailable',
-	workflow: wire.workflow, run: wire.run }, { workflow: 'wf1', run: 'run1' });
+	workflow: 'wf1', run: wire.run }, { workflow: 'wf1', run: 'run1' });
       return parseTrustedReferenceV2(wire, { workflow: 'wf1', run: 'run1' });
     } }, instructions: {
       resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
@@ -1305,6 +1308,19 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
   return { mount, hub, response, wire, calls, reads: () => reads,
     offline: () => { unavailable = true; }, serviceRefused: () => { serviceRefused = true; } };
 }
+
+test('ordinary input holder verifies the canonical child but keeps every submit bound to the requested root', async () => {
+  const f = optionalInputHolder({ canonicalChild: true });
+  const shown = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(shown.isError, undefined);
+  assert.equal(parse(shown).order.workflow, 'wf_child');
+  const submitted = await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: 'local control' }, ctx);
+  assert.equal(submitted.isError, undefined);
+  assert.deepEqual(f.calls.filter(call => call.verb === 'get_order').map(call => call.arg),
+    Array.from({ length: 3 }, () => ({ workflow: 'wf1', run: 'run1' })));
+  assert.deepEqual(f.calls.find(call => call.verb === 'submit')!.arg,
+    { workflow: 'wf1', run: 'run1', path: 'plan', value: 'local control' });
+});
 
 test('fully supplied required inputs still require the independent v2 witness before read and submit', async () => {
   const f = optionalInputHolder({ required: true, supplied: true });

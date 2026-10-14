@@ -22,6 +22,47 @@ const available = (): TrustedReferenceV2 => ({ protocol: 'trusted-reference-read
     consumes: {}, consumedFingerprint: { optional: 1 }, owes: [{ path: 'plan', version: 1 }] },
   inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } }) as unknown as TrustedReferenceV2;
 
+test('v2 parser preserves a Service-canonical child while refusals stay bound to the requested root', () => {
+  const child = available();
+  child.workflow = 'wf_child';
+  child.order.workflow = child.workflow;
+  assert.deepEqual(parseTrustedReferenceV2(child, expected), child);
+  assert.throws(() => parseTrustedReferenceV2({ ...child,
+    order: { ...child.order, workflow: expected.workflow } }, expected));
+  assert.throws(() => parseTrustedReferenceV2({ ...child, run: 'wrong-run' }, expected));
+  assert.throws(() => parseTrustedReferenceV2({ protocol: child.protocol, state: 'unavailable',
+    workflow: child.workflow, run: expected.run }, expected));
+});
+
+test('v2 admission binds the child to the independent Service read and refuses canonical movement', async () => {
+  const direct = available();
+  direct.workflow = 'wf_child';
+  direct.order.workflow = direct.workflow;
+  const local = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const admission = createTrustedInputV2Admission({ reader: { read: async () => direct }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local, inputNames: ['optional'],
+	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+    consumedVerifier: async (order, options) => {
+      assert.equal(options.hardRule, true);
+      assert.equal(order.workflow, 'wf_child');
+      return { ok: true, order, warnings: [] };
+    } });
+  const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+    reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  const accepted = await admission.observe(privateOrder);
+  assert.equal(accepted.ok, true);
+  if (accepted.ok) assert.equal(accepted.order.workflow, 'wf_child');
+  assert.deepEqual(await admission.observe({ ...privateOrder, workflow: 'wf_forged' }),
+    { ok: false, reason: 'private-order-v2-mismatch' });
+  direct.workflow = 'wf_changed';
+  direct.order.workflow = direct.workflow;
+  assert.deepEqual(await admission.observe({ ...privateOrder, workflow: direct.workflow }),
+    { ok: false, reason: 'canonical-workflow-changed' });
+});
+
 test('strict v2 parser preserves absent witness and refuses malformed authority', () => {
   assert.deepEqual(parseTrustedReferenceV2(available(), expected), available());
   const bad = (change: (wire: ReturnType<typeof available>) => void) => {
@@ -84,6 +125,18 @@ test('worker-owned HTTPS POST binds bearer/body, refuses redirect, old Service, 
       wire = available();
       cache = 'max-age=60';
       await assert.rejects(reader.read());
+      cache = 'no-store';
+      const child = available();
+      child.workflow = 'wf_child';
+      child.order.workflow = child.workflow;
+      wire = child;
+      const childReader = createTrustedReferenceV2Reader({ origin: `https://localhost:${address.port}`,
+	expected, getToken: async () => 'worker-secret', trustedCa: readFileSync(cert) });
+      assert.deepEqual(await childReader.read(), child);
+      wire = { ...child, order: { ...child.order, workflow: expected.workflow } };
+      await assert.rejects(childReader.read(), /order malformed/);
+      wire = { ...child, workflow: 'wf_changed', order: { ...child.order, workflow: 'wf_changed' } };
+      await assert.rejects(childReader.read(), /canonical workflow changed/);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }

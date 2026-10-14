@@ -276,10 +276,11 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const supplied = mode === 'supplied';
   const workdirInput = mode === 'workdir';
+  const canonicalWorkflow = mode === 'child' ? 'wf_child' : 'wf1';
   const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
 inputs:
 ${workdirInput ? `  - name: config
@@ -309,7 +310,7 @@ steps:
     { stdio: 'ignore' });
     const consumes: Record<string, unknown> = workdirInput ? {}
       : { proposal: 'a local test proposal', ...(supplied ? { optional: 'supplied required input' } : {}) };
-    const packet = { workflow: 'wf1', run: 'run1', step: 'planner', key: '',
+    const packet = { workflow: canonicalWorkflow, run: 'run1', step: 'planner', key: '',
       defDigest: defInstructionDigest(definition), inputs: workdirInput ? [] : ['proposal', 'optional'], outputs: ['plan'],
       consumes,
       consumedFingerprint: workdirInput ? {} : { proposal: 1, optional: 1 },
@@ -317,6 +318,7 @@ steps:
       owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
     const seen: string[] = [];
     let witnessAvailable = true;
+    let witnessWorkflow = canonicalWorkflow;
     server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
       seen.push(req.url!);
       assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);
@@ -328,8 +330,8 @@ steps:
       if (req.url === '/api/reference_order/v2') {
 	assert.deepEqual(body, { workflow: 'wf1', run: 'run1' });
 	res.end(JSON.stringify(witnessAvailable ? {
-	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
-	  order: { ...packet, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput ? [] : [
+	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: witnessWorkflow, run: 'run1',
+	  order: { ...packet, workflow: witnessWorkflow, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput ? [] : [
 	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
 	    { path: 'optional', version: 1, present: supplied,
 	      ...(supplied ? { value: packet.consumes.optional } : {}) },
@@ -337,7 +339,7 @@ steps:
 	  lease: { claimed: true },
 	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
       } else if (req.url === '/api/get_order') {
-	res.end(JSON.stringify({ text: '', workflow: 'wf1', run: 'run1', order: packet, lease: { claimed: true } }));
+	res.end(JSON.stringify({ text: '', workflow: canonicalWorkflow, run: 'run1', order: packet, lease: { claimed: true } }));
       } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
       else res.end(JSON.stringify({ text: '' }));
     });
@@ -349,10 +351,20 @@ steps:
     await handshake(mcp);
     const viewed = await callTool(mcp, 'get_order');
     assert.equal(viewed.isError, false, mcp.stderr());
+    assert.equal(viewed.body.order.workflow, canonicalWorkflow);
     assert.deepEqual(viewed.body.order.consumes, packet.consumes);
     if (workdirInput) assert.deepEqual(viewed.body.order.inputWitnesses, []);
     else assert.equal(viewed.body.order.inputWitnesses.find((w: { path: string }) => w.path === 'optional').present, supplied);
     assert.ok(seen.includes('/api/reference_order/v2'), 'normal mode must use the independent service witness');
+    if (mode === 'child') {
+      witnessWorkflow = 'wf_changed';
+      const moved = await callTool(mcp, 'get_order');
+      assert.equal(moved.isError, true);
+      const refusedWrite = await callTool(mcp, 'ask', { path: 'plan', question: 'changed child control' });
+      assert.equal(refusedWrite.isError, true);
+      assert.equal(seen.includes('/api/ask'), false);
+      witnessWorkflow = canonicalWorkflow;
+    }
     witnessAvailable = false;
     const rejected = workdirInput
       ? await callTool(mcp, 'ask', { path: 'plan', question: 'local boundary test' })

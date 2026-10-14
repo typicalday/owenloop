@@ -75,11 +75,13 @@ function bounded(value: unknown): boolean {
 export function parseTrustedReferenceV2(raw: unknown, expected: { workflow: string; run: string }): TrustedReferenceV2Result {
   if (!bounded(raw)) throw new Error('trusted reference v2 response exceeds bounds');
   const wire = rec(raw);
-  if (!wire || wire.protocol !== PROTOCOL || wire.workflow !== expected.workflow || wire.run !== expected.run
+  if (!wire || wire.protocol !== PROTOCOL || !ident(wire.workflow) || wire.run !== expected.run
     || !exact(wire, ENVELOPE_FIELDS)) throw new Error('trusted reference v2 envelope mismatch');
   if (wire.state !== 'available') {
     if (wire.state !== 'unavailable' && wire.state !== 'unsupported-feedback' && wire.state !== 'routing-unsupported'
-      || Object.keys(wire).length !== 4) throw new Error('trusted reference v2 refusal malformed');
+      || wire.workflow !== expected.workflow || Object.keys(wire).length !== 4) {
+      throw new Error('trusted reference v2 refusal malformed');
+    }
     return wire as TrustedReferenceV2Result;
   }
   const order = rec(wire.order);
@@ -87,7 +89,7 @@ export function parseTrustedReferenceV2(raw: unknown, expected: { workflow: stri
   const fingerprint = rec(order?.consumedFingerprint);
   const consumes = rec(order?.consumes);
   if (!order || !exact(order, ORDER_FIELDS) || !lease || Object.keys(lease).length !== 1 || lease.claimed !== true
-    || order.workflow !== expected.workflow || order.run !== expected.run || !ident(order.step)
+    || order.workflow !== wire.workflow || order.run !== expected.run || !ident(order.step)
     || typeof order.key !== 'string' || order.key.length > 200 || typeof order.defDigest !== 'string'
     || !DIGEST.test(order.defDigest) || !Array.isArray(order.inputs) || order.inputs.length > MAX_PATHS
     || !Array.isArray(order.outputs) || order.outputs.length > MAX_PATHS || !Array.isArray(order.owes)
@@ -188,6 +190,7 @@ export function createTrustedReferenceV2Reader(options: {
   }
   const url = new URL('/api/reference_order/v2', origin);
   const now = options.now ?? Date.now;
+  let canonicalWorkflow: string | undefined;
   return { async read() {
     const began = now();
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -207,6 +210,16 @@ export function createTrustedReferenceV2Reader(options: {
       || !String(response.headers['cache-control'] ?? '').toLowerCase().split(',').map(part => part.trim()).includes('no-store')) {
       throw new Error('trusted reference v2 transport refused');
     }
-    return parseTrustedReferenceV2(JSON.parse(response.body) as unknown, options.expected);
+    const parsed = parseTrustedReferenceV2(JSON.parse(response.body) as unknown, options.expected);
+    if (parsed.state === 'available') {
+      // Service authorizes requested-root -> canonical-child through durable
+      // ancestry. Keep every POST argv-bound; the private packet cannot choose
+      // a new request target, and this reader never accepts canonical movement.
+      if (canonicalWorkflow !== undefined && parsed.workflow !== canonicalWorkflow) {
+	throw new Error('trusted reference v2 canonical workflow changed');
+      }
+      canonicalWorkflow ??= parsed.workflow;
+    }
+    return parsed;
   } };
 }
