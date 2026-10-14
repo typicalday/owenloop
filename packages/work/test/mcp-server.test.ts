@@ -334,3 +334,19 @@ test('pumpStdin flushes a non-empty trailing partial line at EOF', async () => {
   await new Promise((r) => setTimeout(r, 10));
   assert.equal((writes[0] as Frame).id, 5);
 });
+
+test('transport EOF cannot restore a response after earlier client cancellation', async () => {
+  let resume!: () => void;
+  const paused = new Promise<void>(resolve => { resume = resolve; });
+  const tool: ToolRegistration = { name: 'paused', description: '', inputSchema: { type: 'object' },
+    handler: async () => { await paused; return textResult({ done: 'cancelled-before-eof' }); } };
+  const { server, writes } = harness([tool]);
+  const pending = server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 42,
+    method: 'tools/call', params: { name: 'paused' } }));
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled',
+    params: { requestId: 42 } }));
+  server.close();
+  resume();
+  await pending;
+  assert.deepEqual(writes, []);
+});

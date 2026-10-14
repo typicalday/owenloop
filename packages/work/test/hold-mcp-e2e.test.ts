@@ -276,7 +276,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const supplied = mode === 'supplied';
   const workdirInput = mode === 'workdir';
@@ -344,7 +344,7 @@ steps:
 	  return;
 	}
 	const availableAtRead = witnessAvailable;
-	if (mode === 'overlap' && ++witnessReads === 1) {
+	if ((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) {
 	  firstWitnessEntered();
 	  await firstWitnessResume;
 	}
@@ -368,6 +368,20 @@ steps:
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
       '--heartbeat-interval', '25', '--mcp'], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
+    if (mode === 'cancelled') {
+      const requestId = mcp.fireRequest('tools/call', { name: 'ask',
+	arguments: { path: 'plan', question: 'local cancellation boundary test' } });
+      await firstWitnessPaused;
+      mcp.notify('notifications/cancelled', { requestId });
+      await mcp.request('ping'); // The notification has been processed before the witness resumes.
+      releaseFirstWitness();
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      assert.equal(mcp.frames.some(frame => frame.id === requestId), false, 'cancelled response stays suppressed');
+      assert.equal(seen.includes('/api/ask'), false, 'cancelled request must not send a later consequence');
+      assert.equal(seen.includes('/api/submit'), false);
+      return;
+    }
     if (mode === 'overlap') {
       const older = callTool(mcp, 'get_order');
       await firstWitnessPaused;

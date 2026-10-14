@@ -1743,3 +1743,57 @@ test('overlapping healthy witness reads remain admissible', async () => {
   assert.ok(f.mount.readGatedOrder());
   assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
 });
+
+test('pre-cancelled normal holder calls stop before any read or consequence', async () => {
+  const cancelledCtx: ToolCallContext = { cancelled: true, onCancel: () => {}, sendProgress: () => {} };
+  for (const [name, args] of [['get_order', {}], ['submit', { path: 'plan', value: {} }],
+    ['ask', { path: 'plan', question: 'why' }], ['reject', { path: 'optional', text: 'retry' }],
+    ['put_file_artifact', { file: 'never-opened.txt' }]] as const) {
+    const f = optionalInputHolder();
+    const result = await tool(f.mount.tools, name).handler(args, cancelledCtx);
+    assert.equal(result.isError, true, name);
+    assert.match(parse(result).error, /call-cancelled/);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+for (const phase of ['initial', 'final'] as const) {
+  test(`normal holder cancellation during ${phase} verification prevents submit`, async () => {
+    const pause = deferredWitness();
+    let cancelled = false;
+    let proofs = 0;
+    const callContext: ToolCallContext = { get cancelled() { return cancelled; },
+      onCancel: () => {}, sendProgress: () => {} };
+    const f = optionalInputHolder({ proofHook: async () => {
+      if (++proofs === (phase === 'initial' ? 1 : 2)) await pause.wait();
+    } });
+    const pending = tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, callContext);
+    await pause.paused;
+    cancelled = true;
+    pause.release();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.match(parse(result).error, /call-cancelled/);
+    assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+  });
+}
+
+test('cancelling an older pending model read preserves a newer verified request', async () => {
+  const pause = deferredWitness();
+  let proofs = 0;
+  let cancelled = false;
+  const callContext: ToolCallContext = { get cancelled() { return cancelled; },
+    onCancel: () => {}, sendProgress: () => {} };
+  const f = optionalInputHolder({ proofHook: async () => { if (++proofs === 1) await pause.wait(); } });
+  const pending = tool(f.mount.tools, 'get_order').handler({}, callContext);
+  await pause.paused;
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const newest = f.mount.readGatedOrder();
+  cancelled = true;
+  pause.release();
+  const result = await pending;
+  assert.equal(result.isError, true);
+  assert.match(parse(result).error, /call-cancelled/);
+  assert.equal(f.mount.readGatedOrder(), newest);
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+});
