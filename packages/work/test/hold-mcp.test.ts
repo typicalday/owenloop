@@ -1560,7 +1560,7 @@ test('a claim changing during submit preparation is refused by the final observa
 
 // A producer proof is not rejecting-actor or history authority. Normal holders
 // must consult the existing Service refusal even when the step consumes nothing.
-function zeroInputFeedbackHolder() {
+function zeroInputFeedbackHolder(reason = 'service-unsupported-feedback') {
   const response = defaultOrderResponse();
   response.order = { ...response.order!, inputs: [], consumes: {}, consumedFingerprint: {},
     owes: [{ path: 'pr', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
@@ -1571,7 +1571,7 @@ function zeroInputFeedbackHolder() {
     consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
     trustedInputV2: { async observe() {
       reads++;
-      return { ok: false, reason: offline ? 'reference-v2-unavailable' : 'service-unsupported-feedback' };
+      return { ok: false, reason: offline ? 'reference-v2-unavailable' : reason };
     } },
   }));
   return { response, mount, hub, calls, reads: () => reads, offline: () => { offline = true; } };
@@ -1608,6 +1608,47 @@ test('zero-input feedback arriving before submit is refused and its required wit
   assert.equal(refused.isError, true);
   assert.match(parse(refused).error, /service-unsupported-feedback/);
   f.response.order!.owes[0]!.judgmentRejects = 0;
+  f.offline();
+  const removed = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(removed.isError, true);
+  assert.match(parse(removed).error, /reference-v2-unavailable/);
+  assert.equal(f.mount.readGatedOrder(), undefined);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+// Routing is an explicitly unsupported Service v2 branch. These local sidecars
+// are synthetic boundary fixtures, not signed routing or native claim evidence.
+test('zero-input routing presence refuses model access and every consequence', async () => {
+  for (const routing of [{}, null]) {
+    const f = zeroInputFeedbackHolder('service-routing-unsupported');
+    Object.assign(f.response.order!, { routing });
+    for (const [name, args] of [['get_order', {}], ['submit', { path: 'pr', value: {} }],
+      ['ask', { path: 'pr', question: 'why' }], ['reject', { path: 'pr', text: 'retry' }]] as const) {
+      const refused = await tool(f.mount.tools, name).handler(args, ctx);
+      assert.equal(refused.isError, true, name);
+      assert.match(parse(refused).error, /service-routing-unsupported/);
+    }
+    assert.equal(f.reads(), 4);
+    assert.equal(f.mount.readGatedOrder(), undefined);
+    assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+  }
+});
+
+test('zero-input routing appearing at final submit read fences the write and latches admission', async () => {
+  const f = zeroInputFeedbackHolder('service-routing-unsupported');
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  assert.equal(f.reads(), 0, 'empty static compatibility stays available');
+  const originalRead = f.hub.getOrder;
+  let reads = 0;
+  f.hub.getOrder = async req => {
+    if (++reads === 2) Object.assign(f.response.order!, { routing: {} });
+    return originalRead(req);
+  };
+  const refused = await tool(f.mount.tools, 'submit').handler({ path: 'pr', value: {} }, ctx);
+  assert.equal(refused.isError, true);
+  assert.match(parse(refused).error, /service-routing-unsupported/);
+  assert.equal(reads, 2, 'routing moved after signing, before the write');
+  Reflect.deleteProperty(f.response.order!, 'routing');
   f.offline();
   const removed = await tool(f.mount.tools, 'get_order').handler({}, ctx);
   assert.equal(removed.isError, true);

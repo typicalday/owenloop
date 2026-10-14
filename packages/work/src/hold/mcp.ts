@@ -274,11 +274,15 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     // Only empty static zero-input packets retain compatibility. Producer
     // proofs do not authenticate rejecting actors, counters or prior values;
     // the normal holder must observe Service's unsupported-feedback refusal.
+    // A routing sidecar also leaves the static compatibility branch, even
+    // when empty or null. Its presence cannot authorize a legacy write while
+    // Service independently refuses routing until its signed protocol is ready.
     const hasFeedback = res.order.owes.some(owed => owed.reasons.length > 0
       || owed.judgmentRejects !== 0 || owed.schemaRejects !== 0
       || owed.proof !== undefined || owed.previousValue !== undefined);
     v2Required ||= (deps.trustedInputV2 !== undefined && (res.order.inputs.length > 0 || hasFeedback))
-      || res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path));
+      || res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path))
+      || Object.hasOwn(res.order, 'routing');
     if (!v2Required) {
       if (deps.modelOrderVerifier === undefined) {
 	return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
