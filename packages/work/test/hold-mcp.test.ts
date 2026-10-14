@@ -9,6 +9,8 @@ import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
 import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
 import { createHoldMcp } from '../src/hold/mcp.ts';
+import { createTrustedInputV2Admission } from '../src/hosted/trusted-input-admission.ts';
+import { parseTrustedReferenceV2 } from '../src/hosted/trusted-reference-v2.ts';
 import { validModelOrderFields } from '../src/order-definition-binding.ts';
 import { buildDef } from '../../../src/defs.ts';
 import type { SubmissionKeyManager } from '../src/submit-proof.ts';
@@ -1254,4 +1256,144 @@ test('put_file_artifact refuses once the hold is terminal', async () => {
   } finally {
     cleanup();
   }
+});
+
+// Hermetic input-boundary tests, not deployed workflow acceptance evidence.
+function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; workdir?: string } = {}) {
+  const definition = buildDef({ name: 'optional-input-holder',
+    inputs: [{ name: 'optional', seedOwed: cfg.required ?? false }],
+    steps: [{ name: 'planner', consumes: ['optional'], produces: ['plan'] }] });
+  const local = definition.steps[0]!;
+  const response = defaultOrderResponse();
+  response.order = { ...response.order!, step: 'planner', defDigest: 'a'.repeat(64),
+    inputs: ['optional'], outputs: ['plan'], consumes: {}, consumedFingerprint: { optional: 1 },
+    owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  const wire = { protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
+    order: { ...response.order, owes: [{ path: 'plan', version: 1 }] },
+    inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } };
+  let reads = 0;
+  let unavailable = false;
+  const trustedInputV2 = createTrustedInputV2Admission({ expected: { workflow: 'wf1', run: 'run1' },
+    reader: { async read() {
+      reads++;
+      if (unavailable) throw new Error('offline');
+      return parseTrustedReferenceV2(wire, { workflow: 'wf1', run: 'run1' });
+    } }, instructions: {
+      resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local,
+	declaredInputs: cfg.producer ? [] : definition.inputs, callsProducers: {}, allowedModifiers: [] }),
+    }, consumedVerifier: async (order, options) => {
+      assert.equal(options?.hardRule, true);
+      assert.deepEqual(order.consumes, {});
+      return { ok: true, order, warnings: [] };
+    } });
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, { trustedInputV2, workdir: cfg.workdir ?? process.cwd(),
+    // Legacy exact membership refuses this order. The service witness must
+    // be consulted; accepting via a softened legacy verifier would fail.
+    modelOrderVerifier: async order => validModelOrderFields(local, order)
+      ? { ok: true } : { ok: false, reason: 'legacy membership refused' },
+  }));
+  return { mount, hub, response, wire, calls, reads: () => reads,
+    offline: () => { unavailable = true; } };
+}
+
+test('ordinary held MCP admits witnessed optional absence and never synthesizes a value', async () => {
+  const f = optionalInputHolder();
+  const get = tool(f.mount.tools, 'get_order');
+  const result = await get.handler({}, ctx);
+  assert.equal(result.isError, undefined);
+  const view = parse(result).order;
+  assert.deepEqual(view.inputs, ['optional']);
+  assert.deepEqual(view.consumes, {});
+  assert.deepEqual(view.inputWitnesses, [{ path: 'optional', version: 1, present: false }]);
+  assert.equal(f.reads(), 1);
+  const submitted = await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx);
+  assert.equal(submitted.isError, undefined);
+  assert.equal(f.reads(), 3, 'fresh witness before signing and immediately before submit');
+  assert.equal(f.calls.filter(call => call.verb === 'submit').length, 1);
+});
+
+test('required and producer input absence refuse read and every mutation', async () => {
+  for (const cfg of [{ required: true }, { producer: true }]) {
+    const f = optionalInputHolder(cfg);
+    for (const [name, args] of [
+      ['get_order', {}], ['submit', { path: 'plan', value: {} }],
+      ['reject', { path: 'optional', text: 'bad' }], ['ask', { path: 'plan', question: 'why' }],
+    ] as const) {
+      const result = await tool(f.mount.tools, name).handler(args, ctx);
+      assert.equal(result.isError, true);
+      assert.match(parse(result).error, /unwitnessed-absence/);
+    }
+    assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+  }
+});
+
+test('held MCP refuses a dropped supplied value and changed witness or claim version', async () => {
+  for (const change of ['dropped', 'version', 'witness'] as const) {
+    const f = optionalInputHolder();
+    assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+    if (change === 'dropped') {
+      f.wire.inputs[0] = { path: 'optional', version: 1, present: true, value: 'supplied' } as typeof f.wire.inputs[0];
+      f.wire.order.consumes = { optional: 'supplied' };
+    } else if (change === 'version') {
+      f.response.order!.consumedFingerprint!.optional = 2;
+      f.wire.order.consumedFingerprint = { optional: 2 };
+      f.wire.inputs[0]!.version = 2;
+    } else {
+      // Service input witness movement cannot become a legacy fallback.
+      f.response.order!.consumes = { optional: 'now-present' };
+      f.wire.order.consumes = { optional: 'now-present' };
+      f.wire.inputs[0] = { path: 'optional', version: 1, present: true, value: 'now-present' } as typeof f.wire.inputs[0];
+    }
+    const result = await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx);
+    assert.equal(result.isError, true);
+    assert.equal(f.calls.some(call => call.verb === 'submit'), false);
+    assert.equal(f.mount.readGatedOrder(), undefined);
+  }
+});
+
+test('a lost claim or unavailable witness blocks reject, ask and upload after an accepted read', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optional-v2-upload-'));
+  try {
+    const file = join(dir, 'output.txt');
+    writeFileSync(file, 'test');
+    for (const state of ['offline', 'lost'] as const) {
+      const f = optionalInputHolder({ workdir: dir });
+      assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+      if (state === 'offline') f.offline();
+      else f.response.lease.claimed = false;
+      for (const [name, args] of [
+	['reject', { path: 'optional', text: 'bad' }],
+	['ask', { path: 'plan', question: 'why' }],
+	['put_file_artifact', { file }],
+      ] as const) {
+	const result = await tool(f.mount.tools, name).handler(args, ctx);
+	assert.equal(result.isError, true);
+	assert.match(parse(result).error, /reference unavailable|reference-v2-unavailable|identity refusal/);
+      }
+      assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a claim changing during submit preparation is refused by the final observation', async () => {
+  const f = optionalInputHolder();
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const originalRead = f.hub.getOrder;
+  let submitReads = 0;
+  f.hub.getOrder = async req => {
+    if (++submitReads === 2) {
+      f.response.order!.consumedFingerprint!.optional = 2;
+      f.wire.order.consumedFingerprint = { optional: 2 };
+      f.wire.inputs[0]!.version = 2;
+    }
+    return originalRead(req);
+  };
+  const result = await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx);
+  assert.equal(result.isError, true);
+  assert.match(parse(result).error, /claim input observation changed/);
+  assert.equal(submitReads, 2);
+  assert.equal(f.calls.some(call => call.verb === 'submit'), false);
 });

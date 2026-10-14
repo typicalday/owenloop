@@ -768,6 +768,21 @@ policies still apply: `warn` reports unsigned or unadmitted publications while
 `enforce` refuses them. Static task instructions and output schemas are resolved
 locally, never taken from the hub packet.
 
+When an input path has no supplied value, the ordinary holder automatically
+requires the Service's authenticated `reference_order/v2` read over HTTPS. The
+locally verified publication must declare that input optional (`seedOwed: false`)
+and the Service must witness its absence at the exact claimed version. The
+model receives an `inputWitnesses` entry with `present: false`; no value is
+invented. This path requires a verified publication even under `defPolicy=warn`.
+Producer artifacts still require signed value and producer-chain verification.
+
+The holder rechecks the live order and input witnesses before writes, including
+a second check after submission signing. A moved input version or value, lost
+claim, unavailable Service witness, or unsupported feedback refuses the operation.
+Once a holder requires v2, it cannot fall back to legacy verification. Rework
+feedback and routing require their separate authority migration; this initial
+optional-input path does not authorize them.
+
 Route siblings can be submitted when the Service projects them as owed by the
 current run. An older Service that cannot project a sibling's issued target
 cannot authorize that path through this holder. Collection members use the

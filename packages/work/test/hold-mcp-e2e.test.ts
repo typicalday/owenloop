@@ -9,7 +9,12 @@
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:https';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -266,5 +271,86 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
     assert.match(mcp.stderr(), /mutually exclusive/);
   } finally {
     mcp.child.kill('SIGKILL');
+  }
+});
+
+// Local signed test publication and loopback TLS only. This verifies the normal
+// production role wiring; it is not hosted Delivery acceptance evidence.
+test('normal hold --mcp automatically verifies optional absence over independent HTTPS', async () => {
+  const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
+inputs:
+  - name: proposal
+    seedOwed: true
+  - name: optional
+    seedOwed: false
+steps:
+  - name: planner
+    consumes: [proposal, optional]
+    produces: [plan]
+    terminal: true
+    body: "Produce plan."
+` });
+  let server: ReturnType<typeof createServer> | undefined;
+  let mcp: McpChild | undefined;
+  try {
+    const installed = await installSignedBundleFixture({ sourceDir,
+      root: join(configDir, '.owenloop', 'workflows'), home: configDir });
+    const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+    const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name)!;
+    const key = join(configDir, 'tls.key');
+    const cert = join(configDir, 'tls.crt');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+    { stdio: 'ignore' });
+    const packet = { workflow: 'wf1', run: 'run1', step: 'planner', key: '',
+      defDigest: defInstructionDigest(definition), inputs: ['proposal', 'optional'], outputs: ['plan'],
+      consumes: { proposal: 'a local test proposal' }, consumedFingerprint: { proposal: 1, optional: 1 },
+      owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+    const seen: string[] = [];
+    let witnessAvailable = true;
+    server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      seen.push(req.url!);
+      assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      assert.equal(body.workflow, 'wf1');
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      if (req.url === '/api/reference_order/v2') {
+	assert.deepEqual(body, { workflow: 'wf1', run: 'run1' });
+	res.end(JSON.stringify(witnessAvailable ? {
+	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
+	  order: { ...packet, owes: [{ path: 'plan', version: 1 }] }, inputs: [
+	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
+	    { path: 'optional', version: 1, present: false },
+	  ], lease: { claimed: true },
+	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
+      } else if (req.url === '/api/get_order') {
+	res.end(JSON.stringify({ text: '', workflow: 'wf1', run: 'run1', order: packet, lease: { claimed: true } }));
+      } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
+      else res.end(JSON.stringify({ text: '' }));
+    });
+    await new Promise<void>(resolve => server!.listen(0, 'localhost', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
+      '--heartbeat-interval', '25', '--mcp'], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
+    await handshake(mcp);
+    const viewed = await callTool(mcp, 'get_order');
+    assert.equal(viewed.isError, false, mcp.stderr());
+    assert.deepEqual(viewed.body.order.consumes, packet.consumes);
+    assert.equal(viewed.body.order.inputWitnesses.find((w: { path: string }) => w.path === 'optional').present, false);
+    assert.ok(seen.includes('/api/reference_order/v2'), 'normal mode must use the independent service witness');
+    witnessAvailable = false;
+    const rejected = await callTool(mcp, 'reject', { path: 'proposal', text: 'local boundary test' });
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.body.error, /service-unavailable/);
+    assert.equal(seen.includes('/api/reject'), false);
+    mcp.endStdin();
+    assert.equal(await mcp.exited, 0);
+  } finally {
+    if (mcp?.child.exitCode === null) { mcp.endStdin(); await mcp.exited; }
+    if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+    rmSync(sourceDir, { recursive: true, force: true });
   }
 });

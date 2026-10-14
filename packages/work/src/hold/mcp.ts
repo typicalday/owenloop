@@ -55,6 +55,7 @@ import { resolveContainedPath } from '../contained-path.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
+import type { TrustedInputAdmission } from '../hosted/trusted-input-admission.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask', 'put_file_artifact'] as const;
@@ -78,6 +79,8 @@ export interface HoldMcpDeps {
   consumedVerifier?: ConsumedVerifier;
   /** Local definition binding for fields that signed artifact proofs do not cover. */
   modelOrderVerifier?: (order: OrderPacket) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  /** Worker-owned Service witness required when a consumed input is absent. */
+  trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -145,7 +148,7 @@ function guessContentType(path: string): string {
  * passed the gate. The full packet stays private for proof construction. In
  * particular, hub-carried static extensions, schema and previousValue do not
  * inherit authenticity from a valid consumes/reasons proof. */
-function orderView(res: GetOrderResponse): unknown {
+function orderView(res: GetOrderResponse, inputWitnesses?: Array<{ path: string; version: number; present: boolean }>): unknown {
   const order = res.order;
   if (order === null) return { workflow: res.workflow, run: res.run, order: null };
   return {
@@ -160,6 +163,7 @@ function orderView(res: GetOrderResponse): unknown {
       inputs: order.inputs,
       outputs: order.outputs,
       consumes: order.consumes,
+      ...(inputWitnesses === undefined ? {} : { inputWitnesses }),
       owes: order.owes.map((owed) => ({
 	path: owed.path,
 	...(owed.version === undefined ? {} : { version: owed.version }),
@@ -186,6 +190,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // is asynchronous. Keep the unverified response in a private pending slot until
   // a tool call gates it; only a gated response may populate `captured` and reach
   // either the model or submit-proof construction.
+  let v2Required = false;
+  let v2Pin: { packetDigest: string; witnessDigest: string } | undefined;
+  let inputWitnesses: Array<{ path: string; version: number; present: boolean }> | undefined;
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
   let canonicalWorkflow: string | undefined;
@@ -259,7 +266,25 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     if (firstContactIdentityRefusal !== undefined) return firstContactIdentityRefusal;
     const refusedIdentity = identityGuard(res);
     if (refusedIdentity !== undefined) return refusedIdentity;
-    if (res.order === null) return undefined;
+    if (res.order === null) return v2Required
+      ? textResult({ error: 'trusted input v2 refusal: no live order' }, true) : undefined;
+    // Once absence requires v2, this holder never falls back to the legacy gate.
+    v2Required ||= res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path));
+    if (v2Required) {
+      captured = undefined;
+      if (!deps.trustedInputV2) return textResult({ error: 'trusted input v2 refusal: witness reader unavailable' }, true);
+      let observed: TrustedInputAdmission;
+      try { observed = await deps.trustedInputV2.observe(res.order); }
+      catch { return textResult({ error: 'trusted input v2 refusal: reference unavailable' }, true); }
+      if (!observed.ok) return textResult({ error: `trusted input v2 refusal: ${observed.reason}` }, true);
+      if (v2Pin && (v2Pin.packetDigest !== observed.packetDigest || v2Pin.witnessDigest !== observed.witnessDigest)) {
+	captured = undefined;
+	return textResult({ error: 'trusted input v2 refusal: claim input observation changed' }, true);
+      }
+      v2Pin ??= { packetDigest: observed.packetDigest, witnessDigest: observed.witnessDigest };
+      inputWitnesses = observed.inputs.map(({ path, version, present }) => ({ path, version, present }));
+      return undefined;
+    }
     if (deps.modelOrderVerifier === undefined) {
       return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
     }
@@ -295,6 +320,17 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     handler: async () => {
       const gone = terminalGuard();
       if (gone !== undefined) return gone;
+      if (deps.trustedInputV2) {
+	try {
+	  const res = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(res);
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	  if (refused !== undefined) { captured = undefined; return refused; }
+	  captured = res;
+	  return textResult(orderView(res, inputWitnesses));
+	} catch { captured = undefined; return textResult({ error: 'held get_order unavailable' }, true); }
+      }
       if (captured !== undefined) {
         const refused = await gate(captured);
         const afterGate = terminalGuard();
@@ -374,7 +410,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         // packet even when no origin was supplied for submit-proof signing;
         // otherwise a direct submit call could bypass MCP consume-side
         // verification without first calling get_order.
-        let orderResponse = captured ?? firstContact;
+	let orderResponse = deps.trustedInputV2 ? undefined : captured ?? firstContact;
         if (orderResponse === undefined) {
           orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
         }
@@ -405,6 +441,12 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
         }
+	// Key access and signing may await. Fence the claim again before writing.
+	if (deps.trustedInputV2) {
+	  const fresh = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refusedFresh = await gate(fresh);
+	  if (refusedFresh !== undefined) { captured = undefined; return refusedFresh; }
+	}
         const beforeSubmit = terminalGuard();
         if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({
@@ -455,6 +497,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'reject "requested" must be a non-empty string when provided' }, true);
       }
       try {
+	if (deps.trustedInputV2) {
+	  const current = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(current);
+	  if (refused !== undefined) { captured = undefined; return refused; }
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	}
         const res = await hub.reject({ workflow, run, path, text, ...(requested === undefined ? {} : { requested }) });
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
@@ -505,6 +554,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'ask "context" must be a string when present' }, true);
       }
       try {
+	if (deps.trustedInputV2) {
+	  const current = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(current);
+	  if (refused !== undefined) { captured = undefined; return refused; }
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	}
         const res = await hub.ask({
           workflow,
           run,
@@ -575,6 +631,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         const contentType =
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
+	if (deps.trustedInputV2) {
+	  const current = await hub.getOrder({ workflow, run, ...holderReq });
+	  const refused = await gate(current);
+	  if (refused !== undefined) { captured = undefined; return refused; }
+	  const afterGate = terminalGuard();
+	  if (afterGate !== undefined) return afterGate;
+	}
         const beforeUpload = terminalGuard();
         if (beforeUpload !== undefined) return beforeUpload;
         const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
