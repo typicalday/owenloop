@@ -417,8 +417,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (parsed.mcp) {
     let modelResolver = deps.modelInstructionResolver;
     const consumedVerifier = createConsumedVerifier({ env, now: () => Date.now() });
-    // Build the service reader lazily: ordinary complete-input packets retain
-    // their legacy contract, while absent inputs must use explicit v2 witnesses.
+    // Build the Service reader lazily for all declared input paths, whether
+    // supplied or absent. Zero-input static orders retain their compatibility.
     let admission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
     const trustedInputV2 = { async observe(order: Parameters<InstructionResolver['resolveStep']>[0]) {
       modelResolver ??= createDefaultStoreInstructionResolver({

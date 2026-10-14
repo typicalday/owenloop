@@ -1259,24 +1259,29 @@ test('put_file_artifact refuses once the hold is terminal', async () => {
 });
 
 // Hermetic input-boundary tests, not deployed workflow acceptance evidence.
-function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; workdir?: string } = {}) {
+function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supplied?: boolean; workdir?: string } = {}) {
   const definition = buildDef({ name: 'optional-input-holder',
     inputs: [{ name: 'optional', seedOwed: cfg.required ?? false }],
     steps: [{ name: 'planner', consumes: ['optional'], produces: ['plan'] }] });
   const local = definition.steps[0]!;
   const response = defaultOrderResponse();
   response.order = { ...response.order!, step: 'planner', defDigest: 'a'.repeat(64),
-    inputs: ['optional'], outputs: ['plan'], consumes: {}, consumedFingerprint: { optional: 1 },
+    inputs: ['optional'], outputs: ['plan'], consumes: cfg.supplied ? { optional: 'supplied input' } : {},
+    consumedFingerprint: { optional: 1 },
     owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
   const wire = { protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
     order: { ...response.order, owes: [{ path: 'plan', version: 1 }] },
-    inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } };
+    inputs: [{ path: 'optional', version: 1, present: cfg.supplied ?? false,
+      ...(cfg.supplied ? { value: 'supplied input' as unknown } : {}) }], lease: { claimed: true } };
   let reads = 0;
   let unavailable = false;
+  let serviceRefused = false;
   const trustedInputV2 = createTrustedInputV2Admission({ expected: { workflow: 'wf1', run: 'run1' },
     reader: { async read() {
       reads++;
       if (unavailable) throw new Error('offline');
+      if (serviceRefused) return parseTrustedReferenceV2({ protocol: wire.protocol, state: 'unavailable',
+	workflow: wire.workflow, run: wire.run }, { workflow: 'wf1', run: 'run1' });
       return parseTrustedReferenceV2(wire, { workflow: 'wf1', run: 'run1' });
     } }, instructions: {
       resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
@@ -1294,10 +1299,65 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; work
     // be consulted; accepting via a softened legacy verifier would fail.
     modelOrderVerifier: async order => validModelOrderFields(local, order)
       ? { ok: true } : { ok: false, reason: 'legacy membership refused' },
+    // A successful compatibility gate cannot replace the independent read.
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
   }));
   return { mount, hub, response, wire, calls, reads: () => reads,
-    offline: () => { unavailable = true; } };
+    offline: () => { unavailable = true; }, serviceRefused: () => { serviceRefused = true; } };
 }
+
+test('fully supplied required inputs still require the independent v2 witness before read and submit', async () => {
+  const f = optionalInputHolder({ required: true, supplied: true });
+  const result = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(f.reads(), 1, 'all-present input must not select the legacy gate');
+  assert.deepEqual(parse(result).order.inputWitnesses, [{ path: 'optional', version: 1, present: true }]);
+  assert.equal((await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx)).isError, undefined);
+  assert.equal(f.reads(), 3, 'all-present input is checked before signing and before submit');
+  assert.equal(f.calls.filter(call => call.verb === 'submit').length, 1);
+});
+
+test('fully supplied inputs cannot bypass an offline or independently refused first v2 read', async () => {
+  for (const state of ['offline', 'refused'] as const) {
+    const f = optionalInputHolder({ required: true, supplied: true });
+    if (state === 'offline') f.offline();
+    else f.serviceRefused();
+    const result = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+    assert.equal(result.isError, true);
+    assert.match(parse(result).error, /reference-v2-unavailable|service-unavailable/);
+    assert.equal(f.mount.readGatedOrder(), undefined);
+    assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+  }
+});
+
+test('fully supplied input witness movement or independent lease loss fences every consequence', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'present-v2-upload-'));
+  try {
+    const file = join(dir, 'output.txt');
+    writeFileSync(file, 'test');
+    for (const state of ['value', 'version', 'lost', 'offline'] as const) {
+      const f = optionalInputHolder({ required: true, supplied: true, workdir: dir });
+      assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+      if (state === 'value') {
+	f.wire.order.consumes = { optional: 'changed' };
+	f.wire.inputs[0]!.value = 'changed';
+      } else if (state === 'version') {
+	f.wire.order.consumedFingerprint = { optional: 2 };
+	f.wire.inputs[0]!.version = 2;
+      } else if (state === 'lost') f.serviceRefused();
+      else f.offline();
+      for (const [name, args] of [
+	['get_order', {}], ['submit', { path: 'plan', value: {} }],
+	['reject', { path: 'optional', text: 'bad' }], ['ask', { path: 'plan', question: 'why' }],
+	['put_file_artifact', { file }],
+      ] as const) {
+	assert.equal((await tool(f.mount.tools, name).handler(args, ctx)).isError, true, state + ': ' + name);
+      }
+      assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+      assert.equal(f.mount.readGatedOrder(), undefined);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('ordinary held MCP admits witnessed optional absence and never synthesizes a value', async () => {
   const f = optionalInputHolder();

@@ -79,7 +79,7 @@ export interface HoldMcpDeps {
   consumedVerifier?: ConsumedVerifier;
   /** Local definition binding for fields that signed artifact proofs do not cover. */
   modelOrderVerifier?: (order: OrderPacket) => Promise<{ ok: true } | { ok: false; reason: string }>;
-  /** Worker-owned Service witness required when a consumed input is absent. */
+  /** Independent Service v2 admission for held input paths, including present ones. */
   trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
@@ -268,8 +268,11 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     if (refusedIdentity !== undefined) return refusedIdentity;
     if (res.order === null) return v2Required
       ? textResult({ error: 'trusted input v2 refusal: no live order' }, true) : undefined;
-    // Once absence requires v2, this holder never falls back to the legacy gate.
-    v2Required ||= res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path));
+    // Normal role wiring supplies the independent reader. Input presence must
+    // not select the compatibility gate; a v2 holder never falls back later.
+    // Zero-input packets retain the existing static-definition compatibility.
+    v2Required ||= (deps.trustedInputV2 !== undefined && res.order.inputs.length > 0)
+      || res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path));
     if (v2Required) {
       captured = undefined;
       if (!deps.trustedInputV2) return textResult({ error: 'trusted input v2 refusal: witness reader unavailable' }, true);

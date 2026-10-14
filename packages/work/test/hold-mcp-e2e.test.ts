@@ -276,13 +276,14 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-test('normal hold --mcp automatically verifies optional absence over independent HTTPS', async () => {
+for (const supplied of [false, true]) {
+test(`normal hold --mcp independently verifies ${supplied ? 'fully supplied inputs' : 'optional absence'} over HTTPS`, async () => {
   const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
 inputs:
   - name: proposal
     seedOwed: true
   - name: optional
-    seedOwed: false
+    seedOwed: ${supplied}
 steps:
   - name: planner
     consumes: [proposal, optional]
@@ -304,7 +305,8 @@ steps:
     { stdio: 'ignore' });
     const packet = { workflow: 'wf1', run: 'run1', step: 'planner', key: '',
       defDigest: defInstructionDigest(definition), inputs: ['proposal', 'optional'], outputs: ['plan'],
-      consumes: { proposal: 'a local test proposal' }, consumedFingerprint: { proposal: 1, optional: 1 },
+      consumes: { proposal: 'a local test proposal', ...(supplied ? { optional: 'supplied required input' } : {}) },
+      consumedFingerprint: { proposal: 1, optional: 1 },
       owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
     const seen: string[] = [];
     let witnessAvailable = true;
@@ -322,7 +324,8 @@ steps:
 	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
 	  order: { ...packet, owes: [{ path: 'plan', version: 1 }] }, inputs: [
 	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
-	    { path: 'optional', version: 1, present: false },
+	    { path: 'optional', version: 1, present: supplied,
+	      ...(supplied ? { value: packet.consumes.optional } : {}) },
 	  ], lease: { claimed: true },
 	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
       } else if (req.url === '/api/get_order') {
@@ -339,7 +342,7 @@ steps:
     const viewed = await callTool(mcp, 'get_order');
     assert.equal(viewed.isError, false, mcp.stderr());
     assert.deepEqual(viewed.body.order.consumes, packet.consumes);
-    assert.equal(viewed.body.order.inputWitnesses.find((w: { path: string }) => w.path === 'optional').present, false);
+    assert.equal(viewed.body.order.inputWitnesses.find((w: { path: string }) => w.path === 'optional').present, supplied);
     assert.ok(seen.includes('/api/reference_order/v2'), 'normal mode must use the independent service witness');
     witnessAvailable = false;
     const rejected = await callTool(mcp, 'reject', { path: 'proposal', text: 'local boundary test' });
@@ -354,3 +357,4 @@ steps:
     rmSync(sourceDir, { recursive: true, force: true });
   }
 });
+}
