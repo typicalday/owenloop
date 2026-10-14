@@ -63,6 +63,7 @@ import { buildSubmitProof } from '../submit-proof.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { validModelOrderFields } from '../order-definition-binding.ts';
+import { parseWorkdirFrom } from '../../../../src/paths.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, watchStdinEof, type SignalHost, type StdinHost } from './signals.ts';
@@ -441,6 +442,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	if (!resolved.ok) return { ok: false, reason: 'model order refusal: local definition unavailable' };
 	if (!validModelOrderFields(resolved.step, order, resolved.inputNames)) {
 	  return { ok: false, reason: 'model order refusal: fields differ from local definition' };
+	}
+	if (resolved.step.workdirFrom !== undefined
+	  && parseWorkdirFrom(resolved.step.workdirFrom, resolved.step.consumes, resolved.inputNames ?? [])?.source === 'input') {
+	  return { ok: true, requiresInputWitness: true };
 	}
 	return { ok: true };
       } catch {

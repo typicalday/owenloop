@@ -78,7 +78,8 @@ export interface HoldMcpDeps {
   /** Gate dynamic consumed values before the packet reaches the model. */
   consumedVerifier?: ConsumedVerifier;
   /** Local definition binding for fields that signed artifact proofs do not cover. */
-  modelOrderVerifier?: (order: OrderPacket) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  modelOrderVerifier?: (order: OrderPacket) => Promise<
+    { ok: true; requiresInputWitness?: true } | { ok: false; reason: string }>;
   /** Independent Service v2 admission for held input paths, including present ones. */
   trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
   /** B3 holder tag; rides get_order/heartbeat when known. */
@@ -273,6 +274,20 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     // Zero-input packets retain the existing static-definition compatibility.
     v2Required ||= (deps.trustedInputV2 !== undefined && res.order.inputs.length > 0)
       || res.order.inputs.some(path => !Object.hasOwn(res.order!.consumes, path));
+    if (!v2Required) {
+      if (deps.modelOrderVerifier === undefined) {
+	return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
+      }
+      try {
+	const bound = await deps.modelOrderVerifier(res.order);
+	if (!bound.ok) return textResult({ error: bound.reason }, true);
+	// An unconsumed declared input may determine cwd while inputs is empty.
+	// This decision comes only from the local definition, never the packet.
+	v2Required ||= bound.requiresInputWitness === true;
+      } catch {
+	return textResult({ error: 'model order refusal: local definition binding failed' }, true);
+      }
+    }
     if (v2Required) {
       captured = undefined;
       if (!deps.trustedInputV2) return textResult({ error: 'trusted input v2 refusal: witness reader unavailable' }, true);
@@ -287,15 +302,6 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       v2Pin ??= { packetDigest: observed.packetDigest, witnessDigest: observed.witnessDigest };
       inputWitnesses = observed.inputs.map(({ path, version, present }) => ({ path, version, present }));
       return undefined;
-    }
-    if (deps.modelOrderVerifier === undefined) {
-      return textResult({ error: 'model order refusal: local definition verifier is not configured' }, true);
-    }
-    try {
-      const bound = await deps.modelOrderVerifier(res.order);
-      if (!bound.ok) return textResult({ error: bound.reason }, true);
-    } catch {
-      return textResult({ error: 'model order refusal: local definition binding failed' }, true);
     }
     const hasConsumedData = Object.keys(res.order.consumes).length > 0
       || res.order.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);

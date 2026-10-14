@@ -775,6 +775,9 @@ verification based on input presence. These input-bearing orders require a
 verified publication even under `defPolicy=warn`; an older Service without v2
 cannot serve them through this client. Zero-input static orders and the Service's
 generic MCP legacy responses retain their existing compatibility during migration.
+An input-derived `workdirFrom` also requires the independent witness when the
+step does not consume that input. The holder determines this from the locally
+resolved declaration; an empty packet input list cannot bypass the cwd check.
 
 When an input has no supplied value, the locally verified publication must
 declare it optional (`seedOwed: false`) and the Service must witness its absence

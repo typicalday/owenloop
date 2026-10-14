@@ -1359,6 +1359,90 @@ test('fully supplied input witness movement or independent lease loss fences eve
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+function unconsumedInputWorkdirHolder(cfg: { noReader?: boolean } = {}) {
+  const definition = buildDef({ name: 'unconsumed-input-cwd', inputs: [{ name: 'config', seedOwed: true }],
+    steps: [{ name: 'planner', consumes: [], workdirFrom: 'config.path', produces: ['plan'] }] });
+  const local = definition.steps[0]!;
+  const response = defaultOrderResponse();
+  response.order = { ...response.order!, step: 'planner', defDigest: 'a'.repeat(64),
+    inputs: [], outputs: ['plan'], consumes: {}, consumedFingerprint: {}, workdir: '/owned/workdir',
+    owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  const wire = { protocol: 'trusted-reference-read-v2', state: 'available', workflow: 'wf1', run: 'run1',
+    order: { ...response.order, owes: [{ path: 'plan', version: 1 }] }, inputs: [],
+    workdirInput: { stem: 'config', version: 1, value: { path: '/owned/workdir' } }, lease: { claimed: true } };
+  let reads = 0;
+  let unavailable = false;
+  const trustedInputV2 = createTrustedInputV2Admission({ expected: { workflow: 'wf1', run: 'run1' },
+    reader: { async read() {
+      reads++;
+      if (unavailable) throw new Error('offline');
+      return parseTrustedReferenceV2(wire, { workflow: 'wf1', run: 'run1' });
+    } }, instructions: {
+      resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local,
+	declaredInputs: definition.inputs, callsProducers: {}, allowedModifiers: [] }),
+    }, consumedVerifier: async order => ({ ok: true, order, warnings: [] }) });
+  const { hub, calls } = mockHub({ getOrder: response });
+  const mount = createHoldMcp(deps(hub, { ...(cfg.noReader ? {} : { trustedInputV2 }),
+    modelOrderVerifier: async order => validModelOrderFields(local, order, ['config'])
+      ? { ok: true, requiresInputWitness: true } : { ok: false, reason: 'local fields differ' },
+  }));
+  return { mount, hub, wire, response, reads: () => reads, calls, offline: () => { unavailable = true; } };
+}
+
+test('zero consumed inputs do not bypass a declared unconsumed workdir witness', async () => {
+  const f = unconsumedInputWorkdirHolder();
+  const result = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(f.reads(), 1);
+  assert.equal(f.mount.readGatedOrder()?.order?.workdir, '/owned/workdir');
+  assert.deepEqual(parse(result).order.consumes, {});
+});
+
+test('unconsumed workdir witness outage and value or version movement fence reads and writes', async () => {
+  for (const change of ['first-offline', 'offline', 'value', 'version'] as const) {
+    const f = unconsumedInputWorkdirHolder();
+    if (change !== 'first-offline') {
+      assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+    }
+    if (change === 'offline' || change === 'first-offline') f.offline();
+    else if (change === 'version') f.wire.workdirInput.version = 2;
+    else f.wire.workdirInput.value.path = '/changed/workdir';
+    for (const [name, args] of [['get_order', {}], ['submit', { path: 'plan', value: {} }],
+      ['ask', { path: 'plan', question: 'why' }]] as const) {
+      const result = await tool(f.mount.tools, name).handler(args, ctx);
+      assert.equal(result.isError, true, change + ': ' + name);
+    }
+    assert.equal(f.mount.readGatedOrder(), undefined);
+    assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+  }
+});
+
+test('unconsumed workdir witness requirement cannot fall back when its reader is missing', async () => {
+  const f = unconsumedInputWorkdirHolder({ noReader: true });
+  const result = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(result.isError, true);
+  assert.match(parse(result).error, /witness reader unavailable/);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+test('unconsumed workdir version movement during submit preparation is refused by the final read', async () => {
+  const f = unconsumedInputWorkdirHolder();
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const originalRead = f.hub.getOrder;
+  let reads = 0;
+  f.hub.getOrder = async req => {
+    if (++reads === 2) f.wire.workdirInput.version = 2;
+    return originalRead(req);
+  };
+  const result = await tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx);
+  assert.equal(result.isError, true);
+  assert.match(parse(result).error, /claim input observation changed/);
+  assert.equal(reads, 2);
+  assert.equal(f.calls.some(call => call.verb === 'submit'), false);
+});
+
 test('ordinary held MCP admits witnessed optional absence and never synthesizes a value', async () => {
   const f = optionalInputHolder();
   const get = tool(f.mount.tools, 'get_order');
