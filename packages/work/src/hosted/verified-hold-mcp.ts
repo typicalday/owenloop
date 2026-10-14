@@ -104,6 +104,20 @@ export function createVerifiedHostedHoldMcp(
   let reconciliationToken: string | undefined;
   let reconciliationDigest: string | undefined;
   let submitInFlight = false;
+  // A later failed independent observation fences requests still awaiting an
+  // older observation or signature. Cancellation remains request-scoped.
+  let observationRevision = 0;
+  function observationGuard(revision: number, ctx: Parameters<ToolRegistration['handler']>[1]): ToolResult | undefined {
+    if (ctx.cancelled) return refusal('call-cancelled');
+    return revision === observationRevision ? undefined : refusal('observation-superseded');
+  }
+  function invalidateObservation(revision: number): void {
+    if (revision === observationRevision) observationRevision++;
+  }
+  function refuseObservation(code: string, revision: number): ToolResult {
+    invalidateObservation(revision);
+    return refusal(code);
+  }
   function requireReconciliation(): void {
     reconciliationRequired = true;
     reconciliationEpoch++;
@@ -135,11 +149,12 @@ export function createVerifiedHostedHoldMcp(
     }
     return undefined;
   }
-  async function readVerified(ctx: Parameters<ToolRegistration['handler']>[1]): Promise<
+  async function observeVerified(revision: number, ctx: Parameters<ToolRegistration['handler']>[1]): Promise<
     | { ok: true; projection: HostedOrderProjection; fullDigest: string; startedAt: number; packet?: HostedVerifiedPacket }
     | { ok: false; result: ToolResult }
   > {
-    if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
+    const initialGuard = observationGuard(revision, ctx);
+    if (initialGuard !== undefined) return { ok: false, result: initialGuard };
     let ref = anchoredRef;
     const firstObservation = ref === undefined;
     let initialFullDigest: string;
@@ -147,6 +162,8 @@ export function createVerifiedHostedHoldMcp(
     let initialStableDigest: string;
     if (ref === undefined) {
       const privateOrder = await livePrivateOrder(ctx);
+      const afterPrivate = observationGuard(revision, ctx);
+      if (afterPrivate !== undefined) return { ok: false, result: afterPrivate };
       if (privateOrder === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
       ref = privateOrder.ref;
       initialFullDigest = privateOrder.fullDigest;
@@ -154,6 +171,8 @@ export function createVerifiedHostedHoldMcp(
       initialStableDigest = privateOrder.stableDigest;
     } else {
       const privateOrder = await livePrivateOrder(ctx);
+      const afterPrivate = observationGuard(revision, ctx);
+      if (afterPrivate !== undefined) return { ok: false, result: afterPrivate };
       if (privateOrder === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
       if (privateOrder.fullDigest !== anchoredFullDigest) return { ok: false, result: refusal('holder-order-changed') };
       initialFullDigest = privateOrder.fullDigest;
@@ -174,7 +193,8 @@ export function createVerifiedHostedHoldMcp(
     } catch {
       return { ok: false, result: refusal('verification-unavailable') };
     }
-    if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
+    const afterVerification = observationGuard(revision, ctx);
+    if (afterVerification !== undefined) return { ok: false, result: afterVerification };
     if (verified.state !== 'ready') {
       return { ok: false, result: refusal(verified.state === 'refused' ? verified.code : 'order-unavailable') };
     }
@@ -191,12 +211,13 @@ export function createVerifiedHostedHoldMcp(
     // A direct service observation cannot attest that this local process kept
     // the hold while verification was pending. The raw mount must still gate it.
     const current = await livePrivateOrder(ctx);
+    const afterCurrent = observationGuard(revision, ctx);
+    if (afterCurrent !== undefined) return { ok: false, result: afterCurrent };
     if (current === undefined) return { ok: false, result: refusal('holder-order-unavailable') };
     if (current.fullDigest !== initialFullDigest || current.referenceDigest !== initialReferenceDigest
       || current.stableDigest !== initialStableDigest) {
       return { ok: false, result: refusal('holder-order-changed') };
     }
-    if (ctx.cancelled) return { ok: false, result: refusal('call-cancelled') };
     const stale = observationCurrent(verified, startedAt);
     if (stale !== undefined) return { ok: false, result: stale };
     anchoredRef = ref;
@@ -204,15 +225,25 @@ export function createVerifiedHostedHoldMcp(
     return { ok: true, projection: verified, fullDigest: initialFullDigest, startedAt,
       ...(verifiedPacket === undefined ? {} : { packet: verifiedPacket }) };
   }
+  async function readVerified(revision: number, ctx: Parameters<ToolRegistration['handler']>[1]): ReturnType<typeof observeVerified> {
+    const checked = await observeVerified(revision, ctx);
+    const stale = observationGuard(revision, ctx);
+    if (stale !== undefined) return { ok: false, result: stale };
+    if (!checked.ok) invalidateObservation(revision);
+    return checked;
+  }
   const orderTool: ToolRegistration = {
     name: 'get_order',
     description: 'Return the locally verified hosted order projection for this bound workflow/run.',
     inputSchema: rawGet.inputSchema,
     handler: async (_args, ctx) => {
+      const revision = observationRevision;
       const reconciling = reconciliationRequired;
       const startedEpoch = reconciliationEpoch;
-      const checked = await readVerified(ctx);
+      const checked = await readVerified(revision, ctx);
       if (!checked.ok) return checked.result;
+      const beforeExposure = observationGuard(revision, ctx);
+      if (beforeExposure !== undefined) return beforeExposure;
       if (reconciliationRequired && (!reconciling || startedEpoch !== reconciliationEpoch)) {
 	return refusal('reconciliation-superseded');
       }
@@ -244,6 +275,9 @@ export function createVerifiedHostedHoldMcp(
       },
     },
     handler: async (args, ctx) => {
+      const revision = observationRevision;
+      const initialGuard = observationGuard(revision, ctx);
+      if (initialGuard !== undefined) return initialGuard;
       const path = args['path'];
       const value = args['value'];
       const done = args['done'];
@@ -261,8 +295,10 @@ export function createVerifiedHostedHoldMcp(
       const visibleDigest = reconciliationDigest;
       submitInFlight = true;
       try {
-	const checked = await readVerified(ctx);
+	const checked = await readVerified(revision, ctx);
 	if (!checked.ok) return checked.result;
+	const beforeSigning = observationGuard(revision, ctx);
+	if (beforeSigning !== undefined) return beforeSigning;
 	if (reconciling && (reconciliationEpoch !== submitEpoch || reconciliationToken !== submittedToken)) {
 	  return refusal('submit-reconciliation-required');
 	}
@@ -281,13 +317,15 @@ export function createVerifiedHostedHoldMcp(
 	  return refusal('submit-proof-unavailable');
 	}
 	if (typeof proof !== 'string' || proof.length === 0) return refusal('submit-proof-unavailable');
-	if (ctx.cancelled) return refusal('call-cancelled');
+	const beforeCurrent = observationGuard(revision, ctx);
+	if (beforeCurrent !== undefined) return beforeCurrent;
 	const current = await livePrivateOrder(ctx);
-	if (current === undefined) return refusal('holder-order-unavailable');
-	if (current.fullDigest !== checked.fullDigest) return refusal('holder-order-changed');
-	if (ctx.cancelled) return refusal('call-cancelled');
+	const beforeSubmit = observationGuard(revision, ctx);
+	if (beforeSubmit !== undefined) return beforeSubmit;
+	if (current === undefined) return refuseObservation('holder-order-unavailable', revision);
+	if (current.fullDigest !== checked.fullDigest) return refuseObservation('holder-order-changed', revision);
 	const stale = observationCurrent(checked.projection, checked.startedAt);
-	if (stale !== undefined) return stale;
+	if (stale !== undefined) { invalidateObservation(revision); return stale; }
 	if (reconciling && (reconciliationEpoch !== submitEpoch || reconciliationToken !== submittedToken
 	  || reconciliationDigest !== visibleDigest)) return refusal('submit-reconciliation-required');
       let response: ConditionalSubmitResponse;
