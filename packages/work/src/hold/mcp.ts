@@ -196,6 +196,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   let inputWitnesses: Array<{ path: string; version: number; present: boolean }> | undefined;
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
+  // A newer failed observation invalidates requests already awaiting an older
+  // witness. Their late completion cannot restore model data or write authority.
+  let refusalRevision = 0;
   let canonicalWorkflow: string | undefined;
   let firstContactIdentityRefusal: ToolResult | undefined;
   let stopping = false;
@@ -242,9 +245,23 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   };
 
   /** The fast-fail both tools apply once the hold is over. */
-  function terminalGuard(): ToolResult | undefined {
-    if (terminal === undefined && !stopping) return undefined;
-    return textResult({ error: `order no longer held (${terminal ?? 'stopping'}) — stop` }, true);
+  function terminalGuard(requestRevision?: number): ToolResult | undefined {
+    if (terminal !== undefined || stopping) {
+      return textResult({ error: `order no longer held (${terminal ?? 'stopping'}) — stop` }, true);
+    }
+    return requestRevision === undefined ? undefined : supersededGuard(requestRevision);
+  }
+
+  function supersededGuard(requestRevision: number): ToolResult | undefined {
+    return requestRevision === refusalRevision ? undefined
+      : textResult({ error: 'order observation superseded by a newer refusal' }, true);
+  }
+
+  function invalidateObservation(requestRevision: number): void {
+    // An already-superseded completion cannot erase a later verified packet.
+    if (requestRevision !== refusalRevision) return;
+    refusalRevision++;
+    captured = undefined;
   }
 
   function identityGuard(res: GetOrderResponse): ToolResult | undefined {
@@ -263,7 +280,22 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     return undefined;
   }
 
-  async function gate(res: GetOrderResponse): Promise<ToolResult | undefined> {
+  async function gate(res: GetOrderResponse, requestRevision: number): Promise<ToolResult | undefined> {
+    const superseded = supersededGuard(requestRevision);
+    if (superseded !== undefined) return superseded;
+    try {
+      const refused = await observeGate(res, requestRevision);
+      const afterObservation = supersededGuard(requestRevision);
+      if (afterObservation !== undefined) return afterObservation;
+      if (refused !== undefined) invalidateObservation(requestRevision);
+      return refused;
+    } catch (error) {
+      invalidateObservation(requestRevision);
+      throw error;
+    }
+  }
+
+  async function observeGate(res: GetOrderResponse, requestRevision: number): Promise<ToolResult | undefined> {
     if (firstContactIdentityRefusal !== undefined) return firstContactIdentityRefusal;
     const refusedIdentity = identityGuard(res);
     if (refusedIdentity !== undefined) return refusedIdentity;
@@ -289,6 +321,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       }
       try {
 	const bound = await deps.modelOrderVerifier(res.order);
+	const superseded = supersededGuard(requestRevision);
+	if (superseded !== undefined) return superseded;
 	if (!bound.ok) return textResult({ error: bound.reason }, true);
 	// An unconsumed declared input may determine cwd while inputs is empty.
 	// This decision comes only from the local definition, never the packet.
@@ -303,6 +337,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       let observed: TrustedInputAdmission;
       try { observed = await deps.trustedInputV2.observe(res.order); }
       catch { return textResult({ error: 'trusted input v2 refusal: reference unavailable' }, true); }
+      const superseded = supersededGuard(requestRevision);
+      if (superseded !== undefined) return superseded;
       if (!observed.ok) return textResult({ error: `trusted input v2 refusal: ${observed.reason}` }, true);
       if (v2Pin && (v2Pin.packetDigest !== observed.packetDigest || v2Pin.witnessDigest !== observed.witnessDigest)) {
 	captured = undefined;
@@ -322,6 +358,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     }
     try {
       const checked = await deps.consumedVerifier(res.order, { hardRule: false });
+      const superseded = supersededGuard(requestRevision);
+      if (superseded !== undefined) return superseded;
       if (!checked.ok) return textResult({ error: checked.reason }, true);
       for (const warning of checked.warnings) deps.err(warning);
       return undefined;
@@ -336,29 +374,30 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       "Return the bound run's gated dynamic order state: consumed inputs, owed paths, and rejection reasons. Static task instructions and schemas come from the locally verified workflow definition or agent brief, not this tool. Takes no arguments.",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     handler: async () => {
-      const gone = terminalGuard();
+      const requestRevision = refusalRevision;
+      const gone = terminalGuard(requestRevision);
       if (gone !== undefined) return gone;
       if (deps.trustedInputV2) {
 	try {
 	  const res = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(res);
-	  const afterGate = terminalGuard();
+	  const refused = await gate(res, requestRevision);
+	  const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined);
 	  if (afterGate !== undefined) return afterGate;
-	  if (refused !== undefined) { captured = undefined; return refused; }
+	  if (refused !== undefined) return refused;
 	  captured = res;
 	  return textResult(orderView(res, inputWitnesses));
-	} catch { captured = undefined; return textResult({ error: 'held get_order unavailable' }, true); }
+	} catch { invalidateObservation(requestRevision); return textResult({ error: 'held get_order unavailable' }, true); }
       }
       if (captured !== undefined) {
-        const refused = await gate(captured);
-        const afterGate = terminalGuard();
+	const refused = await gate(captured, requestRevision);
+	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         return textResult(orderView(captured));
       }
       if (firstContact !== undefined) {
-        const refused = await gate(firstContact);
-        const afterGate = terminalGuard();
+	const refused = await gate(firstContact, requestRevision);
+	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = firstContact;
@@ -366,13 +405,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       }
       try {
         const res = await hub.getOrder({ workflow, run, ...holderReq });
-        const refused = await gate(res);
-        const afterGate = terminalGuard();
+	const refused = await gate(res, requestRevision);
+	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = res;
         return textResult(orderView(res));
       } catch (e) {
+	invalidateObservation(requestRevision);
         return textResult({ error: errMsg(e) }, true);
       }
     },
@@ -398,7 +438,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       additionalProperties: false,
     },
     handler: async (args) => {
-      const gone = terminalGuard();
+      const requestRevision = refusalRevision;
+      const gone = terminalGuard(requestRevision);
       if (gone !== undefined) return gone;
       const path = args['path'];
       if (typeof path !== 'string' || path === '') {
@@ -432,8 +473,10 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (orderResponse === undefined) {
           orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
         }
-        const refused = await gate(orderResponse);
+	const refused = await gate(orderResponse, requestRevision);
         if (refused !== undefined) return refused;
+	const afterGate = terminalGuard(requestRevision);
+	if (afterGate !== undefined) return afterGate;
 	if (orderResponse.order === null) {
 	  return textResult({ error: 'submit order refusal: no bound order packet is available' }, true);
 	}
@@ -462,10 +505,10 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	// Key access and signing may await. Fence the claim again before writing.
 	if (deps.trustedInputV2) {
 	  const fresh = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refusedFresh = await gate(fresh);
-	  if (refusedFresh !== undefined) { captured = undefined; return refusedFresh; }
+	  const refusedFresh = await gate(fresh, requestRevision);
+	  if (refusedFresh !== undefined) return refusedFresh;
 	}
-        const beforeSubmit = terminalGuard();
+	const beforeSubmit = terminalGuard(requestRevision);
         if (beforeSubmit !== undefined) return beforeSubmit;
         const res = await hub.submit({
           workflow,
@@ -500,7 +543,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       additionalProperties: false,
     },
     handler: async (args) => {
-      const gone = terminalGuard();
+      const requestRevision = refusalRevision;
+      const gone = terminalGuard(requestRevision);
       if (gone !== undefined) return gone;
       const path = args['path'];
       const text = args['text'];
@@ -517,9 +561,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       try {
 	if (deps.trustedInputV2) {
 	  const current = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(current);
-	  if (refused !== undefined) { captured = undefined; return refused; }
-	  const afterGate = terminalGuard();
+	  const refused = await gate(current, requestRevision);
+	  if (refused !== undefined) return refused;
+	  const afterGate = terminalGuard(requestRevision);
 	  if (afterGate !== undefined) return afterGate;
 	}
         const res = await hub.reject({ workflow, run, path, text, ...(requested === undefined ? {} : { requested }) });
@@ -557,7 +601,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       additionalProperties: false,
     },
     handler: async (args) => {
-      const gone = terminalGuard();
+      const requestRevision = refusalRevision;
+      const gone = terminalGuard(requestRevision);
       if (gone !== undefined) return gone;
       const path = args['path'];
       const question = args['question'];
@@ -574,9 +619,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       try {
 	if (deps.trustedInputV2) {
 	  const current = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(current);
-	  if (refused !== undefined) { captured = undefined; return refused; }
-	  const afterGate = terminalGuard();
+	  const refused = await gate(current, requestRevision);
+	  if (refused !== undefined) return refused;
+	  const afterGate = terminalGuard(requestRevision);
 	  if (afterGate !== undefined) return afterGate;
 	}
         const res = await hub.ask({
@@ -622,7 +667,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       additionalProperties: false,
     },
     handler: async (args) => {
-      const gone = terminalGuard();
+      const requestRevision = refusalRevision;
+      const gone = terminalGuard(requestRevision);
       if (gone !== undefined) return gone;
       const file = args['file'];
       if (typeof file !== 'string' || file.trim() === '') {
@@ -651,12 +697,12 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
 	if (deps.trustedInputV2) {
 	  const current = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(current);
-	  if (refused !== undefined) { captured = undefined; return refused; }
-	  const afterGate = terminalGuard();
+	  const refused = await gate(current, requestRevision);
+	  if (refused !== undefined) return refused;
+	  const afterGate = terminalGuard(requestRevision);
 	  if (afterGate !== undefined) return afterGate;
 	}
-        const beforeUpload = terminalGuard();
+	const beforeUpload = terminalGuard(requestRevision);
         if (beforeUpload !== undefined) return beforeUpload;
         const res = await hub.putFileArtifact({ workflow, bytes, contentType, filename });
         // Hand back the envelope EXACTLY as it must be submitted. The hub's

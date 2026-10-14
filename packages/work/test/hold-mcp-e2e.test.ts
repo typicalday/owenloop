@@ -276,7 +276,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const supplied = mode === 'supplied';
   const workdirInput = mode === 'workdir';
@@ -324,6 +324,11 @@ steps:
     const seen: string[] = [];
     let witnessAvailable = true;
     let witnessWorkflow = canonicalWorkflow;
+    let witnessReads = 0;
+    let firstWitnessEntered!: () => void;
+    let releaseFirstWitness!: () => void;
+    const firstWitnessPaused = new Promise<void>(resolve => { firstWitnessEntered = resolve; });
+    const firstWitnessResume = new Promise<void>(resolve => { releaseFirstWitness = resolve; });
     server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
       seen.push(req.url!);
       assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);
@@ -338,7 +343,12 @@ steps:
 	  res.end(JSON.stringify({ protocol: 'trusted-reference-read-v2', state: routing ? 'routing-unsupported' : 'unsupported-feedback', workflow: 'wf1', run: 'run1' }));
 	  return;
 	}
-	res.end(JSON.stringify(witnessAvailable ? {
+	const availableAtRead = witnessAvailable;
+	if (mode === 'overlap' && ++witnessReads === 1) {
+	  firstWitnessEntered();
+	  await firstWitnessResume;
+	}
+	res.end(JSON.stringify(availableAtRead ? {
 	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: witnessWorkflow, run: 'run1',
 	  order: { ...packet, workflow: witnessWorkflow, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput || emptyInputs ? [] : [
 	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
@@ -358,6 +368,22 @@ steps:
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
       '--heartbeat-interval', '25', '--mcp'], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
+    if (mode === 'overlap') {
+      const older = callTool(mcp, 'get_order');
+      await firstWitnessPaused;
+      witnessAvailable = false;
+      const newer = await callTool(mcp, 'get_order');
+      assert.equal(newer.isError, true);
+      assert.match(newer.body.error, /service-unavailable/);
+      releaseFirstWitness();
+      const late = await older;
+      assert.equal(late.isError, true, 'delayed old HTTPS response cannot undo newer refusal');
+      assert.match(late.body.error, /superseded.*refusal/);
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
     const viewed = await callTool(mcp, 'get_order');
     if (emptyInputs) {
       assert.equal(viewed.isError, true, 'normal zero-input holder must refuse unsupported dynamic state');

@@ -1260,7 +1260,7 @@ test('put_file_artifact refuses once the hold is terminal', async () => {
 
 // Hermetic input-boundary tests, not deployed workflow acceptance evidence.
 function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supplied?: boolean;
-  workdir?: string; canonicalChild?: boolean; admissionNow?: () => number } = {}) {
+  workdir?: string; canonicalChild?: boolean; admissionNow?: () => number; proofHook?: () => Promise<void> } = {}) {
   const definition = buildDef({ name: 'optional-input-holder',
     inputs: [{ name: 'optional', seedOwed: cfg.required ?? false }],
     steps: [{ name: 'planner', consumes: ['optional'], produces: ['plan'] }] });
@@ -1295,6 +1295,7 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
     }, consumedVerifier: async (order, options) => {
       assert.equal(options?.hardRule, true);
       assert.deepEqual(order.consumes, {});
+      await cfg.proofHook?.();
       return { ok: true, order, warnings: [] };
     } });
   const { hub, calls } = mockHub({ getOrder: response });
@@ -1307,7 +1308,8 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
     consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
   }));
   return { mount, hub, response, wire, calls, reads: () => reads,
-    offline: () => { unavailable = true; }, serviceRefused: () => { serviceRefused = true; } };
+    offline: () => { unavailable = true; }, serviceRefused: () => { serviceRefused = true; },
+    serviceRestored: () => { serviceRefused = false; } };
 }
 
 test('ordinary input holder verifies the canonical child but keeps every submit bound to the requested root', async () => {
@@ -1679,5 +1681,65 @@ test('ordinary holder fences wall expiry during the final observation after sign
   assert.equal(samples, 6, 'initial, pre-sign and final observations sampled');
   assert.equal(f.reads(), 3);
   assert.equal(f.mount.readGatedOrder(), undefined);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+function deferredWitness() {
+  let release!: () => void;
+  let entered!: () => void;
+  const resumed = new Promise<void>(resolve => { release = resolve; });
+  const paused = new Promise<void>(resolve => { entered = resolve; });
+  return { release, paused, async wait() { entered(); await resumed; } };
+}
+
+test('an overlapping witness refusal cannot be undone by an earlier pending model read', async () => {
+  const pause = deferredWitness();
+  let proofs = 0;
+  const f = optionalInputHolder({ proofHook: async () => { if (++proofs === 1) await pause.wait(); } });
+  const older = tool(f.mount.tools, 'get_order').handler({}, ctx);
+  await pause.paused;
+  f.serviceRefused();
+  const newer = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(newer.isError, true);
+  pause.release();
+  const late = await older;
+  assert.equal(late.isError, true);
+  assert.match(parse(late).error, /superseded.*refusal/);
+  assert.equal(f.mount.readGatedOrder(), undefined);
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+test('an overlapping witness refusal fences pending final submission without clearing a newer verified read', async () => {
+  const pause = deferredWitness();
+  let proofs = 0;
+  const f = optionalInputHolder({ proofHook: async () => { if (++proofs === 3) await pause.wait(); } });
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const older = tool(f.mount.tools, 'submit').handler({ path: 'plan', value: {} }, ctx);
+  await pause.paused;
+  f.serviceRefused();
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, true);
+  f.serviceRestored();
+  assert.equal((await tool(f.mount.tools, 'get_order').handler({}, ctx)).isError, undefined);
+  const newest = f.mount.readGatedOrder();
+  pause.release();
+  const late = await older;
+  assert.equal(late.isError, true);
+  assert.match(parse(late).error, /superseded.*refusal/);
+  assert.equal(f.mount.readGatedOrder(), newest, 'stale completion must not erase later verified state');
+  assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
+});
+
+test('overlapping healthy witness reads remain admissible', async () => {
+  const pause = deferredWitness();
+  let proofs = 0;
+  const f = optionalInputHolder({ proofHook: async () => { if (++proofs === 1) await pause.wait(); } });
+  const older = tool(f.mount.tools, 'get_order').handler({}, ctx);
+  await pause.paused;
+  const newer = await tool(f.mount.tools, 'get_order').handler({}, ctx);
+  assert.equal(newer.isError, undefined);
+  pause.release();
+  assert.equal((await older).isError, undefined);
+  assert.equal(f.reads(), 2);
+  assert.ok(f.mount.readGatedOrder());
   assert.equal(f.calls.some(call => call.verb !== 'get_order'), false);
 });
