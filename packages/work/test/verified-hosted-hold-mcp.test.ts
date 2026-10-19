@@ -56,7 +56,7 @@ function fixture(enableSubmit = false, settings: {
   function projection(packet: OrderPacket): HostedOrderResult {
     const result = ready(packet);
     if (settings.v2 && result.state === 'ready') Object.assign(result.serviceObservation, {
-      referenceProtocol: 'trusted-reference-read-v2', inputWitnessDigest: witnessDigest,
+      workflow: packet.workflow, referenceProtocol: 'trusted-reference-read-v2', inputWitnessDigest: witnessDigest,
       packetDigest: hostedReferenceV2Digest(packet, settings.declaredInputPaths ?? []),
     });
     return result;
@@ -89,12 +89,12 @@ function fixture(enableSubmit = false, settings: {
 	rawGets++;
 	await settings.onRawGet?.(rawGets, heldOrder);
 	if (!holding) return textResult({ error: 'order no longer held' }, true);
-	return textResult({ workflow: 'wf', run: 'run', order: reducedOrder(heldOrder) });
+	return textResult({ workflow: heldOrder.workflow, run: 'run', order: reducedOrder(heldOrder) });
       } },
       unsafeAction,
     ],
     readGatedOrder: () => holding
-      ? { text: 'RAW HUB TEXT', workflow: 'wf', run: 'run', order: heldOrder, lease: { claimed: true } }
+      ? { text: 'RAW HUB TEXT', workflow: heldOrder.workflow, run: 'run', order: heldOrder, lease: { claimed: true } }
       : undefined,
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
@@ -840,5 +840,27 @@ test('healthy overlapping verified reads and a cancelled sibling preserve fresh 
     if (cancelOlder) assert.match(completed.content[0]!.text, /call-cancelled/);
     const later = await f.call();
     assert.equal(later.isError, undefined, later.content[0]?.text);
+  }
+});
+
+
+test('v2 verified canonical child remains independently matched, pinned, and root-bound for conditional writes', async () => {
+  const child = { ...structuredClone(rawOrder), workflow: 'wf-canonical-child' };
+  const f = fixture(true, { v2: true });
+  f.mutateHeldOrder(order => Object.assign(order, child));f.setPacket(child);
+  assert.equal((await f.call()).isError, undefined);
+  assert.equal((await f.submit({ path: 'out', value: { n: 1 } })).isError, undefined);
+  assert.deepEqual(f.submits.map(({ workflow, run }) => ({ workflow, run })), [{ workflow: 'wf', run: 'run' }]);
+  for (const move of ['private-only', 'independent-only', 'both'] as const) {
+    const g = fixture(true, { v2: true });
+    g.mutateHeldOrder(order => Object.assign(order, child));g.setPacket(child);
+    assert.equal((await g.call()).isError, undefined);
+    const changed = { ...child, workflow: 'wf-changed-child' };
+    if (move !== 'independent-only') g.mutateHeldOrder(order => Object.assign(order, changed));
+    if (move !== 'private-only') g.setPacket(changed);
+    const refused = await g.submit({ path: 'out', value: { n: 1 } });
+    assert.equal(refused.isError, true, move);
+    assert.equal(g.submits.length, 0, move);
+    assert.equal(g.calls.includes('sign'), false, move);
   }
 });

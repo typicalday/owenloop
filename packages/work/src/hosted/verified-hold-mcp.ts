@@ -50,10 +50,15 @@ function privatePreflight(result: ToolResult, gated: GetOrderResponse | undefine
   const packet = record(view);
   const visible = record(packet?.order);
   const order = record(gated?.order);
-  if (packet?.workflow !== bound.workflow || packet?.run !== bound.run
-    || visible?.workflow !== bound.workflow || visible?.run !== bound.run
-    || gated?.workflow !== bound.workflow || gated.run !== bound.run
-    || order?.workflow !== bound.workflow || order?.run !== bound.run
+  // A parent-bound private read may resolve to a canonical child. Only the
+  // independent v2 observation can authorize it; the hint never retargets the
+  // adapter's root/run-bound service requests.
+  const canonicalWorkflow = v2 ? gated?.workflow : bound.workflow;
+  if (typeof canonicalWorkflow !== 'string' || canonicalWorkflow.length === 0
+    || packet?.workflow !== canonicalWorkflow || packet?.run !== bound.run
+    || visible?.workflow !== canonicalWorkflow || visible?.run !== bound.run
+    || gated?.workflow !== canonicalWorkflow || gated.run !== bound.run
+    || order?.workflow !== canonicalWorkflow || order?.run !== bound.run
     || visible.step !== order.step || visible.key !== order.key || visible.defDigest !== order.defDigest
     || typeof order.defDigest !== 'string') return undefined;
   if (Object.keys(order).some((field) => !RAW_ORDER_FIELDS.has(field))

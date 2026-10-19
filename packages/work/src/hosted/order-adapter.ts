@@ -340,7 +340,8 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	const envelope = record(response);
 	if (!envelope) return refused('direct-response-malformed');
 	if (envelope.protocol !== (referenceV2 ? 'trusted-reference-read-v2' : REFERENCE_PROTOCOL)) return refused('reference-protocol-unavailable');
-	if (envelope.workflow !== expectedWorkflowId || envelope.run !== expectedRunId) return refused('reference-rebound');
+	const canonicalWorkflowId = v2?.workflow ?? expectedWorkflowId;
+	if (envelope.workflow !== canonicalWorkflowId || envelope.run !== expectedRunId) return refused('reference-rebound');
 	if (envelope.state !== 'available') {
 	  if (envelope.state === 'unavailable' || envelope.state === 'unsupported-feedback' || envelope.state === 'routing-unsupported') {
 	    return refused(`service-${envelope.state}`);
@@ -351,7 +352,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	const order = envelope.order as OrderPacket;
 	const lease = record(envelope.lease);
 	if (!record(order) || !lease
-	  || order.workflow !== expectedWorkflowId || order.run !== expectedRunId
+	  || order.workflow !== canonicalWorkflowId || order.run !== expectedRunId
 	  || typeof order.defDigest !== 'string' || order.defDigest.toLowerCase() !== ref.defDigest) return refused('reference-rebound');
 	if (lease.claimed !== true || lease.outcome !== undefined) return refused('claim-not-current');
 	if (Object.keys(lease).some((field) => !LEASE_FIELDS.has(field))) return refused('direct-response-malformed');
@@ -422,7 +423,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	let inputWitnessDigest: string | undefined;
 	if (v2) {
 	  const bound = await bindTrustedReferenceV2({ response: v2,
-	    expected: { workflow: expectedWorkflowId, run: expectedRunId, defDigest: ref.defDigest, step: order.step, key: order.key },
+	    expected: { workflow: canonicalWorkflowId, run: expectedRunId, defDigest: ref.defDigest, step: order.step, key: order.key },
 	    step, declaredInputs: staticResult.declaredInputs, consumedVerifier, callsProducers: staticResult.callsProducers });
 	  if (signal.aborted) return refused('claim-observation-expired');
 	  if (!bound.ok) return refused(`reference-v2-${bound.reason}`);

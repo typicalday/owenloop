@@ -276,7 +276,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -284,7 +284,7 @@ test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTP
   const feedback = mode === 'feedback';
   const routing = mode === 'routing';
   const emptyInputs = feedback || routing;
-  const canonicalWorkflow = mode === 'child' ? 'wf_child' : 'wf1';
+  const canonicalWorkflow = (mode === 'child' || mode === 'verified-child') ? 'wf_child' : 'wf1';
   const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
 inputs:
 ${emptyInputs ? '  []' : workdirInput ? `  - name: config
@@ -422,6 +422,15 @@ steps:
 	const late = await older;
 	assert.equal(newer.isError, false, JSON.stringify(newer.body));
 	assert.equal(late.isError, false, JSON.stringify(late.body));
+      }
+      if (mode === 'verified-child') {
+	assert.equal(viewed.body.serviceObservation.workflow, 'wf_child');
+	witnessWorkflow = 'wf_changed_child';
+	const moved = await callTool(mcp, 'get_order');
+	assert.equal(moved.isError, true, 'a newer independent child identity cannot replace the pinned child');
+	assert.doesNotMatch(JSON.stringify(moved.body), /a local test proposal/);
+	witnessWorkflow = canonicalWorkflow;
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'fresh verification of the original child recovers');
       }
       witnessAvailable = false;
       const refused = await callTool(mcp, 'get_order');

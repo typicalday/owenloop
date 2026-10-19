@@ -20,6 +20,13 @@ loss, unsupported feedback/routing, or a v1 response refuses exposure and
 pending writes. There is no v1 fallback after v2 selection. The outer real read
 deadline and wall/monotonic freshness checks still apply.
 
+A parent-bound v2 request may resolve to a Service-authorized canonical child.
+The private outer/inner order identities and independent witness must agree on
+that child and the exact requested run. The child is pinned across subsequent
+reads. MCP navigation, HTTPS requests, and conditional writes retain the
+original requested root/run; neither private content nor a later child can
+retarget them. Legacy v1 still requires its original exact workflow binding.
+
 Partial conditional submissions may advance only owed target versions. A
 private `get_order`-only mount can refresh those versions; ordinary mutation
 tools cannot select that mode. The wrapper keeps every other private field and
@@ -36,8 +43,8 @@ choice is fixed before reading untrusted preflight content. The existing
 `local-hosted-order-v1` projection gains the explicit v2 reference marker and
 declared-input witness labels; no new Service protocol or signer is introduced.
 
-Root-bound v2 optional-input source tests do not establish hosted canonical,
-canonical-child, native, signed-feedback authority, or full migration acceptance.
+Local v2 optional-input and canonical-child tests do not establish hosted or
+native child execution, signed-feedback authority, or full migration acceptance.
 
 ## Legacy v1 adapter contract
 

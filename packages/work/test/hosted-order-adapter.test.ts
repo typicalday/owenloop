@@ -925,3 +925,23 @@ test('v1 hosted source refuses a calls-produced path without a verified child cl
     });
   }
 });
+
+
+test('v2 adapter resolves a root-bound reference to a matched canonical child without retargeting navigation', async () => {
+  let corruptInner = false;
+  const h = await harness({ referenceV2: p => {
+    const wire = v2Wire(p, ['seed']);
+    if (corruptInner) (wire.order as OrderPacket).workflow = 'wf-other-child';
+    return wire;
+  } });
+  h.p.workflow = 'wf-canonical-child';
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') assert.equal(result.serviceObservation.workflow, 'wf-canonical-child');
+  const retarget = preflight(h.f.defDigest) as { order: { workflow: string } };
+  retarget.order.workflow = 'wf-canonical-child';
+  assert.equal((await h.adapter.open(retarget)).state, 'refused', 'canonical child cannot retarget root-bound navigation');
+  corruptInner = true;
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused', 'outer and inner independent identities must agree');
+  assert.equal(h.fetches(), 0, 'v2 selection never invokes the v1 route');
+});
