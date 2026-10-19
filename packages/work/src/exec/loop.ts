@@ -900,12 +900,13 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     for (const owe of order.owes) {
       let proof: string | undefined;
       try {
-        if (opts.origin !== undefined) {
+	const signingOrigin = opts.origin;
+	if (signingOrigin !== undefined) {
 	  // The immutable order can authorize a judge proof only when the owed
 	  // path is the fingerprinted judged artifact. Producer command receipts
 	  // remain unsigned until the hub issues a retry-safe target version.
-          proof = await buildSubmitProof({
-            origin: opts.origin,
+	  const signing = await prepareWhileHeld(() => buildSubmitProof({
+	    origin: signingOrigin,
             order,
             path: owe.path,
             value: receipt,
@@ -914,7 +915,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
             ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
             ...(opts.env !== undefined ? { env: opts.env } : {}),
             ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
-          });
+	  }));
+	  if (signing.kind === 'lease') return mapNoHold(signing.outcome);
+	  proof = signing.value;
         }
       } catch (e) {
         return failSubmit(owe.path, e);
@@ -934,6 +937,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       let res: Awaited<ReturnType<HubClient['submit']>> | undefined;
 
       for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
+	// A signed proof or an earlier ACK cannot revive a stopped/lost lease.
+	// Consume already-sent ACKs normally; fence only sends not yet begun.
+	if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
         try {
           res = await hub.submit(submitRequest);
           break;

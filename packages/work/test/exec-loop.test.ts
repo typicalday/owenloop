@@ -2408,3 +2408,94 @@ for (const stage of ['instruction resolution', 'pre-launch revalidation'] as con
     assert.equal(await running, 'killed');
   });
 }
+
+for (const stage of ['key inspection', 'signature'] as const) {
+  for (const ending of ['stop', 'lease loss'] as const) {
+    test(`${ending} during pending receipt ${stage} settles without a late submit`, async () => {
+      const fr = fakeRunner();
+      const response = commandOrder({ judge: 'input', owes: ['input'] });
+      response.order!.consumedFingerprint = { input: 4 };
+      let revoked = false;
+      const { hub, calls, submits } = mockHub({ getOrder: [response], submit: ['green'], heartbeat: () => {
+	if (revoked) throw new HubError(403, 'claim revoked');
+      } });
+      let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+      let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+      const pause = async () => { entered();await blocked; };
+      const keys = signingKeys();const inspect = keys.inspect;
+      if (stage === 'key inspection') keys.inspect = async ref => { await pause();return inspect(ref); };
+      const sshCalls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
+      const ssh = fakeSshProcess(sshCalls);const runSsh = ssh.run;
+      if (stage === 'signature') ssh.run = async (cmd, args, opts) => {
+	if (args[0] === '-Y' && args[1] === 'sign') await pause();
+	return runSsh(cmd, args, opts);
+      };
+      const loop = createExecLoop(baseOpts(hub, fr.runner, { origin: 'https://hub.example.test', principalKeys: keys, sshProcess: ssh }));
+      const running = loop.run();await macrotaskSleep();fr.resolve(result(0));await pending;
+      if (ending === 'stop') loop.stop('signal');else revoked = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let beforeResume: string;
+      try {
+	beforeResume = await Promise.race([running, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 100); })]);
+      } finally { clearTimeout(timer);resume();await running; }
+      await macrotaskSleep();
+      assert.deepEqual({ outcomeBeforeResume: beforeResume, submitted: submits.length },
+	{ outcomeBeforeResume: ending === 'stop' ? 'killed' : 'ownership-error', submitted: 0 });
+      assert.equal(only(calls, 'release').length, ending === 'stop' ? 1 : 0);
+      assert.equal(only(calls, 'ask').length, 0);assert.equal(only(calls, 'reject').length, 0);
+    });
+  }
+}
+
+for (const ending of ['stop', 'lease loss'] as const) {
+  test(`${ending} while first receipt ACK is pending preserves that ACK without sending the next receipt`, async () => {
+    const fr = fakeRunner();let revoked = false;
+    const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ owes: ['first', 'second'] })], submit: ['green'],
+      heartbeat: () => { if (revoked) throw new HubError(403, 'claim revoked'); },
+    });
+    let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+    let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+    const submit = hub.submit;
+    hub.submit = async req => {
+      const ack = await submit(req);
+      if (req.path === 'first') { entered();await blocked; }
+      return ack;
+    };
+    const loop = createExecLoop(baseOpts(hub, fr.runner));const running = loop.run();
+    await macrotaskSleep();fr.resolve(result(0));await pending;
+    if (ending === 'stop') loop.stop('signal');else revoked = true;
+    await macrotaskSleep();await macrotaskSleep();resume();
+    const outcome = await running;
+    assert.deepEqual({ outcome, submittedPaths: submits.map(x => x.path) },
+      { outcome: ending === 'stop' ? 'killed' : 'ownership-error', submittedPaths: ['first'] });
+    assert.equal(only(calls, 'release').length, ending === 'stop' ? 1 : 0);
+  });
+}
+
+for (const late of ['proof', 'error'] as const) {
+  test(`stop fences a late signing ${late} while final release is still pending`, async () => {
+    const fr = fakeRunner();const response = commandOrder({ judge: 'input', owes: ['input'] });
+    response.order!.consumedFingerprint = { input: 4 };
+    let release!: () => void;
+    const { hub, submits } = mockHub({ getOrder: [response], submit: ['green'],
+      release: () => new Promise(resolve => { release = () => resolve({ text: '' }); }),
+    });
+    let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+    let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+    const keys = signingKeys();const inspect = keys.inspect;
+    keys.inspect = async ref => { entered();await blocked;
+      if (late === 'error') throw new Error('late signing failure');
+      return inspect(ref);
+    };
+    const sshCalls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
+    const loop = createExecLoop(baseOpts(hub, fr.runner, { origin: 'https://hub.example.test',
+      principalKeys: keys, sshProcess: fakeSshProcess(sshCalls), sleep: () => new Promise<void>(() => {}),
+    }));
+    const running = loop.run();await macrotaskSleep();fr.resolve(result(0));await pending;
+    loop.stop('signal');await macrotaskSleep();resume();await macrotaskSleep();
+    let settled = false;void running.then(() => { settled = true; });await macrotaskSleep();
+    try { assert.equal(submits.length, 0);assert.equal(settled, false, 'bounded final release is still awaited'); }
+    finally { release();await running; }
+    assert.equal(await running, 'killed');
+  });
+}

@@ -175,3 +175,10 @@ command launch and releases prepared payload directories while a late private
 result remains fenced. Stop still waits for the existing bounded final release.
 A private resolver may continue its own background work; this fence does not
 forcibly terminate it or roll back effects it already performed.
+
+Receipt signing is subordinate to the same lease fence. A stop or observed
+terminal lease while key inspection/signing is pending prevents a later submit.
+Each send checks the lease again, including a later owed path after an earlier
+receipt acknowledgement. Requests already sent still consume their normal ACK;
+the client does not undo committed receipts or silently retry uncertain writes.
+Private signing work may finish in the background without authorizing a send.
