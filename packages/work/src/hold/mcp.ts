@@ -523,17 +523,26 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 
         let proof: string | undefined;
         if (deps.origin !== undefined && orderResponse.order !== null) {
-          proof = await buildSubmitProof({
-            origin: deps.origin,
-            order: orderResponse.order,
-            path,
-            value,
-            now: deps.now,
-            warn: deps.err,
-            ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
-            ...(deps.env !== undefined ? { env: deps.env } : {}),
-            ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
-          });
+	  const signing = new AbortController();
+	  let signingActive = true;
+	  ctx.onCancel(() => { if (signingActive) signing.abort(); });
+	  try {
+	    if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
+	    proof = await buildSubmitProof({
+	      origin: deps.origin,
+	      order: orderResponse.order,
+	      path,
+	      value,
+	      now: deps.now,
+	      warn: deps.err,
+	      signal: signing.signal,
+	      ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
+	      ...(deps.env !== undefined ? { env: deps.env } : {}),
+	      ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
+	    });
+	  } finally {
+	    signingActive = false;
+	  }
         }
 	// Key access and signing may await. Fence the claim again before writing.
 	if (deps.trustedInputV2) {
@@ -556,6 +565,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ outcome: res.outcome, closed: res.closed ?? false, text: res.text });
       } catch (e) {
+	if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
         return textResult({ error: errMsg(e) }, true);
       }
     },

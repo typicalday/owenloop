@@ -277,7 +277,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -387,6 +387,9 @@ steps:
 	assert.equal(typeof body.proof, 'string');
 	assert.equal(body.expectedVersion, 1);
 	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' }));
+      } else if (req.url === '/api/submit') {
+	assert.equal(typeof body.proof, 'string');
+	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true }));
       } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
       else res.end(JSON.stringify({ text: '' }));
     });
@@ -394,8 +397,8 @@ steps:
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
     const origin = `https://localhost:${address.port}`;
-    const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof';
-    const submitting = delayedSigning || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof' || mode === 'signing-cancelled' || mode === 'signing-eof' || mode === 'signing-sibling';
+    const submitting = delayedSigning || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
     const signingStarted = join(configDir, 'signing-started');
     const signingFinished = join(configDir, 'signing-finished');
     let signingEnv: Record<string, string> = {};
@@ -439,7 +442,12 @@ if (sign) {
       const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
       await until(() => existsSync(signingStarted), 'normal CLI reached real machine-key signing');
       const signingProcess = JSON.parse(readFileSync(signingStarted, 'utf8')) as { pid: number; keyPath: string };
-      if (mode === 'verified-signing-cancelled') mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode === 'verified-signing-cancelled' || mode === 'signing-cancelled' || mode === 'signing-sibling') mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode === 'signing-sibling') {
+	await mcp.request('ping');
+	await until(() => !existsSync(signingProcess.keyPath), 'cancelled request cleans its own key while transport stays open', 1_000);
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'per-call cancellation preserves a healthy sibling');
+      }
       mcp.endStdin();
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -450,9 +458,10 @@ if (sign) {
 	assert.equal(existsSync(signingFinished), false, 'shutdown precedes the real delayed signer completion');
 	assert.equal(existsSync(signingProcess.keyPath), false, 'normal key materialization cleanup finishes before CLI exit');
 	const replies = mcp.frames.filter(frame => frame.id === id);
-	assert.equal(replies.length, mode === 'verified-signing-cancelled' ? 0 : 1);
-	if (mode === 'verified-signing-eof') assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(replies.length, mode.endsWith('cancelled') || mode === 'signing-sibling' ? 0 : 1);
+	if (mode.endsWith('signing-eof')) assert.match(JSON.stringify(replies[0]), /call-cancelled/);
 	assert.equal(seen.includes('/api/submit/conditional-v1'), false);
+	assert.equal(seen.includes('/api/submit'), false);
       } finally {
 	clearTimeout(timer);
 	await until(() => {
@@ -463,10 +472,10 @@ if (sign) {
     }
     if (submitting) {
       const pending = callTool(mcp, 'submit', { path: 'plan', value: { n: 1 } });
-      if (mode === 'verified-submit-healthy') {
+      if (mode === 'verified-submit-healthy' || mode === 'signing-healthy') {
 	const accepted = await pending;
 	assert.equal(accepted.isError, false, JSON.stringify(accepted.body));
-	assert.equal(seen.filter(path => path === '/api/submit/conditional-v1').length, 1);
+	assert.equal(seen.filter(path => path === (verified ? '/api/submit/conditional-v1' : '/api/submit')).length, 1);
       } else {
 	await privatePaused;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -484,7 +493,7 @@ if (sign) {
 	} finally { clearTimeout(timer);releasePrivateRead();await pending; }
 	assert.equal(seen.includes('/api/submit/conditional-v1'), false);
       }
-      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject', '/api/reference_order/v1'].includes(path)), false);
+      assert.equal(seen.some(path => [...(verified ? ['/api/submit'] : ['/api/submit/conditional-v1']), '/api/ask', '/api/reject', '/api/reference_order/v1'].includes(path)), false);
       mcp.endStdin();
       assert.equal(await mcp.exited, 0);
       return;
