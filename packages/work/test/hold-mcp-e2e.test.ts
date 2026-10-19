@@ -9,7 +9,7 @@
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:https';
 import { createHash } from 'node:crypto';
@@ -278,7 +278,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'verified-adapter-get-eof', 'verified-adapter-get-cancelled', 'verified-adapter-get-body-eof', 'verified-adapter-get-sibling', 'verified-adapter-get-deadline', 'verified-adapter-submit-eof', 'verified-adapter-submit-cancelled', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat', 'file-redirect-307', 'file-redirect-308', 'file-redirect-healthy', 'file-redirect-outside', 'file-ack-empty', 'file-ack-key', 'file-ack-hash', 'file-ack-size', 'file-ack-content-type', 'file-ack-filename'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'verified-adapter-get-eof', 'verified-adapter-get-cancelled', 'verified-adapter-get-body-eof', 'verified-adapter-get-sibling', 'verified-adapter-get-deadline', 'verified-adapter-submit-eof', 'verified-adapter-submit-cancelled', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat', 'file-redirect-307', 'file-redirect-308', 'file-redirect-healthy', 'file-redirect-outside', 'file-ack-empty', 'file-ack-key', 'file-ack-hash', 'file-ack-size', 'file-ack-content-type', 'file-ack-filename', 'file-race-leaf', 'file-race-ancestor'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -305,12 +305,15 @@ steps:
   let server: ReturnType<typeof createServer> | undefined;
   let mcp: McpChild | undefined;
   let uploadTarget: ReturnType<typeof createServer> | undefined;
-  const fileCase = mode.startsWith('file-redirect-') || mode.startsWith('file-ack-');
+  const fileCase = mode.startsWith('file-redirect-') || mode.startsWith('file-ack-') || mode.startsWith('file-race-');
   const uploadBytes = Buffer.from('own isolated TEST upload\n');
   const uploadHash = createHash('sha256').update(uploadBytes).digest('hex');
   const pointer = { __file: `orgs/TEST/artifacts/wf1/files/${uploadHash}`, hash: uploadHash,
     size: uploadBytes.byteLength, contentType: 'text/plain', filename: 'own-artifact.txt' };
   const outsideFile = `${configDir}-outside.txt`;
+  const outsideDir = `${configDir}-outside-dir`;
+  const outsideBytes = Buffer.from('own OUTSIDE TEST marker\n');
+  let outsideUploads = 0;
   let uploadRequests = 0;
   let targetRequests = 0;
   let targetBytes = 0;
@@ -369,7 +372,15 @@ steps:
       for await (const chunk of req) chunks.push(chunk as Buffer);
       if (fileCase && req.url === '/api/file-artifacts?workflow=wf1') {
 	uploadRequests++;
-	assert.deepEqual(Buffer.concat(chunks), uploadBytes);
+	const received = Buffer.concat(chunks);
+	if (mode.startsWith('file-race-')) {
+	  if (received.equals(outsideBytes)) outsideUploads++;
+	  else assert.deepEqual(received, uploadBytes);
+	  const hash = createHash('sha256').update(received).digest('hex');
+	  res.writeHead(200, { 'content-type': 'application/json' });
+	  res.end(JSON.stringify({ ...pointer, __file: `orgs/TEST/artifacts/wf1/files/${hash}`, hash, size: received.byteLength }));return;
+	}
+	assert.deepEqual(received, uploadBytes);
 	assert.equal(req.headers['content-type'], 'text/plain');
 	assert.equal(req.headers['x-file-name'], 'own-artifact.txt');
 	if (mode === 'file-redirect-307' || mode === 'file-redirect-308') {
@@ -496,6 +507,43 @@ if (sign) {
       assert.equal(verified, false, 'DEFAULT ordinary hold, no verified-hosted flag');
       const initial = await callTool(mcp, 'get_order');assert.equal(initial.isError, false, JSON.stringify(initial.body));
       assert.ok(seen.includes('/api/reference_order/v2'));
+      if (mode.startsWith('file-race-')) {
+	const ancestor = mode === 'file-race-ancestor';
+	mkdirSync(outsideDir);writeFileSync(join(outsideDir, 'payload.txt'), outsideBytes);
+	writeFileSync(outsideFile, outsideBytes);
+	const slot = join(configDir, ancestor ? 'race-dir' : 'own-artifact.txt');
+	const parked = `${slot}.parked`;
+	const link = `${slot}.link`;
+	if (ancestor) { mkdirSync(slot);writeFileSync(join(slot, 'payload.txt'), uploadBytes); }
+	else writeFileSync(slot, uploadBytes);
+	symlinkSync(ancestor ? outsideDir : outsideFile, link);
+	const file = ancestor ? 'race-dir/payload.txt' : 'own-artifact.txt';
+	assert.equal((await callTool(mcp, 'put_file_artifact', { file, contentType: 'text/plain', filename: 'own-artifact.txt' })).isError, false);
+	let running = true;let linked = false;let swaps = 0;
+	const yieldTurn = () => new Promise<void>(resolve => setImmediate(resolve));
+	const churn = (async () => {
+	  try {
+	    while (running) {
+	      renameSync(slot, parked);renameSync(link, slot);linked = true;
+	      await yieldTurn();
+	      renameSync(slot, link);renameSync(parked, slot);linked = false;swaps++;
+	      await yieldTurn();
+	    }
+	  } finally { if (linked) { renameSync(slot, link);renameSync(parked, slot); } }
+	})();
+	let attempts = 0;let refusals = 0;const started = performance.now();
+	try {
+	  while (attempts < 2000 && performance.now() - started < 10000 && outsideUploads === 0) {
+	    const result = await callTool(mcp, 'put_file_artifact', { file, contentType: 'text/plain', filename: 'own-artifact.txt' });
+	    attempts++;if (result.isError) refusals++;
+	  }
+	} finally { running = false;await churn;rmSync(link, { force: true }); }
+	console.log(JSON.stringify({ fileRace: { mode, attempts, refusals, swaps, outsideUploads, uploadRequests } }));
+	assert.equal(outsideUploads, 0, 'outside TEST bytes must never reach configured upload origin');
+	assert.equal((await callTool(mcp, 'put_file_artifact', { file, contentType: 'text/plain', filename: 'own-artifact.txt' })).isError, false, 'stable owned file recovers after swaps stop');
+	assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	mcp.endStdin();assert.equal(await mcp.exited, 0);return;
+      }
       writeFileSync(join(configDir, 'own-artifact.txt'), uploadBytes);
       if (mode === 'file-redirect-outside') writeFileSync(outsideFile, 'own outside-boundary TEST file');
       const result = await callTool(mcp, 'put_file_artifact', {
@@ -833,6 +881,7 @@ if (sign) {
     if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
     if (uploadTarget) await new Promise<void>((resolve, reject) => uploadTarget!.close(error => error ? reject(error) : resolve()));
     rmSync(outsideFile, { force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
     rmSync(sourceDir, { recursive: true, force: true });
   }
 });

@@ -1,5 +1,6 @@
-import { realpath } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { constants, type BigIntStats } from 'node:fs';
+import { lstat, open, realpath } from 'node:fs/promises';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 
 import { isInside } from './harness/gatekeeper.ts';
 
@@ -42,6 +43,61 @@ export async function resolveContainedPath(
     return canonicalCandidate;
   } catch (error) {
     if (error instanceof Error && error.message.startsWith(`${errorPrefix}-outside-workdir:`)) throw error;
+    throw new Error(`${errorPrefix}-read-failed: could not read ${relativePath}: ${errorMessage(error)}`);
+  }
+}
+
+/** Read through one opened file, refusing namespace or content movement. */
+export async function readContainedFile(
+  workdir: string,
+  relativePath: string,
+  errorPrefix: string,
+): Promise<{ path: string; bytes: Buffer }> {
+  const candidate = resolve(workdir, relativePath);
+  if (!isInside(workdir, candidate)) {
+    throw new Error(`${errorPrefix}-outside-workdir: ${relativePath} is outside the run workdir`);
+  }
+  const same = (a: BigIntStats, b: BigIntStats) => a.dev === b.dev && a.ino === b.ino
+    && a.ctimeNs === b.ctimeNs && a.mtimeNs === b.mtimeNs && a.size === b.size;
+  const moved = () => new Error(`${errorPrefix}-read-failed: file or containing directory changed during read: ${relativePath}`);
+  try {
+    const root = await realpath(workdir);
+    const rootBefore = await lstat(root, { bigint: true });
+    const path = await realpath(candidate);
+    if (!isInside(root, path)) {
+      throw new Error(`${errorPrefix}-outside-workdir: ${relativePath} is outside the run workdir`);
+    }
+    if (path === root) throw moved();
+    // A returned pathname is not a retained filesystem object. Snapshot every
+    // containing directory too: an ancestor can be renamed to a symlink and
+    // restored while the leaf itself remains unchanged. Directory metadata
+    // fences that movement, including a swap back to the original inode.
+    const directories = [root];
+    const suffix = relative(root, dirname(path));
+    if (suffix !== '') for (const part of suffix.split(sep)) directories.push(join(directories[directories.length - 1]!, part));
+    const before: BigIntStats[] = [];
+    for (const directory of directories) {
+      const info = await lstat(directory, { bigint: true });
+      if (!info.isDirectory() || info.isSymbolicLink()) throw moved();
+      before.push(info);
+    }
+    if (!same(rootBefore, before[0]!)) throw moved();
+    const fileBefore = await lstat(path, { bigint: true });
+    if (!fileBefore.isFile() || fileBefore.isSymbolicLink()) throw moved();
+    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      if (!same(fileBefore, await handle.stat({ bigint: true }))) throw moved();
+      const bytes = await handle.readFile();
+      if (!same(fileBefore, await handle.stat({ bigint: true }))) throw moved();
+      if (!same(fileBefore, await lstat(path, { bigint: true }))) throw moved();
+      for (let index = directories.length - 1; index >= 0; index--) {
+	const after = await lstat(directories[index]!, { bigint: true });
+	if (!after.isDirectory() || after.isSymbolicLink() || !same(before[index]!, after)) throw moved();
+      }
+      return { path, bytes };
+    } finally { await handle.close(); }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(`${errorPrefix}-`)) throw error;
     throw new Error(`${errorPrefix}-read-failed: could not read ${relativePath}: ${errorMessage(error)}`);
   }
 }

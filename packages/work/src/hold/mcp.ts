@@ -42,7 +42,6 @@
  * its own — so a unit test drives the tools with a fake hub and a scriptable
  * clock. The role (`src/roles/hold.ts`) owns the real stdin/stdout pump.
  */
-import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 
 import { textResult, type ToolRegistration, type ToolResult, type ToolCallContext } from '../mcp/server.ts';
@@ -51,7 +50,7 @@ import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import { readSubmitValueFile } from '../submit-file.ts';
-import { resolveContainedPath } from '../contained-path.ts';
+import { readContainedFile } from '../contained-path.ts';
 import { normalizeSubmitValue } from '../submit-value.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
@@ -746,8 +745,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         // own error family: the working directory is the only root a step's
         // outputs may come from, and a symlink out of it is an exfiltration
         // path, not a convenience.
-        const resolved = await resolveContainedPath(deps.workdir, file, 'file-artifact');
-        const bytes = new Uint8Array(await readFile(resolved));
+	const { path: resolved, bytes } = await readContainedFile(deps.workdir, file, 'file-artifact');
         if (bytes.byteLength === 0) {
           return textResult({ error: `file-artifact-empty: ${file} is zero bytes` }, true);
         }
