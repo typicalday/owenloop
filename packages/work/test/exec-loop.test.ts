@@ -2311,3 +2311,26 @@ for (const movement of ['receipt', 'admission', 'missing', 'throw', 'stable', 'o
     f.store.close();
   });
 }
+
+test('exec stop during pending first contact cannot launch late work', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()] });
+  let entered!: () => void;
+  const pending = new Promise<void>(r => { entered = r; });
+  let resume!: (res: GetOrderResponse) => void;
+  hub.getOrder = async () => { entered(); return new Promise<GetOrderResponse>(r => { resume = r; }); };
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const running = loop.run();
+  await pending;
+  loop.stop('signal');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([running, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 100); })]);
+    assert.equal(outcome, 'killed');
+  } finally {
+    clearTimeout(timer);resume(commandOrder());await running;
+  }
+  await macrotaskSleep();
+  assert.equal(fr.starts.length, 0);assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'heartbeat').length, 0);
+});

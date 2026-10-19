@@ -276,7 +276,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -367,9 +367,14 @@ steps:
 	  ], ...(workdirInput ? { workdirInput: { stem: 'config', version: workdirVersion, value: { path: configDir } } } : {}),
 	  lease: { claimed: true },
 	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
+      } else if (req.url === '/api/heartbeat' && mode === 'lease-stalled-heartbeat') {
+	res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
+	privateReadEntered();await privateResume;
+	res.end(JSON.stringify({ text: '' }));
       } else if (req.url === '/api/get_order') {
 	privateReads++;
-	if ((mode === 'verified-stalled-private-initial' && privateReads === 2)
+	if ((mode === 'lease-stalled-first-contact' && privateReads === 1)
+	  || (mode === 'verified-stalled-private-initial' && privateReads === 2)
 	  || (mode === 'verified-stalled-private-final' && privateReads === 3)) {
 	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
 	  privateReadEntered();
@@ -385,6 +390,23 @@ steps:
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
       '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : [])], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
+    if (mode === 'lease-stalled-first-contact' || mode === 'lease-stalled-heartbeat') {
+      await privatePaused;
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const outcome = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(outcome, 0, 'EOF exits while lease contact is stalled');
+	await until(() => privateTransportClosed, 'EOF aborts lease HTTPS request', 1_000);
+      } finally { clearTimeout(timer);releasePrivateRead();await mcp.exited; }
+      assert.equal(seen.filter(path => path === '/api/get_order').length, 1);
+      assert.equal(seen.filter(path => path === '/api/heartbeat').length, mode === 'lease-stalled-heartbeat' ? 1 : 0);
+      assert.equal(seen.filter(path => path === '/api/release').length, mode === 'lease-stalled-heartbeat' ? 1 : 0);
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      return;
+    }
     if (mode === 'cancelled') {
       const requestId = mcp.fireRequest('tools/call', { name: 'ask',
 	arguments: { path: 'plan', question: 'local cancellation boundary test' } });

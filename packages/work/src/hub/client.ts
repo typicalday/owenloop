@@ -80,7 +80,7 @@ export interface HubClient {
   getOrder(req: GetOrderRequest, signal?: AbortSignal): Promise<GetOrderResponse>;
   /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
   getReferenceOrder?(req: GetOrderRequest, signal?: AbortSignal): Promise<unknown>;
-  heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
+  heartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   /** Versioned route only; callers must never fall back to legacy submit. */
@@ -235,7 +235,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     },
     getOrder: (req, signal) => post<GetOrderResponse>('get_order', req, signal),
     getReferenceOrder: (req, signal) => post<unknown>('reference_order/v1', req, signal),
-    heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
+    heartbeat: (req, signal) => post<HeartbeatResponse>('heartbeat', req, signal),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
     submitConditional: (req) => post<ConditionalSubmitResponse>('submit/conditional-v1', req),

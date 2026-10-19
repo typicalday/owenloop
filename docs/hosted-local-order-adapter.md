@@ -157,3 +157,14 @@ This local source boundary still requires an admitted matching Service counterpa
 bearer-authenticated remote proof, signature and enrollment checks at submit
 or downstream consumption, native Jev Linux proof, formal pstack maker/checker,
 and staging and deployment gates before live use.
+
+### Stopping a pending lease read
+
+Hold and exec cancel an in-flight first-contact/lease-probe `get_order` or
+heartbeat when stopped (including MCP stdin EOF). Normal HTTPS requests receive the
+existing cancellation signal. A private client that ignores it cannot delay
+shutdown or deliver a late order to the command runner. An established hold
+still uses the bounded final-breath release unless `release:false` was requested;
+a stop before first contact is confirmed remains `stopped`. Late probe results
+cannot start another heartbeat. This does not roll back a request already sent
+to the Service or force termination of opaque private client work.
