@@ -191,6 +191,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     signal?.throwIfAborted();
     const res = await fetchImpl(`${base}/api/${verb}`, {
       method: 'POST',
+      redirect: 'error',
       headers,
       body: JSON.stringify(body),
       ...(signal === undefined ? {} : { signal }),
@@ -202,6 +203,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
     const res = await fetchImpl(url, {
       method: 'GET',
+      redirect: 'error',
       headers: await authHeaders(),
       ...(signal === undefined ? {} : { signal }),
     });
@@ -219,6 +221,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     if (req.filename !== undefined) headers['x-file-name'] = req.filename;
     const res = await fetchImpl(`${base}${path}?workflow=${encodeURIComponent(req.workflow)}`, {
       method: 'POST',
+      redirect: 'error',
       headers,
       body: req.bytes,
     });
