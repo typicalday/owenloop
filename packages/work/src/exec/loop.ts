@@ -419,6 +419,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   let signalled = false;
   let leasePromise: Promise<LeaseOutcome> | undefined;
   let leaseOutcome: LeaseOutcome | undefined;
+  let signingCancel: AbortController | undefined;
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -908,22 +909,29 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       try {
 	const signingOrigin = opts.origin;
 	if (signingOrigin !== undefined) {
-	  // The immutable order can authorize a judge proof only when the owed
-	  // path is the fingerprinted judged artifact. Producer command receipts
-	  // remain unsigned until the hub issues a retry-safe target version.
-	  const signing = await prepareWhileHeld(() => buildSubmitProof({
-	    origin: signingOrigin,
-            order,
-            path: owe.path,
-            value: receipt,
-            now: opts.now,
-            warn: opts.err,
-            ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
-            ...(opts.env !== undefined ? { env: opts.env } : {}),
-            ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
-	  }));
-	  if (signing.kind === 'lease') return mapNoHold(signing.outcome);
-	  proof = signing.value;
+	  const cancellation = new AbortController();
+	  signingCancel = cancellation;
+	  try {
+	    // The immutable order can authorize a judge proof only when the owed
+	    // path is the fingerprinted judged artifact. Producer command receipts
+	    // remain unsigned until the hub issues a retry-safe target version.
+	    const signing = await prepareWhileHeld(() => buildSubmitProof({
+	      origin: signingOrigin,
+	      signal: cancellation.signal,
+	      order,
+	      path: owe.path,
+	      value: receipt,
+	      now: opts.now,
+	      warn: opts.err,
+	      ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
+	      ...(opts.env !== undefined ? { env: opts.env } : {}),
+	      ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
+	    }));
+	    if (signing.kind === 'lease') return mapNoHold(signing.outcome);
+	    proof = signing.value;
+	  } finally {
+	    if (signingCancel === cancellation) signingCancel = undefined;
+	  }
         }
       } catch (e) {
         return failSubmit(owe.path, e);
@@ -1021,7 +1029,11 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   async function run(): Promise<ExecOutcome> {
-    leasePromise = lease.run().then(outcome => { leaseOutcome = outcome;return outcome; });
+    leasePromise = lease.run().then(outcome => {
+      leaseOutcome = outcome;
+      signingCancel?.abort();
+      return outcome;
+    });
 
     // First contact race: the order arrives (hold established), or the lease
     // resolves terminally before we ever established it.
@@ -1265,6 +1277,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   function stop(reason?: string): void {
     if (signalled) return;
     signalled = true;
+    signingCancel?.abort();
     if (running !== undefined) void running.kill();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

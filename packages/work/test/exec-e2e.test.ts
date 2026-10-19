@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { createServer as createHttpsServer } from 'node:https';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,7 @@ import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../src/store/index.ts';
 import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { PrincipalKeyManager } from '../../../src/crypto/keys.ts';
 
 // Plan test 12 — integration-style, end to end through the REAL pieces: the
 // default runner (a real child), the real receipt builder, and the REAL hub
@@ -224,6 +225,102 @@ test('e2e kill drill: signal mid-run → real child killed → release observed,
     server.close();
   }
 });
+
+for (const ending of ['stop', 'lease loss', 'healthy'] as const) {
+  test(`actual exec CLI ${ending} during receipt signing cleans its temporary key`, async () => {
+    const home = tempDir('owenloop-exec-signing-cleanup-');
+    const sourceDir = writeBundleSource({ name: 'signing-exec', workflow: `name: signing-exec
+steps:
+  - name: builder
+    produces: [artifacts/build]
+    terminal: true
+    executor: command
+    command: 'printf signing-cleanup-command'
+` });
+    const signed = await installSignedBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows'), home });
+    const key = join(home, 'tls.key');const cert = join(home, 'tls.crt');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+    const marker = join(home, 'signing-started');const finished = join(home, 'signing-finished');
+    const order = storeCommandOrder(signed.packed.digest, 'ignored remote command');
+    order.order!.consumedFingerprint = {};
+    order.order!.owes[0]!.version = 1;
+    const seen: string[] = [];
+    const server = createHttpsServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      seen.push(req.url!);assert.equal(req.headers.authorization, 'Bearer exec-signing-local-test');
+      let raw = '';for await (const chunk of req) raw += String(chunk);
+      if (req.url === '/api/heartbeat' && ending === 'lease loss' && existsSync(marker)) {
+	res.writeHead(403);res.end(JSON.stringify({ error: 'fixture claim revoked' }));return;
+      }
+      if (req.url === '/api/get_order') res.end(JSON.stringify(order));
+      else if (req.url === '/api/submit') {
+	const body = JSON.parse(raw);assert.equal(typeof body.proof, 'string');
+	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true }));
+      } else res.end(JSON.stringify({ text: '' }));
+    });
+    await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+    const address = server.address();assert.ok(address && typeof address !== 'string');
+    const origin = `https://localhost:${address.port}`;
+    await new PrincipalKeyManager({ env: { HOME: home, OWENLOOP_NO_KEYCHAIN: '1' } })
+      .ensure({ origin, kind: 'machine', id: 'local-test-exec' });
+    const realSsh = execFileSync('which', ['ssh-keygen'], { encoding: 'utf8' }).trim();
+    const shimDir = join(home, 'signing-bin');mkdirSync(shimDir);
+    const shim = join(shimDir, 'ssh-keygen');
+    writeFileSync(shim, `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const sign = args[0] === '-Y' && args[1] === 'sign';
+function run() {
+  const result = spawnSync(${JSON.stringify(realSsh)}, args, { stdio: 'inherit' });
+  if (sign) writeFileSync(${JSON.stringify(finished)}, 'finished');
+  process.exit(result.status ?? 1);
+}
+if (sign) {
+  writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ pid: process.pid, keyPath: args[args.indexOf('-f') + 1] }));
+  setTimeout(run, 4000);
+} else run();
+`);
+    chmodSync(shim, 0o700);
+    const child = spawn(process.execPath, [join(import.meta.dirname, '../../../bin/owenloop.mjs'), 'work', 'exec',
+      'wf1/run1', '--origin', origin, '--heartbeat-interval', '25'], {
+      cwd: home, env: { ...process.env, ...signed.env, HOME: home, OWENLOOP_NO_KEYCHAIN: '1',
+	PATH: `${shimDir}:${process.env.PATH ?? ''}`, OWENLOOP_TOKEN: 'exec-signing-local-test',
+	OWENLOOP_CONFIG_DIR: '', OWENLOOP_SESSION: '', NODE_EXTRA_CA_CERTS: cert },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout!.resume();let stderr = '';child.stderr!.on('data', chunk => { stderr += String(chunk); });
+    const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+    let signingProcess: { pid: number; keyPath: string } | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await until(() => existsSync(marker), `CLI reached normal signing: ${stderr}`, 5_000);
+      signingProcess = JSON.parse(readFileSync(marker, 'utf8')) as { pid: number; keyPath: string };
+      if (ending === 'stop') child.kill('SIGTERM');
+      const outcome = await Promise.race([exited, new Promise<'pending'>(resolve => {
+	timer = setTimeout(() => resolve('pending'), ending === 'healthy' ? 6_000 : 2_000);
+      })]);
+      assert.equal(outcome, ending === 'healthy' ? 0 : 1, stderr);
+      assert.equal(existsSync(signingProcess.keyPath), false, 'own materialized private key must be removed before process exit');
+      assert.equal(seen.filter(path => path === '/api/submit').length, ending === 'healthy' ? 1 : 0);
+      assert.equal(seen.filter(path => path === '/api/release').length, ending === 'stop' ? 1 : 0);
+      if (ending !== 'healthy') {
+	assert.equal(existsSync(finished), false, 'cancelled signer must not finish normally');
+	await until(() => {
+	  try { process.kill(signingProcess!.pid, 0); return false; } catch { return true; }
+	}, 'cancelled SSH child stops before its finite delay expires', 2_000);
+      }
+    } finally {
+      clearTimeout(timer);
+      if (child.exitCode === null) child.kill('SIGTERM');
+      await exited;
+      if (signingProcess) await until(() => {
+	try { process.kill(signingProcess!.pid, 0); return false; } catch { return true; }
+      }, 'own finite SSH fixture exited', 6_000);
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+}
 
 test('actual exec CLI stop while signed bundle recovery is pending exits without a command launch', async () => {
   const home = tempDir('owenloop-exec-recovery-stop-');

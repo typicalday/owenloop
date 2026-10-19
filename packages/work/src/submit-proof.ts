@@ -88,7 +88,7 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
       ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     });
     return signSubmission(record, signer);
-  });
+  }, opts.signal);
 }
 
 function submissionFingerprint(
