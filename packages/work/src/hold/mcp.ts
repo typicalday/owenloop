@@ -81,7 +81,7 @@ export interface HoldMcpDeps {
   modelOrderVerifier?: (order: OrderPacket) => Promise<
     { ok: true; requiresInputWitness?: true } | { ok: false; reason: string }>;
   /** Independent Service v2 admission for held input paths, including present ones. */
-  trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
+  trustedInputV2?: { observe(order: OrderPacket, signal?: AbortSignal): Promise<TrustedInputAdmission> };
   /** Only for a private get_order-only mount wrapped by conditional-v1 submit. */
   owedVersionMode?: 'conditional-v1';
   /** B3 holder tag; rides get_order/heartbeat when known. */
@@ -292,22 +292,24 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     return undefined;
   }
 
-  async function gate(res: GetOrderResponse, requestRevision: number): Promise<ToolResult | undefined> {
+  async function gate(res: GetOrderResponse, requestRevision: number, signal?: AbortSignal): Promise<ToolResult | undefined> {
     const superseded = supersededGuard(requestRevision);
     if (superseded !== undefined) return superseded;
     try {
-      const refused = await observeGate(res, requestRevision);
+      signal?.throwIfAborted();
+      const refused = await observeGate(res, requestRevision, signal);
+      signal?.throwIfAborted();
       const afterObservation = supersededGuard(requestRevision);
       if (afterObservation !== undefined) return afterObservation;
       if (refused !== undefined) invalidateObservation(requestRevision);
       return refused;
     } catch (error) {
-      invalidateObservation(requestRevision);
+      if (!signal?.aborted) invalidateObservation(requestRevision);
       throw error;
     }
   }
 
-  async function observeGate(res: GetOrderResponse, requestRevision: number): Promise<ToolResult | undefined> {
+  async function observeGate(res: GetOrderResponse, requestRevision: number, signal?: AbortSignal): Promise<ToolResult | undefined> {
     if (firstContactIdentityRefusal !== undefined) return firstContactIdentityRefusal;
     const refusedIdentity = identityGuard(res);
     if (refusedIdentity !== undefined) return refusedIdentity;
@@ -347,8 +349,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       captured = undefined;
       if (!deps.trustedInputV2) return textResult({ error: 'trusted input v2 refusal: witness reader unavailable' }, true);
       let observed: TrustedInputAdmission;
-      try { observed = await deps.trustedInputV2.observe(res.order); }
-      catch { return textResult({ error: 'trusted input v2 refusal: reference unavailable' }, true); }
+      try { observed = await deps.trustedInputV2.observe(res.order, signal); }
+      catch { signal?.throwIfAborted();return textResult({ error: 'trusted input v2 refusal: reference unavailable' }, true); }
+      signal?.throwIfAborted();
       const superseded = supersededGuard(requestRevision);
       if (superseded !== undefined) return superseded;
       if (!observed.ok) return textResult({ error: `trusted input v2 refusal: ${observed.reason}` }, true);
@@ -404,7 +407,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	  const res = await hub.getOrder({ workflow, run, ...holderReq }, controller.signal);
 	  const afterRead = terminalGuard(requestRevision, ctx);
 	  if (afterRead !== undefined) return afterRead;
-	  const refused = await gate(res, requestRevision);
+	  const refused = await gate(res, requestRevision, controller.signal);
 	  const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
 	  if (afterGate !== undefined) return afterGate;
 	  if (refused !== undefined) return refused;
@@ -418,14 +421,14 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	}
       }
       if (captured !== undefined) {
-	const refused = await gate(captured, requestRevision);
+	const refused = await gate(captured, requestRevision, controller.signal);
 	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
 	return gatedView(captured, requestRevision);
       }
       if (firstContact !== undefined) {
-	const refused = await gate(firstContact, requestRevision);
+	const refused = await gate(firstContact, requestRevision, controller.signal);
 	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
@@ -436,7 +439,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	const res = await hub.getOrder({ workflow, run, ...holderReq }, controller.signal);
 	const afterRead = terminalGuard(requestRevision, ctx);
 	if (afterRead !== undefined) return afterRead;
-	const refused = await gate(res, requestRevision);
+	const refused = await gate(res, requestRevision, controller.signal);
 	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
@@ -510,7 +513,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (orderResponse === undefined) {
 	  orderResponse = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
         }
-	const refused = await gate(orderResponse, requestRevision);
+	const refused = await gate(orderResponse, requestRevision, cancellation.signal);
         if (refused !== undefined) return refused;
 	const afterGate = terminalGuard(requestRevision, ctx);
 	if (afterGate !== undefined) return afterGate;
@@ -543,7 +546,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	// Key access and signing may await. Fence the claim again before writing.
 	if (deps.trustedInputV2) {
 	  const fresh = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
-	  const refusedFresh = await gate(fresh, requestRevision);
+	  const refusedFresh = await gate(fresh, requestRevision, cancellation.signal);
 	  if (refusedFresh !== undefined) return refusedFresh;
 	}
 	const beforeSubmit = terminalGuard(requestRevision, ctx);
@@ -599,10 +602,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (requested !== undefined && (typeof requested !== 'string' || requested.trim() === '')) {
         return textResult({ error: 'reject "requested" must be a non-empty string when provided' }, true);
       }
+      const cancellation = new AbortController();
+      let active = true;
+      ctx.onCancel(() => { if (active) cancellation.abort(); });
       try {
 	if (deps.trustedInputV2) {
-	  const current = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(current, requestRevision);
+	  const current = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
+	  const refused = await gate(current, requestRevision, cancellation.signal);
 	  if (refused !== undefined) return refused;
 	  const afterGate = terminalGuard(requestRevision, ctx);
 	  if (afterGate !== undefined) return afterGate;
@@ -611,7 +617,10 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
       } catch (e) {
+	if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
         return textResult({ error: errMsg(e) }, true);
+      } finally {
+	active = false;
       }
     },
   };
@@ -657,10 +666,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (context !== undefined && typeof context !== 'string') {
         return textResult({ error: 'ask "context" must be a string when present' }, true);
       }
+      const cancellation = new AbortController();
+      let active = true;
+      ctx.onCancel(() => { if (active) cancellation.abort(); });
       try {
 	if (deps.trustedInputV2) {
-	  const current = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(current, requestRevision);
+	  const current = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
+	  const refused = await gate(current, requestRevision, cancellation.signal);
 	  if (refused !== undefined) return refused;
 	  const afterGate = terminalGuard(requestRevision, ctx);
 	  if (afterGate !== undefined) return afterGate;
@@ -677,7 +689,10 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (res.closed === true) loop.stop('asked', { release: false });
         return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
       } catch (e) {
+	if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
         return textResult({ error: errMsg(e) }, true);
+      } finally {
+	active = false;
       }
     },
   };
@@ -723,6 +738,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       if (filenameArg !== undefined && (typeof filenameArg !== 'string' || filenameArg.trim() === '')) {
         return textResult({ error: 'file-artifact-invalid: filename must be a non-empty string when present' }, true);
       }
+      const cancellation = new AbortController();
+      let active = true;
+      ctx.onCancel(() => { if (active) cancellation.abort(); });
       try {
         // Same two-phase containment as a submit value file, under this tool's
         // own error family: the working directory is the only root a step's
@@ -737,8 +755,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
           typeof contentTypeArg === 'string' ? contentTypeArg.trim() : guessContentType(resolved);
         const filename = typeof filenameArg === 'string' ? filenameArg.trim() : basename(resolved);
 	if (deps.trustedInputV2) {
-	  const current = await hub.getOrder({ workflow, run, ...holderReq });
-	  const refused = await gate(current, requestRevision);
+	  const current = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
+	  const refused = await gate(current, requestRevision, cancellation.signal);
 	  if (refused !== undefined) return refused;
 	  const afterGate = terminalGuard(requestRevision, ctx);
 	  if (afterGate !== undefined) return afterGate;
@@ -761,7 +779,10 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
           text: `Stored ${String(bytes.byteLength)} bytes as ${contentType}. Submit this pointer as your value, or embed it in one.`,
         });
       } catch (e) {
+	if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
         return textResult({ error: errMsg(e) }, true);
+      } finally {
+	active = false;
       }
     },
   };

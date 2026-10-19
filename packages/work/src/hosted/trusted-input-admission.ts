@@ -56,20 +56,22 @@ export function createTrustedInputV2Admission(args: {
   now?: () => number;
   /** An elapsed clock across remote awaits. */
   elapsedNow?: () => number;
-}): { observe(privateOrder: OrderPacket): Promise<TrustedInputAdmission> } {
+}): { observe(privateOrder: OrderPacket, signal?: AbortSignal): Promise<TrustedInputAdmission> } {
   const now = args.now ?? Date.now;
   const elapsedNow = args.elapsedNow ?? (() => performance.now());
   const refused = (reason: string): TrustedInputAdmission => ({ ok: false, reason });
   let canonicalWorkflow: string | undefined;
-  return { async observe(privateOrder) {
+  return { async observe(privateOrder, signal) {
+    signal?.throwIfAborted();
     const started = now();
     const startedElapsed = elapsedNow();
     if (!Number.isSafeInteger(started) || privateOrder.run !== args.expected.run) {
       return refused('private-order-out-of-scope');
     }
     let response: Awaited<ReturnType<TrustedReferenceV2Reader['read']>>;
-    try { response = await args.reader.read(); }
-    catch { return refused('reference-v2-unavailable'); }
+    try { response = await args.reader.read(signal); }
+    catch { signal?.throwIfAborted();return refused('reference-v2-unavailable'); }
+    signal?.throwIfAborted();
     if (response.state !== 'available') return refused(`service-${response.state}`);
     const direct = response.order;
     if (response.run !== args.expected.run || direct.run !== args.expected.run
@@ -101,6 +103,7 @@ export function createTrustedInputV2Admission(args: {
     let step: Awaited<ReturnType<NonNullable<InstructionResolver['resolveHostedStep']>>>;
     try { step = await args.instructions.resolveHostedStep(direct); }
     catch { return refused('local-definition-verifier-unavailable'); }
+    signal?.throwIfAborted();
     if (!step.ok) return refused(`local-definition-${step.kind}`);
     const local = step.step;
     if (!equal(privateOrder.model ?? null, local.model ?? null)
@@ -128,6 +131,7 @@ export function createTrustedInputV2Admission(args: {
 	defDigest: direct.defDigest, step: privateOrder.step, key: privateOrder.key },
       step: step.step, declaredInputs: step.declaredInputs,
       consumedVerifier: args.consumedVerifier, callsProducers: step.callsProducers });
+    signal?.throwIfAborted();
     if (!bound.ok) return refused(bound.reason);
     const finished = now();
     const finishedElapsed = elapsedNow();
@@ -141,6 +145,7 @@ export function createTrustedInputV2Admission(args: {
       || !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= MAX_OBSERVATION_MS) {
       return refused('observation-expired');
     }
+    signal?.throwIfAborted();
     canonicalWorkflow ??= direct.workflow;
     return { ok: true, order: privateOrder, step,
       packetDigest: valueDigestHex(dynamic(direct)),

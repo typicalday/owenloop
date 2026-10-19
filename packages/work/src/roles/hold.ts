@@ -423,7 +423,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     // supplied or absent, and unsupported feedback. Empty zero-input static
     // orders retain their compatibility; producer proofs are not actor grants.
     let admission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
-    const trustedInputV2 = { async observe(order: Parameters<InstructionResolver['resolveStep']>[0]) {
+    const trustedInputV2 = { async observe(order: Parameters<InstructionResolver['resolveStep']>[0], signal?: AbortSignal) {
       modelResolver ??= createDefaultStoreInstructionResolver({
 	cwd: parsed.neverRelease ? env['OWENLOOP_INSTRUCTION_CWD'] ?? process.cwd() : process.cwd(), env,
       });
@@ -432,7 +432,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	  origin, getToken: async () => token, expected: target,
 	}), instructions: modelResolver, consumedVerifier, expected: target,
       });
-      return admission.observe(order);
+      return admission.observe(order, signal);
     } };
     const modelOrderVerifier: NonNullable<Parameters<typeof createHoldMcp>[0]['modelOrderVerifier']> = async (order) => {
       try {

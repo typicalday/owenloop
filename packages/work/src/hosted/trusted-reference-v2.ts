@@ -46,7 +46,7 @@ export type TrustedReferenceV2Result = TrustedReferenceV2 | {
 };
 
 export interface TrustedReferenceV2Reader {
-  read(): Promise<TrustedReferenceV2Result>;
+  read(signal?: AbortSignal): Promise<TrustedReferenceV2Result>;
 }
 
 const rec = (value: unknown): Record<string, unknown> | undefined =>
@@ -143,7 +143,8 @@ export function parseTrustedReferenceV2(raw: unknown, expected: { workflow: stri
 
 interface RawResponse { status: number; headers: IncomingHttpHeaders; body: string }
 
-function postHttps(url: URL, token: string, body: string, remainingMs: number, ca?: string | Buffer): Promise<RawResponse> {
+function postHttps(url: URL, token: string, body: string, remainingMs: number, ca?: string | Buffer, signal?: AbortSignal): Promise<RawResponse> {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (error?: Error, result?: RawResponse) => {
@@ -153,7 +154,8 @@ function postHttps(url: URL, token: string, body: string, remainingMs: number, c
       if (error) reject(error);
       else resolve(result!);
     };
-    const req: ClientRequest = httpsRequest(url, { method: 'POST', ...(ca === undefined ? {} : { ca }), headers: {
+    const req: ClientRequest = httpsRequest(url, { method: 'POST', ...(ca === undefined ? {} : { ca }),
+      ...(signal === undefined ? {} : { signal }), headers: {
       authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json',
       'content-length': Buffer.byteLength(body), 'cache-control': 'no-store',
     } }, response => {
@@ -194,7 +196,8 @@ export function createTrustedReferenceV2Reader(options: {
   const now = options.now ?? Date.now;
   const elapsedNow = options.elapsedNow ?? (() => performance.now());
   let canonicalWorkflow: string | undefined;
-  return { async read() {
+  return { async read(signal) {
+    signal?.throwIfAborted();
     const began = now();
     const beganElapsed = elapsedNow();
     if (!Number.isSafeInteger(began) || !Number.isFinite(beganElapsed) || beganElapsed < 0) {
@@ -220,11 +223,13 @@ export function createTrustedReferenceV2Reader(options: {
 	timeout = setTimeout(() => reject(new Error('trusted reference v2 credential deadline exceeded')), MAX_MS);
       }),
     ]).finally(() => clearTimeout(timeout));
+    signal?.throwIfAborted();
     const remaining = remainingBudget();
     if (typeof token !== 'string' || token.length === 0 || /[\r\n]/.test(token) || remaining <= 0) {
       throw new Error('trusted reference v2 credential or deadline unavailable');
     }
-    const response = await postHttps(url, token, JSON.stringify(options.expected), remaining, options.trustedCa);
+    const response = await postHttps(url, token, JSON.stringify(options.expected), remaining, options.trustedCa, signal);
+    signal?.throwIfAborted();
     if (remainingBudget() <= 0 || response.status !== 200
       || !String(response.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')
       || !String(response.headers['cache-control'] ?? '').toLowerCase().split(',').map(part => part.trim()).includes('no-store')) {
@@ -232,6 +237,7 @@ export function createTrustedReferenceV2Reader(options: {
     }
     const parsed = parseTrustedReferenceV2(JSON.parse(response.body) as unknown, options.expected);
     if (remainingBudget() <= 0) throw new Error('trusted reference v2 deadline exceeded');
+    signal?.throwIfAborted();
     if (parsed.state === 'available') {
       // Service authorizes requested-root -> canonical-child through durable
       // ancestry. Keep every POST argv-bound; the private packet cannot choose

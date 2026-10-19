@@ -403,3 +403,42 @@ test('v2 admission refuses its wall deadline after local verification even with 
     } else assert.deepEqual(result, { ok: false, reason: 'observation-expired' });
   }
 });
+
+
+test('pre-cancelled v2 reader does not resolve a credential or start HTTPS', async () => {
+  let credentials = 0;
+  const reader = createTrustedReferenceV2Reader({ origin: 'https://localhost', expected,
+    getToken: async () => { credentials++;return 'local-test-token'; } });
+  const cancellation = new AbortController();
+  cancellation.abort();
+  await assert.rejects(reader.read(cancellation.signal), /abort/i);
+  assert.equal(credentials, 0);
+});
+
+for (const phase of ['local', 'producer'] as const) {
+  test(`cancelled v2 ${phase} verification cannot return or pin a later admission`, async () => {
+    const direct = available();
+    const cancellation = new AbortController();
+    let cancel = true;
+    const local = { name: 'planner', consumes: [parseConsume('optional')],
+      produces: [parseProduce('plan')] } as StepDef;
+    const admission = createTrustedInputV2Admission({ reader: { read: async () => direct }, expected,
+      instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+	resolveStep: async () => ({ ok: true, step: local }),
+	resolveHostedStep: async () => {
+	  if (cancel && phase === 'local') cancellation.abort();
+	  return { ok: true, step: local, inputNames: ['optional'],
+	    declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} };
+	} },
+      consumedVerifier: async (order, options) => {
+	assert.equal(options.hardRule, true);
+	if (cancel && phase === 'producer') cancellation.abort();
+	return { ok: true, order, warnings: [] };
+      } });
+    const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+      reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+    await assert.rejects(admission.observe(privateOrder, cancellation.signal), /abort/i);
+    cancel = false;
+    assert.equal((await admission.observe(privateOrder)).ok, true);
+  });
+}

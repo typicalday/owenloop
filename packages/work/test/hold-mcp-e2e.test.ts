@@ -277,7 +277,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -333,6 +333,7 @@ steps:
     let releasePrivateRead!: () => void;
     const privatePaused = new Promise<void>(resolve => { privateReadEntered = resolve; });
     const privateResume = new Promise<void>(resolve => { releasePrivateRead = resolve; });
+    let witnessTransportClosed = false;
     let witnessReads = 0;
     let pauseNextWitness = false;
     let firstWitnessEntered!: () => void;
@@ -354,6 +355,11 @@ steps:
 	  return;
 	}
 	const availableAtRead = witnessAvailable;
+	if (mode.startsWith('witness-') && ++witnessReads === 1) {
+	  res.once('close', () => { if (!res.writableEnded) witnessTransportClosed = true; });
+	  if (mode === 'witness-get-body-eof') res.flushHeaders();
+	  firstWitnessEntered();await firstWitnessResume;
+	}
 	if (((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) || pauseNextWitness) {
 	  pauseNextWitness = false;
 	  firstWitnessEntered();
@@ -404,7 +410,7 @@ steps:
     assert.ok(address && typeof address !== 'string');
     const origin = `https://localhost:${address.port}`;
     const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof' || mode === 'signing-cancelled' || mode === 'signing-eof' || mode === 'signing-sibling';
-    const submitting = delayedSigning || mode.startsWith('submit-private-') || mode === 'submit-ack-cancelled' || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const submitting = delayedSigning || mode.startsWith('submit-private-') || mode === 'submit-ack-cancelled' || mode.startsWith('witness-submit-') || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
     const signingStarted = join(configDir, 'signing-started');
     const signingFinished = join(configDir, 'signing-finished');
     let signingEnv: Record<string, string> = {};
@@ -442,8 +448,61 @@ if (sign) {
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', origin,
       '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : []),
       ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
-    { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert });
+    { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert }, mode.startsWith('witness-') ? configDir : undefined);
     await handshake(mcp);
+    if (mode.startsWith('witness-')) {
+      writeFileSync(join(configDir, 'output.txt'), 'local test artifact');
+      const name = mode.startsWith('witness-submit-') ? 'submit'
+	: mode.startsWith('witness-reject-') ? 'reject' : mode.startsWith('witness-ask-') ? 'ask'
+	: mode.startsWith('witness-file-') ? 'put_file_artifact' : 'get_order';
+      const args = name === 'submit' ? { path: 'plan', value: { n: 1 } }
+	: name === 'reject' ? { path: 'proposal', text: 'local test reason' }
+	: name === 'ask' ? { path: 'plan', question: 'local test question' }
+	: name === 'put_file_artifact' ? { file: 'output.txt' } : {};
+      if (mode === 'witness-get-deadline') {
+	const pending = callTool(mcp, name, args);
+	await firstWitnessPaused;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+	  const result = await Promise.race([pending, new Promise<'pending'>(resolve => {
+	    timer = setTimeout(() => resolve('pending'), 6_500);
+	  })]);
+	  assert.notEqual(result, 'pending', 'existing5sec witness deadline stays active');
+	  if (result !== 'pending') {
+	    assert.equal(result.isError, true);
+	    assert.match(JSON.stringify(result.body), /reference-v2-unavailable/);
+	  }
+	  await until(() => witnessTransportClosed, 'deadline closes independent HTTPS', 1_000);
+	} finally { clearTimeout(timer);releaseFirstWitness();await pending; }
+	assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	mcp.endStdin();assert.equal(await mcp.exited, 0);
+	return;
+      }
+      const id = mcp.fireRequest('tools/call', { name, arguments: args });
+      await firstWitnessPaused;
+      if (mode.endsWith('cancelled') || mode.endsWith('sibling')) mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode.endsWith('sibling')) {
+	await mcp.request('ping');
+	await until(() => witnessTransportClosed, 'cancel only this independent witness read', 1_000);
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'healthy concurrent witness read survives cancellation');
+	releaseFirstWitness();
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'late cancelled response cannot poison fresh admission');
+      }
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const outcome = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(outcome, 0, 'EOF must cancel the independent witness before its existing5sec deadline');
+	await until(() => witnessTransportClosed, 'independent HTTPS request closes on cancellation', 1_000);
+	const replies = mcp.frames.filter(frame => frame.id === id);
+	assert.equal(replies.length, mode.endsWith('cancelled') || mode.endsWith('sibling') ? 0 : 1);
+	if (mode.endsWith('eof')) assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/reject', '/api/ask', '/api/file-artifacts'].includes(path)), false);
+      } finally { clearTimeout(timer);releaseFirstWitness();await mcp.exited; }
+      return;
+    }
     if (mode === 'submit-ack-cancelled') {
       const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
       await privatePaused;
