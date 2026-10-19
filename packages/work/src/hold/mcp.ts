@@ -397,16 +397,25 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       const requestRevision = refusalRevision;
       const gone = terminalGuard(requestRevision, ctx);
       if (gone !== undefined) return gone;
+      const controller = new AbortController();
+      ctx.onCancel(() => controller.abort());
       if (deps.trustedInputV2) {
 	try {
-	  const res = await hub.getOrder({ workflow, run, ...holderReq });
+	  const res = await hub.getOrder({ workflow, run, ...holderReq }, controller.signal);
+	  const afterRead = terminalGuard(requestRevision, ctx);
+	  if (afterRead !== undefined) return afterRead;
 	  const refused = await gate(res, requestRevision);
 	  const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
 	  if (afterGate !== undefined) return afterGate;
 	  if (refused !== undefined) return refused;
 	  captured = res;
 	  return gatedView(res, requestRevision, inputWitnesses);
-	} catch { invalidateObservation(requestRevision); return textResult({ error: 'held get_order unavailable' }, true); }
+	} catch {
+	  const cancelled = terminalGuard(requestRevision, ctx);
+	  if (cancelled !== undefined) return cancelled;
+	  invalidateObservation(requestRevision);
+	  return textResult({ error: 'held get_order unavailable' }, true);
+	}
       }
       if (captured !== undefined) {
 	const refused = await gate(captured, requestRevision);
@@ -424,7 +433,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	return gatedView(firstContact, requestRevision);
       }
       try {
-        const res = await hub.getOrder({ workflow, run, ...holderReq });
+	const res = await hub.getOrder({ workflow, run, ...holderReq }, controller.signal);
+	const afterRead = terminalGuard(requestRevision, ctx);
+	if (afterRead !== undefined) return afterRead;
 	const refused = await gate(res, requestRevision);
 	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
         if (afterGate !== undefined) return afterGate;
@@ -432,6 +443,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         captured = res;
 	return gatedView(res, requestRevision);
       } catch (e) {
+	const cancelled = terminalGuard(requestRevision, ctx);
+	if (cancelled !== undefined) return cancelled;
 	invalidateObservation(requestRevision);
         return textResult({ error: errMsg(e) }, true);
       }

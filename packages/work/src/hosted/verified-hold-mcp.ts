@@ -256,11 +256,71 @@ export function createVerifiedHostedHoldMcp(
       ...(verifiedPacket === undefined ? {} : { packet: verifiedPacket }) };
   }
   async function readVerified(revision: number, ctx: Parameters<ToolRegistration['handler']>[1]): ReturnType<typeof observeVerified> {
-    const checked = await observeVerified(revision, ctx);
-    const stale = observationGuard(revision, ctx);
-    if (stale !== undefined) return { ok: false, result: stale };
-    if (!checked.ok) invalidateObservation(revision);
-    return checked;
+    const initial = observationGuard(revision, ctx);
+    if (initial !== undefined) return { ok: false, result: initial };
+    // The independent adapter has its own deadline, but private holder reads
+    // occur on both sides of it. Bound the complete observation too, and make
+    // a late private completion see cancellation before pinning or exposure.
+    let wallStartedAt: number;
+    let monotonicStartedAt: number;
+    try {
+      wallStartedAt = (options.now ?? Date.now)();
+      monotonicStartedAt = (options.monotonicNow ?? (() => performance.now()))();
+    } catch {
+      return { ok: false, result: refuseObservation('clock-unavailable', revision) };
+    }
+    if (!Number.isSafeInteger(wallStartedAt) || wallStartedAt < 0 || !Number.isFinite(monotonicStartedAt)) {
+      return { ok: false, result: refuseObservation('clock-unavailable', revision) };
+    }
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const localCancellations = new Set<() => void>();
+    const scopedContext = { ...ctx,
+      get cancelled() { return expired || ctx.cancelled; },
+      onCancel(callback: () => void) {
+	if (expired) callback();
+	else {
+	  localCancellations.add(callback);
+	  ctx.onCancel(callback);
+	}
+      },
+    };
+    const deadline = new Promise<Awaited<ReturnType<typeof observeVerified>>>((resolve) => {
+      timer = setTimeout(() => {
+	expired = true;
+	for (const cancel of localCancellations) { try { cancel(); } catch { /* Cancellation cannot prevent refusal. */ } }
+	if (!ctx.cancelled) invalidateObservation(revision);
+	resolve({ ok: false, result: refusal(ctx.cancelled ? 'call-cancelled' : 'claim-observation-expired') });
+      }, 5_000);
+    });
+    try {
+      const checked = await Promise.race([observeVerified(revision, scopedContext), deadline]);
+      if (expired) return checked;
+      const stale = observationGuard(revision, ctx);
+      if (stale !== undefined) return { ok: false, result: stale };
+      // Timer callbacks can run late if synchronous local work blocked the
+      // event loop. Include the initial private read in both elapsed budgets.
+      let wallElapsed: number;
+      let monotonicElapsed: number;
+      try {
+	wallElapsed = (options.now ?? Date.now)() - wallStartedAt;
+	monotonicElapsed = (options.monotonicNow ?? (() => performance.now()))() - monotonicStartedAt;
+      } catch {
+	return { ok: false, result: refuseObservation('clock-unavailable', revision) };
+      }
+      if (!Number.isSafeInteger(wallElapsed) || wallElapsed < 0
+	|| !Number.isFinite(monotonicElapsed) || monotonicElapsed < 0) {
+	return { ok: false, result: refuseObservation('clock-unavailable', revision) };
+      }
+      if (wallElapsed >= 5_000 || monotonicElapsed >= 5_000) {
+	return { ok: false, result: refuseObservation('claim-observation-expired', revision) };
+      }
+      if (!checked.ok) invalidateObservation(revision);
+      return checked;
+    } finally {
+      clearTimeout(timer);
+      localCancellations.clear();
+    }
   }
   const orderTool: ToolRegistration = {
     name: 'get_order',

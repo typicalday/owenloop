@@ -276,11 +276,11 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
-  const workdirInput = mode === 'workdir';
+  const workdirInput = mode === 'workdir' || mode === 'verified-workdir';
   const feedback = mode === 'feedback';
   const routing = mode === 'routing';
   const emptyInputs = feedback || routing;
@@ -325,6 +325,13 @@ steps:
     const seen: string[] = [];
     let witnessAvailable = true;
     let witnessWorkflow = canonicalWorkflow;
+    let workdirVersion = 1;
+    let privateReads = 0;
+    let privateTransportClosed = false;
+    let privateReadEntered!: () => void;
+    let releasePrivateRead!: () => void;
+    const privatePaused = new Promise<void>(resolve => { privateReadEntered = resolve; });
+    const privateResume = new Promise<void>(resolve => { releasePrivateRead = resolve; });
     let witnessReads = 0;
     let pauseNextWitness = false;
     let firstWitnessEntered!: () => void;
@@ -357,10 +364,17 @@ steps:
 	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
 	    { path: 'optional', version: 1, present: supplied,
 	      ...(supplied ? { value: packet.consumes.optional } : {}) },
-	  ], ...(workdirInput ? { workdirInput: { stem: 'config', version: 1, value: { path: configDir } } } : {}),
+	  ], ...(workdirInput ? { workdirInput: { stem: 'config', version: workdirVersion, value: { path: configDir } } } : {}),
 	  lease: { claimed: true },
 	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
       } else if (req.url === '/api/get_order') {
+	privateReads++;
+	if ((mode === 'verified-stalled-private-initial' && privateReads === 2)
+	  || (mode === 'verified-stalled-private-final' && privateReads === 3)) {
+	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
+	  privateReadEntered();
+	  await privateResume;
+	}
 	res.end(JSON.stringify({ text: '', workflow: canonicalWorkflow, run: 'run1', order: packet, lease: { claimed: true } }));
       } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
       else res.end(JSON.stringify({ text: '' }));
@@ -401,12 +415,37 @@ steps:
       assert.equal(await mcp.exited, 0);
       return;
     }
+    if (mode === 'verified-stalled-private-initial' || mode === 'verified-stalled-private-final') {
+      const pending = callTool(mcp, 'get_order');
+      await privatePaused;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const result = await Promise.race([pending, new Promise<'still-pending'>(resolve => {
+	  timer = setTimeout(() => resolve('still-pending'), 6_000);
+	})]);
+	assert.notEqual(result, 'still-pending', 'actual verified CLI must bound its private holder reads');
+	if (result !== 'still-pending') {
+	  assert.equal(result.isError, true);
+	  assert.match(JSON.stringify(result.body), /claim-observation-expired/);
+	  await until(() => privateTransportClosed, 'expired private HTTPS transport closes', 1_000);
+	  assert.equal((await callTool(mcp, 'get_order')).isError, false, 'healthy sibling succeeds while old private read is stalled');
+	}
+      } finally {
+	clearTimeout(timer);releasePrivateRead();await pending;
+      }
+      assert.equal((await callTool(mcp, 'get_order')).isError, false, 'late completion cannot erase fresh state');
+      assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/ask', '/api/reject'].includes(path)), false);
+      assert.equal(seen.includes('/api/reference_order/v1'), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
     const viewed = await callTool(mcp, 'get_order');
     if (verified) {
       assert.equal(viewed.isError, false, JSON.stringify(viewed.body));
       assert.equal(viewed.body.state, 'ready');
       assert.equal(viewed.body.serviceObservation.referenceProtocol, 'trusted-reference-read-v2');
-      assert.deepEqual(viewed.body.inputWitnesses, [
+      assert.deepEqual(viewed.body.inputWitnesses, workdirInput ? [] : [
 	{ path: 'proposal', version: 1, present: true, trust: 'trusted-service-claim-version' },
 	{ path: 'optional', version: 1, present: supplied, trust: 'trusted-service-claim-version' },
       ]);
@@ -422,6 +461,14 @@ steps:
 	const late = await older;
 	assert.equal(newer.isError, false, JSON.stringify(newer.body));
 	assert.equal(late.isError, false, JSON.stringify(late.body));
+      }
+      if (mode === 'verified-workdir') {
+	assert.deepEqual(viewed.body.consumes, []);
+	workdirVersion++;
+	const moved = await callTool(mcp, 'get_order');
+	assert.equal(moved.isError, true, 'same cwd value at a new source version must refuse');
+	workdirVersion--;
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'fresh original workdir witness recovers');
       }
       if (mode === 'verified-child') {
 	assert.equal(viewed.body.serviceObservation.workflow, 'wf_child');

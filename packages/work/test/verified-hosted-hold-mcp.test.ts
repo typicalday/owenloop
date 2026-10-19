@@ -864,3 +864,106 @@ test('v2 verified canonical child remains independently matched, pinned, and roo
     assert.equal(g.calls.includes('sign'), false, move);
   }
 });
+
+test('verified observations bound a stalled initial or final private holder read and fence its late completion', async () => {
+  for (const stalledRead of [1, 2]) {
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const f = fixture(false, { v2: true, onRawGet: async count => {
+      if (count === stalledRead) { entered(); await pending; }
+    } });
+    const old = f.call();
+    await started;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([old, new Promise<'still-pending'>(resolve => {
+	timer = setTimeout(() => resolve('still-pending'), 6_000);
+      })]);
+      assert.notEqual(result, 'still-pending', 'private holder read must share the five-second observation deadline');
+      if (result === 'still-pending') continue;
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /claim-observation-expired/);
+      assert.equal((await f.call()).isError, undefined, 'a fresh healthy read recovers independently');
+    } finally {
+      clearTimeout(timer);release();await old;
+    }
+    assert.equal((await f.call()).isError, undefined, 'late private completion cannot erase the newer verified observation');
+    assert.equal(f.calls.includes('sign'), false);
+    assert.equal(f.submits.length, 0);
+  }
+});
+
+test('the complete verified observation deadline includes elapsed time before the independent read starts', async () => {
+  for (const clock of ['wall', 'monotonic'] as const) {
+    const f = fixture(true, { v2: true, onRawGet: async count => {
+      if (count === 1) {
+	if (clock === 'wall') f.setTime(5_002);
+	else f.setMonotonicTime(5_000);
+      }
+    } });
+    const result = await f.submit({ path: 'out', value: { n: 1 } });
+    assert.equal(result.isError, true, clock);
+    assert.match(result.content[0]!.text, /claim-observation-expired/);
+    assert.equal(f.calls.includes('sign'), false, clock);
+    assert.equal(f.submits.length, 0, clock);
+  }
+});
+
+test('a stalled private read after signing expires without a conditional write', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const f = fixture(true, { v2: true, onRawGet: async count => {
+    if (count === 3) { entered(); await pending; }
+  } });
+  const submitted = f.submit({ path: 'out', value: { n: 1 } });
+  await started;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([submitted, new Promise<'still-pending'>(resolve => {
+      timer = setTimeout(() => resolve('still-pending'), 6_000);
+    })]);
+    assert.notEqual(result, 'still-pending');
+    if (result !== 'still-pending') {
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /claim-observation-expired/);
+    }
+    assert.equal(f.calls.filter(call => call === 'sign').length, 1);
+    assert.equal(f.submits.length, 0);
+  } finally {
+    clearTimeout(timer);release();await submitted;
+  }
+  assert.equal((await f.call()).isError, undefined);
+  assert.equal(f.submits.length, 0, 'late post-sign read cannot send the pending conditional write');
+});
+
+test('a cancelled private-read timeout does not fence a healthy sibling still verifying', async () => {
+  const cancelled = { ...context, cancelled: false };
+  let releasePrivate!: () => void;
+  let privateEntered!: () => void;
+  let releaseHealthy!: (value: HostedOrderResult) => void;
+  let healthyEntered!: () => void;
+  const privatePending = new Promise<void>(resolve => { releasePrivate = resolve; });
+  const privateStarted = new Promise<void>(resolve => { privateEntered = resolve; });
+  const healthyPending = new Promise<HostedOrderResult>(resolve => { releaseHealthy = resolve; });
+  const healthyStarted = new Promise<void>(resolve => { healthyEntered = resolve; });
+  const f = fixture(false, { context: cancelled, onRawGet: async count => {
+    if (count === 1) { privateEntered();await privatePending; }
+  }, open: async () => { healthyEntered();return healthyPending; } });
+  const old = f.call();
+  await privateStarted;
+  cancelled.cancelled = true;
+  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const healthy = f.wrapped.tools[0]!.handler({}, context);
+  await healthyStarted;
+  try {
+    const result = await old;
+    assert.match(result.content[0]!.text, /call-cancelled/);
+  } finally {
+    releasePrivate();releaseHealthy(ready());
+  }
+  assert.equal((await healthy).isError, undefined, 'cancelled request expiry cannot invalidate an unrelated healthy observation');
+});

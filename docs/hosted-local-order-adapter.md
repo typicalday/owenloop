@@ -27,6 +27,17 @@ reads. MCP navigation, HTTPS requests, and conditional writes retain the
 original requested root/run; neither private content nor a later child can
 retarget them. Legacy v1 still requires its original exact workflow binding.
 
+The verified holder also bounds the complete observation to five seconds,
+including its initial and final private holder reads. A real deadline returns
+a refusal when a private read stalls and cancels its normal HTTPS request.
+The request signal also prevents a late credential lookup from starting an
+expired private bearer request. Wall and monotonic elapsed checks cover
+local work that delays the timer callback. Deadline expiry fences late private
+results before exposure, signing, or a conditional write; a fresh healthy read
+can recover. An already cancelled call does not invalidate healthy siblings
+when its deadline expires. This does not forcibly terminate a private transport or verifier
+that ignores cancellation.
+
 Partial conditional submissions may advance only owed target versions. A
 private `get_order`-only mount can refresh those versions; ordinary mutation
 tools cannot select that mode. The wrapper keeps every other private field and

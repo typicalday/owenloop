@@ -77,7 +77,7 @@ export interface HubClient {
    * a fake that ignores it simply cannot be cut short.
    */
   whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
-  getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
+  getOrder(req: GetOrderRequest, signal?: AbortSignal): Promise<GetOrderResponse>;
   /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
   getReferenceOrder?(req: GetOrderRequest, signal?: AbortSignal): Promise<unknown>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
@@ -233,7 +233,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
       }
       return result;
     },
-    getOrder: (req) => post<GetOrderResponse>('get_order', req),
+    getOrder: (req, signal) => post<GetOrderResponse>('get_order', req, signal),
     getReferenceOrder: (req, signal) => post<unknown>('reference_order/v1', req, signal),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
