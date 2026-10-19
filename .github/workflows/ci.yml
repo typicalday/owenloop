@@ -49,6 +49,59 @@ jobs:
             .owenloop/proofs/runtime-selection/state.sqlite
             .owenloop/proofs/runtime-selection/receipt.json
 
+      # Project checks keep their matrix runtime above. Exercise the published
+      # package's advertised minimum separately, after recording that proof.
+      - name: Select minimum installed-consumer runtime
+        if: matrix.node == 22
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.13.0
+
+      - name: Check isolated installed package
+        env:
+          CONSUMER_NODE_MAJOR: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          consumer_root="$(mktemp -d "${RUNNER_TEMP}/owenloop-consumer.XXXXXX")"
+          trap 'rm -rf -- "$consumer_root"' EXIT
+          npm pack --ignore-scripts --json --pack-destination "$consumer_root" > "$consumer_root/pack.json"
+          tarball="$(node -e 'const fs=require("node:fs"),p=require("node:path"),d=process.argv[1],f=fs.readdirSync(d).filter(n=>n.endsWith(".tgz"));if(f.length!==1)throw Error("expected one archive");console.log(p.join(d,f[0]));' "$consumer_root")"
+          node scripts/check-npm-package.mjs "$tarball"
+          node -e 'const fs=require("node:fs"),c=require("node:crypto");console.log("archive sha256",c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"));' "$tarball"
+          mkdir "$consumer_root/app"
+          printf '{"private":true,"type":"module"}\n' > "$consumer_root/app/package.json"
+          npm --prefix "$consumer_root/app" install --omit=dev --ignore-scripts --no-audit --no-fund "$tarball"
+          cd "$consumer_root/app"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { realpathSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          import { Engine, openStore, buildDef, defInstructionDigest } from 'owenloop';
+          const major = Number(process.env.CONSUMER_NODE_MAJOR);
+          assert.equal(Number(process.versions.node.split('.')[0]), major);
+          if (major === 22) assert.equal(process.version, 'v22.13.0');
+          assert.equal(import.meta.resolve('owenloop'), pathToFileURL(resolve('node_modules/owenloop/dist/src/index.js')).href);
+          assert.equal(realpathSync('node_modules/.bin/owenloop'), resolve('node_modules/owenloop/bin/owenloop.mjs'));
+          const definition = buildDef({ name: 'private-consumer', inputs: [{ name: 'q', seedOwed: false }],
+            steps: [{ name: 'make', consumes: ['q'], produces: ['out'], body: 'Create own fixture output.' }] });
+          assert.equal(typeof defInstructionDigest(definition), 'string');
+          const store = openStore(':memory:');
+          try {
+            const engine = new Engine(store, () => definition);
+            const workflow = engine.createInstance(definition.name);
+            const order = engine.tick(workflow).orders.find(candidate => candidate.step === 'make');
+            assert.ok(order);
+            assert.equal(engine.green(workflow, order.run, 'out', { ok: true }).outcome, 'green');
+            engine.close(workflow, order.run);
+            assert.equal(store.getArtifact(workflow, 'out').acceptance, 'green');
+          } finally { store.close(); }
+          console.log(JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch,
+            entry: import.meta.resolve('owenloop'), publicLifecycle: 'passed', store: ':memory:' }));
+          NODE
+          ./node_modules/.bin/owenloop --help
+          npm audit --omit=dev --audit-level=low
+
   # Real SSHSIG interoperability: both OS runners ship stock `ssh-keygen` with
   # `-Y` support, so the crypto tests run unskipped — module sign → stock
   # verify and stock sign → module verify in both directions, plus the secure
