@@ -945,3 +945,29 @@ test('v2 adapter resolves a root-bound reference to a matched canonical child wi
   assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused', 'outer and inner independent identities must agree');
   assert.equal(h.fetches(), 0, 'v2 selection never invokes the v1 route');
 });
+
+
+test('adapter cancellation prevents pre-aborted bearer work and late private verification exposure', async () => {
+  const pre = new AbortController();pre.abort();
+  const untouched = await harness();
+  assert.deepEqual(await untouched.adapter.open(preflight(untouched.f.defDigest), 0, undefined, pre.signal), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'call-cancelled',
+  });
+  assert.equal(untouched.fetches(), 0);
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const resume = new Promise<void>(resolve => { release = resolve; });
+  const h = await harness({ publicationWait: async () => { entered();await resume; } });
+  const cancel = new AbortController();
+  let exposed = 0;
+  const pending = h.adapter.open(preflight(h.f.defDigest), 0, () => { exposed++; }, cancel.signal);
+  await started;cancel.abort();
+  assert.deepEqual(await boundedResult(pending), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'call-cancelled',
+  });
+  release();
+  await new Promise<void>(resolve => setTimeout(resolve, 20));
+  assert.equal(exposed, 0, 'cancelled local verification cannot expose a late private packet');
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'ready');
+});

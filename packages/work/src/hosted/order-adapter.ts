@@ -146,19 +146,28 @@ function refused(code: string): HostedOrderResult {
 async function withReadDeadline(
   duration: number,
   read: (signal: AbortSignal) => Promise<HostedOrderResult>,
+  callerSignal?: AbortSignal,
 ): Promise<HostedOrderResult> {
   const deadline = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancel!: () => void;
   const expired = new Promise<HostedOrderResult>((resolve) => {
+    cancel = () => {
+      resolve(refused('call-cancelled'));
+      deadline.abort();
+    };
     timer = setTimeout(() => {
       resolve(refused('claim-observation-expired'));
       deadline.abort();
     }, duration);
   });
+  callerSignal?.addEventListener('abort', cancel, { once: true });
   try {
+    if (callerSignal?.aborted) { cancel(); return await expired; }
     return await Promise.race([read(deadline.signal), expired]);
   } finally {
     clearTimeout(timer);
+    callerSignal?.removeEventListener('abort', cancel);
   }
 }
 
@@ -244,7 +253,7 @@ export function hostedReferenceV2Digest(packet: OrderPacket, declaredInputPaths:
  */
 export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
   readonly referenceProtocol?: 'trusted-reference-read-v2';
-  open(preflight: unknown, index?: number, onVerified?: (packet: HostedVerifiedPacket) => void): Promise<HostedOrderResult>;
+  open(preflight: unknown, index?: number, onVerified?: (packet: HostedVerifiedPacket) => void, signal?: AbortSignal): Promise<HostedOrderResult>;
   submitConditional(req: ConditionalSubmitRequest): Promise<ConditionalSubmitResponse>;
 } {
   const referenceV2 = options.referenceV2;
@@ -287,7 +296,8 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       if (hub.submitConditional === undefined) throw new Error('conditional submit transport is unavailable');
       return hub.submitConditional(req);
     },
-    async open(preflight: unknown, index = 0, onVerified?: (packet: HostedVerifiedPacket) => void): Promise<HostedOrderResult> {
+    async open(preflight: unknown, index = 0, onVerified?: (packet: HostedVerifiedPacket) => void, signal?: AbortSignal): Promise<HostedOrderResult> {
+      if (signal?.aborted) return refused('call-cancelled');
       const navigation = preflightRef(preflight, index);
       if (navigation.kind !== 'ref') return { protocol: 'local-hosted-order-v1', state: 'unavailable' };
       const { ref } = navigation;
@@ -309,7 +319,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       return withReadDeadline(duration, async (signal) => {
 	let response: unknown;
 	try {
-	  if (referenceV2) response = await referenceV2.read();
+	  if (referenceV2) response = await referenceV2.read(signal);
 	  else {
 	    if (hub.getReferenceOrder === undefined) return refused('reference-read-unavailable');
 	    response = await hub.getReferenceOrder({ workflow: expectedWorkflowId, run: expectedRunId }, signal);
@@ -495,7 +505,7 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
 	    trust: 'trusted-service-claim-version' as const })) } : {}),
 	  outputs,
 	};
-      });
+      }, signal);
     },
   };
 }

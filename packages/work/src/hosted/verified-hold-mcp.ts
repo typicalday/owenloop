@@ -13,7 +13,7 @@ import { hostedPacketDigest, hostedReferencePacketDigest, hostedReferenceStableD
 
 type Adapter = {
   readonly referenceProtocol?: 'trusted-reference-read-v2';
-  open(preflight: unknown, index?: number, onVerified?: (packet: HostedVerifiedPacket) => void): Promise<HostedOrderResult>;
+  open(preflight: unknown, index?: number, onVerified?: (packet: HostedVerifiedPacket) => void, signal?: AbortSignal): Promise<HostedOrderResult>;
   submitConditional?: (req: ConditionalSubmitRequest) => Promise<ConditionalSubmitResponse>;
 };
 type BoundOrder = { workflow: string; run: string };
@@ -207,10 +207,16 @@ export function createVerifiedHostedHoldMcp(
     if (!Number.isFinite(startedAt)) return { ok: false, result: refusal('clock-unavailable') };
     let verified: HostedOrderResult;
     let verifiedPacket: HostedVerifiedPacket | undefined;
+    const independent = new AbortController();
+    let independentActive = true;
+    ctx.onCancel(() => { if (independentActive) independent.abort(); });
+    if (ctx.cancelled) independent.abort();
     try {
-      verified = await adapter.open(ref, 0, (packet) => { verifiedPacket = packet; });
+      verified = await adapter.open(ref, 0, (packet) => { verifiedPacket = packet; }, independent.signal);
     } catch {
       return { ok: false, result: refusal('verification-unavailable') };
+    } finally {
+      independentActive = false;
     }
     const afterVerification = observationGuard(revision, ctx);
     if (afterVerification !== undefined) return { ok: false, result: afterVerification };

@@ -41,7 +41,7 @@ function reducedOrder(order: OrderPacket) {
 }
 
 function fixture(enableSubmit = false, settings: {
-  open?: () => Promise<HostedOrderResult>;
+  open?: (signal?: AbortSignal) => Promise<HostedOrderResult>;
   onRawGet?: (count: number, order: OrderPacket) => Promise<void>;
   sign?: (signal?: AbortSignal) => Promise<string | undefined>;
   onConditionalSubmit?: (req: ConditionalSubmitRequest) => Promise<void> | void;
@@ -99,7 +99,7 @@ function fixture(enableSubmit = false, settings: {
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
     ...(settings.v2 ? { referenceProtocol: 'trusted-reference-read-v2' as const } : {}),
-    open: async (ref, _index, onVerified) => {
+    open: async (ref, _index, onVerified, signal) => {
       calls.push('verify');
       assert.deepEqual(ref, {
 	protocol: 'client-preflight-v1', verification: 'not-performed',
@@ -107,7 +107,7 @@ function fixture(enableSubmit = false, settings: {
       });
       if (observation.state === 'ready') onVerified?.({ order: verifiedPacket, collectionOutputs,
 	...(settings.v2 ? { declaredInputPaths: settings.declaredInputPaths ?? [] } : {}) });
-      return settings.open === undefined ? observation : settings.open();
+      return settings.open === undefined ? observation : settings.open(signal);
     },
     submitConditional: async (req) => {
       calls.push('conditional-submit');
@@ -1023,3 +1023,35 @@ for (const v2 of [false, true]) {
     assert.equal((await f.call()).isError, undefined, 'fresh healthy verification remains available');
   });
 }
+
+
+test('cancelled adapter observation leaves an already-verifying healthy sibling valid', async () => {
+  let cancelled = false;
+  const callbacks: Array<() => void> = [];
+  const ctx: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: cb => { callbacks.push(cb); }, sendProgress: () => {} };
+  let enteredFirst!: () => void;
+  let enteredSecond!: () => void;
+  let releaseSecond!: () => void;
+  const first = new Promise<void>(resolve => { enteredFirst = resolve; });
+  const second = new Promise<void>(resolve => { enteredSecond = resolve; });
+  const resume = new Promise<void>(resolve => { releaseSecond = resolve; });
+  let calls = 0;
+  const f = fixture(false, { open: async signal => {
+    if (++calls === 1) {
+      assert.ok(signal);
+      enteredFirst();
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+      return { protocol: 'local-hosted-order-v1', state: 'refused', code: 'call-cancelled' };
+    }
+    enteredSecond();await resume;
+    return ready();
+  } });
+  const stopped = f.wrapped.tools[0]!.handler({}, ctx);
+  await first;
+  const healthy = f.call();
+  await second;
+  cancelled = true;callbacks.forEach(cb => cb());
+  assert.match((await stopped).content[0]!.text, /call-cancelled/);
+  releaseSecond();
+  assert.equal((await healthy).isError, undefined, 'cancelled adapter read must not supersede a healthy in-flight sibling');
+});

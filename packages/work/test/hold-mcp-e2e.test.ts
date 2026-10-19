@@ -277,7 +277,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'verified-adapter-get-eof', 'verified-adapter-get-cancelled', 'verified-adapter-get-body-eof', 'verified-adapter-get-sibling', 'verified-adapter-get-deadline', 'verified-adapter-submit-eof', 'verified-adapter-submit-cancelled', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -355,9 +355,10 @@ steps:
 	  return;
 	}
 	const availableAtRead = witnessAvailable;
-	if (mode.startsWith('witness-') && ++witnessReads === 1) {
+	if ((mode.startsWith('witness-') && ++witnessReads === 1)
+	  || (mode.startsWith('verified-adapter-') && ++witnessReads === 2)) {
 	  res.once('close', () => { if (!res.writableEnded) witnessTransportClosed = true; });
-	  if (mode === 'witness-get-body-eof') res.flushHeaders();
+	  if (mode === 'witness-get-body-eof' || mode === 'verified-adapter-get-body-eof') res.flushHeaders();
 	  firstWitnessEntered();await firstWitnessResume;
 	}
 	if (((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) || pauseNextWitness) {
@@ -410,7 +411,7 @@ steps:
     assert.ok(address && typeof address !== 'string');
     const origin = `https://localhost:${address.port}`;
     const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof' || mode === 'signing-cancelled' || mode === 'signing-eof' || mode === 'signing-sibling';
-    const submitting = delayedSigning || mode.startsWith('submit-private-') || mode === 'submit-ack-cancelled' || mode.startsWith('witness-submit-') || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const submitting = mode.startsWith('verified-adapter-submit-') || delayedSigning || mode.startsWith('submit-private-') || mode === 'submit-ack-cancelled' || mode.startsWith('witness-submit-') || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
     const signingStarted = join(configDir, 'signing-started');
     const signingFinished = join(configDir, 'signing-finished');
     let signingEnv: Record<string, string> = {};
@@ -450,16 +451,16 @@ if (sign) {
       ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
     { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert }, mode.startsWith('witness-') ? configDir : undefined);
     await handshake(mcp);
-    if (mode.startsWith('witness-')) {
+    if (mode.startsWith('witness-') || mode.startsWith('verified-adapter-')) {
       writeFileSync(join(configDir, 'output.txt'), 'local test artifact');
-      const name = mode.startsWith('witness-submit-') ? 'submit'
+      const name = (mode.startsWith('witness-submit-') || mode.startsWith('verified-adapter-submit-')) ? 'submit'
 	: mode.startsWith('witness-reject-') ? 'reject' : mode.startsWith('witness-ask-') ? 'ask'
 	: mode.startsWith('witness-file-') ? 'put_file_artifact' : 'get_order';
       const args = name === 'submit' ? { path: 'plan', value: { n: 1 } }
 	: name === 'reject' ? { path: 'proposal', text: 'local test reason' }
 	: name === 'ask' ? { path: 'plan', question: 'local test question' }
 	: name === 'put_file_artifact' ? { file: 'output.txt' } : {};
-      if (mode === 'witness-get-deadline') {
+      if (mode === 'witness-get-deadline' || mode === 'verified-adapter-get-deadline') {
 	const pending = callTool(mcp, name, args);
 	await firstWitnessPaused;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -470,7 +471,7 @@ if (sign) {
 	  assert.notEqual(result, 'pending', 'existing5sec witness deadline stays active');
 	  if (result !== 'pending') {
 	    assert.equal(result.isError, true);
-	    assert.match(JSON.stringify(result.body), /reference-v2-unavailable/);
+	    assert.match(JSON.stringify(result.body), /reference-v2-unavailable|claim-observation-expired|reference-read-unavailable/);
 	  }
 	  await until(() => witnessTransportClosed, 'deadline closes independent HTTPS', 1_000);
 	} finally { clearTimeout(timer);releaseFirstWitness();await pending; }
