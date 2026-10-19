@@ -735,6 +735,10 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     order: OrderPacket,
     resolvedCommand: string,
   ): Promise<ExecOutcome> {
+    // A non-closing reject ACK describes that already-sent request only.
+    // It cannot authorize a later escalation after stop or observed lease loss.
+    if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
+
     // run() returns misroute when order.owes is empty, so this index is safe.
     const path = order.owes[0]!.path;
     const how = describeCommandFailure(receipt);

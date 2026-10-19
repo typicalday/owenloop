@@ -2499,3 +2499,59 @@ for (const late of ['proof', 'error'] as const) {
     assert.equal(await running, 'killed');
   });
 }
+
+for (const ending of ['stop', 'lease loss'] as const) {
+  test(`${ending} while non-closing payload reject ACK is pending prevents failure escalation`, async () => {
+    const fr = fakeRunner();let revoked = false;
+    const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()], reject: [{ ok: true, closed: false }],
+      heartbeat: () => { if (revoked) throw new HubError(403, 'claim revoked'); },
+    });
+    let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+    let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+    const reject = hub.reject;
+    hub.reject = async req => { const ack = await reject(req);entered();await blocked;return ack; };
+    const loop = createExecLoop(baseOpts(hub, fr.runner));const running = loop.run();
+    await macrotaskSleep();fr.resolve(result(1, { payloadLine: '{"reject":{"path":"input","text":"invalid upstream"}}' }));
+    await pending;
+    if (ending === 'stop') loop.stop('signal');else revoked = true;
+    await macrotaskSleep();await macrotaskSleep();resume();
+    const outcome = await running;
+    assert.deepEqual({ outcome, asks: only(calls, 'ask').length, rejects: only(calls, 'reject').length, submits: submits.length },
+      { outcome: ending === 'stop' ? 'killed' : 'ownership-error', asks: 0, rejects: 1, submits: 0 });
+    assert.equal(only(calls, 'release').length, ending === 'stop' ? 1 : 0);
+  });
+}
+
+test('stop after non-closing reject ACK fences escalation while final release remains pending', async () => {
+  const fr = fakeRunner();let release!: () => void;
+  const { hub, calls } = mockHub({ getOrder: [commandOrder()], reject: [{ ok: true, closed: false }],
+    release: () => new Promise(resolve => { release = () => resolve({ text: '' }); }),
+  });
+  let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+  let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+  const reject = hub.reject;
+  hub.reject = async req => { const ack = await reject(req);entered();await blocked;return ack; };
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { sleep: () => new Promise<void>(() => {}) }));
+  const running = loop.run();await macrotaskSleep();
+  fr.resolve(result(1, { payloadLine: '{"reject":{"path":"input","text":"invalid upstream"}}' }));
+  await pending;loop.stop('signal');await macrotaskSleep();resume();await macrotaskSleep();
+  try { assert.equal(only(calls, 'ask').length, 0); }
+  finally { release();await running; }
+  assert.equal(await running, 'killed');
+});
+
+for (const accepted of [true, false]) {
+  test(`stop during closing reject preserves already-sent ${accepted ? 'accepted' : 'refused'} ACK`, async () => {
+    const fr = fakeRunner();
+    const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()], reject: [{ ok: accepted, closed: true }] });
+    let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+    let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+    const reject = hub.reject;
+    hub.reject = async req => { const ack = await reject(req);entered();await blocked;return ack; };
+    const loop = createExecLoop(baseOpts(hub, fr.runner));const running = loop.run();await macrotaskSleep();
+    fr.resolve(result(1, { payloadLine: '{"reject":{"path":"input","text":"invalid upstream"}}' }));
+    await pending;loop.stop('signal');await macrotaskSleep();resume();
+    assert.equal(await running, accepted ? 'rejected' : 'reject-failed');
+    assert.equal(only(calls, 'reject').length, 1);assert.equal(only(calls, 'ask').length, 0);assert.equal(submits.length, 0);
+  });
+}

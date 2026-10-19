@@ -234,3 +234,43 @@ steps:
     await new Promise<void>(r => server.close(() => r()));
   }
 });
+
+for (const ending of ['stop', 'lease loss', 'healthy'] as const) {
+  test(`e2e: ${ending} during payload reject ACK preserves reject-first failure escalation boundary`, async () => {
+    const reqs: HubReq[] = [];let revoked = false;let rejectAck!: () => void;
+    const server = createServer((req, res) => {
+      let raw = '';req.on('data', (chunk: Buffer) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+	const verb = (req.url ?? '').replace(/^\/api\//, '');
+	reqs.push({ verb, auth: req.headers.authorization, body: JSON.parse(raw) as Record<string, unknown> });
+	res.setHeader('content-type', 'application/json');
+	if (verb === 'get_order') res.end(JSON.stringify(commandOrder('local fixture')));
+	else if (verb === 'reject') rejectAck = () => res.end(JSON.stringify({ text: 'rejected non-consumed input', ok: true, closed: false }));
+	else if (verb === 'heartbeat' && revoked) { res.statusCode = 403;res.end(JSON.stringify({ error: 'claim revoked' })); }
+	else if (verb === 'ask') res.end(JSON.stringify({ text: '', ok: true, closed: true }));
+	else res.end(JSON.stringify({ text: '' }));
+      });
+    });
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as AddressInfo;
+    const loop = loopAgainst(`http://127.0.0.1:${port}`,
+      `printf '%s' '{"reject":{"path":"input","text":"invalid upstream"}}' > "$OWENLOOP_PAYLOAD_FILE"; exit 1`);
+    const running = loop.run();
+    try {
+      await until(() => rejectAck !== undefined, 'pending reject ACK');
+      assert.equal(of(reqs, 'ask').length, 0);
+      if (ending === 'stop') { loop.stop('signal');await until(() => of(reqs, 'release').length === 1, 'final release'); }
+      else if (ending === 'lease loss') {
+	revoked = true;const beats = of(reqs, 'heartbeat').length;
+	await until(() => of(reqs, 'heartbeat').length > beats, 'revoked heartbeat');await realSleep(20);
+      }
+      rejectAck();
+      const outcome = await running;
+      assert.deepEqual({ outcome, rejects: of(reqs, 'reject').length, asks: of(reqs, 'ask').length, submits: of(reqs, 'submit').length },
+	{ outcome: ending === 'stop' ? 'killed' : ending === 'lease loss' ? 'ownership-error' : 'command-failed',
+	  rejects: 1, asks: ending === 'healthy' ? 1 : 0, submits: 0 });
+      for (const r of reqs) assert.equal(r.auth, 'Bearer tok-e2e');
+      if (ending === 'healthy') assert.ok(reqs.findIndex(r => r.verb === 'reject') < reqs.findIndex(r => r.verb === 'ask'));
+    } finally { rejectAck?.();loop.stop('test cleanup');await running;server.closeAllConnections();server.close(); }
+  });
+}

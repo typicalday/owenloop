@@ -182,3 +182,9 @@ Each send checks the lease again, including a later owed path after an earlier
 receipt acknowledgement. Requests already sent still consume their normal ACK;
 the client does not undo committed receipts or silently retry uncertain writes.
 Private signing work may finish in the background without authorizing a send.
+
+A non-closing payload rejection does not authorize a later failure escalation
+once stop or lease loss has been observed. Exec consumes the rejection ACK,
+then checks the lease before sending an `ask`. Closing or refused rejection
+responses retain their existing outcomes; a healthy failed command still
+rejects first and asks afterward without greening its owed outputs.
