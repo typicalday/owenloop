@@ -560,9 +560,12 @@ never surfacing a token to the model. See the
   unflagged from 22.13 onward (it still prints an experimental warning until it
   stabilises in Node 24.15 / 25.7). owenloop is an ESM-only package. CI runs the
   full check on Node 22 (active LTS) and 24 (current).
-- **No native dependencies.** `node:sqlite` is built in, so there's nothing to
-  compile. The only runtime deps are `yaml` (parsing defs) and
-  `@cfworker/json-schema` (optional per-artifact schema validation).
+- **No SQLite addon build.** Storage uses Node's built-in `node:sqlite`, so
+  installing Owenloop does not compile a SQLite addon.
+- **Runtime dependencies.** `yaml` parses definitions, `@cfworker/json-schema`
+  validates artifact schemas, and `semver` checks bundle/runtime versions.
+  `@anthropic-ai/claude-agent-sdk` and its transitive dependencies are also
+  installed with Owenloop. The Claude adapter loads the SDK's runtime API lazily.
 - **OpenSSH `ssh-keygen` with `-Y` support** (OpenSSH 8.1+) for the signing
   features. `owenloop setup` automatically ensures an Ed25519 signing key for
   each of the three local principals — human, machine, agent — and signs /
