@@ -130,6 +130,28 @@ function refused(code: string): HostedOrderResult {
   return { protocol: 'local-hosted-order-v1', state: 'refused', code };
 }
 
+/** Bound the caller even when a credential reader, transport or verifier
+ * ignores cancellation. Late completions must check the signal before any
+ * further work or exposure. Each read owns its timer and cancellation. */
+async function withReadDeadline(
+  duration: number,
+  read: (signal: AbortSignal) => Promise<HostedOrderResult>,
+): Promise<HostedOrderResult> {
+  const deadline = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<HostedOrderResult>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(refused('claim-observation-expired'));
+      deadline.abort();
+    }, duration);
+  });
+  try {
+    return await Promise.race([read(deadline.signal), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Equality check between the holder's private packet and the direct verified fetch. */
 export function hostedPacketDigest(packet: unknown): string | undefined {
   try {
@@ -247,161 +269,166 @@ export function createHostedOrderAdapter(options: HostedOrderAdapterOptions): {
       if (!Number.isFinite(startedAt) || !Number.isSafeInteger(observedAt) || observedAt < 0) return refused('clock-unavailable');
       const expiresAt = observedAt + duration;
       if (!Number.isSafeInteger(expiresAt)) return refused('clock-unavailable');
-      let response: unknown;
-      try {
-	if (hub.getReferenceOrder === undefined) return refused('reference-read-unavailable');
-	response = await hub.getReferenceOrder({ workflow: expectedWorkflowId, run: expectedRunId });
-      } catch {
-	return refused('reference-read-unavailable');
-      }
-      let fetchedAt: number;
-      let fetchedElapsed: number;
-      try {
-	fetchedAt = options.now();
-	fetchedElapsed = monotonicNow() - startedAt;
-      } catch {
-	return refused('clock-unavailable');
-      }
-      if (!Number.isFinite(fetchedElapsed) || fetchedElapsed < 0) return refused('clock-unavailable');
-      if (!Number.isSafeInteger(fetchedAt) || fetchedAt < observedAt || fetchedAt >= expiresAt
-	|| fetchedElapsed >= duration) return refused('claim-observation-expired');
-      const envelope = record(response);
-      if (!envelope) return refused('direct-response-malformed');
-      if (envelope.protocol !== REFERENCE_PROTOCOL) return refused('reference-protocol-unavailable');
-      if (envelope.workflow !== expectedWorkflowId || envelope.run !== expectedRunId) return refused('reference-rebound');
-      if (envelope.state !== 'available') {
-	if (envelope.state === 'unavailable' || envelope.state === 'unsupported-feedback' || envelope.state === 'routing-unsupported') {
-	  return refused(`service-${envelope.state}`);
+      return withReadDeadline(duration, async (signal) => {
+	let response: unknown;
+	try {
+	  if (hub.getReferenceOrder === undefined) return refused('reference-read-unavailable');
+	  response = await hub.getReferenceOrder({ workflow: expectedWorkflowId, run: expectedRunId }, signal);
+	} catch {
+	  return refused('reference-read-unavailable');
 	}
-	return refused('reference-state-malformed');
-      }
-      if (Object.keys(envelope).some((field) => !RESPONSE_FIELDS.has(field))) return refused('direct-response-malformed');
-      const order = envelope.order as OrderPacket;
-      const lease = record(envelope.lease);
-      if (!record(order) || !lease
-	|| order.workflow !== expectedWorkflowId || order.run !== expectedRunId
-	|| typeof order.defDigest !== 'string' || order.defDigest.toLowerCase() !== ref.defDigest) return refused('reference-rebound');
-      if (lease.claimed !== true || lease.outcome !== undefined) return refused('claim-not-current');
-      if (Object.keys(lease).some((field) => !LEASE_FIELDS.has(field))) return refused('direct-response-malformed');
-      if ((lease.claimedAt !== undefined && (!Number.isSafeInteger(lease.claimedAt) || (lease.claimedAt as number) < 0))
-	|| (lease.heartbeatAt !== undefined && (!Number.isSafeInteger(lease.heartbeatAt) || (lease.heartbeatAt as number) < 0))) {
-	return refused('direct-response-malformed');
-      }
-      if (!identifier(order.step) || typeof order.key !== 'string' || order.key.length > 200 || !record(order.consumes)
-	|| !Array.isArray(order.owes)) return refused('order-malformed');
-      if (Object.keys(order).some((field) => !ORDER_FIELDS.has(field))
-	|| order.owes.some((owed) => !record(owed) || Object.keys(owed).some((field) => !OWED_FIELDS.has(field)))) {
-	return refused('unsupported-order-field');
-      }
-      if (order.owes.some((owed) => owed.proof !== undefined)) return refused('unsupported-feedback');
-      // Service v1 withholds authored feedback/previous values, modifier and
-      // cause. Reject all unrecognized fields and unsupported local shapes.
-      if (Object.keys(order.consumes).length === 0
-	&& (order.consumesProof !== undefined || order.consumesProofRelay !== undefined)) {
-	return refused('unsupported-order-field');
-      }
-      if (instructions.resolveHostedStep === undefined) {
-	return refused('unsupported-worker');
-      }
-      let staticResult: Awaited<ReturnType<NonNullable<typeof instructions.resolveHostedStep>>>;
-      try {
-	staticResult = await instructions.resolveHostedStep(order);
-      } catch {
-	return refused('definition-verifier-failed');
-      }
-      if (!staticResult.ok) return refused(`definition-${staticResult.kind}`);
-      const step = staticResult.step;
-      if ((step.executor !== undefined && step.executor !== 'agent') || step.workdir !== undefined
-	|| step.workdirFrom !== undefined || step.calls !== undefined || step.callsInterface !== undefined
-	|| step.judges !== undefined) return refused('unsupported-step');
-      // Service v1 has no dynamic modifier/cause fields. A local definition
-      // that needs either value cannot be materialized from this protocol.
-      if ((step.on !== undefined && (step.on.length !== 1 || step.on[0] !== 'inputsGreen'))
-	|| step.body.includes('${MODIFIER}')) return refused('unsupported-service-v1-shape');
-      if (!validConsumedPaths(step, order)) return refused('consume-path-mismatch');
-      if (!Array.isArray(order.outputs) || order.outputs.length === 0 || order.outputs.length !== order.owes.length
-	|| order.outputs.some((path) => typeof path !== 'string')
-	|| new Set(order.outputs).size !== order.outputs.length
-	|| new Set(order.owes.map((owed) => owed.path)).size !== order.owes.length
-	|| order.owes.some((owed) => !order.outputs.includes(owed.path))) {
-	return refused('output-path-mismatch');
-      }
-      const outputs: HostedOrderProjection['outputs'] = [];
-      const collectionOutputs: string[] = [];
-      for (const owed of order.owes) {
-	if (typeof owed.path !== 'string' || owed.path.length > 200 || !Number.isSafeInteger(owed.version) || owed.version! < 1) {
-	  return refused('output-malformed');
+	if (signal.aborted) return refused('claim-observation-expired');
+	let fetchedAt: number;
+	let fetchedElapsed: number;
+	try {
+	  fetchedAt = options.now();
+	  fetchedElapsed = monotonicNow() - startedAt;
+	} catch {
+	  return refused('clock-unavailable');
 	}
-	const produce = outputFor(step, order, owed.path);
-	if (produce === undefined) return refused('output-path-mismatch');
-	if (produce.kind === 'collection') collectionOutputs.push(owed.path);
-	const schemaAppliesTo = produce.kind === 'collection' ? 'member' : 'value';
-	outputs.push({
-	  path: owed.path,
-	  version: owed.version!,
-	  versionTrust: 'trusted-service-observation',
-	  ...(produce.schema === undefined ? {} : { schema: produce.schema, schemaAppliesTo }),
-	});
-      }
-      let checked: Awaited<ReturnType<typeof consumedVerifier>>;
-      try {
-	// The v1 marker asserts no rework thread. Legacy verifier code expects
-	// empty counters/reasons, so supply that private neutral shape only here.
-	checked = await consumedVerifier({ ...order, owes: order.owes.map((owed) => ({ ...owed,
-	  reasons: [], judgmentRejects: 0, schemaRejects: 0 })) }, {
-	  hardRule: true,
-	  callsProducers: staticResult.callsProducers,
-	});
-      } catch {
-	return refused('consume-verifier-failed');
-      }
-      if (!checked.ok) return refused('consume-proof-refused');
-      let prompt: string;
-      try {
-	prompt = substituteOrderVars(step.body, {
-	  workflow: order.workflow,
-	  run: order.run,
-	  key: order.key,
-	  ...(order.index === undefined ? {} : { index: order.index }),
-	  ...(order.modifier === undefined ? {} : { modifier: order.modifier }),
-	}, { step: step.name, maxAttempts: step.maxAttempts });
-      } catch {
-	return refused('definition-materialization-failed');
-      }
-      // Verification and materialization share the fetch-start window.
-      let finishedAt: number;
-      let finishedElapsed: number;
-      try {
-	finishedAt = options.now();
-	finishedElapsed = monotonicNow() - startedAt;
-      } catch {
-	return refused('clock-unavailable');
-      }
-      if (!Number.isFinite(finishedElapsed) || finishedElapsed < fetchedElapsed) return refused('clock-unavailable');
-      if (!Number.isSafeInteger(finishedAt) || finishedAt < observedAt || finishedAt >= expiresAt) {
-	return refused('claim-observation-expired');
-      }
-      if (finishedElapsed >= duration) return refused('claim-observation-expired');
-      const remainingExpiry = Math.floor(finishedAt + duration - finishedElapsed);
-      if (!Number.isSafeInteger(remainingExpiry) || remainingExpiry <= finishedAt) return refused('claim-observation-expired');
-      const packetDigest = hostedReferencePacketDigest(order);
-      if (packetDigest === undefined) return refused('order-malformed');
-      onVerified?.({ order, collectionOutputs });
-      return {
-	protocol: 'local-hosted-order-v1',
-	state: 'ready',
-	serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, packetDigest, observedAt, expiresAt: Math.min(expiresAt, remainingExpiry) },
-	definition: { bodyTrust: 'verified-local-publication', substitutions: 'trusted-service-observation', digest: order.defDigest, prompt },
-	...(step.spec === undefined && step.x === undefined ? {} : {
-	  staticExtensions: {
-	    trust: 'verified-local-definition' as const,
-	    ...(step.spec === undefined ? {} : { spec: step.spec }),
-	    ...(step.x === undefined ? {} : { x: step.x }),
-	  },
-	}),
-	consumes: Object.entries(order.consumes).map(([path, value]) => ({ path, value, trust: 'signed-value-and-local-chain-at-service-observed-version' })),
-	outputs,
-      };
+	if (!Number.isFinite(fetchedElapsed) || fetchedElapsed < 0) return refused('clock-unavailable');
+	if (!Number.isSafeInteger(fetchedAt) || fetchedAt < observedAt || fetchedAt >= expiresAt
+	  || fetchedElapsed >= duration) return refused('claim-observation-expired');
+	const envelope = record(response);
+	if (!envelope) return refused('direct-response-malformed');
+	if (envelope.protocol !== REFERENCE_PROTOCOL) return refused('reference-protocol-unavailable');
+	if (envelope.workflow !== expectedWorkflowId || envelope.run !== expectedRunId) return refused('reference-rebound');
+	if (envelope.state !== 'available') {
+	  if (envelope.state === 'unavailable' || envelope.state === 'unsupported-feedback' || envelope.state === 'routing-unsupported') {
+	    return refused(`service-${envelope.state}`);
+	  }
+	  return refused('reference-state-malformed');
+	}
+	if (Object.keys(envelope).some((field) => !RESPONSE_FIELDS.has(field))) return refused('direct-response-malformed');
+	const order = envelope.order as OrderPacket;
+	const lease = record(envelope.lease);
+	if (!record(order) || !lease
+	  || order.workflow !== expectedWorkflowId || order.run !== expectedRunId
+	  || typeof order.defDigest !== 'string' || order.defDigest.toLowerCase() !== ref.defDigest) return refused('reference-rebound');
+	if (lease.claimed !== true || lease.outcome !== undefined) return refused('claim-not-current');
+	if (Object.keys(lease).some((field) => !LEASE_FIELDS.has(field))) return refused('direct-response-malformed');
+	if ((lease.claimedAt !== undefined && (!Number.isSafeInteger(lease.claimedAt) || (lease.claimedAt as number) < 0))
+	  || (lease.heartbeatAt !== undefined && (!Number.isSafeInteger(lease.heartbeatAt) || (lease.heartbeatAt as number) < 0))) {
+	  return refused('direct-response-malformed');
+	}
+	if (!identifier(order.step) || typeof order.key !== 'string' || order.key.length > 200 || !record(order.consumes)
+	  || !Array.isArray(order.owes)) return refused('order-malformed');
+	if (Object.keys(order).some((field) => !ORDER_FIELDS.has(field))
+	  || order.owes.some((owed) => !record(owed) || Object.keys(owed).some((field) => !OWED_FIELDS.has(field)))) {
+	  return refused('unsupported-order-field');
+	}
+	if (order.owes.some((owed) => owed.proof !== undefined)) return refused('unsupported-feedback');
+	// Service v1 withholds authored feedback/previous values, modifier and
+	// cause. Reject all unrecognized fields and unsupported local shapes.
+	if (Object.keys(order.consumes).length === 0
+	  && (order.consumesProof !== undefined || order.consumesProofRelay !== undefined)) {
+	  return refused('unsupported-order-field');
+	}
+	if (instructions.resolveHostedStep === undefined) {
+	  return refused('unsupported-worker');
+	}
+	let staticResult: Awaited<ReturnType<NonNullable<typeof instructions.resolveHostedStep>>>;
+	try {
+	  staticResult = await instructions.resolveHostedStep(order);
+	} catch {
+	  return refused('definition-verifier-failed');
+	}
+	if (signal.aborted) return refused('claim-observation-expired');
+	if (!staticResult.ok) return refused(`definition-${staticResult.kind}`);
+	const step = staticResult.step;
+	if ((step.executor !== undefined && step.executor !== 'agent') || step.workdir !== undefined
+	  || step.workdirFrom !== undefined || step.calls !== undefined || step.callsInterface !== undefined
+	  || step.judges !== undefined) return refused('unsupported-step');
+	// Service v1 has no dynamic modifier/cause fields. A local definition
+	// that needs either value cannot be materialized from this protocol.
+	if ((step.on !== undefined && (step.on.length !== 1 || step.on[0] !== 'inputsGreen'))
+	  || step.body.includes('${MODIFIER}')) return refused('unsupported-service-v1-shape');
+	if (!validConsumedPaths(step, order)) return refused('consume-path-mismatch');
+	if (!Array.isArray(order.outputs) || order.outputs.length === 0 || order.outputs.length !== order.owes.length
+	  || order.outputs.some((path) => typeof path !== 'string')
+	  || new Set(order.outputs).size !== order.outputs.length
+	  || new Set(order.owes.map((owed) => owed.path)).size !== order.owes.length
+	  || order.owes.some((owed) => !order.outputs.includes(owed.path))) {
+	  return refused('output-path-mismatch');
+	}
+	const outputs: HostedOrderProjection['outputs'] = [];
+	const collectionOutputs: string[] = [];
+	for (const owed of order.owes) {
+	  if (typeof owed.path !== 'string' || owed.path.length > 200 || !Number.isSafeInteger(owed.version) || owed.version! < 1) {
+	    return refused('output-malformed');
+	  }
+	  const produce = outputFor(step, order, owed.path);
+	  if (produce === undefined) return refused('output-path-mismatch');
+	  if (produce.kind === 'collection') collectionOutputs.push(owed.path);
+	  const schemaAppliesTo = produce.kind === 'collection' ? 'member' : 'value';
+	  outputs.push({
+	    path: owed.path,
+	    version: owed.version!,
+	    versionTrust: 'trusted-service-observation',
+	    ...(produce.schema === undefined ? {} : { schema: produce.schema, schemaAppliesTo }),
+	  });
+	}
+	let checked: Awaited<ReturnType<typeof consumedVerifier>>;
+	try {
+	  // The v1 marker asserts no rework thread. Legacy verifier code expects
+	  // empty counters/reasons, so supply that private neutral shape only here.
+	  checked = await consumedVerifier({ ...order, owes: order.owes.map((owed) => ({ ...owed,
+	    reasons: [], judgmentRejects: 0, schemaRejects: 0 })) }, {
+	    hardRule: true,
+	    callsProducers: staticResult.callsProducers,
+	  });
+	} catch {
+	  return refused('consume-verifier-failed');
+	}
+	if (signal.aborted) return refused('claim-observation-expired');
+	if (!checked.ok) return refused('consume-proof-refused');
+	let prompt: string;
+	try {
+	  prompt = substituteOrderVars(step.body, {
+	    workflow: order.workflow,
+	    run: order.run,
+	    key: order.key,
+	    ...(order.index === undefined ? {} : { index: order.index }),
+	    ...(order.modifier === undefined ? {} : { modifier: order.modifier }),
+	  }, { step: step.name, maxAttempts: step.maxAttempts });
+	} catch {
+	  return refused('definition-materialization-failed');
+	}
+	// Verification and materialization share the fetch-start window.
+	let finishedAt: number;
+	let finishedElapsed: number;
+	try {
+	  finishedAt = options.now();
+	  finishedElapsed = monotonicNow() - startedAt;
+	} catch {
+	  return refused('clock-unavailable');
+	}
+	if (!Number.isFinite(finishedElapsed) || finishedElapsed < fetchedElapsed) return refused('clock-unavailable');
+	if (!Number.isSafeInteger(finishedAt) || finishedAt < observedAt || finishedAt >= expiresAt) {
+	  return refused('claim-observation-expired');
+	}
+	if (finishedElapsed >= duration) return refused('claim-observation-expired');
+	const remainingExpiry = Math.floor(finishedAt + duration - finishedElapsed);
+	if (!Number.isSafeInteger(remainingExpiry) || remainingExpiry <= finishedAt) return refused('claim-observation-expired');
+	const packetDigest = hostedReferencePacketDigest(order);
+	if (packetDigest === undefined) return refused('order-malformed');
+	onVerified?.({ order, collectionOutputs });
+	return {
+	  protocol: 'local-hosted-order-v1',
+	  state: 'ready',
+	  serviceObservation: { workflow: order.workflow, run: order.run, step: order.step, packetDigest, observedAt, expiresAt: Math.min(expiresAt, remainingExpiry) },
+	  definition: { bodyTrust: 'verified-local-publication', substitutions: 'trusted-service-observation', digest: order.defDigest, prompt },
+	  ...(step.spec === undefined && step.x === undefined ? {} : {
+	    staticExtensions: {
+	      trust: 'verified-local-definition' as const,
+	      ...(step.spec === undefined ? {} : { spec: step.spec }),
+	      ...(step.x === undefined ? {} : { x: step.x }),
+	    },
+	  }),
+	  consumes: Object.entries(order.consumes).map(([path, value]) => ({ path, value, trust: 'signed-value-and-local-chain-at-service-observed-version' })),
+	  outputs,
+	};
+      });
     },
   };
 }

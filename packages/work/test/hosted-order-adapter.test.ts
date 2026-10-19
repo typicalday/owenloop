@@ -150,6 +150,10 @@ async function harness(overrides: {
   expected?: { workflowId: string; runId: string };
   now?: () => number;
   monotonicNow?: () => number;
+  observationMs?: number;
+  getToken?: () => Promise<string>;
+  transport?: typeof fetch;
+  publicationWait?: () => Promise<void>;
 } = {}) {
   const f = await fixture(overrides.workflowYaml);
   const p = await packet(f.defDigest, f.keyPath, f.rootKeyId);
@@ -170,13 +174,15 @@ async function harness(overrides: {
     return new Response(JSON.stringify(response), { status: overrides.status ?? 200, headers: { 'content-type': 'application/json' } });
   };
   const adapter = createHostedOrderAdapter({
-    hub: { origin: 'https://trusted.example', getToken: async () => 'local-secret', fetchImpl },
+    hub: { origin: 'https://trusted.example', getToken: overrides.getToken ?? (async () => 'local-secret'),
+      fetchImpl: overrides.transport ?? fetchImpl },
     expected: overrides.expected ?? { workflowId: 'wf-hosted', runId: 'run-hosted' },
     instructionSource: {
       projectRoot: f.projectRoot, globalRoot: tempDir('owenloop-hosted-adapter-global-'),
       verifier: createBundleIngestor(), env: f.env,
       ...(overrides.missingPublicationVerifier ? {} : {
-	definitionVerifier: () => {
+	definitionVerifier: async () => {
+	  await overrides.publicationWait?.();
 	  if (overrides.throwPublicationVerifier) throw new Error('HOSTILE RAW VERIFIER ERROR');
 	  return { kind: 'verified' as const, publisherKeyId: f.rootKeyId, principal: 'publisher' };
 	},
@@ -185,9 +191,83 @@ async function harness(overrides: {
     consumeTrust: { env: f.env },
     now: overrides.now ?? (() => 1_000),
     monotonicNow: overrides.monotonicNow ?? (() => 0),
+    ...(overrides.observationMs === undefined ? {} : { observationMs: overrides.observationMs }),
   });
   return { adapter, p, f, fetches: () => fetches };
 }
+
+async function boundedResult<T>(pending: Promise<T>): Promise<T | 'still-pending'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([pending, new Promise<'still-pending'>((resolve) => {
+      timer = setTimeout(() => resolve('still-pending'), 500);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test('v1 read deadline settles stalled credentials and prevents a late bearer request', async () => {
+  let releaseToken!: (token: string) => void;
+  const token = new Promise<string>((resolve) => { releaseToken = resolve; });
+  const h = await harness({ observationMs: 30, getToken: () => token });
+  const pending = h.adapter.open(preflight(h.f.defDigest));
+  const result = await boundedResult(pending);
+  assert.deepEqual(result, { protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired' });
+  releaseToken('late-secret');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(h.fetches(), 0, 'expired authentication must never start a bearer POST');
+});
+
+test('v1 read deadline aborts stalled transport and isolates a healthy parallel read', async () => {
+  let firstSignal: AbortSignal | null | undefined;
+  let calls = 0;
+  let releaseFetch!: (response: Response) => void;
+  const stalled = new Promise<Response>((resolve) => { releaseFetch = resolve; });
+  const h = await harness({ observationMs: 100, transport: async (_input, init) => {
+    if (++calls === 1) { firstSignal = init?.signal; return stalled; }
+    return new Response(JSON.stringify({ protocol: 'trusted-reference-read-v1',
+      workflow: 'wf-hosted', run: 'run-hosted', state: 'unavailable' }));
+  } });
+  let exposed = 0;
+  const pending = h.adapter.open(preflight(h.f.defDigest), 0, () => { exposed++; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'service-unavailable',
+  });
+  const result = await boundedResult(pending);
+  releaseFetch(new Response(JSON.stringify(availableWire(h.p))));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(result, { protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired' });
+  assert.equal(firstSignal?.aborted, true);
+  assert.equal(exposed, 0, 'late non-cooperative transport must not publish a verified packet');
+});
+
+test('v1 read deadline covers stalled response bodies and local publication verification', async () => {
+  for (const stage of ['body', 'publication'] as const) {
+    let release!: () => void;
+    const stalled = new Promise<void>((resolve) => { release = resolve; });
+    let h: Awaited<ReturnType<typeof harness>>;
+    h = await harness({ observationMs: 100,
+      ...(stage === 'body' ? { transport: async () => {
+	return new Response(new ReadableStream({ start(controller) {
+	  void stalled.then(() => {
+	    controller.enqueue(new TextEncoder().encode(JSON.stringify(availableWire(h.p))));
+	    controller.close();
+	  });
+	} }));
+      } } : { publicationWait: () => stalled }),
+    });
+    let exposed = 0;
+    const pending = h.adapter.open(preflight(h.f.defDigest), 0, () => { exposed++; });
+    const result = await boundedResult(pending);
+    release();
+    await pending;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(result, { protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired' }, stage);
+    assert.equal(exposed, 0, `${stage} completing late must not publish a verified packet`);
+  }
+});
 
 /** Test double for the Service v1 allowlist. Negative tests can bypass this
  * helper with wireResponse to inject malformed protocol payloads. */

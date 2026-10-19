@@ -43,8 +43,12 @@ caps the projected epoch expiry by remaining monotonic time. Unsafe clock
 arithmetic, a delayed response, and expiry during verification refuse. A
 retained projection needs a caller-side monotonic deadline or another `open`
 immediately before use. A claim can change after return, so consequential
-actions require a fresh read and local hold check. A stalled request remains
-a separate liveness concern; the Hub client does not provide an abort signal.
+actions require a fresh read and local hold check. Each read also owns a real
+deadline: expiry returns a bounded refusal and aborts the HTTPS request and
+response body. A stalled credential lookup or local verifier cannot hold the
+caller indefinitely. A late credential cannot start a bearer request, and a
+late transport or verifier cannot publish a verified packet. This does not
+forcibly terminate a credential reader or verifier that ignores cancellation.
 
 `work hold --mcp --verified-hosted` is read-only by default. Its native
 `get_order` shows a reduced dynamic model view. The full previously gated
