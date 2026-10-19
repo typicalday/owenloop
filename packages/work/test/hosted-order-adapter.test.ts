@@ -15,6 +15,7 @@ import { createBundleIngestor, createStoreInstructionSource } from '../../../src
 import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import type { GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
 import { createDefaultHostedOrderAdapter, createHostedOrderAdapter, hostedReferencePacketDigest } from '../src/hosted/order-adapter.ts';
+import { parseTrustedReferenceV2 } from '../src/hosted/trusted-reference-v2.ts';
 
 const CALLS_CHILD = `name: hosted-child
 inputs:
@@ -150,6 +151,11 @@ async function harness(overrides: {
   expected?: { workflowId: string; runId: string };
   now?: () => number;
   monotonicNow?: () => number;
+  observationMs?: number;
+  getToken?: () => Promise<string>;
+  transport?: typeof fetch;
+  publicationWait?: () => Promise<void>;
+  referenceV2?: (p: OrderPacket) => unknown;
 } = {}) {
   const f = await fixture(overrides.workflowYaml);
   const p = await packet(f.defDigest, f.keyPath, f.rootKeyId);
@@ -170,13 +176,17 @@ async function harness(overrides: {
     return new Response(JSON.stringify(response), { status: overrides.status ?? 200, headers: { 'content-type': 'application/json' } });
   };
   const adapter = createHostedOrderAdapter({
-    hub: { origin: 'https://trusted.example', getToken: async () => 'local-secret', fetchImpl },
+    ...(overrides.referenceV2 ? { referenceV2: { read: async () => parseTrustedReferenceV2(overrides.referenceV2!(p),
+      { workflow: 'wf-hosted', run: 'run-hosted' }) } } : {}),
+    hub: { origin: 'https://trusted.example', getToken: overrides.getToken ?? (async () => 'local-secret'),
+      fetchImpl: overrides.transport ?? fetchImpl },
     expected: overrides.expected ?? { workflowId: 'wf-hosted', runId: 'run-hosted' },
     instructionSource: {
       projectRoot: f.projectRoot, globalRoot: tempDir('owenloop-hosted-adapter-global-'),
       verifier: createBundleIngestor(), env: f.env,
       ...(overrides.missingPublicationVerifier ? {} : {
-	definitionVerifier: () => {
+	definitionVerifier: async () => {
+	  await overrides.publicationWait?.();
 	  if (overrides.throwPublicationVerifier) throw new Error('HOSTILE RAW VERIFIER ERROR');
 	  return { kind: 'verified' as const, publisherKeyId: f.rootKeyId, principal: 'publisher' };
 	},
@@ -185,9 +195,83 @@ async function harness(overrides: {
     consumeTrust: { env: f.env },
     now: overrides.now ?? (() => 1_000),
     monotonicNow: overrides.monotonicNow ?? (() => 0),
+    ...(overrides.observationMs === undefined ? {} : { observationMs: overrides.observationMs }),
   });
   return { adapter, p, f, fetches: () => fetches };
 }
+
+async function boundedResult<T>(pending: Promise<T>): Promise<T | 'still-pending'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([pending, new Promise<'still-pending'>((resolve) => {
+      timer = setTimeout(() => resolve('still-pending'), 500);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test('v1 read deadline settles stalled credentials and prevents a late bearer request', async () => {
+  let releaseToken!: (token: string) => void;
+  const token = new Promise<string>((resolve) => { releaseToken = resolve; });
+  const h = await harness({ observationMs: 30, getToken: () => token });
+  const pending = h.adapter.open(preflight(h.f.defDigest));
+  const result = await boundedResult(pending);
+  assert.deepEqual(result, { protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired' });
+  releaseToken('late-secret');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(h.fetches(), 0, 'expired authentication must never start a bearer POST');
+});
+
+test('v1 read deadline aborts stalled transport and isolates a healthy parallel read', async () => {
+  let firstSignal: AbortSignal | null | undefined;
+  let calls = 0;
+  let releaseFetch!: (response: Response) => void;
+  const stalled = new Promise<Response>((resolve) => { releaseFetch = resolve; });
+  const h = await harness({ observationMs: 100, transport: async (_input, init) => {
+    if (++calls === 1) { firstSignal = init?.signal; return stalled; }
+    return new Response(JSON.stringify({ protocol: 'trusted-reference-read-v1',
+      workflow: 'wf-hosted', run: 'run-hosted', state: 'unavailable' }));
+  } });
+  let exposed = 0;
+  const pending = h.adapter.open(preflight(h.f.defDigest), 0, () => { exposed++; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(await h.adapter.open(preflight(h.f.defDigest)), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'service-unavailable',
+  });
+  const result = await boundedResult(pending);
+  releaseFetch(new Response(JSON.stringify(availableWire(h.p))));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(result, { protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired' });
+  assert.equal(firstSignal?.aborted, true);
+  assert.equal(exposed, 0, 'late non-cooperative transport must not publish a verified packet');
+});
+
+test('v1 read deadline covers stalled response bodies and local publication verification', async () => {
+  for (const stage of ['body', 'publication'] as const) {
+    let release!: () => void;
+    const stalled = new Promise<void>((resolve) => { release = resolve; });
+    let h: Awaited<ReturnType<typeof harness>>;
+    h = await harness({ observationMs: 100,
+      ...(stage === 'body' ? { transport: async () => {
+	return new Response(new ReadableStream({ start(controller) {
+	  void stalled.then(() => {
+	    controller.enqueue(new TextEncoder().encode(JSON.stringify(availableWire(h.p))));
+	    controller.close();
+	  });
+	} }));
+      } } : { publicationWait: () => stalled }),
+    });
+    let exposed = 0;
+    const pending = h.adapter.open(preflight(h.f.defDigest), 0, () => { exposed++; });
+    const result = await boundedResult(pending);
+    release();
+    await pending;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(result, { protocol: 'local-hosted-order-v1', state: 'refused', code: 'claim-observation-expired' }, stage);
+    assert.equal(exposed, 0, `${stage} completing late must not publish a verified packet`);
+  }
+});
 
 /** Test double for the Service v1 allowlist. Negative tests can bypass this
  * helper with wireResponse to inject malformed protocol payloads. */
@@ -213,6 +297,63 @@ function serviceWire(raw: GetOrderResponse | null): unknown {
 function availableWire(order: OrderPacket): Record<string, unknown> {
   return serviceWire({ text: '', workflow: order.workflow, run: order.run, order, lease: { claimed: true } }) as Record<string, unknown>;
 }
+
+/** Explicit local Service-v2 fixture; not hosted/native authority evidence. */
+function v2Wire(p: OrderPacket, declared: string[]): Record<string, unknown> {
+  const order = structuredClone(p);
+  const proofs = JSON.parse(order.consumesProof ?? '{}') as Record<string, string>;
+  order.consumesProof = JSON.stringify(Object.fromEntries(Object.entries(proofs).filter(([path]) => !declared.includes(path))));
+  return { protocol: 'trusted-reference-read-v2', state: 'available', workflow: order.workflow, run: order.run,
+    order: { ...order, owes: order.owes.map(({ path, version }) => ({ path, version })) },
+    inputs: order.inputs.map(path => ({ path, version: order.consumedFingerprint![path],
+      present: Object.hasOwn(order.consumes, path), ...(Object.hasOwn(order.consumes, path) ? { value: order.consumes[path] } : {}) })),
+    lease: { claimed: true } };
+}
+
+test('explicit v2 adapter admits witnessed optional absence and labels declared values without producer authority', async () => {
+  let mutate: (wire: Record<string, unknown>) => unknown = wire => wire;
+  const h = await harness({ workflowYaml: WORKFLOW.replace('steps:', '  - name: optional\n    seedOwed: false\nsteps:')
+    .replace('consumes: [seed]', 'consumes: [seed, optional]'),
+    referenceV2: p => mutate(v2Wire(p, ['seed', 'optional'])) });
+  h.p.inputs.push('optional');h.p.consumedFingerprint!.optional = 1;
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') {
+    assert.equal(result.serviceObservation.referenceProtocol, 'trusted-reference-read-v2');
+    assert.deepEqual(result.inputWitnesses, [
+      { path: 'seed', version: 2, present: true, trust: 'trusted-service-claim-version' },
+      { path: 'optional', version: 1, present: false, trust: 'trusted-service-claim-version' },
+    ]);
+    assert.deepEqual(result.consumes, [{ path: 'seed', value: VALUE, trust: 'trusted-service-claim-version' }]);
+  }
+  for (const bad of [
+    (wire: Record<string, unknown>) => { wire.inputs = []; },
+    (wire: Record<string, unknown>) => { (wire.inputs as Array<{ version: number }>)[1]!.version++; },
+    (wire: Record<string, unknown>) => { (wire.inputs as Array<{ present: boolean }>)[1]!.present = true; },
+  ]) {
+    mutate = wire => { bad(wire);return wire; };
+    assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  }
+  mutate = () => ({ protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf-hosted', run: 'run-hosted' });
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  assert.equal(h.fetches(), 0, 'a selected v2 reader never downgrades to the v1 fetch transport');
+});
+
+test('v2 adapter retains hard signed producer verification for collection member inputs', async () => {
+  const h = await harness({ workflowYaml: MAP_WORKFLOW.replace('name: hosted-map', 'name: hosted-adapter'), referenceV2: p => v2Wire(p, []) });
+  Object.assign(h.p, { step: 'annotate', key: 'items[0]', index: 0, inputs: ['items[0]'], outputs: ['items[0].note'],
+    consumes: { 'items[0]': VALUE }, consumedFingerprint: { 'items[0]': 2 },
+    consumesProof: JSON.stringify({ 'items[0]': await proof(VALUE, h.f.keyPath, h.f.rootKeyId, 'items[0]', 2) }),
+    owes: [{ path: 'items[0].note', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] });
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') assert.equal(result.consumes[0]!.trust, 'signed-value-and-local-chain-at-service-observed-version');
+  h.p.consumes['items[0]'] = { tampered: true };
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  h.p.consumes['items[0]'] = VALUE;delete h.p.consumesProof;
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  assert.equal(h.fetches(), 0);
+});
 
 test('valid signed consume crosses direct authenticated fetch into a minimized labeled projection', async () => {
   const h = await harness({ received: (body, init) => {
@@ -783,4 +924,50 @@ test('v1 hosted source refuses a calls-produced path without a verified child cl
       protocol: 'local-hosted-order-v1', state: 'refused', code: 'definition-integrity',
     });
   }
+});
+
+
+test('v2 adapter resolves a root-bound reference to a matched canonical child without retargeting navigation', async () => {
+  let corruptInner = false;
+  const h = await harness({ referenceV2: p => {
+    const wire = v2Wire(p, ['seed']);
+    if (corruptInner) (wire.order as OrderPacket).workflow = 'wf-other-child';
+    return wire;
+  } });
+  h.p.workflow = 'wf-canonical-child';
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') assert.equal(result.serviceObservation.workflow, 'wf-canonical-child');
+  const retarget = preflight(h.f.defDigest) as { order: { workflow: string } };
+  retarget.order.workflow = 'wf-canonical-child';
+  assert.equal((await h.adapter.open(retarget)).state, 'refused', 'canonical child cannot retarget root-bound navigation');
+  corruptInner = true;
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused', 'outer and inner independent identities must agree');
+  assert.equal(h.fetches(), 0, 'v2 selection never invokes the v1 route');
+});
+
+
+test('adapter cancellation prevents pre-aborted bearer work and late private verification exposure', async () => {
+  const pre = new AbortController();pre.abort();
+  const untouched = await harness();
+  assert.deepEqual(await untouched.adapter.open(preflight(untouched.f.defDigest), 0, undefined, pre.signal), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'call-cancelled',
+  });
+  assert.equal(untouched.fetches(), 0);
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const resume = new Promise<void>(resolve => { release = resolve; });
+  const h = await harness({ publicationWait: async () => { entered();await resume; } });
+  const cancel = new AbortController();
+  let exposed = 0;
+  const pending = h.adapter.open(preflight(h.f.defDigest), 0, () => { exposed++; }, cancel.signal);
+  await started;cancel.abort();
+  assert.deepEqual(await boundedResult(pending), {
+    protocol: 'local-hosted-order-v1', state: 'refused', code: 'call-cancelled',
+  });
+  release();
+  await new Promise<void>(resolve => setTimeout(resolve, 20));
+  assert.equal(exposed, 0, 'cancelled local verification cannot expose a late private packet');
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'ready');
 });

@@ -156,7 +156,7 @@ export class AmbiguousInstructionError extends Error {
  * and every step's authored instruction/routing fields. Deliberately
  * EXCLUDED: the source-location-only metadata `WorkflowDef.dir` (identical
  * content loaded from a different directory keeps the same identity) and the
- * `@internal` `_includes` (always absent on a fully-expanded def anyway).
+ * private `_includes` (always absent on a fully-expanded def anyway).
  *
  * This is NOT hashDef's 16-hex accidental-drift hash, and it is not an
  * adversarial trust claim — WP-A3's content-addressed store replaces it with

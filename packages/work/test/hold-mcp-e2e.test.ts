@@ -9,7 +9,14 @@
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:https';
+import { createHash } from 'node:crypto';
+import { PrincipalKeyManager } from '../../../src/crypto/keys.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -268,3 +275,614 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
     mcp.child.kill('SIGKILL');
   }
 });
+
+// Local signed test publication and loopback TLS only. This verifies the normal
+// production role wiring; it is not hosted Delivery acceptance evidence.
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'verified-adapter-get-eof', 'verified-adapter-get-cancelled', 'verified-adapter-get-body-eof', 'verified-adapter-get-sibling', 'verified-adapter-get-deadline', 'verified-adapter-submit-eof', 'verified-adapter-submit-cancelled', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat', 'file-redirect-307', 'file-redirect-308', 'file-redirect-healthy', 'file-redirect-outside', 'file-ack-empty', 'file-ack-key', 'file-ack-hash', 'file-ack-size', 'file-ack-content-type', 'file-ack-filename', 'file-race-leaf', 'file-race-ancestor'] as const) {
+test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
+  const verified = mode.startsWith('verified-');
+  const supplied = mode === 'supplied' || mode === 'verified-supplied';
+  const workdirInput = mode === 'workdir' || mode === 'verified-workdir';
+  const feedback = mode === 'feedback';
+  const routing = mode === 'routing';
+  const emptyInputs = feedback || routing;
+  const canonicalWorkflow = (mode === 'child' || mode === 'verified-child') ? 'wf_child' : 'wf1';
+  const sourceDir = writeBundleSource({ name: 'optional-holder', workflow: `name: optional-holder
+inputs:
+${emptyInputs ? '  []' : workdirInput ? `  - name: config
+    seedOwed: true` : `
+  - name: proposal
+    seedOwed: true
+  - name: optional
+    seedOwed: ${supplied}`}
+steps:
+  - name: planner
+    consumes: ${emptyInputs ? '[]' : workdirInput ? '[]\n    workdirFrom: config.path' : '[proposal, optional]'}
+    produces: [plan]
+    terminal: true
+    body: "Produce plan."
+` });
+  let server: ReturnType<typeof createServer> | undefined;
+  let mcp: McpChild | undefined;
+  let uploadTarget: ReturnType<typeof createServer> | undefined;
+  const fileCase = mode.startsWith('file-redirect-') || mode.startsWith('file-ack-') || mode.startsWith('file-race-');
+  const uploadBytes = Buffer.from('own isolated TEST upload\n');
+  const uploadHash = createHash('sha256').update(uploadBytes).digest('hex');
+  const pointer = { __file: `orgs/TEST/artifacts/wf1/files/${uploadHash}`, hash: uploadHash,
+    size: uploadBytes.byteLength, contentType: 'text/plain', filename: 'own-artifact.txt' };
+  const outsideFile = `${configDir}-outside.txt`;
+  const outsideDir = `${configDir}-outside-dir`;
+  const outsideBytes = Buffer.from('own OUTSIDE TEST marker\n');
+  let outsideUploads = 0;
+  let uploadRequests = 0;
+  let targetRequests = 0;
+  let targetBytes = 0;
+  let targetFilename: string | string[] | undefined;
+  try {
+    const installed = await installSignedBundleFixture({ sourceDir,
+      root: join(configDir, '.owenloop', 'workflows'), home: configDir });
+    const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+    const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name)!;
+    const key = join(configDir, 'tls.key');
+    const cert = join(configDir, 'tls.crt');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+    { stdio: 'ignore' });
+    const consumes: Record<string, unknown> = workdirInput || emptyInputs ? {}
+      : { proposal: 'a local test proposal', ...(supplied ? { optional: 'supplied required input' } : {}) };
+    const packet = { workflow: canonicalWorkflow, run: 'run1', step: 'planner', key: '',
+      defDigest: defInstructionDigest(definition), inputs: workdirInput || emptyInputs ? [] : ['proposal', 'optional'], outputs: ['plan'],
+      consumes,
+      consumedFingerprint: workdirInput || emptyInputs ? {} : { proposal: 1, optional: 1 },
+      ...(workdirInput ? { workdir: configDir } : {}),
+      // Synthetic unsupported sidecar; no native routing authority is claimed.
+      ...(routing ? { routing: {} } : {}),
+      owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: feedback ? 1 : 0, schemaRejects: 0 }] };
+    const seen: string[] = [];
+    let witnessAvailable = true;
+    let witnessWorkflow = canonicalWorkflow;
+    let workdirVersion = 1;
+    let privateReads = 0;
+    let privateTransportClosed = false;
+    let privateReadEntered!: () => void;
+    let releasePrivateRead!: () => void;
+    const privatePaused = new Promise<void>(resolve => { privateReadEntered = resolve; });
+    const privateResume = new Promise<void>(resolve => { releasePrivateRead = resolve; });
+    let witnessTransportClosed = false;
+    let witnessReads = 0;
+    let pauseNextWitness = false;
+    let firstWitnessEntered!: () => void;
+    let releaseFirstWitness!: () => void;
+    const firstWitnessPaused = new Promise<void>(resolve => { firstWitnessEntered = resolve; });
+    const firstWitnessResume = new Promise<void>(resolve => { releaseFirstWitness = resolve; });
+    if (fileCase) {
+      uploadTarget = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+	targetRequests++;
+	targetFilename = req.headers['x-file-name'];
+	for await (const chunk of req) targetBytes += (chunk as Buffer).byteLength;
+	res.writeHead(200, { 'content-type': 'application/json' });
+	res.end(JSON.stringify({ text: 'stored own TEST fixture', ...pointer }));
+      });
+      await new Promise<void>(resolve => uploadTarget!.listen(0, 'localhost', resolve));
+    }
+    server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      seen.push(req.url!);
+      assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      if (fileCase && req.url === '/api/file-artifacts?workflow=wf1') {
+	uploadRequests++;
+	const received = Buffer.concat(chunks);
+	if (mode.startsWith('file-race-')) {
+	  if (received.equals(outsideBytes)) outsideUploads++;
+	  else assert.deepEqual(received, uploadBytes);
+	  const hash = createHash('sha256').update(received).digest('hex');
+	  res.writeHead(200, { 'content-type': 'application/json' });
+	  res.end(JSON.stringify({ ...pointer, __file: `orgs/TEST/artifacts/wf1/files/${hash}`, hash, size: received.byteLength }));return;
+	}
+	assert.deepEqual(received, uploadBytes);
+	assert.equal(req.headers['content-type'], 'text/plain');
+	assert.equal(req.headers['x-file-name'], 'own-artifact.txt');
+	if (mode === 'file-redirect-307' || mode === 'file-redirect-308') {
+	  const address = uploadTarget!.address();assert.ok(address && typeof address !== 'string');
+	  res.writeHead(mode.endsWith('307') ? 307 : 308, { location: `https://localhost:${address.port}/substitute` });
+	  res.end();return;
+	}
+	const ack: Record<string, unknown> = { text: 'stored own TEST fixture', ...pointer };
+	if (mode === 'file-ack-empty') for (const field of Object.keys(ack)) delete ack[field];
+	if (mode === 'file-ack-key') ack.__file = true;
+	if (mode === 'file-ack-hash') ack.hash = '0'.repeat(64);
+	if (mode === 'file-ack-size') ack.size = uploadBytes.byteLength + 1;
+	if (mode === 'file-ack-content-type') ack.contentType = 'application/octet-stream';
+	if (mode === 'file-ack-filename') ack.filename = 'another-file.txt';
+	res.writeHead(200, { 'content-type': 'application/json' });res.end(JSON.stringify(ack));return;
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      assert.equal(body.workflow, 'wf1');
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      if (req.url === '/api/reference_order/v2') {
+	assert.deepEqual(body, { workflow: 'wf1', run: 'run1' });
+	if (emptyInputs) {
+	  res.end(JSON.stringify({ protocol: 'trusted-reference-read-v2', state: routing ? 'routing-unsupported' : 'unsupported-feedback', workflow: 'wf1', run: 'run1' }));
+	  return;
+	}
+	const availableAtRead = witnessAvailable;
+	if ((mode.startsWith('witness-') && ++witnessReads === 1)
+	  || (mode.startsWith('verified-adapter-') && ++witnessReads === 2)) {
+	  res.once('close', () => { if (!res.writableEnded) witnessTransportClosed = true; });
+	  if (mode === 'witness-get-body-eof' || mode === 'verified-adapter-get-body-eof') res.flushHeaders();
+	  firstWitnessEntered();await firstWitnessResume;
+	}
+	if (((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) || pauseNextWitness) {
+	  pauseNextWitness = false;
+	  firstWitnessEntered();
+	  await firstWitnessResume;
+	}
+	res.end(JSON.stringify(availableAtRead ? {
+	  protocol: 'trusted-reference-read-v2', state: 'available', workflow: witnessWorkflow, run: 'run1',
+	  order: { ...packet, workflow: witnessWorkflow, owes: [{ path: 'plan', version: 1 }] }, inputs: workdirInput || emptyInputs ? [] : [
+	    { path: 'proposal', version: 1, present: true, value: packet.consumes.proposal },
+	    { path: 'optional', version: 1, present: supplied,
+	      ...(supplied ? { value: packet.consumes.optional } : {}) },
+	  ], ...(workdirInput ? { workdirInput: { stem: 'config', version: workdirVersion, value: { path: configDir } } } : {}),
+	  lease: { claimed: true },
+	} : { protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf1', run: 'run1' }));
+      } else if (req.url === '/api/heartbeat' && mode === 'lease-stalled-heartbeat') {
+	res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
+	privateReadEntered();await privateResume;
+	res.end(JSON.stringify({ text: '' }));
+      } else if (req.url === '/api/get_order') {
+	privateReads++;
+	if ((mode === 'lease-stalled-first-contact' && privateReads === 1)
+	  || (mode === 'verified-stalled-private-initial' && privateReads === 2)
+	  || (mode === 'verified-stalled-private-final' && privateReads === 3)
+	  || (mode === 'verified-stalled-submit-final' && privateReads === 6)
+	  || (mode.startsWith('submit-private-initial-') && privateReads === 2)
+	  || (mode.startsWith('submit-private-final-') && privateReads === 3)) {
+	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
+	  privateReadEntered();
+	  await privateResume;
+	}
+	res.end(JSON.stringify({ text: '', workflow: canonicalWorkflow, run: 'run1', order: packet, lease: { claimed: true } }));
+      } else if (req.url === '/api/submit/conditional-v1') {
+	assert.equal(typeof body.proof, 'string');
+	assert.equal(body.expectedVersion, 1);
+	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' }));
+      } else if (req.url === '/api/submit') {
+	assert.equal(typeof body.proof, 'string');
+	if (mode === 'submit-ack-cancelled') {
+	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
+	  privateReadEntered();await privateResume;
+	}
+	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true }));
+      } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
+      else res.end(JSON.stringify({ text: '' }));
+    });
+    await new Promise<void>(resolve => server!.listen(0, 'localhost', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `https://localhost:${address.port}`;
+    const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof' || mode === 'signing-cancelled' || mode === 'signing-eof' || mode === 'signing-sibling';
+    const submitting = mode.startsWith('verified-adapter-submit-') || delayedSigning || mode.startsWith('submit-private-') || mode === 'submit-ack-cancelled' || mode.startsWith('witness-submit-') || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const signingStarted = join(configDir, 'signing-started');
+    const signingFinished = join(configDir, 'signing-finished');
+    let signingEnv: Record<string, string> = {};
+    if (submitting) {
+      // Local TEST identity only; no hosted grant or authority is fabricated.
+      await new PrincipalKeyManager({ env: { HOME: configDir, OWENLOOP_NO_KEYCHAIN: '1' } })
+	.ensure({ origin, kind: 'machine', id: 'local-test-machine' });
+    }
+    if (delayedSigning) {
+      const realSsh = execFileSync('which', ['ssh-keygen'], { encoding: 'utf8' }).trim();
+      const shimDir = join(configDir, 'signing-bin');
+      mkdirSync(shimDir);
+      const shim = join(shimDir, 'ssh-keygen');
+      // Delay only the real sign invocation, below its existing10sec timeout.
+      // Key generation, public derivation, verification and the signature itself
+      // still use the installed stock binary and the normal local TEST key.
+      writeFileSync(shim, `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const sign = args[0] === '-Y' && args[1] === 'sign';
+function run() {
+  const result = spawnSync(${JSON.stringify(realSsh)}, args, { stdio: 'inherit' });
+  if (sign) writeFileSync(${JSON.stringify(signingFinished)}, 'finished');
+  process.exit(result.status ?? 1);
+}
+if (sign) {
+  writeFileSync(${JSON.stringify(signingStarted)}, JSON.stringify({ pid: process.pid, keyPath: args[args.indexOf('-f') + 1] }));
+  setTimeout(run, 4000);
+} else run();
+`);
+      chmodSync(shim, 0o700);
+      signingEnv = { PATH: `${shimDir}:${process.env.PATH ?? ''}` };
+    }
+    mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', origin,
+      '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : []),
+      ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
+    { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert }, (mode.startsWith('witness-') || fileCase) ? configDir : undefined);
+    await handshake(mcp);
+    if (fileCase) {
+      assert.equal(verified, false, 'DEFAULT ordinary hold, no verified-hosted flag');
+      const initial = await callTool(mcp, 'get_order');assert.equal(initial.isError, false, JSON.stringify(initial.body));
+      assert.ok(seen.includes('/api/reference_order/v2'));
+      if (mode.startsWith('file-race-')) {
+	const ancestor = mode === 'file-race-ancestor';
+	mkdirSync(outsideDir);writeFileSync(join(outsideDir, 'payload.txt'), outsideBytes);
+	writeFileSync(outsideFile, outsideBytes);
+	const slot = join(configDir, ancestor ? 'race-dir' : 'own-artifact.txt');
+	const parked = `${slot}.parked`;
+	const link = `${slot}.link`;
+	if (ancestor) { mkdirSync(slot);writeFileSync(join(slot, 'payload.txt'), uploadBytes); }
+	else writeFileSync(slot, uploadBytes);
+	symlinkSync(ancestor ? outsideDir : outsideFile, link);
+	const file = ancestor ? 'race-dir/payload.txt' : 'own-artifact.txt';
+	assert.equal((await callTool(mcp, 'put_file_artifact', { file, contentType: 'text/plain', filename: 'own-artifact.txt' })).isError, false);
+	let running = true;let linked = false;let swaps = 0;
+	const yieldTurn = () => new Promise<void>(resolve => setImmediate(resolve));
+	const churn = (async () => {
+	  try {
+	    while (running) {
+	      renameSync(slot, parked);renameSync(link, slot);linked = true;
+	      await yieldTurn();
+	      renameSync(slot, link);renameSync(parked, slot);linked = false;swaps++;
+	      await yieldTurn();
+	    }
+	  } finally { if (linked) { renameSync(slot, link);renameSync(parked, slot); } }
+	})();
+	let attempts = 0;let refusals = 0;const started = performance.now();
+	try {
+	  while (attempts < 2000 && performance.now() - started < 10000 && outsideUploads === 0) {
+	    const result = await callTool(mcp, 'put_file_artifact', { file, contentType: 'text/plain', filename: 'own-artifact.txt' });
+	    attempts++;if (result.isError) refusals++;
+	  }
+	} finally { running = false;await churn;rmSync(link, { force: true }); }
+	console.log(JSON.stringify({ fileRace: { mode, attempts, refusals, swaps, outsideUploads, uploadRequests } }));
+	assert.equal(outsideUploads, 0, 'outside TEST bytes must never reach configured upload origin');
+	assert.equal((await callTool(mcp, 'put_file_artifact', { file, contentType: 'text/plain', filename: 'own-artifact.txt' })).isError, false, 'stable owned file recovers after swaps stop');
+	assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	mcp.endStdin();assert.equal(await mcp.exited, 0);return;
+      }
+      writeFileSync(join(configDir, 'own-artifact.txt'), uploadBytes);
+      if (mode === 'file-redirect-outside') writeFileSync(outsideFile, 'own outside-boundary TEST file');
+      const result = await callTool(mcp, 'put_file_artifact', {
+	file: mode === 'file-redirect-outside' ? outsideFile : 'own-artifact.txt',
+	contentType: 'text/plain', filename: 'own-artifact.txt',
+      });
+      if (mode === 'file-redirect-healthy') {
+	assert.equal(result.isError, false, JSON.stringify(result.body));
+	assert.deepEqual(result.body.pointer, pointer, 'preserve real Service string-key pointer metadata');
+      } else {
+	assert.equal(result.isError, true, 'malformed or redirected upload must not report success: ' + JSON.stringify(result.body));
+	assert.equal(result.body.pointer, undefined, 'no phantom artifact pointer');
+      }
+      assert.equal(uploadRequests, mode === 'file-redirect-outside' ? 0 : 1, 'no automatic retry');
+      assert.equal(targetRequests, 0);assert.equal(targetBytes, 0);assert.equal(targetFilename, undefined);
+      assert.equal((await callTool(mcp, 'get_order')).isError, false, 'healthy read sibling remains usable');
+      assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();assert.equal(await mcp.exited, 0, mcp.stderr());
+      assert.equal(seen.filter(path => path === '/api/release').length, 1, 'upload does not close the held lease');
+      return;
+    }
+    if (mode.startsWith('witness-') || mode.startsWith('verified-adapter-')) {
+      writeFileSync(join(configDir, 'output.txt'), 'local test artifact');
+      const name = (mode.startsWith('witness-submit-') || mode.startsWith('verified-adapter-submit-')) ? 'submit'
+	: mode.startsWith('witness-reject-') ? 'reject' : mode.startsWith('witness-ask-') ? 'ask'
+	: mode.startsWith('witness-file-') ? 'put_file_artifact' : 'get_order';
+      const args = name === 'submit' ? { path: 'plan', value: { n: 1 } }
+	: name === 'reject' ? { path: 'proposal', text: 'local test reason' }
+	: name === 'ask' ? { path: 'plan', question: 'local test question' }
+	: name === 'put_file_artifact' ? { file: 'output.txt' } : {};
+      if (mode === 'witness-get-deadline' || mode === 'verified-adapter-get-deadline') {
+	const pending = callTool(mcp, name, args);
+	await firstWitnessPaused;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+	  const result = await Promise.race([pending, new Promise<'pending'>(resolve => {
+	    timer = setTimeout(() => resolve('pending'), 6_500);
+	  })]);
+	  assert.notEqual(result, 'pending', 'existing5sec witness deadline stays active');
+	  if (result !== 'pending') {
+	    assert.equal(result.isError, true);
+	    assert.match(JSON.stringify(result.body), /reference-v2-unavailable|claim-observation-expired|reference-read-unavailable/);
+	  }
+	  await until(() => witnessTransportClosed, 'deadline closes independent HTTPS', 1_000);
+	} finally { clearTimeout(timer);releaseFirstWitness();await pending; }
+	assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	mcp.endStdin();assert.equal(await mcp.exited, 0);
+	return;
+      }
+      const id = mcp.fireRequest('tools/call', { name, arguments: args });
+      await firstWitnessPaused;
+      if (mode.endsWith('cancelled') || mode.endsWith('sibling')) mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode.endsWith('sibling')) {
+	await mcp.request('ping');
+	await until(() => witnessTransportClosed, 'cancel only this independent witness read', 1_000);
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'healthy concurrent witness read survives cancellation');
+	releaseFirstWitness();
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'late cancelled response cannot poison fresh admission');
+      }
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const outcome = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(outcome, 0, 'EOF must cancel the independent witness before its existing5sec deadline');
+	await until(() => witnessTransportClosed, 'independent HTTPS request closes on cancellation', 1_000);
+	const replies = mcp.frames.filter(frame => frame.id === id);
+	assert.equal(replies.length, mode.endsWith('cancelled') || mode.endsWith('sibling') ? 0 : 1);
+	if (mode.endsWith('eof')) assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/reject', '/api/ask', '/api/file-artifacts'].includes(path)), false);
+      } finally { clearTimeout(timer);releaseFirstWitness();await mcp.exited; }
+      return;
+    }
+    if (mode === 'submit-ack-cancelled') {
+      const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
+      await privatePaused;
+      mcp.notify('notifications/cancelled', { requestId: id });
+      await mcp.request('ping');
+      assert.equal(privateTransportClosed, false, 'client cancel cannot abort an already-sent write ACK');
+      releasePrivateRead();mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      assert.equal(mcp.frames.some(frame => frame.id === id), false);
+      assert.equal(seen.filter(path => path === '/api/submit').length, 1);
+      assert.equal(seen.includes('/api/release'), false, 'closing ACK is consumed without releasing the closed claim');
+      return;
+    }
+    if (mode.startsWith('submit-private-')) {
+      const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
+      await privatePaused;
+      if (mode.endsWith('cancelled') || mode.endsWith('sibling')) mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode.endsWith('sibling')) {
+	await mcp.request('ping');
+	await until(() => privateTransportClosed, 'per-call cancel closes only its own private read', 1_000);
+	assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	releasePrivateRead();
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'late private completion cannot poison a sibling observation');
+      }
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const outcome = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(outcome, 0, 'EOF exits while the ordinary submit private read is stalled');
+	await until(() => privateTransportClosed, 'cancel/EOF aborts the private HTTPS read', 1_000);
+	const replies = mcp.frames.filter(frame => frame.id === id);
+	assert.equal(replies.length, mode.endsWith('cancelled') || mode.endsWith('sibling') ? 0 : 1);
+	if (mode.endsWith('eof')) assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1'].includes(path)), false);
+      } finally {
+	clearTimeout(timer);releasePrivateRead();await mcp.exited;
+      }
+      return;
+    }
+    if (delayedSigning) {
+      const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
+      await until(() => existsSync(signingStarted), 'normal CLI reached real machine-key signing');
+      const signingProcess = JSON.parse(readFileSync(signingStarted, 'utf8')) as { pid: number; keyPath: string };
+      if (mode === 'verified-signing-cancelled' || mode === 'signing-cancelled' || mode === 'signing-sibling') mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode === 'signing-sibling') {
+	await mcp.request('ping');
+	await until(() => !existsSync(signingProcess.keyPath), 'cancelled request cleans its own key while transport stays open', 1_000);
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'per-call cancellation preserves a healthy sibling');
+      }
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const exited = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(exited, 0, 'cancel/EOF must exit without awaiting the finite signing operation');
+	assert.equal(existsSync(signingFinished), false, 'shutdown precedes the real delayed signer completion');
+	assert.equal(existsSync(signingProcess.keyPath), false, 'normal key materialization cleanup finishes before CLI exit');
+	const replies = mcp.frames.filter(frame => frame.id === id);
+	assert.equal(replies.length, mode.endsWith('cancelled') || mode === 'signing-sibling' ? 0 : 1);
+	if (mode.endsWith('signing-eof')) assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(seen.includes('/api/submit/conditional-v1'), false);
+	assert.equal(seen.includes('/api/submit'), false);
+      } finally {
+	clearTimeout(timer);
+	await until(() => {
+	  try { process.kill(signingProcess.pid, 0); return false; } catch { return true; }
+	}, 'own finite SSH fixture stopped', 6_000);
+      }
+      return;
+    }
+    if (submitting) {
+      const pending = callTool(mcp, 'submit', { path: 'plan', value: { n: 1 } });
+      if (mode === 'verified-submit-healthy' || mode === 'signing-healthy') {
+	const accepted = await pending;
+	assert.equal(accepted.isError, false, JSON.stringify(accepted.body));
+	assert.equal(seen.filter(path => path === (verified ? '/api/submit/conditional-v1' : '/api/submit')).length, 1);
+      } else {
+	await privatePaused;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+	  const result = await Promise.race([pending, new Promise<'still-pending'>(resolve => {
+	    timer = setTimeout(() => resolve('still-pending'), 6_000);
+	  })]);
+	  assert.notEqual(result, 'still-pending', 'actual verified submit must bound its last private read');
+	  if (result !== 'still-pending') {
+	    assert.equal(result.isError, true);
+	    assert.match(JSON.stringify(result.body), /claim-observation-expired/);
+	    await until(() => privateTransportClosed, 'expired last private HTTPS transport closes', 1_000);
+	    assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	  }
+	} finally { clearTimeout(timer);releasePrivateRead();await pending; }
+	assert.equal(seen.includes('/api/submit/conditional-v1'), false);
+      }
+      assert.equal(seen.some(path => [...(verified ? ['/api/submit'] : ['/api/submit/conditional-v1']), '/api/ask', '/api/reject', '/api/reference_order/v1'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    if (mode === 'lease-stalled-first-contact' || mode === 'lease-stalled-heartbeat') {
+      await privatePaused;
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const outcome = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(outcome, 0, 'EOF exits while lease contact is stalled');
+	await until(() => privateTransportClosed, 'EOF aborts lease HTTPS request', 1_000);
+      } finally { clearTimeout(timer);releasePrivateRead();await mcp.exited; }
+      assert.equal(seen.filter(path => path === '/api/get_order').length, 1);
+      assert.equal(seen.filter(path => path === '/api/heartbeat').length, mode === 'lease-stalled-heartbeat' ? 1 : 0);
+      assert.equal(seen.filter(path => path === '/api/release').length, mode === 'lease-stalled-heartbeat' ? 1 : 0);
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      return;
+    }
+    if (mode === 'cancelled') {
+      const requestId = mcp.fireRequest('tools/call', { name: 'ask',
+	arguments: { path: 'plan', question: 'local cancellation boundary test' } });
+      await firstWitnessPaused;
+      mcp.notify('notifications/cancelled', { requestId });
+      await mcp.request('ping'); // The notification has been processed before the witness resumes.
+      releaseFirstWitness();
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      assert.equal(mcp.frames.some(frame => frame.id === requestId), false, 'cancelled response stays suppressed');
+      assert.equal(seen.includes('/api/ask'), false, 'cancelled request must not send a later consequence');
+      assert.equal(seen.includes('/api/submit'), false);
+      return;
+    }
+    if (mode === 'overlap') {
+      const older = callTool(mcp, 'get_order');
+      await firstWitnessPaused;
+      witnessAvailable = false;
+      const newer = await callTool(mcp, 'get_order');
+      assert.equal(newer.isError, true);
+      assert.match(newer.body.error, /service-unavailable/);
+      releaseFirstWitness();
+      const late = await older;
+      assert.equal(late.isError, true, 'delayed old HTTPS response cannot undo newer refusal');
+      assert.match(late.body.error, /superseded.*refusal/);
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    if (mode === 'verified-stalled-private-initial' || mode === 'verified-stalled-private-final') {
+      const pending = callTool(mcp, 'get_order');
+      await privatePaused;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const result = await Promise.race([pending, new Promise<'still-pending'>(resolve => {
+	  timer = setTimeout(() => resolve('still-pending'), 6_000);
+	})]);
+	assert.notEqual(result, 'still-pending', 'actual verified CLI must bound its private holder reads');
+	if (result !== 'still-pending') {
+	  assert.equal(result.isError, true);
+	  assert.match(JSON.stringify(result.body), /claim-observation-expired/);
+	  await until(() => privateTransportClosed, 'expired private HTTPS transport closes', 1_000);
+	  assert.equal((await callTool(mcp, 'get_order')).isError, false, 'healthy sibling succeeds while old private read is stalled');
+	}
+      } finally {
+	clearTimeout(timer);releasePrivateRead();await pending;
+      }
+      assert.equal((await callTool(mcp, 'get_order')).isError, false, 'late completion cannot erase fresh state');
+      assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/ask', '/api/reject'].includes(path)), false);
+      assert.equal(seen.includes('/api/reference_order/v1'), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    const viewed = await callTool(mcp, 'get_order');
+    if (verified) {
+      assert.equal(viewed.isError, false, JSON.stringify(viewed.body));
+      assert.equal(viewed.body.state, 'ready');
+      assert.equal(viewed.body.serviceObservation.referenceProtocol, 'trusted-reference-read-v2');
+      assert.deepEqual(viewed.body.inputWitnesses, workdirInput ? [] : [
+	{ path: 'proposal', version: 1, present: true, trust: 'trusted-service-claim-version' },
+	{ path: 'optional', version: 1, present: supplied, trust: 'trusted-service-claim-version' },
+      ]);
+      assert.deepEqual(viewed.body.consumes.map((input: { path: string; value: unknown }) => [input.path, input.value]),
+	Object.entries(packet.consumes));
+      assert.equal(seen.includes('/api/reference_order/v1'), false, 'v2 must not downgrade to v1');
+      if (mode === 'verified-overlap') {
+	pauseNextWitness = true;
+	const older = callTool(mcp, 'get_order');
+	await firstWitnessPaused;
+	const newer = await callTool(mcp, 'get_order');
+	releaseFirstWitness();
+	const late = await older;
+	assert.equal(newer.isError, false, JSON.stringify(newer.body));
+	assert.equal(late.isError, false, JSON.stringify(late.body));
+      }
+      if (mode === 'verified-workdir') {
+	assert.deepEqual(viewed.body.consumes, []);
+	workdirVersion++;
+	const moved = await callTool(mcp, 'get_order');
+	assert.equal(moved.isError, true, 'same cwd value at a new source version must refuse');
+	workdirVersion--;
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'fresh original workdir witness recovers');
+      }
+      if (mode === 'verified-child') {
+	assert.equal(viewed.body.serviceObservation.workflow, 'wf_child');
+	witnessWorkflow = 'wf_changed_child';
+	const moved = await callTool(mcp, 'get_order');
+	assert.equal(moved.isError, true, 'a newer independent child identity cannot replace the pinned child');
+	assert.doesNotMatch(JSON.stringify(moved.body), /a local test proposal/);
+	witnessWorkflow = canonicalWorkflow;
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'fresh verification of the original child recovers');
+      }
+      witnessAvailable = false;
+      const refused = await callTool(mcp, 'get_order');
+      assert.equal(refused.isError, true);
+      assert.doesNotMatch(JSON.stringify(refused.body), /a local test proposal|supplied required input/);
+      assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    if (emptyInputs) {
+      assert.equal(viewed.isError, true, 'normal zero-input holder must refuse unsupported dynamic state');
+      assert.match(viewed.body.error, routing ? /service-routing-unsupported/ : /service-unsupported-feedback/);
+      for (const [name, args] of [['submit', { path: 'plan', value: {} }], ['ask', { path: 'plan', question: 'why' }], ['reject', { path: 'plan', text: 'retry' }]] as const) {
+	assert.equal((await callTool(mcp, name, args)).isError, true);
+      }
+      assert.ok(seen.includes('/api/reference_order/v2'));
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
+    assert.equal(viewed.isError, false, mcp.stderr());
+    assert.equal(viewed.body.order.workflow, canonicalWorkflow);
+    assert.deepEqual(viewed.body.order.consumes, packet.consumes);
+    if (workdirInput) assert.deepEqual(viewed.body.order.inputWitnesses, []);
+    else assert.equal(viewed.body.order.inputWitnesses.find((w: { path: string }) => w.path === 'optional').present, supplied);
+    assert.ok(seen.includes('/api/reference_order/v2'), 'normal mode must use the independent service witness');
+    if (mode === 'child') {
+      witnessWorkflow = 'wf_changed';
+      const moved = await callTool(mcp, 'get_order');
+      assert.equal(moved.isError, true);
+      const refusedWrite = await callTool(mcp, 'ask', { path: 'plan', question: 'changed child control' });
+      assert.equal(refusedWrite.isError, true);
+      assert.equal(seen.includes('/api/ask'), false);
+      witnessWorkflow = canonicalWorkflow;
+    }
+    witnessAvailable = false;
+    const rejected = workdirInput
+      ? await callTool(mcp, 'ask', { path: 'plan', question: 'local boundary test' })
+      : await callTool(mcp, 'reject', { path: 'proposal', text: 'local boundary test' });
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.body.error, /service-unavailable/);
+    assert.equal(seen.includes('/api/reject'), false);
+    assert.equal(seen.includes('/api/ask'), false);
+    mcp.endStdin();
+    assert.equal(await mcp.exited, 0);
+  } finally {
+    if (mcp?.child.exitCode === null) { mcp.endStdin(); await mcp.exited; }
+    if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+    if (uploadTarget) await new Promise<void>((resolve, reject) => uploadTarget!.close(error => error ? reject(error) : resolve()));
+    rmSync(outsideFile, { force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+    rmSync(sourceDir, { recursive: true, force: true });
+  }
+});
+}

@@ -37,9 +37,9 @@
  *    consecutive failures span `failureWindowMs`, one last classify then
  *    `hub-unreachable`.
  *  - `stop(reason, {release?})` flips a flag checked between awaits AND aborts
- *    the in-flight interval sleep (final breath fires ~immediately, not up to a
- *    full interval late), then — unless the order already `completed` or the
- *    caller passed `release:false` — a targeted `release` bounded at
+ *    the in-flight lease contact and interval sleep (final breath fires
+ *    ~immediately, not up to a full interval late), then — unless the order
+ *    already `completed` or the caller passed `release:false` — a targeted `release` bounded at
  *    RELEASE_CAP_MS. `release:false` is exec's "the run just closed via submit,
  *    don't release" path (a release then would be a confusing no-op). Release is
  *    idempotent hub-side (`not-held` is a no-op, never a throw), so a normal
@@ -131,6 +131,7 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
   const runId = opts.run;
   const req = { workflow, run: runId, ...(opts.holder !== undefined ? { holder: opts.holder } : {}) };
 
+  const contactAbort = new AbortController();
   let stopped = false;
   let stopReason = '';
   let releaseOnStop = true;
@@ -163,6 +164,17 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
     await Promise.race([opts.sleep(ms), stopPromise]);
   }
 
+  /** Stop must settle the loop even when a private client ignores cancellation.
+   * The race consumes late rejection; only the caller may use a live result. */
+  async function whileActive<T>(request: () => Promise<T>): Promise<T | undefined> {
+    if (stopped) return undefined;
+    const res = await Promise.race([
+      request(),
+      stopPromise.then(() => undefined),
+    ]);
+    return stopped ? undefined : res;
+  }
+
   /** Backoff delay for the current `attempt`, jittered and window-bounded. */
   function backoffDelay(): number {
     const raw = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, attempt - 1));
@@ -184,7 +196,8 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
    */
   async function probe(): Promise<Probe> {
     try {
-      const res = await opts.hub.getOrder(req);
+      const res = await whileActive(() => opts.hub.getOrder(req, contactAbort.signal));
+      if (res === undefined) return 'transient';
       if (res.lease.claimed) return 'holding';
       return res.lease.outcome !== undefined ? 'completed' : 'lease-lost';
     } catch {
@@ -201,7 +214,8 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
     for (;;) {
       if (stopped) return 'stopped';
       try {
-        const res = await opts.hub.getOrder(req);
+	const res = await whileActive(() => opts.hub.getOrder(req, contactAbort.signal));
+	if (res === undefined) return 'stopped';
         resetFailures();
         if (res.lease.claimed) {
           opts.onOrder?.(res);
@@ -209,6 +223,7 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
         }
         return res.lease.outcome !== undefined ? 'completed' : 'lease-lost';
       } catch (e) {
+	if (stopped) return 'stopped';
         if (isForbidden(e)) {
           opts.err(`owenloop work ${role}: ${workflow}/${runId} is not yours to hold (forbidden)`);
           return 'ownership-error';
@@ -233,6 +248,7 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
     if (gap > interval + jumpTolerance) {
       opts.err(`owenloop work ${role}: clock jump detected (${gap}ms gap) — verifying lease before beat`);
       const p = await probe();
+      if (stopped) return undefined;
       if (p === 'completed') return 'completed';
       if (p === 'lease-lost') return 'lease-lost';
       // 'holding' → carry on and beat; 'transient' → fall through, the beat's
@@ -240,16 +256,19 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
     }
 
     try {
-      await opts.hub.heartbeat(req);
+      await whileActive(() => opts.hub.heartbeat(req, contactAbort.signal));
+      if (stopped) return undefined;
       resetFailures();
       return undefined;
     } catch (e) {
+      if (stopped) return undefined;
       if (isForbidden(e)) {
         opts.err(`owenloop work ${role}: heartbeat forbidden — the claim is no longer yours`);
         return 'ownership-error';
       }
       // Classify the failure: did the order finish, or was the lease lost?
       const p = await probe();
+      if (stopped) return undefined;
       if (p === 'completed') return 'completed';
       if (p === 'lease-lost') return 'lease-lost';
       // Transient (still claimed, or the classify call itself failed): back off.
@@ -257,6 +276,7 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
       opts.err(`owenloop work ${role}: heartbeat failed: ${errMsg(e)} (attempt ${attempt}, backing off)`);
       if (failureWindowExceeded()) {
         const last = await probe();
+	if (stopped) return undefined;
         if (last === 'completed') return 'completed';
         if (last === 'lease-lost') return 'lease-lost';
         opts.err(`owenloop work ${role}: hub unreachable for ${failureWindow}ms — giving up`);
@@ -322,6 +342,7 @@ export function createLeaseLoop(opts: LeaseLoopOptions): LeaseLoop {
     stopped = true;
     stopReason = reason ?? '';
     if (stopOpts?.release === false) releaseOnStop = false;
+    contactAbort.abort();
     resolveStop();
   }
 

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { createVerifiedHostedHoldMcp } from '../src/hosted/verified-hold-mcp.ts';
-import { createHostedOrderAdapter, hostedPacketDigest, hostedReferencePacketDigest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
+import { createHostedOrderAdapter, hostedPacketDigest, hostedReferencePacketDigest, hostedReferenceV2Digest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
+import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type OrderPacket } from '../src/hub/types.ts';
 import { textResult, type ToolCallContext, type ToolRegistration } from '../src/mcp/server.ts';
 import { createHoldMcp, type HoldMcpMount } from '../src/hold/mcp.ts';
@@ -40,16 +41,27 @@ function reducedOrder(order: OrderPacket) {
 }
 
 function fixture(enableSubmit = false, settings: {
-  open?: () => Promise<HostedOrderResult>;
+  open?: (signal?: AbortSignal) => Promise<HostedOrderResult>;
   onRawGet?: (count: number, order: OrderPacket) => Promise<void>;
-  sign?: () => Promise<string | undefined>;
+  sign?: (signal?: AbortSignal) => Promise<string | undefined>;
   onConditionalSubmit?: (req: ConditionalSubmitRequest) => Promise<void> | void;
   context?: ToolCallContext;
+  v2?: boolean;
+  declaredInputPaths?: string[];
 } = {}) {
   const calls: string[] = [];
   const submits: ConditionalSubmitRequest[] = [];
   const stops: Array<{ reason: string | undefined; release?: boolean }> = [];
-  let observation: HostedOrderResult = ready();
+  let witnessDigest = valueDigestHex({ localFixtureWitness: 1 });
+  function projection(packet: OrderPacket): HostedOrderResult {
+    const result = ready(packet);
+    if (settings.v2 && result.state === 'ready') Object.assign(result.serviceObservation, {
+      workflow: packet.workflow, referenceProtocol: 'trusted-reference-read-v2', inputWitnessDigest: witnessDigest,
+      packetDigest: hostedReferenceV2Digest(packet, settings.declaredInputPaths ?? []),
+    });
+    return result;
+  }
+  let observation: HostedOrderResult = projection(rawOrder);
   let holding = true;
   let rawGets = 0;
   const heldOrder: OrderPacket = structuredClone(rawOrder);
@@ -77,23 +89,25 @@ function fixture(enableSubmit = false, settings: {
 	rawGets++;
 	await settings.onRawGet?.(rawGets, heldOrder);
 	if (!holding) return textResult({ error: 'order no longer held' }, true);
-	return textResult({ workflow: 'wf', run: 'run', order: reducedOrder(heldOrder) });
+	return textResult({ workflow: heldOrder.workflow, run: 'run', order: reducedOrder(heldOrder) });
       } },
       unsafeAction,
     ],
     readGatedOrder: () => holding
-      ? { text: 'RAW HUB TEXT', workflow: 'wf', run: 'run', order: heldOrder, lease: { claimed: true } }
+      ? { text: 'RAW HUB TEXT', workflow: heldOrder.workflow, run: 'run', order: heldOrder, lease: { claimed: true } }
       : undefined,
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
-    open: async (ref, _index, onVerified) => {
+    ...(settings.v2 ? { referenceProtocol: 'trusted-reference-read-v2' as const } : {}),
+    open: async (ref, _index, onVerified, signal) => {
       calls.push('verify');
       assert.deepEqual(ref, {
 	protocol: 'client-preflight-v1', verification: 'not-performed',
 	order: { state: 'available', workflow: 'wf', run: 'run', defDigest: rawOrder.defDigest },
       });
-      if (observation.state === 'ready') onVerified?.({ order: verifiedPacket, collectionOutputs });
-      return settings.open === undefined ? observation : settings.open();
+      if (observation.state === 'ready') onVerified?.({ order: verifiedPacket, collectionOutputs,
+	...(settings.v2 ? { declaredInputPaths: settings.declaredInputPaths ?? [] } : {}) });
+      return settings.open === undefined ? observation : settings.open(signal);
     },
     submitConditional: async (req) => {
       calls.push('conditional-submit');
@@ -104,13 +118,13 @@ function fixture(enableSubmit = false, settings: {
     },
   }, { workflow: 'wf', run: 'run' }, enableSubmit ? {
     enableSubmit: true,
-    signProof: async (order, path, value, version) => {
+    signProof: async (order, path, value, version, signal) => {
       calls.push('sign');
       assert.equal(order, verifiedPacket);
       assert.equal(path, 'out');
       assert.deepEqual(value, { n: 1 });
       assert.equal(version, verifiedPacket.owes[0]!.version);
-      return settings.sign === undefined ? proof : settings.sign();
+      return settings.sign === undefined ? proof : settings.sign(signal);
     },
     now: () => currentTime,
     monotonicNow: () => monotonicTime,
@@ -120,7 +134,8 @@ function fixture(enableSubmit = false, settings: {
   return {
     wrapped, call, submit, calls, submits, stops,
     setObservation: (next: HostedOrderResult) => { observation = next; },
-    setPacket: (next: OrderPacket) => { verifiedPacket = next; observation = ready(next); },
+    setPacket: (next: OrderPacket) => { verifiedPacket = next; observation = projection(next); },
+    setWitnessDigest: (next: string) => { witnessDigest = next; observation = projection(verifiedPacket); },
     setCollectionOutputs: (next: string[]) => { collectionOutputs = next; },
     setProof: (next: string | undefined) => { proof = next; },
     setTime: (next: number) => { currentTime = next; },
@@ -164,6 +179,59 @@ test('real hold keeps authored fields private and fences a changed gated full or
   const changed = await wrapped.tools[0]!.handler({}, context);
   assert.equal(changed.isError, true);
   assert.match(changed.content[0]!.text, /holder-order-changed/);
+});
+
+test('v2 verified holder binds declared absence without promoting advisory input proof and refuses downgrade', async () => {
+  const f = fixture(true, { v2: true, declaredInputPaths: ['optional'] });
+  const packet = { ...structuredClone(rawOrder), inputs: ['optional'], consumedFingerprint: { optional: 1 } };
+  f.mutateHeldOrder(order => Object.assign(order, packet, { consumesProof: JSON.stringify({ optional: 'HUMAN ADVISORY' }) }));
+  f.setPacket(packet);
+  assert.equal((await f.call()).isError, undefined);
+  f.setObservation(ready(packet));
+  const downgraded = await f.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(downgraded.isError, true);
+  assert.match(downgraded.content[0]!.text, /reference-v2-required/);
+  assert.equal(f.submits.length, 0);
+});
+
+test('v2 verified submit independently rechecks the input witness after signing', async () => {
+  for (const move of [false, true]) {
+    const f = fixture(true, { v2: true, declaredInputPaths: ['optional'], sign: async () => {
+      if (move) f.setWitnessDigest(valueDigestHex({ localFixtureWitness: 2 }));
+      return 'SIGNED PROOF';
+    } });
+    const packet = { ...structuredClone(rawOrder), inputs: ['optional'], consumedFingerprint: { optional: 1 } };
+    f.mutateHeldOrder(order => Object.assign(order, packet));f.setPacket(packet);
+    const result = await f.submit({ path: 'out', value: { n: 1 } });
+    assert.equal(result.isError === true, move);
+    assert.equal(f.calls.filter(call => call === 'verify').length, 2, 'independent read runs before and after signing');
+    assert.equal(f.submits.length, move ? 0 : 1);
+    if (move) assert.match(result.content[0]!.text, /holder-order-changed/);
+  }
+});
+
+test('v2 conditional partial submission refreshes owed versions without reopening claim inputs', async () => {
+  const f = fixture(true, { v2: true, declaredInputPaths: ['optional'] });
+  const packet = { ...structuredClone(rawOrder), inputs: ['optional'], consumedFingerprint: { optional: 1 } };
+  f.mutateHeldOrder(order => Object.assign(order, packet));f.setPacket(packet);
+  f.setSubmitResponse({ text: '', outcome: 'green', closed: false, conditionApplied: 'expected-version-v1' });
+  assert.equal((await f.submit({ path: 'out', value: { n: 1 } })).isError, undefined);
+  const next = { ...packet, owes: [{ ...packet.owes[0]!, version: 2 }] };
+  f.mutateHeldOrder(order => Object.assign(order, next));f.setPacket(next);
+  assert.equal((await f.call()).isError, undefined);
+  assert.equal((await f.submit({ path: 'out', value: { n: 1 } })).isError, undefined);
+  assert.deepEqual(f.submits.map(req => req.expectedVersion), [1, 2]);
+});
+
+test('v2 private and direct bindings compare producer-proof maps independent of entry order', async () => {
+  const f = fixture(false, { v2: true });
+  const packet = { ...structuredClone(rawOrder), inputs: ['a', 'b'], consumes: { a: 1, b: 2 },
+    consumedFingerprint: { a: 1, b: 1 }, consumesProof: JSON.stringify({ a: 'PROOF_A', b: 'PROOF_B' }) };
+  f.mutateHeldOrder(order => Object.assign(order, packet));
+  f.setPacket({ ...packet, consumesProof: JSON.stringify({ b: 'PROOF_B', a: 'PROOF_A' }) });
+  assert.equal((await f.call()).isError, undefined, 'proof-map JSON ordering carries no new authority');
+  f.setPacket({ ...packet, consumesProof: JSON.stringify({ b: 'PROOF_A', a: 'PROOF_B' }) });
+  assert.equal((await f.call()).isError, true, 'proof values must still bind to the exact producer paths');
 });
 
 test('real reduced hold cannot fall back when Service lacks the versioned reference acknowledgement', async () => {
@@ -354,6 +422,32 @@ test('opt-in verified submit signs the privately verified packet and returns onl
   assert.match(result.content[0]!.text, /local-hosted-submit-v1/);
   assert.doesNotMatch(result.content[0]!.text, /RAW|SIGNED PROOF|defDigest|lease/i);
 });
+
+for (const v2 of [false, true]) {
+  test(`verified signing forwards per-call cancellation without fencing healthy siblings v2=${v2}`, async () => {
+    let cancelled = false;
+    const callbacks: Array<() => void> = [];
+    const ctx: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: cb => { callbacks.push(cb); }, sendProgress: () => {} };
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const f = fixture(true, { v2, context: ctx, sign: signal => {
+      assert.ok(signal);
+      return new Promise((_resolve, reject) => {
+	signal.addEventListener('abort', () => reject(new Error('signer cancelled')), { once: true });
+	started();
+      });
+    } });
+    const pending = f.submit({ path: 'out', value: { n: 1 } });
+    await entered;
+    cancelled = true;
+    for (const callback of callbacks) callback();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /call-cancelled/);
+    assert.deepEqual(f.submits, []);
+    assert.equal((await f.wrapped.tools[0]!.handler({}, context)).isError, undefined);
+  });
+}
 
 test('a stop during proof signing prevents conditional submit', async () => {
   let resolve!: (value: string) => void;
@@ -673,4 +767,291 @@ test('an older v1 read cannot reconcile a newer ambiguous submit', async () => {
   });
   assert.equal(third.isError, undefined, third.content[0]?.text);
   assert.deepEqual(f.submits.map((req) => req.expectedVersion), [1, 2, 3]);
+});
+
+
+test('a newer independent refusal fences an older verified holder read', async () => {
+  let release!: (result: HostedOrderResult) => void;
+  let started!: () => void;
+  const pending = new Promise<HostedOrderResult>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { started = resolve; });
+  let opens = 0;
+  const f = fixture(false, { open: async () => {
+    opens++;
+    if (opens === 1) { started(); return pending; }
+    if (opens === 2) return { protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable' };
+    return ready();
+  } });
+  const older = f.call();
+  await waiting;
+  const newer = await f.call();
+  assert.equal(newer.isError, true);
+  assert.match(newer.content[0]!.text, /reference-read-unavailable/);
+  release(ready());
+  const stale = await older;
+  assert.equal(stale.isError, true, stale.content[0]?.text);
+  assert.match(stale.content[0]!.text, /observation-superseded/);
+  assert.doesNotMatch(stale.content[0]!.text, /VERIFIED INSTRUCTION/);
+  const fresh = await f.call();
+  assert.equal(fresh.isError, undefined, fresh.content[0]?.text);
+});
+
+test('a newer independent refusal fences a verified submit waiting for its read', async () => {
+  let release!: (result: HostedOrderResult) => void;
+  let started!: () => void;
+  const pending = new Promise<HostedOrderResult>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { started = resolve; });
+  let opens = 0;
+  const f = fixture(true, { open: async () => {
+    opens++;
+    if (opens === 1) { started(); return pending; }
+    return { protocol: 'local-hosted-order-v1', state: 'refused', code: 'reference-read-unavailable' };
+  } });
+  const older = f.submit({ path: 'out', value: { n: 1 } });
+  await waiting;
+  assert.equal((await f.call()).isError, true);
+  release(ready());
+  const stale = await older;
+  assert.equal(stale.isError, true, stale.content[0]?.text);
+  assert.match(stale.content[0]!.text, /observation-superseded/);
+  assert.equal(f.calls.includes('sign'), false);
+  assert.deepEqual(f.submits, []);
+});
+
+test('a newer independent refusal fences a verified submit after proof signing', async () => {
+  let release!: (proof: string) => void;
+  let started!: () => void;
+  const pending = new Promise<string>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { started = resolve; });
+  let opens = 0;
+  const f = fixture(true, {
+    open: async () => ++opens === 1 ? ready()
+      : { protocol: 'local-hosted-order-v1', state: 'refused', code: 'unsupported-feedback' },
+    sign: async () => { started(); return pending; },
+  });
+  const older = f.submit({ path: 'out', value: { n: 1 } });
+  await waiting;
+  const newer = await f.call();
+  assert.equal(newer.isError, true);
+  assert.match(newer.content[0]!.text, /unsupported-feedback/);
+  release('SIGNED PROOF');
+  const stale = await older;
+  assert.equal(stale.isError, true, stale.content[0]?.text);
+  assert.match(stale.content[0]!.text, /observation-superseded/);
+  assert.deepEqual(f.submits, []);
+});
+
+
+test('healthy overlapping verified reads and a cancelled sibling preserve fresh verification', async () => {
+  for (const cancelOlder of [false, true]) {
+    let release!: (result: HostedOrderResult) => void;
+    let started!: () => void;
+    const pending = new Promise<HostedOrderResult>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    let opens = 0;
+    let cancelled = false;
+    const callContext: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: () => {}, sendProgress: () => {} };
+    const f = fixture(false, { open: async () => {
+      if (++opens === 1) { started(); return pending; }
+      return ready();
+    } });
+    const older = f.wrapped.tools[0]!.handler({}, callContext);
+    await waiting;
+    cancelled = cancelOlder;
+    const fresh = await f.call();
+    assert.equal(fresh.isError, undefined, fresh.content[0]?.text);
+    release(ready());
+    const completed = await older;
+    assert.equal(completed.isError, cancelOlder ? true : undefined, completed.content[0]?.text);
+    if (cancelOlder) assert.match(completed.content[0]!.text, /call-cancelled/);
+    const later = await f.call();
+    assert.equal(later.isError, undefined, later.content[0]?.text);
+  }
+});
+
+
+test('v2 verified canonical child remains independently matched, pinned, and root-bound for conditional writes', async () => {
+  const child = { ...structuredClone(rawOrder), workflow: 'wf-canonical-child' };
+  const f = fixture(true, { v2: true });
+  f.mutateHeldOrder(order => Object.assign(order, child));f.setPacket(child);
+  assert.equal((await f.call()).isError, undefined);
+  assert.equal((await f.submit({ path: 'out', value: { n: 1 } })).isError, undefined);
+  assert.deepEqual(f.submits.map(({ workflow, run }) => ({ workflow, run })), [{ workflow: 'wf', run: 'run' }]);
+  for (const move of ['private-only', 'independent-only', 'both'] as const) {
+    const g = fixture(true, { v2: true });
+    g.mutateHeldOrder(order => Object.assign(order, child));g.setPacket(child);
+    assert.equal((await g.call()).isError, undefined);
+    const changed = { ...child, workflow: 'wf-changed-child' };
+    if (move !== 'independent-only') g.mutateHeldOrder(order => Object.assign(order, changed));
+    if (move !== 'private-only') g.setPacket(changed);
+    const refused = await g.submit({ path: 'out', value: { n: 1 } });
+    assert.equal(refused.isError, true, move);
+    assert.equal(g.submits.length, 0, move);
+    assert.equal(g.calls.includes('sign'), false, move);
+  }
+});
+
+test('verified observations bound a stalled initial or final private holder read and fence its late completion', async () => {
+  for (const stalledRead of [1, 2]) {
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const f = fixture(false, { v2: true, onRawGet: async count => {
+      if (count === stalledRead) { entered(); await pending; }
+    } });
+    const old = f.call();
+    await started;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([old, new Promise<'still-pending'>(resolve => {
+	timer = setTimeout(() => resolve('still-pending'), 6_000);
+      })]);
+      assert.notEqual(result, 'still-pending', 'private holder read must share the five-second observation deadline');
+      if (result === 'still-pending') continue;
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /claim-observation-expired/);
+      assert.equal((await f.call()).isError, undefined, 'a fresh healthy read recovers independently');
+    } finally {
+      clearTimeout(timer);release();await old;
+    }
+    assert.equal((await f.call()).isError, undefined, 'late private completion cannot erase the newer verified observation');
+    assert.equal(f.calls.includes('sign'), false);
+    assert.equal(f.submits.length, 0);
+  }
+});
+
+test('the complete verified observation deadline includes elapsed time before the independent read starts', async () => {
+  for (const clock of ['wall', 'monotonic'] as const) {
+    const f = fixture(true, { v2: true, onRawGet: async count => {
+      if (count === 1) {
+	if (clock === 'wall') f.setTime(5_002);
+	else f.setMonotonicTime(5_000);
+      }
+    } });
+    const result = await f.submit({ path: 'out', value: { n: 1 } });
+    assert.equal(result.isError, true, clock);
+    assert.match(result.content[0]!.text, /claim-observation-expired/);
+    assert.equal(f.calls.includes('sign'), false, clock);
+    assert.equal(f.submits.length, 0, clock);
+  }
+});
+
+test('a stalled private read after signing expires without a conditional write', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const f = fixture(true, { v2: true, onRawGet: async count => {
+    if (count === 3) { entered(); await pending; }
+  } });
+  const submitted = f.submit({ path: 'out', value: { n: 1 } });
+  await started;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([submitted, new Promise<'still-pending'>(resolve => {
+      timer = setTimeout(() => resolve('still-pending'), 6_000);
+    })]);
+    assert.notEqual(result, 'still-pending');
+    if (result !== 'still-pending') {
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /claim-observation-expired/);
+    }
+    assert.equal(f.calls.filter(call => call === 'sign').length, 1);
+    assert.equal(f.submits.length, 0);
+  } finally {
+    clearTimeout(timer);release();await submitted;
+  }
+  assert.equal((await f.call()).isError, undefined);
+  assert.equal(f.submits.length, 0, 'late post-sign read cannot send the pending conditional write');
+});
+
+test('a cancelled private-read timeout does not fence a healthy sibling still verifying', async () => {
+  const cancelled = { ...context, cancelled: false };
+  let releasePrivate!: () => void;
+  let privateEntered!: () => void;
+  let releaseHealthy!: (value: HostedOrderResult) => void;
+  let healthyEntered!: () => void;
+  const privatePending = new Promise<void>(resolve => { releasePrivate = resolve; });
+  const privateStarted = new Promise<void>(resolve => { privateEntered = resolve; });
+  const healthyPending = new Promise<HostedOrderResult>(resolve => { releaseHealthy = resolve; });
+  const healthyStarted = new Promise<void>(resolve => { healthyEntered = resolve; });
+  const f = fixture(false, { context: cancelled, onRawGet: async count => {
+    if (count === 1) { privateEntered();await privatePending; }
+  }, open: async () => { healthyEntered();return healthyPending; } });
+  const old = f.call();
+  await privateStarted;
+  cancelled.cancelled = true;
+  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const healthy = f.wrapped.tools[0]!.handler({}, context);
+  await healthyStarted;
+  try {
+    const result = await old;
+    assert.match(result.content[0]!.text, /call-cancelled/);
+  } finally {
+    releasePrivate();releaseHealthy(ready());
+  }
+  assert.equal((await healthy).isError, undefined, 'cancelled request expiry cannot invalidate an unrelated healthy observation');
+});
+
+for (const v2 of [false, true]) {
+  test(`verified ${v2 ? 'v2' : 'v1'} submit bounds the last private read immediately before transport`, async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const f = fixture(true, { v2, onRawGet: async count => {
+      if (count === (v2 ? 5 : 3)) { entered();await pending; }
+    } });
+    const submitted = f.submit({ path: 'out', value: { n: 1 } });
+    await started;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([submitted, new Promise<'still-pending'>(resolve => {
+	timer = setTimeout(() => resolve('still-pending'), 6_000);
+      })]);
+      assert.notEqual(result, 'still-pending', 'the final pre-write private read must have a real deadline');
+      if (result !== 'still-pending') {
+	assert.equal(result.isError, true);
+	assert.match(result.content[0]!.text, /claim-observation-expired/);
+      }
+      assert.equal(f.submits.length, 0);
+    } finally {
+      clearTimeout(timer);release();await submitted;
+    }
+    assert.equal(f.submits.length, 0, 'late final private completion cannot send the conditional write');
+    assert.equal((await f.call()).isError, undefined, 'fresh healthy verification remains available');
+  });
+}
+
+
+test('cancelled adapter observation leaves an already-verifying healthy sibling valid', async () => {
+  let cancelled = false;
+  const callbacks: Array<() => void> = [];
+  const ctx: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: cb => { callbacks.push(cb); }, sendProgress: () => {} };
+  let enteredFirst!: () => void;
+  let enteredSecond!: () => void;
+  let releaseSecond!: () => void;
+  const first = new Promise<void>(resolve => { enteredFirst = resolve; });
+  const second = new Promise<void>(resolve => { enteredSecond = resolve; });
+  const resume = new Promise<void>(resolve => { releaseSecond = resolve; });
+  let calls = 0;
+  const f = fixture(false, { open: async signal => {
+    if (++calls === 1) {
+      assert.ok(signal);
+      enteredFirst();
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+      return { protocol: 'local-hosted-order-v1', state: 'refused', code: 'call-cancelled' };
+    }
+    enteredSecond();await resume;
+    return ready();
+  } });
+  const stopped = f.wrapped.tools[0]!.handler({}, ctx);
+  await first;
+  const healthy = f.call();
+  await second;
+  cancelled = true;callbacks.forEach(cb => cb());
+  assert.match((await stopped).content[0]!.text, /call-cancelled/);
+  releaseSecond();
+  assert.equal((await healthy).isError, undefined, 'cancelled adapter read must not supersede a healthy in-flight sibling');
 });

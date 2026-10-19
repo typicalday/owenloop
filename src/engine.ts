@@ -2450,6 +2450,11 @@ export class Engine {
        * match result onto the order that is actually served.
        */
       crewStamps?: CrewStamps;
+      /** Explicit trusted-host command lane. Only command steps consult this
+       * synchronous predicate; agent capability/modifier matching is unchanged.
+       * The host owns principal grants and opt-in. This is never caller-supplied
+       * executable code on the Hub wire. Omission retains the class-crew route. */
+      commandClaims?: (workflow: string, step: string) => boolean;
     } = {},
   ): TickResult {
     // `capabilities` is passed through AS GIVEN — an omitted filter (undefined)
@@ -2466,6 +2471,8 @@ export class Engine {
       opts.capabilityMappings ?? {},
       opts.capabilityRewrites ?? {},
       opts.crewStamps ?? {},
+      false,
+      opts.commandClaims,
     );
   }
 
@@ -2521,6 +2528,7 @@ export class Engine {
     capabilityRewrites: CapabilityRewrites = {},
     crewStamps: CrewStamps = {},
     maintenanceOnly = false,
+    commandClaims?: (workflow: string, step: string) => boolean,
   ): TickResult {
     if (depth > this.maxCallDepth) {
       throw new Error(
@@ -2581,7 +2589,7 @@ export class Engine {
       const firings = eligibleFirings(def, arts, timeFacts, { modifier });
       const contexts = new Map<Firing, ResolvedStepContext>();
       const { selected, deferred } = maintenanceOnly ? { selected: [], deferred: [] }
-	: this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityMappings, capabilityRewrites, contexts, crewStamps);
+	: this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes, capabilityMappings, capabilityRewrites, contexts, crewStamps, undefined, commandClaims);
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
@@ -2619,7 +2627,7 @@ export class Engine {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
-		}, matchModes, capabilityMappings, capabilityRewrites, crewStamps, maintenanceOnly);
+		}, matchModes, capabilityMappings, capabilityRewrites, crewStamps, maintenanceOnly, commandClaims);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -2722,6 +2730,7 @@ export class Engine {
     contexts: Map<Firing, ResolvedStepContext>,
     crewStamps: CrewStamps,
     readyOptions?: ReadyOptions,
+    commandClaims?: (workflow: string, step: string) => boolean,
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
@@ -2750,7 +2759,11 @@ export class Engine {
 	  revision: 'legacy', legacyMappings: capabilityMappings, rewrites: capabilityRewrites, crewStamps, matchModes,
 	});
 	contexts.set(f, context);
-	if (claimMatches(context.capabilities, capabilities, context.matchModes)) stepFirings.push(f);
+	const matches = step.executor === 'command' && commandClaims !== undefined
+	  ? commandClaims(workflow, step.name)
+	  : claimMatches(context.capabilities, capabilities, context.matchModes);
+	if (typeof matches !== 'boolean') throw new Error('command claim predicate must return a synchronous boolean');
+	if (matches) stepFirings.push(f);
         else defer(f, 'capability-mismatch');
       }
       if (stepFirings.length === 0) continue;

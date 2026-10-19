@@ -57,10 +57,13 @@ import type { StopOptions } from '../lease/loop.ts';
 import { createHoldMcp, HOLD_MCP_TOOL_NAMES, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createDefaultHostedOrderAdapter, type HostedOrderResult } from '../hosted/order-adapter.ts';
 import { createVerifiedHostedHoldMcp } from '../hosted/verified-hold-mcp.ts';
+import { createTrustedInputV2Admission } from '../hosted/trusted-input-admission.ts';
+import { createTrustedReferenceV2Reader, type TrustedReferenceV2Reader } from '../hosted/trusted-reference-v2.ts';
 import { buildSubmitProof } from '../submit-proof.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { validModelOrderFields } from '../order-definition-binding.ts';
+import { parseWorkdirFrom } from '../../../../src/paths.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, watchStdinEof, type SignalHost, type StdinHost } from './signals.ts';
@@ -285,11 +288,14 @@ export interface RunDeps {
   env?: Record<string, string | undefined>;
   /** Injected verifier for role wiring tests; production uses the local store. */
   hostedAdapter?: {
+    readonly referenceProtocol?: 'trusted-reference-read-v2';
     open(preflight: unknown): Promise<HostedOrderResult>;
     submitConditional?: ReturnType<typeof createDefaultHostedOrderAdapter>['submitConditional'];
   };
   /** Injected local resolver for model-field binding tests. */
   modelInstructionResolver?: InstructionResolver;
+  /** Hermetic read seam; production uses the independent HTTPS reader. */
+  trustedInputV2Reader?: TrustedReferenceV2Reader;
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -412,6 +418,22 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // `agent-run` child is not and does not.
   if (parsed.mcp) {
     let modelResolver = deps.modelInstructionResolver;
+    const consumedVerifier = createConsumedVerifier({ env, now: () => Date.now() });
+    // Build the Service reader lazily for all declared input paths, whether
+    // supplied or absent, and unsupported feedback. Empty zero-input static
+    // orders retain their compatibility; producer proofs are not actor grants.
+    let admission: ReturnType<typeof createTrustedInputV2Admission> | undefined;
+    const trustedInputV2 = { async observe(order: Parameters<InstructionResolver['resolveStep']>[0], signal?: AbortSignal) {
+      modelResolver ??= createDefaultStoreInstructionResolver({
+	cwd: parsed.neverRelease ? env['OWENLOOP_INSTRUCTION_CWD'] ?? process.cwd() : process.cwd(), env,
+      });
+      admission ??= createTrustedInputV2Admission({
+	reader: deps.trustedInputV2Reader ?? createTrustedReferenceV2Reader({
+	  origin, getToken: async () => token, expected: target,
+	}), instructions: modelResolver, consumedVerifier, expected: target,
+      });
+      return admission.observe(order, signal);
+    } };
     const modelOrderVerifier: NonNullable<Parameters<typeof createHoldMcp>[0]['modelOrderVerifier']> = async (order) => {
       try {
 	modelResolver ??= createDefaultStoreInstructionResolver({
@@ -422,6 +444,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	if (!resolved.ok) return { ok: false, reason: 'model order refusal: local definition unavailable' };
 	if (!validModelOrderFields(resolved.step, order, resolved.inputNames)) {
 	  return { ok: false, reason: 'model order refusal: fields differ from local definition' };
+	}
+	if (resolved.step.workdirFrom !== undefined
+	  && parseWorkdirFrom(resolved.step.workdirFrom, resolved.step.consumes, resolved.inputNames ?? [])?.source === 'input') {
+	  return { ok: true, requiresInputWitness: true };
 	}
 	return { ok: true };
       } catch {
@@ -437,10 +463,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	: parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),
       origin,
       env,
-      consumedVerifier: createConsumedVerifier({
-        env,
-        now: () => Date.now(),
-      }),
+      consumedVerifier,
+      ...(parsed.verifiedHosted ? { owedVersionMode: 'conditional-v1' as const } : {}),
+      ...(!parsed.verifiedHosted || deps.hostedAdapter === undefined
+	|| deps.hostedAdapter.referenceProtocol === 'trusted-reference-read-v2' ? { trustedInputV2 } : {}),
       modelOrderVerifier,
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
@@ -455,6 +481,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       try {
 	adapter = deps.hostedAdapter ?? createDefaultHostedOrderAdapter({
 	  hub: { origin, getToken: async () => token },
+	  referenceV2: true,
 	  expected: { workflowId: target.workflow, runId: target.run },
 	  cwd: process.cwd(), env, now: () => Date.now(),
 	});
@@ -462,8 +489,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	mount = createVerifiedHostedHoldMcp(baseMount, adapter, target, enableSubmit ? {
 	  enableSubmit: true,
 	  holder,
-	  signProof: (order, path, value, version) => buildSubmitProof({
+	  signProof: (order, path, value, version, signal) => buildSubmitProof({
 	    origin, order, path, value, version, now: () => Date.now(), warn: err, env,
+	    ...(signal === undefined ? {} : { signal }),
 	  }),
 	} : {});
       } catch (error) {

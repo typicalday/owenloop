@@ -22,6 +22,7 @@
  * No retries/backoff and no token refresh in C1 — the roles own their retry
  * policy later, and oauth-kind token refresh stays inside owenloop.
  */
+import { createHash } from 'node:crypto';
 import { HubError } from './types.ts';
 import type {
   AnswerApprovalRequest,
@@ -77,10 +78,10 @@ export interface HubClient {
    * a fake that ignores it simply cannot be cut short.
    */
   whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
-  getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
+  getOrder(req: GetOrderRequest, signal?: AbortSignal): Promise<GetOrderResponse>;
   /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
-  getReferenceOrder?(req: GetOrderRequest): Promise<unknown>;
-  heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
+  getReferenceOrder?(req: GetOrderRequest, signal?: AbortSignal): Promise<unknown>;
+  heartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   /** Versioned route only; callers must never fall back to legacy submit. */
@@ -128,7 +129,7 @@ export interface HubClient {
   /** Read the hub's known harness/model registry. */
   listHarnessModels?(): Promise<ListHarnessModelsResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
-  wake(cursor?: number, signal?: AbortSignal): Promise<WakeResponse>;
+  wake(cursor?: number, signal?: AbortSignal, serveCommands?: boolean): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
   presencePing(req: PresencePingRequest, signal?: AbortSignal): Promise<PresencePingResponse>;
   /**
@@ -184,9 +185,15 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   async function post<T>(verb: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
+    const headers = await authHeaders();
+    // A credential lookup can outlive the caller's deadline. Do not let its
+    // late completion start an already-expired authenticated request.
+    signal?.throwIfAborted();
     const res = await fetchImpl(`${base}/api/${verb}`, {
       method: 'POST',
-      headers: await authHeaders(),
+      redirect: 'error',
+      headers,
       body: JSON.stringify(body),
       ...(signal === undefined ? {} : { signal }),
     });
@@ -197,6 +204,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
     const res = await fetchImpl(url, {
       method: 'GET',
+      redirect: 'error',
       headers: await authHeaders(),
       ...(signal === undefined ? {} : { signal }),
     });
@@ -212,19 +220,44 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     // The name rides a header rather than the body because the body IS the
     // bytes. It is a display label only; the hub never resolves it as a path.
     if (req.filename !== undefined) headers['x-file-name'] = req.filename;
+    // Bind the acknowledgement to the bytes/headers passed to fetch, before
+    // awaiting its response. A caller changing its buffer later cannot change
+    // the expected digest of this already-sent request.
+    const expectedHash = createHash('sha256').update(req.bytes).digest('hex');
+    const expectedSize = req.bytes.byteLength;
+    const normalizedHeaders = new Headers(headers);
+    const expectedFilename = normalizedHeaders.get('x-file-name') || undefined;
     const res = await fetchImpl(`${base}${path}?workflow=${encodeURIComponent(req.workflow)}`, {
       method: 'POST',
+      redirect: 'error',
       headers,
       body: req.bytes,
     });
-    return parse<T>(res);
+    const ack = await parse<unknown>(res);
+    if (ack === null || typeof ack !== 'object' || Array.isArray(ack)) {
+      throw new Error('file-artifact-ack-invalid');
+    }
+    const pointer = ack as Record<string, unknown>;
+    if (typeof pointer.__file !== 'string' || pointer.__file.length === 0
+      || pointer.hash !== expectedHash || pointer.size !== expectedSize
+      || pointer.contentType !== normalizedHeaders.get('content-type')
+      || pointer.filename !== expectedFilename) {
+      throw new Error('file-artifact-ack-invalid');
+    }
+    return ack as T;
   }
 
   return {
-    whatsNext: (req, signal) => post<WhatsNextResponse>('whats_next', req, signal),
-    getOrder: (req) => post<GetOrderResponse>('get_order', req),
-    getReferenceOrder: (req) => post<unknown>('reference_order/v1', req),
-    heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
+    whatsNext: async (req, signal) => {
+      const result = await post<WhatsNextResponse>('whats_next', req, signal);
+      if (req.serve_commands && (result.command_lane !== 'grant-v1' || result.orders?.some(order => order.worker !== 'command'))) {
+        throw new Error('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
+      }
+      return result;
+    },
+    getOrder: (req, signal) => post<GetOrderResponse>('get_order', req, signal),
+    getReferenceOrder: (req, signal) => post<unknown>('reference_order/v1', req, signal),
+    heartbeat: (req, signal) => post<HeartbeatResponse>('heartbeat', req, signal),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
     submitConditional: (req) => post<ConditionalSubmitResponse>('submit/conditional-v1', req),
@@ -240,8 +273,11 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).
-    wake: (cursor, signal) =>
-      get<WakeResponse>('wake', typeof cursor === 'number' ? `cursor=${encodeURIComponent(String(cursor))}` : undefined, signal),
+    wake: (cursor, signal, serveCommands = false) => {
+      const parts = typeof cursor === 'number' ? [`cursor=${encodeURIComponent(String(cursor))}`] : [];
+      if (serveCommands) parts.push('serve_commands=true');
+      return get<WakeResponse>('wake', parts.length ? parts.join('&') : undefined, signal);
+    },
     presencePing: (req, signal) => post<PresencePingResponse>('presence_ping', req, signal),
     putFileArtifact: (req) => postBytes<PutFileArtifactResponse>('/api/file-artifacts', req),
   };

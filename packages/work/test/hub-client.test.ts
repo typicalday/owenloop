@@ -1,4 +1,10 @@
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { createServer as createHttpsServer } from 'node:https';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -310,4 +316,170 @@ test('presencePing forwards attended_at using the exact snake_case wire field', 
   await c.presencePing({ name: 'box', serve_crews: [], serve_capabilities: [], attended_at: 456789 });
   assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: [], serve_capabilities: [], attended_at: 456789 });
   assert.equal((captured[0]!.body as Record<string, unknown>)['attendedAt'], undefined);
+});
+
+
+test('command-only transport carries opt-in and refuses a legacy or mixed response', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { body: { text: '', command_lane: 'grant-v1', orders: [], instances: [] } }));
+  await c.whatsNext({ serve_capabilities: [], serve_commands: true });
+  await c.wake(3, undefined, true);
+  assert.deepEqual(captured[0]!.body, { serve_capabilities: [], serve_commands: true });
+  assert.equal(captured[1]!.url, 'https://hub.example/api/wake?cursor=3&serve_commands=true');
+  for (const body of [{ text: '', orders: [] }, { text: '', command_lane: 'grant-v1', orders: [{ worker: 'agent' }] }]) {
+    const old = client(fakeFetch([], { body }));
+    await assert.rejects(old.whatsNext({ serve_capabilities: [], serve_commands: true }), /command-only grant lane/);
+  }
+});
+
+for (const verb of ['get', 'conditional', 'bytes'] as const) {
+  for (const status of [200, 307, 308]) {
+    test(`Hub redirect origin binding: ${verb} HTTP ${status}`, async () => {
+      const body = verb === 'get' ? { text: 'own', orgId: 'own' }
+	: verb === 'conditional' ? { text: 'accepted', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' }
+	  : { text: 'stored', __file: 'own-TEST-key', hash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), size: 3, contentType: 'application/octet-stream', filename: 'isolated-TEST-file' };
+      let targetRequests = 0;
+      let originRequests = 0;
+      const target = createServer(async (req, res) => {
+	targetRequests++;
+	for await (const _chunk of req) { /* Drain isolated fixture bytes only. */ }
+	res.setHeader('content-type', 'application/json');
+	res.end(JSON.stringify(body));
+      });
+      await new Promise<void>(resolve => target.listen(0, '127.0.0.1', resolve));
+      const targetOrigin = `http://127.0.0.1:${(target.address() as AddressInfo).port}`;
+      const origin = createServer(async (req, res) => {
+	originRequests++;
+	for await (const _chunk of req) { /* Drain isolated fixture bytes only. */ }
+	res.statusCode = status;
+	if (status !== 200) res.setHeader('location', `${targetOrigin}/substituted`);
+	res.setHeader('content-type', 'application/json');
+	res.end(JSON.stringify(body));
+      });
+      await new Promise<void>(resolve => origin.listen(0, '127.0.0.1', resolve));
+      try {
+	const c = createHubClient({ origin: `http://127.0.0.1:${(origin.address() as AddressInfo).port}`, getToken: async () => 'isolated-TEST-token' });
+	const call = () => verb === 'get' ? c.whoami()
+	  : verb === 'conditional' ? c.submitConditional!({ workflow: 'wf-test', run: 'run-test', path: 'out', value: { private: 'isolated-TEST-value' }, expectedVersion: 3 })
+	    : c.putFileArtifact({ workflow: 'wf-test', bytes: new Uint8Array([1, 2, 3]), contentType: 'application/octet-stream', filename: 'isolated-TEST-file' });
+	let accepted = false;
+	try { await call(); accepted = true; } catch (error) { assert.ok(error instanceof Error); }
+	assert.equal(targetRequests, 0, 'another origin must receive no read or private write request');
+	assert.equal(originRequests, 1, 'no automatic retry at configured origin');
+	assert.equal(accepted, status === 200, 'only configured-origin response may be accepted');
+      } finally {
+	origin.closeAllConnections(); target.closeAllConnections();
+	await Promise.all([new Promise<void>(resolve => origin.close(() => resolve())), new Promise<void>(resolve => target.close(() => resolve()))]);
+      }
+    });
+  }
+}
+
+for (const status of [200, 307, 308]) {
+  test(`Hub redirect origin binding: real child HTTPS conditional ${status}`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'hub-redirect-tls-'));
+    const key = join(dir, 'key.pem');
+    const cert = join(dir, 'cert.pem');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+    const tls = { key: readFileSync(key), cert: readFileSync(cert) };
+    const payload = { workflow: 'wf-test', run: 'run-test', path: 'out', value: { private: 'isolated-TEST-value' }, expectedVersion: 3 };
+    const ack = { text: 'accepted', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' };
+    let targetRequests = 0;
+    let targetBodyMatched = false;
+    let targetAuthorizationPresent = false;
+    let originRequests = 0;
+    const target = createHttpsServer(tls, async (req, res) => {
+      targetRequests++;
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      targetBodyMatched = JSON.stringify(JSON.parse(body)) === JSON.stringify(payload);
+      targetAuthorizationPresent = req.headers.authorization !== undefined;
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(ack));
+    });
+    await new Promise<void>(resolve => target.listen(0, '127.0.0.1', resolve));
+    const origin = createHttpsServer(tls, async (req, res) => {
+      originRequests++;
+      for await (const _chunk of req) { /* Drain only isolated TEST fixture data. */ }
+      res.statusCode = status;
+      if (status !== 200) res.setHeader('location', `https://localhost:${(target.address() as AddressInfo).port}/substituted`);
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(ack));
+    });
+    await new Promise<void>(resolve => origin.listen(0, '127.0.0.1', resolve));
+    try {
+      const source = `import { createHubClient } from ${JSON.stringify(new URL('../src/hub/client.ts', import.meta.url).href)};
+	const c = createHubClient({ origin: ${JSON.stringify(`https://localhost:${(origin.address() as AddressInfo).port}`)}, getToken: async () => 'isolated-TEST-token' });
+	try { const r = await c.submitConditional(${JSON.stringify(payload)}); console.log(JSON.stringify({ accepted: r.closed === true && r.conditionApplied === 'expected-version-v1' })); }
+	catch { console.log(JSON.stringify({ accepted: false })); }`;
+      const child = spawn(process.execPath, ['--input-type=module', '-e', source], { env: { ...process.env, NODE_EXTRA_CA_CERTS: cert }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = ''; let stderr = '';
+      child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
+      const exit = await new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+      assert.equal(exit, 0, stderr);
+      const result = JSON.parse(stdout) as { accepted: boolean };
+      t.diagnostic(JSON.stringify({ status, targetRequests, targetBodyMatched, targetAuthorizationPresent, accepted: result.accepted }));
+      assert.equal(originRequests, 1);
+      assert.equal(targetRequests, 0, 'redirect target must not receive conditional-submit payload');
+      assert.equal(result.accepted, status === 200, 'a substituted ACK must not be consumed');
+    } finally {
+      origin.closeAllConnections(); target.closeAllConnections();
+      await Promise.all([new Promise<void>(resolve => origin.close(() => resolve())), new Promise<void>(resolve => target.close(() => resolve()))]);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const fault of ['empty', 'array', 'null', 'key', 'empty-key', 'hash', 'size', 'content-type', 'filename', 'missing-filename'] as const) {
+  test(`file acknowledgement refuses ${fault} without retry`, async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const good = { __file: 'opaque-TEST-key', hash: createHash('sha256').update(bytes).digest('hex'), size: 3, contentType: 'application/octet-stream', filename: 'own.txt' };
+    let body: unknown = good;
+    switch (fault) {
+      case 'empty': body = {}; break;
+      case 'array': body = []; break;
+      case 'null': body = null; break;
+      case 'key': body = { ...good, __file: true }; break;
+      case 'empty-key': body = { ...good, __file: '' }; break;
+      case 'hash': body = { ...good, hash: '0'.repeat(64) }; break;
+      case 'size': body = { ...good, size: 4 }; break;
+      case 'content-type': body = { ...good, contentType: 'text/plain' }; break;
+      case 'filename': body = { ...good, filename: 'other.txt' }; break;
+      case 'missing-filename': { const { filename: _filename, ...without } = good; body = without; break; }
+    }
+    let sends = 0;
+    const c = client((async () => { sends++; return new Response(JSON.stringify(body)); }) as typeof fetch);
+    await assert.rejects(c.putFileArtifact({ workflow: 'wf1', bytes, contentType: good.contentType, filename: good.filename }), /file-artifact-ack-invalid/);
+    assert.equal(sends, 1);
+  });
+}
+
+test('file acknowledgement accepts absent filename and normalized request headers', async () => {
+  const bytes = new Uint8Array([1]);
+  const c = client((async () => new Response(JSON.stringify({ __file: 'opaque-TEST-key', hash: createHash('sha256').update(bytes).digest('hex'), size: 1, contentType: 'text/plain' }))) as typeof fetch);
+  const result = await c.putFileArtifact({ workflow: 'wf1', bytes, contentType: ' text/plain ', filename: ' ' });
+  assert.equal(result.__file, 'opaque-TEST-key');
+  assert.equal(result.filename, undefined);
+});
+
+test('file acknowledgement accepts the filename normalization actually sent by Headers', async () => {
+  const bytes = new Uint8Array([1]);
+  const c = client((async () => new Response(JSON.stringify({ __file: 'opaque-TEST-key', hash: createHash('sha256').update(bytes).digest('hex'), size: 1, contentType: 'text/plain', filename: 'own.txt' }))) as typeof fetch);
+  assert.equal((await c.putFileArtifact({ workflow: 'wf1', bytes, contentType: ' text/plain ', filename: ' own.txt ' })).filename, 'own.txt');
+});
+
+test('file acknowledgement uses sent bytes even if the caller changes its buffer while waiting', async () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    assert.deepEqual(Buffer.concat(chunks), Buffer.from([1, 2, 3]));
+    bytes.fill(9);
+    res.end(JSON.stringify({ __file: 'opaque-TEST-key', hash, size: 3, contentType: 'application/octet-stream' }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const c = createHubClient({ origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, getToken: async () => 'own-TEST-token' });
+    assert.equal((await c.putFileArtifact({ workflow: 'wf1', bytes, contentType: 'application/octet-stream' })).hash, hash);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
