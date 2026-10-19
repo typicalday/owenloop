@@ -51,6 +51,9 @@ jobs:
 
       # Project checks keep their matrix runtime above. Exercise the published
       # package's advertised minimum separately, after recording that proof.
+      - name: Record project test runtime
+        run: printf 'OWENLOOP_PROJECT_TEST_NODE=%s\n' "$(command -v node)" >> "$GITHUB_ENV"
+
       - name: Select minimum installed-consumer runtime
         if: matrix.node == 22
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -62,6 +65,7 @@ jobs:
           CONSUMER_NODE_MAJOR: ${{ matrix.node }}
         run: |
           set -euo pipefail
+          project_root="$PWD"
           consumer_root="$(mktemp -d "${RUNNER_TEMP}/owenloop-consumer.XXXXXX")"
           trap 'rm -rf -- "$consumer_root"' EXIT
           npm pack --ignore-scripts --json --pack-destination "$consumer_root" > "$consumer_root/pack.json"
@@ -101,6 +105,13 @@ jobs:
           NODE
           ./node_modules/.bin/owenloop --help
           npm audit --omit=dev --audit-level=low
+          mkdir "$consumer_root/fixtures"
+          TMPDIR="$consumer_root/fixtures" \
+            OWENLOOP_TEST_MCP_BIN="$consumer_root/app/node_modules/owenloop/bin/owenloop.mjs" \
+            OWENLOOP_TEST_MCP_EXECUTABLE="$(command -v node)" \
+            "$OWENLOOP_PROJECT_TEST_NODE" --test --test-reporter=spec \
+              --test-name-pattern='normal hold --mcp independently verifies file-(redirect|ack)-' \
+              "$project_root/packages/work/test/hold-mcp-e2e.test.ts"
 
   # Real SSHSIG interoperability: both OS runners ship stock `ssh-keygen` with
   # `-Y` support, so the crypto tests run unskipped — module sign → stock
