@@ -152,6 +152,8 @@ export interface ExecLoopOptions {
   dirExists?: (path: string) => boolean;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** Elapsed-time clock for the bounded submit retry window. Default `performance.now`. */
+  monotonicNow?: () => number;
   random?: () => number;
   out: (line: string) => void;
   err: (line: string) => void;
@@ -938,12 +940,30 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         holder: opts.holder,
       });
       const retryStartedAt = opts.now();
+      const monotonicNow = opts.monotonicNow ?? (() => performance.now());
+      const retryStartedElapsed = monotonicNow();
+      let lastElapsed = retryStartedElapsed;
+      const retryRemaining = (): number => {
+	const wall = opts.now();
+	const elapsed = monotonicNow();
+	if (
+	  !Number.isFinite(retryStartedAt) || !Number.isFinite(retryStartedElapsed) ||
+	  !Number.isFinite(wall) || !Number.isFinite(elapsed) || elapsed < lastElapsed
+	) return 0;
+	lastElapsed = elapsed;
+	// Wall rollback cannot extend the elapsed-time ceiling. Forward wall
+	// movement may shorten it, including time spent waiting for a 429 ACK.
+	return SUBMIT_RETRY_WINDOW_MS - Math.max(0, wall - retryStartedAt, elapsed - retryStartedElapsed);
+      };
       let res: Awaited<ReturnType<HubClient['submit']>> | undefined;
 
       for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
 	// A signed proof or an earlier ACK cannot revive a stopped/lost lease.
 	// Consume already-sent ACKs normally; fence only sends not yet begun.
 	if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
+	if (attempt > 1 && retryRemaining() <= 0) {
+	  return failSubmit(owe.path, new Error('submit retry window exhausted'));
+	}
         try {
           res = await hub.submit(submitRequest);
           break;
@@ -952,10 +972,10 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
           if (!retryable || attempt === SUBMIT_MAX_ATTEMPTS) return failSubmit(owe.path, e);
 
           const delay = e.retryAfterMs ?? SUBMIT_FALLBACK_DELAYS_MS[attempt - 1]!;
-          const remaining = SUBMIT_RETRY_WINDOW_MS - (opts.now() - retryStartedAt);
+	  const remaining = retryRemaining();
           // Never retry ahead of a server delay, nor hold this receipt beyond
           // the bounded retry window just because a malformed/large header said to.
-          if (delay > remaining) return failSubmit(owe.path, e);
+	  if (!Number.isFinite(delay) || delay < 0 || delay >= remaining) return failSubmit(owe.path, e);
 
           opts.err(
             `owenloop work exec: submit to ${owe.path} failed: ${formatSubmitError(e)}; ` +

@@ -160,6 +160,52 @@ test('e2e: get_order → ≥1 heartbeat (holder on the wire) → run → submit 
   }
 });
 
+test('e2e: a late 429 retry wake sends no expired receipt over HTTP', async () => {
+  const command = 'printf retry-deadline-command';
+  const { origin, reqs, server } = await startMockHub(commandOrder(command));
+  server.removeAllListeners('request');
+  server.on('request', (req, res) => {
+    let raw = '';
+    req.on('data', (chunk: Buffer) => { raw += chunk.toString('utf8'); });
+    req.on('end', () => {
+      const verb = req.url!.replace(/^\/api\//, '');
+      reqs.push({ verb, auth: req.headers.authorization, body: JSON.parse(raw) as Record<string, unknown> });
+      res.setHeader('content-type', 'application/json');
+      if (verb === 'get_order') res.end(JSON.stringify(commandOrder(command)));
+      else if (verb === 'submit' && of(reqs, 'submit').length === 1) {
+	res.writeHead(429, { 'retry-after': '1' });
+	res.end(JSON.stringify({ text: 'limited' }));
+      } else res.end(JSON.stringify({ text: '', outcome: 'green' }));
+    });
+  });
+  let wall = 0;
+  const loop = createExecLoop({
+    hub: createHubClient({ origin, getToken: async () => 'tok-e2e' }),
+    runner: createDefaultRunner(), workflow: 'wf1', run: 'run1', holder: EXEC,
+    instructions: {
+      resolveCommand: async () => ({ ok: true, command }),
+      resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+    },
+    cwd: CWD, now: () => wall,
+    sleep: async (ms) => {
+      if (ms === 1_000) { wall = 30_001; await realSleep(1); }
+      else await new Promise<void>(() => {}); // hold the unrelated heartbeat timer
+    },
+    out: () => {}, err: () => {}, heartbeatIntervalMs: 1_000_000,
+  });
+  try {
+    assert.equal(await loop.run(), 'submit-failed');
+    assert.equal(of(reqs, 'submit').length, 1);
+    assert.equal(of(reqs, 'release').length, 1);
+    const receipt = of(reqs, 'submit')[0]!.body!['value'] as CommandReceipt;
+    assert.equal(receipt.outputHash, `sha256:${createHash('sha256').update('retry-deadline-command').digest('hex')}`);
+  } finally {
+    loop.stop('test-finished');
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('e2e kill drill: signal mid-run → real child killed → release observed, NO submit', async () => {
   const { origin, reqs, server } = await startMockHub(commandOrder('sleep 30'));
   try {

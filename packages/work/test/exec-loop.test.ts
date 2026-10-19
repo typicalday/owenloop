@@ -1769,6 +1769,140 @@ test('a 429 submit honors Retry-After and replays the exact request', async () =
   assert.equal(only(calls, 'release').length, 0);
 });
 
+for (const elapsed of [30_000, 30_001]) {
+  test(`a 429 retry waking at ${elapsed}ms sends no expired receipt`, async () => {
+    const clock = controlledClock();
+    let wall = 0;
+    const fr = fakeRunner();
+    const { hub, calls, submits } = mockHub({
+      getOrder: [commandOrder()],
+      submit: [new HubError(429, 'limited', undefined, 5_000), 'green'],
+    });
+    const loop = createExecLoop(baseOpts(hub, fr.runner, {
+      sleep: clock.sleep, now: () => wall, heartbeatIntervalMs: 1_000_000,
+    }));
+    const pending = loop.run();
+    await macrotaskSleep();
+    fr.resolve(result(0));
+    await macrotaskSleep();
+    wall = elapsed; // scheduler resumes a five-second timer late
+    clock.release(5_000);
+
+    assert.equal(await pending, 'submit-failed');
+    assert.equal(submits.length, 1);
+    assert.equal(fr.starts.length, 1);
+    assert.equal(only(calls, 'release').length, 1);
+  });
+}
+
+test('a 429 retry cannot extend its elapsed window after wall rollback', async () => {
+  const clock = controlledClock();
+  let wall = 0;
+  let elapsed = 0;
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited', undefined, 5_000), 'green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    sleep: clock.sleep, now: () => wall, heartbeatIntervalMs: 1_000_000,
+    ...{ monotonicNow: () => elapsed },
+  }));
+  const pending = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  wall = -60_000;
+  elapsed = 30_000;
+  clock.release(5_000);
+
+  assert.equal(await pending, 'submit-failed');
+  assert.equal(submits.length, 1);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+for (const sample of [29_999, Number.NaN, -1]) {
+  test(`a 429 retry validates the final elapsed sample ${sample}`, async () => {
+    const clock = controlledClock();
+    let elapsed = 0;
+    const fr = fakeRunner();
+    const { hub, calls, submits } = mockHub({
+      getOrder: [commandOrder()],
+      submit: [new HubError(429, 'limited', undefined, 5_000), 'green'],
+    });
+    const loop = createExecLoop(baseOpts(hub, fr.runner, {
+      sleep: clock.sleep, now: () => 0, monotonicNow: () => elapsed,
+      heartbeatIntervalMs: 1_000_000,
+    }));
+    const pending = loop.run();
+    await macrotaskSleep();
+    fr.resolve(result(0));
+    await macrotaskSleep();
+    elapsed = sample;
+    clock.release(5_000);
+
+    const healthy = sample === 29_999;
+    assert.equal(await pending, healthy ? 'submitted' : 'submit-failed');
+    assert.equal(submits.length, healthy ? 2 : 1);
+    assert.equal(only(calls, 'release').length, healthy ? 0 : 1);
+  });
+}
+
+test('time spent awaiting a 429 response consumes the retry window', async () => {
+  const clock = controlledClock();
+  let elapsed = 0;
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()] });
+  const submit = hub.submit;
+  hub.submit = async (req) => {
+    await submit(req);
+    elapsed = 30_000;
+    throw new HubError(429, 'limited', undefined, 0);
+  };
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    sleep: clock.sleep, now: () => 0, monotonicNow: () => elapsed,
+    heartbeatIntervalMs: 1_000_000,
+  }));
+  const pending = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+
+  assert.equal(await pending, 'submit-failed');
+  assert.equal(submits.length, 1);
+  assert.deepEqual(clock.released, []);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('an already-sent successful ACK after the retry window is still consumed', async () => {
+  const clock = controlledClock();
+  let elapsed = 0;
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: [new HubError(429, 'limited', undefined, 5_000), 'green'],
+  });
+  const submit = hub.submit;
+  hub.submit = async (req) => {
+    const ack = await submit(req);
+    elapsed = 40_000;
+    return ack;
+  };
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    sleep: clock.sleep, now: () => 0, monotonicNow: () => elapsed,
+    heartbeatIntervalMs: 1_000_000,
+  }));
+  const pending = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  await macrotaskSleep();
+  elapsed = 5_000;
+  clock.release(5_000);
+
+  assert.equal(await pending, 'submitted');
+  assert.equal(submits.length, 2);
+  assert.equal(only(calls, 'release').length, 0);
+});
+
 test('429 submit fallback delays are 5s then 10s and run the command once', async () => {
   const clock = controlledClock();
   const fr = fakeRunner();
