@@ -6,7 +6,7 @@
  */
 import { randomUUID } from 'node:crypto';
 
-import { textResult, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
+import { textResult, type ToolCallContext, type ToolRegistration, type ToolResult } from '../mcp/server.ts';
 import type { HoldMcpMount } from '../hold/mcp.ts';
 import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type ContactHolder, type GetOrderResponse, type OrderPacket } from '../hub/types.ts';
 import { hostedPacketDigest, hostedReferencePacketDigest, hostedReferenceStableDigest, hostedReferenceV2Digest, type HostedOrderProjection, type HostedOrderResult, type HostedVerifiedPacket } from './order-adapter.ts';
@@ -255,12 +255,16 @@ export function createVerifiedHostedHoldMcp(
     return { ok: true, projection: verified, fullDigest: initialFullDigest, startedAt,
       ...(verifiedPacket === undefined ? {} : { packet: verifiedPacket }) };
   }
-  async function readVerified(revision: number, ctx: Parameters<ToolRegistration['handler']>[1]): ReturnType<typeof observeVerified> {
+  async function readWithDeadline<T extends { ok: boolean }>(
+    revision: number,
+    ctx: ToolCallContext,
+    read: (scopedContext: ToolCallContext) => Promise<T>,
+  ): Promise<T | { ok: false; result: ToolResult }> {
     const initial = observationGuard(revision, ctx);
     if (initial !== undefined) return { ok: false, result: initial };
-    // The independent adapter has its own deadline, but private holder reads
-    // occur on both sides of it. Bound the complete observation too, and make
-    // a late private completion see cancellation before pinning or exposure.
+    // Apply the same observation budget to complete verification and the last
+    // pre-write private read. Late results see cancellation before they can
+    // pin, expose an order, or authorize a conditional write.
     let wallStartedAt: number;
     let monotonicStartedAt: number;
     try {
@@ -285,7 +289,7 @@ export function createVerifiedHostedHoldMcp(
 	}
       },
     };
-    const deadline = new Promise<Awaited<ReturnType<typeof observeVerified>>>((resolve) => {
+    const deadline = new Promise<{ ok: false; result: ToolResult }>((resolve) => {
       timer = setTimeout(() => {
 	expired = true;
 	for (const cancel of localCancellations) { try { cancel(); } catch { /* Cancellation cannot prevent refusal. */ } }
@@ -294,7 +298,7 @@ export function createVerifiedHostedHoldMcp(
       }, 5_000);
     });
     try {
-      const checked = await Promise.race([observeVerified(revision, scopedContext), deadline]);
+      const checked = await Promise.race([read(scopedContext), deadline]);
       if (expired) return checked;
       const stale = observationGuard(revision, ctx);
       if (stale !== undefined) return { ok: false, result: stale };
@@ -321,6 +325,9 @@ export function createVerifiedHostedHoldMcp(
       clearTimeout(timer);
       localCancellations.clear();
     }
+  }
+  async function readVerified(revision: number, ctx: ToolCallContext): ReturnType<typeof observeVerified> {
+    return readWithDeadline(revision, ctx, scopedContext => observeVerified(revision, scopedContext));
   }
   const orderTool: ToolRegistration = {
     name: 'get_order',
@@ -419,7 +426,11 @@ export function createVerifiedHostedHoldMcp(
 	    return refuseObservation('holder-order-changed', revision);
 	  }
 	}
-	const current = await livePrivateOrder(ctx);
+	const finalPrivate = await readWithDeadline(revision, ctx, async scopedContext => ({
+	  ok: true as const, current: await livePrivateOrder(scopedContext),
+	}));
+	if (!finalPrivate.ok) return finalPrivate.result;
+	const current = finalPrivate.current;
 	const beforeSubmit = observationGuard(revision, ctx);
 	if (beforeSubmit !== undefined) return beforeSubmit;
 	if (current === undefined) return refuseObservation('holder-order-unavailable', revision);

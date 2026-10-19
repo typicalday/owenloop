@@ -967,3 +967,33 @@ test('a cancelled private-read timeout does not fence a healthy sibling still ve
   }
   assert.equal((await healthy).isError, undefined, 'cancelled request expiry cannot invalidate an unrelated healthy observation');
 });
+
+for (const v2 of [false, true]) {
+  test(`verified ${v2 ? 'v2' : 'v1'} submit bounds the last private read immediately before transport`, async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const f = fixture(true, { v2, onRawGet: async count => {
+      if (count === (v2 ? 5 : 3)) { entered();await pending; }
+    } });
+    const submitted = f.submit({ path: 'out', value: { n: 1 } });
+    await started;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([submitted, new Promise<'still-pending'>(resolve => {
+	timer = setTimeout(() => resolve('still-pending'), 6_000);
+      })]);
+      assert.notEqual(result, 'still-pending', 'the final pre-write private read must have a real deadline');
+      if (result !== 'still-pending') {
+	assert.equal(result.isError, true);
+	assert.match(result.content[0]!.text, /claim-observation-expired/);
+      }
+      assert.equal(f.submits.length, 0);
+    } finally {
+      clearTimeout(timer);release();await submitted;
+    }
+    assert.equal(f.submits.length, 0, 'late final private completion cannot send the conditional write');
+    assert.equal((await f.call()).isError, undefined, 'fresh healthy verification remains available');
+  });
+}

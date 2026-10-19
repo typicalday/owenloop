@@ -12,6 +12,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:https';
+import { PrincipalKeyManager } from '../../../src/crypto/keys.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
@@ -276,7 +277,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -375,21 +376,63 @@ steps:
 	privateReads++;
 	if ((mode === 'lease-stalled-first-contact' && privateReads === 1)
 	  || (mode === 'verified-stalled-private-initial' && privateReads === 2)
-	  || (mode === 'verified-stalled-private-final' && privateReads === 3)) {
+	  || (mode === 'verified-stalled-private-final' && privateReads === 3)
+	  || (mode === 'verified-stalled-submit-final' && privateReads === 6)) {
 	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
 	  privateReadEntered();
 	  await privateResume;
 	}
 	res.end(JSON.stringify({ text: '', workflow: canonicalWorkflow, run: 'run1', order: packet, lease: { claimed: true } }));
+      } else if (req.url === '/api/submit/conditional-v1') {
+	assert.equal(typeof body.proof, 'string');
+	assert.equal(body.expectedVersion, 1);
+	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' }));
       } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
       else res.end(JSON.stringify({ text: '' }));
     });
     await new Promise<void>(resolve => server!.listen(0, 'localhost', resolve));
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
-    mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
-      '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : [])], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
+    const origin = `https://localhost:${address.port}`;
+    const submitting = mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    if (submitting) {
+      // Local TEST identity only; no hosted grant or authority is fabricated.
+      await new PrincipalKeyManager({ env: { HOME: configDir, OWENLOOP_NO_KEYCHAIN: '1' } })
+	.ensure({ origin, kind: 'machine', id: 'local-test-machine' });
+    }
+    mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', origin,
+      '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : []),
+      ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
+    { ...childEnv(), ...installed.env, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
+    if (submitting) {
+      const pending = callTool(mcp, 'submit', { path: 'plan', value: { n: 1 } });
+      if (mode === 'verified-submit-healthy') {
+	const accepted = await pending;
+	assert.equal(accepted.isError, false, JSON.stringify(accepted.body));
+	assert.equal(seen.filter(path => path === '/api/submit/conditional-v1').length, 1);
+      } else {
+	await privatePaused;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+	  const result = await Promise.race([pending, new Promise<'still-pending'>(resolve => {
+	    timer = setTimeout(() => resolve('still-pending'), 6_000);
+	  })]);
+	  assert.notEqual(result, 'still-pending', 'actual verified submit must bound its last private read');
+	  if (result !== 'still-pending') {
+	    assert.equal(result.isError, true);
+	    assert.match(JSON.stringify(result.body), /claim-observation-expired/);
+	    await until(() => privateTransportClosed, 'expired last private HTTPS transport closes', 1_000);
+	    assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	  }
+	} finally { clearTimeout(timer);releasePrivateRead();await pending; }
+	assert.equal(seen.includes('/api/submit/conditional-v1'), false);
+      }
+      assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject', '/api/reference_order/v1'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
     if (mode === 'lease-stalled-first-contact' || mode === 'lease-stalled-heartbeat') {
       await privatePaused;
       mcp.endStdin();
