@@ -110,7 +110,7 @@ jobs:
             OWENLOOP_TEST_MCP_BIN="$consumer_root/app/node_modules/owenloop/bin/owenloop.mjs" \
             OWENLOOP_TEST_MCP_EXECUTABLE="$(command -v node)" \
             "$OWENLOOP_PROJECT_TEST_NODE" --test --test-reporter=spec \
-              --test-name-pattern='normal hold --mcp independently verifies file-(redirect|ack)-' \
+              --test-name-pattern='normal hold --mcp independently verifies (file-(redirect|ack)-|verified-adapter-)' \
               "$project_root/packages/work/test/hold-mcp-e2e.test.ts"
 
   # Real SSHSIG interoperability: both OS runners ship stock `ssh-keygen` with
