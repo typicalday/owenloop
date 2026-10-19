@@ -11,23 +11,23 @@ import {
 } from '../crypto/dsse.ts';
 import type { DsseRecordPayloadType } from '../crypto/dsse.ts';
 
-import enrollmentGrantSchema from './enrollment-grant.v1.schema.json' with { type: 'json' };
-import orderSchema from './order.v1.schema.json' with { type: 'json' };
-import policyFloorSchema from './policy-floor.v1.schema.json' with { type: 'json' };
-import originSchema from './origin.v1.schema.json' with { type: 'json' };
-import publicationSchema from './publication.v1.schema.json' with { type: 'json' };
-import revocationSchema from './revocation.v1.schema.json' with { type: 'json' };
-import submissionSchema from './submission.v1.schema.json' with { type: 'json' };
+import enrollmentGrantDocument from './enrollment-grant.v1.schema.json' with { type: 'json' };
+import orderDocument from './order.v1.schema.json' with { type: 'json' };
+import policyFloorDocument from './policy-floor.v1.schema.json' with { type: 'json' };
+import originDocument from './origin.v1.schema.json' with { type: 'json' };
+import publicationDocument from './publication.v1.schema.json' with { type: 'json' };
+import revocationDocument from './revocation.v1.schema.json' with { type: 'json' };
+import submissionDocument from './submission.v1.schema.json' with { type: 'json' };
 
-export {
-  enrollmentGrantSchema,
-  orderSchema,
-  originSchema,
-  policyFloorSchema,
-  publicationSchema,
-  revocationSchema,
-  submissionSchema,
-};
+// Export local aliases so emitted declarations describe the schema values
+// without re-exporting JSON imports whose attributes are lost during emit.
+export const enrollmentGrantSchema = enrollmentGrantDocument;
+export const orderSchema = orderDocument;
+export const policyFloorSchema = policyFloorDocument;
+export const originSchema = originDocument;
+export const publicationSchema = publicationDocument;
+export const revocationSchema = revocationDocument;
+export const submissionSchema = submissionDocument;
 
 /** Schemas by the stable contract name used in source and documentation. */
 export const WIRE_SCHEMAS = {
