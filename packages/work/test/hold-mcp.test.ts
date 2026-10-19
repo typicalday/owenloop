@@ -1260,7 +1260,7 @@ test('put_file_artifact refuses once the hold is terminal', async () => {
 
 // Hermetic input-boundary tests, not deployed workflow acceptance evidence.
 function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supplied?: boolean;
-  workdir?: string; canonicalChild?: boolean; admissionNow?: () => number; proofHook?: () => Promise<void> } = {}) {
+  workdir?: string; canonicalChild?: boolean; conditional?: boolean; admissionNow?: () => number; proofHook?: () => Promise<void> } = {}) {
   const definition = buildDef({ name: 'optional-input-holder',
     inputs: [{ name: 'optional', seedOwed: cfg.required ?? false }],
     steps: [{ name: 'planner', consumes: ['optional'], produces: ['plan'] }] });
@@ -1300,6 +1300,7 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
     } });
   const { hub, calls } = mockHub({ getOrder: response });
   const mount = createHoldMcp(deps(hub, { trustedInputV2, workdir: cfg.workdir ?? process.cwd(),
+    ...(cfg.conditional ? { tools: ['get_order'], owedVersionMode: 'conditional-v1' } : {}),
     // Legacy exact membership refuses this order. The service witness must
     // be consulted; accepting via a softened legacy verifier would fail.
     modelOrderVerifier: async order => validModelOrderFields(local, order)
@@ -1311,6 +1312,39 @@ function optionalInputHolder(cfg: { required?: boolean; producer?: boolean; supp
     offline: () => { unavailable = true; }, serviceRefused: () => { serviceRefused = true; },
     serviceRestored: () => { serviceRefused = false; } };
 }
+
+test('private per-result gates expire after a newer independent refusal or hold stop', async () => {
+  const f = optionalInputHolder();
+  const get = tool(f.mount.tools, 'get_order');
+  const shown = await get.handler({}, ctx);
+  assert.equal(shown.isError, undefined);
+  assert.equal(f.mount.readGatedResult?.(shown), f.response);
+  assert.equal(f.mount.readGatedResult?.({ ...shown }), undefined, 'serialized or copied tool content is not a private gate');
+  f.serviceRefused();
+  assert.equal((await get.handler({}, ctx)).isError, true);
+  assert.equal(f.mount.readGatedResult?.(shown), undefined);
+  f.serviceRestored();
+  const fresh = await get.handler({}, ctx);
+  assert.equal(fresh.isError, undefined);
+  assert.equal(f.mount.readGatedResult?.(fresh), f.response);
+  f.mount.loop.stop('released');
+  assert.equal(f.mount.readGatedResult?.(fresh), undefined);
+});
+
+test('private conditional get-order refreshes only owed versions while retaining claim/input fences', async () => {
+  const f = optionalInputHolder({ conditional: true });
+  const get = tool(f.mount.tools, 'get_order');
+  assert.equal((await get.handler({}, ctx)).isError, undefined);
+  f.response.order!.owes[0]!.version = 2;f.wire.order.owes[0]!.version = 2;
+  const refreshed = await get.handler({}, ctx);
+  assert.equal(refreshed.isError, undefined);
+  assert.equal(parse(refreshed).order.owes[0].version, 2);
+  f.response.order!.consumedFingerprint!.optional = 2;
+  f.wire.order.consumedFingerprint!.optional = 2;f.wire.inputs[0]!.version = 2;
+  assert.equal((await get.handler({}, ctx)).isError, true, 'target refresh cannot authorize changed input versions');
+  const { hub } = mockHub({});
+  assert.throws(() => createHoldMcp(deps(hub, { owedVersionMode: 'conditional-v1' })), /private get_order-only/);
+});
 
 test('ordinary input holder verifies the canonical child but keeps every submit bound to the requested root', async () => {
   const f = optionalInputHolder({ canonicalChild: true });

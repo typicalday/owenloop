@@ -40,6 +40,8 @@ export type TrustedInputAdmission = {
   order: OrderPacket;
   step: ResolvedHostedStep;
   packetDigest: string;
+  /** Same claim/input binding with only owed target versions excluded. */
+  stablePacketDigest?: string;
   witnessDigest: string;
   observedAt: number;
   expiresAt: number;
@@ -141,7 +143,9 @@ export function createTrustedInputV2Admission(args: {
     }
     canonicalWorkflow ??= direct.workflow;
     return { ok: true, order: privateOrder, step,
-      packetDigest: valueDigestHex(dynamic(direct)), witnessDigest: bound.witnessDigest,
+      packetDigest: valueDigestHex(dynamic(direct)),
+      stablePacketDigest: valueDigestHex({ ...dynamic(direct), owes: direct.owes.map(owed => ({ path: owed.path })) }),
+      witnessDigest: bound.witnessDigest,
       observedAt: started, expiresAt: started + MAX_OBSERVATION_MS,
       inputs: response.inputs };
   } };

@@ -15,6 +15,7 @@ import { createBundleIngestor, createStoreInstructionSource } from '../../../src
 import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import type { GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
 import { createDefaultHostedOrderAdapter, createHostedOrderAdapter, hostedReferencePacketDigest } from '../src/hosted/order-adapter.ts';
+import { parseTrustedReferenceV2 } from '../src/hosted/trusted-reference-v2.ts';
 
 const CALLS_CHILD = `name: hosted-child
 inputs:
@@ -154,6 +155,7 @@ async function harness(overrides: {
   getToken?: () => Promise<string>;
   transport?: typeof fetch;
   publicationWait?: () => Promise<void>;
+  referenceV2?: (p: OrderPacket) => unknown;
 } = {}) {
   const f = await fixture(overrides.workflowYaml);
   const p = await packet(f.defDigest, f.keyPath, f.rootKeyId);
@@ -174,6 +176,8 @@ async function harness(overrides: {
     return new Response(JSON.stringify(response), { status: overrides.status ?? 200, headers: { 'content-type': 'application/json' } });
   };
   const adapter = createHostedOrderAdapter({
+    ...(overrides.referenceV2 ? { referenceV2: { read: async () => parseTrustedReferenceV2(overrides.referenceV2!(p),
+      { workflow: 'wf-hosted', run: 'run-hosted' }) } } : {}),
     hub: { origin: 'https://trusted.example', getToken: overrides.getToken ?? (async () => 'local-secret'),
       fetchImpl: overrides.transport ?? fetchImpl },
     expected: overrides.expected ?? { workflowId: 'wf-hosted', runId: 'run-hosted' },
@@ -293,6 +297,63 @@ function serviceWire(raw: GetOrderResponse | null): unknown {
 function availableWire(order: OrderPacket): Record<string, unknown> {
   return serviceWire({ text: '', workflow: order.workflow, run: order.run, order, lease: { claimed: true } }) as Record<string, unknown>;
 }
+
+/** Explicit local Service-v2 fixture; not hosted/native authority evidence. */
+function v2Wire(p: OrderPacket, declared: string[]): Record<string, unknown> {
+  const order = structuredClone(p);
+  const proofs = JSON.parse(order.consumesProof ?? '{}') as Record<string, string>;
+  order.consumesProof = JSON.stringify(Object.fromEntries(Object.entries(proofs).filter(([path]) => !declared.includes(path))));
+  return { protocol: 'trusted-reference-read-v2', state: 'available', workflow: order.workflow, run: order.run,
+    order: { ...order, owes: order.owes.map(({ path, version }) => ({ path, version })) },
+    inputs: order.inputs.map(path => ({ path, version: order.consumedFingerprint![path],
+      present: Object.hasOwn(order.consumes, path), ...(Object.hasOwn(order.consumes, path) ? { value: order.consumes[path] } : {}) })),
+    lease: { claimed: true } };
+}
+
+test('explicit v2 adapter admits witnessed optional absence and labels declared values without producer authority', async () => {
+  let mutate: (wire: Record<string, unknown>) => unknown = wire => wire;
+  const h = await harness({ workflowYaml: WORKFLOW.replace('steps:', '  - name: optional\n    seedOwed: false\nsteps:')
+    .replace('consumes: [seed]', 'consumes: [seed, optional]'),
+    referenceV2: p => mutate(v2Wire(p, ['seed', 'optional'])) });
+  h.p.inputs.push('optional');h.p.consumedFingerprint!.optional = 1;
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') {
+    assert.equal(result.serviceObservation.referenceProtocol, 'trusted-reference-read-v2');
+    assert.deepEqual(result.inputWitnesses, [
+      { path: 'seed', version: 2, present: true, trust: 'trusted-service-claim-version' },
+      { path: 'optional', version: 1, present: false, trust: 'trusted-service-claim-version' },
+    ]);
+    assert.deepEqual(result.consumes, [{ path: 'seed', value: VALUE, trust: 'trusted-service-claim-version' }]);
+  }
+  for (const bad of [
+    (wire: Record<string, unknown>) => { wire.inputs = []; },
+    (wire: Record<string, unknown>) => { (wire.inputs as Array<{ version: number }>)[1]!.version++; },
+    (wire: Record<string, unknown>) => { (wire.inputs as Array<{ present: boolean }>)[1]!.present = true; },
+  ]) {
+    mutate = wire => { bad(wire);return wire; };
+    assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  }
+  mutate = () => ({ protocol: 'trusted-reference-read-v2', state: 'unavailable', workflow: 'wf-hosted', run: 'run-hosted' });
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  assert.equal(h.fetches(), 0, 'a selected v2 reader never downgrades to the v1 fetch transport');
+});
+
+test('v2 adapter retains hard signed producer verification for collection member inputs', async () => {
+  const h = await harness({ workflowYaml: MAP_WORKFLOW.replace('name: hosted-map', 'name: hosted-adapter'), referenceV2: p => v2Wire(p, []) });
+  Object.assign(h.p, { step: 'annotate', key: 'items[0]', index: 0, inputs: ['items[0]'], outputs: ['items[0].note'],
+    consumes: { 'items[0]': VALUE }, consumedFingerprint: { 'items[0]': 2 },
+    consumesProof: JSON.stringify({ 'items[0]': await proof(VALUE, h.f.keyPath, h.f.rootKeyId, 'items[0]', 2) }),
+    owes: [{ path: 'items[0].note', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] });
+  const result = await h.adapter.open(preflight(h.f.defDigest));
+  assert.equal(result.state, 'ready', JSON.stringify(result));
+  if (result.state === 'ready') assert.equal(result.consumes[0]!.trust, 'signed-value-and-local-chain-at-service-observed-version');
+  h.p.consumes['items[0]'] = { tampered: true };
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  h.p.consumes['items[0]'] = VALUE;delete h.p.consumesProof;
+  assert.equal((await h.adapter.open(preflight(h.f.defDigest))).state, 'refused');
+  assert.equal(h.fetches(), 0);
+});
 
 test('valid signed consume crosses direct authenticated fetch into a minimized labeled projection', async () => {
   const h = await harness({ received: (body, init) => {

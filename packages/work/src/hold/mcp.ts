@@ -82,6 +82,8 @@ export interface HoldMcpDeps {
     { ok: true; requiresInputWitness?: true } | { ok: false; reason: string }>;
   /** Independent Service v2 admission for held input paths, including present ones. */
   trustedInputV2?: { observe(order: OrderPacket): Promise<TrustedInputAdmission> };
+  /** Only for a private get_order-only mount wrapped by conditional-v1 submit. */
+  owedVersionMode?: 'conditional-v1';
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -100,6 +102,9 @@ export interface HoldMcpMount {
   loop: HoldLoop;
   /** Process-local gated response; never registered as an MCP tool or sent to the model. */
   readGatedOrder: () => GetOrderResponse | undefined;
+  /** Process-local snapshot for one successful tool result. Concurrent reads
+   * may clear the shared cache while each result still has its own valid gate. */
+  readGatedResult?: (result: ToolResult) => GetOrderResponse | undefined;
 }
 
 function errMsg(e: unknown): string {
@@ -184,6 +189,9 @@ function orderView(res: GetOrderResponse, inputWitnesses?: Array<{ path: string;
  * starts `loop.run()`, and pumps stdin — stopping the loop on stdin EOF.
  */
 export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
+  if (deps.owedVersionMode && (deps.tools?.length !== 1 || deps.tools[0] !== 'get_order')) {
+    throw new Error('conditional owed-version refresh requires a private get_order-only mount');
+  }
   const { hub, workflow, run } = deps;
   const holderReq = deps.holder !== undefined ? { holder: deps.holder } : {};
 
@@ -199,6 +207,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // A newer failed observation invalidates requests already awaiting an older
   // witness. Their late completion cannot restore model data or write authority.
   let refusalRevision = 0;
+  const gatedResults = new WeakMap<ToolResult, { response: GetOrderResponse; revision: number }>();
   let canonicalWorkflow: string | undefined;
   let firstContactIdentityRefusal: ToolResult | undefined;
   let stopping = false;
@@ -343,11 +352,13 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       const superseded = supersededGuard(requestRevision);
       if (superseded !== undefined) return superseded;
       if (!observed.ok) return textResult({ error: `trusted input v2 refusal: ${observed.reason}` }, true);
-      if (v2Pin && (v2Pin.packetDigest !== observed.packetDigest || v2Pin.witnessDigest !== observed.witnessDigest)) {
+      const packetDigest = deps.owedVersionMode ? observed.stablePacketDigest : observed.packetDigest;
+      if (packetDigest === undefined) return textResult({ error: 'trusted input v2 refusal: stable claim binding unavailable' }, true);
+      if (v2Pin && (v2Pin.packetDigest !== packetDigest || v2Pin.witnessDigest !== observed.witnessDigest)) {
 	captured = undefined;
 	return textResult({ error: 'trusted input v2 refusal: claim input observation changed' }, true);
       }
-      v2Pin ??= { packetDigest: observed.packetDigest, witnessDigest: observed.witnessDigest };
+      v2Pin ??= { packetDigest, witnessDigest: observed.witnessDigest };
       inputWitnesses = observed.inputs.map(({ path, version, present }) => ({ path, version, present }));
       return undefined;
     }
@@ -371,6 +382,12 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     }
   }
 
+  function gatedView(res: GetOrderResponse, revision: number, witnesses?: Array<{ path: string; version: number; present: boolean }>): ToolResult {
+    const result = textResult(orderView(res, witnesses));
+    gatedResults.set(result, { response: res, revision });
+    return result;
+  }
+
   const getOrderTool: ToolRegistration = {
     name: 'get_order',
     description:
@@ -388,7 +405,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	  if (afterGate !== undefined) return afterGate;
 	  if (refused !== undefined) return refused;
 	  captured = res;
-	  return textResult(orderView(res, inputWitnesses));
+	  return gatedView(res, requestRevision, inputWitnesses);
 	} catch { invalidateObservation(requestRevision); return textResult({ error: 'held get_order unavailable' }, true); }
       }
       if (captured !== undefined) {
@@ -396,7 +413,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 	const afterGate = terminalGuard(refused === undefined ? requestRevision : undefined, ctx);
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
-        return textResult(orderView(captured));
+	return gatedView(captured, requestRevision);
       }
       if (firstContact !== undefined) {
 	const refused = await gate(firstContact, requestRevision);
@@ -404,7 +421,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = firstContact;
-        return textResult(orderView(firstContact));
+	return gatedView(firstContact, requestRevision);
       }
       try {
         const res = await hub.getOrder({ workflow, run, ...holderReq });
@@ -413,7 +430,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         if (afterGate !== undefined) return afterGate;
         if (refused !== undefined) return refused;
         captured = res;
-        return textResult(orderView(res));
+	return gatedView(res, requestRevision);
       } catch (e) {
 	invalidateObservation(requestRevision);
         return textResult({ error: errMsg(e) }, true);
@@ -739,5 +756,9 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   return {
     tools: selected.map((name) => registrations[name]), loop,
     readGatedOrder: () => terminal === undefined && !stopping ? captured : undefined,
+    readGatedResult: result => {
+      const gated = gatedResults.get(result);
+      return terminal === undefined && !stopping && gated?.revision === refusalRevision ? gated.response : undefined;
+    },
   };
 }

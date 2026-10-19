@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { createVerifiedHostedHoldMcp } from '../src/hosted/verified-hold-mcp.ts';
-import { createHostedOrderAdapter, hostedPacketDigest, hostedReferencePacketDigest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
+import { createHostedOrderAdapter, hostedPacketDigest, hostedReferencePacketDigest, hostedReferenceV2Digest, type HostedOrderResult } from '../src/hosted/order-adapter.ts';
+import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { HubError, type ConditionalSubmitRequest, type ConditionalSubmitResponse, type OrderPacket } from '../src/hub/types.ts';
 import { textResult, type ToolCallContext, type ToolRegistration } from '../src/mcp/server.ts';
 import { createHoldMcp, type HoldMcpMount } from '../src/hold/mcp.ts';
@@ -45,11 +46,22 @@ function fixture(enableSubmit = false, settings: {
   sign?: () => Promise<string | undefined>;
   onConditionalSubmit?: (req: ConditionalSubmitRequest) => Promise<void> | void;
   context?: ToolCallContext;
+  v2?: boolean;
+  declaredInputPaths?: string[];
 } = {}) {
   const calls: string[] = [];
   const submits: ConditionalSubmitRequest[] = [];
   const stops: Array<{ reason: string | undefined; release?: boolean }> = [];
-  let observation: HostedOrderResult = ready();
+  let witnessDigest = valueDigestHex({ localFixtureWitness: 1 });
+  function projection(packet: OrderPacket): HostedOrderResult {
+    const result = ready(packet);
+    if (settings.v2 && result.state === 'ready') Object.assign(result.serviceObservation, {
+      referenceProtocol: 'trusted-reference-read-v2', inputWitnessDigest: witnessDigest,
+      packetDigest: hostedReferenceV2Digest(packet, settings.declaredInputPaths ?? []),
+    });
+    return result;
+  }
+  let observation: HostedOrderResult = projection(rawOrder);
   let holding = true;
   let rawGets = 0;
   const heldOrder: OrderPacket = structuredClone(rawOrder);
@@ -86,13 +98,15 @@ function fixture(enableSubmit = false, settings: {
       : undefined,
   };
   const wrapped = createVerifiedHostedHoldMcp(mount, {
+    ...(settings.v2 ? { referenceProtocol: 'trusted-reference-read-v2' as const } : {}),
     open: async (ref, _index, onVerified) => {
       calls.push('verify');
       assert.deepEqual(ref, {
 	protocol: 'client-preflight-v1', verification: 'not-performed',
 	order: { state: 'available', workflow: 'wf', run: 'run', defDigest: rawOrder.defDigest },
       });
-      if (observation.state === 'ready') onVerified?.({ order: verifiedPacket, collectionOutputs });
+      if (observation.state === 'ready') onVerified?.({ order: verifiedPacket, collectionOutputs,
+	...(settings.v2 ? { declaredInputPaths: settings.declaredInputPaths ?? [] } : {}) });
       return settings.open === undefined ? observation : settings.open();
     },
     submitConditional: async (req) => {
@@ -120,7 +134,8 @@ function fixture(enableSubmit = false, settings: {
   return {
     wrapped, call, submit, calls, submits, stops,
     setObservation: (next: HostedOrderResult) => { observation = next; },
-    setPacket: (next: OrderPacket) => { verifiedPacket = next; observation = ready(next); },
+    setPacket: (next: OrderPacket) => { verifiedPacket = next; observation = projection(next); },
+    setWitnessDigest: (next: string) => { witnessDigest = next; observation = projection(verifiedPacket); },
     setCollectionOutputs: (next: string[]) => { collectionOutputs = next; },
     setProof: (next: string | undefined) => { proof = next; },
     setTime: (next: number) => { currentTime = next; },
@@ -164,6 +179,59 @@ test('real hold keeps authored fields private and fences a changed gated full or
   const changed = await wrapped.tools[0]!.handler({}, context);
   assert.equal(changed.isError, true);
   assert.match(changed.content[0]!.text, /holder-order-changed/);
+});
+
+test('v2 verified holder binds declared absence without promoting advisory input proof and refuses downgrade', async () => {
+  const f = fixture(true, { v2: true, declaredInputPaths: ['optional'] });
+  const packet = { ...structuredClone(rawOrder), inputs: ['optional'], consumedFingerprint: { optional: 1 } };
+  f.mutateHeldOrder(order => Object.assign(order, packet, { consumesProof: JSON.stringify({ optional: 'HUMAN ADVISORY' }) }));
+  f.setPacket(packet);
+  assert.equal((await f.call()).isError, undefined);
+  f.setObservation(ready(packet));
+  const downgraded = await f.submit({ path: 'out', value: { n: 1 } });
+  assert.equal(downgraded.isError, true);
+  assert.match(downgraded.content[0]!.text, /reference-v2-required/);
+  assert.equal(f.submits.length, 0);
+});
+
+test('v2 verified submit independently rechecks the input witness after signing', async () => {
+  for (const move of [false, true]) {
+    const f = fixture(true, { v2: true, declaredInputPaths: ['optional'], sign: async () => {
+      if (move) f.setWitnessDigest(valueDigestHex({ localFixtureWitness: 2 }));
+      return 'SIGNED PROOF';
+    } });
+    const packet = { ...structuredClone(rawOrder), inputs: ['optional'], consumedFingerprint: { optional: 1 } };
+    f.mutateHeldOrder(order => Object.assign(order, packet));f.setPacket(packet);
+    const result = await f.submit({ path: 'out', value: { n: 1 } });
+    assert.equal(result.isError === true, move);
+    assert.equal(f.calls.filter(call => call === 'verify').length, 2, 'independent read runs before and after signing');
+    assert.equal(f.submits.length, move ? 0 : 1);
+    if (move) assert.match(result.content[0]!.text, /holder-order-changed/);
+  }
+});
+
+test('v2 conditional partial submission refreshes owed versions without reopening claim inputs', async () => {
+  const f = fixture(true, { v2: true, declaredInputPaths: ['optional'] });
+  const packet = { ...structuredClone(rawOrder), inputs: ['optional'], consumedFingerprint: { optional: 1 } };
+  f.mutateHeldOrder(order => Object.assign(order, packet));f.setPacket(packet);
+  f.setSubmitResponse({ text: '', outcome: 'green', closed: false, conditionApplied: 'expected-version-v1' });
+  assert.equal((await f.submit({ path: 'out', value: { n: 1 } })).isError, undefined);
+  const next = { ...packet, owes: [{ ...packet.owes[0]!, version: 2 }] };
+  f.mutateHeldOrder(order => Object.assign(order, next));f.setPacket(next);
+  assert.equal((await f.call()).isError, undefined);
+  assert.equal((await f.submit({ path: 'out', value: { n: 1 } })).isError, undefined);
+  assert.deepEqual(f.submits.map(req => req.expectedVersion), [1, 2]);
+});
+
+test('v2 private and direct bindings compare producer-proof maps independent of entry order', async () => {
+  const f = fixture(false, { v2: true });
+  const packet = { ...structuredClone(rawOrder), inputs: ['a', 'b'], consumes: { a: 1, b: 2 },
+    consumedFingerprint: { a: 1, b: 1 }, consumesProof: JSON.stringify({ a: 'PROOF_A', b: 'PROOF_B' }) };
+  f.mutateHeldOrder(order => Object.assign(order, packet));
+  f.setPacket({ ...packet, consumesProof: JSON.stringify({ b: 'PROOF_B', a: 'PROOF_A' }) });
+  assert.equal((await f.call()).isError, undefined, 'proof-map JSON ordering carries no new authority');
+  f.setPacket({ ...packet, consumesProof: JSON.stringify({ b: 'PROOF_A', a: 'PROOF_B' }) });
+  assert.equal((await f.call()).isError, true, 'proof values must still bind to the exact producer paths');
 });
 
 test('real reduced hold cannot fall back when Service lacks the versioned reference acknowledgement', async () => {

@@ -1,4 +1,45 @@
-# Local hosted order view and Service v1 reference
+# Local hosted order view and versioned Service references
+
+## Held CLI input migration
+
+`work hold --mcp --verified-hosted` explicitly selects the existing independent
+Service v2 reader. It admits declared required inputs and explicit optional
+absence using claim-version witnesses, the verified local declaration, and the
+same hard signed producer-chain verifier used by the ordinary holder. Declared
+values are labeled `trusted-service-claim-version`; producer artifacts retain
+their signed-value label. `inputWitnesses` reports declared input versions and
+presence without inventing a value for an absent input. A human `provideProof`
+attached to a declared input remains advisory and is not producer authority.
+
+The v2 reader is locally configured and uses its own HTTPS transport. MCP text
+and a replaceable HubClient fetch cannot choose its origin, bearer, or response.
+The wrapper binds claim fields and the complete input/workdir witness digest,
+keeps its full private hold checks, and re-reads the independent witness after
+asynchronous proof signing before conditional submission. Witness movement,
+loss, unsupported feedback/routing, or a v1 response refuses exposure and
+pending writes. There is no v1 fallback after v2 selection. The outer real read
+deadline and wall/monotonic freshness checks still apply.
+
+Partial conditional submissions may advance only owed target versions. A
+private `get_order`-only mount can refresh those versions; ordinary mutation
+tools cannot select that mode. The wrapper keeps every other private field and
+the input/workdir witness digest pinned, and checks the exact refreshed output
+version again after signing. Each successful private read has a process-local
+result gate, so overlapping reads do not depend on a temporarily empty shared
+cache. A newer refusal or stopped hold invalidates those gates.
+
+For API compatibility, `createDefaultHostedOrderAdapter` retains its existing
+v1 contract unless the local caller explicitly supplies `referenceV2: true`;
+the held CLI supplies that option. `createHostedOrderAdapter` accepts a locally
+constructed v2 reader at its low-level integration seam. The constructor's
+choice is fixed before reading untrusted preflight content. The existing
+`local-hosted-order-v1` projection gains the explicit v2 reference marker and
+declared-input witness labels; no new Service protocol or signer is introduced.
+
+Root-bound v2 optional-input source tests do not establish hosted canonical,
+canonical-child, native, signed-feedback authority, or full migration acceptance.
+
+## Legacy v1 adapter contract
 
 `createDefaultHostedOrderAdapter` is an opt-in local order-view component. It
 treats a `client-preflight-v1` MCP reference as a navigation hint only. The
@@ -50,10 +91,10 @@ caller indefinitely. A late credential cannot start a bearer request, and a
 late transport or verifier cannot publish a verified packet. This does not
 forcibly terminate a credential reader or verifier that ignores cancellation.
 
-`work hold --mcp --verified-hosted` is read-only by default. Its native
+The held CLI is read-only by default. Its native
 `get_order` shows a reduced dynamic model view. The full previously gated
 packet stays inside the process through `readGatedOrder()` and is never an MCP
-registration. The verified wrapper compares the first Service v1 dynamic
+registration. In the legacy adapter contract, the wrapper compares the first Service v1 dynamic
 digest with that private hold, checks stable dynamic fields on later reads,
 and hashes the *whole* local packet before and after verification and signing.
 Only owed target versions may advance under the held claim. Hidden authored
@@ -94,7 +135,7 @@ when the acknowledgment is otherwise refused. The model receives bounded
 status only; raw packets, proof bytes, lease and Service response text remain
 private.
 
-This local source boundary still requires an admitted Service v1 counterpart,
+This local source boundary still requires an admitted matching Service counterpart,
 bearer-authenticated remote proof, signature and enrollment checks at submit
 or downstream consumption, native Jev Linux proof, formal pstack maker/checker,
 and staging and deployment gates before live use.

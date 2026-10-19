@@ -276,9 +276,10 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
-  const supplied = mode === 'supplied';
+  const verified = mode.startsWith('verified-');
+  const supplied = mode === 'supplied' || mode === 'verified-supplied';
   const workdirInput = mode === 'workdir';
   const feedback = mode === 'feedback';
   const routing = mode === 'routing';
@@ -325,6 +326,7 @@ steps:
     let witnessAvailable = true;
     let witnessWorkflow = canonicalWorkflow;
     let witnessReads = 0;
+    let pauseNextWitness = false;
     let firstWitnessEntered!: () => void;
     let releaseFirstWitness!: () => void;
     const firstWitnessPaused = new Promise<void>(resolve => { firstWitnessEntered = resolve; });
@@ -344,7 +346,8 @@ steps:
 	  return;
 	}
 	const availableAtRead = witnessAvailable;
-	if ((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) {
+	if (((mode === 'overlap' || mode === 'cancelled') && ++witnessReads === 1) || pauseNextWitness) {
+	  pauseNextWitness = false;
 	  firstWitnessEntered();
 	  await firstWitnessResume;
 	}
@@ -366,7 +369,7 @@ steps:
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', `https://localhost:${address.port}`,
-      '--heartbeat-interval', '25', '--mcp'], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
+      '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : [])], { ...childEnv(), ...installed.env, NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
     if (mode === 'cancelled') {
       const requestId = mcp.fireRequest('tools/call', { name: 'ask',
@@ -399,6 +402,36 @@ steps:
       return;
     }
     const viewed = await callTool(mcp, 'get_order');
+    if (verified) {
+      assert.equal(viewed.isError, false, JSON.stringify(viewed.body));
+      assert.equal(viewed.body.state, 'ready');
+      assert.equal(viewed.body.serviceObservation.referenceProtocol, 'trusted-reference-read-v2');
+      assert.deepEqual(viewed.body.inputWitnesses, [
+	{ path: 'proposal', version: 1, present: true, trust: 'trusted-service-claim-version' },
+	{ path: 'optional', version: 1, present: supplied, trust: 'trusted-service-claim-version' },
+      ]);
+      assert.deepEqual(viewed.body.consumes.map((input: { path: string; value: unknown }) => [input.path, input.value]),
+	Object.entries(packet.consumes));
+      assert.equal(seen.includes('/api/reference_order/v1'), false, 'v2 must not downgrade to v1');
+      if (mode === 'verified-overlap') {
+	pauseNextWitness = true;
+	const older = callTool(mcp, 'get_order');
+	await firstWitnessPaused;
+	const newer = await callTool(mcp, 'get_order');
+	releaseFirstWitness();
+	const late = await older;
+	assert.equal(newer.isError, false, JSON.stringify(newer.body));
+	assert.equal(late.isError, false, JSON.stringify(late.body));
+      }
+      witnessAvailable = false;
+      const refused = await callTool(mcp, 'get_order');
+      assert.equal(refused.isError, true);
+      assert.doesNotMatch(JSON.stringify(refused.body), /a local test proposal|supplied required input/);
+      assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      return;
+    }
     if (emptyInputs) {
       assert.equal(viewed.isError, true, 'normal zero-input holder must refuse unsupported dynamic state');
       assert.match(viewed.body.error, routing ? /service-routing-unsupported/ : /service-unsupported-feedback/);

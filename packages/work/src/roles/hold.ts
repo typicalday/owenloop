@@ -288,6 +288,7 @@ export interface RunDeps {
   env?: Record<string, string | undefined>;
   /** Injected verifier for role wiring tests; production uses the local store. */
   hostedAdapter?: {
+    readonly referenceProtocol?: 'trusted-reference-read-v2';
     open(preflight: unknown): Promise<HostedOrderResult>;
     submitConditional?: ReturnType<typeof createDefaultHostedOrderAdapter>['submitConditional'];
   };
@@ -463,7 +464,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       origin,
       env,
       consumedVerifier,
-      ...(parsed.verifiedHosted ? {} : { trustedInputV2 }),
+      ...(parsed.verifiedHosted ? { owedVersionMode: 'conditional-v1' as const } : {}),
+      ...(!parsed.verifiedHosted || deps.hostedAdapter === undefined
+	|| deps.hostedAdapter.referenceProtocol === 'trusted-reference-read-v2' ? { trustedInputV2 } : {}),
       modelOrderVerifier,
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
@@ -478,6 +481,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       try {
 	adapter = deps.hostedAdapter ?? createDefaultHostedOrderAdapter({
 	  hub: { origin, getToken: async () => token },
+	  referenceV2: true,
 	  expected: { workflowId: target.workflow, runId: target.run },
 	  cwd: process.cwd(), env, now: () => Date.now(),
 	});
