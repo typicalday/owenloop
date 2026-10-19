@@ -2413,13 +2413,14 @@ export function eligibleOutcomes(
   return outcomes;
 }
 
-/** Concrete green inputs this consumer can reject under Engine.assertAuthority. */
+/** Concrete built inputs this consumer can reject under Engine.assertAuthority. */
 function rejectableFiringInputs(def: WorkflowDef, arts: ArtifactMap, firing: Firing): string[] {
   const step = def.steps.find((candidate) => candidate.name === firing.step);
   if (!step || step.judges !== undefined) return [];
   return [...new Set(firing.inputs)].filter((path) => {
     const art = arts.get(path);
-    if (!art || art.producer === 'human' || art.acceptance !== 'green') return false;
+    if (!art || art.producer === 'human'
+      || (art.acceptance !== 'green' && art.acceptance !== 'submitted')) return false;
     const stem = parseElement(path)?.stem ?? sealStem(path) ?? path;
     return step.consumes.some((consume) => consume.stem === stem || consume.stem === path);
   });
@@ -2850,6 +2851,20 @@ export function collectionLeaseSuccessors(
     }
   }
 
+  // Ordinary consumer rejection follows the consume edge, not the run's
+  // submission CAS. It remains legal after sealing or an input version move,
+  // including for collection-only producers. Enumerate each target once,
+  // independently of the number of singleton outputs on this run.
+  const consumer: Firing = {
+    step: lease.step, key: lease.key, inputs: lease.inputs, outputs: sealPaths,
+  };
+  for (const rejectPath of rejectableFiringInputs(def, state.arts, consumer)) {
+    for (const arts of applyOutcome(def, state.arts, consumer, 'judgment-reject',
+      { maxCollectionSize, modifier: state.modifier ?? modifier, rejectPath })) {
+      move('judgment-reject', arts, state.leases, undefined, rejectPath);
+    }
+  }
+
   const stale = lease.inputs.some((path) =>
     !isGreen(state.arts.get(path)) || state.arts.get(path)?.version !== lease.fingerprint[path]);
   if (stale) {
@@ -2891,23 +2906,20 @@ export function collectionLeaseSuccessors(
     };
     for (const outcome of eligibleOutcomes(def, state.arts, firing, { modifier: state.modifier ?? modifier })) {
       if (outcome === 'skip') continue; // Already modeled for both fresh and stale leases.
+      if (outcome === 'judgment-reject') continue; // One transition per consumed target above.
       if (outcome === 'green' && !witnesses?.green) continue;
       if (outcome === 'schema-reject' && !witnesses?.refusal) continue;
       const selected = outcome === 'green' ? witnesses!.acceptedModifiers : [undefined];
-      const rejectPaths = outcome === 'judgment-reject'
-	? rejectableFiringInputs(def, state.arts, firing) : [undefined];
-      for (const rejectPath of rejectPaths) {
-	for (const selectedModifier of selected) {
-	  for (const arts of applyOutcome(def, state.arts, firing, outcome,
-	    { maxCollectionSize, modifier: state.modifier ?? modifier, rejectPath })) {
-	    const submitted = arts.get(path)?.acceptance === 'submitted';
-	    const pending = clonePendingModifiers(state.pendingModifiers);
-	    if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
-	    else if (outcome === 'green') delete pending[path];
-	    move(outcome, arts, state.leases, undefined, rejectPath ?? path,
-	      outcome === 'green' && selectedModifier !== undefined && !submitted
-		? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
-	  }
+      for (const selectedModifier of selected) {
+	for (const arts of applyOutcome(def, state.arts, firing, outcome,
+	  { maxCollectionSize, modifier: state.modifier ?? modifier })) {
+	  const submitted = arts.get(path)?.acceptance === 'submitted';
+	  const pending = clonePendingModifiers(state.pendingModifiers);
+	  if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
+	  else if (outcome === 'green') delete pending[path];
+	  move(outcome, arts, state.leases, undefined, path,
+	    outcome === 'green' && selectedModifier !== undefined && !submitted
+	      ? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
 	}
       }
     }
@@ -3023,6 +3035,7 @@ export function applyOutcome(
           ...targetArt,
           acceptance: 'rejected',
           judgmentRejects: targetArt.judgmentRejects + 1,
+	  approvals: undefined,
         });
       }
     }
