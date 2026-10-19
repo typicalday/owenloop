@@ -9,7 +9,7 @@
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:https';
 import { PrincipalKeyManager } from '../../../src/crypto/keys.ts';
@@ -277,7 +277,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -394,17 +394,73 @@ steps:
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
     const origin = `https://localhost:${address.port}`;
-    const submitting = mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof';
+    const submitting = delayedSigning || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const signingStarted = join(configDir, 'signing-started');
+    const signingFinished = join(configDir, 'signing-finished');
+    let signingEnv: Record<string, string> = {};
     if (submitting) {
       // Local TEST identity only; no hosted grant or authority is fabricated.
       await new PrincipalKeyManager({ env: { HOME: configDir, OWENLOOP_NO_KEYCHAIN: '1' } })
 	.ensure({ origin, kind: 'machine', id: 'local-test-machine' });
     }
+    if (delayedSigning) {
+      const realSsh = execFileSync('which', ['ssh-keygen'], { encoding: 'utf8' }).trim();
+      const shimDir = join(configDir, 'signing-bin');
+      mkdirSync(shimDir);
+      const shim = join(shimDir, 'ssh-keygen');
+      // Delay only the real sign invocation, below its existing10sec timeout.
+      // Key generation, public derivation, verification and the signature itself
+      // still use the installed stock binary and the normal local TEST key.
+      writeFileSync(shim, `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const sign = args[0] === '-Y' && args[1] === 'sign';
+function run() {
+  const result = spawnSync(${JSON.stringify(realSsh)}, args, { stdio: 'inherit' });
+  if (sign) writeFileSync(${JSON.stringify(signingFinished)}, 'finished');
+  process.exit(result.status ?? 1);
+}
+if (sign) {
+  writeFileSync(${JSON.stringify(signingStarted)}, JSON.stringify({ pid: process.pid, keyPath: args[args.indexOf('-f') + 1] }));
+  setTimeout(run, 4000);
+} else run();
+`);
+      chmodSync(shim, 0o700);
+      signingEnv = { PATH: `${shimDir}:${process.env.PATH ?? ''}` };
+    }
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', origin,
       '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : []),
       ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
-    { ...childEnv(), ...installed.env, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert });
+    { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
+    if (delayedSigning) {
+      const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
+      await until(() => existsSync(signingStarted), 'normal CLI reached real machine-key signing');
+      const signingProcess = JSON.parse(readFileSync(signingStarted, 'utf8')) as { pid: number; keyPath: string };
+      if (mode === 'verified-signing-cancelled') mcp.notify('notifications/cancelled', { requestId: id });
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const exited = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(exited, 0, 'cancel/EOF must exit without awaiting the finite signing operation');
+	assert.equal(existsSync(signingFinished), false, 'shutdown precedes the real delayed signer completion');
+	assert.equal(existsSync(signingProcess.keyPath), false, 'normal key materialization cleanup finishes before CLI exit');
+	const replies = mcp.frames.filter(frame => frame.id === id);
+	assert.equal(replies.length, mode === 'verified-signing-cancelled' ? 0 : 1);
+	if (mode === 'verified-signing-eof') assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(seen.includes('/api/submit/conditional-v1'), false);
+      } finally {
+	clearTimeout(timer);
+	await until(() => {
+	  try { process.kill(signingProcess.pid, 0); return false; } catch { return true; }
+	}, 'own finite SSH fixture stopped', 6_000);
+      }
+      return;
+    }
     if (submitting) {
       const pending = callTool(mcp, 'submit', { path: 'plan', value: { n: 1 } });
       if (mode === 'verified-submit-healthy') {

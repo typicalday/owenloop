@@ -43,7 +43,7 @@ function reducedOrder(order: OrderPacket) {
 function fixture(enableSubmit = false, settings: {
   open?: () => Promise<HostedOrderResult>;
   onRawGet?: (count: number, order: OrderPacket) => Promise<void>;
-  sign?: () => Promise<string | undefined>;
+  sign?: (signal?: AbortSignal) => Promise<string | undefined>;
   onConditionalSubmit?: (req: ConditionalSubmitRequest) => Promise<void> | void;
   context?: ToolCallContext;
   v2?: boolean;
@@ -118,13 +118,13 @@ function fixture(enableSubmit = false, settings: {
     },
   }, { workflow: 'wf', run: 'run' }, enableSubmit ? {
     enableSubmit: true,
-    signProof: async (order, path, value, version) => {
+    signProof: async (order, path, value, version, signal) => {
       calls.push('sign');
       assert.equal(order, verifiedPacket);
       assert.equal(path, 'out');
       assert.deepEqual(value, { n: 1 });
       assert.equal(version, verifiedPacket.owes[0]!.version);
-      return settings.sign === undefined ? proof : settings.sign();
+      return settings.sign === undefined ? proof : settings.sign(signal);
     },
     now: () => currentTime,
     monotonicNow: () => monotonicTime,
@@ -422,6 +422,32 @@ test('opt-in verified submit signs the privately verified packet and returns onl
   assert.match(result.content[0]!.text, /local-hosted-submit-v1/);
   assert.doesNotMatch(result.content[0]!.text, /RAW|SIGNED PROOF|defDigest|lease/i);
 });
+
+for (const v2 of [false, true]) {
+  test(`verified signing forwards per-call cancellation without fencing healthy siblings v2=${v2}`, async () => {
+    let cancelled = false;
+    const callbacks: Array<() => void> = [];
+    const ctx: ToolCallContext = { get cancelled() { return cancelled; }, onCancel: cb => { callbacks.push(cb); }, sendProgress: () => {} };
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const f = fixture(true, { v2, context: ctx, sign: signal => {
+      assert.ok(signal);
+      return new Promise((_resolve, reject) => {
+	signal.addEventListener('abort', () => reject(new Error('signer cancelled')), { once: true });
+	started();
+      });
+    } });
+    const pending = f.submit({ path: 'out', value: { n: 1 } });
+    await entered;
+    cancelled = true;
+    for (const callback of callbacks) callback();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /call-cancelled/);
+    assert.deepEqual(f.submits, []);
+    assert.equal((await f.wrapped.tools[0]!.handler({}, context)).isError, undefined);
+  });
+}
 
 test('a stop during proof signing prevents conditional submit', async () => {
   let resolve!: (value: string) => void;

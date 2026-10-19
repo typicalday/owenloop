@@ -489,8 +489,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 	mount = createVerifiedHostedHoldMcp(baseMount, adapter, target, enableSubmit ? {
 	  enableSubmit: true,
 	  holder,
-	  signProof: (order, path, value, version) => buildSubmitProof({
+	  signProof: (order, path, value, version, signal) => buildSubmitProof({
 	    origin, order, path, value, version, now: () => Date.now(), warn: err, env,
+	    ...(signal === undefined ? {} : { signal }),
 	  }),
 	} : {});
       } catch (error) {

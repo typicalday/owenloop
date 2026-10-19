@@ -17,7 +17,7 @@ type Adapter = {
   submitConditional?: (req: ConditionalSubmitRequest) => Promise<ConditionalSubmitResponse>;
 };
 type BoundOrder = { workflow: string; run: string };
-type SignProof = (order: OrderPacket, path: string, value: Record<string, unknown>, version: number) => Promise<string | undefined>;
+type SignProof = (order: OrderPacket, path: string, value: Record<string, unknown>, version: number, signal?: AbortSignal) => Promise<string | undefined>;
 type SubmitOptions = { enableSubmit?: boolean; signProof?: SignProof; holder?: ContactHolder; now?: () => number; monotonicNow?: () => number };
 const RAW_ORDER_FIELDS = new Set([
   'workflow', 'run', 'step', 'key', 'index', 'defDigest', 'inputs', 'outputs',
@@ -408,11 +408,18 @@ export function createVerifiedHostedHoldMcp(
 	if (output === undefined) return refusal('submit-path-not-verified');
 	if (checked.packet.collectionOutputs.includes(path)) return refusal('collection-submit-unsupported');
 	let proof: string | undefined;
+	const signing = new AbortController();
+	let signingActive = true;
+	ctx.onCancel(() => { if (signingActive) signing.abort(); });
 	try {
-	  proof = await options.signProof!(checked.packet.order, path, value as Record<string, unknown>, output.version);
+	  if (ctx.cancelled) return refusal('call-cancelled');
+	  proof = await options.signProof!(checked.packet.order, path, value as Record<string, unknown>, output.version, signing.signal);
 	} catch {
-	  return refusal('submit-proof-unavailable');
+	  return refusal(ctx.cancelled ? 'call-cancelled' : 'submit-proof-unavailable');
+	} finally {
+	  signingActive = false;
 	}
+	if (ctx.cancelled) return refusal('call-cancelled');
 	if (typeof proof !== 'string' || proof.length === 0) return refusal('submit-proof-unavailable');
 	const beforeCurrent = observationGuard(revision, ctx);
 	if (beforeCurrent !== undefined) return beforeCurrent;

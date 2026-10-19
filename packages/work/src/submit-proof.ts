@@ -23,6 +23,7 @@ export interface SubmitProofOptions {
   env?: Record<string, string | undefined>;
   /** Injectable ssh-keygen seam for hermetic callers and tests. */
   sshProcess?: SshProcessAdapter;
+  signal?: AbortSignal;
 }
 
 let warnedUnsigned = false;
@@ -33,6 +34,7 @@ let warnedUnsigned = false;
  * propagate because silently dropping a configured key would hide corruption.
  */
 export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string | undefined> {
+  opts.signal?.throwIfAborted();
   const version = outputVersionForSubmission(opts.order, opts.path, opts.version);
   if (version === undefined) {
     warnUnsigned(
@@ -58,6 +60,7 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
   }
 
   const inspected = await keys.inspect(ref);
+  opts.signal?.throwIfAborted();
   if (!inspected.exists || inspected.publicKey === undefined) {
     warnUnsigned(opts.warn, `machine signing key for ${opts.origin} is unavailable; submitting without a proof`);
     return undefined;
@@ -77,10 +80,12 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
   });
 
   return keys.withSigningKey(ref, async (keyPath) => {
+    opts.signal?.throwIfAborted();
     const signer = createSshSigner({
       namespace: DSSE_SSH_NAMESPACE,
       signKeyPath: keyPath,
       ...(opts.sshProcess !== undefined ? { process: opts.sshProcess } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     });
     return signSubmission(record, signer);
   });
