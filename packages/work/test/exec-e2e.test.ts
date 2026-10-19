@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { createServer as createHttpsServer } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,7 +19,7 @@ import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../src/store/index.ts';
-import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 
 // Plan test 12 — integration-style, end to end through the REAL pieces: the
 // default runner (a real child), the real receipt builder, and the REAL hub
@@ -174,5 +176,61 @@ test('e2e kill drill: signal mid-run → real child killed → release observed,
     assert.equal(rels[0]!.body!['run'], 'run1');
   } finally {
     server.close();
+  }
+});
+
+test('actual exec CLI stop while signed bundle recovery is pending exits without a command launch', async () => {
+  const home = tempDir('owenloop-exec-recovery-stop-');
+  const marker = join(home, 'command-ran');
+  const sourceDir = writeBundleSource({ name: 'stopped-exec', workflow: `name: stopped-exec
+steps:
+  - name: builder
+    produces: [out]
+    terminal: true
+    executor: command
+    command: 'echo unsafe-late-launch > "${marker}"'
+` });
+  const signed = await installSignedBundleFixture({ sourceDir, root: join(home, 'remote-publication'), home });
+  assert.equal(signed.source.kind, 'file');
+  const publication = readFileSync(`${signed.source.path}.dsse`);
+  const key = join(home, 'tls.key');const cert = join(home, 'tls.crt');
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+    '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+  let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+  let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+  const seen: string[] = [];
+  const server = createHttpsServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+    seen.push(req.url!);assert.equal(req.headers.authorization, 'Bearer exec-stop-local-test');
+    for await (const _chunk of req) { /* drain the ordinary request body */ }
+    if (req.url === `/api/bundles/${signed.packed.digest}`) {
+      entered();await blocked;res.writeHead(200, { 'content-type': 'application/octet-stream' });res.end(signed.packed.bytes);
+    } else if (req.url === `/api/publications/${signed.packed.digest}`) {
+      res.writeHead(200, { 'x-owenloop-publication-state': 'signed' });res.end(publication);
+    } else if (req.url?.startsWith('/api/origins/')) { res.writeHead(404);res.end(); }
+    else if (req.url === '/api/get_order') res.end(JSON.stringify(storeCommandOrder(signed.packed.digest, 'ignored remote command')));
+    else res.end(JSON.stringify({ text: '' }));
+  });
+  await new Promise<void>(r => server.listen(0, 'localhost', r));
+  const address = server.address();assert.ok(address && typeof address !== 'string');
+  const child = spawn(process.execPath, [join(import.meta.dirname, '../../../bin/owenloop.mjs'), 'work', 'exec',
+    'wf1/run1', '--origin', `https://localhost:${address.port}`, '--heartbeat-interval', '25'], {
+    cwd: home,env: { ...process.env, ...signed.env, OWENLOOP_TOKEN: 'exec-stop-local-test',
+      OWENLOOP_CONFIG_DIR: '', OWENLOOP_SESSION: '', OWENLOOP_DEF_POLICY: 'enforce', NODE_EXTRA_CA_CERTS: cert },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';child.stderr!.on('data', data => { stderr += String(data); });child.stdout!.resume();
+  const exited = new Promise<number | null>(r => child.once('exit', r));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([pending, exited.then(code => { throw new Error(`CLI exited before recovery: ${code}: ${stderr}`); })]);
+    child.kill('SIGTERM');
+    const outcome = await Promise.race([exited, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 2_000); })]);
+    assert.equal(outcome, 1, `CLI must exit while resolver remains blocked: ${stderr}`);
+    assert.equal(existsSync(marker), false);
+    assert.equal(seen.filter(path => path === '/api/release').length, 1);
+    assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+  } finally {
+    clearTimeout(timer);resume();await exited;
+    await new Promise<void>(r => server.close(() => r()));
   }
 });

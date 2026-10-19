@@ -2334,3 +2334,77 @@ test('exec stop during pending first contact cannot launch late work', async () 
   assert.equal(fr.starts.length, 0);assert.equal(submits.length, 0);
   assert.equal(only(calls, 'heartbeat').length, 0);
 });
+
+for (const stage of ['instruction resolution', 'pre-launch revalidation'] as const) {
+  for (const ending of ['stop', 'lease loss'] as const) {
+    test(`${ending} during pending ${stage} settles and never starts late command work`, async (t) => {
+      const localTemp = mkdtempSync(join(tmpdir(), 'owenloop-launch-stop-'));
+      const names = ['TMPDIR', 'TMP', 'TEMP'] as const;
+      const saved = names.map(name => [name, process.env[name]] as const);
+      for (const name of names) process.env[name] = localTemp;
+      t.after(() => {
+	for (const [name, value] of saved) {
+	  if (value === undefined) delete process.env[name];else process.env[name] = value;
+	}
+	rmSync(localTemp, { recursive: true, force: true });
+      });
+      const fr = fakeRunner();fr.resolve(result(0));
+      let revoked = false;
+      const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()], heartbeat: () => {
+	if (revoked) throw new HubError(403, 'claim revoked');
+      } });
+      let entered!: () => void;
+      const pending = new Promise<void>(r => { entered = r; });
+      let resume!: () => void;
+      const blocked = new Promise<void>(r => { resume = r; });
+      const pause = async () => { entered();await blocked; };
+      const instructions: InstructionResolver = { ...testInstructions(), resolveCommand: async () => {
+	if (stage === 'instruction resolution') await pause();
+	return { ok: true, command: 'echo safe-local-fixture',
+	  ...(stage === 'pre-launch revalidation' ? { revalidate: async () => { await pause();return undefined; } } : {}),
+	};
+      } };
+      const loop = createExecLoop(baseOpts(hub, fr.runner, { instructions }));
+      const running = loop.run();await pending;
+      assert.equal(readdirSync(localTemp).length, stage === 'pre-launch revalidation' ? 1 : 0);
+      if (ending === 'stop') loop.stop('signal');
+      else revoked = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let beforeResume: string;
+      let payloadsAfterLease = -1;
+      try {
+	beforeResume = await Promise.race([running, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 100); })]);
+	payloadsAfterLease = readdirSync(localTemp).length;
+      } finally { clearTimeout(timer);resume();await running; }
+      await macrotaskSleep();
+      assert.deepEqual({ outcomeBeforeResume: beforeResume, started: fr.starts.length, submitted: submits.length, payloadsAfterLease },
+	{ outcomeBeforeResume: ending === 'stop' ? 'killed' : 'ownership-error', started: 0, submitted: 0, payloadsAfterLease: 0 });
+      assert.equal(only(calls, 'release').length, ending === 'stop' ? 1 : 0);
+    });
+  }
+}
+
+for (const stage of ['instruction resolution', 'pre-launch revalidation'] as const) {
+  test(`stop fences ${stage} result while final release is still pending`, async () => {
+    const fr = fakeRunner();fr.resolve(result(0));
+    let release!: () => void;
+    const { hub, submits } = mockHub({ getOrder: [commandOrder()],
+      release: () => new Promise(resolve => { release = () => resolve({ text: '' }); }),
+    });
+    let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+    let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+    const pause = async () => { entered();await blocked; };
+    const instructions: InstructionResolver = { ...testInstructions(), resolveCommand: async () => {
+      if (stage === 'instruction resolution') await pause();
+      return { ok: true, command: 'echo safe-local-fixture',
+	...(stage === 'pre-launch revalidation' ? { revalidate: async () => { await pause();return undefined; } } : {}),
+      };
+    } };
+    const loop = createExecLoop(baseOpts(hub, fr.runner, { instructions, sleep: () => new Promise<void>(() => {}) }));
+    const running = loop.run();await pending;loop.stop('signal');
+    await macrotaskSleep();resume();await macrotaskSleep();
+    try { assert.equal(fr.starts.length, 0);assert.equal(submits.length, 0); }
+    finally { release();await running; }
+    assert.equal(await running, 'killed');
+  });
+}

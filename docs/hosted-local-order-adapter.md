@@ -168,3 +168,10 @@ still uses the bounded final-breath release unless `release:false` was requested
 a stop before first contact is confirmed remains `stopped`. Late probe results
 cannot start another heartbeat. This does not roll back a request already sent
 to the Service or force termination of opaque private client work.
+
+Exec also keeps asynchronous instruction resolution and final pre-launch
+revalidation subordinate to its lease. A stop or observed terminal lease prevents
+command launch and releases prepared payload directories while a late private
+result remains fenced. Stop still waits for the existing bounded final release.
+A private resolver may continue its own background work; this fence does not
+forcibly terminate it or roll back effects it already performed.

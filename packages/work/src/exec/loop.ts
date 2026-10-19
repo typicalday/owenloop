@@ -416,6 +416,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   let running: RunningCommand | undefined;
   let signalled = false;
   let leasePromise: Promise<LeaseOutcome> | undefined;
+  let leaseOutcome: LeaseOutcome | undefined;
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -480,6 +481,27 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (o === 'ownership-error') return 'ownership-error';
     if (o === 'hub-unreachable') return 'hub-unreachable';
     return 'lease-lost';
+  }
+
+  /** Keep asynchronous preparation subordinate to the current lease. Private
+   * resolvers may ignore stop, but their late results cannot launch work. */
+  async function prepareWhileHeld<T>(prepare: () => Promise<T>): Promise<
+    { kind: 'value'; value: T } | { kind: 'lease'; outcome: LeaseOutcome }
+  > {
+    const terminal = async () => ({ kind: 'lease' as const, outcome: await leasePromise! });
+    if (signalled || leaseOutcome !== undefined) return terminal();
+    const prepared = await Promise.race([
+      (async () => prepare())().then(
+	value => ({ kind: 'value' as const, value }),
+	error => ({ kind: 'error' as const, error }),
+      ),
+      leasePromise!.then(outcome => ({ kind: 'lease' as const, outcome })),
+    ]);
+    // Stop can precede the bounded release completing, and a value/error can
+    // win the race in that interval. Neither is permission to start work.
+    if (signalled || leaseOutcome !== undefined) return terminal();
+    if (prepared.kind === 'error') throw prepared.error;
+    return prepared;
   }
 
   /**
@@ -969,7 +991,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   async function run(): Promise<ExecOutcome> {
-    leasePromise = lease.run();
+    leasePromise = lease.run().then(outcome => { leaseOutcome = outcome;return outcome; });
 
     // First contact race: the order arrives (hold established), or the lease
     // resolves terminally before we ever established it.
@@ -1057,7 +1079,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     let resolvedBundleDir: string | undefined;
     let revalidate: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     try {
-      const resolved = await opts.instructions.resolveCommand(order);
+      const preparation = await prepareWhileHeld(() => opts.instructions.resolveCommand(order));
+      if (preparation.kind === 'lease') return mapNoHold(preparation.outcome);
+      const resolved = preparation.value;
       if (!resolved.ok) {
         opts.err(`owenloop work exec: ${resolved.reason}`);
         lease.stop('unresolved-instructions');
@@ -1164,7 +1188,11 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         const startOptions = { cwd, env: childEnv };
         if (revalidate) {
           let reason: string | undefined;
-          try { reason = (await revalidate())?.reason; }
+	  try {
+	    const validation = await prepareWhileHeld(revalidate);
+	    if (validation.kind === 'lease') return mapNoHold(validation.outcome);
+	    reason = validation.value?.reason;
+	  }
           catch (error) { reason = `trusted pre-launch revalidation failed: ${errMsg(error)}`; }
           if (reason !== undefined) {
             opts.err(reason);
@@ -1173,6 +1201,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
             return 'unresolved-instructions';
           }
         }
+	if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
 	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile);
