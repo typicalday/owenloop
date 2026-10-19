@@ -493,6 +493,10 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       // the proof (it stores normalized bytes the signature does not cover),
       // silently, on both sides — see `../submit-value.ts`. One value is used
       // for both the proof and the wire so the two can never diverge.
+      // Cancel pending reads/proof work; an already-sent submit keeps its ACK.
+      const cancellation = new AbortController();
+      let active = true;
+      ctx.onCancel(() => { if (active) cancellation.abort(); });
       try {
 	const rawValue = hasValue
 	  ? args['value']
@@ -504,7 +508,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         // verification without first calling get_order.
 	let orderResponse = deps.trustedInputV2 ? undefined : captured ?? firstContact;
         if (orderResponse === undefined) {
-          orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
+	  orderResponse = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
         }
 	const refused = await gate(orderResponse, requestRevision);
         if (refused !== undefined) return refused;
@@ -523,30 +527,22 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 
         let proof: string | undefined;
         if (deps.origin !== undefined && orderResponse.order !== null) {
-	  const signing = new AbortController();
-	  let signingActive = true;
-	  ctx.onCancel(() => { if (signingActive) signing.abort(); });
-	  try {
-	    if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
-	    proof = await buildSubmitProof({
-	      origin: deps.origin,
-	      order: orderResponse.order,
-	      path,
-	      value,
-	      now: deps.now,
-	      warn: deps.err,
-	      signal: signing.signal,
-	      ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
-	      ...(deps.env !== undefined ? { env: deps.env } : {}),
-	      ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
-	    });
-	  } finally {
-	    signingActive = false;
-	  }
+	  proof = await buildSubmitProof({
+	    origin: deps.origin,
+	    order: orderResponse.order,
+	    path,
+	    value,
+	    now: deps.now,
+	    warn: deps.err,
+	    signal: cancellation.signal,
+	    ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
+	    ...(deps.env !== undefined ? { env: deps.env } : {}),
+	    ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
+	  });
         }
 	// Key access and signing may await. Fence the claim again before writing.
 	if (deps.trustedInputV2) {
-	  const fresh = await hub.getOrder({ workflow, run, ...holderReq });
+	  const fresh = await hub.getOrder({ workflow, run, ...holderReq }, cancellation.signal);
 	  const refusedFresh = await gate(fresh, requestRevision);
 	  if (refusedFresh !== undefined) return refusedFresh;
 	}
@@ -567,6 +563,8 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       } catch (e) {
 	if (ctx.cancelled) return textResult({ error: 'call-cancelled' }, true);
         return textResult({ error: errMsg(e) }, true);
+      } finally {
+	active = false;
       }
     },
   };

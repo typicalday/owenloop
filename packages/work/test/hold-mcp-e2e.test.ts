@@ -277,7 +277,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -377,7 +377,9 @@ steps:
 	if ((mode === 'lease-stalled-first-contact' && privateReads === 1)
 	  || (mode === 'verified-stalled-private-initial' && privateReads === 2)
 	  || (mode === 'verified-stalled-private-final' && privateReads === 3)
-	  || (mode === 'verified-stalled-submit-final' && privateReads === 6)) {
+	  || (mode === 'verified-stalled-submit-final' && privateReads === 6)
+	  || (mode.startsWith('submit-private-initial-') && privateReads === 2)
+	  || (mode.startsWith('submit-private-final-') && privateReads === 3)) {
 	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
 	  privateReadEntered();
 	  await privateResume;
@@ -389,6 +391,10 @@ steps:
 	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' }));
       } else if (req.url === '/api/submit') {
 	assert.equal(typeof body.proof, 'string');
+	if (mode === 'submit-ack-cancelled') {
+	  res.once('close', () => { if (!res.writableEnded) privateTransportClosed = true; });
+	  privateReadEntered();await privateResume;
+	}
 	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true }));
       } else if (req.url === '/api/release') res.end(JSON.stringify({ text: '', released: true }));
       else res.end(JSON.stringify({ text: '' }));
@@ -398,7 +404,7 @@ steps:
     assert.ok(address && typeof address !== 'string');
     const origin = `https://localhost:${address.port}`;
     const delayedSigning = mode === 'verified-signing-cancelled' || mode === 'verified-signing-eof' || mode === 'signing-cancelled' || mode === 'signing-eof' || mode === 'signing-sibling';
-    const submitting = delayedSigning || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
+    const submitting = delayedSigning || mode.startsWith('submit-private-') || mode === 'submit-ack-cancelled' || mode === 'signing-healthy' || mode === 'verified-stalled-submit-final' || mode === 'verified-submit-healthy';
     const signingStarted = join(configDir, 'signing-started');
     const signingFinished = join(configDir, 'signing-finished');
     let signingEnv: Record<string, string> = {};
@@ -438,6 +444,47 @@ if (sign) {
       ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
     { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert });
     await handshake(mcp);
+    if (mode === 'submit-ack-cancelled') {
+      const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
+      await privatePaused;
+      mcp.notify('notifications/cancelled', { requestId: id });
+      await mcp.request('ping');
+      assert.equal(privateTransportClosed, false, 'client cancel cannot abort an already-sent write ACK');
+      releasePrivateRead();mcp.endStdin();
+      assert.equal(await mcp.exited, 0);
+      assert.equal(mcp.frames.some(frame => frame.id === id), false);
+      assert.equal(seen.filter(path => path === '/api/submit').length, 1);
+      assert.equal(seen.includes('/api/release'), false, 'closing ACK is consumed without releasing the closed claim');
+      return;
+    }
+    if (mode.startsWith('submit-private-')) {
+      const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
+      await privatePaused;
+      if (mode.endsWith('cancelled') || mode.endsWith('sibling')) mcp.notify('notifications/cancelled', { requestId: id });
+      if (mode.endsWith('sibling')) {
+	await mcp.request('ping');
+	await until(() => privateTransportClosed, 'per-call cancel closes only its own private read', 1_000);
+	assert.equal((await callTool(mcp, 'get_order')).isError, false);
+	releasePrivateRead();
+	assert.equal((await callTool(mcp, 'get_order')).isError, false, 'late private completion cannot poison a sibling observation');
+      }
+      mcp.endStdin();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+	const outcome = await Promise.race([mcp.exited, new Promise<'pending'>(resolve => {
+	  timer = setTimeout(() => resolve('pending'), 2_000);
+	})]);
+	assert.equal(outcome, 0, 'EOF exits while the ordinary submit private read is stalled');
+	await until(() => privateTransportClosed, 'cancel/EOF aborts the private HTTPS read', 1_000);
+	const replies = mcp.frames.filter(frame => frame.id === id);
+	assert.equal(replies.length, mode.endsWith('cancelled') || mode.endsWith('sibling') ? 0 : 1);
+	if (mode.endsWith('eof')) assert.match(JSON.stringify(replies[0]), /call-cancelled/);
+	assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1'].includes(path)), false);
+      } finally {
+	clearTimeout(timer);releasePrivateRead();await mcp.exited;
+      }
+      return;
+    }
     if (delayedSigning) {
       const id = mcp.fireRequest('tools/call', { name: 'submit', arguments: { path: 'plan', value: { n: 1 } } });
       await until(() => existsSync(signingStarted), 'normal CLI reached real machine-key signing');
