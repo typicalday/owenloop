@@ -105,7 +105,7 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
       if (cfg.putFileArtifact instanceof Error) throw cfg.putFileArtifact;
       return {
         text: 'stored',
-        __file: true,
+	__file: 'orgs/TEST/artifacts/wf1/files/' + 'a'.repeat(64),
         hash: 'a'.repeat(64),
         size: req.bytes.byteLength,
         contentType: req.contentType,
@@ -1129,7 +1129,7 @@ test('put_file_artifact uploads a contained file and returns the submittable env
     assert.notEqual((res as { isError?: boolean }).isError, true);
     const body = parse(res);
     assert.deepEqual(body.pointer, {
-      __file: true,
+      __file: 'orgs/TEST/artifacts/wf1/files/' + 'a'.repeat(64),
       hash: 'a'.repeat(64),
       size: 5,
       contentType: 'image/png',

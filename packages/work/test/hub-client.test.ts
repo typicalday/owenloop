@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { createServer as createHttpsServer } from 'node:https';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -336,7 +337,7 @@ for (const verb of ['get', 'conditional', 'bytes'] as const) {
     test(`Hub redirect origin binding: ${verb} HTTP ${status}`, async () => {
       const body = verb === 'get' ? { text: 'own', orgId: 'own' }
 	: verb === 'conditional' ? { text: 'accepted', outcome: 'green', closed: true, conditionApplied: 'expected-version-v1' }
-	  : { text: 'stored', __file: true, hash: 'test-hash', size: 3, contentType: 'application/octet-stream' };
+	  : { text: 'stored', __file: 'own-TEST-key', hash: createHash('sha256').update(new Uint8Array([1, 2, 3])).digest('hex'), size: 3, contentType: 'application/octet-stream', filename: 'isolated-TEST-file' };
       let targetRequests = 0;
       let originRequests = 0;
       const target = createServer(async (req, res) => {
@@ -427,3 +428,58 @@ for (const status of [200, 307, 308]) {
     }
   });
 }
+
+for (const fault of ['empty', 'array', 'null', 'key', 'empty-key', 'hash', 'size', 'content-type', 'filename', 'missing-filename'] as const) {
+  test(`file acknowledgement refuses ${fault} without retry`, async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const good = { __file: 'opaque-TEST-key', hash: createHash('sha256').update(bytes).digest('hex'), size: 3, contentType: 'application/octet-stream', filename: 'own.txt' };
+    let body: unknown = good;
+    switch (fault) {
+      case 'empty': body = {}; break;
+      case 'array': body = []; break;
+      case 'null': body = null; break;
+      case 'key': body = { ...good, __file: true }; break;
+      case 'empty-key': body = { ...good, __file: '' }; break;
+      case 'hash': body = { ...good, hash: '0'.repeat(64) }; break;
+      case 'size': body = { ...good, size: 4 }; break;
+      case 'content-type': body = { ...good, contentType: 'text/plain' }; break;
+      case 'filename': body = { ...good, filename: 'other.txt' }; break;
+      case 'missing-filename': { const { filename: _filename, ...without } = good; body = without; break; }
+    }
+    let sends = 0;
+    const c = client((async () => { sends++; return new Response(JSON.stringify(body)); }) as typeof fetch);
+    await assert.rejects(c.putFileArtifact({ workflow: 'wf1', bytes, contentType: good.contentType, filename: good.filename }), /file-artifact-ack-invalid/);
+    assert.equal(sends, 1);
+  });
+}
+
+test('file acknowledgement accepts absent filename and normalized request headers', async () => {
+  const bytes = new Uint8Array([1]);
+  const c = client((async () => new Response(JSON.stringify({ __file: 'opaque-TEST-key', hash: createHash('sha256').update(bytes).digest('hex'), size: 1, contentType: 'text/plain' }))) as typeof fetch);
+  const result = await c.putFileArtifact({ workflow: 'wf1', bytes, contentType: ' text/plain ', filename: ' ' });
+  assert.equal(result.__file, 'opaque-TEST-key');
+  assert.equal(result.filename, undefined);
+});
+
+test('file acknowledgement accepts the filename normalization actually sent by Headers', async () => {
+  const bytes = new Uint8Array([1]);
+  const c = client((async () => new Response(JSON.stringify({ __file: 'opaque-TEST-key', hash: createHash('sha256').update(bytes).digest('hex'), size: 1, contentType: 'text/plain', filename: 'own.txt' }))) as typeof fetch);
+  assert.equal((await c.putFileArtifact({ workflow: 'wf1', bytes, contentType: ' text/plain ', filename: ' own.txt ' })).filename, 'own.txt');
+});
+
+test('file acknowledgement uses sent bytes even if the caller changes its buffer while waiting', async () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    assert.deepEqual(Buffer.concat(chunks), Buffer.from([1, 2, 3]));
+    bytes.fill(9);
+    res.end(JSON.stringify({ __file: 'opaque-TEST-key', hash, size: 3, contentType: 'application/octet-stream' }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const c = createHubClient({ origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, getToken: async () => 'own-TEST-token' });
+    assert.equal((await c.putFileArtifact({ workflow: 'wf1', bytes, contentType: 'application/octet-stream' })).hash, hash);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});

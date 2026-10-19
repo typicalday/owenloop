@@ -12,6 +12,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:https';
+import { createHash } from 'node:crypto';
 import { PrincipalKeyManager } from '../../../src/crypto/keys.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
@@ -277,7 +278,7 @@ test('hold --mcp --ignore-stdin is a usage error (exit 2) — stdin IS the trans
 
 // Local signed test publication and loopback TLS only. This verifies the normal
 // production role wiring; it is not hosted Delivery acceptance evidence.
-for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'verified-adapter-get-eof', 'verified-adapter-get-cancelled', 'verified-adapter-get-body-eof', 'verified-adapter-get-sibling', 'verified-adapter-get-deadline', 'verified-adapter-submit-eof', 'verified-adapter-submit-cancelled', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat'] as const) {
+for (const mode of ['absent', 'supplied', 'workdir', 'child', 'feedback', 'routing', 'overlap', 'cancelled', 'verified-absent', 'verified-supplied', 'verified-overlap', 'verified-child', 'verified-workdir', 'verified-stalled-private-initial', 'verified-stalled-private-final', 'verified-stalled-submit-final', 'verified-submit-healthy', 'verified-signing-cancelled', 'verified-signing-eof', 'verified-adapter-get-eof', 'verified-adapter-get-cancelled', 'verified-adapter-get-body-eof', 'verified-adapter-get-sibling', 'verified-adapter-get-deadline', 'verified-adapter-submit-eof', 'verified-adapter-submit-cancelled', 'signing-cancelled', 'signing-eof', 'signing-sibling', 'signing-healthy', 'submit-private-initial-cancelled', 'submit-private-initial-eof', 'submit-private-final-cancelled', 'submit-private-final-eof', 'submit-private-final-sibling', 'submit-ack-cancelled', 'witness-get-eof', 'witness-get-cancelled', 'witness-submit-eof', 'witness-submit-cancelled', 'witness-reject-eof', 'witness-ask-eof', 'witness-file-eof', 'witness-get-body-eof', 'witness-get-deadline', 'witness-get-sibling', 'lease-stalled-first-contact', 'lease-stalled-heartbeat', 'file-redirect-307', 'file-redirect-308', 'file-redirect-healthy', 'file-redirect-outside', 'file-ack-empty', 'file-ack-key', 'file-ack-hash', 'file-ack-size', 'file-ack-content-type', 'file-ack-filename'] as const) {
 test(`normal hold --mcp independently verifies ${mode} input witnesses over HTTPS`, async () => {
   const verified = mode.startsWith('verified-');
   const supplied = mode === 'supplied' || mode === 'verified-supplied';
@@ -303,6 +304,17 @@ steps:
 ` });
   let server: ReturnType<typeof createServer> | undefined;
   let mcp: McpChild | undefined;
+  let uploadTarget: ReturnType<typeof createServer> | undefined;
+  const fileCase = mode.startsWith('file-redirect-') || mode.startsWith('file-ack-');
+  const uploadBytes = Buffer.from('own isolated TEST upload\n');
+  const uploadHash = createHash('sha256').update(uploadBytes).digest('hex');
+  const pointer = { __file: `orgs/TEST/artifacts/wf1/files/${uploadHash}`, hash: uploadHash,
+    size: uploadBytes.byteLength, contentType: 'text/plain', filename: 'own-artifact.txt' };
+  const outsideFile = `${configDir}-outside.txt`;
+  let uploadRequests = 0;
+  let targetRequests = 0;
+  let targetBytes = 0;
+  let targetFilename: string | string[] | undefined;
   try {
     const installed = await installSignedBundleFixture({ sourceDir,
       root: join(configDir, '.owenloop', 'workflows'), home: configDir });
@@ -340,11 +352,40 @@ steps:
     let releaseFirstWitness!: () => void;
     const firstWitnessPaused = new Promise<void>(resolve => { firstWitnessEntered = resolve; });
     const firstWitnessResume = new Promise<void>(resolve => { releaseFirstWitness = resolve; });
+    if (fileCase) {
+      uploadTarget = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+	targetRequests++;
+	targetFilename = req.headers['x-file-name'];
+	for await (const chunk of req) targetBytes += (chunk as Buffer).byteLength;
+	res.writeHead(200, { 'content-type': 'application/json' });
+	res.end(JSON.stringify({ text: 'stored own TEST fixture', ...pointer }));
+      });
+      await new Promise<void>(resolve => uploadTarget!.listen(0, 'localhost', resolve));
+    }
     server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
       seen.push(req.url!);
       assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
+      if (fileCase && req.url === '/api/file-artifacts?workflow=wf1') {
+	uploadRequests++;
+	assert.deepEqual(Buffer.concat(chunks), uploadBytes);
+	assert.equal(req.headers['content-type'], 'text/plain');
+	assert.equal(req.headers['x-file-name'], 'own-artifact.txt');
+	if (mode === 'file-redirect-307' || mode === 'file-redirect-308') {
+	  const address = uploadTarget!.address();assert.ok(address && typeof address !== 'string');
+	  res.writeHead(mode.endsWith('307') ? 307 : 308, { location: `https://localhost:${address.port}/substitute` });
+	  res.end();return;
+	}
+	const ack: Record<string, unknown> = { text: 'stored own TEST fixture', ...pointer };
+	if (mode === 'file-ack-empty') for (const field of Object.keys(ack)) delete ack[field];
+	if (mode === 'file-ack-key') ack.__file = true;
+	if (mode === 'file-ack-hash') ack.hash = '0'.repeat(64);
+	if (mode === 'file-ack-size') ack.size = uploadBytes.byteLength + 1;
+	if (mode === 'file-ack-content-type') ack.contentType = 'application/octet-stream';
+	if (mode === 'file-ack-filename') ack.filename = 'another-file.txt';
+	res.writeHead(200, { 'content-type': 'application/json' });res.end(JSON.stringify(ack));return;
+      }
       const body = JSON.parse(Buffer.concat(chunks).toString());
       assert.equal(body.workflow, 'wf1');
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -449,8 +490,33 @@ if (sign) {
     mcp = spawnMcp(['hold', '--order', 'wf1/run1', '--origin', origin,
       '--heartbeat-interval', '25', '--mcp', ...(verified ? ['--verified-hosted'] : []),
       ...(submitting ? ['--mcp-tools=get_order,submit'] : [])],
-    { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert }, mode.startsWith('witness-') ? configDir : undefined);
+    { ...childEnv(), ...installed.env, ...signingEnv, ...(submitting ? { OWENLOOP_NO_KEYCHAIN: '1' } : {}), NODE_EXTRA_CA_CERTS: cert }, (mode.startsWith('witness-') || fileCase) ? configDir : undefined);
     await handshake(mcp);
+    if (fileCase) {
+      assert.equal(verified, false, 'DEFAULT ordinary hold, no verified-hosted flag');
+      const initial = await callTool(mcp, 'get_order');assert.equal(initial.isError, false, JSON.stringify(initial.body));
+      assert.ok(seen.includes('/api/reference_order/v2'));
+      writeFileSync(join(configDir, 'own-artifact.txt'), uploadBytes);
+      if (mode === 'file-redirect-outside') writeFileSync(outsideFile, 'own outside-boundary TEST file');
+      const result = await callTool(mcp, 'put_file_artifact', {
+	file: mode === 'file-redirect-outside' ? outsideFile : 'own-artifact.txt',
+	contentType: 'text/plain', filename: 'own-artifact.txt',
+      });
+      if (mode === 'file-redirect-healthy') {
+	assert.equal(result.isError, false, JSON.stringify(result.body));
+	assert.deepEqual(result.body.pointer, pointer, 'preserve real Service string-key pointer metadata');
+      } else {
+	assert.equal(result.isError, true, 'malformed or redirected upload must not report success: ' + JSON.stringify(result.body));
+	assert.equal(result.body.pointer, undefined, 'no phantom artifact pointer');
+      }
+      assert.equal(uploadRequests, mode === 'file-redirect-outside' ? 0 : 1, 'no automatic retry');
+      assert.equal(targetRequests, 0);assert.equal(targetBytes, 0);assert.equal(targetFilename, undefined);
+      assert.equal((await callTool(mcp, 'get_order')).isError, false, 'healthy read sibling remains usable');
+      assert.equal(seen.some(path => ['/api/submit', '/api/submit/conditional-v1', '/api/ask', '/api/reject'].includes(path)), false);
+      mcp.endStdin();assert.equal(await mcp.exited, 0, mcp.stderr());
+      assert.equal(seen.filter(path => path === '/api/release').length, 1, 'upload does not close the held lease');
+      return;
+    }
     if (mode.startsWith('witness-') || mode.startsWith('verified-adapter-')) {
       writeFileSync(join(configDir, 'output.txt'), 'local test artifact');
       const name = (mode.startsWith('witness-submit-') || mode.startsWith('verified-adapter-submit-')) ? 'submit'
@@ -765,6 +831,8 @@ if (sign) {
   } finally {
     if (mcp?.child.exitCode === null) { mcp.endStdin(); await mcp.exited; }
     if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+    if (uploadTarget) await new Promise<void>((resolve, reject) => uploadTarget!.close(error => error ? reject(error) : resolve()));
+    rmSync(outsideFile, { force: true });
     rmSync(sourceDir, { recursive: true, force: true });
   }
 });

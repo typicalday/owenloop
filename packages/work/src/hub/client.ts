@@ -22,6 +22,7 @@
  * No retries/backoff and no token refresh in C1 — the roles own their retry
  * policy later, and oauth-kind token refresh stays inside owenloop.
  */
+import { createHash } from 'node:crypto';
 import { HubError } from './types.ts';
 import type {
   AnswerApprovalRequest,
@@ -219,13 +220,31 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     // The name rides a header rather than the body because the body IS the
     // bytes. It is a display label only; the hub never resolves it as a path.
     if (req.filename !== undefined) headers['x-file-name'] = req.filename;
+    // Bind the acknowledgement to the bytes/headers passed to fetch, before
+    // awaiting its response. A caller changing its buffer later cannot change
+    // the expected digest of this already-sent request.
+    const expectedHash = createHash('sha256').update(req.bytes).digest('hex');
+    const expectedSize = req.bytes.byteLength;
+    const normalizedHeaders = new Headers(headers);
+    const expectedFilename = normalizedHeaders.get('x-file-name') || undefined;
     const res = await fetchImpl(`${base}${path}?workflow=${encodeURIComponent(req.workflow)}`, {
       method: 'POST',
       redirect: 'error',
       headers,
       body: req.bytes,
     });
-    return parse<T>(res);
+    const ack = await parse<unknown>(res);
+    if (ack === null || typeof ack !== 'object' || Array.isArray(ack)) {
+      throw new Error('file-artifact-ack-invalid');
+    }
+    const pointer = ack as Record<string, unknown>;
+    if (typeof pointer.__file !== 'string' || pointer.__file.length === 0
+      || pointer.hash !== expectedHash || pointer.size !== expectedSize
+      || pointer.contentType !== normalizedHeaders.get('content-type')
+      || pointer.filename !== expectedFilename) {
+      throw new Error('file-artifact-ack-invalid');
+    }
+    return ack as T;
   }
 
   return {
