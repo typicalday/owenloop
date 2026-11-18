@@ -266,6 +266,16 @@ export async function validateEnrollmentChain(
   input: ChainInput,
   options: ChainOptions = {},
 ): Promise<ChainVerdict> {
+  const verdict = await inspectEnrollmentChain(input, options);
+  return verdict.kind === 'revoked' ? invalid(verdict.reason) : verdict;
+}
+
+/** A verified effective revocation is distinguished for the read-only roster
+ * display. Authorization callers use validateEnrollmentChain, which refuses it. */
+export async function inspectEnrollmentChain(
+  input: ChainInput,
+  options: ChainOptions = {},
+): Promise<ChainVerdict | { kind: 'revoked'; keyid: string; reason: string }> {
   if (!Number.isInteger(input.at) || input.at < 0) {
     return invalid(`validation instant '${String(input.at)}' is not a non-negative integer`);
   }
@@ -450,9 +460,11 @@ export async function validateEnrollmentChain(
       );
     }
     if (record.effectiveFrom <= input.at) {
-      return invalid(
-        `enrollment chain for '${input.targetKeyId}' contains revoked key '${record.revokedKey}' effective from ${record.effectiveFrom}`,
-      );
+      return {
+	kind: 'revoked',
+	keyid: record.revokedKey,
+	reason: `enrollment chain for '${input.targetKeyId}' contains revoked key '${record.revokedKey}' effective from ${record.effectiveFrom}`,
+      };
     }
   }
 

@@ -187,6 +187,30 @@ function decodeSigEntry(entry: unknown, index: number): Buffer {
   }
 }
 
+/** Decode the wire fields for candidate selection. This performs no authentication. */
+export function decodeDsseEnvelope(envelope: unknown) {
+  if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) {
+    throw new DsseEnvelopeError('envelope is not an object');
+  }
+  const env = envelope as DsseEnvelope;
+  if (typeof env.payload !== 'string') throw new DsseEnvelopeError("missing 'payload' field");
+  if (typeof env.payloadType !== 'string' || env.payloadType === '') {
+    throw new DsseEnvelopeError("missing 'payloadType' field");
+  }
+  if (!Array.isArray(env.signatures) || env.signatures.length === 0) {
+    throw new DsseEnvelopeError('envelope must carry at least one signature');
+  }
+  const payloadBytes = (() => {
+    try {
+      return decodeBase64Strict(env.payload, { allowEmpty: true });
+    } catch (e) {
+      throw new DsseEnvelopeError(`payload: ${(e as Error).message}`);
+    }
+  })();
+  const sigBytes = env.signatures.map((entry, i) => decodeSigEntry(entry, i));
+  return { payloadType: env.payloadType, payloadBytes, sigBytes };
+}
+
 /**
  * Verify a DSSE envelope with a format-neutral `Signer`.
  *
@@ -216,26 +240,8 @@ export async function dsseVerifyEnvelope(
   if (!Number.isInteger(threshold) || threshold < 1) {
     throw new DsseEnvelopeError('threshold must be an integer >= 1');
   }
-  if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) {
-    throw new DsseEnvelopeError('envelope is not an object');
-  }
-  const env = envelope as DsseEnvelope;
-  if (typeof env.payload !== 'string') throw new DsseEnvelopeError("missing 'payload' field");
-  if (typeof env.payloadType !== 'string' || env.payloadType === '') {
-    throw new DsseEnvelopeError("missing 'payloadType' field");
-  }
-  if (!Array.isArray(env.signatures) || env.signatures.length === 0) {
-    throw new DsseEnvelopeError('envelope must carry at least one signature');
-  }
-  const payloadBytes = (() => {
-    try {
-      return decodeBase64Strict(env.payload, { allowEmpty: true });
-    } catch (e) {
-      throw new DsseEnvelopeError(`payload: ${(e as Error).message}`);
-    }
-  })();
-  const pae = preAuthEncode(env.payloadType, payloadBytes);
-  const sigBytes = env.signatures.map((entry, i) => decodeSigEntry(entry, i));
+  const { payloadType, payloadBytes, sigBytes } = decodeDsseEnvelope(envelope);
+  const pae = preAuthEncode(payloadType, payloadBytes);
 
   const verified: VerifiedSignature[] = [];
   const seen = new Set<string>();
@@ -252,9 +258,9 @@ export async function dsseVerifyEnvelope(
       `DSSE verification failed: ${verified.length} distinct trusted signer(s), threshold is ${threshold}`,
     );
   }
-  if (env.payloadType !== expectedPayloadType) {
+  if (payloadType !== expectedPayloadType) {
     throw new DsseEnvelopeError(
-      `payload type mismatch: envelope carries '${env.payloadType}', caller expects '${expectedPayloadType}'`,
+      `payload type mismatch: envelope carries '${payloadType}', caller expects '${expectedPayloadType}'`,
     );
   }
   return { payloadBytes, signers: verified };
