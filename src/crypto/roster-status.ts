@@ -36,7 +36,7 @@ function decodeRow(raw: unknown) {
   const bytes = Buffer.from(canonicalValueBytes(envelope));
   if (isGrant) return { kind: 'grant' as const, keyid: (payload as EnrollmentGrantRecord).newKey.keyid, bytes };
   const cut = payload as RevocationRecord;
-  return { kind: 'revocation' as const, keyid: cut.revokedKey, effectiveFrom: cut.effectiveFrom, bytes };
+  return { kind: 'revocation' as const, keyid: cut.revokedKey, effectiveFrom: cut.effectiveFrom, issuer: cut.revokedBy, bytes };
 }
 
 /** Classify only the listed rows, in relay order. Local records can supply
@@ -79,20 +79,36 @@ export async function enrollmentRosterStatuses(input: RosterSource): Promise<Lis
   const material = { orgRootPublicKey: input.orgRootPublicKey, grants: [...grants.values()], at: input.at };
   const cuts = [...revocations.values()];
   const decisions = new Map<string, Awaited<ReturnType<typeof inspectEnrollmentChain>>>();
+  async function currentChain(keyid: string) {
+    let decision = decisions.get(keyid);
+    if (!decision) {
+      decision = await inspectEnrollmentChain({ ...material, targetKeyId: keyid, revocations: cuts });
+      decisions.set(keyid, decision);
+    }
+    return decision;
+  }
+
   const statuses: ListingStatus[] = [];
   for (const row of rows) {
-    // The chain verifier stops at the first effective cut. Inspect ancestors
-    // before the subject so a valid leaf signature cannot mask its lost issuer.
-    const targetCut = revocations.get(row.keyid);
-    const orderedCuts = targetCut ? [...cuts.filter(cut => cut !== targetCut), targetCut] : cuts;
-    const decision = decisions.get(row.keyid) ?? await inspectEnrollmentChain({ ...material, targetKeyId: row.keyid, revocations: orderedCuts });
-    decisions.set(row.keyid, decision);
-    if (row.kind === 'revocation' && (decision.kind === 'verified' || (decision.kind === 'revoked' && decision.keyid === row.keyid))) {
+    if (row.kind === 'grant') {
+      const chain = await currentChain(row.keyid);
+      statuses.push(chain.kind === 'verified'
+	? { kind: 'enrolled', keyid: row.keyid, principal: `${chain.principal.kind}:${chain.principal.id}` }
+	: { kind: chain.kind === 'revoked' ? 'invalid' : chain.kind, reason: chain.reason });
+      continue;
+    }
+    // The issuer must still have authority. An independent cut below that
+    // issuer may invalidate the subject's grant without invalidating this record.
+    const issuer = await currentChain(row.issuer);
+    if (issuer.kind !== 'verified') {
+      statuses.push({ kind: issuer.kind === 'revoked' ? 'invalid' : issuer.kind, reason: issuer.reason });
+      continue;
+    }
+    const cut = await inspectEnrollmentChain({ ...material, targetKeyId: row.keyid, revocations: [row.bytes] });
+    if (cut.kind === 'verified' || cut.kind === 'revoked') {
       statuses.push({ kind: 'revocation', keyid: row.keyid, effectiveFrom: row.effectiveFrom });
-    } else if (decision.kind === 'verified') {
-      statuses.push({ kind: 'enrolled', keyid: decision.keyid, principal: `${decision.principal.kind}:${decision.principal.id}` });
     } else {
-      statuses.push({ kind: decision.kind === 'revoked' ? 'invalid' : decision.kind, reason: decision.reason });
+      statuses.push({ kind: cut.kind, reason: cut.reason });
     }
   }
   return statuses;

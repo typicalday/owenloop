@@ -8770,7 +8770,17 @@ function enrollmentEnvelopeNewKeyId(value: unknown): string | undefined {
   }
 }
 
-function enrollmentEnvelopesFromResponse(body: unknown): unknown[] {
+async function readEnrollmentEnvelopes(res: Response): Promise<unknown[]> {
+  // The roster endpoint has no paging contract. A page can omit a revocation.
+  if (res.status !== 200 || res.headers.has('content-range') || res.headers.has('link')) {
+    throw new CliError('enrollments: expected a complete, unpaginated roster response');
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new CliError('enrollments: malformed response — body is not valid JSON');
+  }
   const unwrap = (row: unknown): unknown => {
     const wrapper = recordOf(row);
     return wrapper !== null && Object.hasOwn(wrapper, 'envelope') ? wrapper.envelope : row;
@@ -8782,6 +8792,9 @@ function enrollmentEnvelopesFromResponse(body: unknown): unknown[] {
   if (fields.length > 1) throw new CliError('enrollments: ambiguous response — multiple roster fields');
   if (fields.length === 1) {
     const field = fields[0]!;
+    if (Object.keys(record).some(key => key !== field && key !== 'ok') || ('ok' in record && record.ok !== true)) {
+      throw new CliError('enrollments: unsupported roster metadata, cannot establish a complete listing');
+    }
     if (field === 'envelope') return [record.envelope];
     const rows = record[field];
     if (Array.isArray(rows)) return rows.map(unwrap);
@@ -8827,7 +8840,7 @@ async function registerMachineEnrollment(
 
   let existing: unknown[];
   try {
-    existing = enrollmentEnvelopesFromResponse(await list.res.json());
+    existing = await readEnrollmentEnvelopes(list.res);
   } catch (error) {
     return noted(error instanceof CliError ? error.message : 'hub enrollment listing was not valid JSON');
   }
@@ -9185,18 +9198,7 @@ async function dispatchEnrollments(io: CliIO, args: Args): Promise<number> {
   const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/enrollments');
   assertAuthOk(res, used, origin);
 
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch {
-    throw new CliError('enrollments: malformed response — body is not valid JSON');
-  }
-  let envelopes: unknown[];
-  try {
-    envelopes = enrollmentEnvelopesFromResponse(body);
-  } catch (error) {
-    throw new CliError(error instanceof Error ? error.message : 'enrollments: malformed response');
-  }
+  const envelopes = await readEnrollmentEnvelopes(res);
 
   let root: ReturnType<typeof resolveOrgRoot>;
   let localGrants: Uint8Array[];

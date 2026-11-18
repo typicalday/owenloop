@@ -3127,7 +3127,10 @@ row in its original order.
 
 Identical evidence from the local store and the relay can support the same
 chain. A local parent grant can authenticate a relayed child. Only relayed
-rows appear in the output. Use a fresh, complete roster for this check.
+rows appear in the output. The command requires a whole-roster HTTP 200
+response. Partial responses, HTTP `Link` or `Content-Range` headers, and unrecognized wrapper
+metadata stop the check before it reports any enrollment. The verdict covers
+the records supplied by the hub and the local store at the time of the check.
 
 A missing human credential is exit `3`; hub, malformed-response, and other
 runtime failures are exit `1`; successful classification is exit `0`.

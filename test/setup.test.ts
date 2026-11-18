@@ -35,6 +35,7 @@ import {
   makeIdentityHub,
   makeIo,
   routedFetch,
+  type RouteResult,
 } from './hubkit.ts';
 import { owenloopSettingsPath } from '../src/work-settings.ts';
 import { dsseSignEnrollmentGrant, dsseSignRevocation, DSSE_SSH_NAMESPACE, encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
@@ -1206,6 +1207,11 @@ test('enrollments: checks signed relay and local records against the organizatio
     })), rootSigner)).envelope;
     assert.deepEqual((await classify([signedCut, parentCut, leaf])).map(row => row.kind), ['invalid', 'revocation', 'invalid']);
     assert.deepEqual((await classify([parentCut, signedCut, leaf])).map(row => row.kind), ['revocation', 'invalid', 'invalid']);
+    const rootCut = (await dsseSignRevocation(Buffer.from(JSON.stringify({
+      ...cut, revokedBy: root.public.keyid,
+    })), rootSigner)).envelope;
+    assert.deepEqual((await classify([rootCut, parentCut, leaf])).map(row => row.kind), ['revocation', 'revocation', 'invalid']);
+    assert.deepEqual((await classify([leaf, parentCut, rootCut])).map(row => row.kind), ['invalid', 'revocation', 'revocation']);
     const competingParent = await grant(human, root, rootSigner, ORG_ROOT_SCOPE, 'someone-else');
     assert.deepEqual((await classify([competingParent, leaf])).map(row => row.kind), ['invalid', 'invalid']);
     const rootAsSubject = await grant(root, root, humanSigner, ORG_ROOT_SCOPE, 'rogue');
@@ -1224,6 +1230,31 @@ test('enrollments: checks signed relay and local records against the organizatio
     humanSigner.dispose();
     rmSync(t.cwd, { recursive: true, force: true });
     rmSync(t.home, { recursive: true, force: true });
+  }
+});
+
+test('enrollments and setup refuse incomplete rosters before classifying or registering', async () => {
+  const incomplete: RouteResult[] = [
+    { status: 206, json: [] },
+    { status: 200, headers: { 'Content-Range': 'items 0-0/2' }, json: [] },
+    { status: 200, headers: { Link: '<page-2>; rel="next"' }, json: [] },
+    { status: 200, json: { entries: [], hasMore: true } },
+    { status: 200, json: { items: [], nextCursor: 'page-2' } },
+    { status: 200, json: { enrollments: [], pagination: { page: 2 } } },
+  ];
+  for (const reply of incomplete) {
+    const { routes } = makeIdentityHub();
+    routes['GET /api/enrollments'] = () => reply;
+    const { fetch, calls } = routedFetch(routes);
+    const t = makeIo({ fetch });
+    seedHuman(t.store);
+    assert.equal(await mainAsync(['enrollments', '--hub', HUB], t.io), 1);
+    assert.match(t.err.join(' '), /complete/);
+    assert.equal(t.out.length, 0);
+    assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0);
+    const setup = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string }[] };
+    assert.equal(setup.steps.find(s => s.step === 'enrollment')?.action, 'noted');
+    assert.ok(!calls.some(call => call.pathname === '/api/enrollments' && call.method === 'POST'));
   }
 });
 
