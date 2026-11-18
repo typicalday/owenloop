@@ -37,7 +37,10 @@ import {
   routedFetch,
 } from './hubkit.ts';
 import { owenloopSettingsPath } from '../src/work-settings.ts';
-import { encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
+import { dsseSignEnrollmentGrant, dsseSignRevocation, DSSE_SSH_NAMESPACE, encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
+import { createSshSigner } from '../src/crypto/ssh.ts';
+import { ORG_ROOT_SCOPE } from '../src/crypto/scope.ts';
+import type { GrantScope } from '../src/crypto/records.ts';
 import { publicKeyDescriptor } from '../src/crypto/keys.ts';
 import { buildEnrollmentGrant, DEFAULT_MACHINE_SCOPE } from '../src/crypto/enrollment.ts';
 import { crewRosterPath, encodedCrewRosterDir, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
@@ -1138,7 +1141,93 @@ test('setup: missing human signing key skips enrollment before contacting the hu
   assertNoOlp(t);
 });
 
-test('enrollments: read-only command classifies a valid D1 envelope as unverifiable without a chain validator', async () => {
+test('enrollments: checks signed relay and local records against the organization root', { skip: ENROLLMENT_SSH_SKIP }, async () => {
+  const { routes } = makeIdentityHub();
+  let listed: unknown[] = [];
+  routes['GET /api/enrollments'] = () => ({ status: 200, json: listed.map(envelope => ({ envelope, verified: true })) });
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t.store);
+  const config = join(t.home, '.owenloop');
+  const localGrants = join(config, 'grants');
+  const localRevocations = join(config, 'revocations');
+  mkdirSync(localGrants, { recursive: true });
+  mkdirSync(localRevocations);
+  const key = (name: string) => {
+    const path = join(t.cwd, name);
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', path]);
+    return { path, public: publicKeyDescriptor(readFileSync(`${path}.pub`, 'utf8')) };
+  };
+  const root = key('root');
+  const human = key('human');
+  const machine = key('machine');
+  writeFileSync(join(config, 'org-root.pub'), root.public.openSshPublicKey);
+  const rootSigner = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: root.path });
+  const humanSigner = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: human.path });
+  const classify = async (envelopes: unknown[]) => {
+    listed = envelopes;
+    t.out.length = 0;
+    assert.equal(await mainAsync(['enrollments', '--hub', HUB], t.io), 0, t.err.join('\n'));
+    return (JSON.parse(t.out.join('\n')) as { enrollments: { kind: string; reason?: string }[] }).enrollments;
+  };
+  const grant = async (child: typeof root, issuer: typeof root, signer: typeof rootSigner, scope: GrantScope, id: string) => {
+    const record = buildEnrollmentGrant({
+      newKey: child.public, principal: { kind: 'machine', id }, scope, grantedBy: issuer.public.keyid, validFrom: 0,
+    });
+    return (await dsseSignEnrollmentGrant(Buffer.from(JSON.stringify(record)), signer)).envelope;
+  };
+  try {
+    const parent = await grant(human, root, rootSigner, ORG_ROOT_SCOPE, 'parent');
+    const leaf = await grant(machine, human, humanSigner, DEFAULT_MACHINE_SCOPE, 'local');
+    const cut = { revokedKey: machine.public.keyid, revokedBy: human.public.keyid,
+      principal: { kind: 'machine', id: 'local' }, issuedAt: 1, effectiveFrom: 1, backdated: false };
+    const signedCut = (await dsseSignRevocation(Buffer.from(JSON.stringify(cut)), humanSigner)).envelope;
+    const [missing] = await classify([leaf]);
+    assert.match(missing!.reason!, /parent .* has no grant/);
+    writeFileSync(join(localGrants, 'parent.grant.dsse'), JSON.stringify(parent, null, 2));
+    const valid = await classify([leaf, parent]);
+    assert.deepEqual(valid, [
+      { kind: 'enrolled', keyid: machine.public.keyid, principal: 'machine:local' },
+      { kind: 'enrolled', keyid: human.public.keyid, principal: 'machine:parent' },
+    ]);
+    const forged = { ...leaf, signatures: parent.signatures };
+    assert.equal((await classify([forged]))[0]!.kind, 'invalid');
+    const revoked = await classify([signedCut, leaf, parent]);
+    assert.deepEqual(revoked.map(row => row.kind), ['revocation', 'invalid', 'enrolled']);
+    assert.match(revoked[1]!.reason!, /contains revoked key/);
+    const localCut = join(localRevocations, 'leaf.revocation.dsse');
+    writeFileSync(localCut, JSON.stringify(signedCut));
+    assert.match((await classify([leaf]))[0]!.reason!, /contains revoked key/);
+    rmSync(localCut);
+    const wrongSigner = (await dsseSignRevocation(Buffer.from(JSON.stringify(cut)), rootSigner)).envelope;
+    assert.deepEqual((await classify([leaf, wrongSigner])).map(row => row.kind), ['invalid', 'invalid']);
+    const parentCut = (await dsseSignRevocation(Buffer.from(JSON.stringify({
+      ...cut, revokedKey: human.public.keyid, revokedBy: root.public.keyid, principal: { kind: 'machine', id: 'parent' },
+    })), rootSigner)).envelope;
+    assert.deepEqual((await classify([signedCut, parentCut, leaf])).map(row => row.kind), ['invalid', 'revocation', 'invalid']);
+    assert.deepEqual((await classify([parentCut, signedCut, leaf])).map(row => row.kind), ['revocation', 'invalid', 'invalid']);
+    const competingParent = await grant(human, root, rootSigner, ORG_ROOT_SCOPE, 'someone-else');
+    assert.deepEqual((await classify([competingParent, leaf])).map(row => row.kind), ['invalid', 'invalid']);
+    const rootAsSubject = await grant(root, root, humanSigner, ORG_ROOT_SCOPE, 'rogue');
+    assert.match((await classify([rootAsSubject]))[0]!.reason!, /root cannot be a roster subject/);
+    const malformed = await classify([leaf, { ...signedCut, payload: '??' }]);
+    assert.deepEqual(malformed.map(row => row.kind), ['invalid', 'invalid']);
+    routes['GET /api/enrollments'] = () => ({ status: 200, json: { entries: [leaf], items: [signedCut] } });
+    t.out.length = 0;
+    assert.equal(await mainAsync(['enrollments', '--hub', HUB], t.io), 1);
+    assert.match(t.err.join('\n'), /ambiguous response/);
+    assert.ok(calls.every(call => call.method === 'GET'));
+    assert.equal(t.principalKeys!.calls.length, 0);
+    assert.equal(existsSync(join(config, 'allowed_signers')), false);
+  } finally {
+    rootSigner.dispose();
+    humanSigner.dispose();
+    rmSync(t.cwd, { recursive: true, force: true });
+    rmSync(t.home, { recursive: true, force: true });
+  }
+});
+
+test('enrollments: read-only command reports a missing organization root without creating or inspecting signing keys', async () => {
   const { routes } = makeIdentityHub();
   const grant = buildEnrollmentGrant({
     newKey: {
@@ -1155,7 +1244,7 @@ test('enrollments: read-only command classifies a valid D1 envelope as unverifia
   const envelope = {
     payloadType: PAYLOAD_TYPE_ENROLLMENT_GRANT,
     payload: encodeBase64(Buffer.from(JSON.stringify(grant), 'utf8')),
-    signatures: [],
+    signatures: [{ sig: 'c2ln' }],
   };
   routes['GET /api/enrollments'] = () => ({ status: 200, json: { enrollments: [{ envelope }] } });
   const { fetch, calls } = routedFetch(routes);
@@ -1166,7 +1255,7 @@ test('enrollments: read-only command classifies a valid D1 envelope as unverifia
   assert.deepEqual(JSON.parse(t.out.join('\n')), {
     ok: true,
     hub: ORIGIN,
-    enrollments: [{ kind: 'unverifiable', reason: 'no allowed_signers trust root was resolved' }],
+    enrollments: [{ kind: 'unverifiable', reason: 'no local organization root is configured' }],
   });
   assert.equal(calls.filter((call) => call.method === 'GET' && call.pathname === '/api/enrollments').length, 1);
   assert.ok(!calls.some((call) => call.method === 'POST'), 'read-only command never posts');
