@@ -400,6 +400,10 @@ change that contract.
 
 ### Local roster verification
 
+The `enrollments` command uses the local organization root, signed grants and
+revocations through the chain verifier. See [enrollment status](cli.md#enrollments--inspect-machine-enrollment).
+The single-record D1 library API below retains its original signer-policy contract.
+
 `verifyRosterEntry` verifies a relayed envelope in a fixed trust order:
 
 1. Decode and validate the DSSE envelope and enrollment-grant payload.
