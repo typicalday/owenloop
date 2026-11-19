@@ -21,6 +21,8 @@ export interface WhatsNextRequest {
    * matching. An empty array legitimately means the shift serves nothing.
    */
   serve_capabilities: string[];
+  /** Explicit command-only poll, authorized by a separate scoped Hub grant. */
+  serve_commands?: boolean;
 }
 
 /**
@@ -87,6 +89,8 @@ export interface InboxInstance {
  * optional because a single type covers both modes.
  */
 export interface WhatsNextResponse extends HubResponse {
+  /** Feature acknowledgement only; not an execution or integrity proof. */
+  command_lane?: 'grant-v1';
   /** Per-workflow mode: the instance id echoed back. */
   workflow?: string;
   /** Per-workflow mode: the def name (used to locate the cached bundle). */
@@ -500,13 +504,13 @@ export interface PutFileArtifactRequest {
 }
 
 /**
- * The envelope, which IS the artifact value. `__file` is the discriminator the
+ * The envelope, which IS the artifact value. `__file` is the opaque object key the
  * hub's pointer walk looks for; `hash` is the content address (so re-uploading
  * identical bytes is free); `size` and `contentType` describe bytes a def can
  * constrain with ordinary JSON Schema even though it can never see them.
  */
 export interface FileArtifactPointer {
-  __file: true;
+  __file: string;
   hash: string;
   size: number;
   contentType: string;

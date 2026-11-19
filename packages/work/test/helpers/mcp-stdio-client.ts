@@ -14,10 +14,11 @@
  * Lives under `test/helpers/` so the `test/*.test.ts` glob never runs it as a
  * suite of its own.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import assert from 'node:assert/strict';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 const BIN = join(import.meta.dirname, '..', '..', '..', '..', 'bin', 'owenloop.mjs');
 
@@ -58,11 +59,26 @@ const REQUEST_TIMEOUT_MS = 10_000;
 
 /** Spawn `owenloop <args>` and wire a line-framed JSON-RPC client to it. */
 export function spawnMcp(args: string[], env: Record<string, string | undefined>, cwd?: string): McpChild {
-  const child = spawn(process.execPath, [BIN, 'work', ...args], {
+  // CI can exercise a fresh private install with this SAME stdio fixture.
+  // Defaults still run the checkout; a partial selection must never fall back.
+  const selectedBin = process.env['OWENLOOP_TEST_MCP_BIN'];
+  const selectedExecutable = process.env['OWENLOOP_TEST_MCP_EXECUTABLE'];
+  assert.equal(selectedBin === undefined, selectedExecutable === undefined, 'select both installed bin and executable');
+  const bin = selectedBin ?? BIN;
+  const executable = selectedExecutable ?? process.execPath;
+  assert.ok(isAbsolute(bin) && isAbsolute(executable), 'MCP child paths must be absolute');
+  const child = spawn(executable, [bin, 'work', ...args], {
     env: { ...process.env, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
     ...(cwd !== undefined ? { cwd } : {}),
   });
+  assert.equal(child.spawnfile, executable);
+  assert.equal(child.spawnargs[1], bin);
+  if (selectedBin !== undefined) {
+    console.log(JSON.stringify({ installedMcpCli: { driverNode: process.version,
+      driverExecutable: process.execPath, childExecutable: child.spawnfile, bin: child.spawnargs[1],
+      childNode: execFileSync(executable, ['--version'], { encoding: 'utf8' }).trim() } }));
+  }
 
   const frames: Frame[] = [];
   const pending = new Map<number, (f: Frame) => void>();

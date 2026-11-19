@@ -459,3 +459,95 @@ test('stop() before first contact establishes the hold ⇒ stopped, no release',
   assert.equal(await loop.run(), 'stopped');
   assert.equal(only(calls, 'release').length, 0);
 });
+
+// A stopped lease reader must settle even if a private client ignores abort.
+for (const stage of ['first contact', 'clock jump', 'failure classify'] as const) {
+  test(`stop during pending ${stage} get_order fences late results and settles promptly`, async () => {
+    const { hub, calls } = mockHub({ heartbeat: stage === 'failure classify' ? () => { throw new Error('offline'); } : undefined });
+    let entered!: () => void;
+    const pending = new Promise<void>(r => { entered = r; });
+    let resume!: (res: GetOrderResponse) => void;
+    let signal: AbortSignal | undefined;
+    let reads = 0;
+    hub.getOrder = async (req, requestSignal) => {
+      calls.push({ verb: 'get_order', arg: req });
+      if (++reads === (stage === 'first contact' ? 1 : 2)) {
+	signal = requestSignal;
+	entered();
+	return new Promise<GetOrderResponse>(r => { resume = r; });
+      }
+      return order(true);
+    };
+    let now = 0;
+    let delivered = 0;
+    const loop = createHoldLoop(baseOpts(hub, {
+      onOrder: () => { delivered++; }, now: () => now,
+      sleep: async () => { now += stage === 'clock jump' ? 2_000 : 1_000; await macrotaskSleep(); },
+    }));
+    const running = loop.run();
+    await pending;
+    loop.stop('EOF');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([running, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 100); })]);
+      assert.equal(outcome, stage === 'first contact' ? 'stopped' : 'released');
+      assert.equal(signal?.aborted, true, 'stop aborts the existing private request signal');
+    } finally {
+      clearTimeout(timer);
+      resume(order(true));
+      await running;
+    }
+    await macrotaskSleep();
+    assert.equal(delivered, stage === 'first contact' ? 0 : 1, 'late initial order never reaches onOrder');
+    assert.equal(only(calls, 'heartbeat').length, stage === 'failure classify' ? 1 : 0, 'no beat starts after stop');
+    assert.equal(only(calls, 'release').length, stage === 'first contact' ? 0 : 1);
+  });
+}
+
+for (const release of [true, false]) {
+  test(`stop during abort-aware probe preserves release:${release} and ignores abort rejection`, async () => {
+    const { hub, calls } = mockHub({});
+    let entered!: () => void;
+    const pending = new Promise<void>(r => { entered = r; });
+    let reads = 0;
+    hub.getOrder = async (_req, signal) => {
+      if (++reads === 1) return order(true);
+      return new Promise<GetOrderResponse>((_resolve, reject) => {
+	signal!.addEventListener('abort', () => reject(new HubError(403, 'late abort')), { once: true });
+	entered();
+      });
+    };
+    let now = 0;
+    const errors: string[] = [];
+    const loop = createHoldLoop(baseOpts(hub, { now: () => now, err: line => errors.push(line),
+      sleep: async () => { now += 2_000; await macrotaskSleep(); },
+    }));
+    const running = loop.run();await pending;
+    loop.stop('EOF', { release });
+    assert.equal(await running, release ? 'released' : 'stopped');
+    assert.equal(only(calls, 'release').length, release ? 1 : 0);
+    assert.equal(only(calls, 'heartbeat').length, 0);
+    assert.equal(errors.some(line => /forbidden|backing off|unreachable/.test(line)), false);
+  });
+}
+
+test('stop during pending heartbeat releases promptly and fences late failure', async () => {
+  const { hub, calls } = mockHub({});
+  let entered!: () => void;
+  const pending = new Promise<void>(r => { entered = r; });
+  let fail!: (error: Error) => void;
+  hub.heartbeat = async () => {
+    calls.push({ verb: 'heartbeat' });entered();
+    return new Promise((_resolve, reject) => { fail = reject; });
+  };
+  const loop = createHoldLoop(baseOpts(hub, { sleep: macrotaskSleep }));
+  const running = loop.run();await pending;loop.stop('EOF');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([running, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 100); })]);
+    assert.equal(outcome, 'released');
+  } finally { clearTimeout(timer);fail(new HubError(403, 'late failure'));await running; }
+  await macrotaskSleep();
+  assert.equal(only(calls, 'get_order').length, 1, 'no late failure classification request');
+  assert.equal(only(calls, 'release').length, 1);
+});

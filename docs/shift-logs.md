@@ -64,9 +64,12 @@ artifact waits for a human retry; additional owed paths remain debts because
 
 After a successful command, the worker submits its receipt once for each owed
 path, in order. HTTP `429` is retried for that path at most twice more (up to
-30 seconds total), honoring `Retry-After` or using 5-second then 10-second
-fallback waits. The worker keeps the same receipt and request for every retry;
-it does not retry other HTTP errors or response-level rejections. A lease that
+30 seconds of elapsed time, shortened by forward wall-clock movement), honoring
+`Retry-After` or using 5-second then 10-second
+fallback waits. The worker keeps the same receipt and request for every retry.
+Clock rollback cannot extend the window, and a late timer wake suppresses an
+expired retry. Already-sent responses are consumed normally. It does not retry
+other HTTP errors or response-level rejections. A lease that
 becomes terminal during a wait suppresses the next submit. Retry notices are
 written to the worker's stderr, and rate-limit notices are rendered as
 `HTTP 429 (rate limited)` without relaying the response body. Other HubError

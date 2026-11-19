@@ -49,6 +49,44 @@ function sshKeygenWorks(): boolean {
 }
 const SKIP = !sshKeygenWorks() && 'host ssh-keygen lacks -Y support';
 
+test('spawn adapter cancellation stops its own pending child before normal completion', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-ssh-cancel-'));
+  const marker = join(dir, 'entered');
+  const controller = new AbortController();
+  const script = 'require("node:fs").writeFileSync(process.argv[1], "ready");setTimeout(() => process.exit(0), 500)';
+  const pending = defaultSshProcess.run(process.execPath, ['-e', script, marker], {
+    timeoutMs: 2_000, ...{ signal: controller.signal },
+  });
+  try {
+    const startedAt = Date.now();
+    while (!existsSync(marker)) {
+      assert.ok(Date.now() - startedAt < 5_000, 'own child must reach its startup marker');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.status, null, 'cancellation must not return the delayed successful child exit');
+    assert.equal(result.timedOut, false);
+  } finally {
+    await pending;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('spawn adapter refuses an already-cancelled invocation before spawning', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-ssh-pre-cancel-'));
+  const marker = join(dir, 'should-not-exist');
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    const result = await defaultSshProcess.run(process.execPath, ['-e', 'require("node:fs").writeFileSync(process.argv[1], "unsafe")', marker], {
+      timeoutMs: 2_000, signal: controller.signal,
+    });
+    assert.equal(result.status, null);
+    assert.equal(existsSync(marker), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('spawn adapter handles early stdin close and fails closed on a zero exit', async () => {
   // Keep the child alive after closing its read end so a large pending write
   // reliably reaches the broken pipe on both Linux and macOS.

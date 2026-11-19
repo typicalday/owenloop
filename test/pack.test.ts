@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import ts from 'typescript';
 import { PLUGIN_FILES } from '../scripts/check-npm-package.mjs';
 import { hostileFileEntry, hostileTarball } from './helpers.ts';
 
@@ -261,4 +262,31 @@ test('the npm package validator rejects an unexpected executable mode independen
     /unexpected mode for plugins\/claude-code\/plugin\/skills\/author\/SKILL\.md: expected 644, got 755/,
   );
   assert.doesNotMatch(result.stderr, /duplicate tar path/);
+});
+
+
+test('emitted public package declarations compile for a strict NodeNext consumer', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'owenloop-package-types-'));
+  const consumer = join(directory, 'consumer.mts');
+  writeFileSync(consumer, `import { createEngine, defInstructionDigest, WIRE_SCHEMAS, type WorkflowDef } from ${JSON.stringify(join(ROOT, 'dist/src/index.js'))};
+declare const definition: WorkflowDef;
+const digest: string = defInstructionDigest(definition);
+const schemaId: string = WIRE_SCHEMAS.order.$id;
+const { store } = createEngine({ db: ':memory:', defs: [definition] });
+store.close();
+void digest; void schemaId;
+`);
+  try {
+    const program = ts.createProgram([consumer], {
+      noEmit: true, strict: true, skipLibCheck: false,
+      module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      target: ts.ScriptTarget.ES2022, types: ['node'],
+    });
+    const diagnostics = ts.getPreEmitDiagnostics(program);
+    assert.equal(diagnostics.length, 0, ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+      getCanonicalFileName: path => path, getCurrentDirectory: () => ROOT, getNewLine: () => '\n',
+    }));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

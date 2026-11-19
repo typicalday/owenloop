@@ -608,3 +608,10 @@ test('shift runtime recovers a true command-store miss, installs it, and dispatc
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+
+test('parseArgs requires explicit command-only opt-in and rejects a flag value', () => {
+  assert.equal(parseArgs([]).serveCommands, undefined);
+  assert.equal(parseArgs(['--serve-commands']).serveCommands, true);
+  assert.match(parseArgs(['--serve-commands=false']).error!, /takes no value/);
+});
