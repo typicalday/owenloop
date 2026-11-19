@@ -2814,14 +2814,15 @@ export function collectionLeaseSuccessors(
   if (sealPaths.some((path) => !state.arts.has(path))) return [];
   const withoutLease = state.leases.filter((candidate) => candidate !== lease);
   const result: Array<{ state: CollectionCheckState; step: CheckStep }> = [];
-  const move = (
+  // applyOutcome already returns a fixpoint. Only settle the transitions built here.
+  const addSettledMove = (
     outcome: CheckStep['outcome'], arts: Map<string, ArtifactData>,
     leases = state.leases, count?: number, path?: string,
     routing = state.modifier ?? modifier, pending = state.pendingModifiers,
     selectedModifier?: string,
   ): void => {
     result.push({
-      state: { arts: settleInMemory(def, arts), leases, modifier: routing,
+      state: { arts, leases, modifier: routing,
 	pendingModifiers: pending },
       step: { step: lease.step, key: lease.key, outcome,
 	...(count === undefined ? {} : { count }), ...(path === undefined ? {} : { path }),
@@ -2831,7 +2832,7 @@ export function collectionLeaseSuccessors(
 
   // `close()` always releases the task. It may be the only live action after a
   // seal, a human intervention, or an input move.
-  move('collection-close', new Map(state.arts), withoutLease);
+  addSettledMove('collection-close', settleInMemory(def, new Map(state.arts)), withoutLease);
 
   const singletonPaths = singletonProduces(step)
     .map((produce) => produce.stem)
@@ -2846,7 +2847,7 @@ export function collectionLeaseSuccessors(
     const firing: Firing = { step: lease.step, key: lease.key, inputs: lease.inputs, outputs: [path] };
     for (const arts of applyOutcome(def, state.arts, firing, 'skip',
       { maxCollectionSize, modifier: state.modifier ?? modifier })) {
-      move('skip', arts, state.leases, undefined, path);
+      addSettledMove('skip', arts, state.leases, undefined, path);
     }
   }
 
@@ -2864,7 +2865,7 @@ export function collectionLeaseSuccessors(
       if (!sealPaths.includes(path)
 	  && activeJudgesForStem(def, path, state.modifier ?? modifier).length === 0
 	  && groupWouldReject(def, state.arts, path)) {
-	move('group-reject', new Map(state.arts), state.leases, undefined, path);
+	addSettledMove('group-reject', settleInMemory(def, new Map(state.arts)), state.leases, undefined, path);
 	continue;
       }
       const next = new Map(state.arts);
@@ -2875,7 +2876,7 @@ export function collectionLeaseSuccessors(
 	  text: 'input moved during collection run', fromVersion: target.version,
 	}],
       });
-      move('collection-born-reject', next, withoutLease, undefined, path);
+      addSettledMove('collection-born-reject', settleInMemory(def, next), withoutLease, undefined, path);
     }
     return result;
   }
@@ -2904,7 +2905,7 @@ export function collectionLeaseSuccessors(
 	    const pending = clonePendingModifiers(state.pendingModifiers);
 	    if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
 	    else if (outcome === 'green') delete pending[path];
-	    move(outcome, arts, state.leases, undefined, rejectPath ?? path,
+	    addSettledMove(outcome, arts, state.leases, undefined, rejectPath ?? path,
 	      outcome === 'green' && selectedModifier !== undefined && !submitted
 		? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
 	  }
@@ -2923,7 +2924,7 @@ export function collectionLeaseSuccessors(
     });
     // seal() can repeat while the run remains open; emit() then refuses only
     // for this sealed stem, leaving sibling collections available.
-    move('collection-seal', sealed, state.leases, undefined, sealP);
+    addSettledMove('collection-seal', settleInMemory(def, sealed), state.leases, undefined, sealP);
     if (seal.acceptance === 'green') continue;
 
     const produce = step.produces.find((pattern) => pattern.kind === 'collection' && pattern.stem === stem);
@@ -2944,7 +2945,7 @@ export function collectionLeaseSuccessors(
 	    fingerprint: fp, reasons: [], judgmentRejects: 0, schemaRejects: 0,
 	  });
         }
-        move('collection-emit', next, state.leases, count, sealP);
+	addSettledMove('collection-emit', settleInMemory(def, next), state.leases, count, sealP);
       }
     }
     if (witnesses.invalid !== undefined) {
@@ -2956,7 +2957,7 @@ export function collectionLeaseSuccessors(
 	  text: 'collection member failed schema validation', fromVersion: seal.version,
         }],
       });
-      move('collection-schema-reject', next, state.leases, undefined, sealP);
+      addSettledMove('collection-schema-reject', settleInMemory(def, next), state.leases, undefined, sealP);
     }
   }
   // emit([]) and an emit on a green seal do not change artifacts or the lease;
