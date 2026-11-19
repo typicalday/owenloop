@@ -1,4 +1,63 @@
-# Local hosted order view and Service v1 reference
+# Local hosted order view and versioned Service references
+
+## Held CLI input migration
+
+`work hold --mcp --verified-hosted` explicitly selects the existing independent
+Service v2 reader. It admits declared required inputs and explicit optional
+absence using claim-version witnesses, the verified local declaration, and the
+same hard signed producer-chain verifier used by the ordinary holder. Declared
+values are labeled `trusted-service-claim-version`; producer artifacts retain
+their signed-value label. `inputWitnesses` reports declared input versions and
+presence without inventing a value for an absent input. A human `provideProof`
+attached to a declared input remains advisory and is not producer authority.
+
+The v2 reader is locally configured and uses its own HTTPS transport. MCP text
+and a replaceable HubClient fetch cannot choose its origin, bearer, or response.
+The wrapper binds claim fields and the complete input/workdir witness digest,
+keeps its full private hold checks, and re-reads the independent witness after
+asynchronous proof signing before conditional submission. Witness movement,
+loss, unsupported feedback/routing, or a v1 response refuses exposure and
+pending writes. There is no v1 fallback after v2 selection. The outer real read
+deadline and wall/monotonic freshness checks still apply.
+
+A parent-bound v2 request may resolve to a Service-authorized canonical child.
+The private outer/inner order identities and independent witness must agree on
+that child and the exact requested run. The child is pinned across subsequent
+reads. MCP navigation, HTTPS requests, and conditional writes retain the
+original requested root/run; neither private content nor a later child can
+retarget them. Legacy v1 still requires its original exact workflow binding.
+
+The verified holder also bounds the complete observation to five seconds,
+including its initial and final private holder reads. A real deadline returns
+a refusal when a private read stalls and cancels its normal HTTPS request.
+The request signal also prevents a late credential lookup from starting an
+expired private bearer request. Wall and monotonic elapsed checks cover
+local work that delays the timer callback. Deadline expiry fences late private
+results before exposure, signing, or a conditional write; a fresh healthy read
+can recover. An already cancelled call does not invalidate healthy siblings
+when its deadline expires. This does not forcibly terminate a private transport or verifier
+that ignores cancellation.
+
+Partial conditional submissions may advance only owed target versions. A
+private `get_order`-only mount can refresh those versions; ordinary mutation
+tools cannot select that mode. The wrapper keeps every other private field and
+the input/workdir witness digest pinned, and checks the exact refreshed output
+version again after signing. Each successful private read has a process-local
+result gate, so overlapping reads do not depend on a temporarily empty shared
+cache. A newer refusal or stopped hold invalidates those gates.
+
+For API compatibility, `createDefaultHostedOrderAdapter` retains its existing
+v1 contract unless the local caller explicitly supplies `referenceV2: true`;
+the held CLI supplies that option. `createHostedOrderAdapter` accepts a locally
+constructed v2 reader at its low-level integration seam. The constructor's
+choice is fixed before reading untrusted preflight content. The existing
+`local-hosted-order-v1` projection gains the explicit v2 reference marker and
+declared-input witness labels; no new Service protocol or signer is introduced.
+
+Local v2 optional-input and canonical-child tests do not establish hosted or
+native child execution, signed-feedback authority, or full migration acceptance.
+
+## Legacy v1 adapter contract
 
 `createDefaultHostedOrderAdapter` is an opt-in local order-view component. It
 treats a `client-preflight-v1` MCP reference as a navigation hint only. The
@@ -43,13 +102,17 @@ caps the projected epoch expiry by remaining monotonic time. Unsafe clock
 arithmetic, a delayed response, and expiry during verification refuse. A
 retained projection needs a caller-side monotonic deadline or another `open`
 immediately before use. A claim can change after return, so consequential
-actions require a fresh read and local hold check. A stalled request remains
-a separate liveness concern; the Hub client does not provide an abort signal.
+actions require a fresh read and local hold check. Each read also owns a real
+deadline: expiry returns a bounded refusal and aborts the HTTPS request and
+response body. A stalled credential lookup or local verifier cannot hold the
+caller indefinitely. A late credential cannot start a bearer request, and a
+late transport or verifier cannot publish a verified packet. This does not
+forcibly terminate a credential reader or verifier that ignores cancellation.
 
-`work hold --mcp --verified-hosted` is read-only by default. Its native
+The held CLI is read-only by default. Its native
 `get_order` shows a reduced dynamic model view. The full previously gated
 packet stays inside the process through `readGatedOrder()` and is never an MCP
-registration. The verified wrapper compares the first Service v1 dynamic
+registration. In the legacy adapter contract, the wrapper compares the first Service v1 dynamic
 digest with that private hold, checks stable dynamic fields on later reads,
 and hashes the *whole* local packet before and after verification and signing.
 Only owed target versions may advance under the held claim. Hidden authored
@@ -90,7 +153,38 @@ when the acknowledgment is otherwise refused. The model receives bounded
 status only; raw packets, proof bytes, lease and Service response text remain
 private.
 
-This local source boundary still requires an admitted Service v1 counterpart,
+This local source boundary still requires an admitted matching Service counterpart,
 bearer-authenticated remote proof, signature and enrollment checks at submit
 or downstream consumption, native Jev Linux proof, formal pstack maker/checker,
 and staging and deployment gates before live use.
+
+### Stopping a pending lease read
+
+Hold and exec cancel an in-flight first-contact/lease-probe `get_order` or
+heartbeat when stopped (including MCP stdin EOF). Normal HTTPS requests receive the
+existing cancellation signal. A private client that ignores it cannot delay
+shutdown or deliver a late order to the command runner. An established hold
+still uses the bounded final-breath release unless `release:false` was requested;
+a stop before first contact is confirmed remains `stopped`. Late probe results
+cannot start another heartbeat. This does not roll back a request already sent
+to the Service or force termination of opaque private client work.
+
+Exec also keeps asynchronous instruction resolution and final pre-launch
+revalidation subordinate to its lease. A stop or observed terminal lease prevents
+command launch and releases prepared payload directories while a late private
+result remains fenced. Stop still waits for the existing bounded final release.
+A private resolver may continue its own background work; this fence does not
+forcibly terminate it or roll back effects it already performed.
+
+Receipt signing is subordinate to the same lease fence. A stop or observed
+terminal lease while key inspection/signing is pending prevents a later submit.
+Each send checks the lease again, including a later owed path after an earlier
+receipt acknowledgement. Requests already sent still consume their normal ACK;
+the client does not undo committed receipts or silently retry uncertain writes.
+Private signing work may finish in the background without authorizing a send.
+
+A non-closing payload rejection does not authorize a later failure escalation
+once stop or lease loss has been observed. Exec consumes the rejection ACK,
+then checks the lease before sending an `ask`. Closing or refused rejection
+responses retain their existing outcomes; a healthy failed command still
+rejects first and asks afterward without greening its owed outputs.

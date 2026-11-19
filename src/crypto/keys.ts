@@ -960,10 +960,12 @@ export class PrincipalKeyManager {
    * the record file is a JSON document, not a key file). Reused keys pass only
    * their canonical path. No private text is returned to the caller.
    */
-  async withSigningKey<T>(ref: PrincipalKeyRef, callback: (keyPath: string) => Promise<T>): Promise<T> {
+  async withSigningKey<T>(ref: PrincipalKeyRef, callback: (keyPath: string) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
     assertKeyRef(ref);
     this.ensureDirs();
     const rec = await this.readRecord(ref);
+    signal?.throwIfAborted();
     if (rec === null) {
       throw new CliError(`no ${ref.kind} signing key stored for ${ref.origin} — run owenloop setup`);
     }
@@ -996,7 +998,13 @@ export class PrincipalKeyManager {
       throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (missing key material)`);
     }
     const dir = this.mkTempKeyDir();
+    // A worker may exit on lease loss before an opaque signing callback
+    // settles. Remove only this invocation's temporary copy on cancellation;
+    // the persistent record and reused caller-owned keys are never removed.
+    const removeTemporaryKey = (): void => { rmSync(dir, { recursive: true, force: true }); };
+    signal?.addEventListener('abort', removeTemporaryKey, { once: true });
     try {
+      signal?.throwIfAborted();
       const keyPath = join(dir, 'id');
       writeFileAtomic(keyPath, rec.privateKey, { mode: 0o600 });
       chmodSync(keyPath, 0o600);
@@ -1004,7 +1012,8 @@ export class PrincipalKeyManager {
       writeFileAtomic(`${keyPath}.pub`, `${rec.publicKey}\n`, { mode: 0o644 });
       return await callback(keyPath);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      signal?.removeEventListener('abort', removeTemporaryKey);
+      removeTemporaryKey();
     }
   }
 

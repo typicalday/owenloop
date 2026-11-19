@@ -18,12 +18,12 @@ export function outputFor(step: StepDef, order: OrderPacket, path: string): Prod
     && concreteOutput(produce, order) === path);
 }
 
-export function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
+function validConsumedShape(step: StepDef, order: OrderPacket, allowAbsent: boolean): boolean {
   if (!Array.isArray(order.inputs) || order.inputs.some((path) => typeof path !== 'string')
     || order.consumes === null || typeof order.consumes !== 'object' || Array.isArray(order.consumes)) return false;
   const expected = new Set(order.inputs);
   const delivered = Object.keys(order.consumes);
-  if (expected.size !== order.inputs.length || expected.size !== delivered.length
+  if (expected.size !== order.inputs.length || (!allowAbsent && expected.size !== delivered.length)
     || delivered.some((path) => !expected.has(path))) return false;
   const map = step.consumes.find((pattern) => pattern.mode === 'map');
   if (map) {
@@ -38,11 +38,21 @@ export function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
     if (!(step.on ?? ['inputsGreen']).includes('inputsGreen')) return false;
   } else if ((order.cause !== 'allGreen' && order.cause !== 'idle')
     || !step.on?.includes(order.cause) || expected.size !== 0) return false;
-  return delivered.every((path) => step.consumes.some((pattern) => {
+  return [...expected].every((path) => step.consumes.some((pattern) => {
     if (pattern.mode === 'reduce' && path === sealPath(pattern.stem)) return true;
     const matched = matchConsume(pattern, path);
     return matched !== null && (pattern.mode !== 'map' || matched.index === order.index);
   }));
+}
+
+/** Legacy consume membership remains exact. The v2 input witness gate calls
+ * the shared shape check separately, then proves each absent declared input. */
+export function validConsumedPaths(step: StepDef, order: OrderPacket): boolean {
+  return validConsumedShape(step, order, false);
+}
+
+export function validConsumedStructureV2(step: StepDef, order: OrderPacket): boolean {
+  return validConsumedShape(step, order, true);
 }
 
 /** Bind an order cwd to the local definition. A consumed `workdirFrom` value

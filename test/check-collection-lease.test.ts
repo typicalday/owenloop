@@ -888,3 +888,108 @@ test('collection lease: mixed singleton schema with no valid value cannot invent
   const report = modelCheck(definition, { maxStates: 1000, maxCollectionSize: 1, assumeProvided: true });
   assert.ok(report.coverageIncomplete.includes('collection-mixed-output-values'));
 });
+
+
+for (const mixed of [false, true]) for (const stale of [false, true]) {
+  test(`collection lease: consumer rejection survives sealing mixed=${mixed} stale=${stale}`, () => {
+    const definition = def('collection-consumer-reject', [input('seed', { seedOwed: false })], [
+      step({ name: 'source', consumes: ['seed'], produces: ['x', 'sourceItems[]'] }),
+      step({ name: 'gather', consumes: ['x'], produces: mixed ? ['note', 'items[]'] : ['items[]'] }),
+    ]);
+    const store = openStore(':memory:');
+    const engine = new Engine(store, () => definition);
+    const wf = engine.createInstance(definition.name);
+    const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+    const sourceRun = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'source');
+    assert.ok(sourceRun);
+    assert.equal(engine.green(wf, sourceRun.run, 'x', {}).outcome, 'green');
+    const run = engine.tick(wf, { now: 2000 }).orders.find((order) => order.step === 'gather');
+    assert.ok(run);
+    const lease: CollectionLease = {
+      step: 'gather', key: run.key, stem: 'items', inputs: ['x'], fingerprint: computeFingerprint(arts(), ['x']),
+    };
+    assert.equal(engine.emit(wf, run.run, [{ value: {} }]).outcome, 'emitted');
+    assert.equal(engine.seal(wf, run.run).outcome, 'green');
+    if (stale) assert.equal(engine.green(wf, sourceRun.run, 'x', {}).outcome, 'green');
+    const before: CollectionCheckState = { arts: arts(), leases: [lease] };
+    // Consumer invalidation follows the consume edge, rather than this run's
+    // submission CAS. Exercise the real verb before checking its abstraction.
+    assert.equal(engine.reject(wf, 'x', 'gather', 'redo current input').outcome, 'rejected');
+    assert.equal(store.getArtifact(wf, 'x')?.judgmentRejects, 1);
+    const moves = collectionLeaseSuccessors(definition, before, lease, 1)
+      .filter((m) => m.step.outcome === 'judgment-reject' && m.step.path === 'x');
+    assert.equal(moves.length, 1, `mixed=${mixed}, stale=${stale}: exactly one legal target`);
+    assert.deepEqual(fields(moves[0]!.state.arts), fields(arts()));
+    assert.deepEqual(moves[0]!.state.leases, [lease], 'consumer rejection leaves the claimed run open');
+  });
+}
+
+
+test('collection lease: checker finds the real collection-only consumer rejection witness', () => {
+  const definition = def('collection-reject-witness', [input('seed', { seedOwed: false })], [
+    step({ name: 'source', consumes: ['seed'], produces: ['x'] }),
+    step({ name: 'gather', consumes: ['x'], produces: ['items[]'] }),
+  ]);
+  definition.invariants = [{ name: 'input-never-rejected', requires: { not: { path: 'x', is: 'rejected' } } }];
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const source = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'source');
+  assert.ok(source);
+  assert.equal(engine.green(wf, source.run, 'x', {}).outcome, 'green');
+  engine.close(wf, source.run);
+  assert.ok(engine.tick(wf, { now: 2000 }).orders.some((order) => order.step === 'gather'));
+  assert.equal(engine.reject(wf, 'x', 'gather', 'redo input').outcome, 'rejected');
+  assert.equal(store.getArtifact(wf, 'x')?.acceptance, 'rejected');
+  const report = modelCheck(definition, { maxStates: 2000, maxDepth: 8, maxCollectionSize: 1, assumeProvided: true });
+  const witness = report.invariantViolations.find((entry) => entry.invariant === 'input-never-rejected');
+  assert.deepEqual(witness?.path.map((entry) => [entry.step, entry.outcome]), [
+    ['source', 'green'], ['gather', 'collection-claim'], ['gather', 'judgment-reject'],
+  ]);
+  assert.equal(witness?.path.at(-1)?.path, 'x');
+  assert.ok(report.coverageIncomplete.includes('collection-width-cap'));
+});
+
+
+test('collection lease: stale consumer can reject a newly submitted input and clear partial approvals', () => {
+  const definition = buildDef({ name: 'collection-reject-resubmitted', inputs: [{ name: 'seed', seedOwed: false }],
+    steps: [
+      { name: 'source', consumes: ['seed'], produces: [{ name: 'x', judges: [
+	{ name: 'first', body: 'review' }, { name: 'second', body: 'review' },
+      ] }] },
+      { name: 'gather', consumes: ['x'], produces: ['items[]'], body: 'gather' },
+    ] });
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const wf = engine.createInstance(definition.name);
+  const arts = () => new Map(store.listArtifacts(wf).map((art) => [art.path, art]));
+  const source = engine.tick(wf, { now: 1000 }).orders.find((order) => order.step === 'source');
+  assert.ok(source);
+  assert.equal(engine.green(wf, source.run, 'x', {}).outcome, 'submitted');
+  const reviews = engine.tick(wf, { now: 2000 }).orders;
+  assert.equal(reviews.length, 2);
+  for (const review of reviews) {
+    engine.green(wf, review.run, 'x', {});
+    engine.close(wf, review.run);
+  }
+  assert.equal(store.getArtifact(wf, 'x')?.acceptance, 'green');
+  const gather = engine.tick(wf, { now: 3000 }).orders.find((order) => order.step === 'gather');
+  assert.ok(gather);
+  const lease: CollectionLease = {
+    step: 'gather', key: gather.key, stem: 'items', inputs: ['x'], fingerprint: computeFingerprint(arts(), ['x']),
+  };
+  assert.equal(engine.seal(wf, gather.run).outcome, 'green');
+  assert.equal(engine.green(wf, source.run, 'x', {}).outcome, 'submitted');
+  const review = engine.tick(wf, { now: 4000 }).orders[0];
+  assert.ok(review);
+  assert.equal(engine.green(wf, review.run, 'x', {}).outcome, 'approved');
+  assert.equal(Object.keys(store.getArtifact(wf, 'x')?.approvals ?? {}).length, 1);
+  const before: CollectionCheckState = { arts: arts(), leases: [lease] };
+  assert.equal(engine.reject(wf, 'x', 'gather', 'redo resubmission').outcome, 'rejected');
+  const moves = collectionLeaseSuccessors(definition, before, lease, 1)
+    .filter((entry) => entry.step.outcome === 'judgment-reject' && entry.step.path === 'x');
+  assert.equal(moves.length, 1);
+  assert.deepEqual(fields(moves[0]!.state.arts), fields(arts()));
+  assert.deepEqual(moves[0]!.state.arts.get('x')?.approvals, store.getArtifact(wf, 'x')?.approvals);
+  assert.deepEqual(moves[0]!.state.leases, [lease]);
+});

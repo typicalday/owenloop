@@ -184,6 +184,7 @@ export interface ParsedArgs {
   as?: string;
   name?: string;
   serveCrews?: string[];
+  serveCommands?: boolean;
   cap?: number;
   workflow?: string;
   pollIntervalMs?: number;
@@ -233,6 +234,10 @@ export function parseArgs(args: string[]): ParsedArgs {
     switch (name) {
       case '--once':
         parsed.once = true;
+        break;
+      case '--serve-commands':
+        if (a !== '--serve-commands') return { error: '--serve-commands takes no value' };
+        parsed.serveCommands = true;
         break;
       case '--origin':
       case '--as':
@@ -310,10 +315,11 @@ export function parseArgs(args: string[]): ParsedArgs {
 
 function usage(): void {
   process.stderr.write(
-    'usage: owenloop work shift [--origin <url>] [--as <account>] [--name <n>] [--serve-crews a,b] [--cap <n>]\n' +
+    'usage: owenloop work shift [--origin <url>] [--as <account>] [--name <n>] [--serve-crews a,b] [--serve-commands] [--cap <n>]\n' +
       '                      [--workflow <id>] [--poll-interval <ms>] [--once]\n' +
       '                      [--max-agents <n>] [--exec-reserve <n>] [--local-queue-hold <ms>] [--cache-dir <p>] [--state-dir <p>]\n' +
-      '                      [--log-dir <p>] [--log-max-age <ms>] [--work-root <dir>]...\n',
+      '                      [--log-dir <p>] [--log-max-age <ms>] [--work-root <dir>]...\n' +
+      '  --serve-commands: command-only polls; each command needs a separate Hub admin grant.\n',
   );
 }
 
@@ -682,6 +688,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     stateDir,
     cap,
     serveCrews: parsed.serveCrews ?? [],
+    serveCommands: parsed.serveCommands,
     name,
     shiftOwner,
     commandRouting: settings.commandRouting,

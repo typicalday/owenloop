@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { createServer as createHttpsServer } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,7 +19,8 @@ import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../src/store/index.ts';
-import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { installBundleFixture, installSignedBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { PrincipalKeyManager } from '../../../src/crypto/keys.ts';
 
 // Plan test 12 — integration-style, end to end through the REAL pieces: the
 // default runner (a real child), the real receipt builder, and the REAL hub
@@ -158,6 +161,52 @@ test('e2e: get_order → ≥1 heartbeat (holder on the wire) → run → submit 
   }
 });
 
+test('e2e: a late 429 retry wake sends no expired receipt over HTTP', async () => {
+  const command = 'printf retry-deadline-command';
+  const { origin, reqs, server } = await startMockHub(commandOrder(command));
+  server.removeAllListeners('request');
+  server.on('request', (req, res) => {
+    let raw = '';
+    req.on('data', (chunk: Buffer) => { raw += chunk.toString('utf8'); });
+    req.on('end', () => {
+      const verb = req.url!.replace(/^\/api\//, '');
+      reqs.push({ verb, auth: req.headers.authorization, body: JSON.parse(raw) as Record<string, unknown> });
+      res.setHeader('content-type', 'application/json');
+      if (verb === 'get_order') res.end(JSON.stringify(commandOrder(command)));
+      else if (verb === 'submit' && of(reqs, 'submit').length === 1) {
+	res.writeHead(429, { 'retry-after': '1' });
+	res.end(JSON.stringify({ text: 'limited' }));
+      } else res.end(JSON.stringify({ text: '', outcome: 'green' }));
+    });
+  });
+  let wall = 0;
+  const loop = createExecLoop({
+    hub: createHubClient({ origin, getToken: async () => 'tok-e2e' }),
+    runner: createDefaultRunner(), workflow: 'wf1', run: 'run1', holder: EXEC,
+    instructions: {
+      resolveCommand: async () => ({ ok: true, command }),
+      resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+    },
+    cwd: CWD, now: () => wall,
+    sleep: async (ms) => {
+      if (ms === 1_000) { wall = 30_001; await realSleep(1); }
+      else await new Promise<void>(() => {}); // hold the unrelated heartbeat timer
+    },
+    out: () => {}, err: () => {}, heartbeatIntervalMs: 1_000_000,
+  });
+  try {
+    assert.equal(await loop.run(), 'submit-failed');
+    assert.equal(of(reqs, 'submit').length, 1);
+    assert.equal(of(reqs, 'release').length, 1);
+    const receipt = of(reqs, 'submit')[0]!.body!['value'] as CommandReceipt;
+    assert.equal(receipt.outputHash, `sha256:${createHash('sha256').update('retry-deadline-command').digest('hex')}`);
+  } finally {
+    loop.stop('test-finished');
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('e2e kill drill: signal mid-run → real child killed → release observed, NO submit', async () => {
   const { origin, reqs, server } = await startMockHub(commandOrder('sleep 30'));
   try {
@@ -176,3 +225,195 @@ test('e2e kill drill: signal mid-run → real child killed → release observed,
     server.close();
   }
 });
+
+for (const ending of ['stop', 'lease loss', 'healthy'] as const) {
+  test(`actual exec CLI ${ending} during receipt signing cleans its temporary key`, async () => {
+    const home = tempDir('owenloop-exec-signing-cleanup-');
+    const sourceDir = writeBundleSource({ name: 'signing-exec', workflow: `name: signing-exec
+steps:
+  - name: builder
+    produces: [artifacts/build]
+    terminal: true
+    executor: command
+    command: 'printf signing-cleanup-command'
+` });
+    const signed = await installSignedBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows'), home });
+    const key = join(home, 'tls.key');const cert = join(home, 'tls.crt');
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+    const marker = join(home, 'signing-started');const finished = join(home, 'signing-finished');
+    const order = storeCommandOrder(signed.packed.digest, 'ignored remote command');
+    order.order!.consumedFingerprint = {};
+    order.order!.owes[0]!.version = 1;
+    const seen: string[] = [];
+    const server = createHttpsServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+      seen.push(req.url!);assert.equal(req.headers.authorization, 'Bearer exec-signing-local-test');
+      let raw = '';for await (const chunk of req) raw += String(chunk);
+      if (req.url === '/api/heartbeat' && ending === 'lease loss' && existsSync(marker)) {
+	res.writeHead(403);res.end(JSON.stringify({ error: 'fixture claim revoked' }));return;
+      }
+      if (req.url === '/api/get_order') res.end(JSON.stringify(order));
+      else if (req.url === '/api/submit') {
+	const body = JSON.parse(raw);assert.equal(typeof body.proof, 'string');
+	res.end(JSON.stringify({ text: '', outcome: 'green', closed: true }));
+      } else res.end(JSON.stringify({ text: '' }));
+    });
+    await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+    const address = server.address();assert.ok(address && typeof address !== 'string');
+    const origin = `https://localhost:${address.port}`;
+    await new PrincipalKeyManager({ env: { HOME: home, OWENLOOP_NO_KEYCHAIN: '1' } })
+      .ensure({ origin, kind: 'machine', id: 'local-test-exec' });
+    const realSsh = execFileSync('which', ['ssh-keygen'], { encoding: 'utf8' }).trim();
+    const shimDir = join(home, 'signing-bin');mkdirSync(shimDir);
+    const shim = join(shimDir, 'ssh-keygen');
+    writeFileSync(shim, `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const sign = args[0] === '-Y' && args[1] === 'sign';
+function run() {
+  const result = spawnSync(${JSON.stringify(realSsh)}, args, { stdio: 'inherit' });
+  if (sign) writeFileSync(${JSON.stringify(finished)}, 'finished');
+  process.exit(result.status ?? 1);
+}
+if (sign) {
+  writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ pid: process.pid, keyPath: args[args.indexOf('-f') + 1] }));
+  setTimeout(run, 4000);
+} else run();
+`);
+    chmodSync(shim, 0o700);
+    const child = spawn(process.execPath, [join(import.meta.dirname, '../../../bin/owenloop.mjs'), 'work', 'exec',
+      'wf1/run1', '--origin', origin, '--heartbeat-interval', '25'], {
+      cwd: home, env: { ...process.env, ...signed.env, HOME: home, OWENLOOP_NO_KEYCHAIN: '1',
+	PATH: `${shimDir}:${process.env.PATH ?? ''}`, OWENLOOP_TOKEN: 'exec-signing-local-test',
+	OWENLOOP_CONFIG_DIR: '', OWENLOOP_SESSION: '', NODE_EXTRA_CA_CERTS: cert },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout!.resume();let stderr = '';child.stderr!.on('data', chunk => { stderr += String(chunk); });
+    const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+    let signingProcess: { pid: number; keyPath: string } | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await until(() => existsSync(marker), `CLI reached normal signing: ${stderr}`, 5_000);
+      signingProcess = JSON.parse(readFileSync(marker, 'utf8')) as { pid: number; keyPath: string };
+      if (ending === 'stop') child.kill('SIGTERM');
+      const outcome = await Promise.race([exited, new Promise<'pending'>(resolve => {
+	timer = setTimeout(() => resolve('pending'), ending === 'healthy' ? 6_000 : 2_000);
+      })]);
+      assert.equal(outcome, ending === 'healthy' ? 0 : 1, stderr);
+      assert.equal(existsSync(signingProcess.keyPath), false, 'own materialized private key must be removed before process exit');
+      assert.equal(seen.filter(path => path === '/api/submit').length, ending === 'healthy' ? 1 : 0);
+      assert.equal(seen.filter(path => path === '/api/release').length, ending === 'stop' ? 1 : 0);
+      if (ending !== 'healthy') {
+	assert.equal(existsSync(finished), false, 'cancelled signer must not finish normally');
+	await until(() => {
+	  try { process.kill(signingProcess!.pid, 0); return false; } catch { return true; }
+	}, 'cancelled SSH child stops before its finite delay expires', 2_000);
+      }
+    } finally {
+      clearTimeout(timer);
+      if (child.exitCode === null) child.kill('SIGTERM');
+      await exited;
+      if (signingProcess) await until(() => {
+	try { process.kill(signingProcess!.pid, 0); return false; } catch { return true; }
+      }, 'own finite SSH fixture exited', 6_000);
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+}
+
+test('actual exec CLI stop while signed bundle recovery is pending exits without a command launch', async () => {
+  const home = tempDir('owenloop-exec-recovery-stop-');
+  const marker = join(home, 'command-ran');
+  const sourceDir = writeBundleSource({ name: 'stopped-exec', workflow: `name: stopped-exec
+steps:
+  - name: builder
+    produces: [out]
+    terminal: true
+    executor: command
+    command: 'echo unsafe-late-launch > "${marker}"'
+` });
+  const signed = await installSignedBundleFixture({ sourceDir, root: join(home, 'remote-publication'), home });
+  assert.equal(signed.source.kind, 'file');
+  const publication = readFileSync(`${signed.source.path}.dsse`);
+  const key = join(home, 'tls.key');const cert = join(home, 'tls.crt');
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+    '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+  let entered!: () => void;const pending = new Promise<void>(r => { entered = r; });
+  let resume!: () => void;const blocked = new Promise<void>(r => { resume = r; });
+  const seen: string[] = [];
+  const server = createHttpsServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+    seen.push(req.url!);assert.equal(req.headers.authorization, 'Bearer exec-stop-local-test');
+    for await (const _chunk of req) { /* drain the ordinary request body */ }
+    if (req.url === `/api/bundles/${signed.packed.digest}`) {
+      entered();await blocked;res.writeHead(200, { 'content-type': 'application/octet-stream' });res.end(signed.packed.bytes);
+    } else if (req.url === `/api/publications/${signed.packed.digest}`) {
+      res.writeHead(200, { 'x-owenloop-publication-state': 'signed' });res.end(publication);
+    } else if (req.url?.startsWith('/api/origins/')) { res.writeHead(404);res.end(); }
+    else if (req.url === '/api/get_order') res.end(JSON.stringify(storeCommandOrder(signed.packed.digest, 'ignored remote command')));
+    else res.end(JSON.stringify({ text: '' }));
+  });
+  await new Promise<void>(r => server.listen(0, 'localhost', r));
+  const address = server.address();assert.ok(address && typeof address !== 'string');
+  const child = spawn(process.execPath, [join(import.meta.dirname, '../../../bin/owenloop.mjs'), 'work', 'exec',
+    'wf1/run1', '--origin', `https://localhost:${address.port}`, '--heartbeat-interval', '25'], {
+    cwd: home,env: { ...process.env, ...signed.env, OWENLOOP_TOKEN: 'exec-stop-local-test',
+      OWENLOOP_CONFIG_DIR: '', OWENLOOP_SESSION: '', OWENLOOP_DEF_POLICY: 'enforce', NODE_EXTRA_CA_CERTS: cert },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';child.stderr!.on('data', data => { stderr += String(data); });child.stdout!.resume();
+  const exited = new Promise<number | null>(r => child.once('exit', r));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([pending, exited.then(code => { throw new Error(`CLI exited before recovery: ${code}: ${stderr}`); })]);
+    child.kill('SIGTERM');
+    const outcome = await Promise.race([exited, new Promise<'pending'>(r => { timer = setTimeout(() => r('pending'), 2_000); })]);
+    assert.equal(outcome, 1, `CLI must exit while resolver remains blocked: ${stderr}`);
+    assert.equal(existsSync(marker), false);
+    assert.equal(seen.filter(path => path === '/api/release').length, 1);
+    assert.equal(seen.some(path => ['/api/submit', '/api/ask', '/api/reject'].includes(path)), false);
+  } finally {
+    clearTimeout(timer);resume();await exited;
+    await new Promise<void>(r => server.close(() => r()));
+  }
+});
+
+for (const ending of ['stop', 'lease loss', 'healthy'] as const) {
+  test(`e2e: ${ending} during payload reject ACK preserves reject-first failure escalation boundary`, async () => {
+    const reqs: HubReq[] = [];let revoked = false;let rejectAck!: () => void;
+    const server = createServer((req, res) => {
+      let raw = '';req.on('data', (chunk: Buffer) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+	const verb = (req.url ?? '').replace(/^\/api\//, '');
+	reqs.push({ verb, auth: req.headers.authorization, body: JSON.parse(raw) as Record<string, unknown> });
+	res.setHeader('content-type', 'application/json');
+	if (verb === 'get_order') res.end(JSON.stringify(commandOrder('local fixture')));
+	else if (verb === 'reject') rejectAck = () => res.end(JSON.stringify({ text: 'rejected non-consumed input', ok: true, closed: false }));
+	else if (verb === 'heartbeat' && revoked) { res.statusCode = 403;res.end(JSON.stringify({ error: 'claim revoked' })); }
+	else if (verb === 'ask') res.end(JSON.stringify({ text: '', ok: true, closed: true }));
+	else res.end(JSON.stringify({ text: '' }));
+      });
+    });
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as AddressInfo;
+    const loop = loopAgainst(`http://127.0.0.1:${port}`,
+      `printf '%s' '{"reject":{"path":"input","text":"invalid upstream"}}' > "$OWENLOOP_PAYLOAD_FILE"; exit 1`);
+    const running = loop.run();
+    try {
+      await until(() => rejectAck !== undefined, 'pending reject ACK');
+      assert.equal(of(reqs, 'ask').length, 0);
+      if (ending === 'stop') { loop.stop('signal');await until(() => of(reqs, 'release').length === 1, 'final release'); }
+      else if (ending === 'lease loss') {
+	revoked = true;const beats = of(reqs, 'heartbeat').length;
+	await until(() => of(reqs, 'heartbeat').length > beats, 'revoked heartbeat');await realSleep(20);
+      }
+      rejectAck();
+      const outcome = await running;
+      assert.deepEqual({ outcome, rejects: of(reqs, 'reject').length, asks: of(reqs, 'ask').length, submits: of(reqs, 'submit').length },
+	{ outcome: ending === 'stop' ? 'killed' : ending === 'lease loss' ? 'ownership-error' : 'command-failed',
+	  rejects: 1, asks: ending === 'healthy' ? 1 : 0, submits: 0 });
+      for (const r of reqs) assert.equal(r.auth, 'Bearer tok-e2e');
+      if (ending === 'healthy') assert.ok(reqs.findIndex(r => r.verb === 'reject') < reqs.findIndex(r => r.verb === 'ask'));
+    } finally { rejectAck?.();loop.stop('test cleanup');await running;server.closeAllConnections();server.close(); }
+  });
+}

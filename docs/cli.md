@@ -284,6 +284,13 @@ self-driven dispatch loop as a foreground process and listens on
 and one JSON-line response. The daemon keeps polling and dispatching while no
 `shift next` client is attached.
 
+Run `owenloop work shift --serve-commands` to poll for commands granted to the
+worker by a Hub administrator. Direct MCP clients can call
+`whats_next_commands_v1`. Command-only inbox and targeted requests use
+`POST /api/command_lane/v1/whats_next`. An older Hub returns an unsupported
+route or tool error, and the worker leaves ordinary jobs available to their
+assigned crews.
+
 The public daemon transport is supported on macOS and Linux. Windows support is
 explicitly limited to the direct `owenloop work shift` loop: the public
 `owenloop shift start|next|status|end` daemon is unavailable because Windows
@@ -767,6 +774,31 @@ is present; MCP tool arguments cannot set it. The existing definition and origin
 policies still apply: `warn` reports unsigned or unadmitted publications while
 `enforce` refuses them. Static task instructions and output schemas are resolved
 locally, never taken from the hub packet.
+
+The ordinary `hold --mcp` client requires the Service's authenticated
+`reference_order/v2` read over HTTPS for every order with declared input paths,
+including orders whose inputs are all supplied. It does not select legacy
+verification based on input presence. These input-bearing orders require a
+verified publication even under `defPolicy=warn`; an older Service without v2
+cannot serve them through this client. Zero-input static orders and the Service's
+generic MCP legacy responses retain their existing compatibility during migration.
+An input-derived `workdirFrom` also requires the independent witness when the
+step does not consume that input. The holder determines this from the locally
+resolved declaration; an empty packet input list cannot bypass the cwd check.
+
+When an input has no supplied value, the locally verified publication must
+declare it optional (`seedOwed: false`) and the Service must witness its absence
+at the exact claimed version. The
+model receives an `inputWitnesses` entry with `present: false`; no value is
+invented.
+Producer artifacts still require signed value and producer-chain verification.
+
+The holder rechecks the live order and input witnesses before writes, including
+a second check after submission signing. A moved input version or value, lost
+claim, unavailable Service witness, or unsupported feedback refuses the operation.
+The v2 holder cannot fall back to legacy verification. Rework feedback and
+routing require their separate authority migration; this input protocol does
+not authorize them.
 
 Route siblings can be submitted when the Service projects them as owed by the
 current run. An older Service that cannot project a sibling's issued target

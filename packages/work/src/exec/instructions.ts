@@ -16,7 +16,7 @@ import type { BundleIngestor, MissingObjectHandler, StoreInstructionSource } fro
 import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
 import { compareStoreText, parseWorkflowCoordinate } from '../../../../src/store/types.ts';
-import type { StepDef, WorkflowDef } from '../../../../src/types.ts';
+import type { InputDef, StepDef, WorkflowDef } from '../../../../src/types.ts';
 import type { DefPolicy, DefVerdict } from '../../../../src/crypto/verify-publication.ts';
 import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
 import type { OriginRuleMatch, OriginRules } from '../../../../src/crypto/origin-rules.ts';
@@ -73,6 +73,9 @@ export interface ResolvedStep {
 /** Static step and calls-boundary facts from one verified local publication. */
 export interface ResolvedHostedStep extends ResolvedStep {
   callsProducers: Readonly<Record<string, VerifiedCallsProducer>>;
+  /** Input and modifier declarations from the same verified publication. */
+  declaredInputs: readonly InputDef[];
+  allowedModifiers?: readonly string[];
 }
 
 export interface InstructionResolver {
@@ -518,6 +521,8 @@ export function createStoreInstructionResolver(
 	  ok: true,
 	  step: resolved.step,
 	  inputNames: resolved.definition.inputs.map((input) => input.name),
+	  declaredInputs: resolved.definition.inputs,
+	  allowedModifiers: resolved.definition.modifiers ?? [],
 	  callsProducers: calls.producers ?? {},
 	  ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}),
       };

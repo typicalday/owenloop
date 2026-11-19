@@ -854,6 +854,55 @@ test('real keygen: withSigningKey materializes a 0600 key in a temp dir that is 
   assert.ok(!existsSync(dirname(observed.path)), 'temp dir removed after the callback');
 });
 
+test('real keygen: cancellation removes only the temporary signing material before callback settlement', { skip: SKIP }, async () => {
+  const home = freshHome();
+  const m = new PrincipalKeyManager({ env: {}, backend: 'file', homeDir: home, tempDir: home });
+  await m.ensure(REF);
+  const controller = new AbortController();
+  let entered!: () => void;const started = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;const blocked = new Promise<void>(resolve => { release = resolve; });
+  let keyPath = '';
+  const recordPath = join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.json`);
+  const record = readFileSync(recordPath, 'utf8');
+  const pending = m.withSigningKey(REF, async path => {
+    keyPath = path;entered();await blocked;
+  }, controller.signal);
+  await started;
+  try {
+    assert.equal(existsSync(keyPath), true);
+    controller.abort();
+    assert.equal(existsSync(keyPath), false, 'the caller may exit before the opaque callback settles');
+    assert.equal(readFileSync(recordPath, 'utf8'), record, 'the stored identity is untouched');
+  } finally { release();await pending; }
+});
+
+test('real keygen: an aborted signing operation never materializes a new temporary key', { skip: SKIP }, async () => {
+  const home = freshHome();
+  const m = new PrincipalKeyManager({ env: {}, backend: 'file', homeDir: home, tempDir: home });
+  await m.ensure(REF);
+  const controller = new AbortController();controller.abort();
+  let called = false;
+  await assert.rejects(m.withSigningKey(REF, async () => { called = true; }, controller.signal), { name: 'AbortError' });
+  assert.equal(called, false);
+  assert.equal(readdirSync(home).some(name => name.startsWith('owenloop-key-')), false);
+});
+
+test('real keygen: cancellation preserves the caller-owned reused signing key', { skip: SKIP }, async () => {
+  const home = freshHome();
+  const candidate = join(home, 'reused-key');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', candidate], { stdio: 'ignore' });
+  const original = readFileSync(candidate);
+  const m = new PrincipalKeyManager({ env: {}, backend: 'file', homeDir: home });
+  await m.ensure(REF, { reuse: { path: candidate } });
+  const controller = new AbortController();
+  await m.withSigningKey(REF, async path => {
+    assert.equal(path, realpathSync(candidate));
+    controller.abort();
+    assert.deepEqual(readFileSync(candidate), original);
+  }, controller.signal);
+  assert.deepEqual(readFileSync(candidate), original);
+});
+
 test('real keygen: withSigningKey on a missing store errors pointing at setup', { skip: SKIP }, async () => {
   const home = freshHome();
   const m = new PrincipalKeyManager({ env: {}, backend: 'file', homeDir: home });
