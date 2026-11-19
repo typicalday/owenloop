@@ -3136,25 +3136,28 @@ hub does not create, sign, or endorse the grant.
 
 ## `enrollments` — inspect machine enrollment
 
-`owenloop enrollments [--hub <url>]` fetches the hub's relayed DSSE envelopes and
-verifies each entry locally. The command is read-only: it does not call key
-creation, does not sign a grant, and does not POST to the hub. The command uses
-the local `allowed_signers` trust root when one is configured.
+`owenloop enrollments [--hub <url>]` fetches the hub roster and checks each
+grant and revocation against the public `org-root.pub` in the local Owenloop
+configuration directory. It uses the signed records from the relay and the
+local `grants/` and `revocations/` directories. It uses only public material
+and performs no roster writes.
 
-The command prints `{ ok, hub, enrollments }` on stdout. Each entry has one of
-four verdicts:
+The command prints `{ ok, hub, enrollments }` with one verdict per returned
+row in its original order.
 
-| verdict | meaning |
+| Verdict | Meaning |
 |---|---|
-| `enrolled` | the grant payload and DSSE signature are valid, the signer is in the local `allowed_signers` root, and an enrollment-chain validator approved the grant |
-| `unenrolled` | no envelope was supplied for the roster entry |
-| `unverifiable` | verification cannot establish trust, including a missing `allowed_signers` root or the D1 fail-closed state where no chain validator is installed |
-| `invalid` | the envelope, payload, schema, signer authorization, signature, or chain-validator result is invalid |
+| `enrolled` | The subject key and principal have a valid, scope-attenuated grant chain to the local root at the time of the check. |
+| `revocation` | A verified revocation names this key. Its signed `effectiveFrom` timestamp determines when it applies. |
+| `unverifiable` | A required local trust anchor, file or verification tool is unavailable. |
+| `invalid` | The chain is missing, revoked or invalid, or the roster contains malformed or conflicting evidence. |
 
-WP-D1 intentionally does not install an enrollment-chain validator. Therefore a
-well-formed, correctly signed D1 grant is reported as `unverifiable` until WP-D4
-installs the validator. This prevents a signature from being mistaken for proof
-that the grantor is enrolled.
+Identical evidence from the local store and the relay can support the same
+chain. A local parent grant can authenticate a relayed child. Only relayed
+rows appear in the output. The command requires a whole-roster HTTP 200
+response. Partial responses, HTTP `Link` or `Content-Range` headers, and unrecognized wrapper
+metadata stop the check before it reports any enrollment. The verdict covers
+the records supplied by the hub and the local store at the time of the check.
 
 A missing human credential is exit `3`; hub, malformed-response, and other
 runtime failures are exit `1`; successful classification is exit `0`.

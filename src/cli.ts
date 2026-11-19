@@ -101,9 +101,8 @@ import {
 } from './crypto/dsse.ts';
 import { assertEd25519PubText, createSshSigner, SshSignerError } from './crypto/ssh.ts';
 import { publicKeyDescriptor } from './crypto/keys.ts';
-import { DEFAULT_MACHINE_SCOPE, buildEnrollmentGrant, verifyRosterEntry } from './crypto/enrollment.ts';
-import type { RosterVerdict } from './crypto/enrollment.ts';
-import { resolveAllowedSigners } from './crypto/trust-roots.ts';
+import { DEFAULT_MACHINE_SCOPE, buildEnrollmentGrant } from './crypto/enrollment.ts';
+import { enrollmentRosterStatuses } from './crypto/roster-status.ts';
 import type {
   EnrollmentGrantRecord,
   OriginRecord,
@@ -113,6 +112,8 @@ import type {
   RevocationRecord,
 } from './crypto/records.ts';
 import {
+  loadGrants,
+  loadRevocations,
   orgRootPrivateKeyPath,
   orgRootPublicKeyPath,
   resolveOrgRoot,
@@ -1629,7 +1630,7 @@ ${' '.repeat(41)}remove one hub roster row (human admin credential)
 ${' '.repeat(41)}replace a harness's hub model snapshot (human admin credential)
     roster sync [--hub <url>] [--as agent|agent:<account>]
 ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
-  enrollments [--hub <url>]               list the hub's relayed machine enrollment grants (read-only)
+  enrollments [--hub <url>]               verify the hub's relayed enrollment grants and revocations
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
   shift start|next|status|end [args]      run and attend a local Unix-socket shift daemon
@@ -8771,15 +8772,35 @@ function enrollmentEnvelopeNewKeyId(value: unknown): string | undefined {
   }
 }
 
-function enrollmentEnvelopesFromResponse(body: unknown): unknown[] {
-  if (Array.isArray(body)) return body.map((row) => recordOf(row)?.envelope ?? row);
+async function readEnrollmentEnvelopes(res: Response): Promise<unknown[]> {
+  // The roster endpoint has no paging contract. A page can omit a revocation.
+  if (res.status !== 200 || res.headers.has('content-range') || res.headers.has('link')) {
+    throw new CliError('enrollments: expected a complete, unpaginated roster response');
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new CliError('enrollments: malformed response — body is not valid JSON');
+  }
+  const unwrap = (row: unknown): unknown => {
+    const wrapper = recordOf(row);
+    return wrapper !== null && Object.hasOwn(wrapper, 'envelope') ? wrapper.envelope : row;
+  };
+  if (Array.isArray(body)) return body.map(unwrap);
   const record = recordOf(body);
   if (record === null) throw new CliError('enrollments: malformed response — expected an array of entries');
-  for (const key of ['enrollments', 'entries', 'envelopes', 'items']) {
-    const rows = record[key];
-    if (Array.isArray(rows)) return rows.map((row) => recordOf(row)?.envelope ?? row);
+  const fields = ['enrollments', 'entries', 'envelopes', 'items', 'envelope'].filter(key => Object.hasOwn(record, key));
+  if (fields.length > 1) throw new CliError('enrollments: ambiguous response — multiple roster fields');
+  if (fields.length === 1) {
+    const field = fields[0]!;
+    if (Object.keys(record).some(key => key !== field && key !== 'ok') || ('ok' in record && record.ok !== true)) {
+      throw new CliError('enrollments: unsupported roster metadata, cannot establish a complete listing');
+    }
+    if (field === 'envelope') return [record.envelope];
+    const rows = record[field];
+    if (Array.isArray(rows)) return rows.map(unwrap);
   }
-  if (record.envelope !== undefined) return [record.envelope];
   throw new CliError('enrollments: malformed response — expected an array of entries');
 }
 
@@ -8821,7 +8842,7 @@ async function registerMachineEnrollment(
 
   let existing: unknown[];
   try {
-    existing = enrollmentEnvelopesFromResponse(await list.res.json());
+    existing = await readEnrollmentEnvelopes(list.res);
   } catch (error) {
     return noted(error instanceof CliError ? error.message : 'hub enrollment listing was not valid JSON');
   }
@@ -9166,8 +9187,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
 /**
  * `owenloop enrollments` — read the hub's relayed DSSE envelopes and classify
  * each roster entry locally. This command never creates keys and never writes a
- * roster entry. D1 intentionally installs no chain validator, so a valid signed
- * grant is visible as `unverifiable` until WP-D4 supplies that validator.
+ * roster entry. The public organization anchor authenticates the chain.
  */
 async function dispatchEnrollments(io: CliIO, args: Args): Promise<number> {
   const origin = resolveSetupHub(io, args);
@@ -9180,31 +9200,25 @@ async function dispatchEnrollments(io: CliIO, args: Args): Promise<number> {
   const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/enrollments');
   assertAuthOk(res, used, origin);
 
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch {
-    throw new CliError('enrollments: malformed response — body is not valid JSON');
-  }
-  let envelopes: unknown[];
-  try {
-    envelopes = enrollmentEnvelopesFromResponse(body);
-  } catch (error) {
-    throw new CliError(error instanceof Error ? error.message : 'enrollments: malformed response');
-  }
+  const envelopes = await readEnrollmentEnvelopes(res);
 
-  let allowedSignersText: string | undefined;
+  let root: ReturnType<typeof resolveOrgRoot>;
+  let localGrants: Uint8Array[];
+  let localRevocations: Uint8Array[];
   try {
-    const roots = resolveAllowedSigners(io.env);
-    allowedSignersText = roots.kind === 'present' ? roots.text : undefined;
+    root = resolveOrgRoot(io.env);
+    localGrants = loadGrants(io.env);
+    localRevocations = loadRevocations(io.env);
   } catch {
-    allowedSignersText = undefined;
+    const reason = 'local organization enrollment trust material could not be read';
+    print(io, { ok: true, hub: origin, enrollments: envelopes.map(() => ({ kind: 'unverifiable', reason })) });
+    return 0;
   }
-
-  const verdicts: RosterVerdict[] = [];
-  for (const envelope of envelopes) {
-    verdicts.push(await verifyRosterEntry({ envelope, allowedSignersText }));
-  }
+  const verdicts = await enrollmentRosterStatuses({
+    envelopes, localGrants, localRevocations,
+    orgRootPublicKey: root.kind === 'present' ? root.publicKey : undefined,
+    at: Date.now(),
+  });
   print(io, { ok: true, hub: origin, enrollments: verdicts });
   return 0;
 }
