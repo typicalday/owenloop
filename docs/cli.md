@@ -284,6 +284,13 @@ self-driven dispatch loop as a foreground process and listens on
 and one JSON-line response. The daemon keeps polling and dispatching while no
 `shift next` client is attached.
 
+Run `owenloop work shift --serve-commands` to poll for commands granted to the
+worker by a Hub administrator. Direct MCP clients can call
+`whats_next_commands_v1`. Command-only inbox and targeted requests use
+`POST /api/command_lane/v1/whats_next`. An older Hub returns an unsupported
+route or tool error, and the worker leaves ordinary jobs available to their
+assigned crews.
+
 The public daemon transport is supported on macOS and Linux. Windows support is
 explicitly limited to the direct `owenloop work shift` loop: the public
 `owenloop shift start|next|status|end` daemon is unavailable because Windows

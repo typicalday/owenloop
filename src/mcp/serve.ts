@@ -588,18 +588,30 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 25 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 25, plus `createAgentTool`, plus the four crew tools from
+ * set: these tools, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
  */
 function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
+  const commandWhatsNext = async (args: Record<string, unknown>) => {
+    const result = await callHub(deps, { method: 'POST', path: '/api/command_lane/v1/whats_next',
+      body: { serve_capabilities: [], ...args, serve_commands: true } });
+    if (result.authFailed) return errorText(result.authMessage ?? loginHint(deps.origin));
+    if (isOk(result.status) && (!isObject(result.json) || result.json['command_lane'] !== 'grant-v1'
+      || (result.json['orders'] !== undefined && (!Array.isArray(result.json['orders'])
+	|| result.json['orders'].some(order => !isObject(order) || order['worker'] !== 'command'))))) {
+      return errorText('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
+    }
+    return toolResultFromRest(result);
+  };
+  const ordinaryWhatsNext = passthrough(deps, args => ({ method: 'POST', path: '/api/whats_next', body: args }));
   return [
     {
       name: 'whats_next',
@@ -621,19 +633,23 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 	},
         additionalProperties: false,
       },
-      handler: async (a) => {
-        const commandOnly = a['serve_commands'] === true;
-        const r = await callHub(deps, { method: 'POST', path: '/api/whats_next',
-          body: commandOnly ? { serve_capabilities: [], ...a } : a });
-        if (r.authFailed) return errorText(r.authMessage ?? loginHint(deps.origin));
-        if (commandOnly && isOk(r.status) && (!isObject(r.json)
-          || r.json['command_lane'] !== 'grant-v1'
-          || (r.json['orders'] !== undefined && (!Array.isArray(r.json['orders'])
-            || r.json['orders'].some(order => !isObject(order) || order['worker'] !== 'command'))))) {
-          return errorText('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
-        }
-        return toolResultFromRest(r);
+      handler: (a, ctx) => a['serve_commands'] === true
+	? commandWhatsNext(a)
+	: ordinaryWhatsNext(a, ctx),
+    },
+    {
+      name: 'whats_next_commands_v1',
+      description: 'List command work or claim a command through the versioned grant lane. An older Hub refuses without claiming ordinary work.',
+      inputSchema: {
+	type: 'object',
+	properties: {
+	  workflow: { type: 'string' },
+	  serve_crews: { type: 'array', items: { type: 'string' } },
+	  serve_capabilities: { type: 'array', items: { type: 'string' } },
+	},
+	additionalProperties: false,
       },
+      handler: commandWhatsNext,
     },
     {
       name: 'grant_command_lane',

@@ -324,6 +324,7 @@ test('command-only transport carries opt-in and refuses a legacy or mixed respon
   const c = client(fakeFetch(captured, { body: { text: '', command_lane: 'grant-v1', orders: [], instances: [] } }));
   await c.whatsNext({ serve_capabilities: [], serve_commands: true });
   await c.wake(3, undefined, true);
+  assert.equal(captured[0]!.url, 'https://hub.example/api/command_lane/v1/whats_next');
   assert.deepEqual(captured[0]!.body, { serve_capabilities: [], serve_commands: true });
   assert.equal(captured[1]!.url, 'https://hub.example/api/wake?cursor=3&serve_commands=true');
   for (const body of [{ text: '', orders: [] }, { text: '', command_lane: 'grant-v1', orders: [{ worker: 'agent' }] }]) {

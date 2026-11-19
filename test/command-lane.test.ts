@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { createHubClient } from '../packages/work/src/hub/client.ts';
 import { Engine } from '../src/engine.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
 import { openStore } from '../src/store.ts';
@@ -100,4 +101,33 @@ test('a nonboolean or asynchronous command predicate cannot create a claim', () 
       assert.deepEqual(engine.tick(wf, { capabilities: ['unbound'], commandClaims: () => true }).orders.map(o => o.step), ['command']);
     } finally { store.close(); }
   }
+});
+
+test('a command-only client leaves ordinary jobs available on a legacy Hub', async () => {
+  const legacy = def('legacy-hub', [], [
+    step({ name: 'ordinary', produces: ['result'], body: 'Ordinary work' }),
+  ]);
+  const { engine, store } = fixture([legacy]);
+  try {
+    const workflow = engine.createInstance(legacy.name);
+    const paths: string[] = [];
+    const hub = createHubClient({ origin: 'https://hub.example', getToken: async () => 'fixture',
+      fetchImpl: async (url, init) => {
+	const path = new URL(String(url)).pathname;
+	paths.push(path);
+	if (path !== '/api/whats_next') return Response.json({ error: 'not_found' }, { status: 404 });
+	const req = JSON.parse(String(init?.body));
+	if (!req.workflow) return Response.json({ text: '', instances: [{ workflow }] });
+	// Legacy Service still permits a capability-silent step with an empty serving set.
+	const result = engine.tick(req.workflow, { capabilities: ['no-bound-capabilities'] });
+	return Response.json({ text: '', orders: result.orders });
+      } });
+    await assert.rejects(hub.whatsNext({ serve_commands: true, serve_capabilities: [] }), { status: 404 });
+    await assert.rejects(hub.whatsNext({ workflow, serve_commands: true, serve_capabilities: [] }), { status: 404 });
+    assert.deepEqual(paths, ['/api/command_lane/v1/whats_next', '/api/command_lane/v1/whats_next']);
+    assert.equal(store.listRuns(workflow).length, 0);
+    const ordinary = await hub.whatsNext({ workflow, serve_capabilities: [] });
+    assert.deepEqual(ordinary.orders?.map(order => order.step), ['ordinary']);
+    assert.equal(store.listRuns(workflow).length, 1);
+  } finally { store.close(); }
 });

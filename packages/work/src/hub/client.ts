@@ -249,7 +249,9 @@ export function createHubClient(opts: HubClientOptions): HubClient {
 
   return {
     whatsNext: async (req, signal) => {
-      const result = await post<WhatsNextResponse>('whats_next', req, signal);
+      // A legacy targeted poll may create a claim before its response can be checked.
+      const path = req.serve_commands ? 'command_lane/v1/whats_next' : 'whats_next';
+      const result = await post<WhatsNextResponse>(path, req, signal);
       if (req.serve_commands && (result.command_lane !== 'grant-v1' || result.orders?.some(order => order.worker !== 'command'))) {
         throw new Error('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
       }
