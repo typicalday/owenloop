@@ -180,7 +180,7 @@ function orderPacket() {
   };
 }
 
-test('idle next blocks, dispatch wakes it, a second next parks, and a third terminal ends the shift', async () => {
+test('an idle command-only shift parks next, dispatches a granted command, and ends from another terminal', async () => {
   let dispatchEnabled = false;
   let dispatchAt: number | undefined;
   let orderVisible = true;
@@ -195,18 +195,21 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
   const { origin, reqs, server } = await startMockHub((verb, body) => {
     if (verb === 'presence_ping') return { text: '', ok: true, name: String(body?.['name'] ?? 'shift'), lastSeen: Date.now() };
     if (verb === 'wake') return { text: '', cursor: dispatchEnabled ? 2 : 1, changed: dispatchEnabled };
-    if (verb === 'whats_next') {
+    if (verb === 'command_lane/v1/whats_next') {
       if (body?.['workflow'] === undefined) {
         return {
           text: '',
+	  command_lane: 'grant-v1',
           instances: [{ workflow: 'wf_blocking', def: 'demo', done: false, eligible: 1, blocked: 0, owedSeededInputs: [] }],
         };
       }
       if (dispatchEnabled && orderVisible) {
         orderVisible = false;
         dispatchAt = Date.now();
-        return { text: '', workflow: 'wf_blocking', def: 'demo', orders: [{
+	return { text: '', command_lane: 'grant-v1', workflow: 'wf_blocking', def: 'demo', orders: [{
           workflow: 'wf_blocking',
+	  worker: 'command',
+	  defDigest: localDefDigest,
           run: 'run_blocking',
           step: 'cmd',
           prompt: '',
@@ -217,7 +220,7 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
           submit_hint: '',
         }] };
       }
-      return { text: '', workflow: 'wf_blocking', def: 'demo', orders: [] };
+      return { text: '', command_lane: 'grant-v1', workflow: 'wf_blocking', def: 'demo', orders: [] };
     }
     if (verb === 'get_order') return { text: '', workflow: 'wf_blocking', run: 'run_blocking', order, lease: { claimed: true } };
     if (verb === 'heartbeat') return { text: '' };
@@ -233,7 +236,7 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     assert.deepEqual(jsonResult(noDaemonResult), { status: 'no daemon', socket: join(stateDir, 'shift.sock') });
 
     shift = spawnShift(
-      ['crew-blocking', '--origin', origin, '--cap', '1', '--poll-interval', '25', '--cache-dir', cacheDir, '--state-dir', stateDir],
+      ['crew-blocking', '--serve-commands', '--origin', origin, '--cap', '1', '--poll-interval', '25', '--cache-dir', cacheDir, '--state-dir', stateDir],
       env(),
     );
     await shift.ready;
@@ -271,6 +274,12 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     assert.ok(dispatchLatency < 2_000, `dispatch-to-return latency was ${dispatchLatency}ms`);
     const firstResponse = jsonResult<{ events: Array<{ type: string }> }>(firstResult);
     assert.ok(firstResponse.events.some((event) => event.type === 'dispatched'), JSON.stringify(firstResponse));
+
+    const lanePolls = requests(reqs, 'command_lane/v1/whats_next');
+    assert.ok(lanePolls.some(request => request.body?.['workflow'] === undefined));
+    assert.ok(lanePolls.some(request => request.body?.['workflow'] === 'wf_blocking'));
+    assert.ok(lanePolls.every(request => request.body?.['serve_commands'] === true));
+    assert.equal(requests(reqs, 'whats_next').length, 0);
 
     const secondNext = runCli(['shift', 'next', '--wait', '90', '--state-dir', stateDir]);
     // The exact overlap result proves secondNext owns the daemon's single
