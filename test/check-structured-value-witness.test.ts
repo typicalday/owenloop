@@ -59,6 +59,63 @@ test('checker leaves a genuinely unsampled valid class incomplete', () => {
   assert.ok(report.unreachedSteps.includes('consume'));
 });
 
+test('anchored string samples can open a nested receipt with hashes, names and an escaped URL', () => {
+  const slug = '[A-Za-z0-9_.-]+';
+  const schema = { type: 'object', required: ['receipt'], properties: {
+    receipt: { type: 'object', required: ['hash', 'pair', 'url'], properties: {
+      hash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+      pair: { type: 'string', pattern: `^${slug}/${slug}$`, minLength: 12 },
+      url: { type: 'string', pattern: `^https://example\\.com/${slug}/${slug}\\.git$` },
+    } },
+  } };
+  const witness = collectionValueWitnesses(schema).valid;
+  assert.ok(witness);
+  assert.equal(validateValue(schema, witness).valid, true);
+  const produce = step({ name: 'snapshot', produces: ['receipt'] });
+  produce.produces[0]!.schema = schema;
+  const workflow = def('patterned-receipt', [], [produce, step({ name: 'review', consumes: ['receipt'], produces: ['done'] })]);
+  const report = modelCheck(workflow);
+  assert.deepEqual(report.unreachedSteps, []);
+  assert.deepEqual(report.coverageIncomplete, []);
+});
+
+test('unrecognized or oversized patterns and a conflicting length remain unsampled', () => {
+  for (const constraint of [
+    { pattern: '^(red|blue)$' }, { pattern: '^[a-f]{129}$' },
+    { pattern: '^' + 'q'.repeat(257) + '$' }, { pattern: '^[a-z]+$', minLength: 129 },
+    { pattern: '^[0-9a-f]{64}$', maxLength: 32 },
+  ]) {
+    const schema = { type: 'object', required: ['id'], properties: { id: { type: 'string', ...constraint } } };
+    const witnesses = collectionValueWitnesses(schema);
+    assert.equal(witnesses.valid, undefined);
+    assert.equal(witnesses.validClassKnown, false);
+  }
+});
+
+test('a different valid pattern sample does not replace an accepted legacy string', () => {
+  const schema = { type: 'object', required: ['id'], properties: {
+    id: { type: 'string', anyOf: [{ type: 'string', pattern: '^z{4}$' }, { const: 'x' }] },
+  } };
+  assert.equal(validateValue(schema, { id: 'zzzz' }).valid, true);
+  assert.deepEqual(collectionValueWitnesses(schema).valid, { id: 'x' });
+});
+
+test('patterned siblings admit named modifiers after previously witnessed routes', () => {
+  const produce = step({ name: 'choose', produces: ['choice'] });
+  const output = produce.produces[0]!;
+  output.bind = { to: 'modifier', from: 'route' };
+  output.schema = { type: 'object', required: ['route', 'hash'], properties: {
+    route: { type: 'string' }, hash: { type: 'string' },
+  }, anyOf: [
+    { properties: { hash: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
+    { properties: { hash: { const: 'x' }, route: { const: 'deep' } } },
+  ] };
+  const workflow = def('patterned-modifier', [], [produce], ['quick', 'deep']);
+  const report = modelCheck(workflow);
+  assert.equal(report.completePath?.[0]?.selectedModifier, 'deep');
+  assert.ok(!report.coverageIncomplete.includes('singleton-bind-modifier'));
+});
+
 test('unbound singletons find both outcomes when only a late array sample distinguishes them', () => {
   for (const schema of [{ allOf: [{ type: 'array' }] }, { not: { type: 'array' } }]) {
     const produce = step({ name: 'produce', produces: ['result'], maxSchemaFailures: 1 });

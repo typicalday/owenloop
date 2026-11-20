@@ -796,11 +796,12 @@ test('modelCheck: assumeProvided cannot invent a green input rejected by its sch
 });
 
 test('modelCheck: unsampled valid input schema is incomplete, not a definite assumed-provide verdict', () => {
+  // Grouped repetition accepts the real input while keeping the finite sample unresolved.
   const uncommon: WorkflowDef = {
     ...def('uncommon-provision',
       [{ ...input('seed', { seedOwed: true }), schema: {
 	      type: 'object', required: ['code'],
-	      properties: { code: { type: 'string', pattern: '^z{40}$' } },
+	      properties: { code: { type: 'string', pattern: '^(?:z){40}$' } },
       } }],
       [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
     invariants: [{ name: 'seed-provided', requires: { path: 'seed', is: 'green' } }],
@@ -823,7 +824,7 @@ test('modelCheck: unresolved provide does not hide an independent initial invari
     ...def('independent-initial-violation', [
       { ...input('seed', { seedOwed: true }), schema: {
 	      type: 'object', required: ['code'],
-	      properties: { code: { type: 'string', pattern: '^z{40}$' } },
+	      properties: { code: { type: 'string', pattern: '^(?:z){40}$' } },
       } },
       input('ready', { seedOwed: false }),
     ], [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
@@ -1520,7 +1521,7 @@ test('CLI check: unrelated initial invariant still fails with unresolved assumed
     '      properties:',
     '        code:',
     '          type: string',
-    '          pattern: "^z{40}$"',
+    '          pattern: "^(?:z){40}$"',
     '  - name: ready',
     '    seedOwed: false',
     'steps:',
