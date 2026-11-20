@@ -3643,6 +3643,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       return true;
     };
 
+    let retractedMembers: Set<string> | undefined;
+
     // Expand ordinary worker/calls/retract transitions. A collection producer
     // first claims a run; subsequent emit/refusal/seal actions occur through
     // the lease transitions below and can interleave with all other firings.
@@ -3705,8 +3707,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	continue;
       }
 
+      const path = firing.outputs[0];
       const ordinaryStep = def.steps.find((candidate) => candidate.name === firing.step);
-      const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, firing.outputs[0] ?? '');
+      const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, path ?? '');
       const witnesses = ordinaryProduce && checkedWitnesses(ordinaryProduce, modifier);
       if (ordinaryProduce && witnesses) {
 	if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
@@ -3735,6 +3738,13 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       const outcomes = firingOutcomes(def, arts, firing, modifier, witnesses);
 
       for (const outcome of outcomes) {
+	if (outcome === 'retract' && path !== undefined) {
+	  // From this state, every authorized actor retracting this member
+	  // produces the same successor. Keep the first actor's BFS witness.
+	  retractedMembers ??= new Set<string>();
+	  if (retractedMembers.has(path)) continue;
+	  retractedMembers.add(path);
+	}
 	const rejectPaths = outcome === 'judgment-reject'
 	  ? rejectableFiringInputs(def, arts, firing) : [undefined];
 	for (const rejectPath of rejectPaths) {
@@ -3742,7 +3752,6 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	    { maxCollectionSize, modifier, rejectPath });
 
 	  for (const suc of successors) {
-	    const path = firing.outputs[0];
 	    const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
 	    if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
 	    let nextModifier = modifier;
