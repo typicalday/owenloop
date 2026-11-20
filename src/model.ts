@@ -2525,15 +2525,12 @@ function clonePendingModifiers(pending?: Record<string, string>): Record<string,
   return Object.assign(Object.create(null) as Record<string, string>, pending);
 }
 
-/** One bounded sample for anchored concatenations of ASCII atoms, + and {n}. */
-function sampleStringPattern(pattern: string, minLength: number): string | undefined {
-  if (pattern.length > 256 || !pattern.startsWith('^') || !pattern.endsWith('$')
-    || !Number.isSafeInteger(minLength) || minLength > 128) return undefined;
+/** One bounded sample for a concatenation of ASCII atoms, + and {n}. */
+function sampleLinearPattern(pattern: string, minLength: number): string | undefined {
   const atom = /(?:\[([A-Za-z0-9_.-]+)\]|\\([./-])|([A-Za-z0-9_:/-]))(?:\{([1-9][0-9]{0,2})\}|(\+))?/y;
   let value = '';
   let extendAt = -1;
-  atom.lastIndex = 1;
-  while (atom.lastIndex < pattern.length - 1) {
+  while (atom.lastIndex < pattern.length) {
     const match = atom.exec(pattern);
     if (!match) return undefined;
     const char = match[1]?.[0] ?? match[2] ?? match[3]!;
@@ -2545,6 +2542,56 @@ function sampleStringPattern(pattern: string, minLength: number): string | undef
   if (value.length >= minLength) return value;
   if (extendAt === -1) return undefined;
   return value.slice(0, extendAt) + value[extendAt]!.repeat(minLength - value.length) + value.slice(extendAt);
+}
+
+function sampleStringPattern(pattern: string, minLength: number): string | undefined {
+  if (pattern.length > 256 || !pattern.startsWith('^') || !pattern.endsWith('$')
+    || !Number.isSafeInteger(minLength) || minLength > 128) return undefined;
+  const body = pattern.slice(1, -1);
+  if (!body.startsWith('(')) return sampleLinearPattern(body, minLength);
+  if (!body.endsWith(')') || (body.startsWith('(?') && !body.startsWith('(?:'))) return undefined;
+
+  // The validator will try earlier branches against the new candidate too.
+  // Admit only fixed-width atoms and unquantified groups, with at most seven
+  // choices across all levels. Sample flat branches of the outer group.
+  let start = body.startsWith('(?:') ? 3 : 1;
+  let depth = 0;
+  let separators = 0;
+  let inClass = false;
+  const branches: string[] = [];
+  for (let i = start; i < body.length - 1; i++) {
+    const char = body[i]!;
+    if (char === '\\') {
+      if (++i === body.length - 1 || !'./-|()[]\\'.includes(body[i]!)) return undefined;
+      continue;
+    }
+    if (inClass) {
+      if (char === ']') inClass = false;
+    } else if (char === '[') {
+      inClass = true;
+    } else if (char === '(') {
+      depth++;
+      if (body.startsWith('(?:', i)) i += 2;
+    } else if (char === ')') {
+      if (depth === 0) return undefined;
+      depth--;
+    } else if (char === '|') {
+      if (++separators > 7) return undefined;
+      if (depth === 0) {
+	branches.push(body.slice(start, i));
+	start = i + 1;
+      }
+    } else if (!/[A-Za-z0-9_:/-]/.test(char)) {
+      return undefined;
+    }
+  }
+  if (depth !== 0 || inClass || branches.length === 0) return undefined;
+  branches.push(body.slice(start, -1));
+  for (const branch of branches) {
+    const candidate = sampleLinearPattern(branch, minLength);
+    if (candidate !== undefined) return candidate;
+  }
+  return undefined;
 }
 
 /** Bounded concrete JSON candidates, shared by collection and singleton guards. */
