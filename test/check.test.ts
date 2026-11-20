@@ -434,6 +434,52 @@ test('modelCheck: linear def with no stalls → completable, exhaustive search',
   // The workflow IS completable; whether bounded depends on maxStates
 });
 
+test('modelCheck admits an exact-fit graph when later transitions revisit known states', () => {
+  const source = input('initial', { seedOwed: false });
+  const limits = { maxAttempts: 1, maxSchemaFailures: 1, terminal: true };
+  const parallel = def('parallel', [source], [
+    step({ name: 'first', consumes: ['initial'], produces: ['x'], ...limits }),
+    step({ name: 'second', consumes: ['initial'], produces: ['y'], ...limits }),
+  ]);
+  const collection = def('collection', [source], [
+    step({ name: 'collect', consumes: ['initial'], produces: ['x[]'], ...limits }),
+  ]);
+  for (const workflow of [parallel, collection]) {
+    const reference = modelCheck(workflow);
+    assert.equal(reference.bounded, false);
+    assert.equal(reference.completable, true);
+    const states = reference.stats.statesExplored;
+    assert.deepEqual(modelCheck(workflow, { maxStates: states }), reference);
+    const smaller = modelCheck(workflow, { maxStates: states - 1 });
+    assert.deepEqual(smaller.boundsHit, ['maxStates']);
+    assert.equal(smaller.stats.statesExplored, states - 1);
+  }
+});
+
+test('modelCheck inspects already admitted completions after refusing a new state', () => {
+  const workflow = def('small-budget', [input('initial', { seedOwed: false })], [
+    step({ name: 'finish', consumes: ['initial'], produces: ['x'], terminal: true, maxAttempts: 1, maxSchemaFailures: 1 }),
+  ]);
+  const report = modelCheck(workflow, { maxStates: 2 });
+  assert.deepEqual(report.boundsHit, ['maxStates']);
+  assert.equal(report.stats.statesExplored, 2);
+  assert.equal(report.completable, true);
+  assert.deepEqual(report.completePath?.map((s) => s.step), ['finish']);
+  for (const maxStates of [0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => modelCheck(workflow, { maxStates }), /maxStates must be a positive safe integer/);
+  }
+});
+
+test('each modifier successor shares the same state budget', () => {
+  const choose = step({ name: 'choose', consumes: ['seed'], produces: ['choice'], terminal: true, maxAttempts: 1, maxSchemaFailures: 1 });
+  choose.produces[0]!.bind = { from: 'modifier', to: 'modifier' };
+  const workflow = def('modifier-budget', [input('seed', { seedOwed: false })], [choose], ['fast', 'deep', 'standard']);
+  const report = modelCheck(workflow, { maxStates: 2 });
+  assert.deepEqual(report.boundsHit, ['maxStates']);
+  assert.equal(report.stats.statesExplored, 2);
+  assert.equal(report.completePath?.[0]?.selectedModifier, 'fast');
+});
+
 test('modelCheck: maxAttempts=1 def (stall, not deadlock, after one reject — a completable branch coexists)', () => {
   // Step 'a' has maxAttempts=1: after one judgment-reject, x is stalled (frozen),
   // no eligible firings remain, not done. But recomputing eligibility with the

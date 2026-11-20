@@ -3227,6 +3227,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   }
   const maxDepth = opts.maxDepth ?? 50;
   const maxStates = opts.maxStates ?? 5000;
+  if (!Number.isSafeInteger(maxStates) || maxStates < 1) throw new Error('maxStates must be a positive safe integer');
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
   const seeded = seedArts(def, opts.assumeProvided ?? false);
@@ -3284,7 +3285,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   let depthReached = 0;
   const boundsHit = new Set<'maxDepth' | 'maxStates'>();
 
-  while (queueHead < queue.length) {
+  search: while (queueHead < queue.length) {
     const node = queue[queueHead]!;
     queue[queueHead++] = undefined;
     let reportedPath: CheckStep[] | undefined;
@@ -3426,20 +3427,27 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       continue;
     }
 
-    const enqueue = (state: CollectionCheckState, step: CheckStep): void => {
+    // Only a previously unseen state consumes a slot. At capacity we may
+    // still follow duplicate edges. If a new state would exceed the limit,
+    // move on to the next queued state so admitted witnesses are inspected.
+    const tryEnqueue = (state: CollectionCheckState, step: CheckStep): boolean => {
       const key = collectionCheckKey(def, state);
-      if (!visited.has(key)) {
-	const id = predecessors.length;
-	predecessors.push({ parent: node.id, step });
-	visited.set(key, id);
-	queue.push({ state, id, depth: node.depth + 1 });
+      if (visited.has(key)) return true;
+      if (visited.size >= maxStates) {
+	boundsHit.add('maxStates');
+	return false;
       }
+      const id = predecessors.length;
+      predecessors.push({ parent: node.id, step });
+      visited.set(key, id);
+      queue.push({ state, id, depth: node.depth + 1 });
+      return true;
     };
 
     // Expand ordinary worker/calls/retract transitions. A collection producer
     // first claims a run; subsequent emit/refusal/seal actions occur through
     // the lease transitions below and can interleave with all other firings.
-    outer: for (const firing of firings) {
+    for (const firing of firings) {
       // An authority-only member retract does not prove its actor ever
       // produced an ordinary firing; preserve structural-dead-step accounting.
       if ((firing as Partial<MemberRetractFiring>).modelTransition !== 'member-retract') {
@@ -3449,7 +3457,6 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       const collections = producer ? collectionProduces(producer)
         .filter((produce) => firing.outputs.includes(sealPath(produce.stem))) : [];
       if (collections.length > 0) {
-	if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
 	report.collectionCapApplied = true;
 	if (!report.coverageIncomplete.includes('collection-width-cap')) {
 	  report.coverageIncomplete.push('collection-width-cap');
@@ -3495,7 +3502,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	  fingerprint: computeFingerprint(arts, firing.inputs),
 	};
 	const claimed = { ...node.state, leases: [...node.state.leases, lease] };
-	enqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' });
+	if (!tryEnqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' })) continue search;
 	continue;
       }
 
@@ -3529,18 +3536,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       const outcomes = eligibleOutcomes(def, arts, firing, { modifier });
 
       for (const outcome of outcomes) {
-        // Check state count before expanding
-        if (visited.size >= maxStates) {
-          boundsHit.add('maxStates');
-          break outer;
-        }
-
 	const rejectPaths = outcome === 'judgment-reject'
 	  ? rejectableFiringInputs(def, arts, firing) : [undefined];
 	for (const rejectPath of rejectPaths) {
-	  // A reducer may have many live members. Count each target branch against
-	  // the same search limit rather than expanding the whole fan-in at once.
-	  if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
 	  const successors = applyOutcome(def, arts, firing, outcome,
 	    { maxCollectionSize, modifier, rejectPath });
 
@@ -3571,20 +3569,17 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	      const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
 		...(rejectPath === undefined ? {} : { path: rejectPath }),
 		...(selectedModifier === undefined ? {} : { selectedModifier }) };
-	      enqueue({ arts: suc, leases: node.state.leases, modifier: routed,
-		pendingModifiers: nextPending }, trace);
+	      if (!tryEnqueue({ arts: suc, leases: node.state.leases, modifier: routed,
+		pendingModifiers: nextPending }, trace)) continue search;
 	    }
 	  }
 	}
       }
     }
-    if (boundsHit.has('maxStates')) break;
 
     for (const move of leaseMoves) {
-      if (visited.size >= maxStates) { boundsHit.add('maxStates'); break; }
-      enqueue(move.state, move.step);
+      if (!tryEnqueue(move.state, move.step)) continue search;
     }
-    if (boundsHit.has('maxStates')) break;
   }
 
   report.stats.depthReached = depthReached;
