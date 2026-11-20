@@ -2795,6 +2795,9 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
   let bindRefusal = false;
   const acceptedModifiers = new Set<string | undefined>();
   for (const value of candidates) {
+    // Without a bind, every schema-valid value represents the same green
+    // transition. Once both classes are witnessed, later samples add nothing.
+    if (!bind && schemaValid && schemaRefusal) break;
     if (schema !== undefined && !validateValue(schema, value).valid) {
       refusal = true;
       schemaRefusal = true;
