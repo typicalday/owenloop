@@ -2633,7 +2633,7 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
 	sawUnionSiblings = true;
 	if (useUnionSiblings) {
 	  const siblings = [...layers];
-	  const owner = layers.findLastIndex((layer) => layer[keyword] === union);
+	  const owner = layers.map((layer) => layer[keyword]).lastIndexOf(union);
 	  const rest = { ...layers[owner] };
 	  delete rest[keyword];
 	  siblings[owner] = rest;
