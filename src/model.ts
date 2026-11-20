@@ -3739,71 +3739,79 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	continue;
       }
 
-      const ordinaryStep = def.steps.find((candidate) => candidate.name === firing.step);
-      const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, firing.outputs[0] ?? '');
-      const witnesses = ordinaryProduce && checkedWitnesses(ordinaryProduce, modifier);
-      if (ordinaryProduce && witnesses) {
-	if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
-	  && !report.coverageIncomplete.includes('singleton-schema-validity')) {
-	  report.coverageIncomplete.push('singleton-schema-validity');
+      // One ordinary order can owe several artifacts. The worker may submit
+      // any of them first, with that output's own schema, judges and binding.
+      const targets = firing.outputs.length ? firing.outputs : [undefined];
+      for (const [index, path] of targets.entries()) {
+	const target = firing.outputs.length > 1 && path !== undefined
+	  ? { ...firing, outputs: [path] } : firing;
+	const ordinaryProduce = producer && produceOwning(producer, path ?? '');
+	const witnesses = ordinaryProduce && checkedWitnesses(ordinaryProduce, modifier);
+	if (ordinaryProduce && witnesses) {
+	  if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
+	    && !report.coverageIncomplete.includes('singleton-schema-validity')) {
+	    report.coverageIncomplete.push('singleton-schema-validity');
+	  }
+	  if (ordinaryProduce.schema !== undefined && !witnesses.schemaRefusalClassKnown
+	    && !report.coverageIncomplete.includes('singleton-schema-refusal')) {
+	    report.coverageIncomplete.push('singleton-schema-refusal');
+	  }
+	  if (ordinaryProduce.bind !== undefined && !witnesses.greenClassKnown
+	    && !report.coverageIncomplete.includes('singleton-bind-validity')) {
+	    report.coverageIncomplete.push('singleton-bind-validity');
+	  }
+	  if (ordinaryProduce.bind !== undefined && !witnesses.bindRefusal && ordinaryProduce.schema !== false
+	    && !report.coverageIncomplete.includes('singleton-bind-refusal')) {
+	    report.coverageIncomplete.push('singleton-bind-refusal');
+	  }
+	  if (ordinaryProduce.bind?.to === 'modifier'
+	    && (def.modifiers ?? []).some((name) => !witnesses.acceptedModifiers.includes(name))
+	    && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
+	    report.coverageIncomplete.push('singleton-bind-modifier');
+	  }
 	}
-	if (ordinaryProduce.schema !== undefined && !witnesses.schemaRefusalClassKnown
-	  && !report.coverageIncomplete.includes('singleton-schema-refusal')) {
-	  report.coverageIncomplete.push('singleton-schema-refusal');
-	}
-	if (ordinaryProduce.bind !== undefined && !witnesses.greenClassKnown
-	  && !report.coverageIncomplete.includes('singleton-bind-validity')) {
-	  report.coverageIncomplete.push('singleton-bind-validity');
-	}
-	if (ordinaryProduce.bind !== undefined && !witnesses.bindRefusal && ordinaryProduce.schema !== false
-	  && !report.coverageIncomplete.includes('singleton-bind-refusal')) {
-	  report.coverageIncomplete.push('singleton-bind-refusal');
-	}
-	if (ordinaryProduce.bind?.to === 'modifier'
-	  && (def.modifiers ?? []).some((name) => !witnesses.acceptedModifiers.includes(name))
-	  && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
-	  report.coverageIncomplete.push('singleton-bind-modifier');
-	}
-      }
 
-      const outcomes = firingOutcomes(def, arts, firing, modifier, witnesses);
+	const outcomes = firingOutcomes(def, arts, target, modifier, witnesses);
 
-      for (const outcome of outcomes) {
-	const rejectPaths = outcome === 'judgment-reject'
-	  ? rejectableFiringInputs(def, arts, firing) : [undefined];
-	for (const rejectPath of rejectPaths) {
-	  const successors = applyOutcome(def, arts, firing, outcome,
-	    { maxCollectionSize, modifier, rejectPath });
+	for (const outcome of outcomes) {
+	  // Rejecting a consumed input is a single choice for the entire order.
+	  if (outcome === 'judgment-reject' && index > 0) continue;
+	  const rejectPaths = outcome === 'judgment-reject'
+	    ? rejectableFiringInputs(def, arts, firing) : [undefined];
+	  for (const rejectPath of rejectPaths) {
+	    const successors = applyOutcome(def, arts, target, outcome,
+	      { maxCollectionSize, modifier, rejectPath });
 
-	  for (const suc of successors) {
-	    const path = firing.outputs[0];
-	    const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
-	    if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
-	    let nextModifier = modifier;
-	    let approvedModifier: string | undefined;
-	    if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
-	      approvedModifier = pendingModifiers[path];
-	      nextModifier = approvedModifier ?? modifier;
-	      delete pendingModifiers[path];
-	    }
-	    const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier' && witnesses
-	      ? witnesses.acceptedModifiers : [undefined];
-	    for (const selected of choices) {
-	      const nextPending = clonePendingModifiers(pendingModifiers);
-	      let routed = nextModifier;
-	      if (outcome === 'green' && path) {
-		delete nextPending[path];
-		if (selected !== undefined) {
-		  if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
-		  else routed = selected;
-		}
+	    for (const suc of successors) {
+	      const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
+	      if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
+	      let nextModifier = modifier;
+	      let approvedModifier: string | undefined;
+	      if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
+		approvedModifier = pendingModifiers[path];
+		nextModifier = approvedModifier ?? modifier;
+		delete pendingModifiers[path];
 	      }
-	      const selectedModifier = outcome === 'green' ? selected : approvedModifier;
-	      const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
-		...(rejectPath === undefined ? {} : { path: rejectPath }),
-		...(selectedModifier === undefined ? {} : { selectedModifier }) };
-	      if (!tryEnqueue({ arts: suc, leases: node.state.leases, modifier: routed,
-		pendingModifiers: nextPending }, trace)) continue search;
+	      const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier' && witnesses
+		? witnesses.acceptedModifiers : [undefined];
+	      for (const selected of choices) {
+		const nextPending = clonePendingModifiers(pendingModifiers);
+		let routed = nextModifier;
+		if (outcome === 'green' && path) {
+		  delete nextPending[path];
+		  if (selected !== undefined) {
+		    if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
+		    else routed = selected;
+		  }
+		}
+		const selectedModifier = outcome === 'green' ? selected : approvedModifier;
+		const tracePath = rejectPath ?? (firing.outputs.length > 1 ? path : undefined);
+		const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
+		  ...(tracePath === undefined ? {} : { path: tracePath }),
+		  ...(selectedModifier === undefined ? {} : { selectedModifier }) };
+		if (!tryEnqueue({ arts: suc, leases: node.state.leases, modifier: routed,
+		  pendingModifiers: nextPending }, trace)) continue search;
+	      }
 	    }
 	  }
 	}
