@@ -263,7 +263,12 @@ test('parent IPC disconnect leaves sentinel-owned bounded teardown running', asy
     let groupAbsent = false;
     while (performance.now() < settlementDeadline) {
       try { process.kill(-(child.pid as number), 0); }
-      catch (error) { assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH'); groupAbsent = true; break; }
+      catch (error) {
+	const code = (error as NodeJS.ErrnoException).code;
+	if (code === 'ESRCH') { groupAbsent = true; break; }
+	// EPERM still means a group exists. Continue observing to the same deadline.
+	if (code !== 'EPERM') throw error;
+      }
       await sleep(10);
     }
     assert.equal(groupAbsent, true, 'disconnected sentinel group remained present at deadline');
