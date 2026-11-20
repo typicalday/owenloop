@@ -268,7 +268,7 @@ steps:
     const shim = join(shimDir, 'ssh-keygen');
     writeFileSync(shim, `#!${process.execPath}
 const { spawnSync } = require('node:child_process');
-const { writeFileSync } = require('node:fs');
+const { renameSync, writeFileSync } = require('node:fs');
 const args = process.argv.slice(2);
 const sign = args[0] === '-Y' && args[1] === 'sign';
 function run() {
@@ -277,7 +277,9 @@ function run() {
   process.exit(result.status ?? 1);
 }
 if (sign) {
-  writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ pid: process.pid, keyPath: args[args.indexOf('-f') + 1] }));
+  const marker = ${JSON.stringify(marker)};
+  writeFileSync(marker + '.tmp', JSON.stringify({ pid: process.pid, keyPath: args[args.indexOf('-f') + 1] }));
+  renameSync(marker + '.tmp', marker);
   setTimeout(run, 4000);
 } else run();
 `);
