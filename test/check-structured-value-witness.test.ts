@@ -45,6 +45,38 @@ test('checker reaches downstream steps through a concrete nested schema witness'
   assert.equal(report.structurallyDeadSteps.length, 0);
 });
 
+test('checker samples required arrays beyond four items when the concrete value fits its budget', () => {
+  const schema = { type: 'object', required: ['principles', 'skills', 'tag'], properties: {
+    principles: { type: 'array', minItems: 21, maxItems: 21 },
+    skills: { type: 'array', minItems: 23, maxItems: 23, uniqueItems: true, items: { type: 'integer' } },
+    tag: { type: 'string', pattern: '^z{8}$' },
+  } };
+  const witness = collectionValueWitnesses(schema);
+  assert.deepEqual(witness.valid, {
+    principles: Array.from({ length: 21 }, (_, index) => index),
+    skills: Array.from({ length: 23 }, (_, index) => index),
+    tag: 'zzzzzzzz',
+  });
+  assert.equal(validateValue(schema, witness.valid).valid, true);
+  const produce = step({ name: 'context', produces: ['receipt'] });
+  produce.produces[0]!.schema = schema;
+  const workflow = def('array-minimum', [], [produce, step({ name: 'classify', consumes: ['receipt'], produces: ['done'] })]);
+  const report = modelCheck(workflow, { maxStates: 500, assumeProvided: true });
+  assert.ok(!report.coverageIncomplete.includes('singleton-schema-validity'));
+  assert.ok(!report.unreachedSteps.includes('classify'));
+});
+
+test('larger array samples respect the width limit and original item validator', () => {
+  for (const items of [
+    { type: 'array', minItems: 33 },
+    { type: 'array', minItems: 21, items: { const: { label: 'large'.repeat(2_000) } } },
+  ]) {
+    const witness = collectionValueWitnesses({ type: 'object', required: ['items'], properties: { items } });
+    assert.equal(witness.validClassKnown, false);
+    assert.equal(witness.valid, undefined);
+  }
+});
+
 test('checker leaves a genuinely unsampled valid class incomplete', () => {
   const produce = step({ name: 'shape', consumes: ['start'], produces: ['evidence'],
     maxAttempts: 1, maxSchemaFailures: 0 });
