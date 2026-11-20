@@ -1643,6 +1643,8 @@ checks both journal locations and dispatches by journal version; a v2 store
 journal uses `index.json` metadata and a v1 GitHub journal uses
 `installed.json` ledger corroboration.
 
+<a id="hub-login--connect--push--logout"></a>
+
 ## Hub (`login` / `connect` / `push` / `start` / `cancel` / `instance` / `publish` / `logout`)
 
 These commands authenticate, publish, and start workflows on a hosted **hub** (default
