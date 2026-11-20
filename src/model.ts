@@ -3369,6 +3369,41 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
   return parts.join(';');
 }
 
+// Neighboring states share most artifact entries. Give each distinct fragment of
+// the canonical key a run-local ID so the visited set needn't retain all that
+// repeated text. Splitting and rejoining on ';' is lossless, even for empty
+// fragments or a delimiter inside a user-supplied name.
+class VisitedStates {
+  private readonly fragments = new Map<string, string>();
+  private readonly keys = new Set<string>();
+  private readonly limit: number;
+
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+
+  admit(key: string): 'seen' | 'added' | 'full' {
+    const full = this.keys.size >= this.limit;
+    const ids: string[] = [];
+    for (const fragment of key.split(';')) {
+      let id = this.fragments.get(fragment);
+      if (id === undefined) {
+	// An unknown fragment proves the whole key is new. At capacity,
+	// leave discarded candidates out of both the set and its dictionary.
+	if (full) return 'full';
+	id = this.fragments.size.toString(36);
+	this.fragments.set(fragment, id);
+      }
+      ids.push(id);
+    }
+    const compact = ids.join(',');
+    if (this.keys.has(compact)) return 'seen';
+    if (full) return 'full';
+    this.keys.add(compact);
+    return 'added';
+  }
+}
+
 /**
  * Bounded reachability / liveness checker over a workflow definition.
  *
@@ -3444,8 +3479,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   // every successor makes queue/visited storage grow with both states and
   // depth, even though only reported findings need materialized paths.
   const predecessors: Array<{ parent: number; step?: CheckStep }> = [{ parent: -1 }];
-  const visited = new Map<string, number>(); // key → predecessor id
-  visited.set(initialKey, 0);
+  const visited = new VisitedStates(maxStates);
+  visited.admit(initialKey);
   const pathTo = (id: number): CheckStep[] => {
     const reversed: CheckStep[] = [];
     while (id !== 0) {
@@ -3630,15 +3665,14 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // still follow duplicate edges. If a new state would exceed the limit,
     // move on to the next queued state so admitted witnesses are inspected.
     const tryEnqueue = (state: CollectionCheckState, step: CheckStep): boolean => {
-      const key = collectionCheckKey(def, state);
-      if (visited.has(key)) return true;
-      if (visited.size >= maxStates) {
+      const admission = visited.admit(collectionCheckKey(def, state));
+      if (admission === 'seen') return true;
+      if (admission === 'full') {
 	boundsHit.add('maxStates');
 	return false;
       }
       const id = predecessors.length;
       predecessors.push({ parent: node.id, step });
-      visited.set(key, id);
       queue.push({ state, id, depth: node.depth + 1 });
       return true;
     };
