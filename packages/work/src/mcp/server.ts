@@ -302,8 +302,12 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
     if (closed) return;
     closed = true;
     for (const tracked of inFlight.values()) {
-      tracked.cancelled = true;
-      tracked.byClose = true;
+      // A later EOF must not turn a client-cancelled request into a
+      // close-cancelled request whose response would be flushed.
+      if (!tracked.cancelled) {
+	tracked.cancelled = true;
+	tracked.byClose = true;
+      }
       for (const cb of tracked.cancelCbs.splice(0)) {
         try {
           cb();

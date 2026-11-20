@@ -91,6 +91,8 @@ export interface SshSignerConfig {
   tempDir?: (prefix: string) => string;
   /** Per-invocation timeout in ms (default 10s). */
   timeoutMs?: number;
+  /** Cancel signing subprocesses without waiting for the per-invocation timeout. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -99,7 +101,7 @@ export interface SshSignerConfig {
  * and stdin secrecy without a real `ssh-keygen`.
  */
 export interface SshProcessAdapter {
-  run(cmd: string, args: string[], opts: { stdin?: Buffer; timeoutMs: number; maxBuffer?: number }): Promise<{
+  run(cmd: string, args: string[], opts: { stdin?: Buffer; timeoutMs: number; maxBuffer?: number; signal?: AbortSignal }): Promise<{
     status: number | null;
     stdout: Buffer;
     stderr: Buffer;
@@ -132,6 +134,10 @@ const SSH_MAX_BUFFER = 1024 * 256;
 export const defaultSshProcess: SshProcessAdapter = {
   run(cmd, args, opts) {
     return new Promise((resolve) => {
+      if (opts.signal?.aborted) {
+	resolve({ status: null, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: false, truncated: false });
+	return;
+      }
       const child = spawn(cmd, args, { shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
@@ -140,11 +146,19 @@ export const defaultSshProcess: SshProcessAdapter = {
       let truncated = false;
       let timedOut = false;
       let stdinWriteFailed = false;
+      let aborted = false;
       const cap = opts.maxBuffer ?? SSH_MAX_BUFFER;
       const timer = setTimeout(() => {
         timedOut = true;
         child.kill('SIGKILL');
       }, opts.timeoutMs);
+      const abort = (): void => {
+	aborted = true;
+	clearTimeout(timer);
+	child.kill('SIGKILL');
+      };
+      opts.signal?.addEventListener('abort', abort, { once: true });
+      if (opts.signal?.aborted) abort();
       child.stdout.on('data', (c: Buffer) => {
         outLen += c.length;
         if (outLen <= cap) stdout.push(c);
@@ -161,12 +175,14 @@ export const defaultSshProcess: SshProcessAdapter = {
       child.stdin.on('error', () => { stdinWriteFailed = true; });
       child.on('error', () => {
         clearTimeout(timer);
+	opts.signal?.removeEventListener('abort', abort);
         resolve({ status: null, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: false, truncated: false });
       });
       child.on('close', (code) => {
         clearTimeout(timer);
+	opts.signal?.removeEventListener('abort', abort);
         resolve({
-          status: stdinWriteFailed && code === 0 ? null : code,
+	  status: aborted || (stdinWriteFailed && code === 0) ? null : code,
           stdout: Buffer.concat(stdout),
           stderr: Buffer.concat(stderr),
           timedOut,
@@ -281,13 +297,14 @@ export class SshSigner implements Signer {
     if (keyPath === undefined) {
       throw new SshSignerError('this signer is not configured for signing (no signKeyPath)');
     }
-    const publicText = await publicTextForSigningPath(keyPath, this.proc, this.config.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS);
+    const publicText = await publicTextForSigningPath(keyPath, this.proc, this.config.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS, this.config.signal);
     assertEd25519PubText(publicText, 'signing key');
     const keyid = fingerprintForPubText(publicText);
     const r = await this.proc.run(
       'ssh-keygen',
       ['-Y', 'sign', '-f', keyPath, '-n', this.config.namespace],
-      { stdin: exactBytes, timeoutMs: this.config.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS },
+      { stdin: exactBytes, timeoutMs: this.config.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS,
+	...(this.config.signal === undefined ? {} : { signal: this.config.signal }) },
     );
     classify(r, 'sshsig sign');
     const armored = r.stdout.toString('utf8');
@@ -371,7 +388,7 @@ export class SshSigner implements Signer {
 
 /** Read the actual public half for a signing path. Private paths are derived
  * through stock ssh-keygen; adjacent `.pub` text is never trusted for them. */
-async function publicTextForSigningPath(keyPath: string, proc: SshProcessAdapter, timeoutMs: number): Promise<string> {
+async function publicTextForSigningPath(keyPath: string, proc: SshProcessAdapter, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   try {
     const text = readFileSync(keyPath, 'utf8');
     const line = text.split(/\r?\n/).find((l) => l.trim() !== '')?.trim() ?? '';
@@ -379,7 +396,8 @@ async function publicTextForSigningPath(keyPath: string, proc: SshProcessAdapter
   } catch {
     // Derivation below reports a fixed error.
   }
-  const result = await proc.run('ssh-keygen', ['-y', '-f', keyPath], { timeoutMs });
+  const result = await proc.run('ssh-keygen', ['-y', '-f', keyPath], { timeoutMs,
+    ...(signal === undefined ? {} : { signal }) });
   classify(result, 'sshsig public-key derivation');
   return result.stdout.toString('utf8');
 }

@@ -2321,6 +2321,16 @@ export function eligibleOutcomes(
   firing: Firing,
   opts: { modifier?: string } = {},
 ): CheckStep['outcome'][] {
+  return firingOutcomes(def, arts, firing, opts.modifier);
+}
+
+function firingOutcomes(
+  def: WorkflowDef,
+  arts: Map<string, ArtifactData>,
+  firing: Firing,
+  modifier: string | undefined,
+  checkedWitnesses?: SingletonWitnesses,
+): CheckStep['outcome'][] {
   if ((firing as Partial<MemberRetractFiring>).modelTransition === 'member-retract') {
     return ['retract'];
   }
@@ -2342,7 +2352,7 @@ export function eligibleOutcomes(
     if (judgedArt?.acceptance === 'submitted') {
       const jName = judgeNameOf(step);
       const approvals = { ...(judgedArt.approvals ?? {}), [jName]: judgedArt.version };
-      const judgeNames = activeJudgesForStem(def, judgedStem, opts.modifier).map((judge) => judge.name);
+      const judgeNames = activeJudgesForStem(def, judgedStem, modifier).map((judge) => judge.name);
       const allApproved = judgeNames.every((jn) => approvals[jn] === judgedArt.version);
       if (allApproved && groupWouldReject(def, arts, judgedStem)) {
         return ['group-reject', 'judge-reject'];
@@ -2382,10 +2392,10 @@ export function eligibleOutcomes(
   // checker explores the real refusal path rather than an impossible green.
   // A judged produce's actual green-moment is judge-approve (handled above),
   // so this only applies to a plain (non-judged) producer output.
-  const hasJudges = activeJudgesForStem(def, outPath, opts.modifier).length > 0;
+  const hasJudges = activeJudgesForStem(def, outPath, modifier).length > 0;
   const groupRejectsGreen = !hasJudges && outPath !== '' && groupWouldReject(def, arts, outPath);
   const produce = produceOwning(step, outPath);
-  const witnesses = produce && singletonValueWitnesses(def, produce, opts.modifier);
+  const witnesses = checkedWitnesses ?? (produce && singletonValueWitnesses(def, produce, modifier));
   if (groupRejectsGreen) {
     outcomes.push('group-reject');
   } else if (!witnesses || witnesses.green) {
@@ -2413,13 +2423,14 @@ export function eligibleOutcomes(
   return outcomes;
 }
 
-/** Concrete green inputs this consumer can reject under Engine.assertAuthority. */
+/** Concrete built inputs this consumer can reject under Engine.assertAuthority. */
 function rejectableFiringInputs(def: WorkflowDef, arts: ArtifactMap, firing: Firing): string[] {
   const step = def.steps.find((candidate) => candidate.name === firing.step);
   if (!step || step.judges !== undefined) return [];
   return [...new Set(firing.inputs)].filter((path) => {
     const art = arts.get(path);
-    if (!art || art.producer === 'human' || art.acceptance !== 'green') return false;
+    if (!art || art.producer === 'human'
+      || (art.acceptance !== 'green' && art.acceptance !== 'submitted')) return false;
     const stem = parseElement(path)?.stem ?? sealStem(path) ?? path;
     return step.consumes.some((consume) => consume.stem === stem || consume.stem === path);
   });
@@ -2514,44 +2525,127 @@ function clonePendingModifiers(pending?: Record<string, string>): Record<string,
   return Object.assign(Object.create(null) as Record<string, string>, pending);
 }
 
+/** One bounded sample for a concatenation of ASCII atoms, + and {n}. */
+function sampleLinearPattern(pattern: string, minLength: number): string | undefined {
+  const atom = /(?:\[([A-Za-z0-9_.-]+)\]|\\([./-])|([A-Za-z0-9_:/-]))(?:\{([1-9][0-9]{0,2})\}|(\+))?/y;
+  let value = '';
+  let extendAt = -1;
+  while (atom.lastIndex < pattern.length) {
+    const match = atom.exec(pattern);
+    if (!match) return undefined;
+    const char = match[1]?.[0] ?? match[2] ?? match[3]!;
+    const count = Number(match[4] ?? 1);
+    if (value.length + count > 128) return undefined;
+    if (match[5]) extendAt = value.length;
+    value += char.repeat(count);
+  }
+  if (value.length >= minLength) return value;
+  if (extendAt === -1) return undefined;
+  return value.slice(0, extendAt) + value[extendAt]!.repeat(minLength - value.length) + value.slice(extendAt);
+}
+
+function sampleStringPattern(pattern: string, minLength: number): string | undefined {
+  if (pattern.length > 256 || !pattern.startsWith('^') || !pattern.endsWith('$')
+    || !Number.isSafeInteger(minLength) || minLength > 128) return undefined;
+  const body = pattern.slice(1, -1);
+  if (!body.startsWith('(')) return sampleLinearPattern(body, minLength);
+  if (!body.endsWith(')') || (body.startsWith('(?') && !body.startsWith('(?:'))) return undefined;
+
+  // The validator will try earlier branches against the new candidate too.
+  // Admit only fixed-width atoms and unquantified groups, with at most seven
+  // choices across all levels. Sample flat branches of the outer group.
+  let start = body.startsWith('(?:') ? 3 : 1;
+  let depth = 0;
+  let separators = 0;
+  let inClass = false;
+  const branches: string[] = [];
+  for (let i = start; i < body.length - 1; i++) {
+    const char = body[i]!;
+    if (char === '\\') {
+      if (++i === body.length - 1 || !'./-|()[]\\'.includes(body[i]!)) return undefined;
+      continue;
+    }
+    if (inClass) {
+      if (char === ']') inClass = false;
+    } else if (char === '[') {
+      inClass = true;
+    } else if (char === '(') {
+      depth++;
+      if (body.startsWith('(?:', i)) i += 2;
+    } else if (char === ')') {
+      if (depth === 0) return undefined;
+      depth--;
+    } else if (char === '|') {
+      if (++separators > 7) return undefined;
+      if (depth === 0) {
+	branches.push(body.slice(start, i));
+	start = i + 1;
+      }
+    } else if (!/[A-Za-z0-9_:/-]/.test(char)) {
+      return undefined;
+    }
+  }
+  if (depth !== 0 || inClass || branches.length === 0) return undefined;
+  branches.push(body.slice(start, -1));
+  for (const branch of branches) {
+    const candidate = sampleLinearPattern(branch, minLength);
+    if (candidate !== undefined) return candidate;
+  }
+  return undefined;
+}
+
 /** Bounded concrete JSON candidates, shared by collection and singleton guards. */
-function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives = false): unknown[] {
+function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives = false): {
+  candidates: unknown[];
+  additionalSamples: unknown[];
+} {
   // Width and depth alone are not a resource bound: four items at every nested
   // array level would allocate exponentially. Exhaustion leaves this class
   // unsampled; the caller must report incomplete coverage.
   let remainingSampleNodes = 1_024;
   let sampleBudgetExhausted = false;
-  const withHints = (base: JsonSchema | undefined, hints: JsonSchema | undefined): JsonSchema | undefined => {
-    if (hints === undefined || typeof hints === 'boolean') return base;
-    if (base === undefined || typeof base === 'boolean') return hints;
-    const baseProps = base.properties && typeof base.properties === 'object' && !Array.isArray(base.properties)
-      ? base.properties as Record<string, JsonSchema> : undefined;
-    const hintProps = hints.properties && typeof hints.properties === 'object' && !Array.isArray(hints.properties)
-      ? hints.properties as Record<string, JsonSchema> : undefined;
-    const properties: Record<string, JsonSchema> | undefined = hintProps
-      ? Object.assign(Object.create(null) as Record<string, JsonSchema>, baseProps) : undefined;
-    if (properties && hintProps) {
-      for (const [name, shape] of Object.entries(hintProps)) {
-	properties[name] = withHints(baseProps?.[name], shape) ?? shape;
-      }
-    }
-    return { ...base, ...hints, ...(properties ? { properties } : {}) };
-  };
-  const sample = (shape: JsonSchema | undefined, depth: number): unknown => {
+  let sawUnionSiblings = false;
+  let useUnionSiblings = false;
+  let sawPatternSample = false;
+  let usePatternSamples = false;
+  let sawLargerArray = false;
+  let useLargerArrays = false;
+  // Keep overlapping schemas as shallow layers. Only look up properties and
+  // items we actually sample, even if an optional subtree is very deep.
+  const sample = (parts: Array<JsonSchema | undefined>, depth: number): unknown => {
     if (depth > 16 || remainingSampleNodes-- <= 0) {
       sampleBudgetExhausted = true;
       return undefined;
     }
-    if (shape === undefined || shape === true) return {};
-    if (shape === false) return undefined;
+    const layers = parts.filter((part): part is Record<string, unknown> =>
+      part !== undefined && typeof part !== 'boolean');
+    if (layers.length === 0) return parts.find((part) => part !== undefined) === false ? undefined : {};
+    if (useUnionSiblings && parts.includes(false)) return undefined;
+    const shape = layers.length === 1 ? layers[0]! : Object.assign({}, ...layers) as Record<string, unknown>;
     if ('const' in shape) return shape.const;
     const values = shape.enum;
     if (Array.isArray(values) && values.length > 0) return values[0];
     const union = shape.anyOf ?? shape.oneOf;
-    if (Array.isArray(union) && union.length > 0) return sample(union[0] as JsonSchema, depth + 1);
+    if (Array.isArray(union) && union.length > 0) {
+      const keyword = shape.anyOf === union ? 'anyOf' : 'oneOf';
+      const first = union[0] as JsonSchema;
+      if (layers.length > 1 || Object.keys(shape).some((key) => key !== keyword)) {
+	sawUnionSiblings = true;
+	if (useUnionSiblings) {
+	  const siblings = [...layers];
+	  const owner = layers.map((layer) => layer[keyword]).lastIndexOf(union);
+	  const rest = { ...layers[owner] };
+	  delete rest[keyword];
+	  siblings[owner] = rest;
+	  return sample([...siblings, first], depth + 1);
+	}
+      }
+      return sample([first], depth + 1);
+    }
     const type = Array.isArray(shape.type) ? shape.type[0] : shape.type;
     if (type === 'string') {
       const minLength = typeof shape.minLength === 'number' ? Math.max(1, shape.minLength) : 1;
+      const fallback = 'x'.repeat(Math.min(minLength, 32));
       const strings = ['x', 'E1', 'C1', 'S1', 'SC1', 'U1', 'F1', 'R1', '1', '2026-01-01'];
       if (typeof shape.pattern === 'string') {
 	try {
@@ -2559,8 +2653,13 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
 	  const matching = strings.find((value) => value.length >= minLength && pattern.test(value));
 	  if (matching !== undefined) return matching;
 	} catch { /* The validator below remains authoritative. */ }
+	const patterned = sampleStringPattern(shape.pattern, minLength);
+	if (patterned !== undefined && patterned !== fallback) {
+	  sawPatternSample = true;
+	  if (usePatternSamples) return patterned;
+	}
       }
-      return 'x'.repeat(Math.min(minLength, 32));
+      return fallback;
     }
     if (type === 'integer' || type === 'number') return typeof shape.minimum === 'number' ? shape.minimum : 1;
     if (type === 'boolean') return true;
@@ -2570,15 +2669,47 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
       // never a claim about arbitrary collection widths or schema values:
       // every completed candidate is checked by the runtime validator below.
       const count = typeof shape.minItems === 'number' ? shape.minItems : 0;
-      if (!Number.isInteger(count) || count < 0 || count > 4) return [];
-      const item = shape.items as JsonSchema | undefined;
-      return Array.from({ length: count }, () => sample(item, depth + 1));
+      if (!Number.isSafeInteger(count) || count < 0) return [];
+      if (count > 4) {
+	// Keep recursive item synthesis at four. For moderate minima, a
+	// sequence of small integers can satisfy the ordinary runtime schema
+	// without multiplying nested objects, enum values or string literals.
+	if (count > 32 || count > remainingSampleNodes) return [];
+	if (!useLargerArrays) {
+	  sawLargerArray = true;
+	  return [];
+	}
+	remainingSampleNodes -= count;
+	return Array.from({ length: count }, (_, index) => index);
+      }
+      const items = (useUnionSiblings ? layers : [shape]).map((layer) => layer.items as JsonSchema | undefined);
+      const values: unknown[] = [];
+      for (let i = 0; i < count; i++) {
+	const value = sample(items, depth + 1);
+	if (value === undefined) return undefined;
+	values.push(value);
+      }
+      return values;
     }
     const object: Record<string, unknown> = {};
-    const props = shape.properties && typeof shape.properties === 'object' && !Array.isArray(shape.properties)
-      ? shape.properties as Record<string, JsonSchema> : {};
-    const required = Array.isArray(shape.required) ? shape.required.filter((name): name is string => typeof name === 'string') : [];
-    for (const name of required) object[name] = sample(props[name], depth + 1);
+    const propertyParts = (name: string) => layers.map((layer) => {
+      const props = layer.properties;
+      return props && typeof props === 'object' && Object.hasOwn(props, name)
+	? (props as Record<string, JsonSchema>)[name] : undefined;
+    });
+    // The branch-only pass keeps the established conditional override. The
+    // sibling-aware pass needs the required names from every applicable layer.
+    for (const layer of useUnionSiblings ? layers : [shape]) {
+      if (!Array.isArray(layer.required)) continue;
+      for (const name of layer.required) {
+	if (sampleBudgetExhausted) return undefined;
+	if (typeof name === 'string' && !Object.hasOwn(object, name)) {
+	  const value = sample(propertyParts(name), depth + 1);
+	  if (value === undefined) return undefined;
+	  object[name] = value;
+	}
+      }
+    }
     if (Array.isArray(shape.allOf)) {
       for (const branch of shape.allOf) {
 	if (typeof branch !== 'object' || branch === null || Array.isArray(branch)) continue;
@@ -2591,11 +2722,14 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
 	  if (typeof thenProps !== 'object' || thenProps === null || Array.isArray(thenProps)) continue;
 	  for (const [name, hints] of Object.entries(thenProps)) {
 	    if (Object.prototype.hasOwnProperty.call(object, name)) {
-	      object[name] = sample(withHints(props[name], hints as JsonSchema), depth + 1);
+	      const value = sample([...propertyParts(name), hints as JsonSchema], depth + 1);
+	      // Earlier hints may already have changed whether the condition
+	      // holds. Keep the concrete field if this hint yields no value.
+	      if (value !== undefined) object[name] = value;
 	    }
 	  }
 	} else {
-	  const part = sample(branch as JsonSchema, depth + 1);
+	  const part = sample([branch as JsonSchema], depth + 1);
 	  if (part && typeof part === 'object' && !Array.isArray(part)) Object.assign(object, part);
 	}
       }
@@ -2603,18 +2737,47 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     return object;
   };
 
-  const generated = sample(schema, 0);
+  const generated = sample([schema], 0);
+  const generatedComplete = !sampleBudgetExhausted && generated !== undefined;
+  let combined: unknown;
+  if (sawUnionSiblings && !sampleBudgetExhausted) {
+    useUnionSiblings = true;
+    const candidate = sample([schema], 0);
+    if (!sampleBudgetExhausted) combined = candidate;
+  }
+  const additionalSamples: unknown[] = [];
+  // A different field in a union can make the unmodified string valid. Keep
+  // the original samples and build this alternative within the same node budget.
+  if (sawPatternSample && !sampleBudgetExhausted) {
+    usePatternSamples = true;
+    const candidate = sample([schema], 0);
+    if (!sampleBudgetExhausted && candidate !== undefined) additionalSamples.push(candidate);
+  }
+  if (sawLargerArray && !sampleBudgetExhausted) {
+    useLargerArrays = true;
+    // Retain concrete witnesses for any patterned or union-shaped siblings.
+    usePatternSamples = true;
+    useUnionSiblings = true;
+    const candidate = sample([schema], 0);
+    if (!sampleBudgetExhausted && candidate !== undefined) additionalSamples.push(candidate);
+  }
+
   const candidates: unknown[] = [
     {},
     { ok: true }, { ok: false }, { url: 'x' }, { value: 'x' },
     { n: 1 }, { value: 1 }, { items: [] },
   ];
-  if (includePrimitives) candidates.push(null, false, true, 0, 1, '', 'x', []);
-  if (!sampleBudgetExhausted && generated !== undefined && (includePrimitives
+  if (generatedComplete && (includePrimitives
     || (generated !== null && typeof generated === 'object' && !Array.isArray(generated)))) {
     candidates.unshift(generated);
   }
-  if (!sampleBudgetExhausted && generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
+  if (includePrimitives) {
+    // Singleton binding varies the first 16 candidates. Keep all original
+    // object seeds ahead of the new one and within that window.
+    if (combined !== undefined) candidates.push(combined);
+    candidates.push(null, false, true, 0, 1, '', 'x', []);
+  }
+  if (generatedComplete && generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
     const object = generated as Record<string, unknown>;
     for (const key of Object.keys(object)) {
       const omitted = { ...object };
@@ -2622,7 +2785,12 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
       candidates.push(omitted, { ...object, [key]: null });
     }
   }
-  return candidates;
+  // Collection callers use only the first accepted object. Preserve their
+  // existing choice, including an omission or null variant if it validates.
+  if (!includePrimitives && combined !== null && typeof combined === 'object' && !Array.isArray(combined)) {
+    candidates.push(combined);
+  }
+  return { candidates, additionalSamples };
 }
 
 /**
@@ -2640,7 +2808,9 @@ export function collectionValueWitnesses(schema: JsonSchema | undefined): {
   if (schema === undefined) return { valid: {}, validClassKnown: true, invalidClassKnown: true };
   let valid: Record<string, unknown> | undefined;
   let invalid: Record<string, unknown> | undefined;
-  for (const value of schemaValueCandidates(schema)) {
+  const { candidates, additionalSamples } = schemaValueCandidates(schema);
+  candidates.push(...additionalSamples);
+  for (const value of candidates) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
     const object = value as Record<string, unknown>;
     if (validateValue(schema, value).valid) {
@@ -2705,8 +2875,7 @@ function bindVariant(base: unknown, path: string, leaf: unknown): Record<string,
   return root;
 }
 
-/** Concrete singleton commit classes; no declaration alone creates a branch. */
-function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modifier?: string): {
+type SingletonWitnesses = {
   green: boolean;
   refusal: boolean;
   schemaValidClassKnown: boolean;
@@ -2714,7 +2883,10 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
   greenClassKnown: boolean;
   bindRefusal: boolean;
   acceptedModifiers: Array<string | undefined>;
-} {
+};
+
+/** Concrete singleton commit classes; no declaration alone creates a branch. */
+function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modifier?: string): SingletonWitnesses {
   const schema = produce.schema;
   const bind = produce.bind;
   if (schema === undefined && bind === undefined) {
@@ -2722,23 +2894,30 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
       schemaRefusalClassKnown: true, greenClassKnown: true, bindRefusal: false,
       acceptedModifiers: [undefined] };
   }
-  const candidates = schemaValueCandidates(schema, true);
+  const { candidates, additionalSamples } = schemaValueCandidates(schema, true);
   if (bind) {
     // A bare bind-shaped object often omits another required schema field.
     // Vary the bound leaf in a bounded set of complete sampled objects too;
     // the runtime validator below remains the acceptance authority.
     const leaves = bind.to === 'modifier'
       ? [...(def.modifiers ?? []), '__invalid_modifier__'] : [null];
-    for (const base of candidates.slice(0, 16)) {
+    const addBindVariants = (base: unknown): void => {
       for (const leaf of leaves) {
 	const variant = bindVariant(base, bind.from, leaf);
 	if (variant !== undefined) candidates.push(variant);
       }
-    }
+    };
+    for (const base of candidates.slice(0, 16)) addBindVariants(base);
     candidates.unshift(bindCandidate(bind.from, bind.to === 'modifier'
       ? (modifier ?? def.modifiers?.[0] ?? 'x') : null));
     for (const name of def.modifiers ?? []) candidates.push(bindCandidate(bind.from, name));
     candidates.push(bindCandidate(bind.from, '__invalid_modifier__'));
+    for (const sample of additionalSamples) {
+      candidates.push(sample);
+      addBindVariants(sample);
+    }
+  } else {
+    candidates.push(...additionalSamples);
   }
   let green = false;
   let refusal = false;
@@ -2747,6 +2926,9 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
   let bindRefusal = false;
   const acceptedModifiers = new Set<string | undefined>();
   for (const value of candidates) {
+    // Without a bind, every schema-valid value represents the same green
+    // transition. Once both classes are witnessed, later samples add nothing.
+    if (!bind && schemaValid && schemaRefusal) break;
     if (schema !== undefined && !validateValue(schema, value).valid) {
       refusal = true;
       schemaRefusal = true;
@@ -2851,6 +3033,20 @@ export function collectionLeaseSuccessors(
     }
   }
 
+  // Ordinary consumer rejection follows the consume edge, not the run's
+  // submission CAS. It remains legal after sealing or an input version move,
+  // including for collection-only producers. Enumerate each target once,
+  // independently of the number of singleton outputs on this run.
+  const consumer: Firing = {
+    step: lease.step, key: lease.key, inputs: lease.inputs, outputs: sealPaths,
+  };
+  for (const rejectPath of rejectableFiringInputs(def, state.arts, consumer)) {
+    for (const arts of applyOutcome(def, state.arts, consumer, 'judgment-reject',
+      { maxCollectionSize, modifier: state.modifier ?? modifier, rejectPath })) {
+      addSettledMove('judgment-reject', arts, state.leases, undefined, rejectPath);
+    }
+  }
+
   const stale = lease.inputs.some((path) =>
     !isGreen(state.arts.get(path)) || state.arts.get(path)?.version !== lease.fingerprint[path]);
   if (stale) {
@@ -2892,23 +3088,20 @@ export function collectionLeaseSuccessors(
     };
     for (const outcome of eligibleOutcomes(def, state.arts, firing, { modifier: state.modifier ?? modifier })) {
       if (outcome === 'skip') continue; // Already modeled for both fresh and stale leases.
+      if (outcome === 'judgment-reject') continue; // One transition per consumed target above.
       if (outcome === 'green' && !witnesses?.green) continue;
       if (outcome === 'schema-reject' && !witnesses?.refusal) continue;
       const selected = outcome === 'green' ? witnesses!.acceptedModifiers : [undefined];
-      const rejectPaths = outcome === 'judgment-reject'
-	? rejectableFiringInputs(def, state.arts, firing) : [undefined];
-      for (const rejectPath of rejectPaths) {
-	for (const selectedModifier of selected) {
-	  for (const arts of applyOutcome(def, state.arts, firing, outcome,
-	    { maxCollectionSize, modifier: state.modifier ?? modifier, rejectPath })) {
-	    const submitted = arts.get(path)?.acceptance === 'submitted';
-	    const pending = clonePendingModifiers(state.pendingModifiers);
-	    if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
-	    else if (outcome === 'green') delete pending[path];
-	    addSettledMove(outcome, arts, state.leases, undefined, rejectPath ?? path,
-	      outcome === 'green' && selectedModifier !== undefined && !submitted
-		? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
-	  }
+      for (const selectedModifier of selected) {
+	for (const arts of applyOutcome(def, state.arts, firing, outcome,
+	  { maxCollectionSize, modifier: state.modifier ?? modifier })) {
+	  const submitted = arts.get(path)?.acceptance === 'submitted';
+	  const pending = clonePendingModifiers(state.pendingModifiers);
+	  if (outcome === 'green' && selectedModifier !== undefined && submitted) pending[path] = selectedModifier;
+	  else if (outcome === 'green') delete pending[path];
+	  addSettledMove(outcome, arts, state.leases, undefined, path,
+	    outcome === 'green' && selectedModifier !== undefined && !submitted
+	      ? selectedModifier : state.modifier ?? modifier, pending, selectedModifier);
 	}
       }
     }
@@ -3024,6 +3217,7 @@ export function applyOutcome(
           ...targetArt,
           acceptance: 'rejected',
           judgmentRejects: targetArt.judgmentRejects + 1,
+	  approvals: undefined,
         });
       }
     }
@@ -3175,6 +3369,41 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
   return parts.join(';');
 }
 
+// Neighboring states share most artifact entries. Give each distinct fragment of
+// the canonical key a run-local ID so the visited set needn't retain all that
+// repeated text. Splitting and rejoining on ';' is lossless, even for empty
+// fragments or a delimiter inside a user-supplied name.
+class VisitedStates {
+  private readonly fragments = new Map<string, string>();
+  private readonly keys = new Set<string>();
+  private readonly limit: number;
+
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+
+  admit(key: string): 'seen' | 'added' | 'full' {
+    const full = this.keys.size >= this.limit;
+    const ids: string[] = [];
+    for (const fragment of key.split(';')) {
+      let id = this.fragments.get(fragment);
+      if (id === undefined) {
+	// An unknown fragment proves the whole key is new. At capacity,
+	// leave discarded candidates out of both the set and its dictionary.
+	if (full) return 'full';
+	id = this.fragments.size.toString(36);
+	this.fragments.set(fragment, id);
+      }
+      ids.push(id);
+    }
+    const compact = ids.join(',');
+    if (this.keys.has(compact)) return 'seen';
+    if (full) return 'full';
+    this.keys.add(compact);
+    return 'added';
+  }
+}
+
 /**
  * Bounded reachability / liveness checker over a workflow definition.
  *
@@ -3214,7 +3443,26 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   }
   const maxDepth = opts.maxDepth ?? 50;
   const maxStates = opts.maxStates ?? 5000;
+  if (!Number.isSafeInteger(maxStates) || maxStates < 1) throw new Error('maxStates must be a positive safe integer');
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
+
+  // Schema/bind witnesses depend on the declaration, modifier and this definition,
+  // never on artifact state. A later check may receive a mutated definition.
+  const witnessesByRoute = new Map<string | undefined, Map<ProducePattern, SingletonWitnesses>>();
+  function checkedWitnesses(produce: ProducePattern, modifier: string | undefined) {
+    const route = produce.bind?.to === 'modifier' ? modifier : undefined;
+    let byProduce = witnessesByRoute.get(route);
+    if (!byProduce) {
+      byProduce = new Map();
+      witnessesByRoute.set(route, byProduce);
+    }
+    let witnesses = byProduce.get(produce);
+    if (!witnesses) {
+      witnesses = singletonValueWitnesses(def, produce, route);
+      byProduce.set(produce, witnesses);
+    }
+    return witnesses;
+  }
 
   const seeded = seedArts(def, opts.assumeProvided ?? false);
   const initial: CollectionCheckState = { arts: seeded.arts, leases: [], modifier: opts.modifier };
@@ -3231,8 +3479,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   // every successor makes queue/visited storage grow with both states and
   // depth, even though only reported findings need materialized paths.
   const predecessors: Array<{ parent: number; step?: CheckStep }> = [{ parent: -1 }];
-  const visited = new Map<string, number>(); // key → predecessor id
-  visited.set(initialKey, 0);
+  const visited = new VisitedStates(maxStates);
+  visited.admit(initialKey);
   const pathTo = (id: number): CheckStep[] => {
     const reversed: CheckStep[] = [];
     while (id !== 0) {
@@ -3271,7 +3519,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   let depthReached = 0;
   const boundsHit = new Set<'maxDepth' | 'maxStates'>();
 
-  while (queueHead < queue.length) {
+  search: while (queueHead < queue.length) {
     const node = queue[queueHead]!;
     queue[queueHead++] = undefined;
     let reportedPath: CheckStep[] | undefined;
@@ -3413,20 +3661,26 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       continue;
     }
 
-    const enqueue = (state: CollectionCheckState, step: CheckStep): void => {
-      const key = collectionCheckKey(def, state);
-      if (!visited.has(key)) {
-	const id = predecessors.length;
-	predecessors.push({ parent: node.id, step });
-	visited.set(key, id);
-	queue.push({ state, id, depth: node.depth + 1 });
+    // Only a previously unseen state consumes a slot. At capacity we may
+    // still follow duplicate edges. If a new state would exceed the limit,
+    // move on to the next queued state so admitted witnesses are inspected.
+    const tryEnqueue = (state: CollectionCheckState, step: CheckStep): boolean => {
+      const admission = visited.admit(collectionCheckKey(def, state));
+      if (admission === 'seen') return true;
+      if (admission === 'full') {
+	boundsHit.add('maxStates');
+	return false;
       }
+      const id = predecessors.length;
+      predecessors.push({ parent: node.id, step });
+      queue.push({ state, id, depth: node.depth + 1 });
+      return true;
     };
 
     // Expand ordinary worker/calls/retract transitions. A collection producer
     // first claims a run; subsequent emit/refusal/seal actions occur through
     // the lease transitions below and can interleave with all other firings.
-    outer: for (const firing of firings) {
+    for (const firing of firings) {
       // An authority-only member retract does not prove its actor ever
       // produced an ordinary firing; preserve structural-dead-step accounting.
       if ((firing as Partial<MemberRetractFiring>).modelTransition !== 'member-retract') {
@@ -3436,7 +3690,6 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       const collections = producer ? collectionProduces(producer)
         .filter((produce) => firing.outputs.includes(sealPath(produce.stem))) : [];
       if (collections.length > 0) {
-	if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
 	report.collectionCapApplied = true;
 	if (!report.coverageIncomplete.includes('collection-width-cap')) {
 	  report.coverageIncomplete.push('collection-width-cap');
@@ -3459,7 +3712,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	}
 	for (const produce of producer?.produces ?? []) {
 	  if (produce.kind !== 'singleton' || produce.bind === undefined) continue;
-	  const witnesses = singletonValueWitnesses(def, produce, modifier);
+	  const witnesses = checkedWitnesses(produce, modifier);
 	  if (!witnesses.greenClassKnown && !report.coverageIncomplete.includes('singleton-bind-validity')) {
 	    report.coverageIncomplete.push('singleton-bind-validity');
 	  }
@@ -3482,96 +3735,92 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	  fingerprint: computeFingerprint(arts, firing.inputs),
 	};
 	const claimed = { ...node.state, leases: [...node.state.leases, lease] };
-	enqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' });
+	if (!tryEnqueue(claimed, { step: firing.step, key: firing.key, outcome: 'collection-claim' })) continue search;
 	continue;
       }
 
-      const ordinaryStep = def.steps.find((candidate) => candidate.name === firing.step);
-      const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, firing.outputs[0] ?? '');
-      if (ordinaryProduce?.schema !== undefined || ordinaryProduce?.bind !== undefined) {
-	const witnesses = singletonValueWitnesses(def, ordinaryProduce, modifier);
-	if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
-	  && !report.coverageIncomplete.includes('singleton-schema-validity')) {
-	  report.coverageIncomplete.push('singleton-schema-validity');
+      // One ordinary order can owe several artifacts. The worker may submit
+      // any of them first, with that output's own schema, judges and binding.
+      const targets = firing.outputs.length ? firing.outputs : [undefined];
+      for (const [index, path] of targets.entries()) {
+	const target = firing.outputs.length > 1 && path !== undefined
+	  ? { ...firing, outputs: [path] } : firing;
+	const ordinaryProduce = producer && produceOwning(producer, path ?? '');
+	const witnesses = ordinaryProduce && checkedWitnesses(ordinaryProduce, modifier);
+	if (ordinaryProduce && witnesses) {
+	  if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
+	    && !report.coverageIncomplete.includes('singleton-schema-validity')) {
+	    report.coverageIncomplete.push('singleton-schema-validity');
+	  }
+	  if (ordinaryProduce.schema !== undefined && !witnesses.schemaRefusalClassKnown
+	    && !report.coverageIncomplete.includes('singleton-schema-refusal')) {
+	    report.coverageIncomplete.push('singleton-schema-refusal');
+	  }
+	  if (ordinaryProduce.bind !== undefined && !witnesses.greenClassKnown
+	    && !report.coverageIncomplete.includes('singleton-bind-validity')) {
+	    report.coverageIncomplete.push('singleton-bind-validity');
+	  }
+	  if (ordinaryProduce.bind !== undefined && !witnesses.bindRefusal && ordinaryProduce.schema !== false
+	    && !report.coverageIncomplete.includes('singleton-bind-refusal')) {
+	    report.coverageIncomplete.push('singleton-bind-refusal');
+	  }
+	  if (ordinaryProduce.bind?.to === 'modifier'
+	    && (def.modifiers ?? []).some((name) => !witnesses.acceptedModifiers.includes(name))
+	    && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
+	    report.coverageIncomplete.push('singleton-bind-modifier');
+	  }
 	}
-	if (ordinaryProduce.schema !== undefined && !witnesses.schemaRefusalClassKnown
-	  && !report.coverageIncomplete.includes('singleton-schema-refusal')) {
-	  report.coverageIncomplete.push('singleton-schema-refusal');
-	}
-	if (ordinaryProduce.bind !== undefined && !witnesses.greenClassKnown
-	  && !report.coverageIncomplete.includes('singleton-bind-validity')) {
-	  report.coverageIncomplete.push('singleton-bind-validity');
-	}
-	if (ordinaryProduce.bind !== undefined && !witnesses.bindRefusal && ordinaryProduce.schema !== false
-	  && !report.coverageIncomplete.includes('singleton-bind-refusal')) {
-	  report.coverageIncomplete.push('singleton-bind-refusal');
-	}
-	if (ordinaryProduce.bind?.to === 'modifier'
-	  && (def.modifiers ?? []).some((name) => !witnesses.acceptedModifiers.includes(name))
-	  && !report.coverageIncomplete.includes('singleton-bind-modifier')) {
-	  report.coverageIncomplete.push('singleton-bind-modifier');
-	}
-      }
 
-      const outcomes = eligibleOutcomes(def, arts, firing, { modifier });
+	const outcomes = firingOutcomes(def, arts, target, modifier, witnesses);
 
-      for (const outcome of outcomes) {
-        // Check state count before expanding
-        if (visited.size >= maxStates) {
-          boundsHit.add('maxStates');
-          break outer;
-        }
+	for (const outcome of outcomes) {
+	  // Rejecting a consumed input is a single choice for the entire order.
+	  if (outcome === 'judgment-reject' && index > 0) continue;
+	  const rejectPaths = outcome === 'judgment-reject'
+	    ? rejectableFiringInputs(def, arts, firing) : [undefined];
+	  for (const rejectPath of rejectPaths) {
+	    const successors = applyOutcome(def, arts, target, outcome,
+	      { maxCollectionSize, modifier, rejectPath });
 
-	const rejectPaths = outcome === 'judgment-reject'
-	  ? rejectableFiringInputs(def, arts, firing) : [undefined];
-	for (const rejectPath of rejectPaths) {
-	  // A reducer may have many live members. Count each target branch against
-	  // the same search limit rather than expanding the whole fan-in at once.
-	  if (visited.size >= maxStates) { boundsHit.add('maxStates'); break outer; }
-	  const successors = applyOutcome(def, arts, firing, outcome,
-	    { maxCollectionSize, modifier, rejectPath });
-
-	  for (const suc of successors) {
-	    const path = firing.outputs[0];
-	    const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
-	    if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
-	    let nextModifier = modifier;
-	    let approvedModifier: string | undefined;
-	    if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
-	      approvedModifier = pendingModifiers[path];
-	      nextModifier = approvedModifier ?? modifier;
-	      delete pendingModifiers[path];
-	    }
-	    const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier'
-	      ? singletonValueWitnesses(def, ordinaryProduce, modifier).acceptedModifiers : [undefined];
-	    for (const selected of choices) {
-	      const nextPending = clonePendingModifiers(pendingModifiers);
-	      let routed = nextModifier;
-	      if (outcome === 'green' && path) {
-		delete nextPending[path];
-		if (selected !== undefined) {
-		  if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
-		  else routed = selected;
-		}
+	    for (const suc of successors) {
+	      const pendingModifiers = clonePendingModifiers(node.state.pendingModifiers);
+	      if (outcome === 'judge-reject' && path) delete pendingModifiers[path];
+	      let nextModifier = modifier;
+	      let approvedModifier: string | undefined;
+	      if (outcome === 'judge-approve' && path && suc.get(path)?.acceptance === 'green') {
+		approvedModifier = pendingModifiers[path];
+		nextModifier = approvedModifier ?? modifier;
+		delete pendingModifiers[path];
 	      }
-	      const selectedModifier = outcome === 'green' ? selected : approvedModifier;
-	      const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
-		...(rejectPath === undefined ? {} : { path: rejectPath }),
-		...(selectedModifier === undefined ? {} : { selectedModifier }) };
-	      enqueue({ arts: suc, leases: node.state.leases, modifier: routed,
-		pendingModifiers: nextPending }, trace);
+	      const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier' && witnesses
+		? witnesses.acceptedModifiers : [undefined];
+	      for (const selected of choices) {
+		const nextPending = clonePendingModifiers(pendingModifiers);
+		let routed = nextModifier;
+		if (outcome === 'green' && path) {
+		  delete nextPending[path];
+		  if (selected !== undefined) {
+		    if (suc.get(path)?.acceptance === 'submitted') nextPending[path] = selected;
+		    else routed = selected;
+		  }
+		}
+		const selectedModifier = outcome === 'green' ? selected : approvedModifier;
+		const tracePath = rejectPath ?? (firing.outputs.length > 1 ? path : undefined);
+		const trace: CheckStep = { step: firing.step, key: firing.key, outcome,
+		  ...(tracePath === undefined ? {} : { path: tracePath }),
+		  ...(selectedModifier === undefined ? {} : { selectedModifier }) };
+		if (!tryEnqueue({ arts: suc, leases: node.state.leases, modifier: routed,
+		  pendingModifiers: nextPending }, trace)) continue search;
+	      }
 	    }
 	  }
 	}
       }
     }
-    if (boundsHit.has('maxStates')) break;
 
     for (const move of leaseMoves) {
-      if (visited.size >= maxStates) { boundsHit.add('maxStates'); break; }
-      enqueue(move.state, move.step);
+      if (!tryEnqueue(move.state, move.step)) continue search;
     }
-    if (boundsHit.has('maxStates')) break;
   }
 
   report.stats.depthReached = depthReached;

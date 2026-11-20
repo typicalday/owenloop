@@ -413,8 +413,14 @@ the bundled Claude Code and Codex plugins on that same CLI and hub connection.
 
 ## Quick start
 
-Put the `owenloop` CLI (Node ≥ 22.13) on `PATH` and run `owenloop setup` once. Then
-ask your Prime Agent for what you want:
+With Node.js 22.13 or newer, install the CLI and connect it to your Hub:
+
+```sh
+npm install --global owenloop
+owenloop setup
+```
+
+Then ask your Prime Agent for what you want:
 
 > Use author to build me a workflow that researches a topic, writes
 > a report, and doesn't accept it until an independent reviewer signs off —
@@ -429,9 +435,10 @@ plugins launch the same `owenloop` command as
 check the installed CLI/plugin version pair at session start when their hooks
 are enabled, and the MCP server reports a readable mismatch error on tool calls; run `owenloop setup` when the versions differ. For one-off shell
 use, `npx owenloop` still works — no clone, no build, no environment
-variables, no CLI verbs to memorize. The same package also includes the
-execution-side companion; use `owenloop work <subcommand>` for lower-level
-execution tasks. There is no separate `owenwork` package or binary.
+variables, no CLI verbs to memorize. The same package includes the worker
+commands under `owenloop work`. To connect a worker with a one-time join
+code, copy the command from the Console or run
+`owenloop work join <code> --hub <origin>` with your Hub's URL.
 
 ### Deterministic workflow bundles
 
@@ -560,9 +567,12 @@ never surfacing a token to the model. See the
   unflagged from 22.13 onward (it still prints an experimental warning until it
   stabilises in Node 24.15 / 25.7). owenloop is an ESM-only package. CI runs the
   full check on Node 22 (active LTS) and 24 (current).
-- **No native dependencies.** `node:sqlite` is built in, so there's nothing to
-  compile. The only runtime deps are `yaml` (parsing defs) and
-  `@cfworker/json-schema` (optional per-artifact schema validation).
+- **No SQLite addon build.** Storage uses Node's built-in `node:sqlite`, so
+  installing Owenloop does not compile a SQLite addon.
+- **Runtime dependencies.** `yaml` parses definitions, `@cfworker/json-schema`
+  validates artifact schemas, and `semver` checks bundle/runtime versions.
+  `@anthropic-ai/claude-agent-sdk` and its transitive dependencies are also
+  installed with Owenloop. The Claude adapter loads the SDK's runtime API lazily.
 - **OpenSSH `ssh-keygen` with `-Y` support** (OpenSSH 8.1+) for the signing
   features. `owenloop setup` automatically ensures an Ed25519 signing key for
   each of the three local principals — human, machine, agent — and signs /

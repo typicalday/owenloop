@@ -2383,7 +2383,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     } else {
       // text format
       const formatCheckStep = (step: CheckStep): string =>
-	`${step.step}/${step.outcome}${step.outcome === 'judgment-reject' && step.path ? `(${step.path})` : ''}`;
+	`${step.step}/${step.outcome}${step.path ? `(${step.path})` : ''}`;
       const definiteDefect = hasDefiniteCheckDefect(report);
       const status = definiteDefect ? 'DEFECTS FOUND'
 	: report.bounded || report.coverageIncomplete.length > 0 || !report.completable
@@ -2473,7 +2473,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       if (report.completePath) {
         io.out('');
         io.out(`Example completion path:`);
-        io.out(`  ${report.completePath.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(already done)'}`);
+	io.out(`  ${report.completePath.map(formatCheckStep).join(' -> ') || '(already done)'}`);
       }
     }
 

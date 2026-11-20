@@ -36,6 +36,7 @@ Options:
       <crew...>                  serve only these crews (positional, space
                                  separated); or --all for every crew on the key
       --all                      serve every crew on the key
+      --serve-commands           poll only for commands granted to this worker
       --origin <url>             hub origin (else settings.hubOrigin)
       --as <account>             Scoped Identity credential account to read + hand
                                  to dispatched holds/execs (default 'default')

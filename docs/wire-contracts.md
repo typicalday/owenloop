@@ -453,8 +453,11 @@ closes the run, so additional owed paths remain debts.
 
 Receipt submission is retried only for `HubError` responses with HTTP `429`.
 The worker makes at most three total attempts for each owed path, with a
-30-second wall-clock retry window. It honors a supplied `Retry-After` delay
-exactly when that delay fits the remaining window; without one, it waits 5
+30-second elapsed-time retry window, also shortened by forward wall-clock
+movement. Wall-clock rollback cannot extend it. The worker checks the window
+immediately before each retry, so a late timer wake cannot send an expired
+receipt. It honors a supplied `Retry-After` delay when that full delay leaves
+time for a retry within the window; without one, it waits 5
 seconds before the second attempt and 10 seconds before the third. A delay that
 would exceed the window fails the submit rather than being shortened. The
 receipt, proof, and request bytes are built once per path and replayed

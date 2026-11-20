@@ -56,6 +56,15 @@ test('state-dir and start parser preserve explicit crews, queue hold, exec reser
   assert.match(parseStartArgs(['--all', 'alpha']).error!, /cannot be combined/);
 });
 
+test('command-only polling is opt-in and preserves public crew selection', () => {
+  assert.equal(parseStartArgs(['alpha']).serveCommands, undefined);
+  assert.equal(parseStartArgs(['alpha', '--serve-commands']).serveCommands, true);
+  assert.deepEqual(parseStartArgs(['--serve-commands', 'alpha']).serveCrews, ['alpha']);
+  assert.deepEqual(parseStartArgs(['--all', '--serve-commands']).serveCrews, []);
+  assert.match(parseStartArgs(['--serve-commands']).error!, /at least one crew/);
+  assert.match(parseStartArgs(['alpha', '--serve-commands=false']).error!, /takes no value/);
+});
+
 test('every public Shift daemon client command refuses Windows named-pipe assumptions', () => {
   for (const command of ['next', 'status', 'end'] as const) {
     assert.match(

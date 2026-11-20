@@ -23,6 +23,7 @@
  * policy later, and oauth-kind token refresh stays inside owenloop.
  */
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 import { HubError } from './types.ts';
 import type {
   AnswerApprovalRequest,
@@ -119,8 +120,8 @@ export interface HubClient {
   whatsNext(req: WhatsNextRequest, signal?: AbortSignal): Promise<WhatsNextResponse>;
   getOrder(req: GetOrderRequest, signal?: AbortSignal): Promise<GetOrderResponse>;
   /** Opt-in trusted reference protocol. An older Service returns 404; no legacy retry. */
-  getReferenceOrder?(req: GetOrderRequest): Promise<unknown>;
-  heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
+  getReferenceOrder?(req: GetOrderRequest, signal?: AbortSignal): Promise<unknown>;
+  heartbeat(req: HeartbeatRequest, signal?: AbortSignal): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   /** Versioned route only; callers must never fall back to legacy submit. */
@@ -170,7 +171,7 @@ export interface HubClient {
   /** Ask the authorized routing service for one local-model advisory. */
   assessLocalModel?(req: LocalModelRequest, signal?: AbortSignal): Promise<LocalModelResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
-  wake(cursor?: number, signal?: AbortSignal): Promise<WakeResponse>;
+  wake(cursor?: number, signal?: AbortSignal, serveCommands?: boolean): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
   presencePing(req: PresencePingRequest, signal?: AbortSignal): Promise<PresencePingResponse>;
   /**
@@ -223,7 +224,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
   const base = opts.origin.replace(/\/+$/, '');
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
 
-  async function authHeaders(): Promise<Record<string, string>> {
+  async function authHeaders(signal?: AbortSignal): Promise<Record<string, string>> {
+    signal?.throwIfAborted();
     const token = await opts.getToken();
     return {
       authorization: `Bearer ${token}`,
@@ -264,9 +266,14 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     // A routing claim has additional authority and launch fences. Legacy
     // lifecycle verbs cannot settle it through bearer-only routes.
     if (opts.routingSession) throw new Error('routing session legacy POST refused');
+    const headers = await authHeaders(signal);
+    // A credential lookup can outlive the caller's deadline. Do not let its
+    // late completion start an already-expired authenticated request.
+    signal?.throwIfAborted();
     const res = await fetchImpl(`${base}/api/${verb}`, {
       method: 'POST',
-      headers: await authHeaders(),
+      redirect: 'error',
+      headers,
       body: JSON.stringify(body),
       ...(signal === undefined ? {} : { signal }),
     });
@@ -285,7 +292,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     if (!opening && (!session || !Number.isFinite(session.expiresAt)
       || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)) throw new Error('routing session unavailable');
     try {
-      const headers = await authHeaders();
+      const headers = await authHeaders(signal);
+      signal?.throwIfAborted();
       if (session) headers['X-Owenloop-Routing-Session'] = session.credential;
       routing.beforeRequest?.();
       const res = await fetchImpl(`${base}/api/${verb}`, {
@@ -323,7 +331,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
       || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
       throw new Error('routing session unavailable');
     try {
-      const headers = await authHeaders();
+      const headers = await authHeaders(signal);
+      signal?.throwIfAborted();
       headers['X-Owenloop-Routing-Session'] = session.credential;
       headers['X-Owenloop-Routing-Intent'] = req.intentId;
       if (req.generationToken) headers['X-Owenloop-Routing-Generation'] = req.generationToken;
@@ -358,7 +367,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
       || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
       throw new Error('routing session unavailable');
     try {
-      const headers = await authHeaders();
+      const headers = await authHeaders(signal);
+      signal?.throwIfAborted();
       headers['X-Owenloop-Routing-Session'] = session.credential;
       headers['content-type'] = req.contentType;
       headers['content-length'] = String(req.size);
@@ -397,7 +407,8 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
       || session.expiresAt <= (routing.now?.() ?? Date.now()) || !session.credential)
       throw new Error('routing session unavailable');
     try {
-      const headers = await authHeaders();
+      const headers = await authHeaders(signal);
+      signal?.throwIfAborted();
       headers['X-Owenloop-Routing-Session'] = session.credential;
       routing.beforeRequest?.();
       const url = `${base}/api/routing_file_artifacts/v1?workflow=${encodeURIComponent(req.workflow)}`
@@ -433,11 +444,12 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     }
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
     try {
-      const headers = await authHeaders();
+      const headers = await authHeaders(signal);
+      signal?.throwIfAborted();
       opts.routingSession?.beforeRequest?.();
       const res = await fetchImpl(url, {
 	method: 'GET', headers,
-	...(opts.routingSession ? { redirect: 'error' as const } : {}),
+	redirect: 'error',
 	...(signal === undefined ? {} : { signal }),
       });
       if (opts.routingSession && !res.ok) {
@@ -462,18 +474,47 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     // The name rides a header rather than the body because the body IS the
     // bytes. It is a display label only; the hub never resolves it as a path.
     if (req.filename !== undefined) headers['x-file-name'] = req.filename;
+    // Bind the acknowledgement to the bytes/headers passed to fetch, before
+    // awaiting its response. A caller changing its buffer later cannot change
+    // the expected digest of this already-sent request.
+    const expectedHash = createHash('sha256').update(req.bytes).digest('hex');
+    const expectedSize = req.bytes.byteLength;
+    const normalizedHeaders = new Headers(headers);
+    const expectedFilename = normalizedHeaders.get('x-file-name') || undefined;
     const res = await fetchImpl(`${base}${path}?workflow=${encodeURIComponent(req.workflow)}`, {
       method: 'POST',
+      redirect: 'error',
       headers,
       body: req.bytes,
     });
-    return parse<T>(res);
+    const ack = await parse<unknown>(res);
+    if (ack === null || typeof ack !== 'object' || Array.isArray(ack)) {
+      throw new Error('file-artifact-ack-invalid');
+    }
+    const pointer = ack as Record<string, unknown>;
+    if (typeof pointer.__file !== 'string' || pointer.__file.length === 0
+      || pointer.hash !== expectedHash || pointer.size !== expectedSize
+      || pointer.contentType !== normalizedHeaders.get('content-type')
+      || pointer.filename !== expectedFilename) {
+      throw new Error('file-artifact-ack-invalid');
+    }
+    return ack as T;
   }
 
   return {
-    whatsNext: (req, signal) => opts.routingSession !== undefined || req.routing !== undefined
-      ? scopedPost<WhatsNextResponse>('whats_next', req, signal)
-      : post<WhatsNextResponse>('whats_next', req, signal),
+    whatsNext: async (req, signal) => {
+      // A legacy targeted poll may create a claim before its response can be checked.
+      if (opts.routingSession !== undefined || req.routing !== undefined) {
+	if (req.serve_commands) throw new Error('command-only polls cannot select model routing');
+	return scopedPost<WhatsNextResponse>('whats_next', req, signal);
+      }
+      const path = req.serve_commands ? 'command_lane/v1/whats_next' : 'whats_next';
+      const result = await post<WhatsNextResponse>(path, req, signal);
+      if (req.serve_commands && (result.command_lane !== 'grant-v1' || result.orders?.some(order => order.worker !== 'command'))) {
+        throw new Error('Hub did not acknowledge a command-only grant lane; no work may be dispatched');
+      }
+      return result;
+    },
     getOrder: (req, signal) => opts.routingSession !== undefined
       ? scopedPost<GetOrderResponse>('get_order', req, signal)
       : post<GetOrderResponse>('get_order', req, signal),
@@ -508,10 +549,10 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     assessLocalModel: (req, signal) => scopedPost<LocalModelResponse>('assess_local_model', req, signal),
     // Hosted-holder preflight only. Routing orders return routing-unsupported;
     // get_order plus read_routing_claim supply Jev authority instead.
-    getReferenceOrder: (req) => opts.routingSession !== undefined
-      ? scopedPost<unknown>('reference_order/v1', req)
-      : post<unknown>('reference_order/v1', req),
-    heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
+    getReferenceOrder: (req, signal) => opts.routingSession !== undefined
+      ? scopedPost<unknown>('reference_order/v1', req, signal)
+      : post<unknown>('reference_order/v1', req, signal),
+    heartbeat: (req, signal) => post<HeartbeatResponse>('heartbeat', req, signal),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
     submitConditional: (req) => post<ConditionalSubmitResponse>('submit/conditional-v1', req),
@@ -529,8 +570,11 @@ export function createHubClient(opts: HubClientOptions): RoutingHubClient {
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).
-    wake: (cursor, signal) =>
-      get<WakeResponse>('wake', typeof cursor === 'number' ? `cursor=${encodeURIComponent(String(cursor))}` : undefined, signal),
+    wake: (cursor, signal, serveCommands = false) => {
+      const parts = typeof cursor === 'number' ? [`cursor=${encodeURIComponent(String(cursor))}`] : [];
+      if (serveCommands) parts.push('serve_commands=true');
+      return get<WakeResponse>('wake', parts.length ? parts.join('&') : undefined, signal);
+    },
     presencePing: (req, signal) => post<PresencePingResponse>('presence_ping', req, signal),
     putFileArtifact: (req) => postBytes<PutFileArtifactResponse>('/api/file-artifacts', req),
   };

@@ -149,6 +149,8 @@ export interface ShiftLoopOptions {
   /** Serve crews this shift accepts (sent to presence + whats_next). INITIAL
    *  value only — live-mutable via the `ShiftLoop.setShift` (MCP `clock_in`). */
   serveCrews: string[];
+  /** Separate command-only polling; never changes grants or agent routing. */
+  serveCommands?: boolean;
   /** Shift name for presence. INITIAL value only — live-mutable via
    *  `ShiftLoop.setShift` (MCP `clock_in`). */
   name: string;
@@ -1941,7 +1943,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     } else {
       try {
 	const inbox = await hubCall('inbox whats_next', (signal) =>
-	  opts.hub.whatsNext({ serve_capabilities: [...serveCapabilities] }, signal));
+	  opts.hub.whatsNext({ serve_capabilities: [...serveCapabilities], ...(opts.serveCommands ? { serve_commands: true } : {}) }, signal));
 	instances = (inbox.instances ?? []).map((inbox) => ({ workflow: inbox.workflow, inbox }));
       } catch (e) {
 	noteServerBackoff(e);
@@ -2029,6 +2031,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    serve_crews: selection.crews,
 	    serve_capabilities: selection.capabilities,
 	    ...(routing ? { routing } : {}),
+	    ...(opts.serveCommands ? { serve_commands: true } : {}),
 	  }, signal);
 	});
       } catch (e) {
@@ -2448,7 +2451,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     try {
       // Under the per-call deadline: a timeout lands in the catch below on the
       // same terms as any other non-rate-limited failure (issue #300).
-      const w = await hubCall('wake', (signal) => opts.hub.wake(cursor, signal));
+      const w = await hubCall('wake', (signal) => opts.serveCommands ? opts.hub.wake(cursor, signal, true) : opts.hub.wake(cursor, signal));
       changed = w.changed;
       cursor = w.cursor;
       wakeSucceeded = true;

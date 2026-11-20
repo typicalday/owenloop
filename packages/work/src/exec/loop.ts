@@ -163,6 +163,8 @@ export interface ExecLoopOptions {
   dirExists?: (path: string) => boolean;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** Elapsed-time clock for the bounded submit retry window. Default `performance.now`. */
+  monotonicNow?: () => number;
   random?: () => number;
   out: (line: string) => void;
   err: (line: string) => void;
@@ -432,6 +434,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   let signalled = false;
   let leasePromise: Promise<LeaseOutcome> | undefined;
   const routedPrestartAbort = new AbortController();
+  let leaseOutcome: LeaseOutcome | undefined;
+  let signingCancel: AbortController | undefined;
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -496,6 +500,27 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (o === 'ownership-error') return 'ownership-error';
     if (o === 'hub-unreachable') return 'hub-unreachable';
     return 'lease-lost';
+  }
+
+  /** Keep asynchronous preparation subordinate to the current lease. Private
+   * resolvers may ignore stop, but their late results cannot launch work. */
+  async function prepareWhileHeld<T>(prepare: () => Promise<T>): Promise<
+    { kind: 'value'; value: T } | { kind: 'lease'; outcome: LeaseOutcome }
+  > {
+    const terminal = async () => ({ kind: 'lease' as const, outcome: await leasePromise! });
+    if (signalled || leaseOutcome !== undefined) return terminal();
+    const prepared = await Promise.race([
+      (async () => prepare())().then(
+	value => ({ kind: 'value' as const, value }),
+	error => ({ kind: 'error' as const, error }),
+      ),
+      leasePromise!.then(outcome => ({ kind: 'lease' as const, outcome })),
+    ]);
+    // Stop can precede the bounded release completing, and a value/error can
+    // win the race in that interval. Neither is permission to start work.
+    if (signalled || leaseOutcome !== undefined) return terminal();
+    if (prepared.kind === 'error') throw prepared.error;
+    return prepared;
   }
 
   /**
@@ -751,6 +776,10 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     resolvedCommand: string,
     revalidate?: () => Promise<import('./instructions.ts').InstructionRefusal | undefined>,
   ): Promise<ExecOutcome> {
+    // A non-closing reject ACK describes that already-sent request only.
+    // It cannot authorize a later escalation after stop or observed lease loss.
+    if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
+
     // run() returns misroute when order.owes is empty, so this index is safe.
     const path = order.owes[0]!.path;
     const how = describeCommandFailure(receipt);
@@ -925,21 +954,31 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     for (const owe of order.owes) {
       let proof: string | undefined;
       try {
-        if (opts.origin !== undefined) {
-	  // The immutable order can authorize a judge proof only when the owed
-	  // path is the fingerprinted judged artifact. Producer command receipts
-	  // remain unsigned until the hub issues a retry-safe target version.
-          proof = await buildSubmitProof({
-            origin: opts.origin,
-            order,
-            path: owe.path,
-            value: receipt,
-            now: opts.now,
-            warn: opts.err,
-            ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
-            ...(opts.env !== undefined ? { env: opts.env } : {}),
-            ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
-          });
+	const signingOrigin = opts.origin;
+	if (signingOrigin !== undefined) {
+	  const cancellation = new AbortController();
+	  signingCancel = cancellation;
+	  try {
+	    // The immutable order can authorize a judge proof only when the owed
+	    // path is the fingerprinted judged artifact. Producer command receipts
+	    // remain unsigned until the hub issues a retry-safe target version.
+	    const signing = await prepareWhileHeld(() => buildSubmitProof({
+	      origin: signingOrigin,
+	      signal: cancellation.signal,
+	      order,
+	      path: owe.path,
+	      value: receipt,
+	      now: opts.now,
+	      warn: opts.err,
+	      ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
+	      ...(opts.env !== undefined ? { env: opts.env } : {}),
+	      ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
+	    }));
+	    if (signing.kind === 'lease') return mapNoHold(signing.outcome);
+	    proof = signing.value;
+	  } finally {
+	    if (signingCancel === cancellation) signingCancel = undefined;
+	  }
         }
       } catch (e) {
         return failSubmit(owe.path, e);
@@ -956,11 +995,32 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         holder: opts.holder,
       });
       const retryStartedAt = opts.now();
+      const monotonicNow = opts.monotonicNow ?? (() => performance.now());
+      const retryStartedElapsed = monotonicNow();
+      let lastElapsed = retryStartedElapsed;
+      const retryRemaining = (): number => {
+	const wall = opts.now();
+	const elapsed = monotonicNow();
+	if (
+	  !Number.isFinite(retryStartedAt) || !Number.isFinite(retryStartedElapsed) ||
+	  !Number.isFinite(wall) || !Number.isFinite(elapsed) || elapsed < lastElapsed
+	) return 0;
+	lastElapsed = elapsed;
+	// Wall rollback cannot extend the elapsed-time ceiling. Forward wall
+	// movement may shorten it, including time spent waiting for a 429 ACK.
+	return SUBMIT_RETRY_WINDOW_MS - Math.max(0, wall - retryStartedAt, elapsed - retryStartedElapsed);
+      };
       let res: Awaited<ReturnType<HubClient['submit']>> | undefined;
 
       for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
 	const refusedAttempt = await checkV2Consequence(revalidateAfterRun);
 	if (refusedAttempt !== undefined) return refusedAttempt;
+	// A signed proof or an earlier ACK cannot revive a stopped/lost lease.
+	// Consume already-sent ACKs normally; fence only sends not yet begun.
+	if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
+	if (attempt > 1 && retryRemaining() <= 0) {
+	  return failSubmit(owe.path, new Error('submit retry window exhausted'));
+	}
         try {
           res = await hub.submit(submitRequest);
           break;
@@ -969,10 +1029,10 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
           if (!retryable || attempt === SUBMIT_MAX_ATTEMPTS) return failSubmit(owe.path, e);
 
           const delay = e.retryAfterMs ?? SUBMIT_FALLBACK_DELAYS_MS[attempt - 1]!;
-          const remaining = SUBMIT_RETRY_WINDOW_MS - (opts.now() - retryStartedAt);
+	  const remaining = retryRemaining();
           // Never retry ahead of a server delay, nor hold this receipt beyond
           // the bounded retry window just because a malformed/large header said to.
-          if (delay > remaining) return failSubmit(owe.path, e);
+	  if (!Number.isFinite(delay) || delay < 0 || delay >= remaining) return failSubmit(owe.path, e);
 
           opts.err(
             `owenloop work exec: submit to ${owe.path} failed: ${formatSubmitError(e)}; ` +
@@ -1018,10 +1078,16 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   async function run(): Promise<ExecOutcome> {
-    leasePromise = lease.run();
-    // A terminal lease cancels a pending scoped file stream before a shell can
-    // start. Normal completion happens only after the command is already done.
-    void leasePromise.then(() => routedPrestartAbort.abort(), () => routedPrestartAbort.abort());
+    leasePromise = lease.run().then(outcome => {
+      leaseOutcome = outcome;
+      signingCancel?.abort();
+      routedPrestartAbort.abort();
+      return outcome;
+    }, error => {
+      signingCancel?.abort();
+      routedPrestartAbort.abort();
+      throw error;
+    });
 
     // First contact race: the order arrives (hold established), or the lease
     // resolves terminally before we ever established it.
@@ -1110,7 +1176,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     let revalidate: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     let revalidateAfterRun: (() => Promise<import('./instructions.ts').InstructionRefusal | undefined>) | undefined;
     try {
-      const resolved = await opts.instructions.resolveCommand(order);
+      const preparation = await prepareWhileHeld(() => opts.instructions.resolveCommand(order));
+      if (preparation.kind === 'lease') return mapNoHold(preparation.outcome);
+      const resolved = preparation.value;
       if (!resolved.ok) {
         opts.err(`owenloop work exec: ${resolved.reason}`);
         lease.stop('unresolved-instructions');
@@ -1222,7 +1290,11 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         const startOptions = { cwd, env: childEnv };
         if (revalidate) {
           let reason: string | undefined;
-          try { reason = (await revalidate())?.reason; }
+	  try {
+	    const validation = await prepareWhileHeld(revalidate);
+	    if (validation.kind === 'lease') return mapNoHold(validation.outcome);
+	    reason = validation.value?.reason;
+	  }
           catch (error) { reason = `trusted pre-launch revalidation failed: ${errMsg(error)}`; }
           if (reason !== undefined) {
             opts.err(reason);
@@ -1252,6 +1324,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
 	    return signalled ? 'killed' : mapLeaseDuringRun(terminal);
 	  }
 	}
+	if (signalled || leaseOutcome !== undefined) return mapNoHold(await leasePromise!);
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
 	return deliverCommandResult(machineryFailure(e), order, resolvedCommand, payloadFile, revalidateAfterRun);
@@ -1303,6 +1376,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (signalled) return;
     signalled = true;
     routedPrestartAbort.abort();
+    signingCancel?.abort();
     if (running !== undefined) void running.kill();
     lease.stop(reason ?? 'signal'); // release:true — hand the killed order back
   }

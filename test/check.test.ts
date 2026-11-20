@@ -434,6 +434,102 @@ test('modelCheck: linear def with no stalls → completable, exhaustive search',
   // The workflow IS completable; whether bounded depends on maxStates
 });
 
+test('modelCheck admits an exact-fit graph when later transitions revisit known states', () => {
+  const source = input('initial', { seedOwed: false });
+  const limits = { maxAttempts: 1, maxSchemaFailures: 1, terminal: true };
+  const parallel = def('parallel', [source], [
+    step({ name: 'first', consumes: ['initial'], produces: ['x'], ...limits }),
+    step({ name: 'second', consumes: ['initial'], produces: ['y'], ...limits }),
+  ]);
+  const collection = def('collection', [source], [
+    step({ name: 'collect', consumes: ['initial'], produces: ['x[]'], ...limits }),
+  ]);
+  for (const workflow of [parallel, collection]) {
+    const reference = modelCheck(workflow);
+    assert.equal(reference.bounded, false);
+    assert.equal(reference.completable, true);
+    const states = reference.stats.statesExplored;
+    assert.deepEqual(modelCheck(workflow, { maxStates: states }), reference);
+    const smaller = modelCheck(workflow, { maxStates: states - 1 });
+    assert.deepEqual(smaller.boundsHit, ['maxStates']);
+    assert.equal(smaller.stats.statesExplored, states - 1);
+  }
+});
+
+test('checker replays a worker committing the second owed output first', () => {
+  const workflow = def('output-order', [input('seed', { seedOwed: false })], [
+    step({ name: 'producer', consumes: ['seed'], produces: ['alpha', 'beta'] }),
+  ]);
+  workflow.invariants = [{
+    name: 'alpha-before-beta',
+    when: { path: 'beta', is: 'green' },
+    requires: { not: { path: 'alpha', is: 'owed' } },
+  }];
+  assert.deepEqual(validateDef(workflow), []);
+  const { engine } = makeEngine([workflow]);
+  const wf = engine.createInstance(workflow.name);
+  const order = fire(engine, wf, 'producer');
+  assert.deepEqual(order.owes.map((owed) => owed.path), ['alpha', 'beta']);
+  engine.green(wf, order.run, 'beta', {});
+  assert.equal(engineArts(engine, wf).get('alpha')?.acceptance, 'owed');
+  assert.equal(engineArts(engine, wf).get('beta')?.acceptance, 'green');
+
+  const report = modelCheck(workflow);
+  assert.equal(report.bounded, false);
+  assert.deepEqual(report.invariantViolations, [{
+    invariant: 'alpha-before-beta',
+    path: [{ step: 'producer', key: '', outcome: 'green', path: 'beta' }],
+  }]);
+});
+
+test('checker applies the selected output schema before reporting a multi-output witness', () => {
+  const producer = step({ name: 'producer', consumes: ['seed'], produces: ['alpha', 'beta'], maxSchemaFailures: 1 });
+  producer.produces[1]!.schema = false;
+  const workflow = def('output-schemas', [input('seed', { seedOwed: false })], [producer]);
+  workflow.invariants = [
+    { name: 'beta-never-green', requires: { not: { path: 'beta', is: 'green' } } },
+    { name: 'alpha-before-beta-rejection', when: { path: 'beta', is: 'rejected' },
+      requires: { not: { path: 'alpha', is: 'owed' } } },
+  ];
+  assert.deepEqual(validateDef(workflow), []);
+  const { engine } = makeEngine([workflow]);
+  const wf = engine.createInstance(workflow.name);
+  const order = fire(engine, wf, 'producer');
+  assert.equal(engine.green(wf, order.run, 'beta', {}).outcome, 'schema-rejected');
+  assert.equal(engineArts(engine, wf).get('alpha')?.acceptance, 'owed');
+
+  const report = modelCheck(workflow);
+  assert.equal(report.bounded, false);
+  assert.deepEqual(report.invariantViolations, [{
+    invariant: 'alpha-before-beta-rejection',
+    path: [{ step: 'producer', key: '', outcome: 'schema-reject', path: 'beta' }],
+  }]);
+});
+
+test('modelCheck inspects already admitted completions after refusing a new state', () => {
+  const workflow = def('small-budget', [input('initial', { seedOwed: false })], [
+    step({ name: 'finish', consumes: ['initial'], produces: ['x'], terminal: true, maxAttempts: 1, maxSchemaFailures: 1 }),
+  ]);
+  const report = modelCheck(workflow, { maxStates: 2 });
+  assert.deepEqual(report.boundsHit, ['maxStates']);
+  assert.equal(report.stats.statesExplored, 2);
+  assert.equal(report.completable, true);
+  assert.deepEqual(report.completePath?.map((s) => s.step), ['finish']);
+  for (const maxStates of [0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => modelCheck(workflow, { maxStates }), /maxStates must be a positive safe integer/);
+  }
+});
+
+test('each modifier successor shares the same state budget', () => {
+  const choose = step({ name: 'choose', consumes: ['seed'], produces: ['choice'], terminal: true, maxAttempts: 1, maxSchemaFailures: 1 });
+  choose.produces[0]!.bind = { from: 'modifier', to: 'modifier' };
+  const workflow = def('modifier-budget', [input('seed', { seedOwed: false })], [choose], ['fast', 'deep', 'standard']);
+  const report = modelCheck(workflow, { maxStates: 2 });
+  assert.deepEqual(report.boundsHit, ['maxStates']);
+  assert.equal(report.stats.statesExplored, 2);
+  assert.equal(report.completePath?.[0]?.selectedModifier, 'fast');
+});
+
 test('modelCheck: maxAttempts=1 def (stall, not deadlock, after one reject — a completable branch coexists)', () => {
   // Step 'a' has maxAttempts=1: after one judgment-reject, x is stalled (frozen),
   // no eligible firings remain, not done. But recomputing eligibility with the
@@ -750,11 +846,12 @@ test('modelCheck: assumeProvided cannot invent a green input rejected by its sch
 });
 
 test('modelCheck: unsampled valid input schema is incomplete, not a definite assumed-provide verdict', () => {
+  // Grouped repetition accepts the real input while keeping the finite sample unresolved.
   const uncommon: WorkflowDef = {
     ...def('uncommon-provision',
       [{ ...input('seed', { seedOwed: true }), schema: {
 	      type: 'object', required: ['code'],
-	      properties: { code: { type: 'string', pattern: '^z{40}$' } },
+	      properties: { code: { type: 'string', pattern: '^(?:z){40}$' } },
       } }],
       [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
     invariants: [{ name: 'seed-provided', requires: { path: 'seed', is: 'green' } }],
@@ -777,7 +874,7 @@ test('modelCheck: unresolved provide does not hide an independent initial invari
     ...def('independent-initial-violation', [
       { ...input('seed', { seedOwed: true }), schema: {
 	      type: 'object', required: ['code'],
-	      properties: { code: { type: 'string', pattern: '^z{40}$' } },
+	      properties: { code: { type: 'string', pattern: '^(?:z){40}$' } },
       } },
       input('ready', { seedOwed: false }),
     ], [step({ name: 'make', consumes: ['seed'], produces: ['out'], terminal: true })]),
@@ -1474,7 +1571,7 @@ test('CLI check: unrelated initial invariant still fails with unresolved assumed
     '      properties:',
     '        code:',
     '          type: string',
-    '          pattern: "^z{40}$"',
+    '          pattern: "^(?:z){40}$"',
     '  - name: ready',
     '    seedOwed: false',
     'steps:',

@@ -22,6 +22,80 @@ const available = (): TrustedReferenceV2 => ({ protocol: 'trusted-reference-read
     consumes: {}, consumedFingerprint: { optional: 1 }, owes: [{ path: 'plan', version: 1 }] },
   inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } }) as unknown as TrustedReferenceV2;
 
+test('v2 parser preserves a Service-canonical child while refusals stay bound to the requested root', () => {
+  const child = available();
+  child.workflow = 'wf_child';
+  child.order.workflow = child.workflow;
+  assert.deepEqual(parseTrustedReferenceV2(child, expected), child);
+  assert.throws(() => parseTrustedReferenceV2({ ...child,
+    order: { ...child.order, workflow: expected.workflow } }, expected));
+  assert.throws(() => parseTrustedReferenceV2({ ...child, run: 'wrong-run' }, expected));
+  assert.throws(() => parseTrustedReferenceV2({ protocol: child.protocol, state: 'unavailable',
+    workflow: child.workflow, run: expected.run }, expected));
+});
+
+test('v2 admission binds the child to the independent Service read and refuses canonical movement', async () => {
+  const direct = available();
+  direct.workflow = 'wf_child';
+  direct.order.workflow = direct.workflow;
+  const local = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const admission = createTrustedInputV2Admission({ reader: { read: async () => direct }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local, inputNames: ['optional'],
+	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+    consumedVerifier: async (order, options) => {
+      assert.equal(options.hardRule, true);
+      assert.equal(order.workflow, 'wf_child');
+      return { ok: true, order, warnings: [] };
+    } });
+  const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+    reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  const accepted = await admission.observe(privateOrder);
+  assert.equal(accepted.ok, true);
+  if (accepted.ok) assert.equal(accepted.order.workflow, 'wf_child');
+  assert.deepEqual(await admission.observe({ ...privateOrder, workflow: 'wf_forged' }),
+    { ok: false, reason: 'private-order-v2-mismatch' });
+  direct.workflow = 'wf_changed';
+  direct.order.workflow = direct.workflow;
+  assert.deepEqual(await admission.observe({ ...privateOrder, workflow: direct.workflow }),
+    { ok: false, reason: 'canonical-workflow-changed' });
+});
+
+test('overlapping verified observations cannot pin different canonical children', async () => {
+  const child = (id: string) => {
+    const packet = available();
+    packet.workflow = id;
+    packet.order.workflow = id;
+    return packet;
+  };
+  const first = child('child_a'), second = child('child_b');
+  let resume!: () => void, enter!: () => void;
+  const pending = new Promise<void>(resolve => { resume = resolve; });
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  let current = first;
+  const local = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const admission = createTrustedInputV2Admission({ reader: { read: async () => current }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local, inputNames: ['optional'],
+	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+    consumedVerifier: async order => {
+      if (order.workflow === first.workflow) { enter();await pending; }
+      return { ok: true, order, warnings: [] };
+    } });
+  const privateOrder = (packet: TrustedReferenceV2) => ({ ...packet.order,
+    owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] });
+  const slow = admission.observe(privateOrder(first));
+  await entered;
+  current = second;
+  assert.equal((await admission.observe(privateOrder(second))).ok, true);
+  resume();
+  assert.deepEqual(await slow, { ok: false, reason: 'canonical-workflow-changed' });
+});
+
 test('strict v2 parser preserves absent witness and refuses malformed authority', () => {
   assert.deepEqual(parseTrustedReferenceV2(available(), expected), available());
   const bad = (change: (wire: ReturnType<typeof available>) => void) => {
@@ -84,6 +158,18 @@ test('worker-owned HTTPS POST binds bearer/body, refuses redirect, old Service, 
       wire = available();
       cache = 'max-age=60';
       await assert.rejects(reader.read());
+      cache = 'no-store';
+      const child = available();
+      child.workflow = 'wf_child';
+      child.order.workflow = child.workflow;
+      wire = child;
+      const childReader = createTrustedReferenceV2Reader({ origin: `https://localhost:${address.port}`,
+	expected, getToken: async () => 'worker-secret', trustedCa: readFileSync(cert) });
+      assert.deepEqual(await childReader.read(), child);
+      wire = { ...child, order: { ...child.order, workflow: expected.workflow } };
+      await assert.rejects(childReader.read(), /order malformed/);
+      wire = { ...child, workflow: 'wf_changed', order: { ...child.order, workflow: 'wf_changed' } };
+      await assert.rejects(childReader.read(), /canonical workflow changed/);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
@@ -280,3 +366,112 @@ test('a real capability claim remains unsupported until Service v2 witnesses the
       { ok: false, reason: 'private-order-v2-mismatch' });
   } finally { store.close(); }
 });
+
+// Exercise the existing reader over real TLS. Advancing/frozen wall time must
+// never extend its credential-plus-request budget or admit an expired reply.
+for (const phase of ['before-post', 'after-post', 'frozen-wall'] as const) {
+  test(`v2 reader deadline fences ${phase} clock movement over HTTPS`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'trusted-v2-clock-'));
+    let server: ReturnType<typeof createServer> | undefined;
+    try {
+      const key = join(dir, 'key.pem');
+      const cert = join(dir, 'cert.pem');
+      execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+	'-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', key, '-out', cert],
+      { stdio: 'ignore' });
+      let calls = 0;
+      server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }, async (req, res) => {
+	calls++;
+	assert.equal(req.headers.authorization, 'Bearer worker-secret');
+	for await (const _chunk of req) { /* consume the fixed POST */ }
+	res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+	res.end(JSON.stringify(available()));
+      });
+      await new Promise<void>(resolve => server!.listen(0, 'localhost', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      let wallReads = 0;
+      let elapsedReads = 0;
+      const options = { origin: `https://localhost:${address.port}`, expected,
+	getToken: async () => 'worker-secret', trustedCa: readFileSync(cert),
+	now: () => {
+	  const n = wallReads++;
+	  return phase === 'before-post' && n > 0 || phase === 'after-post' && n > 1 ? 999 : 1_000;
+	},
+	elapsedNow: () => phase === 'frozen-wall' && elapsedReads++ > 0 ? 5_000 : 0,
+      };
+      await assert.rejects(createTrustedReferenceV2Reader(options).read(), /deadline|clock|transport/);
+      assert.equal(calls, phase === 'after-post' ? 1 : 0,
+	'no bearer POST after the credential budget or clock fence fails');
+    } finally {
+      if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('v2 admission refuses its wall deadline after local verification even with unchanged elapsed time', async () => {
+  const direct = available();
+  const local = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+    reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+  for (const delta of [4_999, 5_000, 5_001]) {
+    let wall = 1_000;
+    const admission = createTrustedInputV2Admission({ expected,
+      reader: { read: async () => direct }, now: () => wall, elapsedNow: () => 10,
+      instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+	resolveStep: async () => ({ ok: true, step: local }),
+	resolveHostedStep: async () => ({ ok: true, step: local,
+	  declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+      consumedVerifier: async (order, options) => {
+	assert.equal(options.hardRule, true);
+	wall += delta;
+	return { ok: true, order, warnings: [] };
+      } });
+    const result = await admission.observe(privateOrder);
+    if (delta < 5_000) {
+      assert.equal(result.ok, true);
+      if (result.ok) assert.ok(result.expiresAt > wall);
+    } else assert.deepEqual(result, { ok: false, reason: 'observation-expired' });
+  }
+});
+
+
+test('pre-cancelled v2 reader does not resolve a credential or start HTTPS', async () => {
+  let credentials = 0;
+  const reader = createTrustedReferenceV2Reader({ origin: 'https://localhost', expected,
+    getToken: async () => { credentials++;return 'local-test-token'; } });
+  const cancellation = new AbortController();
+  cancellation.abort();
+  await assert.rejects(reader.read(cancellation.signal), /abort/i);
+  assert.equal(credentials, 0);
+});
+
+for (const phase of ['local', 'producer'] as const) {
+  test(`cancelled v2 ${phase} verification cannot return or pin a later admission`, async () => {
+    const direct = available();
+    const cancellation = new AbortController();
+    let cancel = true;
+    const local = { name: 'planner', consumes: [parseConsume('optional')],
+      produces: [parseProduce('plan')] } as StepDef;
+    const admission = createTrustedInputV2Admission({ reader: { read: async () => direct }, expected,
+      instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+	resolveStep: async () => ({ ok: true, step: local }),
+	resolveHostedStep: async () => {
+	  if (cancel && phase === 'local') cancellation.abort();
+	  return { ok: true, step: local, inputNames: ['optional'],
+	    declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} };
+	} },
+      consumedVerifier: async (order, options) => {
+	assert.equal(options.hardRule, true);
+	if (cancel && phase === 'producer') cancellation.abort();
+	return { ok: true, order, warnings: [] };
+      } });
+    const privateOrder = { ...direct.order, owes: [{ path: 'plan', version: 1,
+      reasons: [], judgmentRejects: 0, schemaRejects: 0 }] };
+    await assert.rejects(admission.observe(privateOrder, cancellation.signal), /abort/i);
+    cancel = false;
+    assert.equal((await admission.observe(privateOrder)).ok, true);
+  });
+}

@@ -1,4 +1,4 @@
-/** One worker's opt-in Service v2 observation, bound to its private held order
+/** One worker's Service v2 observation, bound to its private held order
  * and the locally verified publication. No v1 fallback exists here. */
 import { valueDigestHex } from '../../../../src/crypto/canonical.ts';
 
@@ -7,6 +7,7 @@ import type { InstructionResolver, ResolvedHostedStep } from '../exec/instructio
 import type { OrderPacket } from '../hub/types.ts';
 import { bindTrustedReferenceV2 } from './trusted-input-binding.ts';
 import type { TrustedInputWitness, TrustedReferenceV2Reader } from './trusted-reference-v2.ts';
+
 import { parseRoutedClaimV2, parseRoutedReferenceV2, type RoutedClaimV2,
   type RoutedReferenceV2, type RoutedReferenceV2Reader } from './trusted-routed-reference-v2.ts';
 import { parseRecordedClaimV2, parseRecordedReferenceV2, type RecordedClaimV2,
@@ -44,6 +45,8 @@ export type TrustedInputAdmission = {
   order: OrderPacket;
   step: ResolvedHostedStep;
   packetDigest: string;
+  /** Same claim/input binding with only owed target versions excluded. */
+  stablePacketDigest?: string;
   witnessDigest: string;
   observedAt: number;
   expiresAt: number;
@@ -56,22 +59,31 @@ export function createTrustedInputV2Admission(args: {
   consumedVerifier: ConsumedVerifier;
   expected: { workflow: string; run: string };
   now?: () => number;
-  /** An elapsed clock; routed callers use monotonic time across remote awaits. */
+  /** An elapsed clock across remote awaits. */
   elapsedNow?: () => number;
-}): { observe(privateOrder: OrderPacket): Promise<TrustedInputAdmission> } {
+}): { observe(privateOrder: OrderPacket, signal?: AbortSignal): Promise<TrustedInputAdmission> } {
   const now = args.now ?? Date.now;
-  const elapsedNow = args.elapsedNow ?? now;
+  const elapsedNow = args.elapsedNow ?? (() => performance.now());
   const refused = (reason: string): TrustedInputAdmission => ({ ok: false, reason });
-  return { async observe(privateOrder) {
+  let canonicalWorkflow: string | undefined;
+  return { async observe(privateOrder, signal) {
+    signal?.throwIfAborted();
     const started = now();
     const startedElapsed = elapsedNow();
-    if (!Number.isSafeInteger(started) || privateOrder.workflow !== args.expected.workflow
-      || privateOrder.run !== args.expected.run) return refused('private-order-out-of-scope');
+    if (!Number.isSafeInteger(started) || privateOrder.run !== args.expected.run) {
+      return refused('private-order-out-of-scope');
+    }
     let response: Awaited<ReturnType<TrustedReferenceV2Reader['read']>>;
-    try { response = await args.reader.read(); }
-    catch { return refused('reference-v2-unavailable'); }
+    try { response = await args.reader.read(signal); }
+    catch { signal?.throwIfAborted();return refused('reference-v2-unavailable'); }
+    signal?.throwIfAborted();
     if (response.state !== 'available') return refused(`service-${response.state}`);
     const direct = response.order;
+    if (response.run !== args.expected.run || direct.run !== args.expected.run
+      || response.workflow !== direct.workflow) return refused('private-order-v2-mismatch');
+    if (canonicalWorkflow !== undefined && direct.workflow !== canonicalWorkflow) {
+      return refused('canonical-workflow-changed');
+    }
     const dynamic = (order: OrderPacket) => ({
       workflow: order.workflow, run: order.run, step: order.step, key: order.key,
       index: order.index ?? null, defDigest: order.defDigest,
@@ -96,6 +108,7 @@ export function createTrustedInputV2Admission(args: {
     let step: Awaited<ReturnType<NonNullable<InstructionResolver['resolveHostedStep']>>>;
     try { step = await args.instructions.resolveHostedStep(direct); }
     catch { return refused('local-definition-verifier-unavailable'); }
+    signal?.throwIfAborted();
     if (!step.ok) return refused(`local-definition-${step.kind}`);
     const local = step.step;
     if (!equal(privateOrder.model ?? null, local.model ?? null)
@@ -119,20 +132,34 @@ export function createTrustedInputV2Admission(args: {
       return refused('private-order-worker-mismatch');
     }
     const bound = await bindTrustedReferenceV2({ response,
-      expected: { ...args.expected, defDigest: direct.defDigest, step: privateOrder.step, key: privateOrder.key },
+      expected: { workflow: direct.workflow, run: args.expected.run,
+	defDigest: direct.defDigest, step: privateOrder.step, key: privateOrder.key },
       step: step.step, declaredInputs: step.declaredInputs,
       consumedVerifier: args.consumedVerifier, callsProducers: step.callsProducers });
+    signal?.throwIfAborted();
     if (!bound.ok) return refused(bound.reason);
     const finished = now();
     const finishedElapsed = elapsedNow();
     const elapsed = finishedElapsed - startedElapsed;
+    // Local publication and producer verification follow the Service read.
+    // Their result must still be inside both clocks' original budget; a
+    // forward wall jump cannot return an already-expired admission to MCP.
     if (!Number.isSafeInteger(finished) || finished < started
+      || finished - started >= MAX_OBSERVATION_MS
       || !Number.isFinite(startedElapsed) || !Number.isFinite(finishedElapsed)
       || !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= MAX_OBSERVATION_MS) {
       return refused('observation-expired');
     }
+    signal?.throwIfAborted();
+    // Another admission may finish while this one is verifying producer proofs.
+    if (canonicalWorkflow !== undefined && canonicalWorkflow !== direct.workflow) {
+      return refused('canonical-workflow-changed');
+    }
+    canonicalWorkflow ??= direct.workflow;
     return { ok: true, order: privateOrder, step,
-      packetDigest: valueDigestHex(dynamic(direct)), witnessDigest: bound.witnessDigest,
+      packetDigest: valueDigestHex(dynamic(direct)),
+      stablePacketDigest: valueDigestHex({ ...dynamic(direct), owes: direct.owes.map(owed => ({ path: owed.path })) }),
+      witnessDigest: bound.witnessDigest,
       observedAt: started, expiresAt: started + MAX_OBSERVATION_MS,
       inputs: response.inputs };
   } };
@@ -221,6 +248,7 @@ export async function bindTrustedRoutedInputV2(args: {
   const finishedMonotonic = monotonicNow();
   const elapsed = finishedMonotonic - startedMonotonic;
   if (!Number.isSafeInteger(finished) || finished < started
+    || finished - started >= MAX_OBSERVATION_MS
     || !Number.isFinite(finishedMonotonic) || !Number.isFinite(elapsed)
     || elapsed < 0 || elapsed >= MAX_OBSERVATION_MS
     || (args.phase === 'prestart' && reference.binding.preferenceExpiresAt <= finished))
