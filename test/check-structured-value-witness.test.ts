@@ -111,9 +111,29 @@ test('anchored string samples can open a nested receipt with hashes, names and a
   assert.deepEqual(report.coverageIncomplete, []);
 });
 
+test('anchored alternatives sample one flat branch in declaration order', () => {
+  for (const [pattern, expected] of [
+    ['^(red|blue)$', 'red'],
+    ['^(?:id/(left|right)/[0-3]|batch\\.[0-7])$', 'batch.0'],
+    ['^(red\\|blue|green)$', 'green'],
+    ['^([a|b]tail|green)$', 'green'],
+    ['^(red|blue|green|amber|gray|gold|lime|pink)$', 'red'],
+  ] as const) {
+    const schema = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern } } };
+    const witness = collectionValueWitnesses(schema).valid;
+    assert.deepEqual(witness, { id: expected });
+    assert.ok(validateValue(schema, witness).valid);
+  }
+});
+
 test('unrecognized or oversized patterns and a conflicting length remain unsampled', () => {
   for (const constraint of [
-    { pattern: '^(red|blue)$' }, { pattern: '^[a-f]{129}$' },
+    { pattern: '^(red|blue)tail$' }, { pattern: '^(red|blue)$', maxLength: 2 },
+    { pattern: '^(red)(blue|green)$' }, { pattern: '^(red|blue){2}$' },
+    { pattern: '^(ab(cd)+|green)$' }, { pattern: '^(ab(?=cd)|green)$' },
+    { pattern: '^(ab(c)\\1|green)$' },
+    { pattern: '^(red|blue|green|amber|gray|gold|lime|pink|navy)$' },
+    { pattern: '^[a-f]{129}$' },
     { pattern: '^' + 'q'.repeat(257) + '$' }, { pattern: '^[a-z]+$', minLength: 129 },
     { pattern: '^[0-9a-f]{64}$', maxLength: 32 },
   ]) {
