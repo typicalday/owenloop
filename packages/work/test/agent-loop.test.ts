@@ -46,6 +46,7 @@ import { HubError, type ContactHolder, type GetOrderResponse, type ReasonEntry }
 import type { HubClient } from '../src/hub/client.ts';
 import type { LeaseLoop, LeaseOutcome } from '../src/lease/loop.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import type { TrustedInputAdmission } from '../src/hosted/trusted-input-admission.ts';
 import { projectSession } from '../src/roles/sessions.ts';
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
@@ -69,6 +70,7 @@ interface OrderOpts {
   outcome?: string;
   /** Consumed input artifact values, keyed by path. */
   consumes?: Record<string, unknown>;
+  inputs?: string[];
   /** Owed outputs, with their standing reject counts. */
   owes?: Array<{
     path: string;
@@ -103,7 +105,7 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       workflow: 'wf1',
       step: o.step ?? 'builder',
       key: 'k',
-      inputs: [],
+      inputs: o.inputs ?? [],
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
@@ -289,7 +291,13 @@ interface BuildOpts {
   shiftName?: string;
   shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
+  trustedInputV2?: AgentRunLoopOptions['trustedInputV2'];
+  routedInputV2?: AgentRunLoopOptions['routedInputV2'];
   resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
+  routedSelect?: AgentRunLoopOptions['routedSelect'];
+  routingHolderPath?: string;
+  createRoutingHolderPath?: AgentRunLoopOptions['createRoutingHolderPath'];
+  routedFileCacheRoot?: string;
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
 	latestRunSession?: AgentRunLoopOptions['latestRunSession'];
@@ -318,7 +326,15 @@ function buildOpts(b: BuildOpts): Harnessed {
     resolveAdapter: () => resolution,
     harnessAvailable: (id) => id === 'fake',
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
+    ...(b.trustedInputV2 === undefined ? {} : { trustedInputV2: b.trustedInputV2 }),
+    ...(b.routedInputV2 === undefined ? {} : { routedInputV2: b.routedInputV2 }),
     resolveCrewRosters: b.resolveCrewRosters ?? (() => ({ ok: true, rosters: [] })),
+    ...(b.routedSelect === undefined ? {} : { routedSelect: b.routedSelect }),
+    ...(b.routedSelect === undefined ? {} : {
+      routingHolderPath: b.routingHolderPath ?? '/private/routed-holder.json',
+    }),
+    ...(b.createRoutingHolderPath ? { createRoutingHolderPath: b.createRoutingHolderPath } : {}),
+    ...(b.routedFileCacheRoot ? { routedFileCacheRoot: b.routedFileCacheRoot } : {}),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
@@ -363,6 +379,255 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
     adapter.calls.filter((c) => c.kind === 'stop').length,
     1,
   );
+});
+
+test('routed single-output first start awaits authorization after adapter policy without invoking recovery', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const gates: string[] = [];
+  adapter.recoveryPolicy = () => ({ idleTimeoutMs: 1_000 });
+  adapter.preflight = () => { gates.push('policy'); return []; };
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'out' }],
+    consumes: { input: 'verified-value' } }),
+    agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter, routedFileCacheRoot: '/private/cache/verified',
+    consumedVerifier: async (order, options) => {
+      gates.push(`consumed:${String(options.hardRule)}`);
+      return { ok: true, order, warnings: [] };
+    }, routedSelect: async () => {
+    gates.push('select');
+    return { selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => { gates.push('authorize'); return {
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }; } };
+  } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.deepEqual(gates, ['consumed:true', 'select', 'policy', 'authorize']);
+  const starts = adapter.calls.filter(call => call.kind === 'start');
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0]?.kind === 'start' &&
+    { model: starts[0].args.model, effort: starts[0].args.effort },
+    { model: 'service-model', effort: 'high' });
+  if (starts[0]?.kind !== 'start') assert.fail('missing routed start');
+  assert.ok(starts[0].args.owenloopMcp.args.includes('--routing-holder'));
+  assert.ok(starts[0].args.owenloopMcp.args.includes('/private/routed-holder.json'));
+  assert.equal(starts[0].args.owenloopMcp.args.includes('--as'), false);
+  assert.equal(starts[0].args.owenloopMcp.args.includes('acct-1'), false);
+  assert.equal(starts[0].args.verifiedFileCacheRoot, undefined);
+  assert.equal(adapter.calls.filter(call => call.kind === 'deliver').length, 0);
+  assert.equal(verbs(calls).includes('report_resolution'), false);
+});
+
+test('routed consumed file attaches only its published cache view to provider', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const pointer = { __file: 'orgs/o/artifacts/wf/files/routed/run/key',
+    hash: 'a'.repeat(64), size: 4, contentType: 'text/plain' };
+  const packet = agentOrder({ inputs: ['input'], consumes: { input: pointer },
+    owes: [{ path: 'out' }] });
+  const { hub } = mockHub({ getOrder: [packet,
+    agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter, routedFileCacheRoot: '/private/cache/verified',
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'm', effort: 'high' },
+      authorize: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'm', effort: 'high' },
+	expiresAt: 5_000 }) }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  const start = adapter.calls.find(call => call.kind === 'start');
+  if (start?.kind !== 'start') assert.fail('missing routed provider start');
+  assert.equal(start.args.verifiedFileCacheRoot, '/private/cache/verified');
+});
+
+test('routed consumed file without published cache refuses before authorization and provider', async () => {
+  const adapter = createFakeAdapter();
+  const packet = agentOrder({ inputs: ['input'], consumes: { input: {
+    __file: 'orgs/o/artifacts/wf/files/routed/run/key', hash: 'a'.repeat(64),
+    size: 4, contentType: 'text/plain' } }, owes: [{ path: 'out' }] });
+  const { hub } = mockHub({ getOrder: [packet] });
+  let authorized = false;
+  const h = buildOpts({ hub, adapter,
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'm', effort: 'high' },
+      authorize: async () => { authorized = true; throw new Error('unexpected authorize'); } }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(authorized, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start').length, 0);
+});
+
+test('routed worker refuses unscoped trusted input v2 before its reader runs', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let observed = false;
+  let selected = false;
+  const h = buildOpts({ hub, adapter,
+    trustedInputV2: { observe: async () => { observed = true; throw new Error('unscoped reader'); } },
+    routedSelect: async () => { selected = true; throw new Error('unexpected selection'); } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(observed, false);
+  assert.equal(selected, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('scoped routed v2 input is admitted before step loading and refuses a changed witness before selection', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let selected = false;
+  let loaded = false;
+  const h = buildOpts({ hub, adapter,
+    loadStep: async () => { loaded = true; return baseSpec(); },
+    routedInputV2: { observe: async () => ({ ok: false, reason: 'input-version-moved' }) },
+    routedSelect: async () => { selected = true; throw new Error('must not select'); } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'unverified-consumed');
+  assert.equal(loaded, false);
+  assert.equal(selected, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('scoped routed v2 input reaches selection without the ordinary bearer reader', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let selected = false;
+  const h = buildOpts({ hub, adapter,
+    routedInputV2: { observe: async order => ({ ok: true, order,
+      step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+      packetDigest: 'packet', witnessDigest: 'witness', observedAt: 1, expiresAt: 5_000,
+      inputs: [] }) },
+    routedSelect: async () => { selected = true; throw new Error('later selection refused'); } });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(selected, true);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('routed authorization refusal starts no provider process', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({ hub, adapter, routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => { throw new Error('private broker failed'); },
+  }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+  assert.ok(h.errs.some(line => line.includes('routed launch authorization refused')));
+  assert.ok(h.errs.every(line => !line.includes('private broker failed')));
+});
+
+test('routed holder subcap is issued only after final launch authorization', async () => {
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({ getOrder: [agentOrder(),
+    agentOrder({ claimed: false, outcome: 'green' })] });
+  const gates: string[] = [];
+  const h = buildOpts({ hub, adapter,
+    createRoutingHolderPath: () => { gates.push('holder'); return '/private/fresh-holder.json'; },
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => { gates.push('report-and-final-order'); return {
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }; } }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.deepEqual(gates, ['report-and-final-order', 'holder']);
+  const start = adapter.calls.find(call => call.kind === 'start');
+  if (start?.kind !== 'start') assert.fail('missing routed provider start');
+  assert.ok(start.args.owenloopMcp.args.includes('/private/fresh-holder.json'));
+  assert.equal(start.args.owenloopMcp.args.includes('--as'), false);
+});
+
+test('holder handoff issuance failure after final launch order starts no provider', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({ hub, adapter,
+    createRoutingHolderPath: () => { throw new Error('private path detail'); },
+    routedSelect: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => ({ selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }) }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+  assert.ok(h.errs.every(line => !line.includes('private path detail')));
+});
+
+test('routed start refuses missing holder subcap before report and provider work', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let authorized = false;
+  const h = buildOpts({ hub, adapter, routingHolderPath: '', routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => { authorized = true; throw new Error('must not authorize'); },
+  }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(authorized, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('routed authorization tuple mismatch starts no provider process', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({ hub, adapter, routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => ({ selected: { id: 'other', harness: 'fake', model: 'other-model', effort: 'high' },
+      expiresAt: 5_000 }),
+  }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('routed step harness mismatch refuses before reservation and provider work', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let authorized = false;
+  const h = buildOpts({ hub, adapter, spec: { ...baseSpec(), harness: 'other' },
+    routedSelect: async () => ({
+      selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => { authorized = true; throw new Error('must not authorize'); },
+    }) });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-launch-refused');
+  assert.equal(authorized, false);
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('routed stop during pending launch authorization starts no provider process', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder()] });
+  let entered!: () => void, resume!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { resume = resolve; });
+  const h = buildOpts({ hub, adapter, routedSelect: async () => ({
+    selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+    authorize: async () => { entered(); await held; return {
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }; },
+  }) });
+  const loop = createAgentRunLoop(h.opts);
+  const running = loop.run();
+  await waiting;
+  loop.stop('test-stop');
+  resume();
+  await running;
+  assert.equal(adapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
+});
+
+test('opt-in agent v2 gates before brief and again before provider start, with no legacy consume downgrade', async () => {
+  const success = (order: NonNullable<GetOrderResponse['order']>): TrustedInputAdmission => ({
+    ok: true, order, step: undefined as unknown as Extract<TrustedInputAdmission, { ok: true }>['step'],
+    packetDigest: 'packet-a', witnessDigest: 'witness-a', observedAt: 0, expiresAt: 5000, inputs: [],
+  });
+  const adapter = createFakeAdapter({ start: { events: [{ kind: 'turn_ended' }] } });
+  const { hub } = mockHub({ getOrder: [agentOrder(), agentOrder({ claimed: false, outcome: 'green' })] });
+  let reads = 0;
+  const h = buildOpts({ hub, adapter,
+    consumedVerifier: async () => { throw new Error('v1 verifier must not run'); },
+    trustedInputV2: { observe: async order => { reads++; return success(order); } },
+  });
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+  assert.equal(reads, 2);
+  const started = adapter.calls.find(call => call.kind === 'start');
+  assert.ok(started?.kind === 'start');
+  assert.ok(started.args.owenloopMcp.args.includes('--trusted-input-v2'));
+
+  const refusedAdapter = createFakeAdapter();
+  reads = 0;
+  const refused = buildOpts({ hub: mockHub({ getOrder: [agentOrder()] }).hub, adapter: refusedAdapter,
+    trustedInputV2: { observe: async order => ++reads === 1 ? success(order)
+      : { ok: false, reason: 'input-version-moved' } },
+  });
+  assert.equal(await createAgentRunLoop(refused.opts).run(), 'unverified-consumed');
+  assert.equal(reads, 2);
+  assert.equal(refusedAdapter.calls.filter(call => call.kind === 'start' || call.kind === 'deliver').length, 0);
 });
 
 test('idle recovery is bounded to primary, one wake, one cold start, then one producer ask', async () => {
@@ -1922,6 +2187,36 @@ test('cold start requires a durable active row before provider work', async () =
   assert.equal(verbs(calls).filter((verb) => verb === 'release').length, 1);
   assert.equal(verbs(calls).filter((verb) => verb === 'get_order').length, 1, 'the confirm phase never starts');
   assert.ok(h.errs.some((line) => line.includes('durable active-session persistence failed before provider delivery')));
+});
+
+test('routed started-event persistence failure freezes retained launch before terminal observation', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder()] });
+  const events: string[] = [];
+  const h = buildOpts({ hub, adapter,
+    appendSession: record => { if (record.status === 'active') throw new Error('active fsync failed'); },
+    consumedVerifier: async order => ({ ok: true, order, warnings: [] }),
+    routedSelect: async () => ({
+      selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+      authorize: async () => ({
+	selected: { id: 'tuple', harness: 'fake', model: 'service-model', effort: 'high' },
+	expiresAt: 5_000 }),
+    }),
+  });
+  h.opts.routedLifecycle = {
+    async start(_args, onEvent) {
+      events.push('launch');
+      onEvent({ kind: 'started', ref: { harness: 'fake', token: 'retained' } });
+      assert.fail('active persistence failure must stop provider delivery');
+    },
+    requestStop() { events.push('freeze'); },
+    async complete() { events.push('settle'); return 'uncertain'; },
+  };
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'routed-quarantined');
+  assert.deepEqual(events, ['launch', 'freeze', 'settle']);
+  assert.equal(adapter.calls.filter(call => call.kind === 'stop').length, 0,
+    'ordinary adapter teardown must not precede broker freeze and retained group custody');
+  assert.equal(verbs(calls).filter(verb => verb === 'release').length, 0);
 });
 
 test('resume requires a durable active row before provider delivery', async () => {

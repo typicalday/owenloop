@@ -221,15 +221,19 @@ test('the run record, not the age, decides when a REAL worker\'s log becomes rea
   spawner({ workflow: 'wf1', run: 'run_gamma', step: 's', kind: 'exec' });
   const path = runLogFile(logDir, 'run_gamma');
   await waitForContent(path, 'w3-err');
+  // Filesystem mtimes can have sub-millisecond precision while Date.now()
+  // does not. Use one clock at/after that timestamp for both sweeps, so only
+  // the record changes and a fractional future mtime cannot spare the log.
+  const sweepNow = Math.max(Date.now(), Math.ceil(statSync(path).mtimeMs));
 
   // ── IN FLIGHT: spared, at zero retention, with real bytes on disk ──
-  const spared = sweepShiftLogs({ dir: logDir, stateDir, now: Date.now(), maxAgeMs: 0 });
+  const spared = sweepShiftLogs({ dir: logDir, stateDir, now: sweepNow, maxAgeMs: 0 });
   assert.deepEqual(spared, [], 'a run with a live record must not be reaped at any age');
   assert.ok(readFileSync(path, 'utf8').includes('w3-err'), 'and its bytes must be untouched');
 
   // ── RECORD GONE: the same file, the same age, now reapable ──
   rmSync(record);
-  const reaped = sweepShiftLogs({ dir: logDir, stateDir, now: Date.now(), maxAgeMs: 0 });
+  const reaped = sweepShiftLogs({ dir: logDir, stateDir, now: sweepNow, maxAgeMs: 0 });
   assert.deepEqual(reaped, [path], 'removing the record is the ONLY change between the two sweeps');
   assert.equal(existsSync(path), false);
 });

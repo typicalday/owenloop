@@ -1,0 +1,20 @@
+{
+  "context": {
+    "base": "b4ead192326ba607558cd3bb7687209cbb7c8165",
+    "head": null,
+    "job": "linux-one-relay-qualification",
+    "repository": "typicalday/owenloop",
+    "runAttempt": null,
+    "runId": null
+  },
+  "executionAdmitted": false,
+  "outputName": null,
+  "outputParent": null,
+  "protocol": "jev-one-relay-qualification-admission-v1",
+  "scope": "HARMLESS_ONE_RELAY_ONLY",
+  "sourceManifestSha256": null,
+  "tools": {
+    "cc": null,
+    "node": null
+  }
+}

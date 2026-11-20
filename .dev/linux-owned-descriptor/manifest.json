@@ -1,0 +1,482 @@
+{
+  "allCasesUnrun": true,
+  "authorityReferenceCount": 12,
+  "authorityReferences": [
+    {
+      "bytes": 16302,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/manifest.json",
+      "sha256": "bc59a9c82a5d4ca83292cd0860724724fb4a3d044f3173d9e71c1df87122264c"
+    },
+    {
+      "bytes": 12381,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/protocol.json",
+      "sha256": "4f2859db779c2b282c05690e86a9884aebb2bb3dce1acb988459534fdbdb1b5a"
+    },
+    {
+      "bytes": 12701,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v1-20261012/manifest.json",
+      "sha256": "fdd23a7c4948f002ba84cd76ed19f2d421153677b1528ba8a8c4625041ea58dd"
+    },
+    {
+      "bytes": 6579,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v1-independent-whole-source-review-20261012-transport.md",
+      "sha256": "ee1e166ddd862cb1a32e4bed49c40908d5bad47f2e69b7550649ca42c2f73c78"
+    },
+    {
+      "bytes": 25803,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v1-independent-whole-source-review-20261012-transport.json",
+      "sha256": "7a2c39dfd4c2da9e8cd30255dcd68a867a06f7bde60219bacf0886203d0b1c41"
+    },
+    {
+      "bytes": 15707,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/manifest.json",
+      "sha256": "47fbb10167c18620c3227abaf050518112a8fabf2ec76d6dbd74e3a037439e6b"
+    },
+    {
+      "bytes": 6357,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-publication-source-v2-20261012/manifest.json",
+      "sha256": "7b7004c80ac82f16d8213b4e330e0b01b31a0f04c5ecaac267a7f272cc1a79a1"
+    },
+    {
+      "bytes": 8109,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-publication-source-v2-20261012/protocol.json",
+      "sha256": "b896dbb6683d1236032e7ed3b212d92f0979ef63d25b0f2e3080fd88035530d9"
+    },
+    {
+      "bytes": 2997,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-descriptor-head75c-attempt2-root-bounded-actual-acceptance-20261012.json",
+      "sha256": "3b07b2d2e4006223ca69576870f6d3643370b8eee5cf9d16780d545b94a3882e"
+    },
+    {
+      "bytes": 3802,
+      "mode": 384,
+      "path": "/Volumes/more/jev-head75c-service67-linux-input-source-prep-20261012/manifest.json",
+      "sha256": "8015318b4671f0436b04a288b1c406001dcd365295d214158f01e0b486ac845b"
+    },
+    {
+      "bytes": 5457,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.md",
+      "sha256": "fed40e4fe54b8fc1729ce45a99ed516e030c43cf583060f30ccf4488b38f69c8"
+    },
+    {
+      "bytes": 20494,
+      "mode": 384,
+      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.json",
+      "sha256": "6c7cfb0f9d56cdeff484595c441ec29a314238ed988bf1af209051d844e8c3dd"
+    }
+  ],
+  "caseCount": 8,
+  "creationDelta": {
+    "payloadFiles": [
+      "README.md",
+      "admission-template.json",
+      "dependencies/metadata.mjs",
+      "dependencies/owner.py",
+      "entry.mjs",
+      "headers.py",
+      "inputs/descriptor.c",
+      "inputs/facade.mjs",
+      "inputs/fixture.mjs",
+      "inputs/nested-owner.mjs",
+      "inputs/target.mjs",
+      "launch.py",
+      "libc-contract.c",
+      "loader.mjs",
+      "owner.py",
+      "protocol.json"
+    ],
+    "relative": "FULL_CREATION.diff"
+  },
+  "declaredFileCount": 17,
+  "exactSourceCopies": [
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 33334,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/descriptor.c",
+        "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d"
+      },
+      "relative": "inputs/descriptor.c"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 8918,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/facade.mjs",
+        "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69"
+      },
+      "relative": "inputs/facade.mjs"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 5571,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/fixture.mjs",
+        "sha256": "7dded6bcb8d0ebc1cdb2f89d7ee526d47d9bb22e23bab7cf9500fe4a7686be10"
+      },
+      "relative": "inputs/fixture.mjs"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 1642,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/nested-owner.mjs",
+        "sha256": "c4729ad7e3bb62fc2139a8816fc3a9d92d8acdd00d175fe1af77833b1ae6e77f"
+      },
+      "relative": "inputs/nested-owner.mjs"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 444,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/target.mjs",
+        "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a"
+      },
+      "relative": "inputs/target.mjs"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 19973,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/dependencies/owner.py",
+        "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f"
+      },
+      "relative": "dependencies/owner.py"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 9232,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/dependencies/metadata.mjs",
+        "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"
+      },
+      "relative": "dependencies/metadata.mjs"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 1638,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/launch.py",
+        "sha256": "e181ab5c2e49ba0f281536de8ad4b59f1e21ad1ff11134f1de5fb877067c01d0"
+      },
+      "relative": "launch.py"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 176,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/entry.mjs",
+        "sha256": "6776b4f29a086e34c2244436daac32632f41b556347b1372f4e9f936e2d2df24"
+      },
+      "relative": "entry.mjs"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 2383,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/headers.py",
+        "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e"
+      },
+      "relative": "headers.py"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 853,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/libc-contract.c",
+        "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5"
+      },
+      "relative": "libc-contract.c"
+    },
+    {
+      "byteIdentical": true,
+      "origin": {
+        "bytes": 488,
+        "mode": 384,
+        "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/admission-template.json",
+        "sha256": "0b0125b14d09c4af8b8da6dcd25a71c1aca2a43253bd5e008a2cb4fe9a2e6b4e"
+      },
+      "relative": "admission-template.json"
+    }
+  ],
+  "executionFiles": [
+    {
+      "bytes": 20802,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/owner.py",
+      "relative": "owner.py",
+      "sha256": "02563b2b0f55e1ab3a9eb3b37d11206197a785359f477ef66399631001dfa7e8"
+    },
+    {
+      "bytes": 1638,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/launch.py",
+      "relative": "launch.py",
+      "sha256": "e181ab5c2e49ba0f281536de8ad4b59f1e21ad1ff11134f1de5fb877067c01d0"
+    },
+    {
+      "bytes": 2383,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/headers.py",
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e"
+    },
+    {
+      "bytes": 5300,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/loader.mjs",
+      "relative": "loader.mjs",
+      "sha256": "602cb1565c1890ae367ad0d6e805b6c164b739762395f28cb8e2eab84eb51f30"
+    },
+    {
+      "bytes": 176,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/entry.mjs",
+      "relative": "entry.mjs",
+      "sha256": "6776b4f29a086e34c2244436daac32632f41b556347b1372f4e9f936e2d2df24"
+    },
+    {
+      "bytes": 853,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/libc-contract.c",
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5"
+    },
+    {
+      "bytes": 12597,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/protocol.json",
+      "relative": "protocol.json",
+      "sha256": "9e0f795b2ce18d8e8dd3813e881517fac4d3cb510d1d24b5cd8e278a43b88701"
+    },
+    {
+      "bytes": 19973,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/dependencies/owner.py",
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f"
+    },
+    {
+      "bytes": 9232,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/dependencies/metadata.mjs",
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"
+    },
+    {
+      "bytes": 33334,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/descriptor.c",
+      "relative": "inputs/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d"
+    },
+    {
+      "bytes": 8918,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/facade.mjs",
+      "relative": "inputs/facade.mjs",
+      "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69"
+    },
+    {
+      "bytes": 5571,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/fixture.mjs",
+      "relative": "inputs/fixture.mjs",
+      "sha256": "7dded6bcb8d0ebc1cdb2f89d7ee526d47d9bb22e23bab7cf9500fe4a7686be10"
+    },
+    {
+      "bytes": 1642,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/nested-owner.mjs",
+      "relative": "inputs/nested-owner.mjs",
+      "sha256": "c4729ad7e3bb62fc2139a8816fc3a9d92d8acdd00d175fe1af77833b1ae6e77f"
+    },
+    {
+      "bytes": 444,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/target.mjs",
+      "relative": "inputs/target.mjs",
+      "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a"
+    }
+  ],
+  "executionPerformed": false,
+  "files": [
+    {
+      "bytes": 130639,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/FULL_CREATION.diff",
+      "relative": "FULL_CREATION.diff",
+      "sha256": "d7bdee183929ecc25e5c073aaf54cf9792914a399e2b42c21efe0861e45db1ad"
+    },
+    {
+      "bytes": 2490,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/README.md",
+      "relative": "README.md",
+      "sha256": "7266f2fa1795bb909b641433f5eb4017a01dae88c2a09a8cd2fa9369c78aefc2"
+    },
+    {
+      "bytes": 488,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/admission-template.json",
+      "relative": "admission-template.json",
+      "sha256": "0b0125b14d09c4af8b8da6dcd25a71c1aca2a43253bd5e008a2cb4fe9a2e6b4e"
+    },
+    {
+      "bytes": 9232,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/dependencies/metadata.mjs",
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"
+    },
+    {
+      "bytes": 19973,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/dependencies/owner.py",
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f"
+    },
+    {
+      "bytes": 176,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/entry.mjs",
+      "relative": "entry.mjs",
+      "sha256": "6776b4f29a086e34c2244436daac32632f41b556347b1372f4e9f936e2d2df24"
+    },
+    {
+      "bytes": 2383,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/headers.py",
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e"
+    },
+    {
+      "bytes": 33334,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/descriptor.c",
+      "relative": "inputs/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d"
+    },
+    {
+      "bytes": 8918,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/facade.mjs",
+      "relative": "inputs/facade.mjs",
+      "sha256": "bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69"
+    },
+    {
+      "bytes": 5571,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/fixture.mjs",
+      "relative": "inputs/fixture.mjs",
+      "sha256": "7dded6bcb8d0ebc1cdb2f89d7ee526d47d9bb22e23bab7cf9500fe4a7686be10"
+    },
+    {
+      "bytes": 1642,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/nested-owner.mjs",
+      "relative": "inputs/nested-owner.mjs",
+      "sha256": "c4729ad7e3bb62fc2139a8816fc3a9d92d8acdd00d175fe1af77833b1ae6e77f"
+    },
+    {
+      "bytes": 444,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/target.mjs",
+      "relative": "inputs/target.mjs",
+      "sha256": "f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a"
+    },
+    {
+      "bytes": 1638,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/launch.py",
+      "relative": "launch.py",
+      "sha256": "e181ab5c2e49ba0f281536de8ad4b59f1e21ad1ff11134f1de5fb877067c01d0"
+    },
+    {
+      "bytes": 853,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/libc-contract.c",
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5"
+    },
+    {
+      "bytes": 5300,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/loader.mjs",
+      "relative": "loader.mjs",
+      "sha256": "602cb1565c1890ae367ad0d6e805b6c164b739762395f28cb8e2eab84eb51f30"
+    },
+    {
+      "bytes": 20802,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/owner.py",
+      "relative": "owner.py",
+      "sha256": "02563b2b0f55e1ab3a9eb3b37d11206197a785359f477ef66399631001dfa7e8"
+    },
+    {
+      "bytes": 12597,
+      "mode": 384,
+      "path": "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/protocol.json",
+      "relative": "protocol.json",
+      "sha256": "9e0f795b2ce18d8e8dd3813e881517fac4d3cb510d1d24b5cd8e278a43b88701"
+    }
+  ],
+  "firstEntryPlatformTrustRequired": true,
+  "frozen": true,
+  "futureBindingFields": [
+    "Externally admitted actual source manifest SHA and source publication/entry map",
+    "Actual head/base/runId/runAttempt/job and one selected original admission",
+    "Actual qualified Python/Node/compiler paths; observed image pins and fresh public headers/dependencies",
+    "Exclusive output parent/name and exact public artifact transport/audit; no workflow provided or modified"
+  ],
+  "newExecutableBytes": 73925,
+  "newExecutionSources": [
+    "owner.py",
+    "loader.mjs",
+    "inputs/descriptor.c",
+    "inputs/facade.mjs",
+    "inputs/fixture.mjs"
+  ],
+  "physicalFileCountIncludingManifest": 18,
+  "protocol": "jev-owned-pair-qualification-source-manifest-v1",
+  "qualificationAccepted": false,
+  "runtimeEntryMap": {
+    "entry/facade.mjs": "inputs/facade.mjs",
+    "entry/fixture.mjs": "entry.mjs",
+    "entry/loader.mjs": "loader.mjs",
+    "entry/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/nested-owner.mjs": "entry.mjs",
+    "entry/target.mjs": "entry.mjs",
+    "entry/verified/facade.mjs": "inputs/facade.mjs",
+    "entry/verified/fixture.mjs": "inputs/fixture.mjs",
+    "entry/verified/metadata.mjs": "dependencies/metadata.mjs",
+    "entry/verified/nested-owner.mjs": "inputs/nested-owner.mjs",
+    "entry/verified/target.mjs": "inputs/target.mjs"
+  },
+  "sourceContractOnlyNoProviderRecoveryAcceptance": true,
+  "sourceOnly": true,
+  "sourcePacketRevision": "EIGHT_CASE_V1",
+  "sourceReviewAndSeparateActualAdmissionRequired": true,
+  "unknownHoldIsNonterminal": true
+}

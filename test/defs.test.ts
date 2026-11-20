@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, InterfaceCallDefinitionError, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, reportCallsCycles, validateCallsEdges, validateDef } from '../src/defs.ts';
+import { buildDef, callsEdgeKey, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, InterfaceCallDefinitionError, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, reportCallsCycles, validateCallsEdges, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -52,6 +52,22 @@ test('parseDef builds a valid def and fills defaults', () => {
   assert.equal(planner.workdir, undefined); // no default: absent unless the def sets it
   assert.deepEqual(planner.invalidates, ['proposal']); // defaults to consumed stems
   assert.equal(def.steps[3]!.terminal, true);
+});
+
+test('data-only Hub live edge deferral never skips a plain edge with the same target', () => {
+  const make = (name: string) => parseDef({ name, inputs: [],
+    steps: [{ name: 'delegate', calls: 'routing/missing', produces: ['result'] }],
+    outputs: ['result'] });
+  const hub = make('hub');
+  const plain = make('plain');
+  hub.bundleDigest = 'a'.repeat(64);
+  plain.bundleDigest = 'b'.repeat(64);
+  Object.defineProperty(hub, 'bundleDialect', { value: 'hub-qualified' });
+  Object.defineProperty(plain, 'bundleDialect', { value: 'plain' });
+  const defs = new Map([['hub', hub], ['plain', plain]]);
+  const deferred = new Set([callsEdgeKey('hub', hub.steps[0]!)]);
+  assert.throws(() => finalizeDefs(defs, { deferredHubLiveCalls: deferred }),
+    /calls names workflow 'routing\/missing' which does not exist/);
 });
 
 test('include expansion preserves live CAS resolution roles without hashing or serializing them', () => {

@@ -513,7 +513,11 @@ export function buildOwenloopMcp(
   spec: BriefSpec,
   binPath: string = resolveOwenloopBin(),
   execPath: string = process.execPath,
+  routingHolderPath?: string,
+  trustedInputV2 = false,
 ): { command: string; args: string[] } {
+  if (routingHolderPath !== undefined && trustedInputV2)
+    throw new Error('routed holder requires scoped trusted-input authority');
   return {
     command: execPath,
     args: [
@@ -524,11 +528,12 @@ export function buildOwenloopMcp(
       composite(spec),
       '--origin',
       spec.origin,
-      '--as',
-      spec.account,
+      ...(routingHolderPath === undefined ? ['--as', spec.account] : []),
       `--shift=${spec.shiftId ?? ''}`,
       '--mcp',
       '--never-release',
+      ...(routingHolderPath === undefined ? [] : ['--routing-holder', routingHolderPath]),
+      ...(trustedInputV2 ? ['--trusted-input-v2'] : []),
     ],
   };
 }

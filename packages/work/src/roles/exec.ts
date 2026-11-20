@@ -35,6 +35,9 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
+import { consumeRoutingHandoff } from './routing-handoff.ts';
+import { prepareRoutedCommandRunner } from './routing-command-runner.ts';
+import { exactRoutedRoleArgs, routingRoleMarker } from './routing-role-marker.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { resolveAllowedWorkdirRoots } from '../agent/workdir.ts';
 import { loadSettings } from '../settings/settings.ts';
@@ -43,6 +46,8 @@ import { createDefaultStoreInstructionResolver, type InstructionResolver } from 
 import { createHubBundleRecoveryHandler } from '../bundle/pull.ts';
 import { createDefaultRunner, type CommandRunner } from '../exec/runner.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
+import { createTrustedInputV2Admission } from '../hosted/trusted-input-admission.ts';
+import { createTrustedReferenceV2Reader, type TrustedReferenceV2Reader } from '../hosted/trusted-reference-v2.ts';
 import { resolveShiftId, resolveTarget } from './hold.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, type SignalHost } from './signals.ts';
@@ -56,6 +61,7 @@ interface ParsedArgs {
   shift?: string;
   heartbeatIntervalMs?: number;
   jumpToleranceMs?: number;
+  trustedInputV2?: boolean;
   error?: string;
 }
 
@@ -109,6 +115,9 @@ export function parseArgs(args: string[]): ParsedArgs {
         }
         break;
       }
+      case '--trusted-input-v2':
+	parsed.trustedInputV2 = true;
+	break;
       default:
         return { error: `unknown option '${a}'` };
     }
@@ -119,6 +128,7 @@ export function parseArgs(args: string[]): ParsedArgs {
 function usage(): void {
   process.stderr.write(
     'usage: owenloop work exec <workflow>/<run> [--origin <url>] [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>]\n' +
+      '                     [--trusted-input-v2  (direct Service HTTPS witness)]\n' +
       '   or: owenloop work exec <run> --workflow <wf> [...]\n',
   );
 }
@@ -150,6 +160,7 @@ export function exitCodeFor(outcome: ExecOutcome): number {
     case 'judge-no-verdict':
     case 'reject-failed':
     case 'stopped':
+    case 'routed-quarantined':
       return 1;
   }
 }
@@ -168,6 +179,8 @@ export interface RunDeps {
   instructions?: InstructionResolver;
   /** Consume-side verifier; injected tests may provide a fake. */
   consumedVerifier?: ConsumedVerifier;
+  /** Test-only local reader seam; production always constructs its own HTTPS reader. */
+  trustedInputV2Reader?: TrustedReferenceV2Reader;
   out?: (line: string) => void;
   err?: (line: string) => void;
   /** cwd for a command order that carries no `workdir` (default `process.cwd()`). */
@@ -201,6 +214,26 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const env = deps.env ?? process.env;
+  const routing = routingRoleMarker(env);
+  if (routing !== 'ordinary') {
+    const refuse = () => { err('owenloop work exec: routing handoff refused'); return 1; };
+    if (routing === 'invalid' || !parsed.origin || !parsed.shift
+      || !exactRoutedRoleArgs(args, target, parsed.origin, parsed.shift)
+      || parsed.trustedInputV2 || parsed.heartbeatIntervalMs !== undefined
+      || parsed.jumpToleranceMs !== undefined) return refuse();
+    try {
+      const handoff = consumeRoutingHandoff({ env, origin: parsed.origin, target, kind: 'exec' });
+      if (!handoff || parsed.shift !== handoff.shiftId) return refuse();
+      const prepared = await prepareRoutedCommandRunner({ handoff, originalEnv: env, out, err });
+      installSignalHandlers(prepared.loop, deps.signalHost ?? process, err, {
+	role: 'exec', drainNote: 'killing the command and releasing the order',
+	stopReason: 'signal',
+      });
+      return exitCodeFor(await prepared.run());
+    } catch {
+      return refuse();
+    }
+  }
   let settings;
   try {
     settings = loadSettings(env);
@@ -234,6 +267,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return bearer.code;
   }
   const token = bearer.token;
+  const trustedInputV2 = parsed.trustedInputV2 === true || env['OWENLOOP_TRUSTED_INPUT_V2'] === '1';
 
   let instructions = deps.instructions;
   if (instructions === undefined) {
@@ -269,6 +303,40 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   };
   const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
   const runner = deps.runner ?? createDefaultRunner();
+
+  if (trustedInputV2) {
+    let reader: TrustedReferenceV2Reader;
+    try {
+      reader = deps.trustedInputV2Reader ?? createTrustedReferenceV2Reader({ origin,
+	getToken: async () => token, expected: target });
+    } catch (e) {
+      err(`owenloop work exec: trusted input v2 unavailable: ${errMsg(e)}`);
+      return 1;
+    }
+    const admission = createTrustedInputV2Admission({ reader, instructions, consumedVerifier, expected: target });
+    const underlying = instructions;
+    instructions = { ...underlying, async resolveCommand(order) {
+      const first = await admission.observe(order);
+      if (!first.ok) return { ok: false, kind: 'unverified-consumed',
+	reason: `trusted input v2 refusal: ${first.reason}` };
+      if (first.step.step.executor !== 'command' || typeof first.step.step.command !== 'string'
+	|| !first.step.step.command.trim()) return { ok: false, kind: 'missing-command',
+	reason: 'trusted input v2 local command unavailable' };
+      const checkFresh = async () => {
+	const fresh = await admission.observe(order);
+	if (!fresh.ok || fresh.packetDigest !== first.packetDigest
+	  || fresh.witnessDigest !== first.witnessDigest) {
+	  return { ok: false as const, kind: 'unverified-consumed' as const,
+	    reason: `trusted input v2 consequence refusal: ${fresh.ok ? 'observation-changed' : fresh.reason}` };
+	}
+	return undefined;
+      };
+      return { ok: true, command: first.step.step.command,
+	...(first.step.bundleDir === undefined ? {} : { bundleDir: first.step.bundleDir }),
+	revalidate: checkFresh,
+	revalidateAfterRun: checkFresh };
+    } };
+  }
 
   const loop = createExecLoop({
     hub,

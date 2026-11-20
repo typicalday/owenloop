@@ -83,6 +83,7 @@ export async function installBundleFixture(args: {
   globalRoot?: string;
   sourcePath?: string;
   verifier?: PreCommitVerifier;
+  deferHubLiveCallsAtStorage?: true;
 }): Promise<{
   source: BundleSource;
   packed: PackResult;
@@ -110,6 +111,7 @@ export async function installBundleFixture(args: {
     recoveryMarkerDir: markerDir,
     ingestor: createBundleIngestor(),
     verifier,
+    ...(args.deferHubLiveCallsAtStorage === true ? { deferHubLiveCallsAtStorage: true as const } : {}),
   });
   return { source, packed, result, root };
 }

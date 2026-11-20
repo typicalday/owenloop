@@ -13,7 +13,7 @@ import {
 import { dirname, join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import { parseVersionedCallTarget } from '../bundle/manifest.ts';
-import { loadDefFile } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
 import {
   acquireInstallLock,
   ensureDirectoryPathNoSymlink,
@@ -185,16 +185,18 @@ function readObjectMetadata(root: string, digest: DefDigest): BundleObjectMetada
   const objectDir = objectDirForDigest(root, digest);
   verifyWorkflowObjectSync(objectDir, digest, { coordinateRepair: false });
   const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
+  const dialect = bundleDialectForManifest(manifest);
   const qualifiedWorkflows: string[] = [];
   for (const [workflowName, workflowPath] of Object.entries(manifest.workflows).sort(([a], [b]) => compareStoreText(a, b))) {
-    const def = loadDefFile(join(objectDir, workflowPath));
+    const def = loadBundleDefFile(join(objectDir, workflowPath), dialect);
     if (def.name !== workflowName) {
       throw new Error(
 		`workflow-store object ${digest}: workflow '${workflowPath}' has definition name ` +
 		  `'${def.name}', expected '${workflowName}'`,
       );
     }
-    qualifiedWorkflows.push(`${manifest.package.name}/${workflowName}`);
+    qualifiedWorkflows.push(workflowName.includes('/')
+      ? `hub:${workflowName}` : `${manifest.package.name}/${workflowName}`);
   }
   return {
     digest,

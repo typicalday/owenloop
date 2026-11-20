@@ -31,6 +31,15 @@
  * adapter contract, not in this neutral shape module.
  */
 
+import type {
+  DecisionBindingV1,
+  LocalModelTuple,
+  LocalTupleEligibility,
+  ReferenceRouting,
+  RoleModelPolicy,
+  TaskRole,
+} from '../hub/types.ts';
+
 /** Reasoning rungs the neutral start contract accepts, weakest to strongest. */
 export const EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 
@@ -196,4 +205,202 @@ export function selectCandidate(
     if (isAvailable(candidate.harness)) return { kind: 'selected', candidate };
   }
   return { kind: 'none-available', offered: survivors.map((candidate) => candidate.harness) };
+}
+
+/** The winning row's identity, supplied by the trusted crew/roster resolver. */
+export interface AuthorizedRowIdentity {
+  crew: string;
+  capability: string;
+  source: string;
+}
+
+export interface AuthorizedSelectionInput {
+  /** Only the authorized crew, with strongest-layer rows already merged atomically.
+   * Weaker rows and other crews are deliberately not fallback inputs. */
+  roster: {
+    crew: string;
+    rows: Readonly<Record<string, { source: string; candidates: readonly RosterCandidate[] }>>;
+  };
+  authorizedRow: AuthorizedRowIdentity;
+  capabilities: readonly string[];
+  binding: Pick<DecisionBindingV1, 'issuedAt' | 'expiresAt'> & {
+    revisions: Pick<DecisionBindingV1['revisions'], 'roster' | 'rolePolicy'>;
+  };
+  /** Authenticated service snapshot, including the exact submitted offer. */
+  preference: ReferenceRouting['preference'];
+  current: {
+    now: number;
+    /** Trusted current task role; an arbitrary or unknown string must refuse. */
+    role: string;
+    rolePolicy: RoleModelPolicy | null;
+    /** Roster CONTENT identity, comparable to offer/preference.rosterRevision. */
+    rosterRevision: string;
+    /** Scoped generation, comparable only to binding.revisions.roster. */
+    rosterGeneration: string;
+    /** Current authoritative tuple eligibility and model-specific availability.
+     * The caller supplies any required quota checks; installation alone is insufficient. */
+    tuples: readonly LocalTupleEligibility[];
+    installedHarnesses: readonly string[];
+  };
+  stepHarness?: string;
+  /** Optional ranking hint, never authority. IDs and every component must match. */
+  preferred?: LocalModelTuple;
+}
+
+export type AuthorizedSelectionRefusal =
+  | 'no-row' | 'unauthorized-row' | 'missing-offer' | 'role-policy'
+  | 'stale-revisions' | 'stale-window' | 'harness-policy' | 'none-eligible';
+
+export interface AuthorizedSelectionProvenance {
+  requested: LocalModelTuple | null;
+  row: AuthorizedRowIdentity | null;
+  match: CapabilityMatch | null;
+  revisions: { rosterContent: string; rosterGeneration: string; rolePolicy: string | null };
+}
+
+/**
+ * The trusted, ordered tuple set that may be sent to the routing service.
+ * This is deliberately separate from selection: an advisory can only rank
+ * candidates already admitted by the local authorization snapshot.
+ */
+export interface AuthorizedCandidateExtraction extends AuthorizedSelectionProvenance {
+  candidates: readonly LocalModelTuple[];
+  refusal: AuthorizedSelectionRefusal | null;
+}
+
+export type AuthorizedSelectionOutcome = AuthorizedSelectionProvenance & (
+  | { kind: 'refused'; reason: AuthorizedSelectionRefusal; selected: null }
+  | { kind: 'selected'; reason: 'preferred' | 'roster-order'; selected: LocalModelTuple }
+  | { kind: 'fallback'; reason: 'preferred-ineligible' | 'roster-fallback'; selected: LocalModelTuple }
+);
+
+function knownTaskRole(role: string): role is TaskRole {
+  // Exhaustive against the shared DTO, without defining a competing role type.
+  const roles = { research: true, implementation: true, review: true, judge: true } satisfies Record<TaskRole, true>;
+  return Object.prototype.hasOwnProperty.call(roles, role);
+}
+
+function sameModel(a: RosterCandidate, b: RosterCandidate): boolean {
+  return a.harness === b.harness && a.model === b.model && a.effort === b.effort;
+}
+
+function sameTuple(a: LocalModelTuple, b: LocalModelTuple): boolean {
+  return a.id === b.id && sameModel(a, b);
+}
+
+function copyTuple(tuple: LocalModelTuple): LocalModelTuple {
+  return { id: tuple.id, harness: tuple.harness, model: tuple.model, effort: tuple.effort };
+}
+
+function eligibleTuple(rows: readonly LocalTupleEligibility[], tuple: LocalModelTuple): boolean {
+  const matches = rows.filter(row => row.tuple.id === tuple.id);
+  // Conflicting components or flags under the same ID are not usable authority.
+  return matches.length === 1 && matches[0]!.eligible === true && matches[0]!.available === true
+    && sameTuple(matches[0]!.tuple, tuple);
+}
+
+function policyAllows(policy: RoleModelPolicy, role: TaskRole, model: string): boolean {
+  return policy.rules.some(rule => rule.model === model && rule.roles.includes(role));
+}
+
+function currentWindow(window: { issuedAt: number; expiresAt: number }, now: number): boolean {
+  return Number.isFinite(window.issuedAt) && Number.isFinite(window.expiresAt)
+    && window.issuedAt <= now && now < window.expiresAt;
+}
+
+/**
+ * Pure opt-in model selection over one trusted, current authorization snapshot.
+ * The caller must authenticate account/session/claim and supply the authoritative
+ * crew, winning row, role, policy and current availability. This function does
+ * not establish those authorities or authorize a future process launch.
+ *
+ * Resolve exact-before-bare across all capabilities once, lock the winning row,
+ * then intersect local installation, full service tuple identities, current
+ * eligibility/availability, both policies and the hard harness before ranking.
+ * Failure is terminal for this opt-in path: callers must not retry legacy crew
+ * or layer fallback. The separate no-model command path is outside this API.
+ */
+export function extractAuthorizedCandidates(input: AuthorizedSelectionInput): AuthorizedCandidateExtraction {
+  const { current, preference, binding } = input;
+  const rows = input.roster.rows;
+  const roster: Record<string, readonly RosterCandidate[]> = Object.create(null);
+  for (const capability of Object.keys(rows)) roster[capability] = rows[capability]!.candidates;
+  const resolved = resolveCapabilityCandidates(roster, input.capabilities);
+  const row = resolved ? {
+    crew: input.roster.crew, capability: resolved.capability, source: rows[resolved.capability]!.source,
+  } : null;
+  const provenance: AuthorizedSelectionProvenance = {
+    requested: input.preferred ? copyTuple(input.preferred) : null,
+    row,
+    match: resolved?.match ?? null,
+    revisions: {
+      rosterContent: current.rosterRevision,
+      rosterGeneration: current.rosterGeneration,
+      rolePolicy: current.rolePolicy?.revision ?? null,
+    },
+  };
+  const refuse = (reason: AuthorizedSelectionRefusal): AuthorizedCandidateExtraction => (
+    { ...provenance, candidates: [], refusal: reason }
+  );
+  if (!resolved || !row) return refuse('no-row');
+  if (!row.crew || !row.source || row.crew !== input.authorizedRow.crew
+    || row.capability !== input.authorizedRow.capability || row.source !== input.authorizedRow.source) {
+    return refuse('unauthorized-row');
+  }
+  const offer = preference.offer;
+  if (!offer) return refuse('missing-offer');
+  const policy = current.rolePolicy;
+  const offeredPolicy = preference.rolePolicy;
+  if (!knownTaskRole(current.role) || preference.role !== current.role
+    || !policy || !offeredPolicy || policy.unknownRole !== 'refuse' || offeredPolicy.unknownRole !== 'refuse') {
+    return refuse('role-policy');
+  }
+  if (!current.rosterRevision || !current.rosterGeneration || !policy.revision
+    || current.rosterRevision !== preference.rosterRevision || current.rosterRevision !== offer.rosterRevision
+    || current.rosterGeneration !== binding.revisions.roster
+    || policy.revision !== offeredPolicy.revision || policy.revision !== offer.rolePolicyRevision
+    || policy.revision !== binding.revisions.rolePolicy) return refuse('stale-revisions');
+  if (!Number.isFinite(current.now) || !currentWindow(binding, current.now) || !currentWindow(offer, current.now)
+    || !Number.isFinite(preference.expiresAt) || current.now >= preference.expiresAt) return refuse('stale-window');
+
+  const hardHarness = input.stepHarness;
+  const constrained = resolved.candidates.filter(candidate => !hardHarness || candidate.harness === hardHarness);
+  if (resolved.candidates.length > 0 && constrained.length === 0) return refuse('harness-policy');
+  const role = current.role;
+  const eligible = constrained.flatMap(candidate => {
+    if (!current.installedHarnesses.includes(candidate.harness)
+      || !policyAllows(policy, role, candidate.model) || !policyAllows(offeredPolicy, role, candidate.model)) return [];
+    return offer.tuples.filter(({ tuple }) => tuple.id.trim() !== '' && sameModel(tuple, candidate)
+      && eligibleTuple(offer.tuples, tuple) && eligibleTuple(preference.tuples, tuple)
+      && eligibleTuple(current.tuples, tuple)).map(({ tuple }) => copyTuple(tuple));
+  });
+  return { ...provenance, candidates: eligible, refusal: eligible.length === 0 ? 'none-eligible' : null };
+}
+
+export function evaluateAuthorizedSelection(input: AuthorizedSelectionInput): AuthorizedSelectionOutcome {
+  const extracted = extractAuthorizedCandidates(input);
+  const provenance: AuthorizedSelectionProvenance = {
+    requested: extracted.requested,
+    row: extracted.row,
+    match: extracted.match,
+    revisions: extracted.revisions,
+  };
+  if (extracted.refusal) {
+    return { ...provenance, kind: 'refused', reason: extracted.refusal, selected: null };
+  }
+  const eligible = extracted.candidates;
+  const preferred = input.preferred && eligible.find(tuple => sameTuple(tuple, input.preferred!));
+  if (preferred) return { ...provenance, kind: 'selected', reason: 'preferred', selected: copyTuple(preferred) };
+  const first = eligible[0];
+  if (!first) return { ...provenance, kind: 'refused', reason: 'none-eligible', selected: null };
+  if (input.preferred) {
+    return { ...provenance, kind: 'fallback', reason: 'preferred-ineligible', selected: copyTuple(first) };
+  }
+  const rowCandidates = extracted.row
+    ? input.roster.rows[extracted.row.capability]?.candidates
+    : undefined;
+  if (!rowCandidates?.[0] || !sameModel(first, rowCandidates[0])) {
+    return { ...provenance, kind: 'fallback', reason: 'roster-fallback', selected: copyTuple(first) };
+  }
+  return { ...provenance, kind: 'selected', reason: 'roster-order', selected: copyTuple(first) };
 }

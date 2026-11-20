@@ -1,0 +1,444 @@
+{
+  "protocol": "jev-current-production-owner-qualification-source-v1",
+  "sourceOnly": true,
+  "executionAdmitted": false,
+  "publicationAdmitted": false,
+  "runtimeAccepted": false,
+  "normalRecoveryAccepted": false,
+  "canonicalRelease": false,
+  "rootRelease": false,
+  "engineBaselineHead": "7dc6ea2c96147bf6e8f23a82f673a1e56c0fe813",
+  "engineBaselineTree": "19203025aa3ddcbe5a62841c3069869bdfae7d3c",
+  "serviceHead": "67ec99101ea18dc27b14ddf8a209df317f5bbdf5",
+  "serviceVendoredEngine": "a76c75a7b0d21625980afc67d5943564be854819",
+  "scope": "HARMLESS_CURRENT_PRODUCTION_OWNER_ONLY",
+  "job": "linux-production-owner-qualification",
+  "gate": "OWENLOOP_JEV_PRODUCTION_OWNER_HEAD",
+  "oldGatesMustBeAbsent": [
+    "OWENLOOP_JEV_PREFLIGHT_HEAD",
+    "OWENLOOP_JEV_OBSERVER_HEAD",
+    "OWENLOOP_JEV_DESCRIPTOR_HEAD",
+    "OWENLOOP_JEV_ONE_RELAY_HEAD",
+    "OWENLOOP_JEV_ONE_RELAY_Q2_HEAD"
+  ],
+  "futureHead": "Fresh actual successor head/tree/run/attempt/job/workflow and eight ordinary SUCCESS jobs require external root comparison and separate one-selected-job admission. Current7dc6 original115329386159 is failed and consumed; no permission/result transfers. Unknown POST never permits repost; remove only owned matching gate after terminal reconciliation.",
+  "executionFiles": [
+    "owner.py",
+    "launch.py",
+    "headers.py",
+    "libc-contract.c",
+    "loader.mjs",
+    "fixture.mjs",
+    "role.mjs",
+    "private-entry.mjs",
+    "provider.mjs",
+    "source-inventory.json",
+    "source-composition.json",
+    "protocol.json",
+    "dependencies/owner.py",
+    "dependencies/metadata.mjs",
+    "inputs/relay.c",
+    "inputs/direct/descriptor.c",
+    "overlay/packages/work/src/harness/routed-owner-observer.ts",
+    "selected-inputs.py",
+    "compiler-entry.mjs",
+    "initializer.mjs"
+  ],
+  "caseNames": [
+    "CURRENT_PRODUCTION_MANAGED_OWNER_SEAM",
+    "PRIVATE_AGENT_ENTRY_PARSE_REFUSAL_CLEANUP"
+  ],
+  "fixtureProtocol": "jev-current-production-owner-fixture-v1",
+  "fixtureSeconds": 40,
+  "cleanupSeconds": 10,
+  "ownerSeconds": 360,
+  "bootstrapSeconds": 450,
+  "jobMinutes": 10,
+  "resultCapBytes": 65536,
+  "eventInputCapBytes": 1048576,
+  "sourceInputCapBytes": 1048576,
+  "moduleLoadCapBytes": 16777216,
+  "loadedModuleCapPerInitializerBytes": 33554432,
+  "addonCapBytes": 8388608,
+  "innerSelectedHashCapBytes": 1073741824,
+  "outerSelectedHashCapBytes": 33554432,
+  "innerMemoryBudgetBytes": 1073741824,
+  "outerMemoryBudgetBytes": 33554432,
+  "memoryEnforcementClaimed": false,
+  "memoryLimits": "Single nonconcurrent TypeScript source-build original uses Node old-space512MiB; install uses256MiB; fixture/role/supervisor/provider use192MiB each, at most four concurrent Node processes. These heap allowances are planning limits within the inner1GiB budget, not hard RSS enforcement; native/RSS overhead and npm subordinate-process peaks require actual root audit. No future success is implied.",
+  "nodeVersion": "22.23.0",
+  "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
+  "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
+  "retainedSlots": [
+    "node-dependencies",
+    "typescript",
+    "headers",
+    "dependencies",
+    "libc-build",
+    "libc-abi",
+    "addon-build",
+    "fixture"
+  ],
+  "externalOriginals": 12,
+  "bootstrapOriginals": 4,
+  "innerOriginals": 8,
+  "genuineNestedNodeOriginals": 4,
+  "nodeInitializerEntriesAcrossFixtureCycles": 5,
+  "maximumConcurrentNodeProcesses": 4,
+  "publicTransport": [
+    "result.json"
+  ],
+  "privateStreams": "Exact <slot>.stdout / <slot>.stderr; npm/cache/source tree/dependency paths and all raw role stderr are private and never uploaded.",
+  "stagePlan": [
+    {
+      "slot": "node-dependencies",
+      "seconds": 90,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "typescript",
+      "seconds": 60,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "headers",
+      "seconds": 25,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "dependencies",
+      "seconds": 15,
+      "streamCapBytes": 131072
+    },
+    {
+      "slot": "libc-build",
+      "seconds": 20,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "libc-abi",
+      "seconds": 5,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "addon-build",
+      "seconds": 25,
+      "streamCapBytes": 65536
+    },
+    {
+      "slot": "fixture",
+      "seconds": 40,
+      "streamCapBytes": 65536
+    }
+  ],
+  "firstEntry": "Workflow/bootstrap/launch/Node loader entry and setup-selected npm/runtime are declared platform-trusted first entries. Runtime imports after public registerHooks registration execute same already-read SHA-verified module bytes, canonical URLs with no aliases/query/fragments. No claim initial entry bytes proven by before/after path hash alone.",
+  "moduleIdentity": "Current dist/packages/work/src/harness/routed-owner-observer.js is the one shared canonical branded instance in each process. The actual private agent-run and runner imports resolve the same URL; loader rejects external/unmapped imports.",
+  "notification": "Fresh exclusive owner-created directory, fixed adjacent binding, producer role writes O_EXCL0600 canonical ready.json after ordinary managed ready and fixed RPC issuance. uid/nlink/stable FD/path/size/canonical keys checked; notification is separate nonnative evidence, never consent/authority. One bounded wait, one native sample, no retry/restart/deadline extension. No parent acknowledgment or lifetime hold.",
+  "terminal": "Positive role natural0; actual early parser role natural2. Role stdio intentionally ignored, not invented EOF. Managed settlement must be original-posix-group/empty/normal-exit:group-absent; nested individual supervisor/provider reap and pipe EOF remain UNPROVED. Supervisor existing group signals stay intact. Full native terminal closure remains unqualified.",
+  "cleanup": "Role token-only status overlay makes latched cleanup refusal observable even without child. Every constructor CLEANUP and checked close failure dominates cleanupKnown/exit. Original child remains in production custody on observer refusal. External fixture cleanup sends SIGTERM only through retained original custody; fixture cancellation uses issued SpawnResult, never numeric witness. No force-kill of owner retaining detached originals; UNKNOWN_HOLD is nonterminal, no next stage/restart.",
+  "remainingInputs": [
+    "Whole actual packet independent/root source review",
+    "Separately reviewed actual publication and fresh current-head source/run/workflow context",
+    "Fresh Linux observed tools/npm selected metadata/content/header/artifact/emitted closure; enforced caps can still refuse",
+    "Separately admitted ordinary compiler parity validation before CLI parity claim",
+    "Genuine authorized Linux provider/account and complete Shift/Service NORMAL consent/native/ingress/effect/DSSE/four-guard/terminal closure remain separate"
+  ],
+  "providerAccessQualified": false,
+  "all23ExitsPreserved": true,
+  "healthyBigserver": "STOP",
+  "compilerHookInitializerEntries": 1,
+  "runtimeResultShape": {
+    "fixtureKeys": 14,
+    "sampleKeys": 7,
+    "notificationKeys": 4,
+    "positiveKeys": 11,
+    "parseKeys": 7,
+    "nestedIndividualEOF": "UNPROVED",
+    "roleStdio": "IGNORED"
+  },
+  "childEnvironment": "Fixed narrow PATH/LANG/LC_ALL/TZ/Node heap and fresh private HOME; npm receives distinct exclusive empty user/global config files plus private cache and ignore-scripts/no-audit/no-fund. No provider/service/user config or credential environment is inherited. Actions platform credentials/trust remain separate.",
+  "sourcePacketRevision": "CHECKED_PACKAGE_METADATA_REUSE_V1",
+  "scopeContract": "Existing selected-consumed-input authority unchanged; narrow owner-local checked canonical package metadata reuse plus passive first-closure diagnostic. All closure rows/form/serialization authority retained. No actual cause/fit or generic CLI parity proved.",
+  "sourceByteOrigin": "Exact current7dc6 publication baseline plus declared five mapped successor changes; all206 tracked compilation inputs and all production/Service sources unchanged. Whole private source review precedes publication/CI/action.",
+  "hashAccounting": {
+    "innerCapBytes": 1073741824,
+    "outerCapBytes": 33554432,
+    "conditionalEnvelopeBytes": 1016070144,
+    "unassignedSlackBytes": 57671680,
+    "fitMeasured": false,
+    "partitionsMiB": {
+      "initial": 288,
+      "ownNode": 128,
+      "modules": 192,
+      "addons": 40,
+      "headers": 17,
+      "selected": 128,
+      "compiler": 64,
+      "late": 64,
+      "native": 32,
+      "metadata": 16
+    },
+    "reserveBeforeActions": [
+      "ownNode",
+      "modules",
+      "addons",
+      "headers",
+      "compiler"
+    ],
+    "reservationBytes": 462422016,
+    "moduleInitializers": 6,
+    "modulePerInitializerCap": 33554432,
+    "addonActualPasses": 5,
+    "addonPerPassCap": 8388608,
+    "headerArchiveCap": 16777216,
+    "headerSelectedCap": 262144,
+    "policy": "Nonrefundable attempted parent reads and metadata digests; child read inputs plus public private-source hash updates conservatively charged, even where the same bytes are counted twice. Initializer and addon cardinality is enforced for these exact trusted entries; actual child receipt charges replace their reserved credit once only. Reservations are not released as savings. Rejected/unknown child work retains its reservation and cannot pass. No universal npm/compiler/runtime distribution crypto gate is asserted. readFixed checks remaining declared input allowance before allocation/read; metadata resource chunk overrun refuses. All six accepted process receipts are closed, integer-bounded and lifetime-specific; any failed or missing receipt retains reservation. Logical catalogue storage and bounded runtime-closure containers are not claimed as measured RSS."
+  },
+  "selectedAuthority": {
+    "npmOriginal": "unchanged ci --ignore-scripts --no-audit --no-fund, separate owned installation",
+    "candidate": "All TypeScript and semver/yaml/@cfworker/json-schema package contents plus .ts/.mts/.cts/.js/.mjs/.cjs/.json candidates from all installed package paths. Suffixes are candidate selection, never proof of consumed closure. Any omitted existing consumer refuses.",
+    "runtimePackages": [
+      "semver",
+      "yaml",
+      "@cfworker/json-schema"
+    ],
+    "discardedSdkRuntimeAllowed": false,
+    "workerAllowed": false,
+    "catalogProtocol": "jev-selected-compiler-catalog-v2",
+    "completeOriginalMetadataRequired": true,
+    "catalogCapBytes": 1048576,
+    "entriesCap": 32768,
+    "directoriesCap": 4096,
+    "depthCap": 64,
+    "frontierCap": 65,
+    "pathBytesCap": 4096,
+    "metadataOpsCap": 260000,
+    "cleanupMetadataOpsCap": 262144,
+    "logicalStorageCapBytes": 8388608,
+    "selectedOriginalContentCapBytes": 67108864,
+    "selectedCopyTwoReadChargeCapBytes": 134217728,
+    "metadataSemantics": "Original directory/regular/link names and types are completely bounded or selection refuses. Existing omitted leaf is METADATA_ONLY, distinct from genuine catalogue absence. Source-owned anchored no-follow directory FDs and leaf same-FD/path shape protect acquisition; links remain contained in the fresh owned tree. This is a snapshot, not a global filesystem immutability claim. Logical storage is accounting, not allocator/RSS proof. Core operations are metered and anticipated same-FD read/write metadata credits are reserved before content copy. Fresh destination directories are created once; no parent recursion is used in selected copy. Extra tracked/private catalogue rows come from finite verified source maps rather than a second filesystem scan."
+  },
+  "compilerContract": {
+    "version": "5.9.3",
+    "publicAPI": "getParsedCommandLineOfConfigFile, createCompilerHost, createProgram, getPreEmitDiagnostics, emit",
+    "config": "Exact tracked tsconfig.build.json and tsconfig.json, options/root names/project references/config diagnostics are retained. Declared root names must exactly equal the existing tracked .ts inventory.",
+    "host": "All read/existence/directory/realpath/current-dir/default-lib/environment/write callbacks are explicit. Default getSourceFile closes over overridden compilerHost.readFile; its caught read failure is made sticky. Default option-specific getNewLine and createHash remain from createCompilerHost. UTF8 BOM/UTF16 LE/BE handling is source-declared.",
+    "metadata": "ts.sys.readDirectory keeps TypeScript glob semantics. Its mirror readdir/stat/realpath public-fs calls use only catalogue metadata; there are no live mirror directory reads, symlink follows or zero-content substitutions. Calls/row scans cap1048576; catalogue entries/path/depth/storage caps bound arrays.",
+    "outputCapBytes": 33554432,
+    "readBufferCacheCapBytes": 67108864,
+    "hostileSameProcessSandboxClaimed": false,
+    "ordinaryCliParityProved": false,
+    "ordinaryCliParityGate": "A separately admitted actual compiler parity review/original is required before claiming CLI diagnostic/emit/exit parity. This source implements the explicit API contract; current fixture does not constitute generic tsc CLI equivalence."
+  },
+  "lifetimeContract": {
+    "entryProfiles": [
+      "compiler",
+      "fixture",
+      "positiveRole",
+      "parserRole",
+      "supervisor",
+      "provider"
+    ],
+    "hookInstallCapPerProcess": 1,
+    "uninstall": "Assert policy and retain hook until original exit; no deregister/reset/unhooked tail.",
+    "worker": "Node22.23 permission denies Worker; worker_threads/cluster/vm imports are additionally refused; no allow-worker flag.",
+    "childQuotas": {
+      "compiler": 0,
+      "fixture": 2,
+      "positiveRole": 1,
+      "parserRole": 0,
+      "supervisor": 1,
+      "provider": 0
+    },
+    "addonQuotas": {
+      "compiler": 0,
+      "fixture": 2,
+      "positiveRole": 1,
+      "parserRole": 1,
+      "supervisor": 1,
+      "provider": 0
+    },
+    "firstEntry": "Node/loader/compiler entry and permission implementation remain trusted first entries. Hooks affect later canonical registered loads. Every six-entry preload map is explicit; no env/Hub remote module or provider selection is admitted.",
+    "rawResources": "Only declared copied rows and fixed gate/result/own-proc resources are admitted. Raw async/open-stream consumers outside implemented interfaces refuse; runtime package/resource URLs must be canonical declared rows. Runtime SDK use refuses. Source inputs are read-only under private Node permission; output write scope is fixed. Trusted native/platform/tool code is not a malicious-process security boundary."
+  },
+  "warningPolicy": {
+    "source": "Node22.23 pre_execution.js and warning.js; no suppression",
+    "privateFiles": [
+      "warnings/fixture.txt",
+      "warnings/positiveRole.txt",
+      "warnings/parserRole.txt",
+      "warnings/supervisor.txt",
+      "warnings/provider.txt"
+    ],
+    "recordsPerFile": 1,
+    "fileInputCapBytes": 65536,
+    "expectedFlags": {
+      "fixture": [
+        "--allow-addons",
+        "--allow-child-process"
+      ],
+      "positiveRole": [
+        "--allow-addons",
+        "--allow-child-process"
+      ],
+      "parserRole": [
+        "--allow-addons"
+      ],
+      "supervisor": [
+        "--allow-addons",
+        "--allow-child-process"
+      ],
+      "provider": []
+    },
+    "interpretation": "Each exact initializer has a separate source-owned precreated empty private file, with no cross-original inheritance. Provider NODE_OPTIONS is separately source-owned. Exact version-specific messages, one hint per warning-bearing process and complete distinct source record are privately checked; only length/hash/count/fixed classification is public. Subsequent public emitWarning calls refuse; unknown/additional/oversize records cannot pass. Node first-entry warning scheduling/append and internal FD teardown are explicit platform trust, not a claimed hard file-size limit or independently checked native FD close. Terminal scoped settlement and stable owner FD/path checks precede acceptance. External stderr remains empty for good()/fixture; raw warning bytes are never uploaded."
+  },
+  "buildInvocation": "Same source-owned Node22.23 executable, explicit compiler-entry.mjs public API, exact config/root/options/declarations/emission contract. No Mac output/artifact transfer. Actual CLI behavior parity remains unproved.",
+  "selectedCompilerScope": "Fresh bounded -M preprocessing selection and measured selected header bytes plus observed cc image; not frontend/as/ld/specs/startup/linker/runtime distribution closure. npm/TypeScript/runtime/compiler distributions remain explicit trusted unverified inputs.",
+  "observedExecutableInputCapsBytes": {
+    "node": 134217728,
+    "cc": 33554432,
+    "python": 33554432,
+    "npmCli": 33554432,
+    "selfPs": 33554432
+  },
+  "nativeSelectedDependencyInputCapBytes": 536870912,
+  "catalogProjection": {
+    "catalogKeys": [
+      "protocol",
+      "entries",
+      "links",
+      "selectedCount",
+      "metadataOps",
+      "logicalStorageBytes",
+      "selectedBytes",
+      "snapshotOnly"
+    ],
+    "selectedCountType": "exact integer0..16384; equals len(dependency_rows)",
+    "authority": "Complete entries/links retained without filtering. Complete selection and dependency_rows remain private authoritative owner data; separate runtime-closure SHA/bytes rows and all hash reads/rechecks unchanged. Only unconsumed selected hash array duplicate serialization is omitted from compiler catalogue.",
+    "storageReservationBytes": 1048576,
+    "catalogCapBytes": 1048576,
+    "logicalStorageCapBytes": 8388608,
+    "fitProved": false,
+    "failureCauseProved": false
+  },
+  "postSelectionDiagnostic": {
+    "protocol": "jev-post-selected-catalog-diagnostic-v1",
+    "failureOnly": true,
+    "enclosingStatus": "REFUSED",
+    "enclosingStage": "DEPENDENCY_INVENTORY",
+    "frameKeys": [
+      "protocol",
+      "phase",
+      "error",
+      "counters",
+      "saturated",
+      "unknown"
+    ],
+    "maxEncodedBytesIncludingNewline": 1024,
+    "phaseEnums": [
+      "SELECTED_RETURN",
+      "PROJECT_STORAGE_BASE",
+      "PROJECT_ROWS",
+      "PROJECT_STORAGE_EXTEND",
+      "CATALOG_ENTRY_CAP",
+      "CATALOG_PROJECTION",
+      "CATALOG_SERIALIZE",
+      "CATALOG_INPUT_CAP",
+      "CATALOG_WRITE",
+      "UNKNOWN"
+    ],
+    "errorEnums": [
+      "PREDICATE_REFUSED",
+      "ALLOCATION",
+      "SERIALIZATION",
+      "OTHER",
+      "UNKNOWN"
+    ],
+    "counterKeys": [
+      "selectionEntries",
+      "selectedRows",
+      "selectionLogicalStorage",
+      "projectLogicalStorage",
+      "extraFiles",
+      "extraDirs",
+      "catalogEntries",
+      "catalogBytes"
+    ],
+    "counterType": "null until observed; exact builtin nonnegative int saturated at2147483647; bool forbidden",
+    "flagTypes": "saturated and unknown exact booleans",
+    "serializationContext": "SERIALIZATION only at CATALOG_SERIALIZE; exact TypeError/ValueError/OverflowError",
+    "originalPredicateRecognition": "Exact inert RuntimeError and BaseException.args descriptor equals singleton PRODUCTION_OWNER_REFUSED, no arbitrary errors/messages retained",
+    "window": "Initialized only after selected_installed returned; cleared after successful catalogue digest/write, all other failures null",
+    "bootstrap": "Known closed/context-consistent frames forwarded unchanged. Invalid companions replaced with null without replacing original refusal, original raw result pin remains separately retained. Companion validity is never qualification acceptance.",
+    "noAdditionalReadsHashesCustodyOperations": true,
+    "passiveFailurePolicy": "All tracker/classifier/validation failures contained. No error object, args, path, package, environment, stream or raw payload retained."
+  },
+  "firstClosureDiagnostic": {
+    "protocol": "jev-first-runtime-closure-diagnostic-v1",
+    "failureOnly": true,
+    "enclosingStatus": "REFUSED",
+    "enclosingStage": "DEPENDENCY_INVENTORY",
+    "frameKeys": [
+      "protocol",
+      "phase",
+      "error",
+      "counters",
+      "saturated",
+      "unknown"
+    ],
+    "maxEncodedBytesIncludingNewline": 1024,
+    "phaseEnums": [
+      "ROW_READ",
+      "PACKAGE_LOOKUP",
+      "PACKAGE_ACQUIRE",
+      "PACKAGE_REUSE",
+      "SERIALIZE",
+      "WRITE",
+      "UNKNOWN"
+    ],
+    "errorEnums": [
+      "PREDICATE_REFUSED",
+      "ALLOCATION",
+      "SERIALIZATION",
+      "OTHER",
+      "UNKNOWN"
+    ],
+    "counterKeys": [
+      "heldInputs",
+      "uniquePackages",
+      "cacheRawBytes",
+      "cacheLogicalBytes",
+      "rows",
+      "closureBytes"
+    ],
+    "counterType": "null until observed; exact builtin nonnegative int saturated at2147483647; bool forbidden",
+    "flagTypes": "saturated and unknown exact booleans",
+    "serializationContext": "SERIALIZATION only at SERIALIZE; exact TypeError/ValueError/OverflowError",
+    "originalPredicateRecognition": "Exact inert RuntimeError and BaseException.args descriptor equals singleton PRODUCTION_OWNER_REFUSED, no arbitrary errors/messages retained",
+    "window": "State initialized immediately before first runtime_closure; cleared only after it returns. Later calls untracked. Failure-only enclosing DEPENDENCY_INVENTORY/REFUSED; original exception and custody precedence unchanged.",
+    "bootstrap": "Known closed/context-consistent frames forwarded unchanged. Invalid companions replaced with null without replacing original refusal, original raw result pin remains separately retained. Companion validity is never qualification acceptance.",
+    "noAdditionalReadsHashesCustodyOperations": true,
+    "passiveFailurePolicy": "All tracker/classifier/validation failures contained. No error object, args, path, package, environment, stream or raw payload retained."
+  },
+  "packageMetadataReuse": {
+    "scope": "nearest positive package metadata only, one owner lifetime across three runtime_closure calls; no negative/shared/reset cache",
+    "baselineSites": "First closure402, later calls460/463 in immutable7dc6 owner; corrected research line erratum. Successor line numbers differ.",
+    "acquisition": "existing input_fd registers genuine FD/raw/pin/full initial identity in held before cache allocation/JSON parsing; pin equals selected/source authority",
+    "key": "exact contained canonical project-relative path, no alias/symlink resolution substitution; encoded length<=4096; distinct cache keys cannot share retained dev/ino",
+    "hit": "original absolute deadline/sticky interruption; canonical identity and known pin plus exact full FD/path shape; no reopen/refresh",
+    "form": "every call preserves nearest ancestor search and json_value(raw,SOURCE_LIMIT).get(type) expression",
+    "ownership": "held solely owns all genuine package FDs; cache borrows; final held recheck and one checked close; uncertainty sticky UNKNOWN_HOLD, no numeric retry",
+    "heldCap": 4096,
+    "uniqueCount": "available global held capacity only",
+    "rawCapBytes": 1048576,
+    "logicalCapBytes": 8388608,
+    "reservationBytes": 1048576,
+    "entryLogicalCharge": "raw length+256+4*encoded canonical key length, before retention; same remaining global logical ledger including existing1MiB reservation; bounded map/string/raw representation, not measured RSS",
+    "meter": "Every actual miss read/hash including rejected attempt fully charged; hits reuse already verified raw bytes without fictional charge/refund; all nonpackage/final reads and reserves unchanged",
+    "actualCauseProved": false,
+    "fullFitProved": false,
+    "trust": "sealed source-owned execution tree/retained stat identity; no hostile same-user writer guarantee; OS FD capacity and rglob internal storage remain unqualified",
+    "newConservativeGuards": "Cache raw/logical/alias/known-authority guard may refuse; no cap expansion, skipped inventory or equivalent-full-inventory claim"
+  }
+}

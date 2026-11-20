@@ -1,0 +1,2467 @@
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/README.md
+@@ -0,0 +1,11 @@
++# Eight-case owned descriptor qualification — SOURCE ONLY
++
++This is a private successor to the exact currently published four-case qualification. New inputs are exact corrected negative-controls V2 bytes; its V1 HOLD (NC1 incompatible channel-layout tag) is pinned and superseded only by the distinct V2 type tag. All future source review, publication and native execution remain separate. No tests/imports/build/native action occurred here. Head75c's consumed four-case actual result remains its original bounded scope; it supplies no passing prefix for these eight cases.
++
++Owner changes are limited to the exact new fixture protocol, six additional stage literals, eight ordered names, TRUNCATED_RIGHTS success stage and the conservative source hash multiplier4→8. Loader changes are only exact fixture/facade SHA literals. Acquisition/scan/ordinary sender are unchanged in the native component; finite test-only negative API and V2 tag are declared by that component.
++
++The same40s fixture,10s cleanup,150s inner total,1GiB selected+child hash cap and all stream/tool/header/archive/dependency caps remain. The source map now has eight Node processes: fixture, five direct targets, nested owner, nested target. Node image is hashed once, verified source set conservatively eight times and addon twice; overflow refuses. The old1024-byte canonical parser remains stricter than the component2048 upper ceiling. Result fields/protocol of the owner remain fixed; embedded fixture protocol/case/stage is deliberately new. UNKNOWN_HOLD remains nonterminal with retained originals; never restart authority.
++
++launch/entry/header/libc and metadata/custody helpers stay byte-identical. The actual seven ChildProcess children follow their original EOF/pipe lifecycle; the six external Python-owned stage originals remain retained WNOWAIT/reaped/EOF with no post-reap signal or global absence claim. Public source entry/platform/tool/library trust is unchanged. Selected-M preprocessing dependencies do not certify compiler frontend/assembler/linker/specs/startup/runtime distribution. Future same-job metadata/header/libc/source/artifact checks remain required.
++
++Admission template stays executionAdmitted=false and null future source/head/run/tool/output bindings. No production/provider credentials, recovery, Darwin idle policy, fleet/release/deploy approval is included. Private streams are exact<slot>.stdout/.stderr, never artifact wildcards. The only public transport file is result.json.
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/admission-template.json
+@@ -0,0 +1,20 @@
++{
++  "context": {
++    "base": "b4ead192326ba607558cd3bb7687209cbb7c8165",
++    "head": null,
++    "job": "linux-owned-descriptor-qualification",
++    "repository": "typicalday/owenloop",
++    "runAttempt": null,
++    "runId": null
++  },
++  "executionAdmitted": false,
++  "outputName": null,
++  "outputParent": null,
++  "protocol": "jev-owned-pair-qualification-admission-v1",
++  "scope": "HARMLESS_OWNED_PAIR_ONLY",
++  "sourceManifestSha256": null,
++  "tools": {
++    "cc": null,
++    "node": null
++  }
++}
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/dependencies/metadata.mjs
+@@ -0,0 +1,156 @@
++import fs from 'node:fs';
++import os from 'node:os';
++import crypto from 'node:crypto';
++import { fileURLToPath } from 'node:url';
++
++export const INPUT_CAP = 65536;
++export const TOOL_CAP = 512 * 1024 * 1024;
++export const TOTAL_CAP = 1024 * 1024 * 1024;
++export const OUTPUT_CAP = 65536;
++const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
++export function need(value) { if (!value) throw new Error('METADATA_REFUSED'); }
++export function safeInteger(text) {
++  need(typeof text === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(text));
++  const n = Number(text); need(Number.isSafeInteger(n)); return n;
++}
++export function statusProjection(text) {
++  need(typeof text === 'string' && Buffer.byteLength(text) <= INPUT_CAP);
++  const rows = new Map();
++  for (const line of text.split('\n')) {
++    const match = /^([A-Za-z_]+):\s*(.*)$/.exec(line);
++    if (!match) continue;
++    need(!rows.has(match[1])); rows.set(match[1], match[2]);
++  }
++  const ids = key => {
++    need(rows.has(key));
++    const values = rows.get(key).trim().split(/\s+/).map(safeInteger);
++    need(values.length === 4);
++    return { fourEqual: values.every(v => v === values[0]), allNonzero: values.every(v => v > 0) };
++  };
++  need(rows.has('Groups'));
++  const groups = rows.get('Groups').trim();
++  const gs = groups === '' ? [] : groups.split(/\s+/).map(safeInteger);
++  need(gs.length <= 64 && new Set(gs).size === gs.length);
++  const capabilities = {};
++  for (const [key, label] of [['CapInh','inheritable'],['CapPrm','permitted'],['CapEff','effective'],['CapBnd','bounding'],['CapAmb','ambient']]) {
++    const value = rows.get(key); need(typeof value === 'string' && /^[0-9a-fA-F]{16}$/.test(value));
++    capabilities[label] = BigInt(`0x${value}`) === 0n ? 'ZERO' : 'NONZERO';
++  }
++  const nnp = rows.get('NoNewPrivs'); need(nnp === '0' || nnp === '1');
++  const seccomp = rows.get('Seccomp'); need(['0','1','2'].includes(seccomp));
++  return { uid: ids('Uid'), gid: ids('Gid'), supplementaryGroupCount: gs.length,
++    supplementaryGroupSetSha256: digest(Buffer.from(gs.slice().sort((a,b)=>a-b).join(','))),
++    capabilities, noNewPrivileges: nnp === '1', seccomp: ['DISABLED','STRICT','FILTER'][Number(seccomp)] };
++}
++export function namespaceProjection(kind, first, second) {
++  need(['pid','mnt','user'].includes(kind));
++  need(typeof first === 'string' && first.length <= 128 && first === second);
++  need(new RegExp(`^${kind}:\\[[0-9]{1,20}\\]$`).test(first));
++  return { kind, identitySha256: digest(Buffer.from(first)), stableAcrossTwoReads: true };
++}
++export function mountProjection(text) {
++  need(typeof text === 'string' && Buffer.byteLength(text) <= INPUT_CAP);
++  const lines = text.trimEnd().split('\n'); need(lines.length > 0 && lines.length <= 2048);
++  const matches = [];
++  for (const line of lines) {
++    const sides = line.split(' - '); need(sides.length === 2);
++    const left = sides[0].split(' '), right = sides[1].split(' ');
++    need(left.length >= 6 && right.length >= 3);
++    if (left[4] === '/proc') {
++      need(right[0] === 'proc');
++      const opts = [...left[5].split(','), ...right[2].split(',')];
++      const hide = opts.filter(x => x.startsWith('hidepid='));
++      const subset = opts.filter(x => x.startsWith('subset='));
++      need(hide.length <= 1 && (hide.length === 0 || ['hidepid=0','hidepid=1','hidepid=2','hidepid=4'].includes(hide[0])));
++      need(subset.length <= 1 && (subset.length === 0 || subset[0] === 'subset=pid'));
++      matches.push({ filesystem: 'PROCFS', hidepid: hide.length ? hide[0].slice(8) : 'NOT_DECLARED',
++        subset: subset.length ? 'PID' : 'NOT_DECLARED',
++        readOnly: opts.includes('ro'), optionsSha256: digest(Buffer.from(opts.slice().sort().join(','))) });
++    }
++  }
++  need(matches.length === 1); return matches[0];
++}
++export function validateContext(env) {
++  need(env.JEV_REPOSITORY === 'typicalday/owenloop' && env.JEV_PR === '369');
++  need(env.JEV_BRANCH === 'jev-routing-foundation-20261008' && env.JEV_EVENT === 'pull_request');
++  need(env.JEV_ACTION === 'synchronize');
++  need(env.JEV_HEAD_REPOSITORY === 'typicalday/owenloop');
++  need(env.JEV_BASE === 'b4ead192326ba607558cd3bb7687209cbb7c8165');
++  need(/^[1-9][0-9]{0,19}$/.test(env.JEV_RUN_ID || '') && /^[1-9][0-9]{0,5}$/.test(env.JEV_RUN_ATTEMPT || ''));
++  need(env.JEV_JOB === 'linux-metadata-preflight');
++  need(/^[a-f0-9]{40}$/.test(env.JEV_HEAD || '') && env.JEV_HEAD === env.JEV_ADMITTED_HEAD);
++  return { repository: 'typicalday/owenloop', pullRequest: 369, headSha256: digest(Buffer.from(env.JEV_HEAD)),
++    baseSha256: digest(Buffer.from(env.JEV_BASE)), runId: env.JEV_RUN_ID, runAttempt: env.JEV_RUN_ATTEMPT,
++    job: 'linux-metadata-preflight', sameRepositoryHeadGate: true, admissionKind: 'MUTABLE_ROOT_SCHEDULING_CONTROL' };
++}
++function deadlineCheck(deadline) { need(Number.isFinite(deadline) && performance.now() <= deadline); }
++function boundedInput(path, deadline) {
++  deadlineCheck(deadline);
++  const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
++  try {
++    const a = fs.fstatSync(fd), chunks = []; let count = 0;
++    while (true) {
++      deadlineCheck(deadline); const buffer = Buffer.alloc(8192), n = fs.readSync(fd, buffer);
++      if (!n) break; count += n; need(count <= INPUT_CAP); chunks.push(buffer.subarray(0,n));
++    }
++    const b = fs.fstatSync(fd); need(a.dev === b.dev && a.ino === b.ino && a.mode === b.mode);
++    const bytes = Buffer.concat(chunks); return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
++  } finally { fs.closeSync(fd); }
++}
++function fileHash(path, cap, budget, deadline) {
++  deadlineCheck(deadline); need(budget.files < 64); budget.files++;
++  const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
++  try {
++    const a = fs.fstatSync(fd, { bigint: true }); need(a.isFile() && a.size >= 0n && a.size <= BigInt(cap));
++    const hash = crypto.createHash('sha256'); let total = 0;
++    while (true) {
++      deadlineCheck(deadline); const buffer = Buffer.alloc(65536), n = fs.readSync(fd, buffer);
++      if (!n) break; total += n; budget.bytes += n; need(total <= cap && budget.bytes <= TOTAL_CAP); hash.update(buffer.subarray(0,n));
++    }
++    const b = fs.fstatSync(fd, { bigint: true });
++    for (const key of ['dev','ino','uid','gid','mode','size','nlink','mtimeNs','ctimeNs']) need(a[key] === b[key]);
++    const finalPath = fs.lstatSync(path, { bigint: true });
++    for (const key of ['dev','ino','uid','gid','mode','size','nlink','mtimeNs','ctimeNs']) need(b[key] === finalPath[key]);
++    need(BigInt(total) === b.size); return { sha256: hash.digest('hex'), bytes: total };
++  } finally { fs.closeSync(fd); }
++}
++export function canonicalResult(result) {
++  const text = JSON.stringify(result) + '\n'; need(Buffer.byteLength(text) <= OUTPUT_CAP); return text;
++}
++export function kernelProjection(release) {
++  need(typeof release === 'string' && Buffer.byteLength(release) <= 256 && !release.includes('\0'));
++  const match = /^([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})(?:[-+.][A-Za-z0-9.+_-]{1,128})?$/.exec(release);
++  need(match !== null);
++  return { releaseSha256: digest(Buffer.from(release)), releaseBytes: Buffer.byteLength(release),
++    numericVersion: match.slice(1,4).map(safeInteger), exactVersionRetained: false };
++}
++function collect() {
++  const deadline = performance.now() + 50000, budget = { files: 0, bytes: 0 };
++  const context = validateContext(process.env);
++  need(process.platform === 'linux' && process.version === 'v22.23.0');
++  need(['x64','arm64'].includes(process.arch) && process.versions.napi === '10');
++  const kernel = kernelProjection(os.release());
++  const status = statusProjection(boundedInput('/proc/self/status', deadline));
++  const mount = mountProjection(boundedInput('/proc/self/mountinfo', deadline));
++  need(fs.statfsSync('/proc/self', { bigint: true }).type === 0x9fa0n);
++  mount.ownPathFilesystemVerified = true;
++  const namespaces = ['pid','mnt','user'].map(kind => namespaceProjection(kind,
++    fs.readlinkSync(`/proc/self/ns/${kind}`), fs.readlinkSync(`/proc/self/ns/${kind}`)));
++  const node = fileHash(process.execPath, TOOL_CAP, budget, deadline);
++  const sources = ['metadata.mjs','owner.py','protocol.json'].map(name => ({ slot: name,
++    ...fileHash(new URL(name, import.meta.url), INPUT_CAP, budget, deadline) }));
++  deadlineCheck(deadline);
++  return { protocol: 'jev-linux-own-process-metadata-v2', status: 'METADATA_COMPLETE', context,
++    platform: 'LINUX', architecture: process.arch === 'x64' ? 'X86_64' : 'ARM64',
++    kernel,
++    ownProcess: status, procfs: mount, namespaces,
++    node: { version: '22.23.0', napi: 10, ...node, provenance: 'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION' },
++    sources, hashBudget: { selectedFiles: budget.files, totalBytes: budget.bytes },
++    platformCredentials: 'ACTIONS_PLATFORM_CREDENTIALS_NOT_ABSENT', compilerQualified: false,
++    targetAccessQualified: false, threadEnumerationQualified: false, nativeQualified: false,
++    runtimeAccepted: false, laterObserverMustRemeasure: true, continuousCoverageClaimed: false };
++}
++if (process.argv[1] === fileURLToPath(import.meta.url)) {
++  try { process.stdout.write(canonicalResult(collect())); }
++  catch { process.stderr.write('LINUX_METADATA_REFUSED\n'); process.exitCode = 2; }
++}
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/dependencies/owner.py
+@@ -0,0 +1,361 @@
++import hashlib
++import json
++import os
++from pathlib import Path
++import signal
++import selectors
++import stat
++import subprocess
++import sys
++import time
++
++CAP = 65536
++CAP_SECONDS = 60
++CLEANUP_SECONDS = 10
++
++def need(value):
++    if not value:
++        raise RuntimeError('PREFLIGHT_REFUSED')
++
++def context(env):
++    expected = {'JEV_REPOSITORY': 'typicalday/owenloop', 'JEV_PR': '369',
++                'JEV_BRANCH': 'jev-routing-foundation-20261008', 'JEV_EVENT': 'pull_request', 'JEV_ACTION': 'synchronize',
++                'JEV_HEAD_REPOSITORY': 'typicalday/owenloop',
++                'JEV_BASE': 'b4ead192326ba607558cd3bb7687209cbb7c8165', 'JEV_JOB': 'linux-metadata-preflight'}
++    need(all(env.get(k) == v for k, v in expected.items()))
++    head = env.get('JEV_HEAD', '')
++    need(len(head) == 40 and all(c in '0123456789abcdef' for c in head))
++    need(head == env.get('JEV_ADMITTED_HEAD'))
++    need(env.get('JEV_RUN_ID','').isascii() and env.get('JEV_RUN_ID','').isdigit() and 1 <= len(env['JEV_RUN_ID']) <= 20 and not env['JEV_RUN_ID'].startswith('0'))
++    need(env.get('JEV_RUN_ATTEMPT','').isascii() and env.get('JEV_RUN_ATTEMPT','').isdigit() and 1 <= len(env['JEV_RUN_ATTEMPT']) <= 6 and not env['JEV_RUN_ATTEMPT'].startswith('0'))
++    for k in ('OWNER','METADATA','PROTOCOL'):
++        v=env.get('JEV_EXPECTED_'+k+'_SHA','')
++        need(len(v)==64 and all(c in '0123456789abcdef' for c in v))
++    return {**expected, 'JEV_HEAD':head, 'JEV_ADMITTED_HEAD':head, 'JEV_RUN_ID':env['JEV_RUN_ID'], 'JEV_RUN_ATTEMPT':env['JEV_RUN_ATTEMPT']}
++
++def decode(stdout, stderr, returncode):
++    need(returncode == 0 and stderr == b'' and 0 < len(stdout) <= CAP)
++    text = stdout.decode('utf-8', errors='strict')
++    need(text.endswith('\n') and not text.endswith('\n\n'))
++    def pairs(rows):
++        d = {}
++        for k, v in rows:
++            need(k not in d); d[k] = v
++        return d
++    value = json.loads(text, object_pairs_hook=pairs, parse_constant=lambda _: need(False))
++    need(type(value) is dict and value.get('protocol') == 'jev-linux-own-process-metadata-v2')
++    need(value.get('status') == 'METADATA_COMPLETE')
++    need(json.dumps(value, ensure_ascii=False, separators=(',', ':')) + '\n' == text)
++    def keys(v, names):
++        need(type(v) is dict and set(v) == set(names))
++    def boolean(v):
++        need(type(v) is bool)
++    def integer(v, maximum):
++        need(type(v) is int and 0 <= v <= maximum)
++    def sha(v):
++        need(type(v) is str and len(v) == 64 and all(c in '0123456789abcdef' for c in v))
++    def pin(v, maximum):
++        keys(v, ['sha256','bytes']); sha(v['sha256']); integer(v['bytes'], maximum)
++    keys(value, ['protocol','status','context','platform','architecture','kernel','ownProcess','procfs','namespaces',
++        'node','sources','hashBudget','platformCredentials','compilerQualified','targetAccessQualified',
++        'threadEnumerationQualified','nativeQualified','runtimeAccepted','laterObserverMustRemeasure','continuousCoverageClaimed'])
++    c = value['context']; keys(c, ['repository','pullRequest','headSha256','baseSha256','runId','runAttempt','job','sameRepositoryHeadGate','admissionKind'])
++    need(c['repository'] == 'typicalday/owenloop' and type(c['pullRequest']) is int and c['pullRequest'] == 369)
++    sha(c['headSha256']); sha(c['baseSha256']); need(c['job']=='linux-metadata-preflight')
++    for k,cap in [('runId',20),('runAttempt',6)]: need(type(c[k]) is str and c[k].isascii() and c[k].isdigit() and 1<=len(c[k])<=cap and not c[k].startswith('0'))
++    need(c['sameRepositoryHeadGate'] is True and c['admissionKind'] == 'MUTABLE_ROOT_SCHEDULING_CONTROL')
++    need(value['platform'] == 'LINUX' and value['architecture'] in ('X86_64','ARM64'))
++    k = value['kernel']; keys(k, ['releaseSha256','releaseBytes','numericVersion','exactVersionRetained'])
++    sha(k['releaseSha256']); integer(k['releaseBytes'], 256); need(k['releaseBytes'] > 0 and k['exactVersionRetained'] is False)
++    need(type(k['numericVersion']) is list and len(k['numericVersion']) == 3)
++    for v in k['numericVersion']: integer(v,99999)
++    p = value['ownProcess']; keys(p, ['uid','gid','supplementaryGroupCount','supplementaryGroupSetSha256','capabilities','noNewPrivileges','seccomp'])
++    for label in ('uid','gid'):
++        keys(p[label], ['fourEqual','allNonzero'])
++        for b in p[label].values(): boolean(b)
++    integer(p['supplementaryGroupCount'],64); sha(p['supplementaryGroupSetSha256'])
++    keys(p['capabilities'], ['inheritable','permitted','effective','bounding','ambient'])
++    need(all(v in ('ZERO','NONZERO') for v in p['capabilities'].values()))
++    boolean(p['noNewPrivileges']); need(p['seccomp'] in ('DISABLED','STRICT','FILTER'))
++    f = value['procfs']; keys(f, ['filesystem','hidepid','subset','readOnly','optionsSha256','ownPathFilesystemVerified'])
++    need(f['filesystem'] == 'PROCFS' and f['hidepid'] in ('NOT_DECLARED','0','1','2','4'))
++    boolean(f['readOnly']); sha(f['optionsSha256']); need(f['subset'] in ('PID','NOT_DECLARED') and f['ownPathFilesystemVerified'] is True)
++    need(type(value['namespaces']) is list and len(value['namespaces']) == 3)
++    for n, label in zip(value['namespaces'], ('pid','mnt','user')):
++        keys(n, ['kind','identitySha256','stableAcrossTwoReads'])
++        need(n['kind'] == label and n['stableAcrossTwoReads'] is True); sha(n['identitySha256'])
++    n = value['node']; keys(n, ['version','napi','sha256','bytes','provenance'])
++    need(n['version'] == '22.23.0' and type(n['napi']) is int and n['napi'] == 10)
++    sha(n['sha256']); integer(n['bytes'],512*1024*1024)
++    need(n['provenance'] == 'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION')
++    need(type(value['sources']) is list and len(value['sources']) == 3)
++    for s, label in zip(value['sources'], ('metadata.mjs','owner.py','protocol.json')):
++        keys(s, ['slot','sha256','bytes']); need(s['slot'] == label)
++        pin({'sha256':s['sha256'],'bytes':s['bytes']},CAP)
++    keys(value['hashBudget'], ['selectedFiles','totalBytes'])
++    integer(value['hashBudget']['selectedFiles'],64); integer(value['hashBudget']['totalBytes'],1024*1024*1024)
++    need(value['hashBudget']['selectedFiles'] == 4)
++    need(value['hashBudget']['totalBytes'] == n['bytes'] + sum(s['bytes'] for s in value['sources']))
++    need(value['platformCredentials'] == 'ACTIONS_PLATFORM_CREDENTIALS_NOT_ABSENT')
++    for k in ['nativeQualified','runtimeAccepted','targetAccessQualified','threadEnumerationQualified','compilerQualified','continuousCoverageClaimed']:
++        need(value.get(k) is False)
++    need(value.get('laterObserverMustRemeasure') is True)
++    return value
++
++def tool_hash(path, deadline, previous_bytes, cap=512*1024*1024):
++    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
++    try:
++        a = os.fstat(fd)
++        need(stat.S_ISREG(a.st_mode) and 0 <= a.st_size <= cap)
++        h = hashlib.sha256(); count = 0
++        while True:
++            need(time.monotonic() <= deadline)
++            raw = os.read(fd, 65536)
++            if not raw:
++                break
++            count += len(raw)
++            need(count <= cap and previous_bytes + count <= 1024 * 1024 * 1024)
++            h.update(raw)
++        b = os.fstat(fd)
++        final_path=os.stat(path,follow_symlinks=False)
++        for k in ('st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_nlink','st_mtime_ns','st_ctime_ns'):
++            need(getattr(a,k) == getattr(b,k) == getattr(final_path,k))
++        need(count == a.st_size)
++        return {'sha256': h.hexdigest(), 'bytes': count,
++                'provenance': 'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION'}
++    finally:
++        os.close(fd)
++
++def save(path, value):
++    raw = (json.dumps(value, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
++    need(len(raw) <= CAP)
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++    try:
++        with os.fdopen(fd, 'wb') as stream:
++            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
++    except BaseException:
++        raise
++
++class OriginalCustody:
++    def __init__(self, proc, ops=os):
++        self.proc=proc; self.ops=ops; self.pgid=proc.pid
++        self.reap_attempted=False; self.reaped=False; self.uncertain=False; self.signals=0
++
++    def observe(self):
++        if self.reap_attempted:
++            return 'REAPED' if self.reaped else 'UNKNOWN'
++        try:
++            r=self.ops.waitid(self.ops.P_PID,self.proc.pid,self.ops.WEXITED|self.ops.WNOHANG|self.ops.WNOWAIT)
++            if r is None:
++                return 'LIVE'
++            if r.si_pid==self.proc.pid and r.si_code in (self.ops.CLD_EXITED,self.ops.CLD_KILLED,self.ops.CLD_DUMPED):
++                return 'TERMINAL_UNREAPED'
++        except BaseException:
++            pass
++        self.uncertain=True
++        return 'UNKNOWN'
++
++    def send(self, sig):
++        # A Popen value alone is never post-reap numeric authority.
++        need(not self.reap_attempted and not self.uncertain)
++        need(self.observe() in ('LIVE','TERMINAL_UNREAPED') and not self.uncertain)
++        try:
++            need(self.ops.getpgid(self.proc.pid)==self.pgid)
++            self.ops.killpg(self.pgid,sig); self.signals+=1
++        except BaseException:
++            self.uncertain=True
++            raise RuntimeError('PREFLIGHT_REFUSED')
++
++    def finalize(self, eof):
++        need(eof and self.observe()=='TERMINAL_UNREAPED')
++        self.reap_attempted=True  # Disables all signals, including failed/uncertain wait.
++        code=self.proc.wait()
++        self.reaped=True
++        return code
++
++def append_capped(buffer, raw, cap=CAP):
++    room=max(0,cap-len(buffer))
++    buffer.extend(raw[:room])
++    return len(raw)>room
++
++def checkout_binding(head_raw, tree_raw, status_raw, admitted):
++    need(head_raw==admitted.encode()+b'\n' and status_raw==b'')
++    tree=tree_raw.decode('ascii',errors='strict').removesuffix('\n')
++    need(tree_raw==tree.encode()+b'\n' and len(tree)==40 and all(c in '0123456789abcdef' for c in tree))
++    return {'head':admitted,'tree':tree,'clean':True,'treeKind':'GIT_OBSERVATION_ROOT_COMPARISON_REQUIRED'}
++
++def source_binding(actual, expected):
++    need(set(actual)==set(expected) and all(actual[k]['sha256']==expected[k] for k in expected))
++
++def command_result(stdout,stderr,code):
++    need(code==0 and stderr==b'')
++    return stdout
++
++class PipeChannel:
++    def __init__(self,proc,outdir,slot):
++        self.proc=proc; self.outdir=outdir; self.slot=slot
++        self.buffers={'stdout':bytearray(),'stderr':bytearray()}
++        self.selector=None; self.fds={}; self.opened=False
++    def open(self):
++        self.selector=selectors.DefaultSelector()
++        for name,stream in [('stdout',self.proc.stdout),('stderr',self.proc.stderr)]:
++            os.set_blocking(stream.fileno(),False)
++        for name,stream in [('stdout',self.proc.stdout),('stderr',self.proc.stderr)]:
++            self.selector.register(stream,selectors.EVENT_READ,name)
++        self.opened=True
++        for name in ('stdout','stderr'):
++            self.fds[name]=os.open(self.outdir/(self.slot+'.'+name),os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
++    def eof(self):
++        return self.selector is not None and self.opened and not self.selector.get_map()
++    def pump(self,seconds,persist=True):
++        need(self.opened)
++        overflow=False
++        for key,_ in self.selector.select(seconds):
++            try: raw=os.read(key.fd,8192)
++            except BlockingIOError: continue
++            if not raw:
++                self.selector.unregister(key.fileobj); continue
++            name=key.data; overflow=append_capped(self.buffers[name],raw) or overflow
++            if persist:
++                fd=self.fds[name]; os.lseek(fd,0,0)
++                rawout=memoryview(self.buffers[name])
++                while rawout:
++                    written=os.write(fd,rawout); need(written>0); rawout=rawout[written:]
++                os.ftruncate(fd,len(self.buffers[name]))
++        return overflow
++    def output(self):
++        return bytes(self.buffers['stdout']),bytes(self.buffers['stderr'])
++    def close(self):
++        if self.selector is not None: self.selector.close()
++        for stream in (self.proc.stdout,self.proc.stderr): stream.close()
++        for fd in self.fds.values(): os.close(fd)
++
++def drive_original(c,channel,deadline,interrupted,retain_unknown,clock=time):
++    # Shared pure-test boundary: original/syscalls, pipe channel and clock injectable.
++    try:
++        channel.open()
++        need(c.ops.getpgid(c.proc.pid)==c.pgid)
++        while True:
++            need(not interrupted[0] and clock.monotonic()<=deadline)
++            state=c.observe(); need(state!='UNKNOWN')
++            need(not channel.pump(0.02))
++            if state=='TERMINAL_UNREAPED' and channel.eof(): break
++        code=c.finalize(True)
++        need(not interrupted[0] and clock.monotonic()<=deadline)
++        stdout,stderr=channel.output()
++        return stdout,stderr,code
++    except BaseException:
++        end=clock.monotonic()+CLEANUP_SECONDS; sent_term=False; sent_kill=False
++        while clock.monotonic()<end:
++            state=c.observe()
++            if state=='REAPED': break
++            if not c.uncertain and not c.reap_attempted:
++                sig=None
++                if not sent_term: sig=signal.SIGTERM; sent_term=True
++                elif not sent_kill and clock.monotonic()>=end-5: sig=signal.SIGKILL; sent_kill=True
++                if sig is not None:
++                    try: c.send(sig)
++                    except BaseException: pass
++            try: channel.pump(0.02,False)
++            except BaseException: c.uncertain=True
++            if state=='TERMINAL_UNREAPED' and channel.eof():
++                try: c.finalize(True); break
++                except BaseException: c.uncertain=True
++        while not c.reaped:
++            try: retain_unknown()
++            except BaseException: pass
++            state=c.observe()
++            try: channel.pump(0.02,False)
++            except BaseException: pass
++            if state=='TERMINAL_UNREAPED' and channel.eof():
++                try: c.finalize(True)
++                except BaseException: pass
++            try: clock.sleep(0.1)
++            except BaseException: pass
++        raise RuntimeError('PREFLIGHT_REFUSED')
++
++def run_original(argv,cwd,env,outdir,slot,deadline,interrupted):
++    proc=subprocess.Popen(argv,cwd=cwd,env=env,stdin=subprocess.DEVNULL,
++        stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,close_fds=True)
++    c=OriginalCustody(proc)
++    channel=PipeChannel(proc,outdir,slot)
++    def retain_unknown():
++        save(outdir/'unknown-hold.json',{'protocol':'jev-linux-metadata-unknown-v2','status':'UNKNOWN_HOLD','runtimeAccepted':False})
++    try:
++        stdout,stderr,code=drive_original(c,channel,deadline,interrupted,retain_unknown)
++        return stdout,stderr,code,{'slot':slot,'directOriginalTerminal':True,'directOriginalReaped':True,
++            'ownedPipesEOF':True,'signalsSent':c.signals,'globalGroupAbsenceClaimed':False,'exitCode':code,
++            'stdoutBytes':len(stdout),'stdoutSha256':hashlib.sha256(stdout).hexdigest(),
++            'stderrBytes':len(stderr),'stderrSha256':hashlib.sha256(stderr).hexdigest()}
++    finally:
++        # drive_original never releases an unsettled or uncertain original.
++        channel.close()
++
++def main():
++    os.umask(0o077)
++    need(sys.platform=='linux' and len(sys.argv)==1)
++    need(all(hasattr(os,k) for k in ('waitid','WNOWAIT','WEXITED','WNOHANG','P_PID')))
++    ctx=context(os.environ)
++    root=Path(__file__).resolve().parent
++    need(root.name=='linux-metadata' and root.parent.name=='.dev')
++    checkout=root.parent.parent
++    tmp=Path(os.environ.get('RUNNER_TEMP','')); need(tmp.is_absolute() and tmp.is_dir() and not tmp.is_symlink())
++    outdir=tmp/'jev-linux-metadata-preflight-v2'; outdir.mkdir(mode=0o700)
++    output=outdir/'metadata-result.json'
++    node=Path(os.environ.get('JEV_NODE_EXECUTABLE','')); git=Path(os.environ.get('JEV_GIT_EXECUTABLE',''))
++    for path in (node,git): need(path.is_absolute() and stat.S_ISREG(path.lstat().st_mode))
++    interrupted=[False]
++    def interrupt(_s,_f): interrupted[0]=True
++    signal.signal(signal.SIGTERM,interrupt); signal.signal(signal.SIGINT,interrupt)
++    deadline=time.monotonic()+CAP_SECONDS; budget=0; tools={}; receipts=[]
++    env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','TZ':'UTC',**ctx}
++    git_env={**env,'GIT_OPTIONAL_LOCKS':'0','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null'}
++    try:
++        for label,path in [('node',node),('git',git),('python',Path(sys.executable).resolve())]:
++            tools[label]=tool_hash(path,deadline,budget); budget+=tools[label]['bytes']
++        expected={f:os.environ['JEV_EXPECTED_'+label+'_SHA'] for f,label in [('owner.py','OWNER'),('metadata.mjs','METADATA'),('protocol.json','PROTOCOL')]}
++        def sources():
++            nonlocal budget
++            result={}
++            for f in expected:
++                x=tool_hash(root/f,deadline,budget,CAP); budget+=x['bytes']; result[f]=x
++            return result
++        before=sources(); source_binding(before,expected)
++        args=[str(git),'-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null','-c','core.untrackedCache=false']
++        results=[]
++        for slot,cmd in [('git-head',['rev-parse','--verify','HEAD']),('git-tree',['rev-parse','--verify','HEAD^{tree}']),('git-clean',['status','--porcelain=v1','--untracked-files=all'])]:
++            stdout,stderr,code,receipt=run_original(args+cmd,checkout,git_env,outdir,slot,deadline,interrupted)
++            results.append(command_result(stdout,stderr,code)); receipts.append(receipt)
++        binding=checkout_binding(*results,ctx['JEV_HEAD'])
++        workflow=tool_hash(checkout/'.github/workflows/ci.yml',deadline,budget,CAP)
++        budget+=workflow['bytes']
++        stdout,stderr,code,receipt=run_original([str(node),str(root/'metadata.mjs')],root,env,outdir,'metadata',deadline,interrupted)
++        result=decode(stdout,stderr,code); receipts.append(receipt)
++        need(result['node']['sha256']==tools['node']['sha256'] and result['node']['bytes']==tools['node']['bytes'])
++        for s in result['sources']:
++            need(s['sha256']==before[s['slot']]['sha256'] and s['bytes']==before[s['slot']]['bytes'])
++        need(result['context']['headSha256']==hashlib.sha256(ctx['JEV_HEAD'].encode()).hexdigest())
++        need(result['context']['baseSha256']==hashlib.sha256(ctx['JEV_BASE'].encode()).hexdigest())
++        need(result['context']['runId']==ctx['JEV_RUN_ID'] and result['context']['runAttempt']==ctx['JEV_RUN_ATTEMPT'])
++        after=sources(); source_binding(after,expected); need(before==after)
++        budget+=result['hashBudget']['totalBytes']; need(budget<=1024*1024*1024)
++        need(not interrupted[0] and time.monotonic()<=deadline)
++        result['owner']={'protocol':'jev-linux-metadata-owner-v2','originals':receipts,'checkout':binding,
++            'workflow':workflow,'sourceEquality':True,'sourcePins':after,'tools':tools,
++            'runId':ctx['JEV_RUN_ID'],'runAttempt':ctx['JEV_RUN_ATTEMPT'],'job':'linux-metadata-preflight',
++            'globalGroupAbsenceClaimed':False,'hashBudget':{'selectedReads':14,'totalBytes':budget},
++            'deadlineReached':False,'interrupted':False,'platformRuntimeTrustRequired':True,
++            'stdoutSha256':hashlib.sha256(stdout).hexdigest(),'stdoutBytes':len(stdout),'stderrBytes':len(stderr)}
++        save(output,result)
++        need(not interrupted[0] and time.monotonic()<=deadline)
++        print('LINUX_METADATA_COMPLETE'); return 0
++    except BaseException:
++        try: save(output,{'protocol':'jev-linux-metadata-refusal-v2','status':'REFUSED','runtimeAccepted':False,'nativeQualified':False})
++        except BaseException: pass
++        print('LINUX_METADATA_OWNER_REFUSED',file=sys.stderr); return 2
++
++if __name__=='__main__':
++    try: raise SystemExit(main())
++    except Exception:
++        print('LINUX_METADATA_OWNER_REFUSED',file=sys.stderr)
++        raise SystemExit(2)
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/entry.mjs
+@@ -0,0 +1,3 @@
++import { runVerified } from './loader.mjs';
++try { await runVerified(import.meta.url); }
++catch { process.exitCode = 2; process.stderr.write('JEV_DESCRIPTOR_ENTRY_REFUSED\n'); }
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/headers.py
+@@ -0,0 +1,49 @@
++import hashlib
++import io
++import json
++import os
++from pathlib import Path
++import sys
++import tarfile
++import time
++import urllib.request
++SHA='ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69'
++def need(v):
++    if not v:raise RuntimeError('HEADER_REFUSED')
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self,*args):raise RuntimeError('HEADER_REFUSED')
++def main():
++    need(len(sys.argv)==2);out=Path(sys.argv[1]);need(out.is_dir() and not out.is_symlink())
++    deadline=time.monotonic()+20;raw=bytearray()
++    opener=urllib.request.build_opener(NoRedirect)
++    with opener.open('https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz',timeout=10) as response:
++        need(response.status==200)
++        while True:
++            need(time.monotonic()<deadline);b=response.read(65536)
++            if not b:break
++            raw.extend(b);need(len(raw)<=16*1024*1024)
++    need(hashlib.sha256(raw).hexdigest()==SHA)
++    wanted={'node_api.h','node_api_types.h','js_native_api.h','js_native_api_types.h'};found={};count=0;total=0
++    with tarfile.open(fileobj=io.BytesIO(raw),mode='r:gz') as archive:
++        for item in archive:
++            need(time.monotonic()<deadline);count+=1;total+=item.size
++            need(count<=8192 and 0<=item.size<=16*1024*1024 and total<=128*1024*1024)
++            prefix='node-v22.23.0/include/node/'
++            name=item.name[len(prefix):] if item.name.startswith(prefix) else ''
++            if name not in wanted:continue
++            need(name not in found and item.isfile() and item.size<=65536)
++            with archive.extractfile(item) as f:b=f.read(65537)
++            need(len(b)==item.size)
++            fd=os.open(out/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
++            try:
++                view=memoryview(b)
++                while view:
++                    n=os.write(fd,view);need(n>0);view=view[n:]
++                os.fsync(fd)
++            finally:os.close(fd)
++            found[name]={'sha256':hashlib.sha256(b).hexdigest(),'bytes':len(b)}
++    need(set(found)==wanted and time.monotonic()<deadline)
++    print(json.dumps({'protocol':'jev-owned-pair-headers-v1','archiveSha256':SHA,'archiveBytes':len(raw),'selected':found},separators=(',',':')))
++if __name__=='__main__':
++    try:main()
++    except BaseException:print('JEV_HEADERS_REFUSED',file=sys.stderr);raise SystemExit(2)
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/descriptor.c
+@@ -0,0 +1,811 @@
++#define _GNU_SOURCE
++#include <node_api.h>
++#include <features.h>
++#include <poll.h>
++#include <signal.h>
++#include <sys/socket.h>
++#include <sys/wait.h>
++#if defined(__linux__) && defined(__GLIBC__)
++#if __GLIBC_PREREQ(2,36)
++#include <sys/pidfd.h>
++#define PUBLIC_PIDFD 1
++#endif
++#endif
++#ifndef PUBLIC_PIDFD
++#define PUBLIC_PIDFD 0
++#endif
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/statfs.h>
++#include <time.h>
++#include <unistd.h>
++#define CAP 128
++#define READ_CAP 16384
++#define TOTAL_CAP (8U*1024U*1024U)
++#define PROC_MAGIC 0x9fa0
++typedef struct {
++    int fd;
++    int pidfd;
++    int owner_pidfd;
++    pid_t parent_pid;
++    pid_t pid;
++    uid_t uid;
++    struct stat identity;
++}
++handle;
++static const napi_type_tag BRAND={
++    0x6208c81331da7545ULL,0x9c23bdf2a0098107ULL
++};
++typedef struct {
++    uint64_t pid,ppid,pgid,start,count,tgid,uid;
++    char state;
++}
++row;
++typedef struct {
++    double end;
++    size_t bytes;
++    const char *refusal;
++}
++budget;
++static double now(void) {
++    struct timespec t;
++    if(clock_gettime(CLOCK_MONOTONIC,&t))return -1;
++    return t.tv_sec+t.tv_nsec/1e9;
++}
++static int bound(budget *b) {
++    double t=now();
++    if(t<0||t>=b->end){
++        if(!b->refusal||strcmp(b->refusal,"CLEANUP"))b->refusal="DEADLINE";
++        return 0;
++    }
++    return 1;
++}
++static int fail(budget *b,const char *code) {
++    /* Once a close is uncertain, no enclosing classification may erase it. */
++    if(!b->refusal||strcmp(b->refusal,"CLEANUP"))b->refusal=code;
++    return 0;
++}
++static napi_value refused(napi_env env,const char *code) {
++    napi_throw_error(env,code,code);
++    return NULL;
++}
++static int same(struct stat a,struct stat b) {
++    return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_uid==b.st_uid&&a.st_mode==b.st_mode;
++}
++static int number(const char *s,uint64_t *v) {
++    if(!s||!*s||(*s=='0'&&s[1]))return 0;
++    uint64_t n=0;
++    for(;*s;s++){
++        if(*s<'0'||*s>'9'||n>(UINT64_MAX-(unsigned)(*s-'0'))/10)return 0;
++        n=n*10+(unsigned)(*s-'0');
++    }
++    *v=n;
++    return 1;
++}
++static int input(int dir,const char *name,char *buf,size_t cap,budget *b) {
++    if(!bound(b))return 0;
++    int fd=openat(dir,name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
++    if(fd<0)return fail(b,"ACCESS");
++    size_t n=0;
++    int ok=1;
++    struct stat a,z;
++    if(fstat(fd,&a)||!S_ISREG(a.st_mode))ok=fail(b,"SHAPE");
++    while(ok){
++        if(!bound(b)){
++            ok=0;
++            break;
++        }
++        ssize_t k=read(fd,buf+n,cap-n);
++        if(k<0){
++            ok=fail(b,"ACCESS");
++            break;
++        }
++        if(!k)break;
++        n+=(size_t)k;
++        b->bytes+=(size_t)k;
++        if(n==cap||b->bytes>TOTAL_CAP){
++            ok=fail(b,"CAP");
++            break;
++        }
++    }
++    if(ok&&(fstat(fd,&z)||!same(a,z)))ok=fail(b,"IDENTITY");
++    if(close(fd))ok=fail(b,"CLEANUP");
++    if(!ok)return 0;
++    if(!n||buf[n-1]!='\n'||memchr(buf,0,n))return fail(b,"SHAPE");
++    buf[n]=0;
++    return 1;
++}
++static int statrow(char *buf,row *r,budget *b) {
++    char *open=strchr(buf,'('),*close=strrchr(buf,')');
++    if(!open||!close||close<open||close[1]!=' ')return fail(b,"SHAPE");
++    if(open==buf||open[-1]!=' ')return fail(b,"SHAPE");
++    open[-1]=0;
++    if(!number(buf,&r->pid)||!r->pid||r->pid>INT32_MAX)return fail(b,"SHAPE");
++    char *save=NULL,*v=strtok_r(close+2," \n",&save);
++    if(!v||strlen(v)!=1)return fail(b,"SHAPE");
++    r->state=*v;
++    unsigned field=4;
++    while((v=strtok_r(NULL," \n",&save))){
++        uint64_t n;
++        if(field==4||field==5||field==20||field==22){
++            if(!number(v,&n))return fail(b,"SHAPE");
++            if(field==4)r->ppid=n;
++            if(field==5)r->pgid=n;
++            if(field==20)r->count=n;
++            if(field==22)r->start=n;
++        }
++        if(++field>65)return fail(b,"SHAPE");
++    }
++    if(field<=22||!r->start||!r->pgid||r->pgid>INT32_MAX||r->ppid>INT32_MAX||r->count<1||r->count>=CAP)return fail(b,"COUNT");
++    if(r->state!='R'&&r->state!='S'&&r->state!='D')return fail(b,"STATE");
++    return 1;
++}
++static int statusrow(char *buf,row *r,budget *b) {
++    int tgid=0,uid=0,tracer=0;
++    char *save=NULL;
++    for(char *line=strtok_r(buf,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
++        if(!strncmp(line,"Tgid:\t",6)){
++            if(tgid++||!number(line+6,&r->tgid)||!r->tgid||r->tgid>INT32_MAX)return fail(b,"SHAPE");
++        }
++        else if(!strncmp(line,"Uid:\t",5)){
++            if(uid++)return fail(b,"SHAPE");
++            char *s=NULL;
++            unsigned count=0;
++            uint64_t first=0;
++            for(char *v=strtok_r(line+5," \t",&s);v;v=strtok_r(NULL," \t",&s)){
++                uint64_t n;
++                if(!number(v,&n)||n>UINT32_MAX||count>=4)return fail(b,"SHAPE");
++                if(count&&n!=first)return fail(b,"UID");
++                first=n;
++                count++;
++            }
++            if(count!=4)return fail(b,"SHAPE");
++            r->uid=first;
++        }
++        else if(!strncmp(line,"TracerPid:\t",11)){
++            uint64_t n;
++            if(tracer++||!number(line+11,&n)||n)return fail(b,"STATE");
++        }
++    }
++    return tgid==1&&uid==1&&tracer==1?1:fail(b,"SHAPE");
++}
++static int readrow(int fd,row *r,budget *b) {
++    char st[4097],status[READ_CAP+1];
++    memset(r,0,sizeof(*r));
++    return input(fd,"stat",st,4096,b)&&statrow(st,r,b)&&input(fd,"status",status,READ_CAP,b)&&statusrow(status,r,b);
++}
++static int equalrow(row a,row z) {
++    return a.pid==z.pid&&a.ppid==z.ppid&&a.pgid==z.pgid&&a.start==z.start&&a.count==z.count&&a.tgid==z.tgid&&a.uid==z.uid;
++}
++static int list(int task,uint64_t *ids,size_t *count,budget *b) {
++    int fd=openat(task,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++    if(fd<0)return fail(b,"ACCESS");
++    DIR *d=fdopendir(fd);
++    if(!d){
++        int err=close(fd);
++        return fail(b,err?"CLEANUP":"ACCESS");
++    }
++    size_t n=0;
++    int ok=1;
++    errno=0;
++    for(;;){
++        if(!bound(b)){
++            ok=0;
++            break;
++        }
++        errno=0;
++        struct dirent *e=readdir(d);
++        if(!e){
++            if(errno)ok=fail(b,"ACCESS");
++            break;
++        }
++        if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;
++        uint64_t id;
++        if(!number(e->d_name,&id)||!id||id>INT32_MAX||n>=CAP-1){
++            ok=fail(b,"CAP");
++            break;
++        }
++        for(size_t j=0;j<n;j++)if(ids[j]==id){
++            ok=fail(b,"DUPLICATE");
++            break;
++        }
++        if(!ok)break;
++        ids[n++]=id;
++    }
++    if(closedir(d))ok=fail(b,"CLEANUP");
++    if(ok&&n<2)ok=fail(b,"COUNT");
++    *count=n;
++    return ok;
++}
++/* Native backing is private to the fixed source facade. No inspect(pid) API. */
++static int closefd(int *fd) {
++    int v=*fd;
++    *fd=-1;
++    return v<0||close(v)==0;
++}
++static int alive(int fd) {
++    struct pollfd p={fd,POLLIN|POLLHUP|POLLERR,0};
++    return fd>=0&&poll(&p,1,0)==0&&p.revents==0;
++}
++static int child_live(pid_t pid) {
++    siginfo_t s;
++    struct sigaction a;
++    memset(&s,0,sizeof s);
++    if(sigaction(SIGCHLD,NULL,&a)||a.sa_handler==SIG_IGN||(a.sa_flags&SA_NOCLDWAIT))return 0;
++    return waitid(P_PID,(id_t)pid,&s,WEXITED|WNOHANG|WNOWAIT)==0&&s.si_pid==0;
++}
++static int dispose(handle *h) {
++    int a=closefd(&h->fd),b=closefd(&h->pidfd),c=closefd(&h->owner_pidfd);
++    return a&&b&&c;
++}
++static void finalizer(napi_env env,void *data,void *hint) {
++    (void)env;
++    (void)hint;
++    handle *h=data;
++    if(h){
++        dispose(h);
++        free(h);
++    }
++}
++static handle *unwrap(napi_env env,napi_value v) {
++    void *h=NULL;
++    napi_valuetype t;
++    bool branded=false;
++    if(napi_typeof(env,v,&t)!=napi_ok||t!=napi_object||napi_check_object_type_tag(env,v,&BRAND,&branded)!=napi_ok||!branded||napi_unwrap(env,v,&h)!=napi_ok)return NULL;
++    return h;
++}
++static handle *gethandle(napi_env env,napi_callback_info info) {
++    napi_value args[2];
++    size_t n=2;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1)return NULL;
++    return unwrap(env,args[0]);
++}
++static napi_value wrap(napi_env env,handle *h) {
++    napi_value out;
++    if(napi_create_object(env,&out)!=napi_ok||napi_type_tag_object(env,out,&BRAND)!=napi_ok||napi_wrap(env,out,h,finalizer,NULL,NULL)!=napi_ok){
++        int clean=dispose(h);
++        free(h);
++        return refused(env,clean?"NAPI":"CLEANUP");
++    }
++    return out;
++}
++static int pidfd_pair(handle *h,budget *b);
++static handle *bind_original(pid_t pid,const char **code) {
++    handle *h=NULL;
++    int proc=-1;
++    row a,z;
++    budget b={now()+5,0,"UNKNOWN"};
++    *code="OWNERSHIP";
++    if(getuid()!=geteuid()||getgid()!=getegid()||!child_live(pid))return NULL;
++#if PUBLIC_PIDFD
++    h=calloc(1,sizeof(*h));
++    if(!h){*code="ALLOCATION";return NULL;}
++    h->fd=-1;h->owner_pidfd=-1;h->parent_pid=getpid();
++    h->pidfd=pidfd_open(pid,0);
++    h->pid=pid;
++    h->uid=geteuid();
++    if(h->pidfd<0){*code="UNSUPPORTED";goto bad;}
++#else
++    (void)a;
++    (void)z;
++    (void)b;
++    *code="UNSUPPORTED";
++    return NULL;
++#endif
++    if(!alive(h->pidfd))goto bad;
++    proc=open("/proc",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++    struct statfs f;
++    char name[32];
++    if(proc<0||fstatfs(proc,&f)||f.f_type!=PROC_MAGIC){*code="FILESYSTEM";goto bad;}
++    snprintf(name,sizeof name,"%d",(int)pid);
++    h->fd=openat(proc,name,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++    if(!closefd(&proc)){*code="CLEANUP";goto bad;}
++    if(h->fd<0||fstat(h->fd,&h->identity)||!S_ISDIR(h->identity.st_mode)||!readrow(h->fd,&a,&b)){
++        *code="IDENTITY";goto bad;
++    }
++    if(a.pid!=(uint64_t)pid||a.tgid!=(uint64_t)pid||a.ppid!=(uint64_t)getpid()||a.uid!=h->uid||!child_live(pid)||!alive(h->pidfd)||!readrow(h->fd,&z,&b)||a.pid!=z.pid||a.ppid!=z.ppid||a.pgid!=z.pgid||a.start!=z.start||a.tgid!=z.tgid||a.uid!=z.uid||!bound(&b))goto bad;
++    if(!pidfd_pair(h,&b)||!child_live(pid)||!alive(h->pidfd)||!bound(&b)){*code="PAIR";goto bad;}
++    return h;
++    bad:
++    if(b.refusal&&!strcmp(b.refusal,"CLEANUP"))*code="CLEANUP";
++    if(!closefd(&proc))*code="CLEANUP";
++    if(h){
++        if(!dispose(h))*code="CLEANUP";
++        free(h);
++    }
++    return NULL;
++}
++/* This calls a trusted source-owned callback that performs cp.spawn once. */
++static napi_value spawn_and_bind(napi_env env,napi_callback_info info) {
++    napi_value args[2],child,receiver,pv,exitv,signalv,out,hv;
++    size_t n=2;
++    napi_valuetype t;
++    double pid=0;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1||napi_typeof(env,args[0],&t)!=napi_ok||t!=napi_function)return refused(env,"ARGUMENT");
++    if(napi_get_undefined(env,&receiver)!=napi_ok||napi_call_function(env,receiver,args[0],0,NULL,&child)!=napi_ok)return NULL;
++    if(napi_typeof(env,child,&t)!=napi_ok||t!=napi_object||napi_get_named_property(env,child,"pid",&pv)!=napi_ok||napi_get_value_double(env,pv,&pid)!=napi_ok||!(pid>=1&&pid<=INT32_MAX)||(double)(pid_t)pid!=pid||napi_get_named_property(env,child,"exitCode",&exitv)!=napi_ok||napi_typeof(env,exitv,&t)!=napi_ok||t!=napi_null||napi_get_named_property(env,child,"signalCode",&signalv)!=napi_ok||napi_typeof(env,signalv,&t)!=napi_ok||t!=napi_null)return refused(env,"OWNERSHIP");
++    const char *code;
++    handle *h=bind_original((pid_t)pid,&code);
++    if(!h)return refused(env,code);
++    hv=wrap(env,h);
++    if(!hv)return NULL;
++    if(napi_create_object(env,&out)!=napi_ok||napi_set_named_property(env,out,"child",child)!=napi_ok||napi_set_named_property(env,out,"handle",hv)!=napi_ok){
++        int clean=dispose(h);
++        return refused(env,clean?"NAPI":"CLEANUP");
++    }
++    return out;
++}
++static napi_value close_handle(napi_env env,napi_callback_info info) {
++    handle *h=gethandle(env,info);
++    if(!h||h->fd<0||h->pidfd<0)return refused(env,"CLOSED");
++    if(!dispose(h))return refused(env,"CLEANUP");
++    napi_value v;
++    if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++static napi_value sample(napi_env env,napi_callback_info info) {
++    handle *h=gethandle(env,info);
++    if(!h||h->fd<0||h->pidfd<0)return refused(env,"CLOSED");
++    budget b={
++        now()+5,0,"UNKNOWN"
++    };
++    int task=-1,fds[CAP],second=-1,ok=1;
++    size_t n=0,m=0;
++    uint64_t ids[CAP],last[CAP];
++    struct stat shapes[CAP],a,z;
++    row first,final,rows[CAP],r;
++    for(size_t i=0;i<CAP;i++)fds[i]=-1;
++    if(!alive(h->pidfd)||(h->owner_pidfd>=0&&!alive(h->owner_pidfd))||getuid()!=h->uid||geteuid()!=h->uid||fstat(h->fd,&a)||!same(a,h->identity)){
++        ok=fail(&b,"IDENTITY");
++        goto done;
++    }
++    if(!readrow(h->fd,&first,&b)||first.pid!=(uint64_t)h->pid||first.tgid!=(uint64_t)h->pid||first.ppid!=(uint64_t)h->parent_pid||first.uid!=h->uid){
++        ok=fail(&b,"IDENTITY");
++        goto done;
++    }
++    task=openat(h->fd,"task",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++    if(task<0){
++        ok=fail(&b,"ACCESS");
++        goto done;
++    }
++    if(!list(task,ids,&n,&b)||n!=first.count){
++        ok=fail(&b,"COUNT");
++        goto done;
++    }
++    for(size_t i=0;i<n;i++){
++        char name[32];
++        snprintf(name,sizeof name,"%llu",(unsigned long long)ids[i]);
++        if(!bound(&b)){
++            ok=0;
++            goto done;
++        }
++        fds[i]=openat(task,name,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++        if(fds[i]<0||fstat(fds[i],&shapes[i])||!readrow(fds[i],&rows[i],&b)){
++            ok=0;
++            if(!b.refusal||!strcmp(b.refusal,"UNKNOWN"))fail(&b,"ACCESS");
++            goto done;
++        }
++        if(rows[i].pid!=ids[i]||rows[i].tgid!=first.pid||rows[i].uid!=h->uid||rows[i].count!=n){
++            ok=fail(&b,"IDENTITY");
++            goto done;
++        }
++    }
++    /* Complete second EOF enumeration/count precedes EVERY second state read. */
++    if(!list(task,last,&m,&b)||m!=n||!readrow(h->fd,&final,&b)||final.count!=n||!equalrow(first,final)){
++        ok=fail(&b,"SET_CHANGED");
++        goto done;
++    }
++    for(size_t i=0;i<n;i++){
++        size_t found=0;
++        for(size_t j=0;j<m;j++)if(last[j]==ids[i])found++;
++        if(found!=1){
++            ok=fail(&b,"SET_CHANGED");
++            goto done;
++        }
++        char name[32];
++        snprintf(name,sizeof name,"%llu",(unsigned long long)ids[i]);
++        second=openat(task,name,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++        if(second<0||fstat(second,&z)||!same(z,shapes[i])||fstat(fds[i],&a)||!same(a,z)){
++            ok=fail(&b,"IDENTITY");
++            goto done;
++        }
++        if(close(second)){
++            second=-1;
++            ok=fail(&b,"CLEANUP");
++            goto done;
++        }
++        second=-1;
++        if(!readrow(fds[i],&r,&b)||!equalrow(rows[i],r)){
++            ok=0;
++            if(!strcmp(b.refusal,"UNKNOWN"))fail(&b,"IDENTITY");
++            goto done;
++        }
++    }
++    if(!readrow(h->fd,&final,&b)||!equalrow(first,final)||fstat(h->fd,&z)||!same(z,h->identity)||getuid()!=h->uid||geteuid()!=h->uid||!bound(&b)||!alive(h->pidfd)||(h->owner_pidfd>=0&&!alive(h->owner_pidfd))){
++        ok=0;
++        if(!strcmp(b.refusal,"UNKNOWN"))fail(&b,"IDENTITY");
++    }
++    done:
++    if(second>=0&&close(second))ok=fail(&b,"CLEANUP");
++    for(size_t i=0;i<CAP;i++)if(fds[i]>=0&&close(fds[i]))ok=fail(&b,"CLEANUP");
++    if(task>=0&&close(task))ok=fail(&b,"CLEANUP");
++    if(!ok)return refused(env,b.refusal);
++    napi_value out,v;
++    if(napi_create_object(env,&out)!=napi_ok)return refused(env,"NAPI");
++    if(napi_create_uint32(env,(uint32_t)n,&v)!=napi_ok||napi_set_named_property(env,out,"count",v)!=napi_ok)return refused(env,"NAPI");
++    const char *keys[]={
++        "twoPasses","allStatesLive","sameTaskDescriptors","sameProcessIdentity","completeEOF","cleanupKnown"
++    };
++    for(size_t i=0;i<sizeof(keys)/sizeof(keys[0]);i++)if(napi_get_boolean(env,1,&v)!=napi_ok||napi_set_named_property(env,out,keys[i],v)!=napi_ok)return refused(env,"NAPI");
++    return out;
++}
++
++typedef struct {
++    int receiver,sender,owner_pidfd;
++    pid_t owner;
++    int sent,received,negative_detail;
++}
++channel;
++static const napi_type_tag CHANNEL_BRAND={0x2dd335a00dd5ff1bULL,0x8afa6934c2db7e48ULL};
++static int channel_dispose(channel *c) {
++    int a=closefd(&c->receiver),b=closefd(&c->sender),d=closefd(&c->owner_pidfd);
++    return a&&b&&d;
++}
++static void channel_finalizer(napi_env env,void *data,void *hint) {
++    (void)env;
++    (void)hint;
++    channel *c=data;
++    if(c){channel_dispose(c);free(c);}
++}
++static channel *getchannel(napi_env env,napi_value v) {
++    bool tagged=false;
++    void *p=NULL;
++    if(napi_check_object_type_tag(env,v,&CHANNEL_BRAND,&tagged)!=napi_ok||!tagged||napi_unwrap(env,v,&p)!=napi_ok)return NULL;
++    return p;
++}
++static napi_value channel_object(napi_env env,channel *c) {
++    napi_value out;
++    if(napi_create_object(env,&out)!=napi_ok||napi_type_tag_object(env,out,&CHANNEL_BRAND)!=napi_ok||napi_wrap(env,out,c,channel_finalizer,NULL,NULL)!=napi_ok){
++        int clean=channel_dispose(c);free(c);return refused(env,clean?"NAPI":"CLEANUP");
++    }
++    return out;
++}
++static napi_value create_channel(napi_env env,napi_callback_info info) {
++    size_t n=1;
++    napi_value args[1];
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n)return refused(env,"ARGUMENT");
++    channel *c=calloc(1,sizeof(*c));
++    if(!c)return refused(env,"ALLOCATION");
++    c->receiver=c->sender=c->owner_pidfd=-1;
++    int pair[2];
++    if(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK,0,pair)){
++        free(c);return refused(env,"UNSUPPORTED");
++    }
++    c->receiver=pair[0];c->sender=pair[1];c->owner=getpid();
++    int yes=1;
++    if(setsockopt(c->receiver,SOL_SOCKET,SO_PASSCRED,&yes,sizeof yes)){
++        int clean=channel_dispose(c);free(c);return refused(env,clean?"CHANNEL":"CLEANUP");
++    }
++    return channel_object(env,c);
++}
++static napi_value inherited_sender(napi_env env,napi_callback_info info) {
++    size_t n=1;
++    napi_value args[1];
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n)return refused(env,"ARGUMENT");
++    int type=0;
++    socklen_t size=sizeof type;
++    struct ucred peer;
++    socklen_t ps=sizeof peer;
++    if(getsockopt(4,SOL_SOCKET,SO_TYPE,&type,&size)||size!=sizeof type||type!=SOCK_SEQPACKET||getsockopt(4,SOL_SOCKET,SO_PEERCRED,&peer,&ps)||ps!=sizeof peer||peer.pid!=getppid()||peer.uid!=getuid()||peer.gid!=getgid()){
++        int clean=close(4)==0;
++        return refused(env,clean?"CHANNEL":"CLEANUP");
++    }
++    int fd=fcntl(4,F_DUPFD_CLOEXEC,5);
++    int flags=fd>=0?fcntl(fd,F_GETFL):0;
++    if(fd<0||flags<0||fcntl(fd,F_SETFL,flags|O_NONBLOCK)){
++        int a=closefd(&fd),b=close(4)==0;
++        return refused(env,a&&b?"CHANNEL":"CLEANUP");
++    }
++    /* The inherited slot must not escape to this owner's target. */
++    if(close(4)){closefd(&fd);return refused(env,"CLEANUP");}
++    channel *c=calloc(1,sizeof(*c));
++    if(!c){int clean=closefd(&fd);return refused(env,clean?"ALLOCATION":"CLEANUP");}
++    c->receiver=c->owner_pidfd=-1;c->sender=fd;c->owner=getpid();
++    return channel_object(env,c);
++}
++static napi_value sender_fd(napi_env env,napi_callback_info info) {
++    napi_value args[2],v;
++    size_t n=2;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1)return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    if(!c||c->sender<0||c->sent)return refused(env,"CLOSED");
++    if(napi_create_int32(env,c->sender,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++static napi_value attribute_owner(napi_env env,napi_callback_info info) {
++    napi_value args[3],v;
++    size_t n=3;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=2)return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    handle *h=unwrap(env,args[1]);
++    if(!c||!h||c->receiver<0||c->received||c->sent||c->owner_pidfd>=0||!alive(h->pidfd)||!child_live(h->pid))return refused(env,"OWNERSHIP");
++    c->owner_pidfd=fcntl(h->pidfd,F_DUPFD_CLOEXEC,5);
++    if(c->owner_pidfd<0)return refused(env,"CHANNEL");
++    c->owner=h->pid;
++    if(!closefd(&c->sender))return refused(env,"CLEANUP");
++    if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++static napi_value send_pair(napi_env env,napi_callback_info info) {
++    napi_value args[3],v;
++    size_t n=3;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=2)return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    handle *h=unwrap(env,args[1]);
++    if(!c||!h||c->sender<0||c->sent||!alive(h->pidfd)||!child_live(h->pid))return refused(env,"OWNERSHIP");
++    c->sent=1; /* Single use consumes even an uncertain enqueue outcome. */
++    char frame[]="JEV_PAIR_V1";
++    struct iovec io={frame,sizeof frame};
++    union {struct cmsghdr align;char bytes[CMSG_SPACE(2*sizeof(int))];} control;
++    memset(&control,0,sizeof control);
++    struct msghdr msg={0};
++    msg.msg_iov=&io;msg.msg_iovlen=1;msg.msg_control=control.bytes;msg.msg_controllen=sizeof control.bytes;
++    struct cmsghdr *header=CMSG_FIRSTHDR(&msg);
++    header->cmsg_level=SOL_SOCKET;header->cmsg_type=SCM_RIGHTS;header->cmsg_len=CMSG_LEN(2*sizeof(int));
++    int rights[2]={h->pidfd,h->fd};
++    memcpy(CMSG_DATA(header),rights,sizeof rights);
++    ssize_t sent=sendmsg(c->sender,&msg,MSG_DONTWAIT|MSG_NOSIGNAL);
++    int a=closefd(&c->sender),b=dispose(h);
++    if(!a||!b)return refused(env,"CLEANUP");
++    if(sent!=(ssize_t)sizeof frame)return refused(env,"CHANNEL");
++    if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++/* Private negative fixture only: no caller PID, FD, payload or arbitrary mode.
++   Every alias comes from the same already-bound genuine original pair. */
++static napi_value send_negative(napi_env env,napi_callback_info info) {
++    napi_value args[4],v;
++    size_t n=4,size=0;
++    char mode[32];
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=3||
++       napi_get_value_string_utf8(env,args[2],NULL,0,&size)!=napi_ok||size>=sizeof mode||
++       napi_get_value_string_utf8(env,args[2],mode,sizeof mode,&size)!=napi_ok||strlen(mode)!=size)
++        return refused(env,"ARGUMENT");
++    int count;
++    if(!strcmp(mode,"MALFORMED_FRAME"))count=2;
++    else if(!strcmp(mode,"EXTRA_RIGHTS"))count=3;
++    else if(!strcmp(mode,"TRUNCATED_RIGHTS"))count=CAP+16;
++    else return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    handle *h=unwrap(env,args[1]);
++    if(!c||!h||c->receiver<0||c->sender<0||c->sent||c->received||
++       c->owner!=getpid()||c->owner_pidfd>=0||!alive(h->pidfd)||!child_live(h->pid))
++        return refused(env,"OWNERSHIP");
++    c->sent=1;
++    int rights[CAP+16],made=0,clean=1;
++    for(int i=0;i<count;i++){
++        int fd=fcntl(i%2?h->fd:h->pidfd,F_DUPFD_CLOEXEC,5);
++        if(fd<0)break;
++        rights[made++]=fd;
++    }
++    char frame[]="JEV_PAIR_V1";
++    if(!strcmp(mode,"MALFORMED_FRAME"))frame[0]='X';
++    struct iovec io={frame,sizeof frame};
++    union {struct cmsghdr align;char bytes[CMSG_SPACE((CAP+16)*sizeof(int))];} control;
++    memset(&control,0,sizeof control);
++    struct msghdr msg={0};
++    msg.msg_iov=&io;msg.msg_iovlen=1;msg.msg_control=control.bytes;
++    msg.msg_controllen=CMSG_SPACE((size_t)count*sizeof(int));
++    struct cmsghdr *header=CMSG_FIRSTHDR(&msg);
++    header->cmsg_level=SOL_SOCKET;header->cmsg_type=SCM_RIGHTS;
++    header->cmsg_len=CMSG_LEN((size_t)count*sizeof(int));
++    ssize_t sent=-1;
++    if(made==count){
++        memcpy(CMSG_DATA(header),rights,(size_t)count*sizeof(int));
++        sent=sendmsg(c->sender,&msg,MSG_DONTWAIT|MSG_NOSIGNAL);
++    }
++    /* No retries, including close uncertainty. Do not short-circuit cleanup. */
++    for(int i=0;i<made;i++)if(close(rights[i]))clean=0;
++    int a=closefd(&c->sender),b=dispose(h);
++    if(!clean||!a||!b)return refused(env,"CLEANUP");
++    if(made!=count||sent!=(ssize_t)sizeof frame)return refused(env,"CHANNEL");
++    if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++/* Closed, fixed diagnostic over an already-refused receive; no descriptor data.
++   It is not an authority assertion or an alternative successful receive. */
++static napi_value negative_detail(napi_env env,napi_callback_info info) {
++    napi_value args[2],v;
++    size_t n=2;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1)return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    if(!c)return refused(env,"ARGUMENT");
++    const char *detail="UNKNOWN";
++    if(c->received&&c->receiver<0){
++        if(c->negative_detail==1)detail="MALFORMED_FRAME";
++        else if(c->negative_detail==2)detail="EXTRA_RIGHTS";
++        else if(c->negative_detail==3)detail="CONTROL_TRUNCATED";
++    }
++    if(napi_create_string_utf8(env,detail,NAPI_AUTO_LENGTH,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++static int pidfd_pair(handle *h,budget *b) {
++    int own=open("/proc/self/fdinfo",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
++    struct statfs fs;
++    if(own<0||fstatfs(own,&fs)||fs.f_type!=PROC_MAGIC){
++        int clean=closefd(&own);return fail(b,clean?"PAIR":"CLEANUP");
++    }
++    char name[32],data[4097];
++    snprintf(name,sizeof name,"%d",h->pidfd);
++    int ok=own>=0&&input(own,name,data,4096,b);
++    if(!closefd(&own))return fail(b,"CLEANUP");
++    if(!ok)return fail(b,"PAIR");
++    int found=0;
++    uint64_t pid=0;
++    char *save=NULL;
++    for(char *line=strtok_r(data,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
++        if(!strncmp(line,"Pid:\t",5)){
++            if(found++||!number(line+5,&pid))return fail(b,"PAIR");
++        }
++    }
++    return found==1&&pid==(uint64_t)h->pid&&alive(h->pidfd)?1:fail(b,"PAIR");
++}
++static napi_value receive_pair(napi_env env,napi_callback_info info) {
++    napi_value args[2];
++    size_t n=2;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1)return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    if(!c||c->receiver<0||c->received||(c->owner_pidfd>=0&&!alive(c->owner_pidfd)))return refused(env,"OWNERSHIP");
++    c->received=1;
++    char frame[32];
++    struct iovec io={frame,sizeof frame};
++    /* Space for bounded unexpected rights; all delivered FDs are closed. */
++    union {struct cmsghdr align;char bytes[CMSG_SPACE(CAP*sizeof(int))+CMSG_SPACE(sizeof(struct ucred))];} control;
++    memset(&control,0,sizeof control);
++    struct msghdr msg={0};
++    msg.msg_iov=&io;msg.msg_iovlen=1;msg.msg_control=control.bytes;msg.msg_controllen=sizeof control.bytes;
++    ssize_t length=recvmsg(c->receiver,&msg,MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
++    int rights[CAP],count=0,rights_headers=0,cred_headers=0,bad=0,cleanup_ok=1;
++    struct ucred cred={0};
++    if(length<0){
++        int clean=closefd(&c->receiver);
++        return refused(env,clean?"CHANNEL":"CLEANUP");
++    }
++    for(struct cmsghdr *p=CMSG_FIRSTHDR(&msg);p;p=CMSG_NXTHDR(&msg,p)){
++        if(p->cmsg_len<CMSG_LEN(0)){bad=1;break;}
++        size_t bytes=p->cmsg_len-CMSG_LEN(0);
++        if(p->cmsg_level==SOL_SOCKET&&p->cmsg_type==SCM_RIGHTS){
++            rights_headers++;
++            if(bytes%sizeof(int))bad=1;
++            size_t k=bytes/sizeof(int);
++            for(size_t i=0;i<k;i++){
++                int fd;
++                memcpy(&fd,(char *)CMSG_DATA(p)+i*sizeof(int),sizeof fd);
++                if(count<CAP)rights[count++]=fd;
++                else {if(close(fd))cleanup_ok=0;bad=1;}
++            }
++        }
++        else if(p->cmsg_level==SOL_SOCKET&&p->cmsg_type==SCM_CREDENTIALS){
++            cred_headers++;
++            if(bytes!=sizeof cred)bad=1;
++            else memcpy(&cred,CMSG_DATA(p),sizeof cred);
++        }
++#ifdef SCM_PIDFD
++        else if(p->cmsg_level==SOL_SOCKET&&p->cmsg_type==SCM_PIDFD){
++            bad=1;
++            if(bytes==sizeof(int)){
++                int fd;memcpy(&fd,CMSG_DATA(p),sizeof fd);
++                if(close(fd))cleanup_ok=0;
++            }
++        }
++#endif
++        else bad=1;
++    }
++    /* A successful sender closes its only sender endpoint. Require exact EOF,
++       not a second packet or a still-open channel; no waiting or retry. */
++    char extra[32];
++    struct iovec extra_io={extra,sizeof extra};
++    union {struct cmsghdr align;char bytes[CMSG_SPACE(CAP*sizeof(int))+CMSG_SPACE(sizeof(struct ucred))];} extra_control;
++    memset(&extra_control,0,sizeof extra_control);
++    struct msghdr extra_msg={0};
++    extra_msg.msg_iov=&extra_io;extra_msg.msg_iovlen=1;
++    extra_msg.msg_control=extra_control.bytes;extra_msg.msg_controllen=sizeof extra_control.bytes;
++    ssize_t extra_length=recvmsg(c->receiver,&extra_msg,MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
++    if(extra_length!=0||extra_msg.msg_flags&(MSG_TRUNC|MSG_CTRUNC))bad=1;
++    if(extra_length>=0){
++        for(struct cmsghdr *q=CMSG_FIRSTHDR(&extra_msg);q;q=CMSG_NXTHDR(&extra_msg,q)){
++            bad=1;
++            if(q->cmsg_level==SOL_SOCKET&&q->cmsg_type==SCM_RIGHTS&&q->cmsg_len>=CMSG_LEN(0)){
++                size_t k=(q->cmsg_len-CMSG_LEN(0))/sizeof(int);
++                for(size_t i=0;i<k;i++){
++                    int fd;
++                    memcpy(&fd,(char *)CMSG_DATA(q)+i*sizeof(int),sizeof fd);
++                    if(close(fd))cleanup_ok=0;
++                }
++            }
++#ifdef SCM_PIDFD
++            else if(q->cmsg_level==SOL_SOCKET&&q->cmsg_type==SCM_PIDFD&&q->cmsg_len==CMSG_LEN(sizeof(int))){
++                int fd;memcpy(&fd,CMSG_DATA(q),sizeof fd);
++                if(close(fd))cleanup_ok=0;
++            }
++#endif
++        }
++    }
++    if(!closefd(&c->receiver)){cleanup_ok=0;bad=1;}
++    const char expected[]="JEV_PAIR_V1";
++    if(length!=(ssize_t)sizeof expected||memcmp(frame,expected,sizeof expected)||msg.msg_flags&(MSG_TRUNC|MSG_CTRUNC)||rights_headers!=1||cred_headers!=1||count!=2||cred.pid!=c->owner||cred.uid!=getuid()||cred.gid!=getgid()||(c->owner_pidfd>=0&&!alive(c->owner_pidfd)))bad=1;
++    if(bad){
++        int clean=cleanup_ok;
++        for(int i=0;i<count;i++)if(close(rights[i]))clean=0;
++        /* Publish a reason only after every delivered right was explicitly
++           closed successfully. All original acceptance predicates stay above. */
++        if(clean){
++            if(msg.msg_flags&MSG_CTRUNC)c->negative_detail=3;
++            else if(length==(ssize_t)sizeof expected&&!(msg.msg_flags&MSG_TRUNC)&&
++                    rights_headers==1&&cred_headers==1&&extra_length==0&&
++                    !(extra_msg.msg_flags&(MSG_TRUNC|MSG_CTRUNC))&&
++                    cred.pid==c->owner&&cred.uid==getuid()&&cred.gid==getgid()&&
++                    (c->owner_pidfd<0||alive(c->owner_pidfd))){
++                if(count==2&&memcmp(frame,expected,sizeof expected))c->negative_detail=1;
++                else if(count>2&&!memcmp(frame,expected,sizeof expected))c->negative_detail=2;
++            }
++        }
++        return refused(env,clean?"CHANNEL":"CLEANUP");
++    }
++    handle *h=calloc(1,sizeof(*h));
++    if(!h){
++        int a=close(rights[0]),b=close(rights[1]);
++        return refused(env,a||b?"CLEANUP":"ALLOCATION");
++    }
++    h->pidfd=rights[0];h->fd=rights[1];h->uid=geteuid();h->owner_pidfd=-1;h->parent_pid=c->owner;
++    if(c->owner_pidfd>=0){
++        h->owner_pidfd=fcntl(c->owner_pidfd,F_DUPFD_CLOEXEC,5);
++        if(h->owner_pidfd<0){int clean=dispose(h);free(h);return refused(env,clean?"PAIR":"CLEANUP");}
++    }
++    row r;
++    budget budget={now()+5,0,"UNKNOWN"};
++    struct statfs fs;
++    if(getuid()!=h->uid||!alive(h->pidfd)||fstatfs(h->fd,&fs)||fs.f_type!=PROC_MAGIC||fstat(h->fd,&h->identity)||!S_ISDIR(h->identity.st_mode)||!readrow(h->fd,&r,&budget)||r.uid!=h->uid||r.pid!=r.tgid||r.ppid!=(uint64_t)cred.pid){
++        int clean=dispose(h);free(h);return refused(env,clean&&strcmp(budget.refusal,"CLEANUP")?"PAIR":"CLEANUP");
++    }
++    h->pid=(pid_t)r.pid;
++    if(!pidfd_pair(h,&budget)||!bound(&budget)){
++        int clean=dispose(h);free(h);return refused(env,clean&&strcmp(budget.refusal,"CLEANUP")?"PAIR":"CLEANUP");
++    }
++    return wrap(env,h);
++}
++static napi_value close_channel(napi_env env,napi_callback_info info) {
++    napi_value args[2],v;
++    size_t n=2;
++    if(napi_get_cb_info(env,info,&n,args,NULL,NULL)!=napi_ok||n!=1)return refused(env,"ARGUMENT");
++    channel *c=getchannel(env,args[0]);
++    if(!c)return refused(env,"ARGUMENT");
++    if(!channel_dispose(c))return refused(env,"CLEANUP");
++    if(napi_get_boolean(env,1,&v)!=napi_ok)return refused(env,"NAPI");
++    return v;
++}
++static napi_value init(napi_env env,napi_value out){
++    napi_property_descriptor methods[]={
++        {"spawnAndBind",NULL,spawn_and_bind,NULL,NULL,NULL,napi_default,NULL},
++        {"sample",NULL,sample,NULL,NULL,NULL,napi_default,NULL},
++        {"close",NULL,close_handle,NULL,NULL,NULL,napi_default,NULL},
++        {"createChannel",NULL,create_channel,NULL,NULL,NULL,napi_default,NULL},
++        {"inheritedSender",NULL,inherited_sender,NULL,NULL,NULL,napi_default,NULL},
++        {"senderFD",NULL,sender_fd,NULL,NULL,NULL,napi_default,NULL},
++        {"attributeOwner",NULL,attribute_owner,NULL,NULL,NULL,napi_default,NULL},
++        {"sendPair",NULL,send_pair,NULL,NULL,NULL,napi_default,NULL},
++        {"sendNegative",NULL,send_negative,NULL,NULL,NULL,napi_default,NULL},
++        {"negativeDetail",NULL,negative_detail,NULL,NULL,NULL,napi_default,NULL},
++        {"receivePair",NULL,receive_pair,NULL,NULL,NULL,napi_default,NULL},
++        {"closeChannel",NULL,close_channel,NULL,NULL,NULL,napi_default,NULL}
++    };
++    if(napi_define_properties(env,out,sizeof methods/sizeof methods[0],methods)!=napi_ok)return refused(env,"NAPI");
++    return out;
++}
++NAPI_MODULE(NODE_GYP_MODULE_NAME,init)
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/facade.mjs
+@@ -0,0 +1,179 @@
++import { spawn, ChildProcess } from 'node:child_process';
++import { openSync, closeSync, readFileSync, fstatSync, lstatSync, constants } from 'node:fs';
++import { createHash } from 'node:crypto';
++import { fileURLToPath } from 'node:url';
++
++export const REFUSALS = Object.freeze(['ARGUMENT','OWNERSHIP','UNSUPPORTED','ALLOCATION','FILESYSTEM','IDENTITY','CLEANUP','NAPI','CLOSED','CHANNEL','PAIR','ACCESS','SHAPE','CAP','COUNT','STATE','SET_CHANGED','UID','DUPLICATE','DEADLINE','UNKNOWN','FIXTURE']);
++export function fixedCode(error) {
++  try {
++    const d = Object.getOwnPropertyDescriptors(error);
++    const v = d.code?.value;
++    return typeof v === 'string' && REFUSALS.includes(v) ? v : 'UNKNOWN';
++  } catch { return 'UNKNOWN'; }
++}
++function need(value) {
++  if (!value) throw Object.assign(new Error('FIXTURE'), { code: 'FIXTURE' });
++}
++function same(a, b) {
++  return ['dev','ino','uid','gid','mode','size','nlink','mtimeNs','ctimeNs'].every(k => a[k] === b[k]);
++}
++export function loadPrivateBacking(path, sha) {
++  need(process.platform === 'linux' && process.versions.node === '22.23.0' && /^[a-f0-9]{64}$/.test(sha));
++  let fd;
++  try {
++    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
++    const a = fstatSync(fd, { bigint: true });
++    need(a.isFile() && a.size > 0n && a.size <= 8388608n && a.nlink === 1n);
++    const bytes = readFileSync(fd);
++    need(createHash('sha256').update(bytes).digest('hex') === sha);
++    need(same(a, fstatSync(fd, { bigint: true })) && same(a, lstatSync(path, { bigint: true })));
++    const module = { exports: {} };
++    process.dlopen(module, `/proc/self/fd/${fd}`);
++    need(same(a, fstatSync(fd, { bigint: true })) && same(a, lstatSync(path, { bigint: true })));
++    return createFacade(module.exports, path, sha);
++  } finally { if (fd !== undefined) closeSync(fd); }
++}
++function createFacade(native, artifact, sha) {
++  const pairs = new WeakMap(), channels = new WeakMap();
++  const target = fileURLToPath(new URL('./target.mjs', import.meta.url));
++  const nested = fileURLToPath(new URL('./nested-owner.mjs', import.meta.url));
++  function token(map, value) { const t = Object.freeze({}); map.set(t, value); return t; }
++  function pair(t) { need(pairs.has(t)); return pairs.get(t); }
++  function channel(t) { need(channels.has(t)); return channels.get(t); }
++  function genuineSpawn(kind, output) {
++    let original;
++    try {
++      const bound = native.spawnAndBind(() => {
++        /* The native function calls this once and binds before returning.
++           No yield, next-tick, wait, user callback or nested loop here. */
++        original = spawn(process.execPath, [kind === 'TARGET' ? target : nested], {
++          detached: false,
++          env: kind === 'TARGET' ? {} : { JEV_DESCRIPTOR_ARTIFACT: artifact, JEV_DESCRIPTOR_SHA: sha },
++          stdio: kind === 'TARGET' ? ['pipe','pipe','pipe'] : ['pipe','pipe','pipe','ignore',native.senderFD(channel(output))],
++        });
++        need(Object.getPrototypeOf(original) === ChildProcess.prototype);
++        const d = Object.getOwnPropertyDescriptors(original);
++        need(Number.isSafeInteger(d.pid?.value) && d.pid.value > 0 && d.exitCode?.value === null && d.signalCode?.value === null);
++        return original;
++      });
++      need(bound.child === original);
++      monitor(original);
++      return Object.freeze({ original, capability: token(pairs, bound.handle) });
++    } catch (error) {
++      /* Do not lose the genuine original when acquisition is refused. */
++      if (original) {
++        monitor(original);
++        try { original.stdin.end(); } catch { /* external owner settles uncertainty */ }
++      }
++      if (original) return Object.freeze({ original, capability: null, refusal: fixedCode(error) });
++      throw error;
++    }
++  }
++  return Object.freeze({
++    openChannel: () => token(channels, native.createChannel()),
++    adoptInheritedChannel: () => token(channels, native.inheritedSender()),
++    spawnTarget: () => genuineSpawn('TARGET'),
++    spawnNested: output => {
++      const bound = genuineSpawn('NESTED', output);
++      if (!bound.capability) return bound;
++      try { native.attributeOwner(channel(output), pair(bound.capability)); }
++      catch (error) {
++        try { bound.original.stdin.end(); } catch {}
++        return Object.freeze({ ...bound, refusal: fixedCode(error) });
++      }
++      return bound;
++    },
++    send: (output, capability) => native.sendPair(channel(output), pair(capability)),
++    /* Finite, own-channel negative fixture port; never a general FD sender. */
++    sendNegative: (output, capability, mode) => {
++      need(['MALFORMED_FRAME','EXTRA_RIGHTS','TRUNCATED_RIGHTS'].includes(mode));
++      return native.sendNegative(channel(output), pair(capability), mode);
++    },
++    negativeDetail: output => {
++      const detail = native.negativeDetail(channel(output));
++      need(['MALFORMED_FRAME','EXTRA_RIGHTS','CONTROL_TRUNCATED','UNKNOWN'].includes(detail));
++      return detail;
++    },
++    receive: output => token(pairs, native.receivePair(channel(output))),
++    sample: capability => native.sample(pair(capability)),
++    closePair: capability => native.close(pair(capability)),
++    closeChannel: output => native.closeChannel(channel(output)),
++  });
++}
++const streamRecords = new WeakMap();
++function monitor(original) {
++  let r = streamRecords.get(original);
++  if (r) return r;
++  r = { bytes: 0, stderr: 0, text: '', stdoutEOF: false, stderrEOF: false,
++    stdoutPresent: false, stderrPresent: false, stdinPresent: false,
++    closed: false, terminal: false, bad: false, pipeFailed: false,
++    setupFailed: false, readyUsed: false, waiters: new Set() };
++  /* Store custody before inspecting any optional stream. This never throws
++     away an already-created genuine original on absent/failed pipes. */
++  streamRecords.set(original, r);
++  let resolveClose;
++  r.close = new Promise(resolve => { resolveClose = resolve; });
++  const wake = () => { for (const fn of [...r.waiters]) { try { fn(); } catch { r.bad = true; } } };
++  const attach = (emitter, event, fn, once = false) => {
++    try { emitter[once ? 'once' : 'on'](event, fn); return true; }
++    catch { r.setupFailed = true; r.bad = true; return false; }
++  };
++  attach(original, 'error', () => { r.bad = true; wake(); });
++  attach(original, 'exit', () => { r.terminal = true; wake(); }, true);
++  attach(original, 'close', (code, signal) => {
++    r.closed = true; r.terminal = true; r.code = code; r.signal = signal;
++    wake(); resolveClose();
++  }, true);
++  for (const name of ['stdin','stdout','stderr']) {
++    let stream;
++    try { stream = original[name]; } catch { r.setupFailed = true; }
++    const present = stream !== null && stream !== undefined;
++    r[`${name}Present`] = present;
++    if (!present) { r.bad = true; continue; }
++    attach(stream, 'error', () => { r.pipeFailed = true; r.bad = true; wake(); });
++    if (name === 'stdin') continue;
++    attach(stream, 'end', () => { r[`${name}EOF`] = true; wake(); }, true);
++    attach(stream, 'close', () => { if (!r[`${name}EOF`]) { r.pipeFailed = true; r.bad = true; } wake(); }, true);
++    attach(stream, 'data', b => {
++      if (name === 'stderr') { r.stderr = Math.min(65, r.stderr + b.length); r.bad = true; }
++      else {
++        r.bytes = Math.min(65, r.bytes + b.length);
++        if (r.bytes > 64 || b.some(v => v > 127)) r.bad = true;
++        else r.text += b.toString('ascii');
++      }
++      wake();
++    });
++  }
++  return r;
++}
++export async function ready(original, word) {
++  need(Object.getPrototypeOf(original) === ChildProcess.prototype && (word === 'READY\n' || word === 'NESTED_READY\n'));
++  const r = monitor(original);
++  need(!r.readyUsed && r.waiters.size === 0);
++  r.readyUsed = true;
++  let check;
++  try {
++    await new Promise((resolve, reject) => {
++      check = () => {
++        if (r.bad || r.setupFailed || r.terminal || r.closed || r.stdoutEOF || r.stderrEOF || !word.startsWith(r.text)) reject(Object.assign(new Error('FIXTURE'), { code: 'FIXTURE' }));
++        else if (r.text === word) resolve();
++      };
++      r.waiters.add(check); check();
++    });
++  } finally { if (check) r.waiters.delete(check); }
++}
++export async function endOriginal(original) {
++  const r = monitor(original);
++  if (!r.closed && r.stdinPresent) {
++    try { original.stdin.end(); } catch { r.pipeFailed = true; r.bad = true; }
++  }
++  await r.close;
++  /* Missing pipes on failed spawn are unsupported, not invented EOF. */
++  need(r.closed && !r.setupFailed);
++  const presentPipeEOF = (!r.stdoutPresent || r.stdoutEOF) && (!r.stderrPresent || r.stderrEOF);
++  return Object.freeze({ terminal: true, nodeCloseObserved: true,
++    bothPipesEOF: r.stdoutPresent && r.stderrPresent && r.stdoutEOF && r.stderrEOF,
++    presentPipeEOF, absentPipe: !r.stdinPresent || !r.stdoutPresent || !r.stderrPresent,
++    pipeFailed: r.pipeFailed, code: r.code, signal: r.signal === null ? 'NONE' : 'SIGNAL',
++    streamPolicyValid: !r.bad && presentPipeEOF && r.stderr === 0 });
++}
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/fixture.mjs
+@@ -0,0 +1,98 @@
++import { loadPrivateBacking, ready, endOriginal, fixedCode } from './facade.mjs';
++const cases = [], originals = [], channels = [], capabilities = [];
++let owner, stage = 'LOAD', status = 'SUPPORTED', code = 'NOT_APPLICABLE', cleanup = true;
++function need(v) { if (!v) throw Object.assign(new Error('FIXTURE'), { code: 'FIXTURE' }); }
++function needBound(v) { if (!v.capability || v.refusal) throw Object.assign(new Error('OWNERSHIP'), { code: v.refusal ?? 'OWNERSHIP' }); }
++function checkSample(v) {
++  need(Number.isInteger(v.count) && v.count >= 2 && v.count < 128);
++  need(Reflect.ownKeys(v).length === 7);
++  for (const k of ['twoPasses','allStatesLive','sameTaskDescriptors','sameProcessIdentity','completeEOF','cleanupKnown']) need(v[k] === true);
++}
++try {
++  owner = loadPrivateBacking(process.env.JEV_DESCRIPTOR_ARTIFACT, process.env.JEV_DESCRIPTOR_SHA);
++  stage = 'DIRECT_CHANNEL';
++  const direct = owner.openChannel(); channels.push(direct);
++  stage = 'DIRECT_SPAWN_BIND';
++  const target = owner.spawnTarget(); originals.push(target.original);
++  if (target.capability) capabilities.push(target.capability);
++  needBound(target);
++  stage = 'DIRECT_SEND_RECEIVE';
++  owner.send(direct, target.capability);
++  const received = owner.receive(direct); capabilities.push(received);
++  stage = 'DIRECT_READY';
++  await ready(target.original, 'READY\n');
++  stage = 'DIRECT_ENDPOINT';
++  checkSample(owner.sample(received)); cases.push('DIRECT_OWNER_FRESH_ENDPOINT');
++  stage = 'CLOSED_HANDLE';
++  owner.closePair(received); capabilities.pop();
++  let refused = false;
++  try { owner.sample(received); } catch (error) { refused = fixedCode(error) === 'CLOSED'; }
++  need(refused); cases.push('CLOSED_HANDLE_REFUSED');
++  stage = 'UNOWNED_HANDLE';
++  refused = false;
++  try { owner.sample(Object.freeze({})); } catch (error) { refused = fixedCode(error) === 'FIXTURE'; }
++  need(refused); cases.push('UNOWNED_HANDLE_REFUSED');
++  stage = 'DIRECT_SETTLEMENT';
++  const directEnd = await endOriginal(target.original);
++  need(directEnd.code === 0 && directEnd.signal === 'NONE' && directEnd.streamPolicyValid);
++  stage = 'NESTED_CHANNEL';
++  const nested = owner.openChannel(); channels.push(nested);
++  stage = 'NESTED_OWNER_BIND';
++  const supervisor = owner.spawnNested(nested); originals.push(supervisor.original);
++  if (supervisor.capability) capabilities.push(supervisor.capability);
++  needBound(supervisor);
++  stage = 'NESTED_READY';
++  await ready(supervisor.original, 'NESTED_READY\n');
++  stage = 'NESTED_RECEIVE';
++  const pair = owner.receive(nested); capabilities.push(pair);
++  stage = 'NESTED_ENDPOINT';
++  checkSample(owner.sample(pair)); cases.push('NESTED_GENUINE_OWNER_FRESH_ENDPOINT');
++  stage = 'NESTED_SETTLEMENT';
++  const nestedEnd = await endOriginal(supervisor.original);
++  need(nestedEnd.code === 0 && nestedEnd.signal === 'NONE' && nestedEnd.streamPolicyValid);
++  stage = 'EXITED_REAPED_CHANNEL';
++  const exitedChannel = owner.openChannel(); channels.push(exitedChannel);
++  const exited = owner.spawnTarget(); originals.push(exited.original);
++  if (exited.capability) capabilities.push(exited.capability);
++  needBound(exited);
++  owner.send(exitedChannel, exited.capability);
++  const exitedPair = owner.receive(exitedChannel); capabilities.push(exitedPair);
++  await ready(exited.original, 'READY\n');
++  stage = 'EXITED_REAPED_SETTLEMENT';
++  const exitedEnd = await endOriginal(exited.original);
++  need(exitedEnd.code === 0 && exitedEnd.signal === 'NONE' && exitedEnd.bothPipesEOF && exitedEnd.streamPolicyValid);
++  stage = 'EXITED_REAPED_HANDLE';
++  refused = false;
++  try { owner.sample(exitedPair); } catch (error) { refused = fixedCode(error) === 'IDENTITY'; }
++  need(refused); cases.push('EXITED_AND_REAPED_HANDLE_REFUSED');
++  for (const [mode, detail, caseName] of [
++    ['MALFORMED_FRAME','MALFORMED_FRAME','MALFORMED_FRAME_REFUSED'],
++    ['EXTRA_RIGHTS','EXTRA_RIGHTS','EXTRA_RIGHTS_REFUSED'],
++    ['TRUNCATED_RIGHTS','CONTROL_TRUNCATED','CONTROL_TRUNCATED_RIGHTS_REFUSED'],
++  ]) {
++    stage = mode;
++    const output = owner.openChannel(); channels.push(output);
++    const bound = owner.spawnTarget(); originals.push(bound.original);
++    if (bound.capability) capabilities.push(bound.capability);
++    needBound(bound);
++    await ready(bound.original, 'READY\n');
++    owner.sendNegative(output, bound.capability, mode);
++    refused = false;
++    try {
++      const unexpected = owner.receive(output); capabilities.push(unexpected);
++    } catch (error) { refused = fixedCode(error) === 'CHANNEL'; }
++    need(refused && owner.negativeDetail(output) === detail);
++    const ended = await endOriginal(bound.original);
++    need(ended.code === 0 && ended.signal === 'NONE' && ended.bothPipesEOF && ended.streamPolicyValid);
++    cases.push(caseName);
++  }
++} catch (error) {
++  status = 'UNSUPPORTED'; code = fixedCode(error); if (code === 'CLEANUP') cleanup = false; process.exitCode = 2;
++} finally {
++  for (const original of originals) { try { await endOriginal(original); } catch { cleanup = false; } }
++  for (const cap of capabilities) { try { owner.closePair(cap); } catch (error) { if (fixedCode(error) !== 'CLOSED') cleanup = false; } }
++  for (const output of channels) { try { owner.closeChannel(output); } catch { cleanup = false; } }
++}
++if (!cleanup) { status = 'UNSUPPORTED'; stage = 'CLEANUP'; code = 'CLEANUP'; process.exitCode = 2; }
++const result = { protocol: 'jev-owned-spawn-pair-negative-fixture-v1', status, stage, code, cases, cleanupKnown: cleanup, sequentialEndpointOnly: true, nativeRecoveryAccepted: false };
++process.stdout.write(JSON.stringify(result) + '\n');
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/nested-owner.mjs
+@@ -0,0 +1,30 @@
++import { loadPrivateBacking, ready, endOriginal, fixedCode } from './facade.mjs';
++let owner, output, bound, cleanup = true, stage = 'LOAD';
++try {
++  owner = loadPrivateBacking(process.env.JEV_DESCRIPTOR_ARTIFACT, process.env.JEV_DESCRIPTOR_SHA);
++  stage = 'CHANNEL';
++  output = owner.adoptInheritedChannel();
++  stage = 'SPAWN_BIND';
++  bound = owner.spawnTarget();
++  if (!bound.capability || bound.refusal) throw Object.assign(new Error('OWNERSHIP'), { code: bound.refusal ?? 'OWNERSHIP' });
++  stage = 'SEND';
++  owner.send(output, bound.capability);
++  stage = 'READY';
++  await ready(bound.original, 'READY\n');
++  process.stdout.write('NESTED_READY\n');
++  process.stdin.resume();
++  await new Promise(resolve => process.stdin.once('end', resolve));
++  stage = 'SETTLEMENT';
++  const ended = await endOriginal(bound.original);
++  if (ended.code !== 0 || ended.signal !== 'NONE' || !ended.streamPolicyValid) throw Object.assign(new Error('FIXTURE'), { code: 'FIXTURE' });
++} catch (error) {
++  /* This fixed failure never includes PID, witness, exception or raw stream. */
++  process.exitCode = 2;
++  if (fixedCode(error) === 'CLEANUP') cleanup = false;
++  process.stderr.write(JSON.stringify({ protocol: 'jev-owned-pair-nested-v1', status: 'REFUSED', stage, code: fixedCode(error) }) + '\n');
++} finally {
++  if (bound) { try { await endOriginal(bound.original); } catch { cleanup = false; } }
++  if (bound?.capability) { try { owner.closePair(bound.capability); } catch (error) { if (fixedCode(error) !== 'CLOSED') cleanup = false; } }
++  if (output) { try { owner.closeChannel(output); } catch { cleanup = false; } }
++  if (!cleanup) process.exitCode = 2;
++}
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/inputs/target.mjs
+@@ -0,0 +1,11 @@
++import { Worker } from 'node:worker_threads';
++const worker = new Worker('setInterval(() => {}, 1000)', { eval: true });
++worker.once('online', () => process.stdout.write('READY\n'));
++let ending = false;
++process.stdin.resume();
++process.stdin.once('end', async () => {
++  ending = true;
++  await worker.terminate();
++});
++worker.once('error', () => { process.exitCode = 2; });
++process.once('beforeExit', () => { if (!ending) process.exitCode = 2; });
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/launch.py
+@@ -0,0 +1,36 @@
++import hashlib
++import json
++import os
++from pathlib import Path
++import stat
++import sys
++# This first entry is a separately pinned platform-trusted execution source.
++def read(path,cap):
++    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
++    try:
++        a=os.fstat(fd)
++        if not stat.S_ISREG(a.st_mode) or a.st_nlink!=1 or a.st_size>cap:raise RuntimeError()
++        b=b''
++        while True:
++            x=os.read(fd,8192)
++            if not x:break
++            b+=x
++            if len(b)>cap:raise RuntimeError()
++        z=os.fstat(fd);p=path.lstat()
++        for k in ['st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_nlink','st_mtime_ns','st_ctime_ns']:
++            if getattr(a,k)!=getattr(z,k) or getattr(a,k)!=getattr(p,k):raise RuntimeError()
++        return b
++    finally:os.close(fd)
++try:
++    if len(sys.argv)!=2:raise RuntimeError()
++    admission_path=Path(sys.argv[1]);a=json.loads(read(admission_path,65536))
++    root=Path(__file__).resolve().parent;manifest=read(root/'manifest.json',65536)
++    if hashlib.sha256(manifest).hexdigest()!=a['sourceManifestSha256']:raise RuntimeError()
++    m=json.loads(manifest);expected=next(x for x in m['files'] if x['relative']=='owner.py')
++    raw=read(root/'owner.py',65536)
++    if hashlib.sha256(raw).hexdigest()!=expected['sha256'] or len(raw)!=expected['bytes']:raise RuntimeError()
++    namespace={'__name__':'jev_owned_pair_owner','__file__':str(root/'owner.py')}
++    exec(compile(raw,str(root/'owner.py'),'exec'),namespace)
++    raise SystemExit(namespace['main'](admission_path))
++except Exception:
++    print('JEV_OWNED_PAIR_LAUNCH_REFUSED',file=sys.stderr);raise SystemExit(2)
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/libc-contract.c
+@@ -0,0 +1,24 @@
++#define _GNU_SOURCE
++#include <features.h>
++#if !defined(__linux__) || !defined(__GLIBC__) || !__GLIBC_PREREQ(2,36)
++#error PUBLIC_GLIBC_236_REQUIRED
++#endif
++#include <sys/pidfd.h>
++#include <gnu/libc-version.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++int main(void) {
++    /* Link/load public wrapper without acquiring any target descriptor. */
++    int (*volatile wrapper)(pid_t,unsigned int)=pidfd_open;
++    const char *version=gnu_get_libc_version();
++    char *end=NULL;
++    if(!wrapper||!version||strlen(version)>32)return 2;
++    unsigned long major=strtoul(version,&end,10);
++    if(end==version||*end!='.')return 2;
++    const char *minor_text=end+1;
++    unsigned long minor=strtoul(minor_text,&end,10);
++    if(end==minor_text||*end||major!=2||minor<36)return 2;
++    if(puts("JEV_PUBLIC_GLIBC_PIDFD_ABI_V1")<0)return 2;
++    return 0;
++}
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/loader.mjs
+@@ -0,0 +1,80 @@
++import fs from 'node:fs';
++import os from 'node:os';
++import crypto from 'node:crypto';
++import path from 'node:path';
++import { registerHooks } from 'node:module';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++const expected={"fixture.mjs":"7dded6bcb8d0ebc1cdb2f89d7ee526d47d9bb22e23bab7cf9500fe4a7686be10","facade.mjs":"bc091781b1744524cdef7d17441cf9c34fa88c6eb5f045fe80ebaf8fa6f94e69","target.mjs":"f0f7e6793b7bd3af72e65f9a3d4047775401f52f6f99c72aaa5f6dc44c69910a","nested-owner.mjs":"c4729ad7e3bb62fc2139a8816fc3a9d92d8acdd00d175fe1af77833b1ae6e77f","metadata.mjs":"e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b"};
++const roles=['fixture.mjs','target.mjs','nested-owner.mjs'];
++const digest=b=>crypto.createHash('sha256').update(b).digest('hex');
++function need(v){if(!v)throw new Error('ENTRY_REFUSED');}
++function same(a,b){return ['dev','ino','uid','gid','mode','size','nlink','mtimeNs','ctimeNs'].every(k=>a[k]===b[k]);}
++function acquire(p,sha,cap){
++  let fd;
++  try{
++    fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
++    const a=fs.fstatSync(fd,{bigint:true});need(a.isFile()&&a.nlink===1n&&a.size>0n&&a.size<=BigInt(cap));
++    const chunks=[];let n=0;
++    while(true){const b=Buffer.alloc(8192),k=fs.readSync(fd,b);if(!k)break;n+=k;need(n<=cap);chunks.push(b.subarray(0,k));}
++    const bytes=Buffer.concat(chunks);need(digest(bytes)===sha&&same(a,fs.fstatSync(fd,{bigint:true}))&&same(a,fs.lstatSync(p,{bigint:true})));
++    return {fd,bytes,initial:a,path:p};
++  }catch(error){if(fd!==undefined)try{fs.closeSync(fd);}catch{}throw error;}
++}
++function ownRead(p){
++  const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
++  try{
++    const chunks=[];let n=0;
++    while(true){const b=Buffer.alloc(8192),k=fs.readSync(fd,b);if(!k)break;n+=k;need(n<=65536);chunks.push(b.subarray(0,k));}
++    return new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks));
++  }finally{fs.closeSync(fd);}
++}
++function writeOwn(meta,artifact,value){
++  need(typeof meta==='string'&&path.isAbsolute(meta)&&path.basename(meta)==='own-metadata.json');
++  need(path.dirname(meta)===path.dirname(path.dirname(artifact)));
++  const raw=Buffer.from(JSON.stringify(value)+'\n');need(raw.length<=65536);
++  const fd=fs.openSync(meta,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
++  try{let at=0;while(at<raw.length){const n=fs.writeSync(fd,raw,at,raw.length-at);need(n>0);at+=n;}fs.fsyncSync(fd);}
++  finally{fs.closeSync(fd);}
++}
++export async function runVerified(entryURL){
++  need(process.platform==='linux'&&process.versions.node==='22.23.0'&&process.versions.napi==='10');
++  need(typeof registerHooks==='function'&&['x64','arm64'].includes(process.arch));
++  const entry=fileURLToPath(entryURL),directory=path.dirname(entry),role=path.basename(entry);
++  need(roles.includes(role)&&directory===path.dirname(fileURLToPath(import.meta.url)));
++  const held=[],mapping=new Map();let hook;let failed=false;
++  try{
++    for(const [name,sha] of Object.entries(expected)){
++      const input=path.join(directory,'verified',name),h=acquire(input,sha,65536);held.push(h);
++      const url=pathToFileURL(path.join(directory,name)).href;
++      if(roles.includes(name))mapping.set(url+'?jevExactV3=1',h.bytes);
++      else mapping.set(url,h.bytes);
++    }
++    hook=registerHooks({load(url,context,nextLoad){
++      if(mapping.has(url))return {format:'module',source:mapping.get(url),shortCircuit:true};
++      need(url.startsWith('node:'));return nextLoad(url,context);
++    }});
++    if(role==='fixture.mjs'){
++      const m=await import(pathToFileURL(path.join(directory,'metadata.mjs')).href);
++      const credentials=m.statusProjection(ownRead('/proc/self/status'));
++      need(credentials.uid.fourEqual&&credentials.gid.fourEqual&&credentials.uid.allNonzero&&credentials.gid.allNonzero);
++      const procfs=m.mountProjection(ownRead('/proc/self/mountinfo'));
++      need(fs.statfsSync('/proc/self',{bigint:true}).type===0x9fa0n);
++      const namespaces=['pid','mnt','user'].map(kind=>m.namespaceProjection(kind,fs.readlinkSync(`/proc/self/ns/${kind}`),fs.readlinkSync(`/proc/self/ns/${kind}`)));
++      const image=acquire(process.execPath,process.env.JEV_NODE_IMAGE_SHA,512*1024*1024);held.push(image);
++      writeOwn(process.env.JEV_OWN_METADATA_PATH,process.env.JEV_DESCRIPTOR_ARTIFACT,{
++        protocol:'jev-owned-pair-own-metadata-v1',platform:'LINUX',architecture:process.arch==='x64'?'X86_64':'ARM64',
++        kernel:m.kernelProjection(os.release()),credentials,procfs,namespaces,
++        node:{version:'22.23.0',napi:10,sha256:digest(image.bytes),bytes:image.bytes.length,provenance:'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION'},
++        priorJobPermissionTransferred:false,continuousCoverage:false,providerAccessQualified:false,recoveryAccepted:false
++      });
++    }
++    await import(pathToFileURL(entry).href+'?jevExactV3=1');
++    for(const h of held)need(same(h.initial,fs.fstatSync(h.fd,{bigint:true}))&&same(h.initial,fs.lstatSync(h.path,{bigint:true})));
++  }catch(error){failed=true;throw error;}
++  finally{
++    let cleanup=true;
++    if(hook)try{hook.deregister();}catch{cleanup=false;}
++    for(const h of held)try{fs.closeSync(h.fd);}catch{cleanup=false;}
++    if(!cleanup&&!failed)throw new Error('ENTRY_REFUSED');
++  }
++}
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/owner.py
+@@ -0,0 +1,249 @@
++import hashlib
++import json
++import os
++from pathlib import Path
++import signal
++import stat
++import subprocess
++import sys
++import time
++import types
++
++CAP=65536
++TOTAL_SECONDS=150
++CLEANUP_SECONDS=10
++SOURCE_LIMIT=65536
++HASH_TOTAL=1024*1024*1024
++SLOTS=['headers','dependencies','libc-build','libc-abi','addon-build','fixture']
++CASE_NAMES=['DIRECT_OWNER_FRESH_ENDPOINT','CLOSED_HANDLE_REFUSED','UNOWNED_HANDLE_REFUSED','NESTED_GENUINE_OWNER_FRESH_ENDPOINT','EXITED_AND_REAPED_HANDLE_REFUSED','MALFORMED_FRAME_REFUSED','EXTRA_RIGHTS_REFUSED','CONTROL_TRUNCATED_RIGHTS_REFUSED']
++STAGES=['ADMISSION','SOURCE_BINDING','TOOL_BINDING','HEADER_DISCOVERY','DEPENDENCY_DISCOVERY','DEPENDENCY_BINDING','LIBC_BUILD','LIBC_ABI','ADDON_BUILD','ARTIFACT_BINDING','ENTRY_BINDING','FIXTURE','RESULT_VALIDATION','SOURCE_RECHECK','RESULT_RETENTION','CLEANUP','UNKNOWN']
++
++def need(v):
++    if not v:raise RuntimeError('OWNED_PAIR_OWNER_REFUSED')
++def shape(s):
++    return tuple(getattr(s,k) for k in ['st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_nlink','st_mtime_ns','st_ctime_ns'])
++def sha(v):need(type(v) is str and len(v)==64 and all(c in '0123456789abcdef' for c in v))
++def keys(v,w):need(type(v) is dict and set(v)==set(w))
++def read(path,cap,deadline,budget):
++    need(time.monotonic()<deadline)
++    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
++    try:
++        a=os.fstat(fd);need(stat.S_ISREG(a.st_mode) and a.st_nlink==1 and 0<=a.st_size<=cap)
++        chunks=[];h=hashlib.sha256();count=0
++        while True:
++            need(time.monotonic()<deadline);b=os.read(fd,65536)
++            if not b:break
++            count+=len(b);budget[0]+=len(b);need(count<=cap and budget[0]<=HASH_TOTAL);h.update(b);chunks.append(b)
++        need(count==a.st_size and shape(a)==shape(os.fstat(fd))==shape(path.lstat()))
++        return b''.join(chunks),{'sha256':h.hexdigest(),'bytes':count},fd,a
++    except BaseException:os.close(fd);raise
++    # Caller owns the retained FD, including on every post-read failure.
++def json_value(raw,cap=CAP,canonical=False):
++    need(0<len(raw)<=cap)
++    def pairs(rows):
++        d={}
++        for k,v in rows:need(k not in d);d[k]=v
++        return d
++    x=json.loads(raw.decode('utf-8'),object_pairs_hook=pairs,parse_constant=lambda _:need(False))
++    if canonical:need((json.dumps(x,separators=(',',':'),ensure_ascii=False)+'\n').encode()==raw)
++    return x
++def write(path,raw,mode=0o600):
++    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
++    try:
++        view=memoryview(raw)
++        while view:
++            n=os.write(fd,view);need(n>0);view=view[n:]
++        os.fsync(fd)
++    finally:os.close(fd)
++def save(path,value):
++    raw=(json.dumps(value,separators=(',',':'))+'\n').encode();need(len(raw)<=CAP);write(path,raw)
++def canonical_fixture(raw,code,err):
++    need(code in [0,2] and err==b'');x=json_value(raw,1024,True)
++    keys(x,['protocol','status','stage','code','cases','cleanupKnown','sequentialEndpointOnly','nativeRecoveryAccepted'])
++    need(x['protocol']=='jev-owned-spawn-pair-negative-fixture-v1' and x['sequentialEndpointOnly'] is True and x['nativeRecoveryAccepted'] is False)
++    need(type(x['cleanupKnown']) is bool and type(x['cases']) is list and x['cases']==CASE_NAMES[:len(x['cases'])])
++    need(type(x['stage']) is str and x['stage'] in ['LOAD','DIRECT_CHANNEL','DIRECT_SPAWN_BIND','DIRECT_SEND_RECEIVE','DIRECT_READY','DIRECT_ENDPOINT','CLOSED_HANDLE','UNOWNED_HANDLE','DIRECT_SETTLEMENT','NESTED_CHANNEL','NESTED_OWNER_BIND','NESTED_READY','NESTED_RECEIVE','NESTED_ENDPOINT','NESTED_SETTLEMENT','EXITED_REAPED_CHANNEL','EXITED_REAPED_SETTLEMENT','EXITED_REAPED_HANDLE','MALFORMED_FRAME','EXTRA_RIGHTS','TRUNCATED_RIGHTS','CLEANUP'])
++    enums=['ARGUMENT','OWNERSHIP','UNSUPPORTED','ALLOCATION','FILESYSTEM','IDENTITY','CLEANUP','NAPI','CLOSED','CHANNEL','PAIR','ACCESS','SHAPE','CAP','COUNT','STATE','SET_CHANGED','UID','DUPLICATE','DEADLINE','UNKNOWN','FIXTURE']
++    if code==0:need(x['status']=='SUPPORTED' and x['stage']=='TRUNCATED_RIGHTS' and x['code']=='NOT_APPLICABLE' and x['cases']==CASE_NAMES and x['cleanupKnown'] is True)
++    else:need(x['status']=='UNSUPPORTED' and x['code'] in enums)
++    return x
++
++def main(admission_path):
++    os.umask(0o077)
++    need(sys.platform=='linux' and all(hasattr(os,k) for k in ['waitid','WNOWAIT','WEXITED','WNOHANG','P_PID']))
++    root=Path(__file__).resolve().parent;deadline=time.monotonic()+TOTAL_SECONDS;budget=[0];held=[];receipts=[];stage='ADMISSION';out=None;active=None;interrupted=[False]
++    def interrupt(_s,_f):interrupted[0]=True
++    signal.signal(signal.SIGTERM,interrupt);signal.signal(signal.SIGINT,interrupt)
++    def input_bytes(path,cap=SOURCE_LIMIT):
++        raw,pin,fd,a=read(path,cap,deadline,budget);held.append((fd,path,a));return raw,pin
++    def unknown():
++        if out:
++            try:save(out/'unknown-hold.json',{'protocol':'jev-owned-pair-owner-unknown-v1','status':'UNKNOWN_HOLD','stage':stage,'originalSlot':active['slot'] if active else 'UNKNOWN','nativeQualified':False,'recoveryAccepted':False})
++            except BaseException:pass
++    def close_inputs():
++        failed=False
++        while held:
++            fd,_,_=held.pop()
++            try:os.close(fd)
++            except BaseException:failed=True
++        return not failed
++    def hold_without_authority():
++        while True:
++            unknown()
++            try:time.sleep(0.1)
++            except BaseException:pass
++    try:
++        a_raw,_=input_bytes(admission_path);admission=json_value(a_raw)
++        keys(admission,['protocol','executionAdmitted','scope','sourceManifestSha256','context','tools','outputParent','outputName'])
++        need(admission['protocol']=='jev-owned-pair-qualification-admission-v1' and admission['executionAdmitted'] is True and admission['scope']=='HARMLESS_OWNED_PAIR_ONLY');sha(admission['sourceManifestSha256'])
++        ctx=admission['context'];keys(ctx,['repository','head','base','runId','runAttempt','job'])
++        need(ctx['repository']=='typicalday/owenloop' and ctx['base']=='b4ead192326ba607558cd3bb7687209cbb7c8165' and ctx['job']=='linux-owned-descriptor-qualification')
++        need(type(ctx['head']) is str and len(ctx['head'])==40 and all(c in '0123456789abcdef' for c in ctx['head']))
++        for k,cap in [('runId',20),('runAttempt',6)]:need(type(ctx[k]) is str and ctx[k].isascii() and ctx[k].isdigit() and 1<=len(ctx[k])<=cap and not ctx[k].startswith('0'))
++        parent=Path(admission['outputParent']);name=admission['outputName']
++        need(parent.is_absolute() and parent.is_dir() and not parent.is_symlink())
++        need(type(name) is str and name.startswith('jev-owned-pair-qualification-') and len(name)<=96 and all(c.isalnum() or c=='-' for c in name))
++        out=parent/name;out.mkdir(mode=0o700)
++        stage='SOURCE_BINDING';m_raw,m_pin=input_bytes(root/'manifest.json');need(m_pin['sha256']==admission['sourceManifestSha256']);manifest=json_value(m_raw)
++        blobs={};source_pins={}
++        for r in manifest['executionFiles']:
++            need(type(r['relative']) is str and not Path(r['relative']).is_absolute() and '..' not in Path(r['relative']).parts)
++            raw,p=input_bytes(root/r['relative']);need(p=={'sha256':r['sha256'],'bytes':r['bytes']});blobs[r['relative']]=raw;source_pins[r['relative']]=p
++        required=['owner.py','launch.py','headers.py','loader.mjs','entry.mjs','libc-contract.c','protocol.json','dependencies/owner.py','dependencies/metadata.mjs','inputs/descriptor.c','inputs/facade.mjs','inputs/fixture.mjs','inputs/nested-owner.mjs','inputs/target.mjs']
++        need(set(blobs)==set(required))
++        protocol=json_value(blobs['protocol.json']);need(protocol['protocol']=='jev-owned-pair-qualification-source-v1' and protocol['executionAdmitted'] is False)
++        ns={'__name__':'jev_verified_original_custody','__file__':str(root/'dependencies/owner.py')}
++        exec(compile(blobs['dependencies/owner.py'],ns['__file__'],'exec'),ns)
++        base=types.SimpleNamespace(**ns);base.CLEANUP_SECONDS=CLEANUP_SECONDS
++        stage='TOOL_BINDING';keys(admission['tools'],['node','cc'])
++        tools={};tool_fds={};tool_paths={}
++        for label,p in [('node',Path(admission['tools']['node'])),('cc',Path(admission['tools']['cc'])),('python',Path(sys.executable))]:
++            need(p.is_absolute());p=p.resolve();raw,pin,fd,z=read(p,512*1024*1024,deadline,budget);held.append((fd,p,z));tool_fds[label]=fd;tool_paths[label]=str(p);tools[label]={**pin,'provenance':'OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION'}
++            if label=='node':
++                # A dedicated private executable path for genuine nested cp.spawn.
++                node_copy=out/'node';write(node_copy,raw,0o700);node_raw,node_pin=input_bytes(node_copy,512*1024*1024);need(node_pin==pin)
++        env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','TZ':'UTC'}
++        class OwnedChannel(base.PipeChannel):
++            def __init__(self,proc,slot,cap):
++                super().__init__(proc,out,slot);self.cap=cap;self.overflow=False;self.closed=False;self.terminal_eof=False
++            def pump(self,seconds,persist=True):
++                need(self.opened)
++                for key,_ in self.selector.select(seconds):
++                    try:raw=os.read(key.fd,8192)
++                    except BlockingIOError:continue
++                    if not raw:self.selector.unregister(key.fileobj);continue
++                    name=key.data;room=max(0,self.cap-len(self.buffers[name]));self.buffers[name].extend(raw[:room]);self.overflow|=len(raw)>room
++                    if persist:
++                        fd=self.fds[name];os.lseek(fd,0,0);view=memoryview(self.buffers[name])
++                        while view:
++                            n=os.write(fd,view);need(n>0);view=view[n:]
++                        os.ftruncate(fd,len(self.buffers[name]))
++                return self.overflow
++            def close(self):
++                if self.closed:return
++                self.terminal_eof=self.eof();self.closed=True;failed=False
++                if self.selector is not None:
++                    try:self.selector.close()
++                    except BaseException:failed=True
++                for stream in [self.proc.stdout,self.proc.stderr]:
++                    try:stream.close()
++                    except BaseException:failed=True
++                for fd in self.fds.values():
++                    try:os.close(fd)
++                    except BaseException:failed=True
++                need(not failed)
++        def original(label,argv,seconds,cap=CAP,child_env=None,extra_fds=(),tool=None,execfd=None):
++            nonlocal active,stage
++            need(label in SLOTS and all(r['slot']!=label for r in receipts) and not interrupted[0] and time.monotonic()<deadline)
++            c=None;channel=None
++            imagefd=tool_fds[tool] if tool else execfd
++            need(imagefd is not None)
++            proc=subprocess.Popen(argv,executable='/proc/self/fd/'+str(imagefd),cwd=out,env=child_env or env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,close_fds=True,pass_fds=tuple(set(extra_fds+(imagefd,))))
++            active={'proc':proc,'slot':label,'custody':None,'channel':None}
++            try:
++                c=base.OriginalCustody(proc);active['custody']=c;channel=OwnedChannel(proc,label,cap);active['channel']=channel
++                try:raw,err,code=base.drive_original(c,channel,min(deadline,time.monotonic()+seconds),interrupted,unknown)
++                finally:
++                    if not c.reaped:hold_without_authority()
++                    stdout,stderr=channel.output();eof=channel.eof()
++                    receipts.append({'slot':label,'directOriginalTerminal':True,'directOriginalReaped':True,'ownedPipesEOF':eof,'exitCode':proc.returncode,'signalsSent':c.signals,'stdoutBytes':len(stdout),'stdoutSha256':hashlib.sha256(stdout).hexdigest(),'stderrBytes':len(stderr),'stderrSha256':hashlib.sha256(stderr).hexdigest(),'streamTruncated':channel.overflow,'globalGroupAbsenceClaimed':False})
++                    try:channel.close()
++                    finally:active=None
++                need(c.reaped and channel.terminal_eof and not channel.overflow and not interrupted[0] and time.monotonic()<deadline)
++                return raw,err,code
++            except BaseException:
++                if active:
++                    if c is None or channel is None:hold_without_authority()
++                    if not c.reaped:hold_without_authority()
++                    active=None
++                raise
++        def good(x):
++            raw,err,code=x;need(code==0 and err==b'');return raw
++        stage='HEADER_DISCOVERY';headers=out/'headers';headers.mkdir(mode=0o700)
++        # Execute the same verified header helper bytes through a retained FD.
++        hf=out/'headers.py';write(hf,blobs['headers.py']);_,_,hfd,z=read(hf,SOURCE_LIMIT,deadline,budget);held.append((hfd,hf,z))
++        header_result=json_value(good(original('headers',[tool_paths['python'],'-B','-I','-S','/proc/self/fd/'+str(hfd),str(headers)],25,extra_fds=(hfd,),tool='python')),canonical=True)
++        need(header_result['protocol']=='jev-owned-pair-headers-v1' and header_result['archiveSha256']==protocol['headerArchiveSha256'])
++        need(set(header_result['selected'])=={'node_api.h','node_api_types.h','js_native_api.h','js_native_api_types.h'})
++        for n,p in header_result['selected'].items():_,actual=input_bytes(headers/n);need(actual==p)
++        stage='DEPENDENCY_DISCOVERY';build=out/'build';build.mkdir(mode=0o700)
++        source=build/'descriptor.c';write(source,blobs['inputs/descriptor.c']);_,source_pin,sfd,z=read(source,SOURCE_LIMIT,deadline,budget);held.append((sfd,source,z));need(source_pin==source_pins['inputs/descriptor.c'])
++        flags=['-std=c11','-O2','-Wall','-Wextra','-Werror','-fPIC','-DNAPI_VERSION=8','-DNODE_GYP_MODULE_NAME=jev_owned_pair','-I',str(headers)]
++        source_arg='/proc/self/fd/'+str(sfd)
++        libc_source=build/'libc-contract.c';write(libc_source,blobs['libc-contract.c']);_,_,lfd,z=read(libc_source,SOURCE_LIMIT,deadline,budget);held.append((lfd,libc_source,z));libc_exe=build/'libc-contract';libc_arg='/proc/self/fd/'+str(lfd)
++        raw=good(original('dependencies',[tool_paths['cc'],*flags,'-x','c','-M','-MT','JEV_OWNED_PAIR',source_arg,libc_arg],15,cap=131072,extra_fds=(sfd,lfd),tool='cc'))
++        text=raw.decode('ascii').replace('\\\n',' ');parts=text.split('JEV_OWNED_PAIR:');need(len(parts)==3 and parts[0]=='');tokens=' '.join(parts[1:]).split();need(1<=len(tokens)<=512)
++        dependency_paths=[];dependencies=[]
++        stage='DEPENDENCY_BINDING'
++        for token in tokens:
++            need(token.startswith('/') and all(c.isalnum() or c in '/_.+-' for c in token));p=source if token==source_arg else (libc_source if token==libc_arg else Path(token).resolve())
++            if p in dependency_paths:continue
++            need(p.is_absolute());raw,pin=input_bytes(p,512*1024*1024);dependency_paths.append(p);dependencies.append({'pathSha256':hashlib.sha256(str(p).encode()).hexdigest(),**pin})
++        need(source in dependency_paths and libc_source in dependency_paths and all((headers/n).resolve() in dependency_paths for n in header_result['selected']))
++        stage='LIBC_BUILD'
++        good(original('libc-build',[tool_paths['cc'],*flags,'-x','c',libc_arg,'-o',str(libc_exe)],20,extra_fds=(lfd,),tool='cc'))
++        libc_bytes,libc_pin,libcfd,z=read(libc_exe,8388608,deadline,budget);held.append((libcfd,libc_exe,z))
++        stage='LIBC_ABI';need(good(original('libc-abi',[str(libc_exe)],5,execfd=libcfd))==b'JEV_PUBLIC_GLIBC_PIDFD_ABI_V1\n')
++        stage='ADDON_BUILD';artifact=build/'descriptor.node'
++        good(original('addon-build',[tool_paths['cc'],*flags,'-shared','-x','c',source_arg,'-o',str(artifact)],25,extra_fds=(sfd,),tool='cc'))
++        stage='ARTIFACT_BINDING';artifact_bytes,artifact_pin=input_bytes(artifact,8388608)
++        for p,expected in zip(dependency_paths,dependencies):
++            _,current=input_bytes(p,512*1024*1024);need(current=={k:expected[k] for k in ['sha256','bytes']})
++        stage='ENTRY_BINDING';entry=out/'entry';entry.mkdir(mode=0o700);verified=entry/'verified';verified.mkdir(mode=0o700)
++        for n in ['fixture.mjs','target.mjs','nested-owner.mjs']:write(entry/n,blobs['entry.mjs'])
++        write(entry/'loader.mjs',blobs['loader.mjs'])
++        for n in ['facade.mjs','metadata.mjs']:
++            raw=blobs['inputs/'+n] if n=='facade.mjs' else blobs['dependencies/metadata.mjs'];write(entry/n,raw)
++        for n in ['fixture.mjs','target.mjs','nested-owner.mjs','facade.mjs']:write(verified/n,blobs['inputs/'+n])
++        write(verified/'metadata.mjs',blobs['dependencies/metadata.mjs'])
++        # Fixed eight-process source map: fixture, five direct targets, nested owner, nested target.
++        child_hash_bound=tools['node']['bytes']+8*sum(source_pins[k]['bytes'] for k in ['inputs/fixture.mjs','inputs/target.mjs','inputs/nested-owner.mjs','inputs/facade.mjs','dependencies/metadata.mjs'])+2*artifact_pin['bytes']
++        need(budget[0]+child_hash_bound<=HASH_TOTAL)
++        stage='FIXTURE';fixture_env={**env,'JEV_DESCRIPTOR_ARTIFACT':str(artifact),'JEV_DESCRIPTOR_SHA':artifact_pin['sha256'],'JEV_NODE_IMAGE_SHA':tools['node']['sha256'],'JEV_OWN_METADATA_PATH':str(out/'own-metadata.json')}
++        raw,err,code=original('fixture',[str(node_copy),str(entry/'fixture.mjs')],40,cap=CAP,child_env=fixture_env,execfd=next(fd for fd,p,_ in held if p==node_copy))
++        stage='RESULT_VALIDATION';result=canonical_fixture(raw,code,err)
++        own_raw,own_pin=input_bytes(out/'own-metadata.json');own=json_value(own_raw,canonical=True)
++        keys(own,['protocol','platform','architecture','kernel','credentials','procfs','namespaces','node','priorJobPermissionTransferred','continuousCoverage','providerAccessQualified','recoveryAccepted'])
++        need(own['platform']=='LINUX' and own['architecture'] in ['X86_64','ARM64'] and own['priorJobPermissionTransferred'] is False and own['continuousCoverage'] is False)
++        need(own['protocol']=='jev-owned-pair-own-metadata-v1' and own['node']['sha256']==tools['node']['sha256'] and own['node']['version']=='22.23.0' and own['providerAccessQualified'] is False and own['recoveryAccepted'] is False)
++        stage='SOURCE_RECHECK'
++        for name,before in blobs.items():raw,after=input_bytes(root/name);need(after==source_pins[name] and raw==before)
++        for fd,p,z in held:need(shape(z)==shape(os.fstat(fd))==shape(p.lstat()))
++        need(not interrupted[0] and time.monotonic()<deadline and budget[0]+child_hash_bound<=HASH_TOTAL and len(receipts)==6 and all(r['signalsSent']==0 and not r['streamTruncated'] and r['ownedPipesEOF'] for r in receipts))
++        stage='CLEANUP';need(close_inputs())
++        stage='RESULT_RETENTION'
++        summary={'protocol':'jev-owned-pair-qualification-result-v1','status':'SUPPORTED' if code==0 else 'UNSUPPORTED','stage':stage,'fixture':result,'originals':receipts,'sourceManifestSha256':m_pin['sha256'],'sourcePins':source_pins,'context':ctx,'tools':tools,'headers':header_result,'selectedDependencyCount':len(dependencies),'selectedDependenciesSha256':hashlib.sha256(json.dumps(dependencies,separators=(',',':')).encode()).hexdigest(),'artifact':artifact_pin,'libcContract':libc_pin,'ownMetadata':own,'ownMetadataPin':own_pin,'hashBudget':{'ownerSelectedBytes':budget[0],'fixtureAdditionalBoundBytes':child_hash_bound,'totalCapBytes':HASH_TOTAL},'inputFDsClosed':True,'deadlineReached':False,'interrupted':False,'platformRuntimeTrustRequired':True,'compilerDistributionQualified':False,'globalGroupAbsenceClaimed':False,'providerAccessQualified':False,'recoveryAccepted':False}
++        # Private raw streams and dependency paths never enter the result.
++        save(out/'dependency-closure.private.json',{'paths':[str(p) for p in dependency_paths],'pins':dependencies})
++        save(out/'result.json',summary)
++        need(not interrupted[0] and time.monotonic()<deadline)
++        print('JEV_OWNED_PAIR_COMPLETE' if code==0 else 'JEV_OWNED_PAIR_UNSUPPORTED');return code
++    except BaseException:
++        if active:hold_without_authority()
++        if not close_inputs():stage='CLEANUP'
++        if out:
++            try:save(out/'result.json',{'protocol':'jev-owned-pair-qualification-result-v1','status':'REFUSED','stage':stage if stage in STAGES else 'UNKNOWN','originals':receipts,'deadlineReached':time.monotonic()>=deadline,'interrupted':interrupted[0],'nativeQualified':False,'providerAccessQualified':False,'recoveryAccepted':False,'globalGroupAbsenceClaimed':False})
++            except BaseException:pass
++        print('JEV_OWNED_PAIR_OWNER_REFUSED',file=sys.stderr);return 2
++    finally:
++        if not close_inputs():raise RuntimeError('OWNED_PAIR_OWNER_REFUSED')
+--- /dev/null
++++ /Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/protocol.json
+@@ -0,0 +1,301 @@
++{
++  "admissionProtocol": "jev-owned-pair-qualification-admission-v1",
++  "allCasesUnrun": true,
++  "caps": {
++    "archiveDeclaredTotalBytes": 134217728,
++    "archiveEntries": 8192,
++    "archiveEntryBytes": 16777216,
++    "cleanupSeconds": 10,
++    "compiledImageBytes": 8388608,
++    "dependencyStreamBytes": 131072,
++    "fixtureFrameBytes": 1024,
++    "fixtureSeconds": 40,
++    "headerArchiveBytes": 16777216,
++    "selectedDependencies": 512,
++    "sharedOwnerSeconds": 150,
++    "sourceAdmissionManifestResultBytes": 65536,
++    "toolImageBytesEach": 536870912,
++    "totalSelectedHashBytesIncludingChildBound": 1073741824
++  },
++  "cleanup": "Explicitly close all acquired source/tool FDs, sender aliases and eight-case pair/channel handles. Uncertainty refuses; GC fallback is never affirmative cleanup. COMPLETE alone is settlement, not qualification.",
++  "compilerFlags": [
++    "-std=c11",
++    "-O2",
++    "-Wall",
++    "-Wextra",
++    "-Werror",
++    "-fPIC",
++    "-DNAPI_VERSION=8",
++    "-DNODE_GYP_MODULE_NAME=jev_owned_pair",
++    "-I",
++    "FRESH_SELECTED_HEADERS"
++  ],
++  "componentFrameUpperBytes": 2048,
++  "componentIndependentReview": [
++    {
++      "bytes": 5457,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.md",
++      "sha256": "fed40e4fe54b8fc1729ce45a99ed516e030c43cf583060f30ccf4488b38f69c8"
++    },
++    {
++      "bytes": 20494,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.json",
++      "sha256": "6c7cfb0f9d56cdeff484595c441ec29a314238ed988bf1af209051d844e8c3dd"
++    }
++  ],
++  "componentSource": {
++    "bytes": 16302,
++    "mode": 384,
++    "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/manifest.json",
++    "sha256": "bc59a9c82a5d4ca83292cd0860724724fb4a3d044f3173d9e71c1df87122264c"
++  },
++  "continuousThreadCoverage": false,
++  "custody": "Each of six exact Popen originals is retained, public waitid WNOWAIT precedes any numeric group signal, terminal reap and both owned pipe EOF required. No signal after reap. Qualified Node children use exact genuine ChildProcess same-stack acquisition, not a supplied witness PID.",
++  "darwinPolicyReplacement": false,
++  "entryCommand": [
++    "QUALIFIED_PYTHON",
++    "-B",
++    "-I",
++    "-S",
++    "/Volumes/more/jev-linux-owned-descriptor-eight-case-publication-source-v1-20261012/qualification/launch.py",
++    "FRESH_ROOT_ADMISSION_PATH"
++  ],
++  "executionAdmitted": false,
++  "executionFiles": [
++    "owner.py",
++    "launch.py",
++    "headers.py",
++    "loader.mjs",
++    "entry.mjs",
++    "libc-contract.c",
++    "protocol.json",
++    "dependencies/owner.py",
++    "dependencies/metadata.mjs",
++    "inputs/descriptor.c",
++    "inputs/facade.mjs",
++    "inputs/fixture.mjs",
++    "inputs/nested-owner.mjs",
++    "inputs/target.mjs"
++  ],
++  "firstEntryTrustBoundary": "Isolated hosted platform and explicitly admitted launch/entry/loader paths remain trusted first execution inputs; pathname before/after hashes do not prove immutable first-entry execution. Dynamic runtime/compiler libraries and Python stdlib remain platform/distribution trust.",
++  "fixtureAcceptedFrameBytes": 1024,
++  "fixtureCaseNames": [
++    "DIRECT_OWNER_FRESH_ENDPOINT",
++    "CLOSED_HANDLE_REFUSED",
++    "UNOWNED_HANDLE_REFUSED",
++    "NESTED_GENUINE_OWNER_FRESH_ENDPOINT",
++    "EXITED_AND_REAPED_HANDLE_REFUSED",
++    "MALFORMED_FRAME_REFUSED",
++    "EXTRA_RIGHTS_REFUSED",
++    "CONTROL_TRUNCATED_RIGHTS_REFUSED"
++  ],
++  "fixtureProtocol": "jev-owned-spawn-pair-negative-fixture-v1",
++  "frameCapExplanation": "Unchanged stricter owner1024 canonical parser; all fixed eight-case frames fit, no output budget increase.",
++  "futureBindings": [
++    "Externally admitted actual source manifest SHA and source publication/entry map",
++    "Actual head/base/runId/runAttempt/job and one selected original admission",
++    "Actual qualified Python/Node/compiler paths; observed image pins and fresh public headers/dependencies",
++    "Exclusive output parent/name and exact public artifact transport/audit; no workflow provided or modified"
++  ],
++  "headerArchiveSha256": "ac07673009b92d70f3d842df28204e92785234bae6b4d5785f63fbca8408fc69",
++  "headerArchiveUrl": "https://nodejs.org/dist/v22.23.0/node-v22.23.0-headers.tar.gz",
++  "loadedV3SourceRule": "Public synchronous registerHooks supplies exact already-read eight-case input bytes. Existing query literal jevExactV3 is only a cache bypass key, not a V3 provenance claim. Every child has declared entry/loader; no Worker inheritance claim.",
++  "nativeRecoveryAccepted": false,
++  "newExecutionSources": [
++    "launch.py",
++    "owner.py",
++    "headers.py",
++    "libc-contract.c",
++    "entry.mjs",
++    "loader.mjs"
++  ],
++  "nodeRequirement": {
++    "architectures": [
++      "X86_64",
++      "ARM64"
++    ],
++    "distributionProvenance": "OBSERVED_EXECUTABLE_UNVERIFIED_DISTRIBUTION",
++    "napi": 10,
++    "platform": "LINUX",
++    "version": "22.23.0"
++  },
++  "oldActualOrProviderAccess": false,
++  "passRequirements": [
++    "Root separately admits exact source/context/tools and one owner original",
++    "Owner natural code0 within total bound, six settled/reaped originals and both pipe EOF, no signal/truncation/interruption",
++    "Canonical eight-case SUPPORTED with exact ordered cases, TRUNCATED_RIGHTS success stage and cleanupKnown=true",
++    "Same-job own-process metadata and public libc ABI fixed positive result",
++    "Root independently checks final source/custody/selected dependencies/artifact/result"
++  ],
++  "privacy": "Fixed schemas/enums/counts/hashes only; no PID/UID values, raw exceptions, provider/auth/model data, raw streams or selected dependency paths in public result. No provider secrets; Actions platform credentials/trust are not claimed absent.",
++  "privateOnlyFiles": [
++    "Exactly <slot>.stdout and <slot>.stderr",
++    "dependency-closure.private.json",
++    "all actual source/tool paths"
++  ],
++  "protocol": "jev-owned-pair-qualification-source-v1",
++  "providerAccessQualified": false,
++  "publicOutputFiles": [
++    "result.json"
++  ],
++  "resourceBound": {
++    "addonHashes": 2,
++    "fiveVerifiedSourceSetHashPasses": 8,
++    "fixtureProcessCount": 8,
++    "formula": "node.bytes + 8*sum(fixture,target,nested-owner,facade,metadata source bytes) + 2*artifact.bytes",
++    "genuineChildOriginals": 7,
++    "nodeImageHashes": 1,
++    "overflowRefuses": true,
++    "sharedTotalCapBytes": 1073741824
++  },
++  "resultProtocol": "jev-owned-pair-qualification-result-v1",
++  "retainedOriginalSlots": [
++    "headers",
++    "dependencies",
++    "libc-build",
++    "libc-abi",
++    "addon-build",
++    "fixture"
++  ],
++  "retryPermitted": false,
++  "runtimeAccepted": false,
++  "runtimeEntryMap": {
++    "entry/facade.mjs": "inputs/facade.mjs",
++    "entry/fixture.mjs": "entry.mjs",
++    "entry/loader.mjs": "loader.mjs",
++    "entry/metadata.mjs": "dependencies/metadata.mjs",
++    "entry/nested-owner.mjs": "entry.mjs",
++    "entry/target.mjs": "entry.mjs",
++    "entry/verified/facade.mjs": "inputs/facade.mjs",
++    "entry/verified/fixture.mjs": "inputs/fixture.mjs",
++    "entry/verified/metadata.mjs": "dependencies/metadata.mjs",
++    "entry/verified/nested-owner.mjs": "inputs/nested-owner.mjs",
++    "entry/verified/target.mjs": "inputs/target.mjs"
++  },
++  "scope": "HARMLESS_OWNED_PAIR_ONLY",
++  "selectedHeaders": [
++    "node_api.h",
++    "node_api_types.h",
++    "js_native_api.h",
++    "js_native_api_types.h"
++  ],
++  "sourceOnly": true,
++  "sourcePacketRevision": "EIGHT_CASE_V1",
++  "sourceReferences": [
++    {
++      "bytes": 16302,
++      "mode": 384,
++      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/manifest.json",
++      "sha256": "bc59a9c82a5d4ca83292cd0860724724fb4a3d044f3173d9e71c1df87122264c"
++    },
++    {
++      "bytes": 12381,
++      "mode": 384,
++      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v2-20261012/protocol.json",
++      "sha256": "4f2859db779c2b282c05690e86a9884aebb2bb3dce1acb988459534fdbdb1b5a"
++    },
++    {
++      "bytes": 12701,
++      "mode": 384,
++      "path": "/Volumes/more/jev-linux-owned-descriptor-negative-controls-source-v1-20261012/manifest.json",
++      "sha256": "fdd23a7c4948f002ba84cd76ed19f2d421153677b1528ba8a8c4625041ea58dd"
++    },
++    {
++      "bytes": 6579,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v1-independent-whole-source-review-20261012-transport.md",
++      "sha256": "ee1e166ddd862cb1a32e4bed49c40908d5bad47f2e69b7550649ca42c2f73c78"
++    },
++    {
++      "bytes": 25803,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v1-independent-whole-source-review-20261012-transport.json",
++      "sha256": "7a2c39dfd4c2da9e8cd30255dcd68a867a06f7bde60219bacf0886203d0b1c41"
++    },
++    {
++      "bytes": 15707,
++      "mode": 384,
++      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-qualification-source-v1-20261012/manifest.json",
++      "sha256": "47fbb10167c18620c3227abaf050518112a8fabf2ec76d6dbd74e3a037439e6b"
++    },
++    {
++      "bytes": 6357,
++      "mode": 384,
++      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-publication-source-v2-20261012/manifest.json",
++      "sha256": "7b7004c80ac82f16d8213b4e330e0b01b31a0f04c5ecaac267a7f272cc1a79a1"
++    },
++    {
++      "bytes": 8109,
++      "mode": 384,
++      "path": "/Volumes/more/jev-linux-owned-spawn-descriptor-publication-source-v2-20261012/protocol.json",
++      "sha256": "b896dbb6683d1236032e7ed3b212d92f0979ef63d25b0f2e3080fd88035530d9"
++    },
++    {
++      "bytes": 2997,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-descriptor-head75c-attempt2-root-bounded-actual-acceptance-20261012.json",
++      "sha256": "3b07b2d2e4006223ca69576870f6d3643370b8eee5cf9d16780d545b94a3882e"
++    },
++    {
++      "bytes": 3802,
++      "mode": 384,
++      "path": "/Volumes/more/jev-head75c-service67-linux-input-source-prep-20261012/manifest.json",
++      "sha256": "8015318b4671f0436b04a288b1c406001dcd365295d214158f01e0b486ac845b"
++    },
++    {
++      "bytes": 5457,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.md",
++      "sha256": "fed40e4fe54b8fc1729ce45a99ed516e030c43cf583060f30ccf4488b38f69c8"
++    },
++    {
++      "bytes": 20494,
++      "mode": 384,
++      "path": "/Volumes/more/owenloop-evidence-offload-20261008/full-ledger/jev-linux-owned-descriptor-negative-v2-independent-whole-source-review-20261012-transport.json",
++      "sha256": "6c7cfb0f9d56cdeff484595c441ec29a314238ed988bf1af209051d844e8c3dd"
++    }
++  ],
++  "sourceReviewThenSeparateExecutionRequired": true,
++  "stagePlan": [
++    {
++      "operation": "Exact hash-bound Node22.23.0 public header archive fetch; four selected files only; no redirect/extractall",
++      "seconds": 25,
++      "slot": "headers",
++      "streamCapBytes": 65536
++    },
++    {
++      "operation": "Same verified compiler image -M for both retained descriptor and libc source FDs; selected source/header closure recorded privately",
++      "seconds": 15,
++      "slot": "dependencies",
++      "streamCapBytes": 131072
++    },
++    {
++      "operation": "Compile/link public glibc >=2.36 pidfd_open reference; no target call",
++      "seconds": 20,
++      "slot": "libc-build",
++      "streamCapBytes": 65536
++    },
++    {
++      "operation": "Execute held compiled image FD; fixed ABI/version output; no target acquisition",
++      "seconds": 5,
++      "slot": "libc-abi",
++      "streamCapBytes": 65536
++    },
++    {
++      "operation": "Compile exact corrected negative-controls V2 descriptor.c with same selected header/compiler inputs",
++      "seconds": 25,
++      "slot": "addon-build",
++      "streamCapBytes": 65536
++    },
++    {
++      "operation": "One eight-case genuine direct/nested owner fixture; exited-and-reaped and malformed/extra/control-truncated rights refusal; seven child originals plus fixture process",
++      "seconds": 40,
++      "slot": "fixture",
++      "streamCapBytes": 65536
++    }
++  ],
++  "unknownHold": "UNKNOWN_HOLD is nonterminal and nonpassing. Retain original Popen/custody/channels; no next stage, reconstructed PID authority, timeout restart, external kill, or global escape/descendant absence claim. Separate root handling is required.",
++  "unsupportedIsTerminal": true
++}

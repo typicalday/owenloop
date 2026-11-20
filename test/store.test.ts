@@ -16,6 +16,103 @@ function mem(): Store {
   return new Store(':memory:');
 }
 
+/** Build an actual pre-generation shape; stamping a current ledger older is not migration evidence. */
+function removeNativeClaimMigration(db: DatabaseSync): void {
+  for(const row of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'native_*'").all() as Array<{name:string}>)
+    db.exec(`DROP TRIGGER ${row.name}`);
+  db.exec(`DROP INDEX IF EXISTS workflow_firing_incarnation;
+    DROP TABLE IF EXISTS native_claim_generations; DROP TABLE IF EXISTS native_claim_bindings; DROP TABLE IF EXISTS native_claim_legacy_runs;
+    DELETE FROM meta WHERE k='native_claim_generation_cutover';
+    UPDATE meta SET v='15' WHERE k='schema_version'`);
+  if((db.prepare('PRAGMA table_info(workflow)').all() as Array<{name:string}>).some(row=>row.name==='firing_incarnation'))
+    db.exec('ALTER TABLE workflow DROP COLUMN firing_incarnation');
+}
+
+test('native generation zero is read-only; committed claims advance once and failed transactions roll back', () => {
+  const s=mem();
+  s.insertWorkflow('frame',{def:'test'});
+  const initial=s.getNativeClaimGeneration('frame','build','');
+  assert.equal(initial.generation,0);
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM native_claim_generations').get()!.n,0);
+  assert.throws(()=>s.tx(()=>{
+    s.insertRun('bad',{workflow:'frame',step:'build',key:''});
+    s.recordNativeClaim('frame','build','','bad',initial);
+    throw new Error('after-real-binding');
+  }),/after-real-binding/);
+  assert.equal(s.getRun('bad'),undefined);
+  assert.deepEqual(s.getNativeClaimGeneration('frame','build',''),initial);
+  s.tx(()=>{s.insertRun('one',{workflow:'frame',step:'build',key:''});s.recordNativeClaim('frame','build','','one',initial);});
+  assert.deepEqual(s.getNativeClaimBinding('one'),initial);
+  assert.equal(s.getNativeClaimGeneration('frame','build','').generation,1);
+  assert.throws(()=>s.tx(()=>{s.insertRun('two',{workflow:'frame',step:'build',key:''});s.recordNativeClaim('frame','build','','two',initial);}),/CAS refused/);
+  assert.equal(s.getRun('two'),undefined);
+  s.close();
+});
+
+test('a tracked run missing in the current incarnation is corruption, not another eligible epoch', () => {
+  const s=mem();s.insertWorkflow('frame',{def:'test'});
+  const initial=s.getNativeClaimGeneration('frame','build','');
+  s.tx(()=>{s.insertRun('one',{workflow:'frame',step:'build',key:''});s.recordNativeClaim('frame','build','','one',initial);});
+  s.db.prepare('DELETE FROM run WHERE id=?').run('one');
+  assert.throws(()=>s.getNativeClaimGeneration('frame','build',''),/tracked run missing/);
+  s.close();
+});
+
+test('new unclassified run refuses; task reset cannot reset native claim generation', () => {
+  const s=mem();s.insertWorkflow('frame',{def:'test'});
+  const initial=s.getNativeClaimGeneration('frame','build','');
+  s.tx(()=>{s.insertRun('one',{workflow:'frame',step:'build',key:''});s.recordNativeClaim('frame','build','','one',initial);});
+  s.putTask({workflow:'frame',step:'build',key:'',status:'idle',attempts:0});
+  assert.equal(s.getNativeClaimGeneration('frame','build','').generation,1);
+  s.insertRun('untracked',{workflow:'frame',step:'build',key:''});
+  assert.throws(()=>s.getNativeClaimGeneration('frame','build',''),/history unclassified/);
+  s.close();
+});
+
+test('workflow delete/recreate keeps old tombstones and gives a non-ABA incarnation', () => {
+  const s=mem();s.insertWorkflow('frame',{def:'test'});
+  const before=s.getNativeClaimGeneration('frame','build','');
+  s.tx(()=>{s.insertRun('old',{workflow:'frame',step:'build',key:''});s.recordNativeClaim('frame','build','','old',before);});
+  s.deleteWorkflow('frame');s.insertWorkflow('frame',{def:'test'});
+  const after=s.getNativeClaimGeneration('frame','build','');
+  assert.equal(after.generation,0);assert.notEqual(after.frameIncarnation,before.frameIncarnation);
+  assert.deepEqual(s.getNativeClaimBinding('old'),before);
+  assert.throws(()=>s.insertRun('old',{workflow:'frame',step:'build',key:''}),/identity consumed/);
+  s.close();
+});
+
+test('real v15 migration classifies exact active legacy run, persists cutover across reopen, and allows old completion', () => {
+  const dir=mkdtempSync(join(tmpdir(),'native-cutover-'));const path=join(dir,'store.db');
+  try {
+    const setup=new Store(path);setup.insertWorkflow('frame',{def:'test'});
+    setup.insertRun('legacy',{workflow:'frame',step:'build',key:''});setup.close();
+    const raw=new DatabaseSync(path);removeNativeClaimMigration(raw);raw.close();
+    const migrated=new Store(path);
+    const epoch=migrated.getNativeClaimGeneration('frame','build','');
+    const cutover=migrated.getMeta('native_claim_generation_cutover');
+    assert.equal(epoch.generation,0);assert.equal(migrated.getNativeClaimBinding('legacy'),undefined);
+    migrated.updateRun('legacy',{outcome:'released'});
+    assert.equal(migrated.getRun('legacy')!.outcome,'released');migrated.close();
+    const reopened=new Store(path);assert.deepEqual(reopened.getNativeClaimGeneration('frame','build',''),epoch);
+    assert.equal(reopened.getMeta('native_claim_generation_cutover'),cutover);reopened.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('native migration failure rolls back incarnation, exact classification, and schema stamp', () => {
+  const dir=mkdtempSync(join(tmpdir(),'native-cutover-fail-'));const path=join(dir,'store.db');
+  try {
+    const setup=new Store(path);setup.insertWorkflow('frame',{def:'test'});setup.close();
+    const raw=new DatabaseSync(path);removeNativeClaimMigration(raw);
+    raw.exec("CREATE TRIGGER refuse_cutover BEFORE INSERT ON meta WHEN NEW.k='native_claim_generation_cutover' BEGIN SELECT RAISE(ABORT,'cutover failure'); END");raw.close();
+    assert.throws(()=>new Store(path),/cutover failure/);
+    const check=new DatabaseSync(path);
+    assert.equal(check.prepare("SELECT v FROM meta WHERE k='schema_version'").get()!.v,'15');
+    assert.equal(check.prepare("SELECT 1 FROM sqlite_master WHERE name='native_claim_legacy_runs'").get(),undefined);
+    assert.equal((check.prepare('PRAGMA table_info(workflow)').all() as Array<{name:string}>).some(r=>r.name==='firing_incarnation'),false);
+    check.close();
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 function interfaceBinding(): InterfaceCallBinding {
   return {
     interface: { name: 'research-report', version: '1' },
@@ -196,16 +293,18 @@ test('schema14 migration adds claim prior storage without fabricating legacy sna
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const db = join(dir, 'store.db');
   const initial = new Store(db);
+  initial.insertWorkflow('wf',{def:'legacy'});
   initial.insertRun('pre-v15', { workflow: 'wf', step: 'maker', key: '' });
   initial.close();
   const raw = new DatabaseSync(db);
   raw.exec('DROP TABLE claim_prior_version');
+  removeNativeClaimMigration(raw);
   raw.prepare("UPDATE meta SET v = '14' WHERE k = 'schema_version'").run();
   raw.close();
 
   const migrated = new Store(db);
   try {
-    assert.equal(migrated.getMeta('schema_version'), '15');
+    assert.equal(migrated.getMeta('schema_version'), '16');
     assert.equal(migrated.getClaimPriorVersion('pre-v15', 'plan'), undefined);
     migrated.tx(() => {
       migrated.insertRun('post-v15', { workflow: 'wf', step: 'maker', key: '' });
@@ -481,17 +580,19 @@ test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read 
   try {
     const s1 = new Store(dbPath);
     const legacy = randId('run');
+    s1.insertWorkflow('wf_legacy',{def:'legacy'});
     s1.insertRun(legacy, { workflow: 'wf_legacy', step: 'builder' });
     s1.close();
 
     // Simulate a pre-v7 on-disk state: drop the column and stamp the old version.
     const raw = new DatabaseSync(dbPath);
     raw.exec('ALTER TABLE run DROP COLUMN order_json');
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('6', 'schema_version');
     raw.close();
 
     const s2 = new Store(dbPath); // migrate() must re-add order_json, bump to current
-    assert.equal(s2.getMeta('schema_version'), '15', 'upgraded to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '16', 'upgraded to current SCHEMA_VERSION');
     const cols = (s2.db.prepare('PRAGMA table_info(run)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('order_json'), 'order_json column re-added by migrate()');
     assert.equal(s2.getRun(legacy)?.order, undefined, 'legacy run reads order undefined');
@@ -524,6 +625,7 @@ test('migration: a pre-v9 reason thread backfills once and reopening v9 is idemp
     // but v8's new history tables have no rows yet.
     const raw = new DatabaseSync(dbPath);
     raw.exec('DELETE FROM artifact_event; DELETE FROM artifact_version;');
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('8', 'schema_version');
     raw.close();
 
@@ -826,11 +928,12 @@ test('migration: a v11 DB gains nullable interface bindings without inventing a 
     s1.close();
     const raw = new DatabaseSync(dbPath);
     raw.exec('ALTER TABLE workflow DROP COLUMN interface_bindings');
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('11', 'schema_version');
     raw.close();
 
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '15');
+    assert.equal(s2.getMeta('schema_version'), '16');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((column) => column.name);
     assert.ok(cols.includes('interface_bindings'));
     assert.equal(s2.getWorkflow(legacy)?.interfaceBindings, undefined);
@@ -903,11 +1006,12 @@ test('migration: a pre-modifier DB adds the column with no backfill (existing ro
     // Simulate a pre-v10 on-disk state: drop the column and stamp the old version.
     const raw = new DatabaseSync(dbPath);
     raw.exec('ALTER TABLE workflow DROP COLUMN modifier');
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('9', 'schema_version');
     raw.close();
 
     const s2 = new Store(dbPath); // migrate() must re-add modifier, bump to current
-    assert.equal(s2.getMeta('schema_version'), '15', 'upgraded to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '16', 'upgraded to current SCHEMA_VERSION');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('modifier'), 'modifier column re-added by migrate()');
     // No backfill: an instance created before modifiers existed IS an
@@ -934,10 +1038,11 @@ test('migration: a v10 DB gains nullable metadata without inventing a value', ()
     s1.close();
     const raw = new DatabaseSync(dbPath);
     raw.exec('ALTER TABLE workflow DROP COLUMN meta');
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('10', 'schema_version');
     raw.close();
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '15');
+    assert.equal(s2.getMeta('schema_version'), '16');
     assert.equal(s2.getWorkflow(legacy)?.meta, undefined);
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('meta'));
@@ -1070,7 +1175,7 @@ test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write
 
 test('fresh database stamps schema_version to current SCHEMA_VERSION, no throw', () => {
   const s = mem();
-  assert.equal(s.getMeta('schema_version'), '15');
+  assert.equal(s.getMeta('schema_version'), '16');
   s.close();
 });
 
@@ -1081,7 +1186,7 @@ test('opening a DB already at current SCHEMA_VERSION is a no-op, no throw', () =
     const s1 = new Store(dbPath);
     s1.close();
     const s2 = new Store(dbPath); // reopen at same version — must not throw
-    assert.equal(s2.getMeta('schema_version'), '15');
+    assert.equal(s2.getMeta('schema_version'), '16');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1093,11 +1198,12 @@ test('opening a DB with an older schema_version upgrades normally (regression gu
   const dbPath = join(dir, 'test.db');
   try {
     const s1 = new Store(dbPath);
+    removeNativeClaimMigration(s1.db);
     s1.setMeta('schema_version', '3'); // simulate an old on-disk stamp
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '15', 'upgrades to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '16', 'upgrades to current SCHEMA_VERSION');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1110,17 +1216,17 @@ test('opening a DB with a newer-than-binary schema_version throws StoreVersionEr
   try {
     // Create a normal DB, then simulate a newer binary having stamped it.
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '16');
+    s1.setMeta('schema_version', '17');
     s1.close();
 
-    // Reopening at this binary's SCHEMA_VERSION ('15') must refuse.
+    // Reopening at this binary's SCHEMA_VERSION ('16') must refuse.
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     // Direct raw read proves schema_version was NOT rewritten downward by
     // the throwing constructor.
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '16', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '17', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1135,11 +1241,12 @@ test('§28: old-DB-upgrades-fine at the current SCHEMA_VERSION (def_snapshot/def
   const dbPath = join(dir, 'test.db');
   try {
     const s1 = new Store(dbPath);
+    removeNativeClaimMigration(s1.db);
     s1.setMeta('schema_version', '5'); // simulate a pre-pinning on-disk stamp
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '15');
+    assert.equal(s2.getMeta('schema_version'), '16');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('def_snapshot'));
     assert.ok(cols.includes('def_hash'));
@@ -1211,6 +1318,7 @@ test('REL-5: migration is transactional — a failure mid-migrate rolls back, ol
     raw.exec('DROP INDEX IF EXISTS workflow_produced_by_unique');
     raw.exec('ALTER TABLE run DROP COLUMN order_json');
     raw.exec('CREATE TABLE workflow_produced_by_unique (x INTEGER)');
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('6', 'schema_version');
     raw.close();
 
@@ -1242,7 +1350,7 @@ test('REL-5: the migration tx re-checks schema_version under the write lock (TOC
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-toctou-'));
   const dbPath = join(dir, 'test.db');
   try {
-    const s = new Store(dbPath); // opens clean at the current version ('15')
+    const s = new Store(dbPath); // opens clean at the current version ('16')
     // A concurrent newer binary migrates + stamps the shared file.
     const other = new DatabaseSync(dbPath);
     other.prepare('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(
@@ -1267,7 +1375,7 @@ test('REL-5: the migration tx re-checks schema_version under the write lock (TOC
     const cleanPath = join(dir, 'clean.db');
     const s2 = new Store(cleanPath);
     const check = (s2 as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s2);
-    assert.equal(check(), '15', 're-check returns the current version and does not throw at parity');
+    assert.equal(check(), '16', 're-check returns the current version and does not throw at parity');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1316,13 +1424,14 @@ test('REL-5: legacy duplicate children are tolerated on open (index skipped, no 
     );
     ins.run(older, 'childDef', parentWf, 'deliver', 1000);
     ins.run(newer, 'childDef', parentWf, 'deliver', 2000);
+    removeNativeClaimMigration(raw);
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('7', 'schema_version');
     raw.close();
 
     // Reopening must NOT throw and must NOT delete data — it tolerates the
     // duplicates and simply skips creating the unique index.
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '15', 'still upgrades the version stamp');
+    assert.equal(s2.getMeta('schema_version'), '16', 'still upgrades the version stamp');
     const idxRow = s2.db
       .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'workflow_produced_by_unique'`)
       .get();
@@ -1375,12 +1484,12 @@ test('findChildByParent: id breaks the tie when created_at is identical (determi
     const raw = new DatabaseSync(dbPath);
     raw.exec('DROP INDEX IF EXISTS workflow_produced_by_unique');
     const ins = raw.prepare(
-      `INSERT INTO workflow (id, def, produced_by_wf, produced_by_path, created_at) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO workflow (id, def, produced_by_wf, produced_by_path, created_at, firing_incarnation) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     // Insert the lexically-larger id FIRST so natural rowid order disagrees
     // with id order — proving the tiebreak is the ORDER BY, not insert order.
-    ins.run(hi, 'childDef', parentWf, 'deliver', 5000);
-    ins.run(lo, 'childDef', parentWf, 'deliver', 5000);
+    ins.run(hi, 'childDef', parentWf, 'deliver', 5000, `fi_${'b'.repeat(24)}`);
+    ins.run(lo, 'childDef', parentWf, 'deliver', 5000, `fi_${'a'.repeat(24)}`);
     raw.close();
 
     const s = new Store(dbPath);
@@ -1936,8 +2045,15 @@ test('native schema13 migrates without relabeling or rewriting workflow/run/invo
   raw.close();
   for (let i = 0; i < 2; i++) {
     const s = new Store(path);
-    assert.equal(s.getMeta('schema_version'), '15');
-    assert.deepEqual(tables.map(t => s.db.prepare(`SELECT * FROM ${t}`).all()), before);
+    assert.equal(s.getMeta('schema_version'), '16');
+    assert.deepEqual(tables.map(t => s.db.prepare(`SELECT * FROM ${t}`).all().map(row=>{
+      if(t!=='workflow')return row;
+      const {firing_incarnation}=row;
+      const domain=Object.assign(Object.create(Object.getPrototypeOf(row)),row);
+      delete domain.firing_incarnation;
+      assert.match(firing_incarnation as string,/^fi_[0-9a-f]{24}$/);
+      return domain;
+    })), before);
     assert.deepEqual(s.getAdmission('legacy'), { rootWorkflow: 'legacy', epoch: 7, active: true });
     assert.equal(s.getRun('legacy-run')!.order, undefined);
     assert.equal(s.listInvocations('legacy')[0]!.admission.epoch, 7);
@@ -1961,7 +2077,7 @@ test('schema13 dispatch migration failure rolls back DDL and version, then retri
   check.exec('DROP TRIGGER fail_v14');
   check.close();
   const s = new Store(path);
-  assert.equal(s.getMeta('schema_version'), '15');
+  assert.equal(s.getMeta('schema_version'), '16');
   s.close();
   rmSync(dir, { recursive: true, force: true });
 });

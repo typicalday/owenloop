@@ -10,6 +10,7 @@
 
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
+import { valueDigestHex } from '../crypto/canonical.ts';
 import { isVersionedReference, parseManifestBytes, parseVersionedCallTarget } from '../bundle/manifest.ts';
 import type { BundleManifest } from '../bundle/types.ts';
 import { defInstructionDigest } from '../order-resolver.ts';
@@ -18,7 +19,11 @@ import type {
   OrderInstructionRef,
   OrderInstructionSource,
 } from '../order-resolver.ts';
-import { digestScopedCallsTargetKey, finalizeDefs, loadDefFile, resolveCallsTarget } from '../defs.ts';
+import { DefError, callsEdgeKey, digestScopedCallsTargetKey, expandIncludes, finalizeDefs,
+  validateDef,
+  resolveCallsStep, resolveCallsTarget } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile } from '../bundle/workflow-def.ts';
+import { isBundleWorkflowName } from '../bundle/call-target.ts';
 import type { StepDef, WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import {
@@ -52,6 +57,63 @@ export interface StoreInstructionSourceArgs {
   verifier: BundleIngestor;
   /** Optional one-shot recovery hook for an unknown order digest. */
   onMissing?: MissingObjectHandler;
+  /** Parent-owned native selection for one routed occurrence. Absent on every
+   * ordinary instruction source. The callback must authenticate its Service
+   * read; the store independently verifies the selected signed child bytes. */
+  routedConcreteCalls?: RoutedConcreteCallSelection;
+  /** Internal, throwaway data-only selected-member verification. It never
+   * publishes an executable instruction cache or accepts a routed call grant. */
+  integrityOnlyHubLive?: { workflowName: string;
+    accept(selection: VerifiedWorkflowSelection): void };
+}
+
+export interface RoutedConcreteCallEdge {
+  parentDefRef: { bundleDigest: string; workflowName: string };
+  callStep: string;
+  callPath: string;
+  target: string;
+  childDefRef: { bundleDigest: string; workflowName: string };
+  /** Private provenance derived during the signed graph walk. This field is
+   * never sent as a Service selection hint; Service derives the same class
+   * from the authored call and its verified dialect/lock. */
+  selectionSource: 'service-observed' | 'signed-static';
+  /** Present on a Service-observed slash edge; static signed edges need no
+   * structural receipt but remain in the ancestry checked by Service. */
+  receiptDigest?: string;
+}
+
+export interface RoutedConcreteCallRequest {
+  rootWorkflow: string;
+  run: string;
+  frameWorkflow: string;
+  frameDefRef: { bundleDigest: string; workflowName: string };
+  /** Present only when the parent is a persisted native workflow. */
+  parentWorkflow?: string;
+  ancestry: readonly RoutedConcreteCallEdge[];
+  edge: Omit<RoutedConcreteCallEdge, 'childDefRef' | 'receiptDigest' | 'selectionSource'>;
+}
+
+export type RoutedConcreteCallObservation =
+  | { kind: 'selected-native-concrete-child'; childDefRef: RoutedConcreteCallEdge['childDefRef'];
+      parentWorkflow: string; childWorkflow: string; receiptDigest: string }
+  | { kind: 'prestart-live-concrete-child'; parentWorkflow: string;
+      childDefRef: RoutedConcreteCallEdge['childDefRef']; observedLiveVersion: number;
+      receiptDigest: string }
+  | { kind: 'virtual-live-concrete-child';
+      childDefRef: RoutedConcreteCallEdge['childDefRef']; observedLiveVersion: number;
+      receiptDigest: string };
+
+export interface RoutedConcreteCallSelection {
+  rootWorkflow: string;
+  run: string;
+  frameWorkflow: string;
+  frameDefRef: { bundleDigest: string; workflowName: string };
+  /** Every callback result is scoped to the current original-session claim.
+   * A structural observation alone never authorizes consumed producer proof. */
+  observe(request: RoutedConcreteCallRequest): Promise<RoutedConcreteCallObservation>;
+  stillAuthorized(): boolean;
+  maxDepth?: number;
+  maxReads?: number;
 }
 
 export class StoreInstructionSourceError extends Error {
@@ -72,6 +134,9 @@ export interface VerifiedCallsChild {
   bundleDigest: DefDigest;
   /** The `calls:` target as authored on the parent step. */
   target: string;
+  /** Exact parent-observed structural child; producer admission still needs
+   * a separately verified folded receipt and stored child proof. */
+  selectedConcreteCall?: RoutedConcreteCallObservation;
 }
 
 interface CachedDefinition {
@@ -82,6 +147,8 @@ interface CachedDefinition {
   support: readonly SupportingObject[];
   /** The verified `calls:` child each `calls:` step of `def` invokes, keyed by step name. */
   callsChildren: ReadonlyMap<string, VerifiedCallsChild>;
+  routedSelections?: readonly { request: RoutedConcreteCallRequest;
+    observation: RoutedConcreteCallObservation }[];
 }
 
 interface SupportingObject {
@@ -96,22 +163,48 @@ interface LoadedObject extends SupportingObject {
   defs: Map<string, WorkflowDef>;
 }
 
+/** One exact member of a primed, verified signed bundle and its own closure. */
+export interface VerifiedDefinitionSelection {
+  definition: WorkflowDef;
+  step: StepDef;
+  bundleDigest: DefDigest;
+  objectPath: string;
+  support: readonly { bundleDigest: DefDigest; objectPath: string }[];
+  callsChild(callsStep: string): VerifiedCallsChild | undefined;
+}
+
+/** Exact signed manifest member without choosing a step from a child bundle. */
+export interface VerifiedWorkflowSelection {
+  definition: WorkflowDef;
+  bundleDigest: DefDigest;
+  objectPath: string;
+  support: readonly { bundleDigest: DefDigest; objectPath: string }[];
+}
+
 /** A synchronous lookup source backed by verified local workflow-store objects. */
 export interface StoreInstructionSource extends OrderInstructionSource {
   /** Load and verify the bundle that corresponds to an order or bundle digest. */
   prime(defDigest: string): Promise<'resolved' | 'unknown-digest'>;
+  /** Select an exact signed manifest member; never fall back to a sibling or alias. */
+  selectVerifiedDefinition(defDigest: string, workflowName: string, step: string): VerifiedDefinitionSelection | undefined;
+  selectVerifiedWorkflow(defDigest: string, workflowName: string): VerifiedWorkflowSelection | undefined;
   /** Return a step only after `prime(defDigest)` has resolved that digest. */
   getVerifiedStep(defDigest: string, step: string): StepDef | undefined;
   /** Return the full verified definition cached by `prime`, narrowed by step when a bundle contains several workflows. */
   getVerifiedDefinition(defDigest: string, step?: string): WorkflowDef | undefined;
   /** Return the installed bundle identity and object path cached by `prime`. */
   getVerifiedObject(defDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined;
+  /** Exact objects whose verified bytes support the primed definition, including locked calls children. */
+  getVerifiedSupport?(defDigest: string, step: string): readonly { bundleDigest: DefDigest; objectPath: string }[] | undefined;
   /** Return the verified `calls:` child that step `callsStep` of the definition
    *  serving `step` invokes, resolved in the same finalized closure the
    *  definition was verified in. Optional so a source without a dependency
    *  closure still type-checks; a consumer treats its absence as "no
    *  calls-boundary context", never as permission. */
   getVerifiedCallsChild?(defDigest: string, step: string, callsStep: string): VerifiedCallsChild | undefined;
+  /** Data-only selected-edge handoff for this exact primed frame member. */
+  getRoutedSelections?(defDigest: string, workflowName: string): readonly {
+    request: RoutedConcreteCallRequest; observation: RoutedConcreteCallObservation }[] | undefined;
 }
 
 function indexedBundleDigests(root: string): DefDigest[] {
@@ -188,9 +281,10 @@ async function loadVerifiedObject(
     const objectPath = await verifiedCandidateObject(root, bundleDigest, level, verifier);
     try {
       const manifest = parseManifestBytes(readFileSync(join(objectPath, 'bundle.yaml')));
+      const dialect = bundleDialectForManifest(manifest);
       const defs = new Map<string, WorkflowDef>();
       for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
-	const def = loadDefFile(join(objectPath, workflowPath));
+	const def = loadBundleDefFile(join(objectPath, workflowPath), dialect);
 	if (def.name !== workflowName) {
 	  throw new StoreIntegrityError(
 	    'object-corrupt',
@@ -211,6 +305,38 @@ async function loadVerifiedObject(
       throw new StoreIntegrityError('object-corrupt', bundleDigest, errorText(error));
     }
   });
+}
+
+/** Verify one exact signed child member without constructing an executable
+ * calls graph or adding it to a routed order's instruction cache. This is
+ * used for an invocation-selected child whose bytes are independently bound
+ * by the parent receipt; it grants no instruction lookup for that digest. */
+export async function verifyInstalledWorkflowMember(args: {
+  globalRoot: string;
+  verifier: BundleIngestor;
+  bundleDigest: string;
+  workflowName: string;
+  /** Initial staging may recover this exact signed digest once. Current
+   * consequence rechecks omit the hook and therefore never download. */
+  onMissing?: MissingObjectHandler;
+}): Promise<VerifiedWorkflowSelection> {
+  const digest = defDigest(args.bundleDigest);
+  let selected: VerifiedWorkflowSelection | undefined;
+  // This source is data-only. It verifies every signed member and exact
+  // locked/static dependency, but leaves a Hub live slash edge to the child's
+  // own later original-session native occurrence. No executable cache entry
+  // is constructed or returned to the parent.
+  const isolated = createStoreInstructionSource({ globalRoot: args.globalRoot,
+    verifier: args.verifier,
+    integrityOnlyHubLive: { workflowName: args.workflowName,
+      accept: value => { selected = value; } },
+    ...(args.onMissing === undefined ? {} : { onMissing: args.onMissing }) });
+  if (await isolated.prime(digest) !== 'resolved')
+    throw new DefError('selected signed child digest unavailable');
+  if (!selected || selected.bundleDigest !== digest
+    || selected.definition.name !== args.workflowName)
+    throw new DefError('selected signed child member unavailable');
+  return selected;
 }
 
 export function createStoreInstructionSource(args: StoreInstructionSourceArgs): StoreInstructionSource {
@@ -240,7 +366,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     level: ResolutionLevel,
   ): Promise<boolean> => {
     const parent = await loadVerifiedObject(root, bundleDigest, level, args.verifier);
-    const validation = new Map<string, WorkflowDef>(parent.defs);
+    // Include lookup is archive-local. Expand the parent's members before
+    // digest-scoped dependency aliases share this validation map.
+    const validation = new Map<string, WorkflowDef>([...parent.defs].map(([name, def]) =>
+      [name, expandIncludes(def, member => parent.defs.get(member))] as const));
     const support = new Map<string, SupportingObject>();
     const loadedByRootAndDigest = new Map<string, LoadedObject>();
     const registeredDependencies = new Set<string>();
@@ -254,7 +383,11 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       if (registeredDependencies.has(key)) return;
       registeredDependencies.add(key);
       for (const [workflowName, def] of object.defs) {
-	validation.set(digestScopedCallsTargetKey(object.bundleDigest, workflowName), def);
+	// A dependency's include names are local to its own signed archive.
+	// Resolve them before adding digest-scoped aliases to the shared map,
+	// where a bare name may belong to the parent archive instead.
+	validation.set(digestScopedCallsTargetKey(object.bundleDigest, workflowName),
+	  expandIncludes(def, member => object.defs.get(member)));
       }
     };
     remember(parent);
@@ -337,7 +470,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       const objectKey = keyFor(object);
       if (walked.has(objectKey)) return;
       walked.add(objectKey);
-      for (const def of object.defs.values()) {
+      for (const raw of object.defs.values()) {
+	// An include contributes authored executable steps to this same signed
+	// object. Traverse its exact locked calls before finalizing the closure.
+	const def = expandIncludes(raw, member => object.defs.get(member));
 	for (const step of def.steps) {
 	  if (step.calls === undefined || !isVersionedReference(step.calls)) continue;
 	  const target = step.calls;
@@ -384,30 +520,202 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	  // All child workflows also retain an internal digest-scoped key so their
 	  // bare sibling calls validate in the bundle that authored them.
 	  if (child !== parent) registerDependencyDefinitions(child);
-	  validation.set(digestScopedCallsTargetKey(childDigest, target), selected);
+	  validation.set(digestScopedCallsTargetKey(childDigest, target),
+	    expandIncludes(selected, member => child.defs.get(member)));
 	  await walkObject(child);
 	}
       }
     };
 
     await walkObject(parent);
-    const finalized = finalizeDefs(validation);
-    const parentDefinitions = [...parent.defs.keys()].map((name) => finalized.get(name)!);
+    if (args.integrityOnlyHubLive !== undefined) {
+      if (requestedDigest !== bundleDigest) return false;
+      const deferred = new Set<string>();
+	for (const [nodeKey, raw] of validation) {
+	const def = expandIncludes(raw, member => validation.get(member));
+	if (def.bundleDialect !== 'hub-qualified') continue;
+	for (const step of def.steps) {
+	  const target = step.calls;
+	  if (target !== undefined && target.includes('/')
+	    && isBundleWorkflowName(target)
+	    && !isVersionedReference(target)
+	    && def.bundleLock?.[target] === undefined)
+	    deferred.add(callsEdgeKey(nodeKey, step));
+	}
+      }
+      // This finalization validates all archive members and every static,
+      // plain and locked cross-definition edge/cycle. Its sole deferred edges
+      // are exact signed Hub live slash calls, which cannot authorize this
+      // parent's executable graph without the child's own native occurrence.
+      const finalized = finalizeDefs(validation, { deferredHubLiveCalls: deferred });
+      const workflowName = args.integrityOnlyHubLive.workflowName;
+      const selected = finalized.get(workflowName);
+      if (!parent.defs.has(workflowName) || !selected
+	|| selected.bundleDigest !== bundleDigest)
+	throw new DefError('selected signed child member unavailable');
+      args.integrityOnlyHubLive.accept({ definition: selected, bundleDigest,
+	objectPath: parent.objectPath,
+	support: [...support.values()].map(({ bundleDigest: digest, objectPath }) =>
+	  ({ bundleDigest: digest, objectPath })) });
+      return true;
+    }
+    const validateAllSignedMembers = (object: LoadedObject): void => {
+      for (const [name, raw] of object.defs) {
+	const expanded = expandIncludes(raw, member => object.defs.get(member));
+	const errors = validateDef(expanded);
+	if (errors.length) throw new DefError(`invalid signed workflow '${name}': ${errors[0]}`);
+      }
+    };
+    const routed = args.routedConcreteCalls;
+    const selectedCalls = new Map<string, RoutedConcreteCallObservation>();
+    const routedSelections: Array<{ request: RoutedConcreteCallRequest;
+      observation: RoutedConcreteCallObservation }> = [];
+    let routedCalls: Map<string, string> | undefined;
+    let executable: Map<string, WorkflowDef> = validation;
+    if (routed !== undefined && requestedDigest === routed.frameDefRef.bundleDigest) {
+      if (bundleDigest !== routed.frameDefRef.bundleDigest || !routed.rootWorkflow
+	|| !routed.run || !routed.frameWorkflow || !routed.stillAuthorized())
+	throw new DefError('routed concrete call occurrence unavailable');
+      const entry = parent.defs.get(routed.frameDefRef.workflowName);
+      if (!entry) throw new DefError('routed signed frame member unavailable');
+      // The entire archive is still parsed, hashed and checked for authored
+      // DSL errors. Only cross-definition execution is occurrence-dependent.
+      for (const object of loadedByRootAndDigest.values()) validateAllSignedMembers(object);
+      const reachable = new Map<string, WorkflowDef>();
+      routedCalls = new Map();
+      let observations = 0;
+      const maxDepth = Math.min(routed.maxDepth ?? 64, 64);
+      const maxReads = Math.min(routed.maxReads ?? 64, 64);
+      if (!Number.isSafeInteger(maxDepth) || maxDepth < 1
+	|| !Number.isSafeInteger(maxReads) || maxReads < 1)
+	throw new DefError('routed concrete call limits unavailable');
+      const objectFor = (def: WorkflowDef): LoadedObject | undefined => {
+	if (def.bundleDigest === parent.bundleDigest && parent.defs.has(def.name)) return parent;
+	for (const object of loadedByRootAndDigest.values())
+	  if (object.bundleDigest === def.bundleDigest && object.defs.has(def.name)) return object;
+	return undefined;
+      };
+      const objectForDigest = async (digest: DefDigest, from: LoadedObject): Promise<LoadedObject> => {
+	for (const candidate of dependencyRoots(from)) {
+	  try { return await loadAt(digest, candidate); }
+	  catch (error) {
+	    if (error instanceof StoreIntegrityError && error.code === 'object-missing') continue;
+	    throw error;
+	  }
+	}
+	throw new StoreIntegrityError('dependency-missing', digest,
+	  `routed selected child digest ${digest} is absent from every configured workflow store root`);
+      };
+      const visit = async (
+	def: WorkflowDef, object: LoadedObject, ancestry: readonly RoutedConcreteCallEdge[],
+	parentWorkflow: string | undefined, depth: number, key: string,
+	chain: ReadonlySet<string>,
+      ): Promise<void> => {
+	if (depth > maxDepth || !routed.stillAuthorized())
+	  throw new DefError('routed concrete call closure unavailable');
+	const signedIdentity = `${object.bundleDigest}\0${def.name}`;
+	if (chain.has(signedIdentity)) throw new DefError('routed concrete call cycle');
+	const nextChain = new Set(chain).add(signedIdentity);
+	const expanded = expandIncludes(def, member => object.defs.get(member));
+	reachable.set(key, expanded);
+	for (const step of expanded.steps) {
+	  if (step.calls === undefined) continue;
+	  const callPath = step.produces[0]?.stem;
+	  if (!callPath) throw new DefError('routed concrete call path unavailable');
+	  const edge = { parentDefRef: { bundleDigest: object.bundleDigest,
+	    workflowName: expanded.name }, callStep: step.name, callPath, target: step.calls };
+	  const unversionedSlash = step.calls.includes('/') && !isVersionedReference(step.calls);
+	  if (unversionedSlash && expanded.bundleLock?.[step.calls] === undefined) {
+	    // Service's verified Hub dialect selects this spelling from the
+	    // current live publication even when a same-bundle sibling exists.
+	    // A plain ambient alias has no matching signed producer authority.
+	    if (expanded.bundleDialect !== 'hub-qualified')
+	      throw new DefError('routed plain live calls target has no signed selection');
+	    if (++observations > maxReads || !routed.stillAuthorized())
+	      throw new DefError('routed concrete call read budget exhausted');
+	    const request: RoutedConcreteCallRequest = { rootWorkflow: routed.rootWorkflow,
+	      run: routed.run, frameWorkflow: routed.frameWorkflow,
+	      frameDefRef: routed.frameDefRef,
+	      ...(parentWorkflow === undefined ? {} : { parentWorkflow }),
+	      ancestry, edge };
+	    const selected = await routed.observe(request);
+	    if (!routed.stillAuthorized() || !selected
+	      || !/^[0-9a-f]{64}$/.test(selected.receiptDigest)
+	      || !/^[0-9a-f]{64}$/.test(selected.childDefRef.bundleDigest)
+	      || !selected.childDefRef.workflowName
+	      || (selected.kind === 'selected-native-concrete-child'
+		&& (!selected.parentWorkflow || !selected.childWorkflow))
+	      || (selected.kind === 'prestart-live-concrete-child'
+		&& !selected.parentWorkflow)
+	      || (parentWorkflow !== undefined && selected.kind === 'virtual-live-concrete-child')
+	      || (parentWorkflow !== undefined && selected.kind !== 'virtual-live-concrete-child'
+		&& selected.parentWorkflow !== parentWorkflow)
+	      || (selected.kind === 'selected-native-concrete-child'
+		? false
+		: !Number.isSafeInteger(selected.observedLiveVersion)
+		  || selected.observedLiveVersion < 1))
+	      throw new DefError('routed concrete call selection refused');
+	    const digest = defDigest(selected.childDefRef.bundleDigest);
+	    const childObject = await objectForDigest(digest, object);
+	    validateAllSignedMembers(childObject);
+	    const child = childObject.defs.get(selected.childDefRef.workflowName);
+	    if (!routed.stillAuthorized() || !child || child.bundleDigest !== digest)
+	      throw new DefError('routed concrete call signed child unavailable');
+	    registerDependencyDefinitions(childObject);
+	    await walkObject(childObject);
+	    const childKey = `routed:${valueDigestHex([routed.rootWorkflow, routed.run,
+	      key, step.name, callPath, selected.childDefRef,
+	      selected.kind === 'selected-native-concrete-child' ? selected.childWorkflow : 'virtual'])}`;
+	    routedCalls!.set(callsEdgeKey(key, step), childKey);
+	    selectedCalls.set(callsEdgeKey(key, step), selected);
+	    routedSelections.push({ request, observation: selected });
+	    const nextEdge = { ...edge, childDefRef: selected.childDefRef,
+	      selectionSource: 'service-observed' as const,
+	      receiptDigest: selected.receiptDigest };
+	    await visit(child, childObject, [...ancestry, nextEdge],
+	      selected.kind === 'selected-native-concrete-child' ? selected.childWorkflow : undefined,
+	      depth + 1, childKey, nextChain);
+	    continue;
+	  }
+	  const child = resolveCallsTarget(validation, step.calls, expanded);
+	  if (!child) throw new DefError(`routed calls child '${step.calls}' unavailable`);
+	  const childObject = objectFor(child);
+	  if (!childObject || !child.bundleDigest)
+	    throw new DefError('routed signed calls child unavailable');
+	  const childKey = `routed:${valueDigestHex([routed.rootWorkflow, routed.run,
+	    key, step.name, callPath, child.bundleDigest, child.name, 'signed-static'])}`;
+	  routedCalls!.set(callsEdgeKey(key, step), childKey);
+	  await visit(child, childObject,
+	    [...ancestry, { ...edge, childDefRef: { bundleDigest: child.bundleDigest,
+	      workflowName: child.name }, selectionSource: 'signed-static' }],
+	    undefined, depth + 1, childKey, nextChain);
+	}
+      };
+      await visit(entry, parent, [], routed.frameWorkflow, 0, entry.name, new Set());
+      executable = reachable;
+    }
+    const finalized = finalizeDefs(executable,
+      routedCalls === undefined ? {} : { routedCalls });
+    const parentDefinitions = routed !== undefined && requestedDigest === routed.frameDefRef.bundleDigest
+      ? [finalized.get(routed.frameDefRef.workflowName)!]
+      : [...parent.defs.keys()].map((name) => finalized.get(name)!);
     const cachedSupport = [...support.values()];
     // The same scope-aware rule finalizeDefs validated and the engine runs:
     // a qualified target resolves through the parent's lock, a bare one to
     // the sibling inside the parent's own bundle. Recorded per calls step so
     // a consumer can corroborate a relayed child proof from verified bytes.
-    const callsChildrenOf = (def: WorkflowDef): ReadonlyMap<string, VerifiedCallsChild> => {
+    const callsChildrenOf = (def: WorkflowDef, nodeKey = def.name): ReadonlyMap<string, VerifiedCallsChild> => {
       const children = new Map<string, VerifiedCallsChild>();
       for (const step of def.steps) {
 	if (step.calls === undefined) continue;
-	const child = resolveCallsTarget(finalized, step.calls, def);
+	const child = resolveCallsStep(finalized, def, step, routedCalls, nodeKey);
 	const rawDigest = child?.bundleDigest;
 	if (child === undefined || rawDigest === undefined) continue;
 	const childDigest = asDefDigest(rawDigest);
 	if (childDigest === undefined) continue;
-	children.set(step.name, { definition: child, bundleDigest: childDigest, target: step.calls });
+	children.set(step.name, { definition: child, bundleDigest: childDigest, target: step.calls,
+	  ...(selectedCalls.get(callsEdgeKey(nodeKey, step)) === undefined ? {}
+	    : { selectedConcreteCall: selectedCalls.get(callsEdgeKey(nodeKey, step))! }) });
       }
       return children;
     };
@@ -422,6 +730,8 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
 	objectPath: parent.objectPath,
 	support: cachedSupport,
 	callsChildren: callsChildrenOf(def),
+	...(routed !== undefined && requestedDigest === routed.frameDefRef.bundleDigest
+	  ? { routedSelections } : {}),
       })));
       return true;
     }
@@ -507,7 +817,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   };
 
   const primeOnce = async (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
-    if (await verifyCached(requestedDigest)) return 'resolved';
+    // A native selected call belongs to one original occurrence. Local byte
+    // verification alone cannot refresh that selection after an await.
+    if (args.routedConcreteCalls === undefined && await verifyCached(requestedDigest)) return 'resolved';
+    if (args.routedConcreteCalls !== undefined) cache.delete(requestedDigest);
 
     /**
      * A bundle identity is already content-addressed: only an index row carrying
@@ -627,6 +940,9 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   };
 
   const prime = (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
+    if (args.routedConcreteCalls !== undefined
+      && requestedDigest !== args.routedConcreteCalls.frameDefRef.bundleDigest)
+      return Promise.reject(new DefError('routed instruction source cannot prime another occurrence'));
     const existing = inFlight.get(requestedDigest);
     if (existing !== undefined) return existing;
 
@@ -683,6 +999,27 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       };
     },
     prime,
+    selectVerifiedDefinition: (requestedDigest: string, workflowName: string,
+      stepName: string): VerifiedDefinitionSelection | undefined => {
+      const matches = cache.get(requestedDigest)?.filter((entry) =>
+	entry.def.name === workflowName && entry.def.steps.some((step) => step.name === stepName)) ?? [];
+      if (matches.length !== 1) return undefined;
+      const selected = matches[0]!;
+      const step = selected.def.steps.find((entry) => entry.name === stepName);
+      if (step === undefined) return undefined;
+      return { definition: selected.def, step, bundleDigest: selected.bundleDigest,
+	objectPath: selected.objectPath,
+	support: selected.support.map(({ bundleDigest, objectPath }) => ({ bundleDigest, objectPath })),
+	callsChild: callsStep => selected.callsChildren.get(callsStep) };
+    },
+    selectVerifiedWorkflow: (requestedDigest: string, workflowName: string): VerifiedWorkflowSelection | undefined => {
+      const matches = cache.get(requestedDigest)?.filter(entry => entry.def.name === workflowName) ?? [];
+      if (matches.length !== 1) return undefined;
+      const selected = matches[0]!;
+      return { definition: selected.def, bundleDigest: selected.bundleDigest,
+	objectPath: selected.objectPath,
+	support: selected.support.map(({ bundleDigest, objectPath }) => ({ bundleDigest, objectPath })) };
+    },
     getVerifiedStep: (requestedDigest: string, stepName: string): StepDef | undefined => {
       const cached = definitionForStep(requestedDigest, stepName);
       return cached?.def.steps.find((step) => step.name === stepName);
@@ -699,9 +1036,19 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       const cached = cache.get(requestedDigest)?.[0];
       return cached === undefined ? undefined : { bundleDigest: cached.bundleDigest, objectPath: cached.objectPath };
     },
+    getVerifiedSupport: (requestedDigest: string, stepName: string) =>
+      definitionForStep(requestedDigest, stepName)?.support.map(({ bundleDigest, objectPath }) => ({ bundleDigest, objectPath })),
     getVerifiedCallsChild: (requestedDigest: string, stepName: string, callsStep: string): VerifiedCallsChild | undefined => {
       const cached = cache.get(requestedDigest)?.filter((entry) => entry.def.steps.some((step) => step.name === stepName));
       return cached?.length === 1 ? cached[0]!.callsChildren.get(callsStep) : undefined;
+    },
+    getRoutedSelections: (requestedDigest: string, workflowName: string) => {
+      if (args.routedConcreteCalls === undefined
+	|| requestedDigest !== args.routedConcreteCalls.frameDefRef.bundleDigest
+	|| workflowName !== args.routedConcreteCalls.frameDefRef.workflowName) return undefined;
+      const cached = cache.get(requestedDigest);
+      return cached?.length === 1 && cached[0]?.def.name === workflowName
+	? cached[0].routedSelections : undefined;
     },
   };
 }

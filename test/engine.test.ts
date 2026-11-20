@@ -2125,18 +2125,26 @@ test('alarm set before close is preserved; reap also preserves alarm; claim clea
 
   // Part A: alarm survives a normal close
   const runId1 = 'run_close_test';
-  store.insertRun(runId1, { workflow: wf, step: 'completion', key: '' }, 0);
-  store.putTask({ workflow: wf, step: 'completion', key: '', status: 'claimed',
-    run: runId1, claimedAt: 1000, attempts: 0, alarmAt: ALARM });
+  store.tx(()=>{
+    const generation=store.getNativeClaimGeneration(wf,'completion','');
+    store.insertRun(runId1, { workflow: wf, step: 'completion', key: '' }, 0);
+    store.recordNativeClaim(wf,'completion','',runId1,generation);
+    store.putTask({ workflow: wf, step: 'completion', key: '', status: 'claimed',
+      run: runId1, claimedAt: 1000, attempts: 0, alarmAt: ALARM });
+  });
   engine.close(wf, runId1, 'ok');
   assert.equal(store.getAlarm(wf, 'completion'), ALARM, 'close() must not clear a freshly-set alarm');
 
   // Part B: alarm survives reap
   // (reapTtlMs=500; claimedAt=0; now=1000 => 1000-0=1000 > 500 => stale)
   const runId2 = 'run_reap_test';
-  store.insertRun(runId2, { workflow: wf, step: 'completion', key: '' }, 0);
-  store.putTask({ workflow: wf, step: 'completion', key: '', status: 'claimed',
-    run: runId2, claimedAt: 0, attempts: 1, alarmAt: ALARM });
+  store.tx(()=>{
+    const generation=store.getNativeClaimGeneration(wf,'completion','');
+    store.insertRun(runId2, { workflow: wf, step: 'completion', key: '' }, 0);
+    store.recordNativeClaim(wf,'completion','',runId2,generation);
+    store.putTask({ workflow: wf, step: 'completion', key: '', status: 'claimed',
+      run: runId2, claimedAt: 0, attempts: 1, alarmAt: ALARM });
+  });
   engine.reap(wf, 1000);
   assert.equal(store.getAlarm(wf, 'completion'), ALARM, 'reap() must not clear a set alarm');
 
@@ -3229,8 +3237,49 @@ for (const sameSlot of [true, false]) test(`U1-overlapping-race: ${sameSlot ? 's
 
 function dispatchState(store: Store, workflow: string) {
   return { runs: store.listRuns(workflow), tasks: store.listTasks(workflow), arts: store.listArtifacts(workflow),
+    generations: store.db.prepare('SELECT * FROM native_claim_generations').all(),
+    bindings: store.db.prepare('SELECT * FROM native_claim_bindings').all(),
     lanes: store.db.prepare('SELECT * FROM dispatch_lane').all(), slots: store.db.prepare('SELECT * FROM dispatch_slot').all() };
 }
+
+test('same-session released native claim gets a fresh run and generation without changing input evidence', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const first = choices(engine, workflow).find(f => f.step === 'B')!;
+  assert.equal(first.nativeClaimGeneration.generation, 0);
+  const claimed = engine.claimReady(claimPlan(first), readyOpts);
+  assert.equal(claimed.kind, 'claimed');
+  if (claimed.kind !== 'claimed') return;
+  engine.close(workflow, claimed.order.run, 'released');
+  const second = choices(engine, workflow).find(f => f.step === 'B')!;
+  assert.equal(second.evidenceGeneration, first.evidenceGeneration);
+  assert.equal(second.nativeClaimGeneration.frameIncarnation, first.nativeClaimGeneration.frameIncarnation);
+  assert.equal(second.nativeClaimGeneration.generation, 1);
+  assert.equal(engine.claimReady(claimPlan(first, 'old-replay'), readyOpts).kind, 'stale');
+  const fresh = engine.claimReady(claimPlan(second, 'fresh-slot'), readyOpts);
+  assert.equal(fresh.kind, 'claimed');
+  if (fresh.kind === 'claimed') {
+    assert.notEqual(fresh.order.run, claimed.order.run);
+    assert.deepEqual(store.getNativeClaimBinding(fresh.order.run), second.nativeClaimGeneration);
+  }
+  store.close();
+});
+
+test('ordinary tick claim also invalidates an old routed descriptor and advances once, not on readiness', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  const before = choices(engine, workflow).find(f => f.step === 'B')!;
+  const ledgerBefore = store.db.prepare('SELECT * FROM native_claim_generations').all();
+  choices(engine, workflow);
+  assert.deepEqual(store.db.prepare('SELECT * FROM native_claim_generations').all(), ledgerBefore);
+  const claimed = engine.tick(workflow, { now: 10 }).orders.find(o => o.step === 'B')!;
+  assert.ok(claimed);
+  assert.deepEqual(store.getNativeClaimBinding(claimed.run), before.nativeClaimGeneration);
+  engine.close(workflow, claimed.run, 'no_work');
+  const after = choices(engine, workflow).find(f => f.step === 'B')!;
+  assert.equal(after.nativeClaimGeneration.generation, 1);
+  assert.equal(after.evidenceGeneration, before.evidenceGeneration);
+  assert.equal(engine.claimReady(claimPlan(before, 'old-slot'), readyOpts).kind, 'stale');
+  store.close();
+});
 
 test('U1-rollback: real claim fails before and after slot insertion without spending lane or slot', async () => {
   const { engine, store, workflow } = await boundedFixture();
@@ -3440,4 +3489,39 @@ test('U1-currentness: malformed plans and changed verified DefRefs cannot mutate
   assert.equal(engine.claimReady(plan, readyOpts).kind, 'unverified');
   assert.deepEqual(dispatchState(store, workflow), tampered);
   store.close();
+});
+
+
+test('readReady uses persisted eligibility without writes or native claims', async () => {
+  const { engine, store, workflow } = await boundedFixture();
+  choices(engine, workflow);
+  const before={changes:store.db.prepare('SELECT total_changes() AS n').get(),artifacts:store.listArtifacts(workflow),
+    tasks:store.listTasks(workflow),runs:store.listRuns(workflow),frame:store.getWorkflow(workflow)};
+  const ready=engine.readReady(workflow,readyOpts);
+  assert.equal(ready.kind,'ready');
+  if(ready.kind!=='ready')throw new Error('readReady fixture unavailable');
+  assert.deepEqual(ready.firings.map(f=>f.step),['A','B']);
+  assert.deepEqual({changes:store.db.prepare('SELECT total_changes() AS n').get(),artifacts:store.listArtifacts(workflow),
+    tasks:store.listTasks(workflow),runs:store.listRuns(workflow),frame:store.getWorkflow(workflow)},before);
+});
+
+test('readReady does not reap an expired live claim or silently perform snapshot maintenance', async () => {
+  const { engine, store, workflow }=await boundedFixture();
+  const first=choices(engine,workflow).find(f=>f.step==='A')!;
+  const claim=engine.claimReady(claimPlan(first),readyOpts);assert.equal(claim.kind,'claimed');
+  if(claim.kind!=='claimed')throw new Error('claim unavailable');
+  const before={changes:store.db.prepare('SELECT total_changes() AS n').get(),tasks:store.listTasks(workflow),runs:store.listRuns(workflow)};
+  engine.readReady(workflow,{...readyOpts,now:10*60*60*1000});
+  assert.deepEqual({changes:store.db.prepare('SELECT total_changes() AS n').get(),tasks:store.listTasks(workflow),runs:store.listRuns(workflow)},before);
+  assert.equal(store.getTask(workflow,'A','')!.status,'claimed');
+});
+
+test('readReady distinguishes unverified definition and inactive frame from verified empty readiness',async()=>{
+  const {engine,store,workflow}=await boundedFixture();choices(engine,workflow);
+  const row=store.getWorkflow(workflow)!;
+  store.repinWorkflowDef(workflow,{...row.defSnapshot!,bundleDigest:'f'.repeat(64)},'f'.repeat(64));
+  const changes=store.db.prepare('SELECT total_changes() AS n').get();
+  assert.equal(engine.readReady(workflow,readyOpts).kind,'unverified');
+  assert.deepEqual(store.db.prepare('SELECT total_changes() AS n').get(),changes);
+  assert.equal(engine.readReady('missing-frame',readyOpts).kind,'inactive');
 });

@@ -14,8 +14,7 @@ import { closeSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, r
 import { basename, dirname, join, resolve } from 'node:path';
 import { DEFAULT_TAR_LIMITS, canonicalBundlePathViolation, inflateArchive, parseTar } from '../archive.ts';
 import type { TarEntry, TarLimits } from '../archive.ts';
-import { parseDef } from '../defs.ts';
-import { loadDefFile } from '../defs.ts';
+import { bundleDialectForManifest, loadBundleDefFile, parseBundleDef } from './workflow-def.ts';
 import { parse as parseYaml } from 'yaml';
 import {
   assertLockCoverage,
@@ -229,7 +228,7 @@ function validateWorkflowsBytes(entries: TarEntry[], manifest: BundleManifest): 
     let def;
     try {
       const inlined = inlineArchiveBodyFiles(raw, files, workflowPath, workflowPath);
-      def = parseDef(inlined, workflowPath, undefined);
+      def = parseBundleDef(inlined, workflowPath, undefined);
     } catch (e) {
       throw workflowError((e as Error).message, workflowPath);
     }
@@ -505,7 +504,7 @@ export function packBundle(sourceDir: string, opts: PackOptions = {}): PackResul
     }
     let def;
     try {
-      def = loadDefFile(join(resolve(sourceDir), workflowPath));
+      def = loadBundleDefFile(join(resolve(sourceDir), workflowPath), bundleDialectForManifest(sourceManifest));
     } catch (e) {
       throw workflowError((e as Error).message, workflowPath);
     }

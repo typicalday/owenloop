@@ -1159,7 +1159,7 @@ export function expandIncludes(
   // cannot carry them. Preserve the original descriptor explicitly so an
   // include-expanded CAS definition still coordinates its snapshot writes with
   // bundle GC.
-  for (const key of ['bundleStoreRoots', 'bundleResolutionContext'] as const) {
+  for (const key of ['bundleStoreRoots', 'bundleResolutionContext', 'bundleDialect'] as const) {
     const descriptor = Object.getOwnPropertyDescriptor(def, key);
     if (descriptor !== undefined) Object.defineProperty(expanded, key, descriptor);
   }
@@ -2582,8 +2582,35 @@ function resolveCallsTargetKey(
   defs: Map<string, WorkflowDef>,
   target: string,
   from: WorkflowDef,
+  loadedDialect?: 'plain' | 'hub-qualified',
 ): string | undefined {
   if (target.includes('/')) {
+    // The dialect is stamped from the verified manifest, never inferred from
+    // whichever subset of aliases a resolver happens to carry. A persisted
+    // parent snapshot loses the non-enumerable marker, so its live resolver
+    // must supply the same digest's verified dialect. Unknown CAS context
+    // refuses instead of drifting through an ambient global alias.
+    const dialect = loadedDialect ?? from.bundleDialect
+      ?? (from.bundleDigest === undefined ? undefined : verifiedBundleDialect(defs, from.bundleDigest));
+    // An exact versioned target carries its own digest lock and remains safe
+    // to resolve from an older persisted parent snapshot even when the
+    // resolver has not recovered the manifest dialect. Only unversioned
+    // package/name spelling is ambiguous with a Hub-authored sibling.
+    if (from.bundleDigest !== undefined && dialect === undefined
+      && !target.includes('@') && !target.includes('#')) return undefined;
+    const hubDialect = from.bundleDigest !== undefined && dialect === 'hub-qualified';
+    // A Hub-qualified `calls: namespace/child` is an authored definition
+    // name, not a portable package/workflow alias. Resolve it only from the
+    // parent's exact immutable bundle. This first lookup also lets a plain
+    // parent in a mixed bundle call its qualified sibling without a global
+    // alias. Existing plain-package alias behavior remains the fallback for
+    // plain parents; qualified parents cannot drift to another bundle.
+    if (from.bundleDigest !== undefined && !target.includes('@') && !target.includes('#')) {
+      for (const [key, candidate] of defs) {
+		if (candidate.bundleDigest === from.bundleDigest && candidate.name === target) return key;
+      }
+      if (hubDialect) return undefined;
+    }
     let lockKey = target;
     if (target.includes('#')) {
       try {
@@ -2600,6 +2627,7 @@ function resolveCallsTargetKey(
     if (target.includes('#')) {
       return from.bundleDigest === undefined && defs.has(target) ? target : undefined;
     }
+    if (hubDialect && target.includes('@')) return undefined;
     return defs.has(target) ? target : undefined;
   }
   if (from.bundleDigest !== undefined) {
@@ -2608,6 +2636,46 @@ function resolveCallsTargetKey(
     }
   }
   return defs.has(target) ? target : undefined;
+}
+
+/** Recover the loader's signed-manifest dialect, including when `from` is a
+ * persisted snapshot whose non-enumerable provenance was intentionally not
+ * serialized. A partial resolver with no trusted live member remains unknown. */
+export function verifiedBundleDialect(
+  defs: Map<string, WorkflowDef>, digest: string,
+): 'plain' | 'hub-qualified' | undefined {
+  let dialect: 'plain' | 'hub-qualified' | undefined;
+  for (const def of defs.values()) {
+    if (def.bundleDigest !== digest || def.bundleDialect === undefined) continue;
+    if (dialect !== undefined && dialect !== def.bundleDialect) return undefined;
+    dialect = def.bundleDialect;
+  }
+  return dialect;
+}
+
+/** An explicit qualified DefRef may never fall through to an ambient alias
+ * with the same text but a different bundle digest. Coordinate aliases keep
+ * their existing digest-scoped key; authored names scan verified members. */
+export function resolveExactBundleTarget(
+  defs: Map<string, WorkflowDef>, digest: string, name: string,
+): WorkflowDef | undefined {
+  const aliased = defs.get(digestScopedCallsTargetKey(digest, name));
+  if (aliased?.bundleDigest === digest) return aliased;
+  // Existing explicit package coordinates remain visible to the invocation
+  // verifier even when a supplied digest is wrong; it reports the established
+  // digest-mismatch assessment. Only authored namespace/name has the new
+  // no-global-fallback rule.
+  if (name.includes('@') || name.includes('#')) return defs.get(name);
+  if (name.includes('/')) {
+    const dialect = verifiedBundleDialect(defs, digest);
+    if (dialect === undefined) return undefined;
+    if (dialect === 'plain') return defs.get(name);
+    for (const def of defs.values()) {
+      if (def.bundleDigest === digest && def.name === name) return def;
+    }
+    return undefined;
+  }
+  return defs.get(name);
 }
 
 /**
@@ -2621,8 +2689,9 @@ export function resolveCallsTarget(
   defs: Map<string, WorkflowDef>,
   target: string,
   from: WorkflowDef,
+  loadedDialect?: 'plain' | 'hub-qualified',
 ): WorkflowDef | undefined {
-  const key = resolveCallsTargetKey(defs, target, from);
+  const key = resolveCallsTargetKey(defs, target, from, loadedDialect);
   return key === undefined ? undefined : defs.get(key);
 }
 
@@ -2640,7 +2709,38 @@ interface CallsGraph {
   edges: Map<string, string[]>;
 }
 
-function buildCallsGraph(defs: Map<string, WorkflowDef>): CallsGraph {
+/** Exact authored edge key. A routed parent may override only this one edge
+ * after its host has authenticated the selected native or live child. */
+export function callsEdgeKey(parentNodeKey: string, step: StepDef): string {
+  return JSON.stringify([parentNodeKey, step.name,
+    step.calls ?? null, step.produces[0]?.stem ?? null]);
+}
+
+function resolvedCallsStepKey(
+  defs: Map<string, WorkflowDef>, def: WorkflowDef, step: StepDef,
+  routedCalls?: ReadonlyMap<string, string>, parentNodeKey = def.name,
+): string | undefined {
+  if (routedCalls !== undefined) {
+    // Every edge of a routed executable node must be present. Static edges
+    // were resolved from signed bytes before this map was constructed; live
+    // slash edges came from a parent-authenticated native observation.
+    const selected = routedCalls.get(callsEdgeKey(parentNodeKey, step));
+    return selected !== undefined && defs.has(selected) ? selected : undefined;
+  }
+  return step.calls === undefined ? undefined : resolveCallsTargetKey(defs, step.calls, def);
+}
+
+/** Resolve the exact child used by strict validation and cycle detection. */
+export function resolveCallsStep(
+  defs: Map<string, WorkflowDef>, def: WorkflowDef, step: StepDef,
+  routedCalls?: ReadonlyMap<string, string>, parentNodeKey = def.name,
+): WorkflowDef | undefined {
+  const key = resolvedCallsStepKey(defs, def, step, routedCalls, parentNodeKey);
+  return key === undefined ? undefined : defs.get(key);
+}
+
+function buildCallsGraph(defs: Map<string, WorkflowDef>, routedCalls?: ReadonlyMap<string, string>,
+  deferredHubLiveCalls?: ReadonlySet<string>): CallsGraph {
   const keys = [...defs.keys()];
   const edges = new Map<string, string[]>();
   for (const [key, def] of defs) {
@@ -2649,7 +2749,8 @@ function buildCallsGraph(defs: Map<string, WorkflowDef>): CallsGraph {
     const children = new Set<string>();
     for (const step of def.steps) {
       if (step.calls === undefined) continue;
-      const child = resolveCallsTargetKey(defs, step.calls, def);
+      if (deferredHubLiveCalls?.has(callsEdgeKey(key, step))) continue;
+      const child = resolvedCallsStepKey(defs, def, step, routedCalls, key);
       if (child !== undefined) children.add(child);
     }
     edges.set(key, [...children]);
@@ -2927,11 +3028,19 @@ export interface FinalizeDefsOptions {
    * later validates them against the complete store map before any run starts.
    */
   allowUnresolvedVersionedCalls?: ReadonlySet<string>;
+  /** Storage or data-only integrity verification only: exact authored edge
+   * keys for verified Hub-dialect unlocked slash calls. This grants no
+   * executable lookup; ordinary and routed instruction prime remain strict. */
+  deferredHubLiveCalls?: ReadonlySet<string>;
   /**
    * Permit unresolved `calls:` edges in an explicitly partial, read-only map.
    * Never use this option to construct an executable resolver.
    */
   allowUnresolvedCalls?: boolean;
+  /** Parent-authenticated, occurrence-node graph. Every reachable calls edge
+   * has a callsEdgeKey(parentNodeKey, step) entry pointing at another exact
+   * node in raw. Never use for ordinary or child-selected loading. */
+  routedCalls?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -2943,11 +3052,13 @@ export function validateCallsEdges(
   def: WorkflowDef,
   defs: Map<string, WorkflowDef>,
   options: FinalizeDefsOptions = {},
+  parentNodeKey = def.name,
 ): string[] {
   const errors: string[] = [];
   for (const step of def.steps) {
     if (!step.calls) continue;
-    const childDef = resolveCallsTarget(defs, step.calls, def);
+    if (options.deferredHubLiveCalls?.has(callsEdgeKey(parentNodeKey, step))) continue;
+    const childDef = resolveCallsStep(defs, def, step, options.routedCalls, parentNodeKey);
     if (!childDef) {
       if (
 		options.allowUnresolvedCalls !== true
@@ -2983,7 +3094,7 @@ export function finalizeDefs(
   for (const [name, def] of raw) {
     const expanded = expandIncludes(def, resolver);
 
-    const callsErrors = validateCallsEdges(expanded, raw, options);
+    const callsErrors = validateCallsEdges(expanded, raw, options, name);
     if (callsErrors.length > 0) throw new DefError(callsErrors[0]);
 
     const errors = validateDef(expanded);
@@ -2997,7 +3108,8 @@ export function finalizeDefs(
 
   // Preserve strict loading's first, stable cycle error after all per-def checks
   // without paying the wider authoring reporter's per-member attribution cost.
-  const cycle = findFirstCallsCycle(buildCallsGraph(out));
+  const cycle = findFirstCallsCycle(buildCallsGraph(out, options.routedCalls,
+    options.deferredHubLiveCalls));
   if (cycle !== undefined) throw new DefError(`calls cycle: ${cycle.join(' -> ')}`);
 
   return out;

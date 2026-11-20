@@ -8,6 +8,11 @@ import type { OrderPacket } from '../hub/types.ts';
 import { bindTrustedReferenceV2 } from './trusted-input-binding.ts';
 import type { TrustedInputWitness, TrustedReferenceV2Reader } from './trusted-reference-v2.ts';
 
+import { parseRoutedClaimV2, parseRoutedReferenceV2, type RoutedClaimV2,
+  type RoutedReferenceV2, type RoutedReferenceV2Reader } from './trusted-routed-reference-v2.ts';
+import { parseRecordedClaimV2, parseRecordedReferenceV2, type RecordedClaimV2,
+  type RecordedReferenceV2 } from './trusted-routed-recorded-v2.ts';
+
 const MAX_OBSERVATION_MS = 5_000;
 const CLAIM_FACING_FIELDS = ['capabilities', 'crews', 'reroutedFrom', 'modifier', 'escalated',
   'model', 'worker', 'judge', 'spec', 'x'] as const;
@@ -146,6 +151,10 @@ export function createTrustedInputV2Admission(args: {
       return refused('observation-expired');
     }
     signal?.throwIfAborted();
+    // Another admission may finish while this one is verifying producer proofs.
+    if (canonicalWorkflow !== undefined && canonicalWorkflow !== direct.workflow) {
+      return refused('canonical-workflow-changed');
+    }
     canonicalWorkflow ??= direct.workflow;
     return { ok: true, order: privateOrder, step,
       packetDigest: valueDigestHex(dynamic(direct)),
@@ -153,5 +162,142 @@ export function createTrustedInputV2Admission(args: {
       witnessDigest: bound.witnessDigest,
       observedAt: started, expiresAt: started + MAX_OBSERVATION_MS,
       inputs: response.inputs };
+  } };
+}
+
+/** Phase is chosen by the parent operation. It is never sent to Service or
+ * accepted in a child/holder broker frame. Recorded does not authorize a
+ * first external start even when an unknown report was accepted. */
+export type RoutedInputPhase = 'prestart' | 'recorded-live';
+export type RoutedInputPair =
+  | { reference: RoutedReferenceV2; claim: RoutedClaimV2 }
+  | { reference: RecordedReferenceV2; claim: RecordedClaimV2 };
+export type RoutedInputAdmission = (Extract<TrustedInputAdmission, { ok: true }> & {
+  phase: RoutedInputPhase; bindingDigest: string; occurrenceDigest?: string;
+}) | Extract<TrustedInputAdmission, { ok: false }>;
+
+/** Bind one exact private packet to a parent-observed Service pair and a
+ * locally verified signed step. Both roles and Shift use this same gate. */
+export async function bindTrustedRoutedInputV2(args: {
+  phase: RoutedInputPhase; pair: RoutedInputPair; privateOrder: OrderPacket;
+  instructions: InstructionResolver; consumedVerifier: ConsumedVerifier;
+  expected: { workflow: string; run: string };
+  now?: () => number; monotonicNow?: () => number;
+  startedAt?: number; startedMonotonic?: number;
+}): Promise<RoutedInputAdmission> {
+  const now = args.now ?? Date.now;
+  const monotonicNow = args.monotonicNow ?? (() => performance.now());
+  const started = args.startedAt ?? now();
+  const startedMonotonic = args.startedMonotonic ?? monotonicNow();
+  const refused = (reason: string): RoutedInputAdmission => ({ ok: false, reason });
+  const privateOrder = args.privateOrder;
+  if (!Number.isSafeInteger(started) || !Number.isFinite(startedMonotonic)
+    || privateOrder.run !== args.expected.run || !privateOrder.routing)
+    return refused('routed-private-order-out-of-scope');
+  let reference: RoutedReferenceV2 | RecordedReferenceV2;
+  let claim: RoutedClaimV2 | RecordedClaimV2;
+  try {
+    reference = args.phase === 'prestart'
+      ? parseRoutedReferenceV2(args.pair.reference, args.expected)
+      : parseRecordedReferenceV2(args.pair.reference, args.expected);
+    claim = args.phase === 'prestart'
+      ? parseRoutedClaimV2(args.pair.claim, args.expected)
+      : parseRecordedClaimV2(args.pair.claim, args.expected);
+  } catch { return refused('routed-reference-v2-malformed'); }
+  if (reference.state !== 'available') return refused(`service-${reference.state}`);
+  if (claim.state !== 'available') return refused('routed-claim-unavailable');
+  if (reference.order.workflow !== privateOrder.workflow
+    || reference.binding.frameWorkflow !== privateOrder.workflow
+    || !equal(reference.binding, claim.binding)
+    || !equal(reference.order.routing, claim.routing)
+    || !equal(privateOrder.routing, claim.routing)
+    || (args.phase === 'prestart' && reference.binding.preferenceExpiresAt <= now())
+    || (args.phase === 'recorded-live'
+      && (!('recordedOccurrence' in reference.binding)
+	|| !('recordedOccurrence' in claim.binding))))
+    return refused('routed-binding-changed');
+  // The ordinary signed gate proves optional/human presence and value,
+  // producer chains, local offer fields and dotted input-derived workdir.
+  // Remove only the separately bound routing field.
+  const { routing: _privateRouting, ...privateUnrouted } = privateOrder;
+  const { routing: _directRouting, ...directUnrouted } = reference.order;
+  const frame = reference.binding.frameWorkflow;
+  // The ordinary structural binder sees no routing field. Only its local
+  // signed-definition verifier receives the already-bound Service routing,
+  // which selects the exact member of a multi-definition bundle.
+  const routedInstructions: InstructionResolver = {
+    ...args.instructions,
+    ...(args.instructions.resolveHostedStep ? { resolveHostedStep: (order: OrderPacket) =>
+      args.instructions.resolveHostedStep!({ ...order, routing: reference.order.routing }) } : {}),
+  };
+  const ordinary = createTrustedInputV2Admission({
+    reader: { read: async () => ({
+      protocol: 'trusted-reference-read-v2', state: 'available', workflow: frame,
+      run: args.expected.run, order: directUnrouted, inputs: reference.inputs,
+      ...(reference.workdirInput === undefined ? {} : { workdirInput: reference.workdirInput }),
+      lease: { claimed: true },
+    }) },
+    instructions: routedInstructions,
+    consumedVerifier: (order, opts) => args.consumedVerifier({ ...order,
+      routing: reference.order.routing }, opts),
+    expected: { workflow: frame, run: args.expected.run }, now, elapsedNow: monotonicNow,
+  });
+  const local = await ordinary.observe(privateUnrouted);
+  if (!local.ok) return local;
+  const finished = now();
+  const finishedMonotonic = monotonicNow();
+  const elapsed = finishedMonotonic - startedMonotonic;
+  if (!Number.isSafeInteger(finished) || finished < started
+    || finished - started >= MAX_OBSERVATION_MS
+    || !Number.isFinite(finishedMonotonic) || !Number.isFinite(elapsed)
+    || elapsed < 0 || elapsed >= MAX_OBSERVATION_MS
+    || (args.phase === 'prestart' && reference.binding.preferenceExpiresAt <= finished))
+    return refused('routed-observation-expired');
+  const occurrenceDigest = 'recordedOccurrence' in reference.binding
+    ? valueDigestHex(reference.binding.recordedOccurrence) : undefined;
+  return { ...local, phase: args.phase, order: privateOrder, observedAt: started,
+    expiresAt: args.phase === 'prestart'
+      ? Math.min(started + MAX_OBSERVATION_MS, reference.binding.preferenceExpiresAt)
+      : started + MAX_OBSERVATION_MS,
+    bindingDigest: valueDigestHex(reference.binding),
+    ...(occurrenceDigest ? { occurrenceDigest } : {}),
+    packetDigest: valueDigestHex({ packet: local.packetDigest, binding: reference.binding,
+      routing: reference.order.routing }),
+  };
+}
+
+export function createTrustedRoutedInputV2Admission(args: {
+  reader: Pick<RoutedReferenceV2Reader, 'read'>;
+  instructions: InstructionResolver; consumedVerifier: ConsumedVerifier;
+  expected: { workflow: string; run: string };
+  now?: () => number; monotonicNow?: () => number;
+}): { observe(privateOrder: OrderPacket): Promise<RoutedInputAdmission> } {
+  const now = args.now ?? Date.now;
+  const monotonicNow = args.monotonicNow ?? (() => performance.now());
+  return { async observe(privateOrder) {
+    const startedAt = now(), startedMonotonic = monotonicNow();
+    let pair: Awaited<ReturnType<RoutedReferenceV2Reader['read']>>;
+    try { pair = await args.reader.read(); }
+    catch { return { ok: false, reason: 'routed-reference-v2-unavailable' }; }
+    return bindTrustedRoutedInputV2({ ...args, phase: 'prestart', pair, privateOrder,
+      startedAt, startedMonotonic });
+  } };
+}
+
+export function createTrustedRecordedRoutedInputV2Admission(args: {
+  reader: { read(): Promise<{ reference: RecordedReferenceV2; claim: RecordedClaimV2 }> };
+  instructions: InstructionResolver; consumedVerifier: ConsumedVerifier;
+  expected: { workflow: string; run: string };
+  now?: () => number; monotonicNow?: () => number;
+}): { observe(privateOrder: OrderPacket): Promise<RoutedInputAdmission> } {
+  const now = args.now ?? Date.now;
+  const monotonicNow = args.monotonicNow ?? (() => performance.now());
+  return { async observe(privateOrder) {
+    const startedAt = now(), startedMonotonic = monotonicNow();
+    let pair: { reference: RecordedReferenceV2; claim: RecordedClaimV2 };
+    try { pair = await args.reader.read(); }
+    catch { return { ok: false, reason: 'routed-recorded-reference-unavailable' }; }
+    return bindTrustedRoutedInputV2({ ...args, phase: 'recorded-live', pair, privateOrder,
+      startedAt, startedMonotonic });
   } };
 }

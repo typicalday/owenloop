@@ -26,7 +26,7 @@ import type { DefResolver, EngineEvent, EngineListener } from './engine.ts';
 import { openStore } from './store.ts';
 import type { Store } from './store.ts';
 import { dbPathRefusingSymlink, mkdirRefusingSymlink } from './util.ts';
-import { digestScopedCallsTargetKey, finalizeDefs, loadDefs, resolveCallsTarget } from './defs.ts';
+import { finalizeDefs, loadDefs, resolveCallsTarget, resolveExactBundleTarget, verifiedBundleDialect } from './defs.ts';
 import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
 import type { OrderInstructionSource } from './order-resolver.ts';
 import type { InvocationHostAuthority, WorkflowDef } from './types.ts';
@@ -155,8 +155,9 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
   // rule `finalizeDefs` already validated the set against.
   const resolveDef: DefResolver = (name, from, bundleDigest) => {
     const d = bundleDigest !== undefined
-      ? defs.get(digestScopedCallsTargetKey(bundleDigest, name)) ?? defs.get(name)
-      : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      ? resolveExactBundleTarget(defs, bundleDigest, name)
+      : from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from,
+		from.bundleDigest === undefined ? undefined : verifiedBundleDialect(defs, from.bundleDigest));
     if (!d) throw new Error(`unknown workflow definition '${name}'`);
     return d;
   };

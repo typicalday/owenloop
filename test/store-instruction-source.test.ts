@@ -148,6 +148,35 @@ async function installLockedPair(args: { childSource?: string; root?: string } =
   return { root, target, child, parent };
 }
 
+test('exact signed selection retains its locked calls child from one cached definition', async () => {
+  const f = await installLockedPair();
+  try {
+    const source = createStoreInstructionSource({ globalRoot: f.root,
+      verifier: createBundleIngestor() });
+    assert.equal(await source.prime(f.parent.result.digest), 'resolved');
+    const selected = source.selectVerifiedDefinition(f.parent.result.digest,
+      'locked-parent', 'invoke-child');
+    assert.equal(selected?.definition.name, 'locked-parent');
+    assert.equal(selected?.step.name, 'invoke-child');
+    assert.equal(selected?.callsChild('invoke-child')?.bundleDigest, f.child.result.digest);
+    assert.ok(selected?.support.some(object => object.bundleDigest === f.child.result.digest));
+    assert.equal(source.selectVerifiedDefinition(f.parent.result.digest,
+      'other-parent', 'invoke-child'), undefined);
+  } finally {
+    const writable = (dir: string): void => {
+      chmodSync(dir, 0o700);
+      for (const name of readdirSync(dir)) {
+	const path = join(dir, name);
+	const stat = lstatSync(path);
+	if (stat.isDirectory()) writable(path);
+	else if (stat.isFile()) chmodSync(path, 0o600);
+      }
+    };
+    writable(f.root);
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 function order(defDigest: string, step = 'runner'): OrderPacket {
   return {
     run: 'run-source',

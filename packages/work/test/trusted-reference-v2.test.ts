@@ -63,6 +63,39 @@ test('v2 admission binds the child to the independent Service read and refuses c
     { ok: false, reason: 'canonical-workflow-changed' });
 });
 
+test('overlapping verified observations cannot pin different canonical children', async () => {
+  const child = (id: string) => {
+    const packet = available();
+    packet.workflow = id;
+    packet.order.workflow = id;
+    return packet;
+  };
+  const first = child('child_a'), second = child('child_b');
+  let resume!: () => void, enter!: () => void;
+  const pending = new Promise<void>(resolve => { resume = resolve; });
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  let current = first;
+  const local = { name: 'planner', consumes: [parseConsume('optional')],
+    produces: [parseProduce('plan')] } as StepDef;
+  const admission = createTrustedInputV2Admission({ reader: { read: async () => current }, expected,
+    instructions: { resolveCommand: async () => ({ ok: false, kind: 'unknown-step', reason: 'unused' }),
+      resolveStep: async () => ({ ok: true, step: local }),
+      resolveHostedStep: async () => ({ ok: true, step: local, inputNames: ['optional'],
+	declaredInputs: [{ name: 'optional', producer: 'human', seedOwed: false }], callsProducers: {} }) },
+    consumedVerifier: async order => {
+      if (order.workflow === first.workflow) { enter();await pending; }
+      return { ok: true, order, warnings: [] };
+    } });
+  const privateOrder = (packet: TrustedReferenceV2) => ({ ...packet.order,
+    owes: [{ path: 'plan', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 }] });
+  const slow = admission.observe(privateOrder(first));
+  await entered;
+  current = second;
+  assert.equal((await admission.observe(privateOrder(second))).ok, true);
+  resume();
+  assert.deepEqual(await slow, { ok: false, reason: 'canonical-workflow-changed' });
+});
+
 test('strict v2 parser preserves absent witness and refuses malformed authority', () => {
   assert.deepEqual(parseTrustedReferenceV2(available(), expected), available());
   const bad = (change: (wire: ReturnType<typeof available>) => void) => {

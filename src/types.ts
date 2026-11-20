@@ -943,6 +943,9 @@ export interface WorkflowDef {
    * bundle format carries no per-workflow digest to check instead.
    */
   bundleDigest?: string;
+  /** @internal Verified manifest dialect for CAS calls resolution. Loader-only,
+   * non-enumerable: never changes hashes or persisted definition snapshots. */
+  bundleDialect?: 'plain' | 'hub-qualified';
   /**
    * @internal Store roots whose indexes/objects made `bundleDigest`
    * discoverable. Snapshot writers acquire every root's writer lock and
@@ -1352,6 +1355,11 @@ export interface ResolveStepCapabilitiesInput extends StepCapabilityOptions {
   readonly evidenceGeneration: string;
   readonly modifier?: string;
 }
+export interface NativeClaimGeneration {
+  readonly protocol: 'native-claim-generation-v1';
+  readonly frameIncarnation: string;
+  readonly generation: number;
+}
 export interface ReadyFiring {
   /** Root of the requested scan, and exact instance within that tree. */
   readonly workflow: string;
@@ -1364,7 +1372,8 @@ export interface ReadyFiring {
   readonly executorKind: string;
   readonly meaningDigest: string;
   readonly evidenceGeneration: string;
-  /** Digest of persisted frame/ancestor, artifact, task, run and alarm state. */
+  readonly nativeClaimGeneration: Readonly<NativeClaimGeneration>;
+  /** Digest of persisted frame/ancestor, artifact, task, run, epoch and alarm state. */
   readonly stateDigest: string;
   readonly resolved: ResolvedStepContext;
 }

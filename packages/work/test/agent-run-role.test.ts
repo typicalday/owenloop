@@ -1225,8 +1225,10 @@ test('default agent wiring preserves no-template when recovery fails verificatio
 test('an injected hub builds the default resolver without requiring an agent credential', async () => {
   const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
   const err: string[] = [];
+  process.env.OWENLOOP_ROUTING_SESSION = '0';
   const code = await roleRun(WIRE, {
     hub,
+    env: { ...process.env, OWENLOOP_ROUTING_SESSION: '0' },
     signalHost: fakeSignalHost().host,
     holderId: 'embedded-host',
     cwd: '/work',

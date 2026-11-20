@@ -1,0 +1,218 @@
+{
+  "protocol": "jev-production-owner-execution-manifest-v1",
+  "sourceOnly": true,
+  "files": [
+    {
+      "relative": "owner.py",
+      "sha256": "cf796689c5b3b4801c2ebba845ae47283f3bbc9d52ca17daca4287271b701d97",
+      "bytes": 49460
+    },
+    {
+      "relative": "launch.py",
+      "sha256": "60c554c77e993e70dbac442b8b4ae98f07f4712921296663e80b20744ec8159f",
+      "bytes": 1646
+    },
+    {
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e",
+      "bytes": 2383
+    },
+    {
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5",
+      "bytes": 853
+    },
+    {
+      "relative": "loader.mjs",
+      "sha256": "3b4da6e4e1fe95374593004749cba19bcb7fbb4bd924916e8fd9f9353244eac5",
+      "bytes": 16286
+    },
+    {
+      "relative": "fixture.mjs",
+      "sha256": "e775220697e2619e9d973307f371c269571a26f61183179893f5e30d134c31c9",
+      "bytes": 7467
+    },
+    {
+      "relative": "role.mjs",
+      "sha256": "06f5b01f864c3be150f312fff5c960da71ffc9d63f16a4269da5f7d5749f075e",
+      "bytes": 7220
+    },
+    {
+      "relative": "private-entry.mjs",
+      "sha256": "5b288b406af2b419795b99863a96fb6f1f375fbb6d940f7aff1c9c5e18b52514",
+      "bytes": 9233
+    },
+    {
+      "relative": "provider.mjs",
+      "sha256": "be176b433acb999587289dbecdc91fc9d7cd0d59a7154baeb728fe29e43b8310",
+      "bytes": 987
+    },
+    {
+      "relative": "source-inventory.json",
+      "sha256": "b1a4ca6fbbc999038cc2c02d848d35d56a8b9ff6216c1924f91462e49bee64f7",
+      "bytes": 35522
+    },
+    {
+      "relative": "source-composition.json",
+      "sha256": "b1a4c43f958917eefa203f7b9d836e8d643a4dd6299eaecbd9f99f59abd07008",
+      "bytes": 877
+    },
+    {
+      "relative": "protocol.json",
+      "sha256": "becc3a18a4ce74a9e72cdbdc925eb52c572cca3bb4e7474777048c35b63b05c9",
+      "bytes": 23959
+    },
+    {
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+      "bytes": 19973
+    },
+    {
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+      "bytes": 9232
+    },
+    {
+      "relative": "inputs/relay.c",
+      "sha256": "0ab068dbbd8e2b5b4cdb6a951b4619e8999658c8c818af50b0030cf976ce0576",
+      "bytes": 24083
+    },
+    {
+      "relative": "inputs/direct/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d",
+      "bytes": 33334
+    },
+    {
+      "relative": "overlay/packages/work/src/harness/routed-owner-observer.ts",
+      "sha256": "d80fa25cbac4081009fc8e57008d95635249c9d04129b4efd33641daf3c4869d",
+      "bytes": 15642
+    },
+    {
+      "relative": "selected-inputs.py",
+      "sha256": "f739142bf72b455f6af9ad694c3d4a724116563cc3a24a006fbef57da04fe745",
+      "bytes": 7244
+    },
+    {
+      "relative": "compiler-entry.mjs",
+      "sha256": "fc3baa5ed447685ebcaa9845456662eb2f5bc679a1a4638b702bd208ebfa303d",
+      "bytes": 8238
+    },
+    {
+      "relative": "initializer.mjs",
+      "sha256": "077a275c5d531409d19f91ad49e0485147df77e2d977c6d5926abc398e459e08",
+      "bytes": 416
+    }
+  ],
+  "executionFiles": [
+    {
+      "relative": "owner.py",
+      "sha256": "cf796689c5b3b4801c2ebba845ae47283f3bbc9d52ca17daca4287271b701d97",
+      "bytes": 49460
+    },
+    {
+      "relative": "launch.py",
+      "sha256": "60c554c77e993e70dbac442b8b4ae98f07f4712921296663e80b20744ec8159f",
+      "bytes": 1646
+    },
+    {
+      "relative": "headers.py",
+      "sha256": "d335e03c2ccbfc0918d491c1e917b258c22081d2dc484fe2c4d01892b4e3059e",
+      "bytes": 2383
+    },
+    {
+      "relative": "libc-contract.c",
+      "sha256": "7b6cd63a3fc6dd2a6f4de73127d151e0091fd55bdf23e57d883ec0f78e7775e5",
+      "bytes": 853
+    },
+    {
+      "relative": "loader.mjs",
+      "sha256": "3b4da6e4e1fe95374593004749cba19bcb7fbb4bd924916e8fd9f9353244eac5",
+      "bytes": 16286
+    },
+    {
+      "relative": "fixture.mjs",
+      "sha256": "e775220697e2619e9d973307f371c269571a26f61183179893f5e30d134c31c9",
+      "bytes": 7467
+    },
+    {
+      "relative": "role.mjs",
+      "sha256": "06f5b01f864c3be150f312fff5c960da71ffc9d63f16a4269da5f7d5749f075e",
+      "bytes": 7220
+    },
+    {
+      "relative": "private-entry.mjs",
+      "sha256": "5b288b406af2b419795b99863a96fb6f1f375fbb6d940f7aff1c9c5e18b52514",
+      "bytes": 9233
+    },
+    {
+      "relative": "provider.mjs",
+      "sha256": "be176b433acb999587289dbecdc91fc9d7cd0d59a7154baeb728fe29e43b8310",
+      "bytes": 987
+    },
+    {
+      "relative": "source-inventory.json",
+      "sha256": "b1a4ca6fbbc999038cc2c02d848d35d56a8b9ff6216c1924f91462e49bee64f7",
+      "bytes": 35522
+    },
+    {
+      "relative": "source-composition.json",
+      "sha256": "b1a4c43f958917eefa203f7b9d836e8d643a4dd6299eaecbd9f99f59abd07008",
+      "bytes": 877
+    },
+    {
+      "relative": "protocol.json",
+      "sha256": "becc3a18a4ce74a9e72cdbdc925eb52c572cca3bb4e7474777048c35b63b05c9",
+      "bytes": 23959
+    },
+    {
+      "relative": "dependencies/owner.py",
+      "sha256": "7207411dae463c0c589e2cfd893365c9401e5d23b7c9058b35dd02224c84dc4f",
+      "bytes": 19973
+    },
+    {
+      "relative": "dependencies/metadata.mjs",
+      "sha256": "e1c31a4c7f6fa05b58d08f5c5d18109397a48ea079a39dce7bb4667cca966a8b",
+      "bytes": 9232
+    },
+    {
+      "relative": "inputs/relay.c",
+      "sha256": "0ab068dbbd8e2b5b4cdb6a951b4619e8999658c8c818af50b0030cf976ce0576",
+      "bytes": 24083
+    },
+    {
+      "relative": "inputs/direct/descriptor.c",
+      "sha256": "42190f80dd212ab9991da55652fd0f45b424ffc41ba6a30f61c3ab11692f4a1d",
+      "bytes": 33334
+    },
+    {
+      "relative": "overlay/packages/work/src/harness/routed-owner-observer.ts",
+      "sha256": "d80fa25cbac4081009fc8e57008d95635249c9d04129b4efd33641daf3c4869d",
+      "bytes": 15642
+    },
+    {
+      "relative": "selected-inputs.py",
+      "sha256": "f739142bf72b455f6af9ad694c3d4a724116563cc3a24a006fbef57da04fe745",
+      "bytes": 7244
+    },
+    {
+      "relative": "compiler-entry.mjs",
+      "sha256": "fc3baa5ed447685ebcaa9845456662eb2f5bc679a1a4638b702bd208ebfa303d",
+      "bytes": 8238
+    },
+    {
+      "relative": "initializer.mjs",
+      "sha256": "077a275c5d531409d19f91ad49e0485147df77e2d977c6d5926abc398e459e08",
+      "bytes": 416
+    }
+  ],
+  "privateSourceMode": "0600",
+  "publishedSourceMode": "100644",
+  "sourceComposition": {
+    "sha256": "b1a4c43f958917eefa203f7b9d836e8d643a4dd6299eaecbd9f99f59abd07008",
+    "bytes": 877
+  },
+  "executionAdmitted": false,
+  "runtimeAccepted": false,
+  "sourcePacketRevision": "CHECKED_PACKAGE_METADATA_REUSE_V1",
+  "selectedAuthorityEquivalentFullInventory": false
+}

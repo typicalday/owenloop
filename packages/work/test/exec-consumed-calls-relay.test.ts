@@ -9,10 +9,12 @@ import { keyidFromBlob, publicKeyDescriptor } from '../../../src/crypto/keys.ts'
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import {
   createBundleIngestor,
+  createStoreInstructionSource,
   readWorkflowStoreIndex,
   storeIndexPath,
   writeWorkflowStoreIndex,
 } from '../../../src/store/index.ts';
+import type { StoreInstructionSource } from '../../../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { createConsumedVerifier } from '../src/consumed-verifier.ts';
 import { createDefaultStoreInstructionResolver, createStoreInstructionResolver } from '../src/exec/instructions.ts';
@@ -237,6 +239,75 @@ test('calls relay e2e: a relayed child record admits a calls-produced consumed a
   const result = await resolverFor(fixtureData).resolveCommand(order(fixtureData));
   assert.equal(result.ok, true, JSON.stringify(result));
   if (result.ok) assert.match(result.command, /integrate-ran/);
+});
+
+test('selected native concrete child binds the signed relay to that exact workflow', async () => {
+  const fixtureData = await fixture('qualified');
+  const packet = order(fixtureData);
+  const binding = { runId: 'wf_root', frameId: packet.workflow,
+    def: { bundleDigest: `sha256:${fixtureData.parentDigest}`,
+      workflowName: 'calls-relay-parent' } };
+  packet.routing = { claim: { claimId: packet.run, orderId: packet.run, binding },
+    decision: { binding } } as OrderPacket['routing'];
+  const makeResolver = (selectedWorkflow: string) => {
+    const base = createStoreInstructionSource({ projectRoot: fixtureData.projectRoot,
+      globalRoot: tempDir('owenloop-selected-concrete-global-'),
+      verifier: createBundleIngestor() });
+    const source: StoreInstructionSource = { ...base,
+      selectVerifiedDefinition: (digest, name, step) => {
+	const chosen = base.selectVerifiedDefinition(digest, name, step);
+	return chosen && { ...chosen, callsChild: callsStep => {
+	  const child = chosen.callsChild(callsStep);
+	  return child && { ...child, selectedConcreteCall: {
+	    kind: 'selected-native-concrete-child', parentWorkflow: packet.workflow,
+	    childWorkflow: selectedWorkflow,
+	    childDefRef: { bundleDigest: fixtureData.childDigest,
+	      workflowName: child.definition.name }, receiptDigest: 'a'.repeat(64),
+	  } };
+	} };
+      } };
+    const proof = (JSON.parse(packet.consumesProof!) as Record<string, string>).u1!;
+    const receipt = { kind: 'concrete-call' as const, parentWorkflow: packet.workflow,
+      parentDefRef: { bundleDigest: fixtureData.parentDigest,
+	workflowName: 'calls-relay-parent' }, callStep: 'unit1', callPath: 'u1',
+      parentArtifactVersion: 1, childWorkflow: selectedWorkflow,
+      childDefRef: { bundleDigest: fixtureData.childDigest, workflowName: 'change-unit' },
+      childOutcome: 'result', childOutcomeVersion: CHILD_VERSION,
+      foldedValueDigest: valueDigestHex(U1_VALUE) };
+    return createStoreInstructionResolver({ source,
+      globalRoot: tempDir('owenloop-selected-concrete-global-'),
+      verifier: createBundleIngestor(),
+      routedSelection: { rootWorkflow: 'wf_root', frameWorkflow: packet.workflow,
+	definitionName: 'calls-relay-parent', defDigest: fixtureData.parentDigest,
+	run: packet.run },
+      definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
+      consumedVerifier: verifierFor(fixtureData, 'enforce'), env: fixtureData.env,
+      concreteCallBindingSource: { read: async () => ({ receipt,
+	receiptDigest: valueDigestHex(receipt), proof }) },
+    });
+  };
+  // Signed definition preparation is separate from admitting consumed proof.
+  // Both selected occurrences have valid definition bytes; the effect-time
+  // command and hosted gates must compare the proof's native producer ID.
+  for (const nativeWorkflow of ['wf-change-unit', 'wf-other-native']) {
+    const definition = await makeResolver(nativeWorkflow).resolveRoutedCommandDefinition!(packet);
+    assert.equal(definition.ok, true, JSON.stringify(definition));
+  }
+  const accepted = await makeResolver('wf-change-unit').resolveCommand(packet);
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  const otherNative = await makeResolver('wf-other-native').resolveCommand(packet);
+  assert.equal(otherNative.ok, false, 'a same-definition proof from another native child must refuse');
+  if (!otherNative.ok) assert.equal(otherNative.kind, 'unverified-consumed');
+  for (const nativeWorkflow of ['wf-change-unit', 'wf-other-native']) {
+    const hosted = await makeResolver(nativeWorkflow).resolveHostedStep!(packet);
+    assert.equal(hosted.ok, true, JSON.stringify(hosted));
+    if (!hosted.ok) continue;
+    assert.equal(hosted.callsProducers.u1?.childWorkflow, nativeWorkflow);
+    const consumed = await verifierFor(fixtureData, 'enforce')(packet, {
+      hardRule: true, callsProducers: hosted.callsProducers,
+    });
+    assert.equal(consumed.ok, nativeWorkflow === 'wf-change-unit', JSON.stringify(consumed));
+  }
 });
 
 const NO_RELAY_REASON = /\(calls\) .* artifact 'u1': artifact 'u1' is produced by calls: step 'unit1' \(dep\/change-unit@1\.0\.0\), so only a relayed child proof can prove it, but the order carries no consumesProofRelay entry for it/;
@@ -473,6 +544,41 @@ test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted 
   assert.equal(typeof passed.revalidate, 'function');
   assert.equal(await passed.revalidate!(), undefined);
   assert.deepEqual(reads.slice(2), reads.slice(0, 2), 'final revalidation rereads both trusted receipts');
+  if (!crossStore && factory === 'store') {
+    const definitionName = 'parent';
+    const binding = { runId: 'wf-root', frameId: workflow,
+      def: { bundleDigest: `sha256:${parentDigest}`, workflowName: definitionName } };
+    const routedPacket: OrderPacket = { ...packet, routing: {
+      claim: { claimId: finish.run, orderId: finish.run, binding },
+      decision: { binding },
+    } as OrderPacket['routing'] };
+    let directReads = 0;
+    let allowDirect = true;
+    const routed = createStoreInstructionResolver({ projectRoot, globalRoot,
+      verifier: createBundleIngestor(),
+      definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
+      consumedVerifier: verifierFor(fixtureData, 'enforce'), env: fixtureData.env,
+      routedSelection: { rootWorkflow: 'wf-root', frameWorkflow: workflow,
+	definitionName, defDigest: parentDigest, run: finish.run },
+      invocationBindingSource: { read: key => {
+	directReads++;
+	if (!allowDirect) throw new Error('postfreeze invocation read is forbidden');
+	return source.read(key);
+      } },
+    });
+    const signed = await routed.resolveRoutedCommandDefinition!(routedPacket);
+    assert.equal(signed.ok, true, JSON.stringify(signed));
+    if (signed.ok) {
+      assert.equal(directReads, 2, 'prestart resolves both actual invocation receipts');
+      allowDirect = false;
+      assert.equal(await signed.revalidateLocalAfterRun?.(), undefined);
+      assert.equal(directReads, 2, 'local postrun checks source but makes no frozen role relay read');
+      const full = await signed.revalidateAfterRun?.();
+      assert.equal(full?.ok, false, 'generic full postrun still requires invocation receipts');
+      if (full) assert.equal(full.code, 'invocation-read-failed');
+      assert.equal(directReads, 3);
+    }
+  }
   const refused = async (p: OrderPacket, src: InvocationBindingSource | undefined = source) => {
     const r = await resolver(src).resolveCommand(p);
     assert.equal(r.ok, false, JSON.stringify(r));
@@ -489,7 +595,20 @@ test(`invocation relay (${factory} factory, cross-store=${crossStore}): trusted 
   await refused({ ...packet, consumedFingerprint: { ...packet.consumedFingerprint, one: 999 } });
   const absent = await resolver().resolveCommand(packet);
   assert.equal(absent.ok, false);
-  if (!absent.ok) assert.match(absent.reason, /InvocationBindingSource/);
+  if (!absent.ok) {
+    assert.match(absent.reason, /InvocationBindingSource/);
+    assert.equal(absent.code, 'invocation-source-absent');
+  }
+  const noVersion = await resolver(source).resolveCommand({ ...packet,
+    consumedFingerprint: { two: packet.consumedFingerprint!.two! } });
+  assert.equal(noVersion.ok, false);
+  if (!noVersion.ok) assert.equal(noVersion.code, 'invocation-version-missing');
+  const missingReceipt = await resolver({ read: () => undefined }).resolveCommand(packet);
+  assert.equal(missingReceipt.ok, false);
+  if (!missingReceipt.ok) assert.equal(missingReceipt.code, 'invocation-receipt-moved');
+  const failedRead = await resolver({ read: () => { throw new Error('private relay failure'); } }).resolveCommand(packet);
+  assert.equal(failedRead.ok, false);
+  if (!failedRead.ok) assert.equal(failedRead.code, 'invocation-read-failed');
   await refused(packet, { read: () => undefined });
   await refused(packet, { read: () => { throw new Error('unavailable'); } });
   f.engine.cancelRun(workflow);
