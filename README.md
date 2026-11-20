@@ -413,8 +413,14 @@ the bundled Claude Code and Codex plugins on that same CLI and hub connection.
 
 ## Quick start
 
-Put the `owenloop` CLI (Node ≥ 22.13) on `PATH` and run `owenloop setup` once. Then
-ask your Prime Agent for what you want:
+With Node.js 22.13 or newer, install the CLI and connect it to your Hub:
+
+```sh
+npm install --global owenloop
+owenloop setup
+```
+
+Then ask your Prime Agent for what you want:
 
 > Use author to build me a workflow that researches a topic, writes
 > a report, and doesn't accept it until an independent reviewer signs off —
@@ -429,9 +435,10 @@ plugins launch the same `owenloop` command as
 check the installed CLI/plugin version pair at session start when their hooks
 are enabled, and the MCP server reports a readable mismatch error on tool calls; run `owenloop setup` when the versions differ. For one-off shell
 use, `npx owenloop` still works — no clone, no build, no environment
-variables, no CLI verbs to memorize. The same package also includes the
-execution-side companion; use `owenloop work <subcommand>` for lower-level
-execution tasks. There is no separate `owenwork` package or binary.
+variables, no CLI verbs to memorize. The same package includes the worker
+commands under `owenloop work`. To connect a worker with a one-time join
+code, copy the command from the Console or run
+`owenloop work join <code> --hub <origin>` with your Hub's URL.
 
 ### Deterministic workflow bundles
 
