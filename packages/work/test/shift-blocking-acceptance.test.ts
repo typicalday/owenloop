@@ -6,7 +6,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { chmodSync, lstatSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -138,8 +138,9 @@ function env(): Record<string, string | undefined> {
   };
 }
 
-function runCli(args: string[], extraEnv: Record<string, string | undefined> = env()): CommandResult {
+function runCli(args: string[], extraEnv: Record<string, string | undefined> = env(), cwd?: string): CommandResult {
   const child = spawn(process.execPath, [BIN, ...args], {
+    cwd,
     env: { ...process.env, ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -528,5 +529,53 @@ test('attending shift survives cancellation and dispatches while no client is pa
   } finally {
     shift?.child.kill('SIGKILL');
     server.close();
+  }
+});
+
+test('separate Shift commands can start, reach and close a long state path through a directory alias', async () => {
+  const physical = join(root, 'p'.repeat(120));
+  const alias = join(root, 'a'.repeat(120));
+  mkdirSync(physical);
+  symlinkSync(physical, alias, 'dir');
+  const state = join(alias, 'new', 'state');
+  const socket = join(state, 'shift.sock');
+  const { origin, server } = await startMockHub(() => ({ text: '', instances: [], orders: [] }));
+  const startArgs = ['shift', 'start', 'long-state', '--origin', origin, '--cache-dir', cacheDir, '--state-dir', state];
+  try {
+    const daemon = runCli(startArgs, env(), physical);
+    await until(() => existsSync(socket) || daemon.child.exitCode !== null, 'long-path daemon to start', 10_000);
+    if (daemon.child.exitCode !== null) assert.fail((await daemon.result).stderr);
+    const status = await runCli(['shift', 'status', '--state-dir', '.'], env(), state).result;
+    assert.equal(status.code, 0, status.stderr);
+    assert.deepEqual(jsonResult<{ serve_crews: string[] }>(status).serve_crews, ['long-state']);
+    assert.equal(lstatSync(socket).mode & 0o777, 0o600);
+    const second = await runCli(startArgs, env(), state).result;
+    assert.equal(second.code, 1, second.stderr);
+    assert.match(second.stderr, /another daemon is active/);
+    writeFileSync(join(state, 'keep.txt'), 'existing state');
+    const end = await runCli(['shift', 'end', '--state-dir', state], env(), physical).result;
+    assert.equal(end.code, 0, end.stderr);
+    assert.equal((await daemon.result).code, 0);
+    assert.equal(existsSync(socket), false);
+    assert.equal(existsSync(socket + '.lock'), false);
+    assert.equal(readFileSync(join(state, 'keep.txt'), 'utf8'), 'existing state');
+
+    // A distant client cannot address this path. Both public start modes fail before creating state.
+    const unreachable = join(physical, 'é'.repeat(60), 'uncreated');
+    for (const options of [[], ['--once']]) {
+      const refused = await runCli(['shift', 'start', 'test', '--origin', origin, '--state-dir', unreachable, ...options], env(), root).result;
+      assert.equal(refused.code, 1, refused.stderr);
+      assert.match(refused.stderr, /exceeds the (104|108)-byte limit/);
+      assert.ok(refused.stderr.includes(String(Buffer.byteLength(join(unreachable, 'shift.sock.lock'))) + ' bytes'));
+      assert.match(refused.stderr, /--state-dir \./);
+      assert.equal(existsSync(unreachable), false);
+    }
+    const refused = await runCli(['shift', 'status', '--state-dir', unreachable], env(), root).result;
+    assert.equal(refused.code, 1, refused.stderr);
+    assert.match(refused.stderr, /exceeds the (104|108)-byte limit/);
+  } finally {
+    rmSync(alias);
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
