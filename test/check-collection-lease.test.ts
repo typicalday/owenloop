@@ -779,10 +779,11 @@ test('collection lease: stale CAS uses rebound modifier for scoped group precede
 });
 
 test('collection lease: unsampled real schema-valid value is an incomplete check, not a clean archive proof', () => {
+  // Grouped repetition stays outside the checker's bounded concatenation sampler.
   const gather = step({ name: 'gather', consumes: ['q'], produces: ['items[]'] });
   gather.produces[0]!.schema = {
     type: 'object', required: ['code'],
-    properties: { code: { type: 'string', pattern: '^[A-Z]{3}$' } },
+    properties: { code: { type: 'string', pattern: '^(?:[A-Z]){3}$' } },
   };
   const definition = def('regex-collection', [input('q', { seedOwed: false })], [
     gather,
@@ -819,7 +820,7 @@ test('collection lease: unsampled real schema-valid value is an incomplete check
     '          type: object',
     '          required: [code]',
     '          properties:',
-    '            code: { type: string, pattern: "^[A-Z]{3}$" }',
+    '            code: { type: string, pattern: "^(?:[A-Z]){3}$" }',
     '    body: gather',
     '  - name: inspect',
     '    consumes: ["items[$i]"]',

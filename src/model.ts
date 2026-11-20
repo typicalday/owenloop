@@ -2515,8 +2515,33 @@ function clonePendingModifiers(pending?: Record<string, string>): Record<string,
   return Object.assign(Object.create(null) as Record<string, string>, pending);
 }
 
+/** One bounded sample for anchored concatenations of ASCII atoms, + and {n}. */
+function sampleStringPattern(pattern: string, minLength: number): string | undefined {
+  if (pattern.length > 256 || !pattern.startsWith('^') || !pattern.endsWith('$')
+    || !Number.isSafeInteger(minLength) || minLength > 128) return undefined;
+  const atom = /(?:\[([A-Za-z0-9_.-]+)\]|\\([./-])|([A-Za-z0-9_:/-]))(?:\{([1-9][0-9]{0,2})\}|(\+))?/y;
+  let value = '';
+  let extendAt = -1;
+  atom.lastIndex = 1;
+  while (atom.lastIndex < pattern.length - 1) {
+    const match = atom.exec(pattern);
+    if (!match) return undefined;
+    const char = match[1]?.[0] ?? match[2] ?? match[3]!;
+    const count = Number(match[4] ?? 1);
+    if (value.length + count > 128) return undefined;
+    if (match[5]) extendAt = value.length;
+    value += char.repeat(count);
+  }
+  if (value.length >= minLength) return value;
+  if (extendAt === -1) return undefined;
+  return value.slice(0, extendAt) + value[extendAt]!.repeat(minLength - value.length) + value.slice(extendAt);
+}
+
 /** Bounded concrete JSON candidates, shared by collection and singleton guards. */
-function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives = false): unknown[] {
+function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives = false): {
+  candidates: unknown[];
+  patterned: unknown;
+} {
   // Width and depth alone are not a resource bound: four items at every nested
   // array level would allocate exponentially. Exhaustion leaves this class
   // unsampled; the caller must report incomplete coverage.
@@ -2524,6 +2549,8 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
   let sampleBudgetExhausted = false;
   let sawUnionSiblings = false;
   let useUnionSiblings = false;
+  let sawPatternSample = false;
+  let usePatternSamples = false;
   // Keep overlapping schemas as shallow layers. Only look up properties and
   // items we actually sample, even if an optional subtree is very deep.
   const sample = (parts: Array<JsonSchema | undefined>, depth: number): unknown => {
@@ -2559,6 +2586,7 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     const type = Array.isArray(shape.type) ? shape.type[0] : shape.type;
     if (type === 'string') {
       const minLength = typeof shape.minLength === 'number' ? Math.max(1, shape.minLength) : 1;
+      const fallback = 'x'.repeat(Math.min(minLength, 32));
       const strings = ['x', 'E1', 'C1', 'S1', 'SC1', 'U1', 'F1', 'R1', '1', '2026-01-01'];
       if (typeof shape.pattern === 'string') {
 	try {
@@ -2566,8 +2594,13 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
 	  const matching = strings.find((value) => value.length >= minLength && pattern.test(value));
 	  if (matching !== undefined) return matching;
 	} catch { /* The validator below remains authoritative. */ }
+	const patterned = sampleStringPattern(shape.pattern, minLength);
+	if (patterned !== undefined && patterned !== fallback) {
+	  sawPatternSample = true;
+	  if (usePatternSamples) return patterned;
+	}
       }
-      return 'x'.repeat(Math.min(minLength, 32));
+      return fallback;
     }
     if (type === 'integer' || type === 'number') return typeof shape.minimum === 'number' ? shape.minimum : 1;
     if (type === 'boolean') return true;
@@ -2641,6 +2674,14 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     const candidate = sample([schema], 0);
     if (!sampleBudgetExhausted) combined = candidate;
   }
+  let patterned: unknown;
+  // A different field in a union can make the unmodified string valid. Keep
+  // the original samples and build this alternative within the same node budget.
+  if (sawPatternSample && !sampleBudgetExhausted) {
+    usePatternSamples = true;
+    const candidate = sample([schema], 0);
+    if (!sampleBudgetExhausted) patterned = candidate;
+  }
 
   const candidates: unknown[] = [
     {},
@@ -2670,7 +2711,7 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
   if (!includePrimitives && combined !== null && typeof combined === 'object' && !Array.isArray(combined)) {
     candidates.push(combined);
   }
-  return candidates;
+  return { candidates, patterned };
 }
 
 /**
@@ -2688,7 +2729,9 @@ export function collectionValueWitnesses(schema: JsonSchema | undefined): {
   if (schema === undefined) return { valid: {}, validClassKnown: true, invalidClassKnown: true };
   let valid: Record<string, unknown> | undefined;
   let invalid: Record<string, unknown> | undefined;
-  for (const value of schemaValueCandidates(schema)) {
+  const { candidates, patterned } = schemaValueCandidates(schema);
+  if (patterned !== undefined) candidates.push(patterned);
+  for (const value of candidates) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
     const object = value as Record<string, unknown>;
     if (validateValue(schema, value).valid) {
@@ -2770,23 +2813,31 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
       schemaRefusalClassKnown: true, greenClassKnown: true, bindRefusal: false,
       acceptedModifiers: [undefined] };
   }
-  const candidates = schemaValueCandidates(schema, true);
+  const { candidates, patterned } = schemaValueCandidates(schema, true);
   if (bind) {
     // A bare bind-shaped object often omits another required schema field.
     // Vary the bound leaf in a bounded set of complete sampled objects too;
     // the runtime validator below remains the acceptance authority.
     const leaves = bind.to === 'modifier'
       ? [...(def.modifiers ?? []), '__invalid_modifier__'] : [null];
-    for (const base of candidates.slice(0, 16)) {
+    const addBindVariants = (base: unknown): void => {
       for (const leaf of leaves) {
 	const variant = bindVariant(base, bind.from, leaf);
 	if (variant !== undefined) candidates.push(variant);
       }
-    }
+    };
+    for (const base of candidates.slice(0, 16)) addBindVariants(base);
     candidates.unshift(bindCandidate(bind.from, bind.to === 'modifier'
       ? (modifier ?? def.modifiers?.[0] ?? 'x') : null));
     for (const name of def.modifiers ?? []) candidates.push(bindCandidate(bind.from, name));
     candidates.push(bindCandidate(bind.from, '__invalid_modifier__'));
+    // Try the extra complete object only after all original modifier witnesses.
+    if (patterned !== undefined) {
+      candidates.push(patterned);
+      addBindVariants(patterned);
+    }
+  } else if (patterned !== undefined) {
+    candidates.push(patterned);
   }
   let green = false;
   let refusal = false;
