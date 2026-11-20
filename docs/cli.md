@@ -284,8 +284,9 @@ self-driven dispatch loop as a foreground process and listens on
 and one JSON-line response. The daemon keeps polling and dispatching while no
 `shift next` client is attached.
 
-Run `owenloop work shift --serve-commands` to poll for commands granted to the
-worker by a Hub administrator. Direct MCP clients can call
+Run `owenloop shift start <crew> --serve-commands` to start a foreground daemon
+that polls only for commands granted to this worker by a Hub administrator.
+The direct loop accepts the same flag via `owenloop work shift --serve-commands`. Direct MCP clients can call
 `whats_next_commands_v1`. Command-only inbox and targeted requests use
 `POST /api/command_lane/v1/whats_next`. An older Hub returns an unsupported
 route or tool error, and the worker leaves ordinary jobs available to their
@@ -317,7 +318,7 @@ holds `credentials.json`, `allowed_signers`, `org-root.pub`, `grants/`, and
 ### `shift start <crew...>`
 
 ```text
-owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
+owenloop shift start <crew...> [--all] [--serve-commands] [--origin <url>] [--as <account>] [--name <n>]
 [--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--local-queue-hold <ms>] [--poll-interval <ms>] [--once]
 [--disk-floor <bytes>]
 [--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
@@ -332,6 +333,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 
 | option | default and behavior |
 |---|---|
+| `--serve-commands` | use the command-only lane for this Shift. The Hub checks each command against the worker’s grants. |
 | `--origin <url>` | use this hub origin; otherwise use `hubOrigin` from the execution settings file; there is no hub-origin fallback |
 | `--as <account>` | use this Scoped Identity account; defaults to `default` |
 | `--name <n>` | use this shift name; otherwise generate one from the host and current directory with a process/shift suffix |
