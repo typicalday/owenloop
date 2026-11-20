@@ -30,7 +30,7 @@ interface StartArgs extends ParsedArgs {
 
 function usage(): void {
   process.stderr.write(
-    'usage: owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]\n' +
+    'usage: owenloop shift start <crew...> [--all] [--serve-commands] [--origin <url>] [--as <account>] [--name <n>]\n' +
       '                              [--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--local-queue-hold <ms>] [--poll-interval <ms>] [--once]\n' +
       '                              [--cache-dir <p>] [--state-dir <p>]\n' +
       '                              [--log-dir <p>] [--log-max-age <ms>]\n' +
@@ -60,6 +60,11 @@ function parseStartArgs(args: string[]): StartArgs {
     const name = raw.startsWith('--') && raw.includes('=') ? raw.slice(0, raw.indexOf('=')) : raw;
     if (name === '--all') {
       parsed.all = true;
+      continue;
+    }
+    if (name === '--serve-commands') {
+      if (raw !== name) return { crews: parsed.crews, error: '--serve-commands takes no value' };
+      parsed.serveCommands = true;
       continue;
     }
     if (name === '--once') {

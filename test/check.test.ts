@@ -456,6 +456,56 @@ test('modelCheck admits an exact-fit graph when later transitions revisit known 
   }
 });
 
+test('checker replays a worker committing the second owed output first', () => {
+  const workflow = def('output-order', [input('seed', { seedOwed: false })], [
+    step({ name: 'producer', consumes: ['seed'], produces: ['alpha', 'beta'] }),
+  ]);
+  workflow.invariants = [{
+    name: 'alpha-before-beta',
+    when: { path: 'beta', is: 'green' },
+    requires: { not: { path: 'alpha', is: 'owed' } },
+  }];
+  assert.deepEqual(validateDef(workflow), []);
+  const { engine } = makeEngine([workflow]);
+  const wf = engine.createInstance(workflow.name);
+  const order = fire(engine, wf, 'producer');
+  assert.deepEqual(order.owes.map((owed) => owed.path), ['alpha', 'beta']);
+  engine.green(wf, order.run, 'beta', {});
+  assert.equal(engineArts(engine, wf).get('alpha')?.acceptance, 'owed');
+  assert.equal(engineArts(engine, wf).get('beta')?.acceptance, 'green');
+
+  const report = modelCheck(workflow);
+  assert.equal(report.bounded, false);
+  assert.deepEqual(report.invariantViolations, [{
+    invariant: 'alpha-before-beta',
+    path: [{ step: 'producer', key: '', outcome: 'green', path: 'beta' }],
+  }]);
+});
+
+test('checker applies the selected output schema before reporting a multi-output witness', () => {
+  const producer = step({ name: 'producer', consumes: ['seed'], produces: ['alpha', 'beta'], maxSchemaFailures: 1 });
+  producer.produces[1]!.schema = false;
+  const workflow = def('output-schemas', [input('seed', { seedOwed: false })], [producer]);
+  workflow.invariants = [
+    { name: 'beta-never-green', requires: { not: { path: 'beta', is: 'green' } } },
+    { name: 'alpha-before-beta-rejection', when: { path: 'beta', is: 'rejected' },
+      requires: { not: { path: 'alpha', is: 'owed' } } },
+  ];
+  assert.deepEqual(validateDef(workflow), []);
+  const { engine } = makeEngine([workflow]);
+  const wf = engine.createInstance(workflow.name);
+  const order = fire(engine, wf, 'producer');
+  assert.equal(engine.green(wf, order.run, 'beta', {}).outcome, 'schema-rejected');
+  assert.equal(engineArts(engine, wf).get('alpha')?.acceptance, 'owed');
+
+  const report = modelCheck(workflow);
+  assert.equal(report.bounded, false);
+  assert.deepEqual(report.invariantViolations, [{
+    invariant: 'alpha-before-beta-rejection',
+    path: [{ step: 'producer', key: '', outcome: 'schema-reject', path: 'beta' }],
+  }]);
+});
+
 test('modelCheck inspects already admitted completions after refusing a new state', () => {
   const workflow = def('small-budget', [input('initial', { seedOwed: false })], [
     step({ name: 'finish', consumes: ['initial'], produces: ['x'], terminal: true, maxAttempts: 1, maxSchemaFailures: 1 }),
