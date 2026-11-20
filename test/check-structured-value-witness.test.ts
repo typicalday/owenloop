@@ -59,6 +59,18 @@ test('checker leaves a genuinely unsampled valid class incomplete', () => {
   assert.ok(report.unreachedSteps.includes('consume'));
 });
 
+test('unbound singletons find both outcomes when only a late array sample distinguishes them', () => {
+  for (const schema of [{ allOf: [{ type: 'array' }] }, { not: { type: 'array' } }]) {
+    const produce = step({ name: 'produce', produces: ['result'], maxSchemaFailures: 1 });
+    produce.produces[0]!.schema = schema;
+    const report = modelCheck(def('unbound-witnesses', [], [produce]));
+    assert.deepEqual(report.completePath?.map((move) => move.outcome), ['green']);
+    assert.deepEqual(report.stallStates.map(({ path }) => path.map((move) => move.outcome)),
+      [['schema-reject']]);
+    assert.deepEqual(report.coverageIncomplete, []);
+  }
+});
+
 test('nested arrays exhaust the concrete candidate budget without exhausting memory', { timeout: 5_000 }, () => {
   let nested: Record<string, unknown> = { type: 'string' };
   for (let depth = 0; depth < 16; depth++) {
