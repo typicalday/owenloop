@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { createAgentRunLoop } from '../src/agent/loop.ts';
+import type { HarnessAdapter } from '../src/harness/contract.ts';
+import { createHubClient } from '../src/hub/client.ts';
+import { createRoutedAgentAdapterGate } from '../src/roles/routing-agent-adapter.ts';
+import { createRoutedAgentLifecycle } from '../src/roles/routing-agent-lifecycle.ts';
 import { valueDigestHex } from '../../../src/crypto/canonical.ts';
 import { createRoutedAgentPrestart, createRoutedAgentSelection } from '../src/roles/routing-agent-launch.ts';
 import type { RoutingChildClient } from '../src/hub/routing-child-client.ts';
@@ -167,6 +172,71 @@ for (const status of ['advisory', 'fallback'] as const) {
     assert.deepEqual(f.calls, ['claim', 'assess', 'reserve', 'report', 'order']);
   });
 }
+
+test('stable fallback reaches the routed adapter once after the final order read', async () => {
+  const packet = structuredClone(order);
+  packet.routing!.preference.localModel = { version: 'local-model-policy-v1', onFailure: 'fallback' };
+  const f = fixture(packet);
+  f.child.assessLocalModel = async ({ candidateIds }) => {
+    f.calls.push('assess');
+    assert.deepEqual(candidateIds, [first.id, second.id]);
+    return { status: 'fallback', reason: 'fallback', assessment: assessment('fallback', null) };
+  };
+  f.child.reserveLaunch = async ({ request }) => {
+    f.calls.push('reserve');
+    assert.equal(request.assessmentId, 'lma-one');
+    assert.equal(request.requested, null);
+    assert.deepEqual(request.selected, first);
+    return { reservationId: 'lr-one', orderId: 'run', expiresAt: 50_000 };
+  };
+
+  const adapter: HarnessAdapter = {
+    id: first.harness, resumeTier: 'native-token', preflight: () => [],
+    start: async () => assert.fail('ordinary adapter start'),
+    async startRouted(args, onEvent, launch) {
+      f.calls.push('startRouted');
+      assert.deepEqual([args.model, args.effort], [first.model, first.effort]);
+      launch.onLaunch({ generation: launch.generation, transport: {
+	settleEffects: async () => ({ scope: 'original-posix-group', state: 'empty' }),
+      } });
+      const ref = { harness: first.harness, token: 'test-session' };
+      onEvent({ kind: 'started', ref });
+      onEvent({ kind: 'turn_ended' });
+      return ref;
+    },
+    deliver: async () => {}, stop: async () => {},
+  };
+  const gate = createRoutedAgentAdapterGate(id => id === adapter.id ? adapter : undefined, () => [adapter.id]);
+  const lifecycle = createRoutedAgentLifecycle({ generation: 'test-generation', start: gate.start, child: {
+    quiesce: async () => ({ quiescing: true, effects: 'settled' }),
+    agentOutcome: async () => ({ claim: 'closed' }), agentFinish: async () => assert.fail('unexpected release'),
+  } });
+  const hub = createHubClient({ origin: 'https://hub.example.test', getToken: async () => 'test-token',
+    fetchImpl: async url => {
+      assert.equal(new URL(String(url)).pathname, '/api/get_order');
+      return Response.json({ workflow: packet.workflow, run: packet.run, text: '',
+	lease: { claimed: true }, order: packet });
+    },
+  });
+  const diagnostics: string[] = [];
+  const loop = createAgentRunLoop({
+    hub, workflow: identities.workflow, run: identities.run, holder: roleHolder,
+    origin: 'https://hub.example.test', account: 'test', cwd: '/tmp',
+    loadStep: async () => ({ step: packet.step, brief: 'Write the test result.', permissions: { extensions: {} } }),
+    resolveAdapter: gate.resolveAdapter, harnessAvailable: gate.harnessAvailable,
+    resolveCrewRosters: () => assert.fail('unexpected local roster'),
+    routedSelect: createRoutedAgentSelection({ child: f.child, ...identities, now: () => 2_000 }),
+    routedLifecycle: lifecycle, routingHolderPath: '/tmp/test-holder',
+    consumedVerifier: async input => ({ ok: true, order: input, warnings: [] }),
+    appendSession: () => {}, nextAttempt: () => 1, now: () => 2_000,
+    sleep: () => new Promise(resolve => setImmediate(resolve)), out: () => {},
+    err: line => diagnostics.push(line),
+  });
+  assert.equal(await loop.run(), 'submitted', diagnostics.join('\n'));
+  assert.equal(f.report()?.requested, null);
+  assert.deepEqual(f.report()?.selected, first);
+  assert.deepEqual(f.calls, ['claim', 'assess', 'reserve', 'report', 'order', 'startRouted']);
+});
 
 test('agent assessment refuses an invented preference tuple before reservation', async () => {
   const packet = structuredClone(order);
