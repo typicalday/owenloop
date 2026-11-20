@@ -2522,34 +2522,40 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
   // unsampled; the caller must report incomplete coverage.
   let remainingSampleNodes = 1_024;
   let sampleBudgetExhausted = false;
-  const withHints = (base: JsonSchema | undefined, hints: JsonSchema | undefined): JsonSchema | undefined => {
-    if (hints === undefined || typeof hints === 'boolean') return base;
-    if (base === undefined || typeof base === 'boolean') return hints;
-    const baseProps = base.properties && typeof base.properties === 'object' && !Array.isArray(base.properties)
-      ? base.properties as Record<string, JsonSchema> : undefined;
-    const hintProps = hints.properties && typeof hints.properties === 'object' && !Array.isArray(hints.properties)
-      ? hints.properties as Record<string, JsonSchema> : undefined;
-    const properties: Record<string, JsonSchema> | undefined = hintProps
-      ? Object.assign(Object.create(null) as Record<string, JsonSchema>, baseProps) : undefined;
-    if (properties && hintProps) {
-      for (const [name, shape] of Object.entries(hintProps)) {
-	properties[name] = withHints(baseProps?.[name], shape) ?? shape;
-      }
-    }
-    return { ...base, ...hints, ...(properties ? { properties } : {}) };
-  };
-  const sample = (shape: JsonSchema | undefined, depth: number): unknown => {
+  let sawUnionSiblings = false;
+  let useUnionSiblings = false;
+  // Keep overlapping schemas as shallow layers. Only look up properties and
+  // items we actually sample, even if an optional subtree is very deep.
+  const sample = (parts: Array<JsonSchema | undefined>, depth: number): unknown => {
     if (depth > 16 || remainingSampleNodes-- <= 0) {
       sampleBudgetExhausted = true;
       return undefined;
     }
-    if (shape === undefined || shape === true) return {};
-    if (shape === false) return undefined;
+    const layers = parts.filter((part): part is Record<string, unknown> =>
+      part !== undefined && typeof part !== 'boolean');
+    if (layers.length === 0) return parts.find((part) => part !== undefined) === false ? undefined : {};
+    if (useUnionSiblings && parts.includes(false)) return undefined;
+    const shape = layers.length === 1 ? layers[0]! : Object.assign({}, ...layers) as Record<string, unknown>;
     if ('const' in shape) return shape.const;
     const values = shape.enum;
     if (Array.isArray(values) && values.length > 0) return values[0];
     const union = shape.anyOf ?? shape.oneOf;
-    if (Array.isArray(union) && union.length > 0) return sample(union[0] as JsonSchema, depth + 1);
+    if (Array.isArray(union) && union.length > 0) {
+      const keyword = shape.anyOf === union ? 'anyOf' : 'oneOf';
+      const first = union[0] as JsonSchema;
+      if (layers.length > 1 || Object.keys(shape).some((key) => key !== keyword)) {
+	sawUnionSiblings = true;
+	if (useUnionSiblings) {
+	  const siblings = [...layers];
+	  const owner = layers.findLastIndex((layer) => layer[keyword] === union);
+	  const rest = { ...layers[owner] };
+	  delete rest[keyword];
+	  siblings[owner] = rest;
+	  return sample([...siblings, first], depth + 1);
+	}
+      }
+      return sample([first], depth + 1);
+    }
     const type = Array.isArray(shape.type) ? shape.type[0] : shape.type;
     if (type === 'string') {
       const minLength = typeof shape.minLength === 'number' ? Math.max(1, shape.minLength) : 1;
@@ -2572,14 +2578,34 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
       // every completed candidate is checked by the runtime validator below.
       const count = typeof shape.minItems === 'number' ? shape.minItems : 0;
       if (!Number.isInteger(count) || count < 0 || count > 4) return [];
-      const item = shape.items as JsonSchema | undefined;
-      return Array.from({ length: count }, () => sample(item, depth + 1));
+      const items = (useUnionSiblings ? layers : [shape]).map((layer) => layer.items as JsonSchema | undefined);
+      const values: unknown[] = [];
+      for (let i = 0; i < count; i++) {
+	const value = sample(items, depth + 1);
+	if (value === undefined) return undefined;
+	values.push(value);
+      }
+      return values;
     }
     const object: Record<string, unknown> = {};
-    const props = shape.properties && typeof shape.properties === 'object' && !Array.isArray(shape.properties)
-      ? shape.properties as Record<string, JsonSchema> : {};
-    const required = Array.isArray(shape.required) ? shape.required.filter((name): name is string => typeof name === 'string') : [];
-    for (const name of required) object[name] = sample(props[name], depth + 1);
+    const propertyParts = (name: string) => layers.map((layer) => {
+      const props = layer.properties;
+      return props && typeof props === 'object' && Object.hasOwn(props, name)
+	? (props as Record<string, JsonSchema>)[name] : undefined;
+    });
+    // The branch-only pass keeps the established conditional override. The
+    // sibling-aware pass needs the required names from every applicable layer.
+    for (const layer of useUnionSiblings ? layers : [shape]) {
+      if (!Array.isArray(layer.required)) continue;
+      for (const name of layer.required) {
+	if (sampleBudgetExhausted) return undefined;
+	if (typeof name === 'string' && !Object.hasOwn(object, name)) {
+	  const value = sample(propertyParts(name), depth + 1);
+	  if (value === undefined) return undefined;
+	  object[name] = value;
+	}
+      }
+    }
     if (Array.isArray(shape.allOf)) {
       for (const branch of shape.allOf) {
 	if (typeof branch !== 'object' || branch === null || Array.isArray(branch)) continue;
@@ -2592,11 +2618,14 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
 	  if (typeof thenProps !== 'object' || thenProps === null || Array.isArray(thenProps)) continue;
 	  for (const [name, hints] of Object.entries(thenProps)) {
 	    if (Object.prototype.hasOwnProperty.call(object, name)) {
-	      object[name] = sample(withHints(props[name], hints as JsonSchema), depth + 1);
+	      const value = sample([...propertyParts(name), hints as JsonSchema], depth + 1);
+	      // Earlier hints may already have changed whether the condition
+	      // holds. Keep the concrete field if this hint yields no value.
+	      if (value !== undefined) object[name] = value;
 	    }
 	  }
 	} else {
-	  const part = sample(branch as JsonSchema, depth + 1);
+	  const part = sample([branch as JsonSchema], depth + 1);
 	  if (part && typeof part === 'object' && !Array.isArray(part)) Object.assign(object, part);
 	}
       }
@@ -2604,24 +2633,42 @@ function schemaValueCandidates(schema: JsonSchema | undefined, includePrimitives
     return object;
   };
 
-  const generated = sample(schema, 0);
+  const generated = sample([schema], 0);
+  const generatedComplete = !sampleBudgetExhausted && generated !== undefined;
+  let combined: unknown;
+  if (sawUnionSiblings && !sampleBudgetExhausted) {
+    useUnionSiblings = true;
+    const candidate = sample([schema], 0);
+    if (!sampleBudgetExhausted) combined = candidate;
+  }
+
   const candidates: unknown[] = [
     {},
     { ok: true }, { ok: false }, { url: 'x' }, { value: 'x' },
     { n: 1 }, { value: 1 }, { items: [] },
   ];
-  if (includePrimitives) candidates.push(null, false, true, 0, 1, '', 'x', []);
-  if (!sampleBudgetExhausted && generated !== undefined && (includePrimitives
+  if (generatedComplete && (includePrimitives
     || (generated !== null && typeof generated === 'object' && !Array.isArray(generated)))) {
     candidates.unshift(generated);
   }
-  if (!sampleBudgetExhausted && generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
+  if (includePrimitives) {
+    // Singleton binding varies the first 16 candidates. Keep all original
+    // object seeds ahead of the new one and within that window.
+    if (combined !== undefined) candidates.push(combined);
+    candidates.push(null, false, true, 0, 1, '', 'x', []);
+  }
+  if (generatedComplete && generated !== null && typeof generated === 'object' && !Array.isArray(generated)) {
     const object = generated as Record<string, unknown>;
     for (const key of Object.keys(object)) {
       const omitted = { ...object };
       delete omitted[key];
       candidates.push(omitted, { ...object, [key]: null });
     }
+  }
+  // Collection callers use only the first accepted object. Preserve their
+  // existing choice, including an omission or null variant if it validates.
+  if (!includePrimitives && combined !== null && typeof combined === 'object' && !Array.isArray(combined)) {
+    candidates.push(combined);
   }
   return candidates;
 }

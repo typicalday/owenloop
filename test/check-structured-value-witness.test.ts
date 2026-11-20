@@ -68,3 +68,120 @@ test('nested arrays exhaust the concrete candidate budget without exhausting mem
   const witnesses = collectionValueWitnesses(schema);
   assert.equal(witnesses.validClassKnown, false, 'no partial candidate is promoted to a valid witness');
 });
+
+for (const keyword of ['anyOf', 'oneOf']) {
+  test(`checker samples ${keyword} with required fields and nested property constraints from both sides`, () => {
+    const schema = {
+      type: 'object', required: ['id', 'data'],
+      properties: {
+	id: { const: 'run-1' },
+	data: { type: 'object', required: ['records'], properties: {
+	  records: { type: 'array', items: { type: 'string' } },
+	} },
+      },
+      [keyword]: [{ required: ['stage'], properties: {
+	stage: { const: 'recorded' },
+	data: { required: ['label'], properties: {
+	  records: { minItems: 1 }, label: { const: 'sample' },
+	} },
+      } }, false],
+    };
+    const { valid } = collectionValueWitnesses(schema);
+    assert.deepEqual(valid, { id: 'run-1', data: { records: ['x'], label: 'sample' }, stage: 'recorded' });
+    assert.equal(validateValue(schema, valid).valid, true);
+  });
+}
+
+test('checker samples a union inside an array item with constraints from both item schemas', () => {
+  const schema = { required: ['entries'], properties: {
+    entries: { type: 'array', minItems: 1, items: {
+      type: 'object', required: ['id'], properties: { id: { type: 'string' } },
+      anyOf: [{ properties: { id: { minLength: 3 } } }],
+    } },
+  }, oneOf: [{ properties: { entries: { items: { required: ['ready'], properties: { ready: { const: true } } } } } }] };
+  const { valid } = collectionValueWitnesses(schema);
+  assert.deepEqual(valid, { entries: [{ id: 'xxx', ready: true }] });
+  assert.equal(validateValue(schema, valid).valid, true);
+});
+
+test('checker preserves branch-only witnesses and samples a true alternative with siblings', () => {
+  const branch = { required: ['payload'] };
+  assert.deepEqual(collectionValueWitnesses({ oneOf: [branch, false] }).valid, { payload: {} });
+  assert.deepEqual(collectionValueWitnesses({ anyOf: [branch], properties: {
+    payload: { type: ['array', 'object'] },
+  } }).valid, { payload: {} }, 'keep the original first accepted object if both candidates validate');
+  assert.deepEqual(collectionValueWitnesses({ anyOf: [branch], properties: {
+    payload: { type: ['array', 'object'], minItems: 5 },
+  } }).valid, { payload: {} });
+  assert.deepEqual(collectionValueWitnesses({ oneOf: [true, false], required: ['stamp'],
+    properties: { stamp: { const: 'ready' } } }).valid, { stamp: 'ready' });
+});
+
+test('checker leaves impossible and ambiguous unions without an accepted witness', () => {
+  const parent = { required: ['tag'], properties: { tag: { const: 'parent' } } };
+  for (const union of [
+    { anyOf: [false] },
+    { anyOf: [{ properties: { tag: { const: 'conflict' } } }] },
+    { oneOf: [true, { properties: { tag: { const: 'parent' } } }] },
+  ]) {
+    const { valid, validClassKnown } = collectionValueWitnesses({ type: 'object', ...parent, ...union });
+    assert.equal(valid, undefined);
+    assert.equal(validClassKnown, false);
+  }
+});
+
+test('union hints only visit sampled fields and retain a legacy witness when their shared budget runs out', () => {
+  let optional: Record<string, unknown> = { type: 'string' };
+  for (let i = 0; i < 64; i++) optional = { properties: { child: optional } };
+  const schema = { required: ['stamp'], properties: { stamp: { const: 'ready' }, optional },
+    anyOf: [{ properties: { optional } }] };
+  assert.deepEqual(collectionValueWitnesses(schema).valid, { stamp: 'ready' });
+
+  let expensive: Record<string, unknown> = { type: 'string' };
+  for (let i = 0; i < 6; i++) expensive = { type: 'array', minItems: 4, items: expensive };
+  const requiredPayload = { anyOf: [{ required: ['payload'] }] };
+  const fallback = { ...requiredPayload, properties: { payload: { ...expensive, type: ['array', 'object'] } } };
+  assert.deepEqual(collectionValueWitnesses(fallback).valid, { payload: {} });
+  const incomplete = collectionValueWitnesses({ ...requiredPayload, properties: { payload: expensive } });
+  assert.equal(incomplete.valid, undefined);
+  assert.equal(incomplete.validClassKnown, false);
+});
+
+test('checker never admits a missing JSON value inside a sampled object or array', () => {
+  const noJsonValue = { not: { type: ['object', 'array', 'string', 'number', 'boolean', 'null'] } };
+  for (const [shape, hint] of [
+    [noJsonValue, false],
+    [{ type: 'array', minItems: 1, items: noJsonValue }, { items: false }],
+  ]) {
+    const schema = { type: 'object', required: ['stamp'], properties: { stamp: shape },
+      anyOf: [{ properties: { stamp: hint } }, true] };
+    const result = collectionValueWitnesses(schema);
+    assert.equal(result.valid, undefined);
+    assert.equal(result.validClassKnown, false);
+  }
+});
+
+test('singleton modifier bindings can vary a complete union witness within the candidate limit', () => {
+  const produce = step({ name: 'route', produces: ['decision'] });
+  const action = produce.produces[0]!;
+  action.schema = { type: 'object', required: ['records', 'choice'], properties: {
+    records: { type: 'array', items: { type: 'string' } }, choice: { type: 'string' },
+  }, anyOf: [{ properties: { records: { minItems: 1 } } }] };
+  action.bind = { to: 'modifier', from: 'choice' };
+  const workflow = def('sampled-union-route', [], [produce]);
+  workflow.modifiers = ['quick', 'deep'];
+  const report = modelCheck(workflow, { maxStates: 100 });
+  assert.ok(!report.coverageIncomplete.includes('singleton-bind-validity'));
+  assert.ok(!report.coverageIncomplete.includes('singleton-bind-modifier'));
+});
+
+test('conditional hints keep a concrete field when a previous hint switches off the condition', () => {
+  const schema = { type: 'object', required: ['mode', 'note'],
+    properties: { mode: { type: 'string' }, note: { const: 'kept' } },
+    allOf: [{ if: { properties: { mode: { const: 'x' } } },
+      then: { properties: { mode: { const: 'skip' }, note: false } } }],
+  };
+  const { valid } = collectionValueWitnesses(schema);
+  assert.deepEqual(valid, { mode: 'skip', note: 'kept' });
+  assert.equal(validateValue(schema, valid).valid, true);
+});
