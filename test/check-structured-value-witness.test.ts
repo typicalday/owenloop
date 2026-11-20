@@ -286,3 +286,20 @@ test('conditional hints keep a concrete field when a previous hint switches off 
   assert.deepEqual(valid, { mode: 'skip', note: 'kept' });
   assert.equal(validateValue(schema, valid).valid, true);
 });
+
+test('checking a reused definition observes changes to its output schema', () => {
+  const output = step({ name: 'produce', produces: ['receipt'] });
+  const itemSchema = { type: 'string' };
+  output.produces[0]!.schema = {
+    type: 'array', minItems: 5, maxItems: 5, items: itemSchema,
+  };
+  const workflow = def('changed-output-schema', [], [
+    output, step({ name: 'consume', consumes: ['receipt'], produces: ['done'] }),
+  ]);
+  for (const type of ['string', 'integer', 'string']) {
+    itemSchema.type = type;
+    const report = modelCheck(workflow);
+    assert.equal(report.unreachedSteps.includes('consume'), type === 'string');
+    assert.deepEqual(report, modelCheck(structuredClone(workflow)));
+  }
+});

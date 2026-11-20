@@ -2321,6 +2321,16 @@ export function eligibleOutcomes(
   firing: Firing,
   opts: { modifier?: string } = {},
 ): CheckStep['outcome'][] {
+  return firingOutcomes(def, arts, firing, opts.modifier);
+}
+
+function firingOutcomes(
+  def: WorkflowDef,
+  arts: Map<string, ArtifactData>,
+  firing: Firing,
+  modifier: string | undefined,
+  checkedWitnesses?: SingletonWitnesses,
+): CheckStep['outcome'][] {
   if ((firing as Partial<MemberRetractFiring>).modelTransition === 'member-retract') {
     return ['retract'];
   }
@@ -2342,7 +2352,7 @@ export function eligibleOutcomes(
     if (judgedArt?.acceptance === 'submitted') {
       const jName = judgeNameOf(step);
       const approvals = { ...(judgedArt.approvals ?? {}), [jName]: judgedArt.version };
-      const judgeNames = activeJudgesForStem(def, judgedStem, opts.modifier).map((judge) => judge.name);
+      const judgeNames = activeJudgesForStem(def, judgedStem, modifier).map((judge) => judge.name);
       const allApproved = judgeNames.every((jn) => approvals[jn] === judgedArt.version);
       if (allApproved && groupWouldReject(def, arts, judgedStem)) {
         return ['group-reject', 'judge-reject'];
@@ -2382,10 +2392,10 @@ export function eligibleOutcomes(
   // checker explores the real refusal path rather than an impossible green.
   // A judged produce's actual green-moment is judge-approve (handled above),
   // so this only applies to a plain (non-judged) producer output.
-  const hasJudges = activeJudgesForStem(def, outPath, opts.modifier).length > 0;
+  const hasJudges = activeJudgesForStem(def, outPath, modifier).length > 0;
   const groupRejectsGreen = !hasJudges && outPath !== '' && groupWouldReject(def, arts, outPath);
   const produce = produceOwning(step, outPath);
-  const witnesses = produce && singletonValueWitnesses(def, produce, opts.modifier);
+  const witnesses = checkedWitnesses ?? (produce && singletonValueWitnesses(def, produce, modifier));
   if (groupRejectsGreen) {
     outcomes.push('group-reject');
   } else if (!witnesses || witnesses.green) {
@@ -2818,8 +2828,7 @@ function bindVariant(base: unknown, path: string, leaf: unknown): Record<string,
   return root;
 }
 
-/** Concrete singleton commit classes; no declaration alone creates a branch. */
-function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modifier?: string): {
+type SingletonWitnesses = {
   green: boolean;
   refusal: boolean;
   schemaValidClassKnown: boolean;
@@ -2827,7 +2836,10 @@ function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modi
   greenClassKnown: boolean;
   bindRefusal: boolean;
   acceptedModifiers: Array<string | undefined>;
-} {
+};
+
+/** Concrete singleton commit classes; no declaration alone creates a branch. */
+function singletonValueWitnesses(def: WorkflowDef, produce: ProducePattern, modifier?: string): SingletonWitnesses {
   const schema = produce.schema;
   const bind = produce.bind;
   if (schema === undefined && bind === undefined) {
@@ -3352,6 +3364,24 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   if (!Number.isSafeInteger(maxStates) || maxStates < 1) throw new Error('maxStates must be a positive safe integer');
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
+  // Schema/bind witnesses depend on the declaration, modifier and this definition,
+  // never on artifact state. A later check may receive a mutated definition.
+  const witnessesByRoute = new Map<string | undefined, Map<ProducePattern, SingletonWitnesses>>();
+  function checkedWitnesses(produce: ProducePattern, modifier: string | undefined) {
+    const route = produce.bind?.to === 'modifier' ? modifier : undefined;
+    let byProduce = witnessesByRoute.get(route);
+    if (!byProduce) {
+      byProduce = new Map();
+      witnessesByRoute.set(route, byProduce);
+    }
+    let witnesses = byProduce.get(produce);
+    if (!witnesses) {
+      witnesses = singletonValueWitnesses(def, produce, route);
+      byProduce.set(produce, witnesses);
+    }
+    return witnesses;
+  }
+
   const seeded = seedArts(def, opts.assumeProvided ?? false);
   const initial: CollectionCheckState = { arts: seeded.arts, leases: [], modifier: opts.modifier };
   const definitelySeededInputs = new Set(def.inputs.filter((input) => !input.seedOwed).map((input) => input.name));
@@ -3601,7 +3631,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	}
 	for (const produce of producer?.produces ?? []) {
 	  if (produce.kind !== 'singleton' || produce.bind === undefined) continue;
-	  const witnesses = singletonValueWitnesses(def, produce, modifier);
+	  const witnesses = checkedWitnesses(produce, modifier);
 	  if (!witnesses.greenClassKnown && !report.coverageIncomplete.includes('singleton-bind-validity')) {
 	    report.coverageIncomplete.push('singleton-bind-validity');
 	  }
@@ -3630,8 +3660,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
       const ordinaryStep = def.steps.find((candidate) => candidate.name === firing.step);
       const ordinaryProduce = ordinaryStep && produceOwning(ordinaryStep, firing.outputs[0] ?? '');
-      if (ordinaryProduce?.schema !== undefined || ordinaryProduce?.bind !== undefined) {
-	const witnesses = singletonValueWitnesses(def, ordinaryProduce, modifier);
+      const witnesses = ordinaryProduce && checkedWitnesses(ordinaryProduce, modifier);
+      if (ordinaryProduce && witnesses) {
 	if (ordinaryProduce.schema !== undefined && !witnesses.schemaValidClassKnown
 	  && !report.coverageIncomplete.includes('singleton-schema-validity')) {
 	  report.coverageIncomplete.push('singleton-schema-validity');
@@ -3655,7 +3685,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	}
       }
 
-      const outcomes = eligibleOutcomes(def, arts, firing, { modifier });
+      const outcomes = firingOutcomes(def, arts, firing, modifier, witnesses);
 
       for (const outcome of outcomes) {
 	const rejectPaths = outcome === 'judgment-reject'
@@ -3675,8 +3705,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	      nextModifier = approvedModifier ?? modifier;
 	      delete pendingModifiers[path];
 	    }
-	    const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier'
-	      ? singletonValueWitnesses(def, ordinaryProduce, modifier).acceptedModifiers : [undefined];
+	    const choices = outcome === 'green' && ordinaryProduce?.bind?.to === 'modifier' && witnesses
+	      ? witnesses.acceptedModifiers : [undefined];
 	    for (const selected of choices) {
 	      const nextPending = clonePendingModifiers(pendingModifiers);
 	      let routed = nextModifier;
