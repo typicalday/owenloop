@@ -22,6 +22,36 @@ const available = (): TrustedReferenceV2 => ({ protocol: 'trusted-reference-read
     consumes: {}, consumedFingerprint: { optional: 1 }, owes: [{ path: 'plan', version: 1 }] },
   inputs: [{ path: 'optional', version: 1, present: false }], lease: { claimed: true } }) as unknown as TrustedReferenceV2;
 
+test('writable v2 judge binds a verdict to the exact witnessed producer artifact', async () => {
+  const step = { name: 'make.result.judges.review', judges: 'result', produces: [],
+    consumes: [parseConsume('result')] } as unknown as StepDef;
+  const wire = available();
+  Object.assign(wire.order, { step: step.name, judge: 'result', inputs: ['result'], outputs: ['result'],
+    owes: [{ path: 'result', version: 3 }], consumes: { result: 'sample' },
+    consumedFingerprint: { result: 2 }, consumesProof: JSON.stringify({ result: 'producer-envelope' }) });
+  wire.inputs = [{ path: 'result', version: 2, present: true, value: 'sample' }];
+  const gate = (source = wire, pinned = step, inputAlias = false, validProof = true) =>
+    bindTrustedReferenceV2({ response: source, expected: { ...expected, step: step.name, key: '', defDigest: wire.order.defDigest },
+      step: pinned, declaredInputs: inputAlias ? [{ name: 'result', producer: 'human', seedOwed: true }] : [],
+      callsProducers: {}, consumedVerifier: async (order, options) => {
+	assert.equal(options.hardRule, true);
+	assert.deepEqual(order.inputs, ['result']);
+	assert.equal(order.consumedFingerprint?.result, 2);
+	assert.deepEqual(JSON.parse(order.consumesProof!), { result: 'producer-envelope' });
+	return validProof ? { ok: true, order, warnings: [] } : { ok: false, reason: 'unverifiable' };
+      } });
+  assert.equal((await gate()).ok, true);
+  for (const patch of [{ judge: undefined }, { judge: 'other' }, { outputs: [] }, { outputs: ['other'] },
+    { outputs: ['result', 'other'] }, { owes: [] }, { owes: [{ path: 'other', version: 3 }] },
+    { consumes: {} }]) {
+    assert.equal((await gate({ ...wire, order: { ...wire.order, ...patch } } as TrustedReferenceV2)).ok, false);
+  }
+  assert.equal((await gate(wire, { ...step, produces: [parseProduce('result')] })).ok, false);
+  assert.equal((await gate(wire, { ...step, judges: undefined, produces: [parseProduce('result')] })).ok, false);
+  assert.equal((await gate(wire, step, true)).ok, false);
+  assert.deepEqual(await gate(wire, step, false, false), { ok: false, reason: 'producer-proof-refused' });
+});
+
 test('v2 parser preserves a Service-canonical child while refusals stay bound to the requested root', () => {
   const child = available();
   child.workflow = 'wf_child';

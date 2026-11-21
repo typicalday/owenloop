@@ -57,12 +57,22 @@ export async function bindTrustedReferenceV2(args: {
   if (order.workflow !== expected.workflow || order.run !== expected.run || order.defDigest !== expected.defDigest
     || order.step !== expected.step || order.step !== step.name || order.key !== expected.key
     || !validConsumedStructureV2(step, order)) return refuse('order-structure-mismatch');
-  if (order.outputs.length !== order.owes.length || new Set(order.outputs).size !== order.outputs.length
+  const declared = new Map(args.declaredInputs.map(input => [input.name, input]));
+  if (step.judges !== undefined) {
+    // A judge issues a verdict on one existing producer artifact. The signed
+    // definition declares no outputs of its own, but the live order owes that stem.
+    const target = step.judges;
+    if (!target || order.judge !== target || step.produces.length !== 0 || order.cause !== undefined
+      || !step.consumes.some(consume => consume.mode === 'plain' && consume.stem === target)
+      || declared.has(target) || !Object.hasOwn(order.consumes, target)
+      || order.outputs.length !== 1 || order.outputs[0] !== target
+      || order.owes.length !== 1 || order.owes[0]?.path !== target) return refuse('output-structure-mismatch');
+  } else if (order.judge !== undefined || order.outputs.length !== order.owes.length
+    || new Set(order.outputs).size !== order.outputs.length
     || new Set(order.owes.map(owed => owed.path)).size !== order.owes.length
     || order.owes.some(owed => !order.outputs.includes(owed.path) || outputFor(step, order, owed.path) === undefined)) {
     return refuse('output-structure-mismatch');
   }
-  const declared = new Map(args.declaredInputs.map(input => [input.name, input]));
   const witnesses = new Map(response.inputs.map(input => [input.path, input]));
   if (witnesses.size !== order.inputs.length || Object.keys(order.consumedFingerprint ?? {}).length !== order.inputs.length) {
     return refuse('witness-set-mismatch');
