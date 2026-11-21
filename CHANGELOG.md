@@ -28,7 +28,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * **checker:** require valid assumed input witness ([#355](https://github.com/typicalday/owenloop/issues/355)) ([d057e00](https://github.com/typicalday/owenloop/commit/d057e0020a3a3167be312021314cea5f6cd273c4))
 * **check:** explore collection seal skip ([#363](https://github.com/typicalday/owenloop/issues/363)) ([1c6c23b](https://github.com/typicalday/owenloop/commit/1c6c23b3d1a95bf9a633c86f98a0c94e6a999c0d))
 * **check:** explore concrete consumer rejection targets ([#361](https://github.com/typicalday/owenloop/issues/361)) ([9064490](https://github.com/typicalday/owenloop/commit/90644909361ca244f90bd545d715c3a66e28b31f))
-* **check:** explore each owed output of an ordinary order ([791fb94](https://github.com/typicalday/owenloop/commit/791fb94d3ff772dbc273cf2f75c5ce3e1def7513))
 * **check:** explore each owed output of an ordinary order ([7c0020b](https://github.com/typicalday/owenloop/commit/7c0020b2bc4cfbbc0d0fef98fe977d18bf9a894f))
 * **check:** preserve union owner selection on ES2022 runtimes ([#385](https://github.com/typicalday/owenloop/issues/385)) ([dccb4d7](https://github.com/typicalday/owenloop/commit/dccb4d7bf2359cdfe36cedfdd8d2269cfa0f57f0))
 * **check:** sample bounded anchored pattern alternatives ([#383](https://github.com/typicalday/owenloop/issues/383)) ([3b3cb21](https://github.com/typicalday/owenloop/commit/3b3cb218d900a054912807e5a0c3d8138cbd6a76))
@@ -51,19 +50,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * **work:** bind holder order fields to local definition ([#356](https://github.com/typicalday/owenloop/issues/356)) ([3c4cb56](https://github.com/typicalday/owenloop/commit/3c4cb5693273a05a55c54584b953fb8c8f2ad4a9))
 * **work:** expose command-only polling on the public Shift daemon ([6203694](https://github.com/typicalday/owenloop/commit/6203694525294ad9b9fc98850f5816298c3dedae))
 * **work:** require holder-of-record in verified hosted MCP mode ([#367](https://github.com/typicalday/owenloop/issues/367)) ([9f688de](https://github.com/typicalday/owenloop/commit/9f688dea74cf2ff0207e500ca396e03d60079426))
-* **work:** support command-only polling on the public Shift daemon ([e4eb6d3](https://github.com/typicalday/owenloop/commit/e4eb6d3405897638ab99f17aeda22606ece1a61d))
-* **work:** support long Shift state directory socket paths ([16adae6](https://github.com/typicalday/owenloop/commit/16adae69a0d0d7d8294d55ceafddd2356cb9ccd8))
 * **work:** support long Shift state directory socket paths ([0b63fce](https://github.com/typicalday/owenloop/commit/0b63fce6bd25e1ecbaedde195644b3337ba2040a))
-* **work:** verify the signed report on a writable native judge ([5bf74e0](https://github.com/typicalday/owenloop/commit/5bf74e0e31d3f4505335194c59c7fda303ab0022))
 * **work:** verify the signed verdict target of a native judge ([5b6de4d](https://github.com/typicalday/owenloop/commit/5b6de4d113021f755e25fc1aa2f841d0cf859a21))
 
 
 ### Performance Improvements
 
-* **check:** avoid repeating member retraction successors ([6a50da5](https://github.com/typicalday/owenloop/commit/6a50da5f0b522ddf4f48aee84de1dc567da1409c))
 * **check:** avoid repeating member retraction successors ([50efd98](https://github.com/typicalday/owenloop/commit/50efd98653e8045b249cbd5c56983fb87db04bde))
 * **check:** avoid settling collection outcomes twice ([#374](https://github.com/typicalday/owenloop/issues/374)) ([cbbbbf4](https://github.com/typicalday/owenloop/commit/cbbbbf40d2fc9b671487da0d15d773006028b68d))
-* **check:** reduce memory used by visited states ([9c73d14](https://github.com/typicalday/owenloop/commit/9c73d14264724c5e06b295027e44c70bb45b8298))
 * **check:** reduce memory used by visited states ([ff37627](https://github.com/typicalday/owenloop/commit/ff376274380faf93c115a1edf31b1d87640f98d8))
 * **check:** reuse singleton witnesses within each model check ([c467db5](https://github.com/typicalday/owenloop/commit/c467db53d26e85a7234cabda6cf533e66258fa79))
 * **check:** stop sampling unbound outputs once both outcomes are known ([#378](https://github.com/typicalday/owenloop/issues/378)) ([3537fd0](https://github.com/typicalday/owenloop/commit/3537fd0415ea9a9302208950b00000c2d0d593ef))
