@@ -39,6 +39,8 @@ import {
   resolveWorkRoot,
 } from '../agent/workdir.ts';
 import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
+import { shiftSocketPath } from './client.ts';
+import { shiftSocketAddress, shiftStartupLockPath } from './socket-address.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
 import {
   createBundleIngestor,
@@ -415,22 +417,25 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   }
   const account = parsed.as ?? 'default';
 
+  let cacheDir: string;
+  let stateDir: string;
+  let socketPath: string;
+  try {
+    cacheDir = parsed.cacheDir ?? resolveCacheDir(env, settings.cacheDir);
+    stateDir = resolveStateDir(env, resolveStateDirOverride(parsed.stateDir, env, settings.stateDir));
+    socketPath = options.socketPath ?? shiftSocketPath(stateDir);
+    if (daemonMode) shiftSocketAddress(shiftStartupLockPath(socketPath));
+  } catch (err) {
+    process.stderr.write(`${roleLabel}: ${errMsg(err)}\n`);
+    return 1;
+  }
+
   const bearer = await resolveBearer({ origin, account, env });
   if (!bearer.ok) {
     process.stderr.write(`${roleLabel}: ${bearer.message}\n`);
     return bearer.code;
   }
   const token = bearer.token;
-
-  let cacheDir: string;
-  let stateDir: string;
-  try {
-    cacheDir = parsed.cacheDir ?? resolveCacheDir(env, settings.cacheDir);
-    stateDir = resolveStateDir(env, resolveStateDirOverride(parsed.stateDir, env, settings.stateDir));
-  } catch (err) {
-    process.stderr.write(`${roleLabel}: ${errMsg(err)}\n`);
-    return 1;
-  }
 
   const now = () => Date.now();
   const shiftId = `shf_${randomUUID()}`;
@@ -768,7 +773,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 
   if (daemonMode) {
     daemon = createShiftDaemon({
-      socketPath: options.socketPath ?? join(stateDir, 'shift.sock'),
+      socketPath,
       stateDir,
       loop,
       hub,

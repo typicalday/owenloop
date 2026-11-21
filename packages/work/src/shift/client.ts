@@ -13,6 +13,7 @@ import {
   type ShiftRequest,
   type ShiftResponse,
 } from './protocol.ts';
+import { shiftSocketAddress } from './socket-address.ts';
 
 export interface ShiftClientErrorOptions {
   absent?: boolean;
@@ -42,7 +43,7 @@ export function noDaemonMessage(socketPath: string): string {
 /** Send one request and parse the daemon's one-line response. */
 export function requestShift(socketPath: string, request: ShiftRequest): Promise<ShiftResponse> {
   return new Promise<ShiftResponse>((resolve, reject) => {
-    const socket = createConnection(socketPath);
+    const socket = createConnection(shiftSocketAddress(socketPath));
     let settled = false;
     let buffer = Buffer.alloc(0);
 

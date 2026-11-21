@@ -32,6 +32,7 @@ import {
   type ShiftResponse,
   type ShiftStatus,
 } from './protocol.ts';
+import { shiftSocketAddress, shiftStartupLockPath } from './socket-address.ts';
 import { truncateEventToBytes } from './truncate.ts';
 
 export interface ShiftDaemonOptions {
@@ -130,7 +131,7 @@ function isStaleSocketError(error: unknown): boolean {
 
 async function probeSocket(path: string): Promise<'active' | 'stale'> {
   return new Promise<'active' | 'stale'>((resolve, reject) => {
-    const socket = createConnection(path);
+    const socket = createConnection(shiftSocketAddress(path));
     let settled = false;
     const finish = (result: 'active' | 'stale'): void => {
       if (settled) return;
@@ -165,7 +166,7 @@ async function bindStartupLock(path: string): Promise<Server> {
       };
       lockServer.once('error', onError);
       lockServer.once('listening', onListening);
-      lockServer.listen(path);
+      lockServer.listen(shiftSocketAddress(path));
     });
     return lockServer;
   } catch (error) {
@@ -182,7 +183,7 @@ async function bindStartupLock(path: string): Promise<Server> {
  * ownership therefore does not depend on a PID that the OS could later reuse.
  */
 async function acquireStartupLock(socketPath: string): Promise<StartupLock> {
-  const lockPath = `${socketPath}.lock`;
+  const lockPath = shiftStartupLockPath(socketPath);
   const waitUntil = Date.now() + 2_000;
   for (;;) {
     try {
@@ -729,7 +730,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
         };
         nextServer.once('error', onError);
         nextServer.once('listening', onListening);
-        nextServer.listen(opts.socketPath);
+        nextServer.listen(shiftSocketAddress(opts.socketPath));
       });
       try {
         chmodSync(opts.socketPath, 0o600);
