@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.38](https://github.com/typicalday/owenloop/compare/v0.5.37...v0.5.38) (2026-11-21)
+
+
+### Features
+
+* **engine:** resolve scoped capabilities and claim preferred ready firings ([#320](https://github.com/typicalday/owenloop/issues/320)) ([#320](https://github.com/typicalday/owenloop/issues/320)) ([c704c34](https://github.com/typicalday/owenloop/commit/c704c34d6c9d6f3d64080dd7c595dea494aaf392))
+* **engine:** select child workflows per runtime invocation ([#319](https://github.com/typicalday/owenloop/issues/319)) ([499cd0c](https://github.com/typicalday/owenloop/commit/499cd0cc3155b7e05b406db76fa4f35e01203259))
+* **engine:** separate scoped command work from model routing ([#371](https://github.com/typicalday/owenloop/issues/371)) ([6484593](https://github.com/typicalday/owenloop/commit/6484593299ee642f8ee5c1684f5f1d44cfc67ae3))
+* join versioned Service reference and native order view ([#335](https://github.com/typicalday/owenloop/issues/335)) ([af8de11](https://github.com/typicalday/owenloop/commit/af8de112e80dd19d5f99eb06e8c957e849316324))
+* **work:** add local hosted order view adapter ([#325](https://github.com/typicalday/owenloop/issues/325)) ([372cb87](https://github.com/typicalday/owenloop/commit/372cb87008504fa2ada318b13f34ee9690d08f04))
+* **work:** add verified hosted holder order view ([#328](https://github.com/typicalday/owenloop/issues/328)) ([376a797](https://github.com/typicalday/owenloop/commit/376a79754aceb72c4a8b0dc5579a8ffb857ea150))
+* **work:** opt in verified hosted conditional submit ([#330](https://github.com/typicalday/owenloop/issues/330)) ([ed3d617](https://github.com/typicalday/owenloop/commit/ed3d6179d53f72e88a9249a9b7cb8ab7b8b02a56))
+
+
+### Bug Fixes
+
+* **check:** apply state budgets to distinct successors ([#376](https://github.com/typicalday/owenloop/issues/376)) ([b995880](https://github.com/typicalday/owenloop/commit/b995880fd872fa76415bc5a86b844f271aa4c1c4))
+* **checker:** model collection leases and expose coverage limits ([#352](https://github.com/typicalday/owenloop/issues/352)) ([6630d2f](https://github.com/typicalday/owenloop/commit/6630d2fc782461d79c59b313dce6a06f57512e29))
+* **checker:** model stale mixed singleton skip ([#368](https://github.com/typicalday/owenloop/issues/368)) ([9790c1c](https://github.com/typicalday/owenloop/commit/9790c1c60632f31ad4be03ce3152f01b8e292f24))
+* **checker:** omit impossible schema rejects without validation ([#351](https://github.com/typicalday/owenloop/issues/351)) ([290f67d](https://github.com/typicalday/owenloop/commit/290f67d3fcd1a5bd528539bafd1877de30fa518b))
+* **checker:** require singleton value witnesses for outcomes ([#353](https://github.com/typicalday/owenloop/issues/353)) ([a5ec23f](https://github.com/typicalday/owenloop/commit/a5ec23fa44d02ee3e8d1eb4b5b74a30a355856a0))
+* **checker:** require valid assumed input witness ([#355](https://github.com/typicalday/owenloop/issues/355)) ([d057e00](https://github.com/typicalday/owenloop/commit/d057e0020a3a3167be312021314cea5f6cd273c4))
+* **check:** explore collection seal skip ([#363](https://github.com/typicalday/owenloop/issues/363)) ([1c6c23b](https://github.com/typicalday/owenloop/commit/1c6c23b3d1a95bf9a633c86f98a0c94e6a999c0d))
+* **check:** explore concrete consumer rejection targets ([#361](https://github.com/typicalday/owenloop/issues/361)) ([9064490](https://github.com/typicalday/owenloop/commit/90644909361ca244f90bd545d715c3a66e28b31f))
+* **check:** explore each owed output of an ordinary order ([7c0020b](https://github.com/typicalday/owenloop/commit/7c0020b2bc4cfbbc0d0fef98fe977d18bf9a894f))
+* **check:** preserve union owner selection on ES2022 runtimes ([#385](https://github.com/typicalday/owenloop/issues/385)) ([dccb4d7](https://github.com/typicalday/owenloop/commit/dccb4d7bf2359cdfe36cedfdd8d2269cfa0f57f0))
+* **check:** sample bounded anchored pattern alternatives ([#383](https://github.com/typicalday/owenloop/issues/383)) ([3b3cb21](https://github.com/typicalday/owenloop/commit/3b3cb218d900a054912807e5a0c3d8138cbd6a76))
+* **check:** sample bounded anchored string patterns ([#379](https://github.com/typicalday/owenloop/issues/379)) ([e5ba990](https://github.com/typicalday/owenloop/commit/e5ba990dcaeaaa8b1e2145741e5ccfdea3eecb76))
+* **check:** sample moderate array minima with bounded scalar values ([#380](https://github.com/typicalday/owenloop/issues/380)) ([c21eca7](https://github.com/typicalday/owenloop/commit/c21eca719ea5f5a7cbc2c8c55b6ca4ed8a110d51))
+* **check:** sample union branches with sibling constraints ([#377](https://github.com/typicalday/owenloop/issues/377)) ([89164cb](https://github.com/typicalday/owenloop/commit/89164cb67d026ae8a648d5aac5bff0d342f3be08))
+* **check:** track concrete schema witnesses and modifier state ([#360](https://github.com/typicalday/owenloop/issues/360)) ([7d23022](https://github.com/typicalday/owenloop/commit/7d23022c1c13dac2e06a20997ae3244890e38531))
+* **cli:** verify enrollment status against the organization root ([#373](https://github.com/typicalday/owenloop/issues/373)) ([ebca1eb](https://github.com/typicalday/owenloop/commit/ebca1eb8c89e3e2833282ebd2a6a7942ae3a20cb))
+* **crypto:** bind direct consumed proofs to workflow ([#364](https://github.com/typicalday/owenloop/issues/364)) ([f97a3ec](https://github.com/typicalday/owenloop/commit/f97a3ecde0d205023b9f9c1e6ee73a92175f2193))
+* **deps:** refresh affected transitive production packages ([#372](https://github.com/typicalday/owenloop/issues/372)) ([5e3bbec](https://github.com/typicalday/owenloop/commit/5e3bbec4177d5ca875e394d8503d00a19db5036a))
+* **deps:** update patched MCP SDK and proxy-addr lock entries ([#362](https://github.com/typicalday/owenloop/issues/362)) ([ec43227](https://github.com/typicalday/owenloop/commit/ec43227cb72406e3e96b0682f33502faad6316f3))
+* **engine:** inject host authority for invocation verification ([#321](https://github.com/typicalday/owenloop/issues/321)) ([#321](https://github.com/typicalday/owenloop/issues/321)) ([5c51e55](https://github.com/typicalday/owenloop/commit/5c51e5519bdfdc3c97f25bdf65863b81b8f19d86))
+* **engine:** persist private workdir input snapshots at claim ([#370](https://github.com/typicalday/owenloop/issues/370)) ([b4ead19](https://github.com/typicalday/owenloop/commit/b4ead192326ba607558cd3bb7687209cbb7c8165))
+* **engine:** preserve durable invocation evidence across hydration ([#322](https://github.com/typicalday/owenloop/issues/322)) ([#322](https://github.com/typicalday/owenloop/issues/322)) ([6c5b4c8](https://github.com/typicalday/owenloop/commit/6c5b4c8b1bee2702e5c43426385b6481190ea3ae))
+* **engine:** support explicit multi-collection stems ([#358](https://github.com/typicalday/owenloop/issues/358)) ([cc43099](https://github.com/typicalday/owenloop/commit/cc43099e3eba85243c5316626c4eda98bcea1455))
+* record claim-time prior artifact versions privately ([#359](https://github.com/typicalday/owenloop/issues/359)) ([abb1707](https://github.com/typicalday/owenloop/commit/abb170763559c0c7b6c2b5251cf5864fbb932849))
+* reject outputs unsupported by firing mode ([#354](https://github.com/typicalday/owenloop/issues/354)) ([0a006c4](https://github.com/typicalday/owenloop/commit/0a006c4bc9b6d8dc4fdc749404459738e4ae5bcc))
+* **work:** bind consumed dynamic workdir to verified value ([#366](https://github.com/typicalday/owenloop/issues/366)) ([48edf12](https://github.com/typicalday/owenloop/commit/48edf1258d338f1048baa41c9435d7cacb73d7f3))
+* **work:** bind fixed order workdir to local step ([#365](https://github.com/typicalday/owenloop/issues/365)) ([33630e4](https://github.com/typicalday/owenloop/commit/33630e4fcf993b72319de8c1a070f91c4ffd3cf5))
+* **work:** bind holder order fields to local definition ([#356](https://github.com/typicalday/owenloop/issues/356)) ([3c4cb56](https://github.com/typicalday/owenloop/commit/3c4cb5693273a05a55c54584b953fb8c8f2ad4a9))
+* **work:** expose command-only polling on the public Shift daemon ([6203694](https://github.com/typicalday/owenloop/commit/6203694525294ad9b9fc98850f5816298c3dedae))
+* **work:** require holder-of-record in verified hosted MCP mode ([#367](https://github.com/typicalday/owenloop/issues/367)) ([9f688de](https://github.com/typicalday/owenloop/commit/9f688dea74cf2ff0207e500ca396e03d60079426))
+* **work:** support long Shift state directory socket paths ([0b63fce](https://github.com/typicalday/owenloop/commit/0b63fce6bd25e1ecbaedde195644b3337ba2040a))
+* **work:** verify the signed verdict target of a native judge ([5b6de4d](https://github.com/typicalday/owenloop/commit/5b6de4d113021f755e25fc1aa2f841d0cf859a21))
+
+
+### Performance Improvements
+
+* **check:** avoid repeating member retraction successors ([50efd98](https://github.com/typicalday/owenloop/commit/50efd98653e8045b249cbd5c56983fb87db04bde))
+* **check:** avoid settling collection outcomes twice ([#374](https://github.com/typicalday/owenloop/issues/374)) ([cbbbbf4](https://github.com/typicalday/owenloop/commit/cbbbbf40d2fc9b671487da0d15d773006028b68d))
+* **check:** reduce memory used by visited states ([ff37627](https://github.com/typicalday/owenloop/commit/ff376274380faf93c115a1edf31b1d87640f98d8))
+* **check:** reuse singleton witnesses within each model check ([c467db5](https://github.com/typicalday/owenloop/commit/c467db53d26e85a7234cabda6cf533e66258fa79))
+* **check:** stop sampling unbound outputs once both outcomes are known ([#378](https://github.com/typicalday/owenloop/issues/378)) ([3537fd0](https://github.com/typicalday/owenloop/commit/3537fd0415ea9a9302208950b00000c2d0d593ef))
+
 ## [0.5.37](https://github.com/typicalday/owenloop/compare/v0.5.36...v0.5.37) (2026-10-05)
 
 
