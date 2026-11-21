@@ -144,6 +144,26 @@ test('owenloop#229: minimal-budget map/reduce has only recoverable finite-model 
   assert.deepEqual(report.invariantViolations, []);
 });
 
+test('member retraction keeps the first authorized actor and a shortest witness for each index', () => {
+  const fixture = memberReduceFixture(1, 0);
+  const members = ['gather.source[0]', 'gather.source[1]'];
+  fixture.invariants = members.map((path) => ({
+    name: path,
+    requires: { not: { path, is: 'retracted' } },
+  }));
+  const options = { assumeProvided: true, maxCollectionSize: 2 };
+  assert.deepEqual(modelCheck(fixture, { ...options, maxDepth: 2 }).invariantViolations, []);
+  const report = modelCheck(fixture, { ...options, maxDepth: 3 });
+  assert.deepEqual(report.invariantViolations, members.map((path, index) => ({
+    invariant: path,
+    path: [
+      { step: 'gather', key: '', outcome: 'collection-claim' },
+      { step: 'gather', key: '', outcome: 'collection-emit', count: index + 1, path: 'gather.source.sealed' },
+      { step: 'check', key: path, outcome: 'retract' },
+    ],
+  })));
+});
+
 test('owenloop#236: schema-free retry profiles avoid impossible schema-reject branches', () => {
   const options = { maxStates: 5_000, maxCollectionSize: 3, assumeProvided: true };
   const oneZero = modelCheck(memberReduceFixture(1, 0), options);
