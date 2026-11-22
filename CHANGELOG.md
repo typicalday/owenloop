@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.39](https://github.com/typicalday/owenloop/compare/v0.5.38...v0.5.39) (2026-11-22)
+
+
+### Performance Improvements
+
+* **check:** reuse collection examples within a model check ([#391](https://github.com/typicalday/owenloop/issues/391)) ([09daa3f](https://github.com/typicalday/owenloop/commit/09daa3f191ffe18f9d1d5ba99422e8fd08577551))
+
 ## [0.5.38](https://github.com/typicalday/owenloop/compare/v0.5.37...v0.5.38) (2026-11-21)
 
 
