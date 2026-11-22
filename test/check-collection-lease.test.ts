@@ -847,6 +847,24 @@ test('collection lease: unsampled real schema-valid value is an incomplete check
   assert.ok(JSON.parse(json.out).coverageIncomplete.includes('collection-schema-validity'));
 });
 
+test('a new check resamples a collection schema edited in place', () => {
+  const code = { type: 'string', pattern: '^ABC$' };
+  const gather = step({ name: 'gather', produces: ['items[]'] });
+  gather.produces[0]!.schema = { type: 'object', required: ['code'], properties: { code } };
+  const workflow = def('edit-collection-schema', [], [gather,
+    step({ name: 'inspect', consumes: ['items[$i]'], produces: ['items[$i].checked'] }),
+  ]);
+  const options = { maxStates: 1000, maxCollectionSize: 1 };
+  const before = modelCheck(workflow, options);
+  assert.ok(!before.unreachedSteps.includes('inspect'));
+  assert.ok(!before.coverageIncomplete.includes('collection-schema-validity'));
+
+  code.pattern = '^(?:[A-Z]){3}$'; // Valid objects exist beyond the sampler's supported patterns.
+  const after = modelCheck(workflow, options);
+  assert.ok(after.unreachedSteps.includes('inspect'));
+  assert.ok(after.coverageIncomplete.includes('collection-schema-validity'));
+});
+
 test('collection lease: object-only schema cannot prove all JS emit payloads valid', () => {
   const schema = { type: 'object' } as const;
   const witnesses = collectionValueWitnesses(schema);
