@@ -2985,6 +2985,7 @@ export function collectionLeaseSuccessors(
   lease: CollectionLease,
   maxCollectionSize: number,
   modifier?: string,
+  witnessesForSchema = collectionValueWitnesses,
 ): Array<{ state: CollectionCheckState; step: CheckStep }> {
   const step = def.steps.find((candidate) => candidate.name === lease.step);
   if (!step) return [];
@@ -3121,7 +3122,7 @@ export function collectionLeaseSuccessors(
     if (seal.acceptance === 'green') continue;
 
     const produce = step.produces.find((pattern) => pattern.kind === 'collection' && pattern.stem === stem);
-    const witnesses = collectionValueWitnesses(produce?.schema);
+    const witnesses = witnessesForSchema(produce?.schema);
     const nextIdx = members(state.arts, stem).reduce((max, member) => {
       const element = parseElement(member.path);
       return element ? Math.max(max, element.index + 1) : max;
@@ -3446,6 +3447,17 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   if (!Number.isSafeInteger(maxStates) || maxStates < 1) throw new Error('maxStates must be a positive safe integer');
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
+  // All leases and offers for a collection use the same schema throughout this check.
+  const examplesBySchema = new Map<JsonSchema | undefined, ReturnType<typeof collectionValueWitnesses>>();
+  function collectionWitnesses(schema: JsonSchema | undefined) {
+    let examples = examplesBySchema.get(schema);
+    if (!examples) {
+      examples = collectionValueWitnesses(schema);
+      examplesBySchema.set(schema, examples);
+    }
+    return examples;
+  }
+
   // Schema/bind witnesses depend on the declaration, modifier and this definition,
   // never on artifact state. A later check may receive a mutated definition.
   const witnessesByRoute = new Map<string | undefined, Map<ProducePattern, SingletonWitnesses>>();
@@ -3601,7 +3613,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // including when a schema counter has frozen *new* offers.
     const workerFirings = status.eligible.filter((firing) => !openSteps.has(firing.step));
     const leaseMoves = node.state.leases.flatMap((lease) =>
-      collectionLeaseSuccessors(def, node.state, lease, maxCollectionSize, modifier));
+      collectionLeaseSuccessors(def, node.state, lease, maxCollectionSize, modifier, collectionWitnesses));
     const leaseProgressFirings: Firing[] = node.state.leases.flatMap((lease) =>
       leaseMoves.filter((move) => move.step.step === lease.step
         && move.step.outcome !== 'collection-close' && move.step.path !== undefined)
@@ -3699,7 +3711,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	for (const collectionProduce of collections) {
 	  if (collectionProduce.schema === undefined) continue;
 	  report.collectionSchemaValuesSampled = true;
-	  const witnesses = collectionValueWitnesses(collectionProduce.schema);
+	  const witnesses = collectionWitnesses(collectionProduce.schema);
 	  if (!witnesses.validClassKnown && !report.coverageIncomplete.includes('collection-schema-validity')) {
 	    report.coverageIncomplete.push('collection-schema-validity');
 	  }
