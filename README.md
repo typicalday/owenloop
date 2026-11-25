@@ -82,7 +82,7 @@ or a transition — only what each step consumes and produces. This isn't a
 state machine an agent is asked to role-play from a prompt; the states live
 in the engine, and the engine doesn't negotiate. The agents stay
 probabilistic; the bookkeeping around them never is. The [Quick
-start](#quick-start) gets you running in two commands, and [Driving it with a
+start](#quick-start) walks you through setup, and [Driving it with a
 loop](#driving-it-with-a-loop) covers orchestrators — including the shipped
 skills that do it for you.
 
@@ -412,6 +412,11 @@ the bundled Claude Code and Codex plugins on that same CLI and hub connection.
 ---
 
 ## Quick start
+
+For the hosted Hub, sign in to the [Owenloop Console](https://app.owenloop.com/).
+If you have a team invitation, accept it. If you're starting your own
+workspace, enter a **Display name** and **Slug**, then select **Create organization**.
+Use the same account when setup asks you to select your organization.
 
 With Node.js 22.13 or newer, install the CLI and connect it to your Hub:
 
