@@ -1849,6 +1849,11 @@ verification — including a `429` — never writes the credential.
 
 ### `login` — authenticate the CLI against a hub
 
+Browser login lists the organizations you already belong to. If the list is
+empty on the hosted Hub, sign in to the [Console](https://app.owenloop.com/)
+with the same account. Accept your team's invitation or create an
+organization, then retry the command that opened browser login.
+
 Two ways to get a credential, both of which **verify before storing** (a token
 that can't call the hub is never written to disk):
 
