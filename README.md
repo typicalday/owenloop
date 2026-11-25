@@ -415,8 +415,8 @@ the bundled Claude Code and Codex plugins on that same CLI and hub connection.
 
 For the hosted Hub, sign in to the [Owenloop Console](https://app.owenloop.com/).
 If you have a team invitation, accept it. If you're starting your own
-workspace, choose **Create an organization**. Setup will ask you to select
-that organization, so use the same sign-in in both places.
+workspace, enter a **Display name** and **Slug**, then select **Create organization**.
+Use the same account when setup asks you to select your organization.
 
 With Node.js 22.13 or newer, install the CLI and connect it to your Hub:
 
