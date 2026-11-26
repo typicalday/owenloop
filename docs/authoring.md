@@ -535,11 +535,10 @@ Wire the dependency explicitly if that step must use the synchronized modifier.
 
 ## `judges:` — quality gates before green
 
-A `produces` entry can declare one or more **judges**: deterministic quality
-bars an artifact must clear before it counts as `green`. Judges are an
-enforced form of the independent-verifier pattern — a separate order, with no
-view of the maker's reasoning, has to sign off before the artifact counts as
-done. Use judges for criteria that would never merit a review step of their
+A `produces` entry can declare one or more **judges**. The engine issues
+a separate order for each required judge to assess the submitted version.
+Assign that order to a different worker when the review requires an
+independent judgment. Use judges for criteria that would never merit a review step of their
 own — completeness, rigor, tone, format. If it's actual domain work (a PR
 review, a legal sign-off), that stays a normal step, like `delivery.yaml`'s
 `reviewer`.

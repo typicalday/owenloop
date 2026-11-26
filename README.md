@@ -61,12 +61,10 @@ and reports results back. Here's what the engine enforces as that loop runs:
    and the retry order carries the validation errors as feedback. The hope
    version: the bad output flows downstream and fails somewhere confusing.
 
-3. **The report can't approve itself.** When the writer commits `report`, it
-   lands in `submitted`, not done. The reviewer is a separate order to a
-   separate Step Agent in this example. A rejection sends the report back to
-   the writer, subject to the step's retry limit.
-   The hope version: *"review your work before finishing"* — the fox
-   auditing the henhouse.
+3. **The report needs review.** When the writer submits `report`, the engine
+   issues a separate review order. The orchestrator can assign it to a
+   different agent. A rejection sends the report back to the writer, subject
+   to the step's retry limit.
 
 4. **Failure has a floor.** Third rejected attempt and `report` **stalls**:
    the engine stops issuing jobs for it and flags it for a human, instead of
@@ -173,10 +171,9 @@ full reference.
 
 ### Judges — enforced independent verification
 
-A `produces:` entry can declare one or more **judges**. The artifact stays
-`submitted` until every required judge approves it on a separate order.
-To have a different person or agent review the work, assign the judge order
-to a separate reviewer.
+A `produces:` entry can declare one or more **judges**. When every required
+judge approves the submitted version, the artifact turns `green`. An accepted
+rejection moves it to `rejected`.
 
 On a local run, the producer's retry order includes the reviewer's reason.
 On a hosted run, the verified order reader refuses a retry order that contains
