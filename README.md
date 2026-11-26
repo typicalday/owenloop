@@ -427,12 +427,21 @@ owenloop setup
 
 Then ask your Prime Agent for what you want:
 
-> Use author to build me a workflow that researches a topic, writes
-> a report, and doesn't accept it until an independent reviewer signs off —
-> then run it on "tidepools".
+> Use author to build a workflow that researches a topic and drafts a report.
+> Have an independent reviewer check the draft, then wait for my decision
+> before finalizing it. Run it on "tidepools".
 
 The `author` skill interviews you for anything missing, writes and validates the
 YAML definition, and presents the process for approval before offering to start it.
+
+When the run needs your decision, open the Console on your phone and select
+the same organization. Under **Runs → Needs attention**, find your run and
+tap **Review**. Answer the question and tap **Submit decision**. If the workflow assigns this decision to a particular crew,
+a member of that crew or an organization admin can answer.
+
+Once the run finishes, open **Runs → Finished** and tap **View record** beside
+your run to read its receipt. The receipt is private by default.
+
 Already have a def? *"Conduct the report workflow"* hands it to
 [`conduct`](plugins/_skills/conduct/SKILL.md). The shipped Claude Code and Codex
 plugins launch the same `owenloop` command as
