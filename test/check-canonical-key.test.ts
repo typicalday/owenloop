@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { validateDef } from '../src/defs.ts';
-import { applyOutcome, canonicalKey, settleInMemory, workflowStatus } from '../src/model.ts';
+import { Engine } from '../src/engine.ts';
+import { applyOutcome, canonicalKey, collectionCheckKey, computeFingerprint, isHeld, settleInMemory, workflowStatus } from '../src/model.ts';
+import { openStore } from '../src/store.ts';
 import { def, input, step } from './helpers.ts';
 
 test('checker key treats approvals for the current version equally after a rebuild', () => {
@@ -54,4 +56,46 @@ test('checker key treats approvals for the current version equally after a rebui
   assert.equal(approvedFirst.get('b')?.acceptance, 'green');
   assert.equal(approvedRebuilt.get('b')?.acceptance, 'green');
   assert.equal(canonicalKey(definition, approvedFirst), canonicalKey(definition, approvedRebuilt));
+});
+
+test('checker separates an ordinary rejection from an irreversible hold', () => {
+  const definition = def('checker-held-key', [input('seed', { seedOwed: false })], [
+    step({ name: 'planner', consumes: ['seed'], produces: ['plan', 'items[]'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
+    step({ name: 'finish', consumes: ['pr', 'plan'], produces: ['done'], terminal: true }),
+  ]);
+  assert.deepEqual(validateDef(definition), []);
+  const store = openStore(':memory:');
+  const engine = new Engine(store, () => definition);
+  const workflow = engine.createInstance(definition.name);
+  const artifacts = () => new Map(store.listArtifacts(workflow).map(artifact => [artifact.path, artifact]));
+  const claim = (step: string) => {
+    const order = engine.tick(workflow).orders.find(order => order.step === step);
+    assert.ok(order, `${step} must receive an order`);
+    return order;
+  };
+  const planner = claim('planner');
+  const lease = { step: 'planner', key: planner.key, stem: 'items', inputs: ['seed'],
+    fingerprint: computeFingerprint(artifacts(), ['seed']) };
+  const put = (run: string, path: string, value: number) =>
+    assert.equal(engine.green(workflow, run, path, { value }).outcome, 'green');
+  const build = (value: number) => {
+    const builder = claim('builder');
+    put(builder.run, 'pr', value);
+    engine.close(workflow, builder.run);
+  };
+  put(planner.run, 'plan', 1);
+  build(1);
+  assert.equal(engine.reject(workflow, 'pr', 'finish', 'Revise the PR').outcome, 'rejected');
+  const retryable = artifacts();
+  assert.equal(isHeld(retryable.get('pr')), false);
+  assert.ok(workflowStatus(definition, retryable).eligible.some(firing => firing.step === 'builder'));
+
+  build(2);
+  put(planner.run, 'plan', 2);
+  const held = artifacts();
+  assert.equal(isHeld(held.get('pr')), true);
+  assert.ok(!workflowStatus(definition, held).eligible.some(firing => firing.step === 'builder'));
+  assert.notEqual(collectionCheckKey(definition, { arts: retryable, leases: [lease] }),
+    collectionCheckKey(definition, { arts: held, leases: [lease] }));
 });
