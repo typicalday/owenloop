@@ -3692,6 +3692,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     };
 
     let retractedMembers: Set<string> | undefined;
+    let rejectedInputs: Set<string> | undefined;
 
     // Expand ordinary worker/calls/retract transitions. A collection producer
     // first claims a run; subsequent emit/refusal/seal actions occur through
@@ -3802,6 +3803,13 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 	  const rejectPaths = outcome === 'judgment-reject'
 	    ? rejectableFiringInputs(def, arts, firing) : [undefined];
 	  for (const rejectPath of rejectPaths) {
+	    // Once authorized, an ordinary rejection depends only on the input
+	    // path and the parent state. Preserve the first firing's BFS witness.
+	    if (rejectPath !== undefined) {
+	      rejectedInputs ??= new Set<string>();
+	      if (rejectedInputs.has(rejectPath)) continue;
+	      rejectedInputs.add(rejectPath);
+	    }
 	    const successors = applyOutcome(def, arts, target, outcome,
 	      { maxCollectionSize, modifier, rejectPath });
 
