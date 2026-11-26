@@ -3313,6 +3313,7 @@ export function applyOutcome(
  *   judgmentRejects: BUCKETED to min(count, maxAttempts) so that e.g. 0, 1, 2
  *     are distinct but anything >= cap is the same (frozen state)
  *   schemaRejects: BUCKETED to min(count, maxSchemaFailures) similarly
+ *   held: encoded for rejected artifacts that cannot re-arm without a retry
  *
  * For 'skipped' artifacts, the fingerprint and latest skip kind are encoded to
  * capture their distinct rearm eligibility correctly.
@@ -3338,6 +3339,7 @@ export function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>):
     const sBucket = Math.min(art.schemaRejects, maxSchema);
 
     let entry = `${path}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
+    if (isHeld(art)) entry += '|held';
 
     // §24: encode the sign-off ledger so two states differing only in which
     // judges have approved (same acceptance/version) are not canonicalized
