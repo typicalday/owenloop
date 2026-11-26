@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.40](https://github.com/typicalday/owenloop/compare/v0.5.39...v0.5.40) (2026-11-26)
+
+
+### Performance Improvements
+
+* **checker:** avoid duplicate rejection transitions ([#397](https://github.com/typicalday/owenloop/issues/397)) ([100dd40](https://github.com/typicalday/owenloop/commit/100dd401dbec7017ac666a9278e4b8ae9e616e4a))
+
 ## [0.5.39](https://github.com/typicalday/owenloop/compare/v0.5.38...v0.5.39) (2026-11-22)
 
 
