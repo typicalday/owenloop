@@ -6,6 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.5.40](https://github.com/typicalday/owenloop/compare/v0.5.39...v0.5.40) (2026-11-26)
 
+### Bug Fixes
+
+* Keep retryable rejections separate from holds that require an explicit retry in the checker ([#396](https://github.com/typicalday/owenloop/pull/396)).
 
 ### Performance Improvements
 
