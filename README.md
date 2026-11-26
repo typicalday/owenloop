@@ -18,9 +18,9 @@ makes them useful. The workflow around them doesn't.
 
 ## See it work
 
-A research pipeline: a researcher gathers findings, a writer turns them into
-a report, and an independent reviewer must sign off before the report counts.
-Every clause of that sentence is *enforced* below, not requested:
+In this research pipeline, a researcher gathers findings, a writer turns them
+into a report, and the engine requires a separate review order before it
+accepts the report.
 
 ```yaml
 # workflows/report.yaml
@@ -63,8 +63,8 @@ and reports results back. Here's what the engine enforces as that loop runs:
 
 3. **The report can't approve itself.** When the writer commits `report`, it
    lands in `submitted`, not done. The reviewer is a separate order to a
-   separate Step Agent — one that never saw the writer's reasoning. A rejection
-   re-arms the writer with the reviewer's reasons attached to its next job.
+   separate Step Agent in this example. A rejection sends the report back to
+   the writer, subject to the step's retry limit.
    The hope version: *"review your work before finishing"* — the fox
    auditing the henhouse.
 
@@ -128,7 +128,7 @@ step **owes**. Every output is in one of six states:
 | `submitted` |   no*       | produced, awaiting sign-off from one or more declared judges       |
 
 \* `submitted` isn't a producer debt — the producer already did its job — but the
-workflow isn't done while it sits there either. See [judges](#judges-enforced-independent-verification).
+workflow isn't done while it sits there either. See [judges](#judges--enforced-independent-verification).
 
 A step is **eligible to run** when it owes a debt (an `owed` or `rejected` output)
 and every input it consumes is `green`. Status is never stored — it's computed from
@@ -139,11 +139,10 @@ Two things make this more than running steps in dependency order:
 - **Outputs stay honest as inputs move.** A green output counts as done *only while*
   the inputs it was built from are still green and unchanged. Re-run an early step and
   everything built on it quietly falls back to a debt — no code required to invalidate it.
-- **Rejections carry reasons.** When a reviewer rejects an output, the text rides along.
-  The next job for the producer shows *why* it's being asked again, so the Step Agent has
-  the feedback in hand. (Three flavors: a reviewer's **judgment**, the engine's own
-  **schema** refusal of a malformed value, and **structural** knock-backs from a
-  change cascading downstream.)
+- **Rejections carry reasons.** A local producer can read the reason on its next
+  order. The reason can come from a reviewer's judgment, a schema check, or a
+  change to an upstream input. See [Judges](#judges--enforced-independent-verification)
+  for hosted retry behavior.
 
 ### What owenloop is not
 
@@ -174,14 +173,17 @@ full reference.
 
 ### Judges — enforced independent verification
 
-A `produces:` entry can declare one or more **judges**: deterministic quality
-bars an artifact must clear before it counts as `green`. This is the
-independent-verifier pattern, enforced structurally instead of remembered as a
-convention: the artifact lands in `submitted`, not `green`, and *cannot* move
-further until a separate order — with no view of the producer's reasoning —
-signs off. A rejection carries its reason back to the producer's next job, the
-same as any other knock-back. See [`docs/authoring.md`](docs/authoring.md#judges--quality-gates-before-green)
-and [`judged-research.yaml`](examples/workflows/judged-research.yaml).
+A `produces:` entry can declare one or more **judges**. The artifact stays
+`submitted` until every required judge approves it on a separate order.
+To have a different person or agent review the work, assign the judge order
+to a separate reviewer.
+
+On a local run, the producer's retry order includes the reviewer's reason.
+On a hosted run, the verified order reader refuses a retry order that contains
+unsupported reviewer feedback. The rejection still counts toward the retry
+limit. See the [hosted order reader](docs/hosted-local-order-adapter.md),
+[judge authoring guide](docs/authoring.md#judges--quality-gates-before-green),
+and [research workflow example](examples/workflows/judged-research.yaml).
 
 ### Durable by default
 
