@@ -46,6 +46,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, hasDefiniteCheckDefect, modelCheck } from './model.ts';
+import { writeCheckReportJson } from './check-output.ts';
 import { openStore, readRuntimeSnapshotBundlePins } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import {
@@ -888,6 +889,16 @@ function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
 
 function print(io: CliIO, value: unknown): void {
   io.out(JSON.stringify(value, null, 2));
+}
+
+function writeCheckStdout(chunk: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(chunk, (error) => {
+      if (!error) resolve(true);
+      else if ((error as NodeJS.ErrnoException).code === 'EPIPE') resolve(false);
+      else reject(error);
+    });
+  });
 }
 
 /** Validate the exact positional shape of one bundle subcommand. */
@@ -2291,7 +2302,47 @@ function lintForAuthoring(def: WorkflowDef): { errors: string[]; warnings: strin
     : result;
 }
 
-function dispatch(command: string, io: CliIO, args: Args): number {
+function checkReportExitCode(report: CheckReport): number {
+  // Exit codes:
+  // - reported invariant violations → ALWAYS nonzero, regardless of bounds.
+  //   The checker filters speculative states when an assumed provide has no
+  //   sampled schema-valid witness, while retaining independent initial-state
+  //   violations. Bounds can miss witnesses but cannot turn a reported one
+  //   into a speculative provide.
+  //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
+  // - structurally-dead steps → ALWAYS nonzero, regardless of bounded. Unlike
+  //   true deadlocks (found by the bounded BFS, so a tighter maxCollectionSize
+  //   can manufacture a spurious one), structurally-dead is a STATIC canEverFire
+  //   finding that needs no search bounds at all — it is sound and bounds-
+  //   independent by construction (model.ts's canEverFire only ever returns
+  //   false when certain), so it belongs with invariant violations, not with
+  //   true deadlocks. unreachedSteps (the other dead-step bucket) must NEVER
+  //   affect the exit code — it is purely a bounds artifact.
+  // - definite (true) deadlock only when EXHAUSTIVE (!bounded) → nonzero
+  // - stall states and stuck states are by-design brakes and NEVER affect the
+  //   exit code — a stall state (report.stallStates) is EXPECTED (a human-
+  //   escalation brake whose freeze, once lifted, re-arms a producer, or an
+  //   idle wait that becomes eligible after time passes), and a stuck state
+  //   (report.stuck) is purely informational (a brake tripped on one branch
+  //   while the line still moves on another). Neither is a defect.
+  // - collection width/schema coverage gaps describe finite-model limits.
+  //   They cannot promote a no-moves witness to a definite deadlock, but
+  //   this structural check does not certify every runtime item/value/run.
+  //   Report the limit without making it a blanket source-admission veto.
+  const hasDefiniteDefect = hasDefiniteCheckDefect(report);
+  if (hasDefiniteDefect) {
+    throw new CliError(
+      `definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+      `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
+      `${report.deadlocks.length} true deadlock(s))`,
+    );
+  }
+  return 0;
+}
+
+function dispatch(command: string, io: CliIO, args: Args): number;
+function dispatch(command: string, io: CliIO, args: Args, writeCheckerReport: (report: CheckReport) => Promise<void>): number | Promise<number>;
+function dispatch(command: string, io: CliIO, args: Args, writeCheckerReport?: (report: CheckReport) => Promise<void>): number | Promise<number> {
   // help and lint need no store
   if (command === 'help' || command === '--help' || command === '-h') {
     io.out(USAGE);
@@ -2377,6 +2428,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     const report = modelCheck(def, { ...bounds, assumeProvided: !strictInputs });
 
     if (format === 'json') {
+      if (writeCheckerReport) return writeCheckerReport(report).then(() => checkReportExitCode(report));
       print(io, report);
     } else {
       // text format
@@ -2475,41 +2527,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       }
     }
 
-    // Exit codes:
-    // - reported invariant violations → ALWAYS nonzero, regardless of bounds.
-    //   The checker filters speculative states when an assumed provide has no
-    //   sampled schema-valid witness, while retaining independent initial-state
-    //   violations. Bounds can miss witnesses but cannot turn a reported one
-    //   into a speculative provide.
-    //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
-    // - structurally-dead steps → ALWAYS nonzero, regardless of bounded. Unlike
-    //   true deadlocks (found by the bounded BFS, so a tighter maxCollectionSize
-    //   can manufacture a spurious one), structurally-dead is a STATIC canEverFire
-    //   finding that needs no search bounds at all — it is sound and bounds-
-    //   independent by construction (model.ts's canEverFire only ever returns
-    //   false when certain), so it belongs with invariant violations, not with
-    //   true deadlocks. unreachedSteps (the other dead-step bucket) must NEVER
-    //   affect the exit code — it is purely a bounds artifact.
-    // - definite (true) deadlock only when EXHAUSTIVE (!bounded) → nonzero
-    // - stall states and stuck states are by-design brakes and NEVER affect the
-    //   exit code — a stall state (report.stallStates) is EXPECTED (a human-
-    //   escalation brake whose freeze, once lifted, re-arms a producer, or an
-    //   idle wait that becomes eligible after time passes), and a stuck state
-    //   (report.stuck) is purely informational (a brake tripped on one branch
-    //   while the line still moves on another). Neither is a defect.
-    // - collection width/schema coverage gaps describe finite-model limits.
-    //   They cannot promote a no-moves witness to a definite deadlock, but
-    //   this structural check does not certify every runtime item/value/run.
-    //   Report the limit without making it a blanket source-admission veto.
-    const hasDefiniteDefect = hasDefiniteCheckDefect(report);
-    if (hasDefiniteDefect) {
-      throw new CliError(
-        `definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
-        `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
-        `${report.deadlocks.length} true deadlock(s))`,
-      );
-    }
-    return 0;
+    return checkReportExitCode(report);
   }
 
   // Package-format bundle commands are pure filesystem work on bytes the user
@@ -9438,16 +9456,13 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
 }
 
 /**
- * Async entry point that adds network I/O for `add` and the hub commands on top
- * of the otherwise fully-synchronous engine/CLI (see the doc comment on
- * `sleepMs` above and README "sync end to end"). `main`/`dispatch` stay sync and
- * unchanged — this wraps them, routing only the network-touching verbs through
- * the async path, so every existing command and test keeps working exactly as
- * before.
+ * Async entry point for Hub commands, worker roles and streamed checker output.
+ * Embedded callers can continue to use the synchronous `main` entry point.
  */
 export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'install', 'start', 'pending-gates', 'cancel', 'provide', 'reject', 'retry', 'instance', 'agent', 'capability', 'catalog', 'interface', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
-export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
+export async function mainAsync(argv: string[], customIO?: CliIO): Promise<number> {
+  const io = customIO ?? defaultIO();
   // Delegate execution-side and shift argv tails before root parsing. Their
   // roles own their option grammars, including repeated/value forms that the
   // engine parser must not consume. These dynamic imports are cold-start
@@ -9473,13 +9488,17 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
   const args = parseArgs(argv);
   const command = args.positionals[0];
 	const asyncBundleGc = command === 'bundle' && args.positionals[1] === 'gc';
-	if (command === undefined || (!ASYNC_COMMANDS.has(command) && !asyncBundleGc)) {
+  const streamCheck = customIO === undefined && command === 'check' && last(args, 'format') === 'json';
+	if (command === undefined || (!ASYNC_COMMANDS.has(command) && !asyncBundleGc && !streamCheck)) {
 		return main(argv, io);
 	}
   try {
 	const short = preflight(command, args, io);
 	if (short !== undefined) return short;
 	if (asyncBundleGc) return await dispatchBundleGc(io, args);
+    if (streamCheck) {
+      return await dispatch(command, io, args, (report) => writeCheckReportJson(report, writeCheckStdout));
+    }
 	switch (command) {
       case 'add':
         return await dispatchAdd(io, args);
