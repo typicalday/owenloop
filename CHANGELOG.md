@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.42](https://github.com/typicalday/owenloop/compare/v0.5.41...v0.5.42) (2026-11-27)
+
+
+### Bug Fixes
+
+* **checker:** reduce memory pressure in large workflow searches ([ad2e5cf](https://github.com/typicalday/owenloop/commit/ad2e5cf8f4208926d2bbbf73ddae513e7756cfde))
+
 ## [0.5.41](https://github.com/typicalday/owenloop/compare/v0.5.40...v0.5.41) (2026-11-27)
 
 
