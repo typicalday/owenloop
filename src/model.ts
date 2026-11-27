@@ -3476,8 +3476,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   const definitelySeededInputs = new Set(def.inputs.filter((input) => !input.seedOwed).map((input) => input.name));
   const initialKey = collectionCheckKey(def, initial);
 
-  type StateNode = {
-    state: CollectionCheckState;
+  type QueuedState = {
+    state: Omit<CollectionCheckState, 'arts'> & { artifacts: ArtifactData[] };
     id: number;
     depth: number;
   };
@@ -3497,9 +3497,14 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     }
     return reversed.reverse();
   };
-  // A cursor avoids Array.shift's repeated compaction. Clear processed slots
-  // so their artifact maps can be reclaimed while descendants stay queued.
-  const queue: Array<StateNode | undefined> = [{ state: initial, id: 0, depth: 0 }];
+  // The frontier can have many more states than the one being expanded. It
+  // only needs artifacts in insertion order. The checker keys each artifact by
+  // its own path, so rebuild the lookup map when the state reaches the head.
+  const queue: Array<QueuedState | undefined> = [];
+  const enqueue = ({ arts, ...state }: CollectionCheckState, id: number, depth: number): void => {
+    queue.push({ state: { ...state, artifacts: Array.from(arts.values()) }, id, depth });
+  };
+  enqueue(initial, 0, 0);
   let queueHead = 0;
 
   const report: CheckReport = {
@@ -3527,14 +3532,17 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   const boundsHit = new Set<'maxDepth' | 'maxStates'>();
 
   search: while (queueHead < queue.length) {
-    const node = queue[queueHead]!;
+    const queued = queue[queueHead]!;
     queue[queueHead++] = undefined;
+    const { artifacts, ...state } = queued.state;
+    const arts = new Map<string, ArtifactData>();
+    for (const artifact of artifacts) arts.set(artifact.path, artifact);
+    const node = { id: queued.id, depth: queued.depth, state: { ...state, arts } };
     let reportedPath: CheckStep[] | undefined;
     const nodePath = (): CheckStep[] => (reportedPath ??= pathTo(node.id));
     report.stats.statesExplored++;
     if (node.depth > depthReached) depthReached = node.depth;
 
-    const arts = node.state.arts;
     const modifier = node.state.modifier;
     const status = workflowStatus(def, arts, { modifier });
 
@@ -3680,7 +3688,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       }
       const id = predecessors.length;
       predecessors.push({ parent: node.id, step });
-      queue.push({ state, id, depth: node.depth + 1 });
+      enqueue(state, id, node.depth + 1);
       return true;
     };
 
