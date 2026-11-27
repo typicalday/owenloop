@@ -66,17 +66,16 @@ beforeEach(() => {
   tracePath = join(root, 'harness-trace.jsonl');
 });
 function makeWritableTree(path: string): void {
-  const stat = lstatSync(path);
-  if (stat.isDirectory()) {
-    for (const child of readdirSync(path)) makeWritableTree(join(path, child));
-    chmodSync(path, 0o755);
-  } else {
-    chmodSync(path, 0o644);
-  }
+  if (!lstatSync(path).isDirectory()) return;
+  chmodSync(path, 0o755);
+  for (const child of readdirSync(path)) makeWritableTree(join(path, child));
 }
 
 afterEach(() => {
-  if (existsSync(root)) makeWritableTree(root);
+  // Only the installed bundle contains read-only directories. The worker's
+  // cache has transient lock files that can disappear during a tree walk.
+  const installed = join(home, '.owenloop', 'workflows');
+  if (existsSync(installed)) makeWritableTree(installed);
   rmSync(root, { recursive: true, force: true });
 });
 
