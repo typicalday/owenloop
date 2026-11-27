@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.41](https://github.com/typicalday/owenloop/compare/v0.5.40...v0.5.41) (2026-11-27)
+
+
+### Bug Fixes
+
+* **checker:** stream large JSON reports ([#400](https://github.com/typicalday/owenloop/issues/400)) ([3cf8802](https://github.com/typicalday/owenloop/commit/3cf88028f3dd97192509c2f18ce1f8a619d0e04a))
+
 ## [0.5.40](https://github.com/typicalday/owenloop/compare/v0.5.39...v0.5.40) (2026-11-26)
 
 ### Bug Fixes
