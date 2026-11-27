@@ -511,7 +511,10 @@ export function groupBlockingWinner(
  * patterns and the artifact's own role (seal / element / map child / singleton).
  */
 export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: ArtifactData): string[] {
-  const step = stepByName(def, art.producer);
+  return requiredInputsForStep(stepByName(def, art.producer), arts, art);
+}
+
+function requiredInputsForStep(step: StepDef | undefined, arts: ArtifactMap, art: ArtifactData): string[] {
   if (!step) return [];
   const plain = plainConsumes(step).map((c) => c.stem);
 
@@ -542,18 +545,6 @@ export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: Artifac
     return [...memberInputs, sealPath(rc.stem), ...plain];
   }
   return plain;
-}
-
-/**
- * Dependencies used only by maintenance. A calls step's `callsInputs` are its
- * scheduling gate and its dead-branch edge, but deliberately do not belong to
- * `requiredInputs()`: that function defines build fingerprints, while live
- * calls outputs also carry a child-outcome pin key.
- */
-function maintenanceInputs(def: WorkflowDef, arts: ArtifactMap, art: ArtifactData): string[] {
-  const step = stepByName(def, art.producer);
-  if (step !== undefined && isCallStep(step)) return Object.values(step.callsInputs ?? {});
-  return requiredInputs(def, arts, art);
 }
 
 /** The {path → version} snapshot over a set of input paths. */
@@ -1112,12 +1103,18 @@ export function canEverFire(step: StepDef, def: WorkflowDef, reachable?: Set<str
  */
 export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): CascadeOp[] {
   const ops: CascadeOp[] = [];
+  // A green terminal artifact seals the workflow and prevents evaluator rearming.
+  let anyTerminalGreen = false;
 
   for (const art of arts.values()) {
+    if (art.acceptance === 'green' && art.terminal) {
+      anyTerminalGreen ||= art.terminal === true;
+      continue;
+    }
     if (art.acceptance === 'retracted') continue; // terminal — nothing to maintain
 
-    const el = parseElement(art.path);
-    const isMapChild = !!el && el.suffix !== '';
+    const producer = stepByName(def, art.producer);
+    const calls = producer !== undefined && isCallStep(producer);
 
     // A skipped artifact is settled-but-re-armable. It stays skipped while the
     // routing decision that produced it still holds — i.e. while its inputs are
@@ -1126,18 +1123,19 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     // Re-arming on "inputs are green" alone would thrash, since the skip itself
     // was made on green inputs (§16.1).
     if (art.acceptance === 'skipped') {
-      const producerStep = stepByName(def, art.producer);
-      const isCallsCascade = producerStep !== undefined && isCallStep(producerStep) && isEngineStructuralSkip(art);
-      const req = isCallsCascade ? maintenanceInputs(def, arts, art) : requiredInputs(def, arts, art);
+      const req = calls && isEngineStructuralSkip(art)
+	? Object.values(producer.callsInputs ?? {})
+	: requiredInputsForStep(producer, arts, art);
       const allGreen = req.length > 0 && req.every((p) => isGreen(arts.get(p)));
-      const moved = !fingerprintMatches(arts, req, art.fingerprint ?? {});
-      if (allGreen && moved) {
+      if (allGreen && !fingerprintMatches(arts, req, art.fingerprint ?? {})) {
         ops.push({ kind: 'rearm', path: art.path, reason: 'branch revived: inputs moved since skip' });
       }
       continue;
     }
 
-    const maintenanceReq = maintenanceInputs(def, arts, art);
+    // A calls step's scheduling gates are also its dead-branch edges. Its
+    // fingerprint is still based on the ordinary build inputs and a child pin.
+    const maintenanceReq = calls ? Object.values(producer.callsInputs ?? {}) : requiredInputsForStep(producer, arts, art);
 
     // the first input that is not green (settled-dead or merely in-flight)
     let offender: ArtifactData | undefined;
@@ -1156,21 +1154,20 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     // only stay usable while every input is green *and unmoved* from its build
     // (§11.8). `submitted` is never terminal (terminal applies at judge-approve
     // time, §4.8, so a still-submitted artifact cannot have terminal:true yet).
-    if ((art.acceptance === 'green' && !art.terminal) || art.acceptance === 'submitted') {
+    if (art.acceptance === 'green' || art.acceptance === 'submitted') {
       if (offender && offenderPath) {
-        ops.push(cascadeFromDeadInput(art.path, offender, offenderPath, isMapChild));
+	ops.push(cascadeFromDeadInput(art.path, offender, offenderPath));
         continue;
       }
 
-      const req = requiredInputs(def, arts, art);
+      const req = calls ? requiredInputsForStep(producer, arts, art) : maintenanceReq;
       if (req.length === 0) continue; // a seeded input with no producer-inputs: nothing to rest on
       const versionsOk = fingerprintMatches(arts, req, art.fingerprint ?? {});
       if (versionsOk) continue; // invariant holds
 
       // All inputs are green but at least one moved (version changed). Route on effect:.
       const moved = req.find((p) => (arts.get(p)?.version ?? -1) !== (art.fingerprint ?? {})[p]);
-      const producerStep = stepByName(def, art.producer);
-      const effect = resolvedEffect(producerStep);
+      const effect = resolvedEffect(producer);
 
       if (effect.idempotent) {
         // Default (idempotent=true): re-arm as before. No behavior change for existing defs.
@@ -1197,7 +1194,7 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     // which re-arms if the branch later revives). A debt on a merely in-flight
     // input (owed/rejected) is just blocked, not dead — leave it.
     if (isDebt(art) && offender && offenderPath && isSettledOut(offender)) {
-      ops.push(cascadeFromDeadInput(art.path, offender, offenderPath, isMapChild));
+      ops.push(cascadeFromDeadInput(art.path, offender, offenderPath));
     }
   }
 
@@ -1243,12 +1240,6 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
       }
     }
   }
-
-  // Terminal-settle invariant (§15.2): once any terminal artifact is green,
-  // the instance is sealed — no completion evaluator should re-arm.
-  const anyTerminalGreen = [...arts.values()].some(
-    (a) => a.acceptance === 'green' && a.terminal === true,
-  );
 
   // allGreen re-arm: a green outcome of an allGreen-triggered step is re-armed
   // when the workflow is no longer all-green (excluding the evaluator's own outputs).
@@ -1308,10 +1299,12 @@ function cascadeFromDeadInput(
   path: string,
   offender: ArtifactData,
   offenderPath: string,
-  isMapChild: boolean,
 ): CascadeOp {
-  if (offender.acceptance === 'retracted' && isMapChild) {
-    return { kind: 'retract', path, reason: `auto-retracted: ${offenderPath} was retracted` };
+  if (offender.acceptance === 'retracted') {
+    const element = parseElement(path);
+    if (element && element.suffix !== '') {
+      return { kind: 'retract', path, reason: `auto-retracted: ${offenderPath} was retracted` };
+    }
   }
   if (offender.acceptance === 'skipped') {
     return { kind: 'skip', path, reason: `skipped: ${offenderPath} not taken` };
